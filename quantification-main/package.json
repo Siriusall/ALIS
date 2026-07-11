@@ -1,0 +1,24 @@
+{
+  "name": "quantification-main",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Personal A-share quant research, simulation, backtest, and task runner.",
+  "scripts": {
+    "dev": "powershell -ExecutionPolicy Bypass -File .\\start.ps1",
+    "backend": "powershell -ExecutionPolicy Bypass -File .\\run_backend.ps1",
+    "frontend": "npm --prefix frontend run dev",
+    "frontend:build": "npm --prefix frontend run build",
+    "frontend:preview": "npm --prefix frontend run preview",
+    "install:frontend": "npm --prefix frontend install",
+    "install:backend": "powershell -ExecutionPolicy Bypass -File .\\scripts\\setup_backend.ps1",
+    "check:env": "powershell -ExecutionPolicy Bypass -File .\\scripts\\check_environment.ps1",
+    "check:core": "python backend\\scripts\\check_core_contracts.py",
+    "check:risk-e2e": "powershell -ExecutionPolicy Bypass -Command \"Set-Location backend; if (Test-Path .\\.venv\\Scripts\\python.exe) { .\\.venv\\Scripts\\python.exe scripts\\simulate_risk_gates_e2e.py } else { py -3.11 scripts\\simulate_risk_gates_e2e.py }\"",
+    "check:frontend": "npm --prefix frontend run build",
+    "check:backend": "powershell -ExecutionPolicy Bypass -Command \"Set-Location backend; if (Test-Path .\\.venv\\Scripts\\python.exe) { .\\.venv\\Scripts\\python.exe -m compileall -q app } else { py -3.11 -m compileall -q app }\""
+  },
+  "engines": {
+    "node": ">=18",
+    "python": "3.11.x"
+  }
+}

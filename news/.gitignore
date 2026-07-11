@@ -1,0 +1,17 @@
+node_modules/
+dist/
+__pycache__/
+*.pyc
+.venv/
+venv/
+data/
+.env
+.env.*
+!.env.example
+.DS_Store
+Thumbs.db
+*.png
+*.zip
+*.tsbuildinfo
+crawler/_*.txt
+crawler/probe_web_sources.py

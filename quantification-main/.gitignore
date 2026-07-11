@@ -1,0 +1,41 @@
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+
+# Node
+node_modules/
+
+# 大文件与备份（超出 GitHub 100MB 限制）
+backend.zip
+backups/
+
+# 缓存与数据
+.cache/
+backend/.cache/
+*.db
+*.sqlite
+
+# 环境与密钥（勿提交）
+.env
+.env.local
+*.pem
+
+# 构建产物
+frontend/dist/
+backend/build/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# 系统
+.DS_Store
+Thumbs.db

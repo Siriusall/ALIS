@@ -1,0 +1,1100 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime, timezone
+import os
+from pathlib import Path
+import time
+from typing import Any, Callable, Dict, List, Optional
+
+from app.api.state import add_log
+from app.core.trading_constraints import check_open_trade_constraints
+from app.core.exchange_groups import matches_exchange_group, normalize_exchange_group
+from app.db.store import (
+    add_account_balance,
+    append_operations_to_execution,
+    create_execution,
+    get_account_balance,
+    get_active_model_version,
+    get_positions,
+    get_strategy,
+    list_strategies,
+    merge_execution_into_positions,
+    sell_position,
+)
+from app.integrations.broker_adapter import OrderRequest
+from app.services.backtest_data_source import BacktestDataSource
+from app.services.backtest_engine import _apply_filters, _factor_value, _score_rows
+from app.services.execution_engine import simulate_open_execution
+from app.services.rebalance_allocator import allocate_buy_orders, planned_to_order_results
+from app.services.cache_consolidation import list_available_trade_dates
+from app.services.strategy_recommender import recommend_strategy_template
+from app.services.strategy_config import parse_strategy_content
+from app.services.trend_model import analyze_trend
+
+_SCORING_HEARTBEAT_EVERY = max(100, min(int(os.getenv("QUANT_SCORING_HEARTBEAT_EVERY", "300")), 2000))
+_SCORING_TIMEOUT_SEC = max(10, min(int(os.getenv("QUANT_SCORING_TIMEOUT_SEC", "90")), 1800))
+
+
+class HistoricalDataMissingError(Exception):
+    """
+    历史数据缺失（统一映射为 508）。
+    用于任务线程/接口层识别后触发 backfill。
+    """
+
+    def __init__(self, message: str = "历史交易数据不足，无法执行任务", code: str = "historical_data_missing_508"):
+        self.status_code = 508
+        self.code = code
+        super().__init__(message)
+
+
+class ReplayRiskGateError(Exception):
+    """补跑风控门触发（数据门/资金门/时段门）。"""
+
+    def __init__(self, message: str, code: str = "replay_risk_gate"):
+        self.code = code
+        super().__init__(message)
+
+
+@dataclass
+class QuantRunExecResult:
+    signal_date: str
+    execute_date: str
+    sold_count: int
+    bought_count: int
+    total_buy_cost: float
+    execution_id: int | None
+    message: str
+    planned_buy_count: int = 0
+    executed_buy_count: int = 0
+    fill_rate_pct: float = 0.0
+    avg_slippage_bps: float = 0.0
+    exec_latency_ms: int = 0
+    detail: Dict[str, Any] | None = None
+
+
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[3]
+
+
+def list_consolidated_trade_dates() -> List[str]:
+    out: List[str] = []
+    for ymd in list_available_trade_dates():
+        if len(ymd) == 8 and ymd.isdigit():
+            out.append(f"{ymd[:4]}-{ymd[4:6]}-{ymd[6:8]}")
+    return sorted(set(out))
+
+
+def require_consolidated_trade_dates(min_count: int = 2) -> List[str]:
+    dates = list_consolidated_trade_dates()
+    if len(dates) < max(1, int(min_count or 2)):
+        raise HistoricalDataMissingError("可用交易日不足，无法执行任务/补跑")
+    return dates
+
+
+def resolve_execute_date(signal_date: str) -> tuple[str, bool]:
+    """根据信号日解析执行日。返回 (execute_date, same_day_fallback)。"""
+    dates = list_consolidated_trade_dates()
+    sig = str(signal_date or "").strip()
+    if sig not in dates:
+        raise ValueError(f"signal_date 不在可用交易日列表: {sig}")
+    idx = dates.index(sig)
+    if idx + 1 < len(dates):
+        return dates[idx + 1], False
+    return sig, True
+
+
+def _row_trade_price(row: Any, *, prefer_open: bool = True) -> float:
+    if row is None:
+        return 0.0
+    open_px = float(getattr(row, "open", 0) or 0)
+    close_px = float(getattr(row, "close", 0) or 0)
+    if prefer_open and open_px > 0:
+        return open_px
+    if close_px > 0:
+        return close_px
+    return open_px
+
+
+def _parse_risk_budget(risk_budget: Dict[str, Any] | None) -> tuple[float, float]:
+    rb = risk_budget if isinstance(risk_budget, dict) else {}
+    try:
+        target_pct = float(rb.get("target_position_pct", 1.0) or 1.0)
+    except Exception:
+        target_pct = 1.0
+    try:
+        max_single = float(rb.get("max_single_position_pct", 1.0) or 1.0)
+    except Exception:
+        max_single = 1.0
+    return max(0.0, min(1.0, target_pct)), max(0.0, min(1.0, max_single))
+
+
+def _portfolio_state(ds: BacktestDataSource, valuation_date: str) -> Dict[str, Any]:
+    cash = float(get_account_balance() or 0)
+    positions = get_positions()
+    position_value_by_symbol: Dict[str, float] = {}
+    market_value = 0.0
+    for pos in positions:
+        sym = str(pos.get("symbol") or "").strip()
+        qty = int(pos.get("quantity") or 0)
+        if not sym or qty <= 0:
+            continue
+        px = float(ds.get_price_on_date(sym, valuation_date, field="close") or 0)
+        if px <= 0:
+            px = float(pos.get("price") or 0)
+        val = round(px * qty, 2)
+        position_value_by_symbol[sym] = val
+        market_value += val
+    market_value = round(market_value, 2)
+    total_equity = round(cash + market_value, 2)
+    return {
+        "cash_balance": round(cash, 2),
+        "position_market_value": market_value,
+        "total_equity": total_equity,
+        "position_value_by_symbol": position_value_by_symbol,
+        "positions": positions,
+        "valuation_date": valuation_date,
+    }
+
+
+def _compute_buy_budget(
+    *,
+    total_equity: float,
+    position_market_value: float,
+    cash_balance: float,
+    target_position_pct: float,
+    budget_ratio: float = 1.0,
+) -> float:
+    target_invested = float(total_equity) * max(0.0, min(1.0, float(target_position_pct)))
+    need_to_buy = max(0.0, target_invested - float(position_market_value))
+    ratio = max(0.0, min(1.0, float(budget_ratio)))
+    return max(0.0, round(min(float(cash_balance), need_to_buy) * ratio, 2))
+
+
+def _selection_score_map(detail: Dict[str, Any]) -> Dict[str, float]:
+    out: Dict[str, float] = {}
+    for row in detail.get("selections") or []:
+        sym = str((row or {}).get("symbol") or "").strip()
+        if sym:
+            out[sym] = float((row or {}).get("score") or 0)
+    return out
+
+
+def _calc_total_buy_cost(orders: List[Any]) -> float:
+    total = 0.0
+    for o in orders:
+        amount = float(getattr(o, "price", 0) or 0) * int(getattr(o, "quantity", 0) or 0)
+        total += amount + float(getattr(o, "commission", 0) or 0) + float(getattr(o, "transfer_fee", 0) or 0)
+    return round(total, 2)
+
+
+def _filled_orders(orders: List[Any]) -> List[Any]:
+    return [o for o in orders if int(getattr(o, "quantity", 0) or 0) > 0]
+
+
+def _selection_explanation(
+    ranked: List[tuple[Any, float]],
+    *,
+    weights: Dict[str, float],
+    factor_values: Dict[str, Dict[str, float]],
+    top_n: int,
+) -> List[Dict[str, Any]]:
+    selections: List[Dict[str, Any]] = []
+    for row, score in ranked[: max(0, int(top_n))]:
+        symbol = str(getattr(row, "symbol", "") or "").strip()
+        vals = factor_values.get(symbol) or {}
+        contribs: List[Dict[str, Any]] = []
+        for factor, weight in weights.items():
+            raw = float(vals.get(factor, 0) or 0)
+            contribs.append(
+                {
+                    "factor": factor,
+                    "weight": round(float(weight or 0), 4),
+                    "raw_value": round(raw, 6),
+                    "contribution": round(float(weight or 0) * raw, 6),
+                }
+            )
+        contribs.sort(key=lambda x: abs(float(x.get("contribution") or 0)), reverse=True)
+        selections.append(
+            {
+                "symbol": symbol,
+                "name": str(getattr(row, "name", "") or ""),
+                "score": round(float(score or 0), 6),
+                "factor_contributions": contribs[:6],
+            }
+        )
+    return selections
+
+
+def _build_target_symbols(
+    *,
+    ds: BacktestDataSource,
+    strategy_id: int,
+    signal_date: str,
+    top_n: int,
+    exchange_group: str = "HS",
+    progress_callback: Optional[Callable[[str], None]] = None,
+    scoring_timeout_sec: Optional[int] = None,
+) -> tuple[List[str], Dict[str, Any]]:
+    strategy = get_strategy(strategy_id)
+    if not strategy:
+        raise ValueError(f"strategy_id={strategy_id} 不存在")
+    config = parse_strategy_content(strategy.get("content"), strategy.get("type", "formula"))
+    top_n = max(1, min(int(top_n), int(config.rebalance.get("top_n") or top_n)))
+    exchange_group = normalize_exchange_group(exchange_group)
+    trend_analysis = analyze_trend(ds=ds, signal_date=signal_date, exchange_group=exchange_group)
+    strategy_template = recommend_strategy_template(trend_analysis, requested_top_n=top_n)
+    score_weights = dict(strategy_template.get("score") or config.score)
+    filters = list(strategy_template.get("filters") or config.filters)
+    top_n = max(1, min(int(top_n), int(strategy_template.get("top_n") or top_n)))
+    empty_detail = {
+        "signal_date": signal_date,
+        "exchange_group": exchange_group,
+        "trend_analysis": trend_analysis,
+        "strategy_template": strategy_template,
+        "selected_factors": list(score_weights.keys()),
+        "risk_budget": strategy_template.get("risk_budget") or {},
+        "selections": [],
+        "blocked_events": [],
+        "sell_triggers": [],
+    }
+    if progress_callback is not None:
+        progress_callback("正在加载快照")
+    snapshot = ds.load_snapshot(signal_date.replace("-", ""))
+    # 数据容错：过滤掉晚于 signal_date 的脏行，避免未来数据污染评分。
+    snapshot = [r for r in snapshot if str(getattr(r, "date", "")) <= str(signal_date)]
+    if exchange_group != "ALL":
+        snapshot = [r for r in snapshot if matches_exchange_group(r.symbol, exchange_group)]
+    if not snapshot:
+        return [], empty_detail
+    required_factors = set(score_weights.keys())
+    for f in filters:
+        fn = str(f.get("factor", "")).strip()
+        if fn:
+            required_factors.add(fn)
+    daily_basic_map = ds.get_daily_basic_map(signal_date.replace("-", ""))
+    max_lookback = max(int(config.lookback_days or 60), 20)
+    factor_values: Dict[str, Dict[str, float]] = {}
+    if progress_callback is not None:
+        progress_callback("正在计算打分")
+    t0 = time.monotonic()
+    total = len(snapshot)
+    timeout_sec = int(scoring_timeout_sec) if scoring_timeout_sec else _SCORING_TIMEOUT_SEC
+    for idx, row in enumerate(snapshot, start=1):
+        if (time.monotonic() - t0) > timeout_sec:
+            raise ReplayRiskGateError(
+                f"评分阶段超时：已处理 {idx-1}/{total}，超时阈值 {timeout_sec}s",
+                code="paused_scoring_timeout",
+            )
+        if progress_callback is not None and (idx == 1 or idx % _SCORING_HEARTBEAT_EVERY == 0 or idx == total):
+            progress_callback(f"正在计算打分 {idx}/{total}")
+        hist = ds.get_hist_window(row.symbol, signal_date, max_lookback)
+        vals: Dict[str, float] = {}
+        for f in required_factors:
+            vals[f] = _factor_value(f, row, hist, daily_basic_map)
+        factor_values[row.symbol] = vals
+    filtered = _apply_filters(snapshot, factor_values, filters, skip_factors=set())
+    if not filtered:
+        return [], {**empty_detail, "filter_summary": {"passed": 0, "universe": len(snapshot)}}
+    active_model = get_active_model_version()
+    if active_model:
+        try:
+            from app.services.model_scorer import score_snapshot_rows
+
+            ranked = score_snapshot_rows(ds=ds, rows=filtered, signal_date=signal_date, model_version_id=int(active_model["id"]))
+            strategy_template = {
+                **strategy_template,
+                "id": "active_ml_model",
+                "name": f"机器学习模型 {active_model.get('version')}",
+                "reason": "使用已通过验证的 active model 生成目标组合",
+            }
+        except Exception:
+            ranked = _score_rows(filtered, score_weights, factor_values)
+    else:
+        ranked = _score_rows(filtered, score_weights, factor_values)
+    detail = {
+        **empty_detail,
+        "filter_summary": {
+            "passed": len(filtered),
+            "universe": len(snapshot),
+            "template": strategy_template.get("id"),
+        },
+        "selections": _selection_explanation(
+            ranked,
+            weights=score_weights,
+            factor_values=factor_values,
+            top_n=top_n,
+        ),
+    }
+    return [x[0].symbol for x in ranked[:top_n]], detail
+
+
+def run_for_trade_date(
+    *,
+    strategy_id: int,
+    signal_date: str,
+    execute_date: str,
+    top_n: int,
+    budget_ratio: float,
+    exchange_group: str = "HS",
+    progress_callback: Optional[Callable[[str], None]] = None,
+    strict_no_future: bool = True,
+    scoring_timeout_sec: Optional[int] = None,
+) -> QuantRunExecResult:
+    def _report(phase: str) -> None:
+        if progress_callback is not None:
+            try:
+                progress_callback(phase)
+            except Exception:
+                pass
+
+    ds = BacktestDataSource()
+    exchange_group = normalize_exchange_group(exchange_group)
+    if strict_no_future and str(signal_date) >= str(execute_date):
+        raise ReplayRiskGateError(
+            f"未来函数防护：signal_date({signal_date}) 必须早于 execute_date({execute_date})",
+            code="future_guard_date_order",
+        )
+    _report("正在加载快照")
+    target_symbols, selection_detail = _build_target_symbols(
+        ds=ds,
+        strategy_id=int(strategy_id),
+        signal_date=signal_date,
+        top_n=int(top_n),
+        exchange_group=exchange_group,
+        progress_callback=_report,
+        scoring_timeout_sec=scoring_timeout_sec,
+    )
+    blocked_events: List[Dict[str, Any]] = list(selection_detail.get("blocked_events") or [])
+    sell_triggers: List[Dict[str, Any]] = []
+    strategy = get_strategy(strategy_id)
+    config = parse_strategy_content(strategy.get("content"), strategy.get("type", "formula")) if strategy else None
+    hold_days = int(config.hold_days) if config and config.hold_days else None
+    signal_rows = ds.load_snapshot(signal_date.replace("-", ""))
+    if strict_no_future:
+        if not signal_rows:
+            raise ReplayRiskGateError(f"数据门：信号日 {signal_date} 快照缺失", code="paused_data_not_ready")
+        # 容错：过滤掉脏快照中的“未来日期行”，避免单条异常数据导致整任务长时间暂停。
+        signal_rows = [x for x in signal_rows if str(getattr(x, "date", "")) <= str(signal_date)]
+        if not signal_rows:
+            _report("信号日快照全部为未来日期，已降级为空仓信号继续执行")
+    exec_rows = ds.load_snapshot(execute_date.replace("-", ""))
+    if strict_no_future:
+        if not exec_rows:
+            raise ReplayRiskGateError(f"数据门：执行日 {execute_date} 快照缺失", code="paused_data_not_ready")
+        exec_rows = [x for x in exec_rows if str(getattr(x, "date", "")) <= str(execute_date)]
+        if not exec_rows:
+            raise ReplayRiskGateError(
+                f"未来函数防护：执行日快照全部为未来日期，execute_date={execute_date}",
+                code="future_guard_execute_snapshot",
+            )
+    exec_map = {x.symbol: x for x in exec_rows}
+    executed_at = f"{execute_date}T09:30:00"
+
+    # 先卖出（仅对不在目标池且满足 T+1 / hold_days 的仓位）
+    sold_count = 0
+    sold_ops_payload: List[Dict[str, Any]] = []
+    blocked_count = 0
+    rows = get_positions()
+    for pos in rows:
+        sym = str(pos.get("symbol") or "").strip()
+        if not sym or sym in target_symbols:
+            continue
+        if hold_days and hold_days > 0:
+            bought_at = str(pos.get("bought_at") or "")[:10]
+            if bought_at:
+                try:
+                    held = (datetime.fromisoformat(execute_date) - datetime.fromisoformat(bought_at)).days
+                    if held < hold_days:
+                        continue
+                except ValueError:
+                    continue
+        px_row = exec_map.get(sym)
+        px = float(getattr(px_row, "open", 0) or 0) if px_row else 0.0
+        if px <= 0:
+            px = float(getattr(px_row, "close", 0) or 0) if px_row else 0.0
+        if px <= 0:
+            continue
+        tradable = check_open_trade_constraints(
+            side="SELL",
+            symbol=sym,
+            name=str(pos.get("name") or ""),
+            open_price=px,
+            close_price=float(getattr(px_row, "close", 0) or 0) if px_row else 0.0,
+            change_pct=float(getattr(px_row, "change_pct", 0) or 0) if px_row else 0.0,
+            volume=float(getattr(px_row, "volume", 0) or 0) if px_row else 0.0,
+        )
+        if not tradable.ok:
+            blocked_count += 1
+            event = {
+                "date": execute_date,
+                "symbol": sym,
+                "side": "SELL",
+                "code": tradable.code,
+                "message": tradable.message,
+            }
+            blocked_events.append(event)
+            add_log("WARN", f"QuantRun 卖出被交易约束拦截: {tradable.message}")
+            continue
+        try:
+            sell_position(int(pos["id"]), quantity=int(pos["quantity"]), price=px, trade_date=execute_date)
+            sold_count += 1
+            sell_triggers.append(
+                {
+                    "symbol": sym,
+                    "reason": "调仓卖出",
+                    "detail": "不在目标池且满足持有期/T+1",
+                    "quantity": int(pos["quantity"]),
+                    "price": round(px, 4),
+                }
+            )
+            sold_ops_payload.append(
+                {
+                    "symbol": sym,
+                    "side": "SELL",
+                    "price": px,
+                    "quantity": int(pos["quantity"]),
+                    "at": executed_at,
+                    "remark": "量化任务卖出（关联执行）",
+                    "name": str(pos.get("name") or "").strip(),
+                }
+            )
+        except ValueError:
+            # T+1 触发，跳过该仓位
+            continue
+
+    # 再买入（等权资金，按总权益目标仓位与单票上限）
+    held_after_sell = {str(p.get("symbol") or "").strip() for p in get_positions()}
+    buy_list = [s for s in target_symbols if s not in held_after_sell]
+    risk_budget = selection_detail.get("risk_budget") if isinstance(selection_detail.get("risk_budget"), dict) else {}
+    target_position_pct, max_single_position_pct = _parse_risk_budget(risk_budget)
+    portfolio = _portfolio_state(ds, execute_date)
+    effective_budget_ratio = max(0.0, min(1.0, float(budget_ratio)))
+    available_balance = _compute_buy_budget(
+        total_equity=portfolio["total_equity"],
+        position_market_value=portfolio["position_market_value"],
+        cash_balance=portfolio["cash_balance"],
+        target_position_pct=target_position_pct,
+        budget_ratio=effective_budget_ratio,
+    )
+    order_requests: List[OrderRequest] = []
+    for sym in buy_list:
+        px_row = exec_map.get(sym)
+        px = _row_trade_price(px_row, prefer_open=True)
+        if px <= 0:
+            continue
+        order_requests.append(
+            OrderRequest(
+                symbol=sym,
+                side="BUY",
+                price=px,
+                quantity=0,
+                name=str(getattr(px_row, "name", "") or ""),
+                change_pct=float(getattr(px_row, "change_pct", 0) or 0),
+                volume=float(getattr(px_row, "volume", 0) or 0),
+                close=float(getattr(px_row, "close", 0) or 0),
+            )
+        )
+
+    _report("正在生成买卖单")
+    exec_t0 = time.monotonic()
+    result = simulate_open_execution(
+        order_requests,
+        budget=available_balance,
+        executed_at=executed_at,
+        total_equity=portfolio["total_equity"],
+        max_single_position_pct=max_single_position_pct,
+        existing_position_value=portfolio["position_value_by_symbol"],
+        symbol_scores=_selection_score_map(selection_detail),
+    )
+    exec_latency_ms = max(1, int((time.monotonic() - exec_t0) * 1000))
+    filled = _filled_orders(result.orders)
+    blocked_count += len(result.orders) - len(filled)
+    for o in result.orders:
+        if int(getattr(o, "quantity", 0) or 0) > 0:
+            continue
+        blocked_events.append(
+            {
+                "date": execute_date,
+                "symbol": str(getattr(o, "symbol", "") or ""),
+                "side": str(getattr(o, "side", "") or "BUY").upper(),
+                "code": str(getattr(o, "block_code", "") or "blocked"),
+                "message": str(getattr(o, "message", "") or "买入被拦截"),
+            }
+        )
+    total_buy_cost = _calc_total_buy_cost(filled)
+    if total_buy_cost > 0:
+        add_account_balance(-total_buy_cost)
+    orders_payload = [
+        {
+            "symbol": o.symbol,
+            "side": o.side,
+            "price": o.price,
+            "quantity": o.quantity,
+            "commission": getattr(o, "commission", 0),
+            "transfer_fee": getattr(o, "transfer_fee", 0),
+        }
+        for o in result.orders
+        if int(getattr(o, "quantity", 0) or 0) > 0
+    ]
+    execution_id: int | None = None
+    if orders_payload:
+        execution_id = create_execution(
+            strategy_id=int(strategy_id),
+            executed_at=executed_at,
+            budget=total_buy_cost,
+            top_n=int(top_n),
+            orders=orders_payload,
+        )
+        if sold_ops_payload:
+            append_operations_to_execution(execution_id, executed_at, sold_ops_payload)
+        merge_execution_into_positions(orders_payload, executed_at)
+
+    planned_buy_count = len(order_requests)
+    bought_count = len(filled)
+    fill_rate_pct = round((bought_count / planned_buy_count) * 100.0, 2) if planned_buy_count > 0 else 0.0
+    req_price_map = {str(x.symbol): float(x.price) for x in order_requests}
+    slippage_bps: list[float] = []
+    for o in filled:
+        qty = int(getattr(o, "quantity", 0) or 0)
+        px_exec = float(getattr(o, "price", 0) or 0)
+        px_req = float(req_price_map.get(str(getattr(o, "symbol", "")), 0) or 0)
+        if qty <= 0 or px_exec <= 0 or px_req <= 0:
+            continue
+        slippage_bps.append((px_exec / px_req - 1.0) * 10000.0)
+    avg_slippage_bps = round(sum(slippage_bps) / len(slippage_bps), 2) if slippage_bps else 0.0
+    trend_analysis = selection_detail.get("trend_analysis") if isinstance(selection_detail.get("trend_analysis"), dict) else {}
+    strategy_template = selection_detail.get("strategy_template") if isinstance(selection_detail.get("strategy_template"), dict) else {}
+    trend_text = str(trend_analysis.get("trend") or "unknown")
+    template_name = str(strategy_template.get("name") or strategy_template.get("id") or "策略模板")
+    msg = (
+        f"signal={signal_date} execute={execute_date} "
+        f"趋势={trend_text} 模板={template_name} 交易所={exchange_group} "
+        f"卖出{sold_count} 买入{bought_count} 约束拦截{blocked_count} 买入成本={total_buy_cost:.2f} "
+        f"偏差(fill={fill_rate_pct:.2f}% slip={avg_slippage_bps:.2f}bp latency={exec_latency_ms}ms)"
+    )
+    add_log("INFO", f"QuantRun 执行完成: {msg}")
+    buy_actions = [
+        {
+            "symbol": str(getattr(o, "symbol", "") or ""),
+            "quantity": int(getattr(o, "quantity", 0) or 0),
+            "price": round(float(getattr(o, "price", 0) or 0), 4),
+        }
+        for o in filled
+    ]
+    current_positions = [
+        {
+            "symbol": str(p.get("symbol") or ""),
+            "name": str(p.get("name") or ""),
+            "quantity": int(p.get("quantity") or 0),
+            "cost_price": round(float(p.get("price") or 0), 4),
+        }
+        for p in get_positions()
+    ]
+    detail = {
+        **selection_detail,
+        "execute_date": execute_date,
+        "sell_triggers": sell_triggers,
+        "blocked_events": blocked_events,
+        "target_positions": [
+            {
+                "symbol": str(x.get("symbol") or ""),
+                "name": str(x.get("name") or ""),
+                "score": x.get("score"),
+            }
+            for x in (selection_detail.get("selections") or [])
+        ],
+        "rebalance_actions": {
+            "buy": buy_actions,
+            "sell": sell_triggers,
+            "hold": sorted(list(held_after_sell.intersection(set(target_symbols)))),
+            "blocked": blocked_events,
+        },
+        "current_positions": current_positions,
+        "summary": (
+            f"今日趋势判断为 {trend_text}，采用{template_name}；"
+            f"本次卖出 {sold_count} 只、买入 {bought_count} 只、拦截 {blocked_count} 笔。"
+        ),
+        "buy_summary": {
+            "planned": planned_buy_count,
+            "filled": bought_count,
+            "fill_rate_pct": fill_rate_pct,
+            "avg_slippage_bps": avg_slippage_bps,
+            "effective_budget_ratio": round(effective_budget_ratio, 4),
+        },
+    }
+    return QuantRunExecResult(
+        signal_date=signal_date,
+        execute_date=execute_date,
+        sold_count=sold_count,
+        bought_count=bought_count,
+        total_buy_cost=total_buy_cost,
+        execution_id=execution_id,
+        message=msg,
+        planned_buy_count=planned_buy_count,
+        executed_buy_count=bought_count,
+        fill_rate_pct=fill_rate_pct,
+        avg_slippage_bps=avg_slippage_bps,
+        exec_latency_ms=exec_latency_ms,
+        detail=detail,
+    )
+
+
+def analyze_market_plan(
+    *,
+    strategy_id: int | None = None,
+    signal_date: str | None = None,
+    top_n: int = 10,
+    exchange_group: str = "HS",
+    scoring_timeout_sec: int | None = None,
+) -> Dict[str, Any]:
+    """
+    仅分析：趋势理解 -> 策略模板 -> 选股目标池 -> 调仓建议。
+    不执行真实买卖，供前端一键分析展示。
+    """
+    dates = list_consolidated_trade_dates()
+    if not dates:
+        raise HistoricalDataMissingError("可用交易日不足，无法分析")
+    sig = str(signal_date or dates[-1]).strip()
+    if sig not in dates:
+        raise ValueError(f"signal_date 不在可用交易日列表: {sig}")
+    execute_date, same_day_fallback = resolve_execute_date(sig)
+
+    sid = int(strategy_id or 0)
+    if sid <= 0:
+        strategies = list_strategies()
+        if not strategies:
+            raise ValueError("无可用策略")
+        sid = int(strategies[0]["id"])
+
+    ds = BacktestDataSource()
+    exchange_group = normalize_exchange_group(exchange_group)
+    targets, detail = _build_target_symbols(
+        ds=ds,
+        strategy_id=sid,
+        signal_date=sig,
+        top_n=int(top_n),
+        exchange_group=exchange_group,
+        scoring_timeout_sec=scoring_timeout_sec,
+    )
+    target_set = set(targets)
+    positions = get_positions()
+    held: Dict[str, Dict[str, Any]] = {}
+    for pos in positions:
+        sym = str(pos.get("symbol") or "").strip()
+        if sym:
+            held[sym] = pos
+
+    selection_map = {
+        str(x.get("symbol") or "").strip(): x
+        for x in (detail.get("selections") or [])
+        if str(x.get("symbol") or "").strip()
+    }
+    exec_rows = ds.load_snapshot(execute_date.replace("-", ""))
+    exec_map = {
+        str(getattr(r, "symbol", "") or "").strip(): r
+        for r in exec_rows
+        if str(getattr(r, "symbol", "") or "").strip()
+    }
+
+    buy_actions: List[Dict[str, Any]] = []
+    for sym in targets:
+        if sym in held:
+            continue
+        sel = selection_map.get(sym) or {}
+        row = exec_map.get(sym)
+        trade_px = _row_trade_price(row, prefer_open=True)
+        buy_actions.append(
+            {
+                "symbol": sym,
+                "name": sel.get("name") or (str(getattr(row, "name", "") or "") if row else ""),
+                "score": sel.get("score"),
+                "reason": "入选目标池，建议次日开盘买入" if not same_day_fallback else "入选目标池，建议按执行日开盘价买入",
+                "price": round(trade_px, 4) if trade_px > 0 else None,
+                "close": round(float(getattr(row, "close", 0) or 0), 4) if row else None,
+                "change_pct": float(getattr(row, "change_pct", 0) or 0) if row else 0.0,
+                "volume": float(getattr(row, "volume", 0) or 0) if row else 0.0,
+            }
+        )
+
+    sell_actions: List[Dict[str, Any]] = []
+    for sym, pos in held.items():
+        if sym in target_set:
+            continue
+        row = exec_map.get(sym)
+        trade_px = _row_trade_price(row, prefer_open=True)
+        sell_actions.append(
+            {
+                "symbol": sym,
+                "name": str(pos.get("name") or ""),
+                "quantity": int(pos.get("quantity") or 0),
+                "price": round(trade_px, 4) if trade_px > 0 else None,
+                "reason": "不在目标池，建议次日开盘卖出" if not same_day_fallback else "不在目标池，建议按执行日开盘价卖出",
+            }
+        )
+
+    hold_symbols = sorted([sym for sym in held if sym in target_set])
+    trend = (detail.get("trend_analysis") or {}).get("trend")
+    template_name = (detail.get("strategy_template") or {}).get("name") or (detail.get("strategy_template") or {}).get("id")
+    summary = (
+        f"分析日 {sig}，执行日 {execute_date}：趋势判断为 {trend or '未知'}，采用{template_name or '策略模板'}；"
+        f"建议买入 {len(buy_actions)} 只、卖出 {len(sell_actions)} 只、继续持有 {len(hold_symbols)} 只。"
+    )
+    execution_note = (
+        "按执行日开盘价模拟成交（与量化任务口径一致）"
+        if not same_day_fallback
+        else "当前为最新交易日，暂用当日开盘价口径执行"
+    )
+
+    current_positions = [
+        {
+            "symbol": sym,
+            "name": str(pos.get("name") or ""),
+            "quantity": int(pos.get("quantity") or 0),
+            "cost_price": round(float(pos.get("price") or 0), 4),
+        }
+        for sym, pos in sorted(held.items())
+    ]
+
+    return {
+        "ok": True,
+        "signal_date": sig,
+        "execute_date": execute_date,
+        "execution_note": execution_note,
+        "same_day_fallback": same_day_fallback,
+        "analyzed_at": datetime.now(timezone.utc).isoformat(),
+        "strategy_id": sid,
+        "exchange_group": exchange_group,
+        "target_symbols": targets,
+        **detail,
+        "rebalance_actions": {
+            "buy": buy_actions,
+            "sell": sell_actions,
+            "hold": hold_symbols,
+            "blocked": [],
+        },
+        "current_positions": current_positions,
+        "summary": summary,
+    }
+
+
+def plan_analyze_rebalance(
+    *,
+    signal_date: str,
+    symbols: List[str],
+    strategy_id: int | None = None,
+    mode: str = "full_rebalance",
+    target_position_pct: float | None = None,
+    max_single_position_pct: float | None = None,
+    target_symbols: List[str] | None = None,
+    selection_scores: Dict[str, float] | None = None,
+    dry_run: bool = True,
+) -> Dict[str, Any]:
+    """预览或执行分析调仓：次日开盘价口径、总权益仓位、单票上限、先卖后买。"""
+    sig = str(signal_date or "").strip()
+    dates = list_consolidated_trade_dates()
+    if sig not in dates:
+        raise ValueError(f"signal_date 不在可用交易日列表: {sig}")
+
+    execute_date, same_day_fallback = resolve_execute_date(sig)
+    sid = int(strategy_id or 0)
+    if sid <= 0:
+        strategies = list_strategies()
+        if not strategies:
+            raise ValueError("无可用策略")
+        sid = int(strategies[0]["id"])
+
+    strategy = get_strategy(sid)
+    config = parse_strategy_content(strategy.get("content"), strategy.get("type", "formula")) if strategy else None
+    hold_days = int(config.hold_days) if config and config.hold_days else None
+
+    ds = BacktestDataSource()
+    exec_rows = ds.load_snapshot(execute_date.replace("-", ""))
+    if not exec_rows:
+        raise ReplayRiskGateError(f"执行日 {execute_date} 快照缺失", code="paused_data_not_ready")
+    exec_map = {str(getattr(r, "symbol", "") or "").strip(): r for r in exec_rows}
+
+    pool = {str(s).strip() for s in (target_symbols or symbols or []) if str(s).strip()}
+    buy_symbols = [str(s).strip() for s in symbols if str(s).strip()]
+    scores = dict(selection_scores or {})
+    for sym in buy_symbols:
+        scores.setdefault(sym, 0.0)
+
+    rebalance_mode = str(mode or "full_rebalance").strip().lower()
+    sell_preview: List[Dict[str, Any]] = []
+    sell_blocked: List[Dict[str, Any]] = []
+    sold_count = 0
+    sold_ops_payload: List[Dict[str, Any]] = []
+    executed_at = f"{execute_date}T09:30:00"
+
+    if rebalance_mode == "full_rebalance":
+        for pos in get_positions():
+            sym = str(pos.get("symbol") or "").strip()
+            if not sym or sym in pool:
+                continue
+            if hold_days and hold_days > 0:
+                bought_at = str(pos.get("bought_at") or "")[:10]
+                if bought_at:
+                    try:
+                        held_days = (datetime.fromisoformat(execute_date) - datetime.fromisoformat(bought_at)).days
+                        if held_days < hold_days:
+                            sell_blocked.append(
+                                {
+                                    "symbol": sym,
+                                    "side": "SELL",
+                                    "code": "hold_days_not_met",
+                                    "message": f"{sym} 未满足最短持有期 {hold_days} 天",
+                                }
+                            )
+                            continue
+                    except ValueError:
+                        pass
+            px_row = exec_map.get(sym)
+            px = _row_trade_price(px_row, prefer_open=True)
+            if px <= 0:
+                sell_blocked.append(
+                    {"symbol": sym, "side": "SELL", "code": "no_price", "message": f"{sym} 无有效执行价"}
+                )
+                continue
+            tradable = check_open_trade_constraints(
+                side="SELL",
+                symbol=sym,
+                name=str(pos.get("name") or ""),
+                open_price=px,
+                close_price=float(getattr(px_row, "close", 0) or 0) if px_row else 0.0,
+                change_pct=float(getattr(px_row, "change_pct", 0) or 0) if px_row else 0.0,
+                volume=float(getattr(px_row, "volume", 0) or 0) if px_row else 0.0,
+            )
+            qty = int(pos.get("quantity") or 0)
+            item = {
+                "symbol": sym,
+                "name": str(pos.get("name") or ""),
+                "quantity": qty,
+                "price": round(px, 4),
+                "status": "simulated" if tradable.ok else "blocked",
+                "message": tradable.message,
+                "block_code": tradable.code,
+            }
+            if not tradable.ok:
+                sell_blocked.append({"symbol": sym, "side": "SELL", "code": tradable.code, "message": tradable.message})
+                sell_preview.append(item)
+                continue
+            sell_preview.append(item)
+            if dry_run:
+                continue
+            try:
+                sell_position(int(pos["id"]), quantity=qty, price=px, trade_date=execute_date)
+                sold_count += 1
+                sold_ops_payload.append(
+                    {
+                        "symbol": sym,
+                        "side": "SELL",
+                        "price": px,
+                        "quantity": qty,
+                        "at": executed_at,
+                        "remark": "量化分析调仓卖出",
+                        "name": str(pos.get("name") or "").strip(),
+                    }
+                )
+            except ValueError as e:
+                sell_blocked.append({"symbol": sym, "side": "SELL", "code": "t1_blocked", "message": str(e)})
+
+    portfolio = _portfolio_state(ds, execute_date)
+    cash_balance = float(portfolio["cash_balance"])
+    if cash_balance < 100 and not dry_run:
+        raise ReplayRiskGateError(
+            f"账户余额不足（当前 {cash_balance:.2f} 元），最低需 100 元",
+            code="paused_insufficient_balance",
+        )
+
+    risk_budget = {
+        "target_position_pct": target_position_pct if target_position_pct is not None else 1.0,
+        "max_single_position_pct": max_single_position_pct if max_single_position_pct is not None else 1.0,
+    }
+    target_pct, max_single = _parse_risk_budget(risk_budget)
+    buy_budget = _compute_buy_budget(
+        total_equity=portfolio["total_equity"],
+        position_market_value=portfolio["position_market_value"],
+        cash_balance=cash_balance,
+        target_position_pct=target_pct,
+    )
+
+    held = {str(p.get("symbol") or "").strip() for p in get_positions()}
+    pending_buys = [sym for sym in buy_symbols if sym not in held]
+    order_requests: List[OrderRequest] = []
+    name_by_symbol: Dict[str, str] = {}
+    for sym in pending_buys:
+        row = exec_map.get(sym)
+        px = _row_trade_price(row, prefer_open=True)
+        if px <= 0:
+            continue
+        name = str(getattr(row, "name", "") or "")
+        name_by_symbol[sym] = name
+        order_requests.append(
+            OrderRequest(
+                symbol=sym,
+                side="BUY",
+                price=px,
+                quantity=0,
+                name=name,
+                change_pct=float(getattr(row, "change_pct", 0) or 0),
+                volume=float(getattr(row, "volume", 0) or 0),
+                close=float(getattr(row, "close", 0) or 0),
+            )
+        )
+
+    planned, buy_blocked, pruned = allocate_buy_orders(
+        order_requests,
+        budget=buy_budget,
+        total_equity=portfolio["total_equity"],
+        max_single_position_pct=max_single,
+        existing_position_value=portfolio["position_value_by_symbol"],
+        symbol_scores=scores,
+    )
+    buy_preview = [
+        {
+            "symbol": x.symbol,
+            "name": x.name,
+            "quantity": x.quantity,
+            "request_price": x.request_price,
+            "exec_price": x.exec_price,
+            "amount": x.amount,
+            "commission": x.commission,
+            "transfer_fee": x.transfer_fee,
+            "total_cost": x.total_cost,
+            "position_pct": x.position_pct,
+            "score": x.score,
+            "status": x.status,
+            "message": x.message,
+            "block_code": x.block_code,
+        }
+        for x in planned
+    ]
+    blocked_buy_orders = [
+        {
+            "symbol": str(getattr(o, "symbol", "") or ""),
+            "side": "BUY",
+            "price": round(float(getattr(o, "price", 0) or 0), 4),
+            "quantity": 0,
+            "status": str(getattr(o, "status", "") or "blocked"),
+            "message": str(getattr(o, "message", "") or ""),
+            "block_code": str(getattr(o, "block_code", "") or ""),
+        }
+        for o in buy_blocked
+    ]
+    total_buy_cost = round(sum(float(x.get("total_cost") or 0) for x in buy_preview), 2)
+    estimated_cash_after = round(cash_balance - total_buy_cost, 2)
+    if not dry_run and total_buy_cost > cash_balance:
+        raise ReplayRiskGateError(
+            f"本次买入需 {total_buy_cost:.2f} 元，账户余额 {cash_balance:.2f} 元不足",
+            code="paused_insufficient_balance",
+        )
+
+    execution_id: int | None = None
+    bought_count = 0
+    if not dry_run and buy_preview:
+        filled_results = planned_to_order_results(planned)
+        orders_payload = [
+            {
+                "symbol": o.symbol,
+                "side": o.side,
+                "price": o.price,
+                "quantity": o.quantity,
+                "commission": getattr(o, "commission", 0),
+                "transfer_fee": getattr(o, "transfer_fee", 0),
+                "name": name_by_symbol.get(o.symbol, ""),
+            }
+            for o in filled_results
+        ]
+        if orders_payload:
+            add_account_balance(-total_buy_cost)
+            execution_id = create_execution(
+                strategy_id=int(sid),
+                executed_at=executed_at,
+                budget=total_buy_cost,
+                top_n=len(order_requests),
+                orders=orders_payload,
+            )
+            if sold_ops_payload:
+                append_operations_to_execution(execution_id, executed_at, sold_ops_payload)
+            merge_execution_into_positions(orders_payload, executed_at, name_by_symbol=name_by_symbol)
+            bought_count = len(orders_payload)
+
+    planned_buy_count = len(order_requests)
+    fill_rate_pct = round((len(buy_preview) / planned_buy_count) * 100.0, 2) if planned_buy_count > 0 else 0.0
+    execution_note = (
+        "按执行日开盘价模拟成交（与量化任务口径一致）"
+        if not same_day_fallback
+        else "当前为最新交易日，暂用当日开盘价口径执行"
+    )
+    msg = (
+        f"分析调仓{'预览' if dry_run else '执行'}：signal={sig} execute={execute_date} mode={rebalance_mode} "
+        f"卖出{sold_count if not dry_run else len([x for x in sell_preview if x.get('status') == 'simulated'])} "
+        f"买入{len(buy_preview) if dry_run else bought_count} 成本={total_buy_cost:.2f}"
+    )
+    if not dry_run:
+        add_log("INFO", msg)
+
+    return {
+        "ok": dry_run or bought_count > 0 or sold_count > 0,
+        "dry_run": dry_run,
+        "mode": rebalance_mode,
+        "signal_date": sig,
+        "execute_date": execute_date,
+        "execution_note": execution_note,
+        "same_day_fallback": same_day_fallback,
+        "executed_at": executed_at if not dry_run else None,
+        "execution_id": execution_id,
+        "strategy_id": sid,
+        "total_equity": portfolio["total_equity"],
+        "cash_balance": portfolio["cash_balance"],
+        "position_market_value": portfolio["position_market_value"],
+        "buy_budget": buy_budget,
+        "target_position_pct": target_pct,
+        "max_single_position_pct": max_single,
+        "total_buy_cost": total_buy_cost,
+        "estimated_cash_after": estimated_cash_after,
+        "planned_buy_count": planned_buy_count,
+        "bought_count": len(buy_preview) if dry_run else bought_count,
+        "sold_count": len([x for x in sell_preview if x.get("status") == "simulated"]) if dry_run else sold_count,
+        "blocked_count": len(blocked_buy_orders) + len(sell_blocked),
+        "pruned_symbols": pruned,
+        "fill_rate_pct": fill_rate_pct,
+        "account_balance": round(float(get_account_balance() or 0), 2) if not dry_run else portfolio["cash_balance"],
+        "message": msg,
+        "sell_orders": sell_preview,
+        "buy_orders": buy_preview,
+        "blocked_events": sell_blocked + blocked_buy_orders,
+        "orders": buy_preview + blocked_buy_orders,
+    }
+
+
+def preview_analyze_rebalance_plan(**kwargs: Any) -> Dict[str, Any]:
+    return plan_analyze_rebalance(dry_run=True, **kwargs)
+
+
+def execute_analyze_rebalance_plan(**kwargs: Any) -> Dict[str, Any]:
+    result = plan_analyze_rebalance(dry_run=False, **kwargs)
+    if not result.get("ok"):
+        raise ValueError(result.get("message") or "调仓未成交")
+    return result
+
+
+def execute_analyze_buy_plan(
+    *,
+    signal_date: str,
+    symbols: List[str],
+    strategy_id: int | None = None,
+    target_position_pct: float = 1.0,
+    max_single_position_pct: float | None = None,
+    mode: str = "buy_only",
+) -> Dict[str, Any]:
+    """兼容旧接口：默认仅买入。"""
+    return execute_analyze_rebalance_plan(
+        signal_date=signal_date,
+        symbols=symbols,
+        strategy_id=strategy_id,
+        mode=mode,
+        target_position_pct=target_position_pct,
+        max_single_position_pct=max_single_position_pct,
+    )
