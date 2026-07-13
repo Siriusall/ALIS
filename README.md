@@ -97,8 +97,14 @@ cd quantification-main/backend
 ## 文档
 
 - [整体设计文档](docs/ALIS_DESIGN.md)
+- [长线投资系统工程计划书](docs/ALIS长线投资系统工程计划书.md)
+- [计划实现矩阵](docs/PLAN_IMPLEMENTATION_MATRIX.md)
+- [实现冲突记录](docs/IMPLEMENTATION_CONFLICTS.md)
 - [主量化系统说明](quantification-main/README.md)
-- [因子系统说明](news/README.md)
+
+## 项目对话记录
+
+- [整理版对话记录](docs/conversations/ALIS项目对话记录-2026-07-13.md)
 
 ## 注意
 
