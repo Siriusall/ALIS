@@ -23,6 +23,19 @@ def _current_user_id(credentials: HTTPAuthorizationCredentials | None = None) ->
         return None
 
 
+def require_current_user(
+    credentials: HTTPAuthorizationCredentials | None = Depends(security),
+) -> dict:
+    """Resolve the bearer token and reject unauthenticated business calls."""
+    uid = _current_user_id(credentials)
+    if not uid:
+        raise HTTPException(status_code=401, detail="登录状态无效或已过期")
+    user = get_user_by_id(uid)
+    if not user:
+        raise HTTPException(status_code=401, detail="用户不存在")
+    return user
+
+
 @router.post("/auth/register", response_model=TokenResponse)
 def register(body: UserRegister) -> TokenResponse:
     """注册新用户，成功后返回 token 与用户信息。"""
@@ -49,15 +62,9 @@ def login(body: UserLogin) -> TokenResponse:
     )
 
 
-@router.get("/auth/me", response_model=UserResponse | None)
-def me(credentials: HTTPAuthorizationCredentials | None = Depends(security)) -> UserResponse | None:
-    """获取当前登录用户，未登录返回 null。"""
-    uid = _current_user_id(credentials)
-    if not uid:
-        return None
-    user = get_user_by_id(uid)
-    if not user:
-        return None
+@router.get("/auth/me", response_model=UserResponse)
+def me(user: dict = Depends(require_current_user)) -> UserResponse:
+    """Return the current user or an explicit 401 for an invalid session."""
     return UserResponse(id=user["id"], username=user["username"], created_at=user.get("created_at"))
 
 

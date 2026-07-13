@@ -81,17 +81,29 @@ def write_init_status(data: Dict[str, Any]) -> None:
     payload = dict(data or {})
     payload["updated_at"] = datetime.now().isoformat(timespec="seconds")
     try:
-        _init_status_file().write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        from app.data_platform.db import _conn
+        with _conn() as conn:
+            conn.execute(
+                """INSERT INTO dc_app_state (state_key,payload_json,updated_at) VALUES (?,?,?)
+                   ON CONFLICT(state_key) DO UPDATE SET payload_json=excluded.payload_json,updated_at=excluded.updated_at""",
+                ("market_data_init_status", json.dumps(payload, ensure_ascii=False), payload["updated_at"]),
+            )
     except Exception as e:  # noqa: BLE001
         logger.warning("cache_consolidation: 写入 init_status 失败 %s", str(e)[:120])
 
 
 def read_init_status() -> Dict[str, Any]:
-    p = _init_status_file()
-    if not p.exists():
+    try:
+        from app.data_platform.db import _conn
+        with _conn() as conn:
+            row = conn.execute(
+                "SELECT payload_json FROM dc_app_state WHERE state_key=?", ("market_data_init_status",)
+            ).fetchone()
+        raw = json.loads(str(dict(row).get("payload_json") or "{}")) if row else {}
+        return raw if isinstance(raw, dict) else {}
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("cache_consolidation: PostgreSQL init status read failed %s", str(exc)[:120])
         return {}
-    raw = _load_json(p)
-    return raw if isinstance(raw, dict) else {}
 
 
 def is_strict_first_load_enabled() -> bool:
@@ -880,6 +892,14 @@ def trigger_backfill_merge_meta_async(reason: str = "", force: bool = False) -> 
     - 若已有任务在跑，返回 started=False, running=True
     - 否则启动后台线程并返回 started=True
     """
+    return {
+        "started": False,
+        "running": False,
+        "storage": "postgresql",
+        "reason": reason,
+        "message": "No file-cache metadata backfill is required.",
+    }
+
     global _meta_backfill_running
     with _meta_backfill_lock:
         if _meta_backfill_running:
@@ -933,6 +953,53 @@ def _apply_symbol_filter(payload: Dict[str, Any], symbols: Optional[List[str]]) 
     return out
 
 
+def _read_consolidated_postgres(date_ymd: str, symbols: Optional[List[str]]) -> Optional[Dict[str, Any]]:
+    """Build the all-in-one compatibility payload from PostgreSQL snapshots."""
+    try:
+        from app.data_platform.db import _conn
+        with _conn() as conn:
+            if not date_ymd:
+                row = conn.execute("SELECT MAX(trade_date) AS trade_date FROM dc_stock_daily_snapshot").fetchone()
+                date_ymd = str(dict(row).get("trade_date") or "") if row else ""
+            if not date_ymd:
+                return None
+            rows = conn.execute(
+                """SELECT symbol,name,close,change_pct,volume,turnover,total_mv,circ_mv,pe_ttm,pb,
+                          turnover_rate,is_suspended,up_limit,down_limit,data_quality_score
+                   FROM dc_stock_daily_snapshot WHERE trade_date=? ORDER BY symbol""",
+                (date_ymd,),
+            ).fetchall()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("PostgreSQL all-in-one read failed: %s", str(exc)[:160])
+        return None
+    wanted = {_normalize_symbol(item) for item in (symbols or []) if _normalize_symbol(item)}
+    day: Dict[str, Dict[str, Any]] = {}
+    for raw in rows:
+        item = dict(raw)
+        symbol = _normalize_symbol(str(item.get("symbol") or ""))
+        if not symbol or (wanted and symbol not in wanted):
+            continue
+        row = {
+            "trade_date": date_ymd, "symbol": symbol, "name": str(item.get("name") or ""),
+            "price": float(item.get("close") or 0), "close": float(item.get("close") or 0),
+            "change_pct": float(item.get("change_pct") or 0), "volume": float(item.get("volume") or 0),
+            "turnover": float(item.get("turnover") or 0), "float_mv": float(item.get("circ_mv") or 0),
+            "total_mv": float(item.get("total_mv") or 0), "pe_ttm": float(item.get("pe_ttm") or 0),
+            "pb": float(item.get("pb") or 0), "turnover_rate": float(item.get("turnover_rate") or 0),
+            "is_suspended": bool(item.get("is_suspended")), "up_limit": float(item.get("up_limit") or 0),
+            "down_limit": float(item.get("down_limit") or 0), "data_quality_score": float(item.get("data_quality_score") or 0),
+        }
+        day[symbol] = row
+    if not day:
+        return None
+    data = {date_ymd: day}
+    return {
+        "schema_version": "postgresql-1", "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "trade_date": date_ymd, "counts": {"dates": 1, "symbol_rows": len(day)},
+        "factor_coverage": compute_factor_coverage(data), "data": data,
+    }
+
+
 def read_consolidated_cache(date: Optional[str] = None, symbols: Optional[List[str]] = None) -> Optional[Dict[str, Any]]:
     """
     读取合并缓存：
@@ -940,6 +1007,12 @@ def read_consolidated_cache(date: Optional[str] = None, symbols: Optional[List[s
     - 可选 symbols 过滤
     """
     date_ymd = _normalize_ymd(date or "")
+    postgres_payload = _read_consolidated_postgres(date_ymd, symbols)
+    if postgres_payload is not None:
+        return postgres_payload
+    # Production is PostgreSQL-only.  Legacy cache bundles must never become
+    # an implicit alternate source of truth when a historical day is absent.
+    return None
     payload: Optional[Dict[str, Any]] = None
     if date_ymd:
         day_file = _bundle_dir() / f"{date_ymd}.json"
@@ -974,7 +1047,16 @@ def has_consolidated_for_date(date_ymd: str) -> bool:
     ymd = _normalize_ymd(date_ymd)
     if not ymd:
         return False
-    return _consolidated_day_file(ymd).exists()
+    try:
+        from app.data_platform.db import _conn
+        with _conn() as conn:
+            row = conn.execute(
+                "SELECT 1 AS found FROM dc_stock_daily_snapshot WHERE trade_date=? LIMIT 1", (ymd,)
+            ).fetchone()
+        return row is not None
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("PostgreSQL consolidated-date check failed: %s", str(exc)[:120])
+        return False
 
 
 def _latest_source_mtime_for_date(date_ymd: str) -> Optional[float]:
@@ -1087,7 +1169,19 @@ def list_daily_cache_trade_dates() -> List[str]:
 
 def list_available_trade_dates() -> List[str]:
     """可用于合并/量化任务的交易日：已落盘 all-in-one + daily 可展开日期。"""
-    return sorted(set(list_materialized_all_in_one_dates()) | set(list_daily_cache_trade_dates()))
+    try:
+        from app.data_platform.db import _conn
+        with _conn() as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT trade_date FROM dc_tushare_raw_records WHERE api_name='daily' ORDER BY trade_date"
+            ).fetchall()
+        return [
+            value for value in (str(dict(row).get("trade_date") or "") for row in rows)
+            if _normalize_ymd(value)
+        ]
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("PostgreSQL available-trade-dates read failed: %s", str(exc)[:120])
+        return []
 
 
 def _collect_available_dates() -> List[str]:

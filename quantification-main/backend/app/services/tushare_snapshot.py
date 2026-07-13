@@ -27,6 +27,7 @@ except Exception:  # pragma: no cover - 运行环境未安装 redis 时兜底
     redis = None
 
 from app.core.trade_calendar import get_last_trade_date, get_last_trade_date_str
+from app.data_platform.db import _conn
 from app.integrations.tushare_client import get_tushare_client
 
 logger = logging.getLogger("quant.tushare_snapshot")
@@ -236,6 +237,44 @@ def _load_snapshot_from_disk(trade_date: str) -> Optional[Dict[str, DailySnapsho
     p = _snapshot_cache_file(trade_date)
     if not p.exists():
         return None
+
+
+def _load_snapshot_from_postgres(trade_date: str) -> Optional[Dict[str, DailySnapshotRow]]:
+    """Read the normalized daily snapshot from PostgreSQL, our durable store."""
+    try:
+        with _conn() as conn:
+            rows = conn.execute(
+                """SELECT ts_code,trade_date,symbol,name,close,total_mv,circ_mv,turnover_rate,
+                          pe_ttm,pb,is_suspended,up_limit,down_limit
+                   FROM dc_stock_daily_snapshot WHERE trade_date=?""",
+                (trade_date,),
+            ).fetchall()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("PostgreSQL snapshot read failed trade_date=%s: %s", trade_date, str(exc)[:160])
+        return None
+    if not rows:
+        return None
+    out: Dict[str, DailySnapshotRow] = {}
+    for raw in rows:
+        row = dict(raw)
+        symbol = _normalize_symbol_from_ts_code(str(row.get("symbol") or row.get("ts_code") or ""))
+        if not symbol:
+            continue
+        close = float(row.get("close") or 0)
+        up_limit = float(row.get("up_limit") or 0)
+        down_limit = float(row.get("down_limit") or 0)
+        item = DailySnapshotRow(
+            trade_date=str(row.get("trade_date") or trade_date), ts_code=str(row.get("ts_code") or ""),
+            symbol=symbol, name=str(row.get("name") or ""), close=close,
+            total_mv=float(row.get("total_mv") or 0), float_mv=float(row.get("circ_mv") or 0),
+            turnover_rate=float(row.get("turnover_rate") or 0), pe_ttm=float(row.get("pe_ttm") or 0),
+            pb=float(row.get("pb") or 0), is_st=_infer_is_st(str(row.get("name") or "")),
+            is_suspended=bool(row.get("is_suspended")),
+            is_limit_up=up_limit > 0 and close >= up_limit * 0.9999,
+            is_limit_down=down_limit > 0 and close <= down_limit * 1.0001,
+        )
+        out[symbol] = item
+    return out or None
     try:
         payload = json.loads(p.read_text(encoding="utf-8"))
         rows = payload.get("rows") if isinstance(payload, dict) else None
@@ -447,6 +486,10 @@ def get_daily_snapshot(
         # 仅缓存模式：只读内存/Redis/磁盘，无缓存则返回 {}，不请求 TuShare。
         if trade_date in _snapshot_cache:
             return _snapshot_cache[trade_date]
+        postgres_cached = _load_snapshot_from_postgres(trade_date)
+        if postgres_cached is not None:
+            _snapshot_cache[trade_date] = postgres_cached
+            return postgres_cached
         redis_cached = _load_snapshot_from_redis(trade_date)
         if redis_cached is not None:
             _snapshot_cache[trade_date] = redis_cached
@@ -468,6 +511,10 @@ def get_daily_snapshot(
             return _snapshot_cache.get(trade_date, {})
         if trade_date in _snapshot_cache:
             return _snapshot_cache[trade_date]
+        postgres_cached = _load_snapshot_from_postgres(trade_date)
+        if postgres_cached is not None:
+            _snapshot_cache[trade_date] = postgres_cached
+            return postgres_cached
         redis_cached = _load_snapshot_from_redis(trade_date)
         if redis_cached is not None:
             _snapshot_cache[trade_date] = redis_cached
@@ -481,6 +528,10 @@ def get_daily_snapshot(
         if not force_refresh:
             if trade_date in _snapshot_cache:
                 return _snapshot_cache[trade_date]
+            postgres_cached = _load_snapshot_from_postgres(trade_date)
+            if postgres_cached is not None:
+                _snapshot_cache[trade_date] = postgres_cached
+                return postgres_cached
             redis_cached = _load_snapshot_from_redis(trade_date)
             if redis_cached is not None:
                 _snapshot_cache[trade_date] = redis_cached

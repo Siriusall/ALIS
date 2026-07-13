@@ -8,26 +8,31 @@ if (-not (Test-Path $backendDir)) {
   throw "backend directory not found: $backendDir"
 }
 
-try {
-  $pythonVersion = py -3.11 --version 2>&1
-} catch {
-  throw "Python 3.11 is required. Install Python 3.11, then rerun: npm run install:backend"
-}
-
-Write-Host "Using $pythonVersion" -ForegroundColor Cyan
 Set-Location $backendDir
 
 if (-not (Test-Path $venvPython)) {
   Write-Host "Creating backend virtual environment with Python 3.11..." -ForegroundColor Yellow
-  py -3.11 -m venv .venv
+  $uv = Get-Command uv -ErrorAction SilentlyContinue
+  if ($uv) {
+    & $uv.Source venv --python 3.11 .venv
+  } else {
+    try {
+      py -3.11 -m venv .venv
+    } catch {
+      throw "Python 3.11 or uv is required. Install one, then rerun: npm run install:backend"
+    }
+  }
 }
 
 Write-Host "Installing backend dependencies..." -ForegroundColor Cyan
-& $venvPython -m pip install --upgrade pip
-if ($LASTEXITCODE -ne 0) {
-  throw "pip upgrade failed with exit code $LASTEXITCODE"
+$uv = Get-Command uv -ErrorAction SilentlyContinue
+if ($uv) {
+  & $uv.Source pip install --python $venvPython -r requirements.txt
+} else {
+  & $venvPython -m ensurepip --upgrade
+  & $venvPython -m pip install --upgrade pip
+  & $venvPython -m pip install -r requirements.txt
 }
-& $venvPython -m pip install -r requirements.txt
 if ($LASTEXITCODE -ne 0) {
   throw "backend dependency installation failed with exit code $LASTEXITCODE"
 }

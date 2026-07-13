@@ -42,6 +42,16 @@ EVENT_HALF_LIFE_DAYS = {
     "capital_operation": 60,
 }
 
+INDUSTRY_METRIC_HINTS = {
+    "demand_orders_sales": ("需求", "订单", "销量", "销售", "出货"),
+    "product_price": ("价格", "售价", "价差"),
+    "inventory_cycle": ("库存", "库销"),
+    "capacity_utilization": ("产能", "开工", "利用率"),
+    "profit_diffusion": ("利润", "毛利", "盈利"),
+    "policy_supply": ("政策", "供给", "产量"),
+    "industry_valuation": ("估值", "市盈", "市净"),
+}
+
 
 def _clip(value: Any, low: float = 0, high: float = 100) -> float:
     try:
@@ -78,6 +88,45 @@ def score_industry(observations: dict[str, Any], *, prior_score: float | None = 
     }
 
 
+def _metric_component(definition: dict[str, Any]) -> str | None:
+    text = " ".join(str(definition.get(key) or "") for key in ("metric_code", "metric_name", "description"))
+    return next((component for component, hints in INDUSTRY_METRIC_HINTS.items() if any(hint in text for hint in hints)), None)
+
+
+def _metric_signal(definition: dict[str, Any], values: list[dict[str, Any]]) -> float | None:
+    numeric = []
+    for row in reversed(values):
+        try:
+            numeric.append(float(row.get("value")))
+        except (TypeError, ValueError):
+            continue
+    if len(numeric) < 3:
+        return None
+    baseline = sum(numeric[:-1]) / len(numeric[:-1])
+    scale = max(abs(baseline), max(numeric) - min(numeric), 1e-9)
+    change = (numeric[-1] - baseline) / scale
+    component = _metric_component(definition)
+    inverse = component in {"inventory_cycle", "industry_valuation"}
+    normalized = 50 - change * 50 if inverse else 50 + change * 50
+    return _clip(normalized)
+
+
+def _industry_state_from_series(series: list[dict[str, Any]]) -> tuple[dict[str, Any], dict[str, Any]]:
+    grouped: dict[str, list[float]] = {}
+    evidence: dict[str, list[dict[str, Any]]] = {}
+    history_points = 0
+    for item in series:
+        definition, values = item["definition"], item["values"]
+        history_points += len(values)
+        component = _metric_component(definition)
+        signal = _metric_signal(definition, values)
+        if component and signal is not None:
+            grouped.setdefault(component, []).append(signal)
+            evidence.setdefault(component, []).append({"metric_code": definition.get("metric_code"), "metric_name": definition.get("metric_name"), "latest_date": values[0].get("data_date") if values else None, "points": len(values), "signal": round(signal, 4)})
+    observations = {key: sum(values) / len(values) for key, values in grouped.items()}
+    return score_industry(observations, history_points=history_points), evidence
+
+
 def list_industries() -> dict[str, Any]:
     with _conn() as c:
         definitions = [dict(row) for row in c.execute(
@@ -86,15 +135,55 @@ def list_industries() -> dict[str, Any]:
                GROUP BY d.metric_code,d.industry_code,d.industry_name,d.metric_name,d.unit,d.frequency,d.source_code,d.description,d.created_at,d.updated_at
                ORDER BY d.industry_name,d.metric_name"""
         ).fetchall()]
+        values = [dict(row) for row in c.execute(
+            """SELECT * FROM (
+                   SELECT v.*, ROW_NUMBER() OVER (
+                       PARTITION BY v.metric_code ORDER BY v.data_date DESC
+                   ) AS row_num
+                   FROM dc_industry_metric_value v
+               ) ranked WHERE row_num <= 60
+               ORDER BY metric_code,data_date DESC"""
+        ).fetchall()]
+        company_rows = [dict(row) for row in c.execute(
+            """SELECT industry,ts_code,name FROM dc_stock_master
+               WHERE COALESCE(industry,'')<>'' ORDER BY industry,ts_code"""
+        ).fetchall()]
+    values_by_metric: dict[str, list[dict[str, Any]]] = {}
+    for value in values:
+        value.pop("row_num", None)
+        values_by_metric.setdefault(str(value.get("metric_code") or ""), []).append(value)
     grouped: dict[str, dict[str, Any]] = {}
     for item in definitions:
         key = str(item.get("industry_code") or item.get("industry_name") or "unknown")
         group = grouped.setdefault(key, {"industry_code": key, "industry_name": item.get("industry_name"), "metrics": [], "total_evidence_points": 0})
         group["metrics"].append(item)
         group["total_evidence_points"] += int(item.get("value_count") or 0)
+    companies_by_industry: dict[str, list[dict[str, str]]] = {}
+    for company in company_rows:
+        industry = str(company.get("industry") or "").strip()
+        if industry:
+            companies_by_industry.setdefault(industry, []).append({
+                "ts_code": str(company.get("ts_code") or ""),
+                "name": str(company.get("name") or ""),
+            })
+    known_names = {str(item.get("industry_name") or "").strip() for item in grouped.values()}
+    for industry_name in companies_by_industry:
+        if industry_name not in known_names:
+            key = f"master:{industry_name}"
+            grouped[key] = {"industry_code": key, "industry_name": industry_name, "metrics": [], "total_evidence_points": 0}
     for group in grouped.values():
-        group["state"] = score_industry({}, history_points=group["total_evidence_points"])
-        group["limitations"] = ["指标方向和七类景气分量尚未建立映射"] if group["metrics"] else ["无行业指标"]
+        series = [
+            {"definition": definition, "values": values_by_metric.get(str(definition.get("metric_code") or ""), [])}
+            for definition in group["metrics"]
+        ]
+        state, evidence = _industry_state_from_series(series)
+        unmapped = [x["definition"].get("metric_name") for x in series if not _metric_component(x["definition"])]
+        group["state"] = state
+        group["evidence"] = evidence
+        members = companies_by_industry.get(str(group.get("industry_name") or "").strip(), [])
+        group["company_count"] = len(members)
+        group["companies"] = members[:20]
+        group["limitations"] = [f"{len(unmapped)}个指标未映射，只展示事实"] if unmapped else []
     return {"ok": True, "items": list(grouped.values()), "count": len(grouped)}
 
 
@@ -105,7 +194,9 @@ def industry_detail(industry_code: str) -> dict[str, Any]:
         for definition in definitions:
             values = [dict(row) for row in c.execute("SELECT * FROM dc_industry_metric_value WHERE metric_code=? ORDER BY data_date DESC LIMIT 60", (definition["metric_code"],)).fetchall()]
             series.append({"definition": definition, "values": values})
-    return {"ok": bool(definitions), "industry_code": industry_code, "series": series, "state": score_industry({}, history_points=sum(len(x["values"]) for x in series)), "limitations": ["未映射的指标只展示事实，不参与景气得分"]}
+    state, evidence = _industry_state_from_series(series)
+    unmapped = [x["definition"].get("metric_name") for x in series if not _metric_component(x["definition"])]
+    return {"ok": bool(definitions), "industry_code": industry_code, "series": series, "state": state, "evidence": evidence, "limitations": [f"{len(unmapped)}个指标未映射，只展示事实"] if unmapped else []}
 
 
 def _days_since(value: str) -> int:
@@ -158,9 +249,57 @@ def list_events(*, ts_code: str = "", limit: int = 100) -> dict[str, Any]:
                 {where} ORDER BY COALESCE(NULLIF(e.event_date,''),r.publish_time) DESC,e.id DESC LIMIT ?""",
             tuple(params + [limit]),
         ).fetchall()]
+    try:
+        from app.services.thesis_store import list_theses
+        thesis_by_code = {str(x.get("ts_code") or ""): x for x in list_theses(limit=500)}
+    except Exception:
+        thesis_by_code = {}
     for item in rows:
         item["entities"] = json.loads(item.pop("entities_json") or "[]")
         item["metrics"] = json.loads(item.pop("metrics_json") or "{}")
         item["evidence"] = {"title": item.get("title"), "url": item.get("url"), "available_time": item.get("available_time"), "excerpt": str(item.pop("raw_text", "") or "")[:240]}
         item["impact"] = score_event(item)
+        thesis = thesis_by_code.get(str(item.get("ts_code") or ""))
+        decayed = float(item["impact"].get("decayed_score") or 0)
+        item["thesis_link"] = {"thesis_id": thesis.get("id"), "title": thesis.get("title"), "status": thesis.get("derived_status")} if thesis else None
+        item["follow_up"] = {
+            "status": "urgent" if item.get("impact_direction") == "negative" and decayed >= 60 else "monitor" if decayed >= 25 else "expired",
+            "next_action": "立即复核投资逻辑必要条件" if item.get("impact_direction") == "negative" and decayed >= 60 else "下个披露节点复核" if decayed >= 25 else "保留历史证据",
+            "requires_thesis_review": bool(thesis and item.get("impact_direction") == "negative" and decayed >= 40),
+        }
     return {"ok": True, "items": rows, "count": len(rows)}
+
+
+def review_linked_event_theses(*, limit: int = 100) -> dict[str, Any]:
+    """Recheck only theses hit by actionable negative announcement events.
+
+    Announcement ingestion remains evidence-only.  This explicit action is the
+    controlled bridge into investment logic: it records the existing
+    point-in-time research review without treating a keyword classifier as an
+    automatic thesis invalidation.
+    """
+    events = list_events(limit=limit).get("items", [])
+    candidates: dict[int, dict[str, Any]] = {}
+    for event in events:
+        link = event.get("thesis_link") or {}
+        thesis_id = link.get("thesis_id") if isinstance(link, dict) else None
+        if thesis_id and bool((event.get("follow_up") or {}).get("requires_thesis_review")):
+            candidates[int(thesis_id)] = event
+    from app.services.thesis_store import review_thesis
+
+    reviewed, failed = [], []
+    for thesis_id, event in candidates.items():
+        try:
+            thesis = review_thesis(thesis_id)
+            if thesis:
+                reviewed.append({
+                    "thesis_id": thesis_id,
+                    "ts_code": thesis.get("ts_code"),
+                    "event_id": event.get("id"),
+                    "event_type": event.get("event_type"),
+                    "status": thesis.get("derived_status"),
+                    "confidence": thesis.get("derived_confidence"),
+                })
+        except Exception as exc:  # noqa: BLE001
+            failed.append({"thesis_id": thesis_id, "event_id": event.get("id"), "error": str(exc)[:200]})
+    return {"ok": not failed, "candidates": len(candidates), "reviewed": reviewed, "failed": failed}

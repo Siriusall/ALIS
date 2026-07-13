@@ -5,6 +5,10 @@ import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
 
+from app.core.project_env import load_project_env
+
+load_project_env()
+
 DB_PATH = Path(os.getenv("DATA_PLATFORM_DB_PATH", str(Path(__file__).resolve().parents[1] / "data" / "data-platform.db")))
 
 SCHEMA_SQL = r"""CREATE TABLE data_ingestion_runs (
@@ -98,6 +102,9 @@ CREATE TABLE dc_stock_daily_snapshot (
             name TEXT NOT NULL DEFAULT '',
             industry TEXT NOT NULL DEFAULT '',
             close REAL,
+            change_pct REAL,
+            volume REAL,
+            turnover REAL,
             total_mv REAL,
             circ_mv REAL,
             pe_ttm REAL,
@@ -208,6 +215,11 @@ CREATE TABLE dc_market_context_snapshot (
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
+CREATE TABLE dc_app_state (
+            state_key TEXT PRIMARY KEY,
+            payload_json TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
 CREATE TABLE tushare_api_catalog (
             api_name TEXT PRIMARY KEY,
             category TEXT NOT NULL,
@@ -245,6 +257,7 @@ CREATE INDEX idx_dc_snapshot_date ON dc_stock_daily_snapshot (trade_date);
 CREATE INDEX idx_dc_snapshot_symbol ON dc_stock_daily_snapshot (symbol);
 CREATE INDEX idx_dc_snapshot_date_symbol ON dc_stock_daily_snapshot (trade_date, symbol);
 CREATE INDEX idx_dc_market_context_state ON dc_market_context_snapshot (market_state,trade_date);
+CREATE INDEX idx_dc_app_state_updated ON dc_app_state (updated_at);
 CREATE INDEX idx_dc_stock_industry ON dc_stock_master (industry);
 CREATE INDEX idx_dc_stock_symbol ON dc_stock_master (symbol);
 CREATE INDEX idx_dc_stock_ts_code ON dc_stock_master (ts_code);
@@ -300,7 +313,7 @@ def _is_postgres() -> bool:
         return False
     value = os.getenv(
         "DATA_PLATFORM_DATABASE_URL",
-        "postgresql://sirius@127.0.0.1:5432/alis_data",
+        "postgresql://alis_app@127.0.0.1:5432/alis_data",
     ).strip().lower()
     return value.startswith(("postgresql://", "postgres://", "postgresql+psycopg://"))
 
@@ -312,11 +325,15 @@ def _conn():
         from psycopg.rows import dict_row
         url = os.getenv(
             "DATA_PLATFORM_DATABASE_URL",
-            "postgresql://sirius@127.0.0.1:5432/alis_data",
+            "postgresql://alis_app@127.0.0.1:5432/alis_data",
         )
         if url.startswith("postgresql+psycopg://"):
             url = url.replace("postgresql+psycopg://", "postgresql://", 1)
-        raw = psycopg.connect(url, row_factory=dict_row)
+        raw = psycopg.connect(
+            url,
+            row_factory=dict_row,
+            connect_timeout=int(os.getenv("DATABASE_CONNECT_TIMEOUT_SECONDS", "5")),
+        )
         try:
             conn = Connection(raw, is_postgres=True)
             yield conn
@@ -340,11 +357,13 @@ def _conn():
 def init_db() -> None:
     with _conn() as conn:
         if _is_postgres():
-            # PostgreSQL is populated by the explicit SQLite migration tool;
-            # do not silently create a second, incomplete schema at startup.
-            # A copied table can contain ids far ahead of its SERIAL sequence.
-            # Keep every migrated sequence aligned so inserts cannot reuse an
-            # existing primary key after a restart.
+            schema = SCHEMA_SQL.replace(
+                "INTEGER PRIMARY KEY AUTOINCREMENT", "BIGSERIAL PRIMARY KEY"
+            )
+            schema = schema.replace("CREATE TABLE ", "CREATE TABLE IF NOT EXISTS ")
+            schema = schema.replace("CREATE INDEX ", "CREATE INDEX IF NOT EXISTS ")
+            conn.executescript(schema)
+            # Keep migrated sequences aligned so inserts cannot reuse an id.
             serial_tables = (
                 "data_ingestion_runs",
                 "dc_announcement_event",
@@ -372,7 +391,19 @@ def init_db() -> None:
                 model_version VARCHAR(64) NOT NULL, available_time VARCHAR(64) NOT NULL,
                 created_at VARCHAR(64) NOT NULL, updated_at VARCHAR(64) NOT NULL)""")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_dc_market_context_state ON dc_market_context_snapshot (market_state,trade_date)")
+            for column in ("change_pct", "volume", "turnover"):
+                conn.execute(f"ALTER TABLE dc_stock_daily_snapshot ADD COLUMN IF NOT EXISTS {column} DOUBLE PRECISION")
             return
         schema = SCHEMA_SQL.replace("CREATE TABLE ", "CREATE TABLE IF NOT EXISTS ")
         schema = schema.replace("CREATE INDEX ", "CREATE INDEX IF NOT EXISTS ")
         conn.executescript(schema)
+
+
+def database_health() -> dict[str, Any]:
+    """Run a cheap readiness probe against the data-platform database."""
+    try:
+        with _conn() as conn:
+            conn.execute("SELECT 1").fetchone()
+        return {"status": "ok", "engine": "postgresql"}
+    except Exception as exc:  # noqa: BLE001
+        return {"status": "error", "error": str(exc)[:200]}

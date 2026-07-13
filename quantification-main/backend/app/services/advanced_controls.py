@@ -1,0 +1,87 @@
+"""Plan-book controls that are deterministic, explainable and testable."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import math
+from datetime import datetime
+from statistics import quantiles
+from typing import Any
+
+
+def black_litterman_weights(
+    prior_weights: dict[str, float], views: dict[str, float], confidences: dict[str, float] | None = None,
+    *, max_weight: float = 0.25,
+) -> dict[str, Any]:
+    """A transparent diagonal BL posterior for portfolio views.
+
+    ``views`` are active-return views in weight space; confidence blends each
+    view with the market prior.  The result is capped and renormalized, with
+    every adjustment returned for audit.  A full covariance posterior can be
+    layered on later without changing the contract.
+    """
+    keys = sorted(set(prior_weights) | set(views))
+    if not keys:
+        return {"weights": {}, "adjustments": {}, "method": "black_litterman_diagonal_v1"}
+    prior = {k: max(0.0, float(prior_weights.get(k, 0) or 0)) for k in keys}
+    total = sum(prior.values()) or 1.0
+    prior = {k: v / total for k, v in prior.items()}
+    conf = confidences or {}
+    raw = {}
+    for key in keys:
+        c = max(0.0, min(1.0, float(conf.get(key, 0) or 0)))
+        view = float(views.get(key, 0) or 0)
+        raw[key] = max(0.0, prior[key] + c * view)
+    capped = {k: min(max(0.0, float(max_weight)), v) for k, v in raw.items()}
+    total = sum(capped.values()) or 1.0
+    weights = {k: round(v / total, 8) for k, v in capped.items()}
+    return {"weights": weights, "prior_weights": prior, "adjustments": {k: round(weights[k] - prior[k], 8) for k in keys}, "method": "black_litterman_diagonal_v1", "max_weight": max_weight}
+
+
+def bayesian_update(prior: float, evidence: list[dict[str, Any]]) -> dict[str, Any]:
+    """Update a thesis probability from explicit likelihood ratios."""
+    probability = max(1e-6, min(1 - 1e-6, float(prior)))
+    applied = []
+    for item in evidence:
+        ratio = float(item.get("likelihood_ratio", 1.0) or 1.0)
+        if not math.isfinite(ratio) or ratio <= 0:
+            continue
+        odds = probability / (1 - probability)
+        odds *= ratio
+        probability = odds / (1 + odds)
+        applied.append({"source": item.get("source"), "likelihood_ratio": ratio, "checked_at": item.get("checked_at") or datetime.now().isoformat(timespec="seconds")})
+    return {"prior": float(prior), "posterior": round(probability, 8), "evidence_applied": applied, "method": "bayes_odds_update_v1"}
+
+
+def trade_attribution(*, entry_price: float, exit_price: float, quantity: float, benchmark_return: float = 0.0, industry_return: float = 0.0, execution_cost: float = 0.0) -> dict[str, Any]:
+    gross = (float(exit_price) - float(entry_price)) * float(quantity)
+    capital = max(1e-9, float(entry_price) * float(quantity))
+    total_return = (float(exit_price) / float(entry_price) - 1.0) if float(entry_price) else 0.0
+    return {"gross_pnl": round(gross, 4), "total_return": round(total_return, 8), "market_attribution": round(float(benchmark_return) * capital, 4), "industry_attribution": round((float(industry_return) - float(benchmark_return)) * capital, 4), "selection_attribution": round((total_return - float(industry_return)) * capital, 4), "execution_attribution": round(-float(execution_cost), 4), "method": "single_lot_brinson_proxy_v1", "limitations": ["需要真实成交批次和基准/行业同步价格才能作为正式归因"]}
+
+
+def evaluate_slo(samples: list[dict[str, Any]], *, freshness_seconds: float = 86400.0, success_target: float = .99) -> dict[str, Any]:
+    latencies = sorted(float(x.get("latency_ms", 0) or 0) for x in samples if x.get("latency_ms") is not None)
+    successes = sum(1 for x in samples if str(x.get("status") or "").lower() in {"ok", "success", "ready"})
+    fresh = sum(1 for x in samples if float(x.get("freshness_seconds", 0) or 0) <= freshness_seconds)
+    n = len(samples)
+    p95 = latencies[min(len(latencies) - 1, max(0, math.ceil(len(latencies) * .95) - 1))] if latencies else 0.0
+    success_rate = successes / n if n else 0.0
+    freshness_rate = fresh / n if n else 0.0
+    return {"sample_count": n, "success_rate": round(success_rate, 6), "freshness_rate": round(freshness_rate, 6), "p95_latency_ms": round(p95, 3), "status": "ready" if n and success_rate >= success_target and freshness_rate >= success_target else "degraded" if n else "unknown", "targets": {"success_rate": success_target, "freshness_rate": success_target, "freshness_seconds": freshness_seconds}}
+
+
+def multi_period_oos_report(periods: list[dict[str, Any]]) -> dict[str, Any]:
+    """Aggregate fixed-period out-of-sample reports without hiding failures."""
+    normalized = []
+    for item in periods:
+        normalized.append({"period": item.get("period"), "horizon": item.get("horizon"), "holdout_lift": float(item.get("holdout_lift", 0) or 0), "walk_forward_lift": float(item.get("walk_forward_lift", 0) or 0), "observations": int(item.get("observations", 0) or 0)})
+    passed = [x for x in normalized if x["observations"] > 0 and x["holdout_lift"] > 0 and x["walk_forward_lift"] > 0]
+    return {"periods": normalized, "period_count": len(normalized), "passed_count": len(passed), "status": "passed" if normalized and len(passed) == len(normalized) else "failed" if normalized else "insufficient_data", "method": "fixed_multi_period_oos_v1", "requires_all_periods_pass": True}
+
+
+def freeze_evidence(payload: dict[str, Any], *, schema_version: str = "evidence_freeze_v1") -> dict[str, Any]:
+    canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return {"schema_version": schema_version, "evidence_hash": digest, "frozen_at": datetime.now().isoformat(timespec="seconds"), "payload": payload}

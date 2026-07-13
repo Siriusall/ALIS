@@ -16,6 +16,7 @@ import time
 from typing import Any, Dict, List, Tuple
 
 from app.core.trade_calendar import get_last_trade_date_str
+from app.data_platform.db import _conn
 from app.integrations.market_data_client import fetch_daily_by_trade_date, fetch_stock_zh_a_hist, hist_concurrency_scope
 
 logger = logging.getLogger("quant.daily_data")
@@ -88,8 +89,48 @@ def _raw_to_daily_bar(raw: dict) -> DailyBar:
     )
 
 
+def _load_daily_from_postgres(symbols: List[str], start_date: str, end_date: str) -> Dict[str, List[DailyBar]]:
+    """Load OHLCV history from durable TuShare raw records in PostgreSQL."""
+    normalized = [_normalize_symbol(symbol) for symbol in symbols]
+    ts_codes = []
+    for symbol in normalized:
+        suffix = ".SH" if symbol.startswith(("6", "9")) else ".SZ" if symbol.startswith(("0", "3")) else ".BJ"
+        ts_codes.append(f"{symbol}{suffix}")
+    if not ts_codes:
+        return {}
+    start_ymd, end_ymd = start_date.replace("-", ""), end_date.replace("-", "")
+    placeholders = ",".join("?" for _ in ts_codes)
+    try:
+        with _conn() as conn:
+            rows = conn.execute(
+                f"""SELECT ts_code,trade_date,payload_json FROM dc_tushare_raw_records
+                    WHERE api_name='daily' AND trade_date BETWEEN ? AND ? AND ts_code IN ({placeholders})
+                    ORDER BY ts_code,trade_date""",
+                (start_ymd, end_ymd, *ts_codes),
+            ).fetchall()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("PostgreSQL日线读取失败: %s", str(exc)[:160])
+        return {}
+    out: Dict[str, List[DailyBar]] = {}
+    for row in rows:
+        item = dict(row)
+        payload = json.loads(str(item.get("payload_json") or "{}"))
+        symbol = _normalize_symbol(str(item.get("ts_code") or payload.get("ts_code") or ""))
+        if not symbol:
+            continue
+        out.setdefault(symbol, []).append(DailyBar(
+            date=str(payload.get("trade_date") or item.get("trade_date") or ""),
+            open=float(payload.get("open") or 0), high=float(payload.get("high") or 0),
+            low=float(payload.get("low") or 0), close=float(payload.get("close") or 0),
+            volume=float(payload.get("vol") or 0), turnover=float(payload.get("amount") or 0),
+        ))
+    return out
+
+
 def _normalize_symbol(s: str) -> str:
     s = str(s).strip()
+    if "." in s:
+        s = s.split(".", 1)[0]
     for prefix in ("sh", "sz", "bj", "SH", "SZ", "BJ"):
         if s.lower().startswith(prefix):
             return s[len(prefix) :]
@@ -294,6 +335,16 @@ def _load_daily_from_file(symbol: str, start_date: str, end_date: str) -> List[D
 
 def _get_cache_latest_end_date() -> str | None:
     """返回 .cache/daily 中所有文件名里 end_ymd 的最大值；无缓存时返回 None。用于 require_cache 时与缓存对齐，避免请求日历「最新交易日」而缓存只到昨日。"""
+    try:
+        with _conn() as conn:
+            row = conn.execute(
+                "SELECT MAX(trade_date) AS trade_date FROM dc_tushare_raw_records WHERE api_name='daily'"
+            ).fetchone()
+        postgres_latest = str(dict(row).get("trade_date") or "") if row else ""
+        if len(postgres_latest) == 8 and postgres_latest.isdigit():
+            return postgres_latest
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("PostgreSQL daily cache date read failed: %s", str(exc)[:120])
     cache_dir = _cache_dir()
     if not cache_dir.exists():
         return None
@@ -470,6 +521,7 @@ def get_daily_bars(
             if n not in seen:
                 seen.add(n)
                 uniq.append(n)
+        pg_bars = _load_daily_from_postgres(uniq, start_date, end_date)
         # 全市场时一次扫描缓存目录建索引，避免对每只股票重复 glob 导致卡顿
         cache_index: Dict[str, List[Tuple[Path, str, str]]] | None = None
         if len(uniq) >= 300:
@@ -480,6 +532,10 @@ def get_daily_bars(
             key = (sym, start_date, end_date)
             if key in _DAILY_CACHE:
                 out[sym] = _DAILY_CACHE[key]
+                continue
+            if pg_bars.get(sym):
+                _DAILY_CACHE[key] = pg_bars[sym]
+                out[sym] = pg_bars[sym]
                 continue
             bars: List[DailyBar] | None = None
             start_ymd = start_date.replace("-", "") if len(start_date) == 10 else start_date

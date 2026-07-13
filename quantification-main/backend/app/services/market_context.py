@@ -118,23 +118,23 @@ def live_market_context() -> dict[str, Any]:
         return cached
     with _conn() as c:
         dates = [str(dict(row)["trade_date"]) for row in c.execute(
-            "SELECT DISTINCT trade_date FROM dc_stock_daily_snapshot ORDER BY trade_date DESC LIMIT 6"
+            """SELECT DISTINCT trade_date FROM dc_tushare_raw_records
+               WHERE api_name='daily' ORDER BY trade_date DESC LIMIT 6"""
         ).fetchall()]
         if len(dates) < 2:
             return {"ok": False, "status": "insufficient_data", "reason": "至少需要两个交易日行情"}
         latest, previous = dates[0], dates[1]
         breadth_row = dict(c.execute(
             """SELECT COUNT(*) total,
-                      SUM(CASE WHEN l.close>p.close THEN 1 ELSE 0 END) rising,
-                      AVG(CASE WHEN p.close<>0 THEN l.close/p.close-1 END) average_return
-               FROM dc_stock_daily_snapshot l JOIN dc_stock_daily_snapshot p ON p.ts_code=l.ts_code AND p.trade_date=?
-               WHERE l.trade_date=? AND l.close IS NOT NULL AND p.close IS NOT NULL""", (previous, latest)
+                      SUM(CASE WHEN NULLIF(payload_json::jsonb->>'pct_chg','')::double precision>0 THEN 1 ELSE 0 END) rising,
+                      AVG(NULLIF(payload_json::jsonb->>'pct_chg','')::double precision/100.0) average_return
+               FROM dc_tushare_raw_records WHERE api_name='daily' AND trade_date=?""", (latest,)
         ).fetchone())
         limit_row = dict(c.execute(
             """SELECT COUNT(*) total,
-                      SUM(CASE WHEN close>=up_limit*0.999 THEN 1 ELSE 0 END) limit_up,
-                      SUM(CASE WHEN close<=down_limit*1.001 THEN 1 ELSE 0 END) limit_down
-               FROM dc_stock_daily_snapshot WHERE trade_date=? AND close IS NOT NULL""", (latest,)
+                      SUM(CASE WHEN NULLIF(payload_json::jsonb->>'pct_chg','')::double precision>=9.7 THEN 1 ELSE 0 END) limit_up,
+                      SUM(CASE WHEN NULLIF(payload_json::jsonb->>'pct_chg','')::double precision<=-9.7 THEN 1 ELSE 0 END) limit_down
+               FROM dc_tushare_raw_records WHERE api_name='daily' AND trade_date=?""", (latest,)
         ).fetchone())
         amount_rows = [dict(row) for row in c.execute(
             """SELECT trade_date,SUM(NULLIF(payload_json::jsonb->>'amount','')::double precision) total_amount
@@ -199,3 +199,78 @@ def live_market_context() -> dict[str, Any]:
         )
     set_json("alis:market-context:live:v2", payload, ttl=300)
     return payload
+
+
+def market_context_history(limit: int = 120) -> dict[str, Any]:
+    with _conn() as c:
+        rows = [dict(row) for row in c.execute(
+            """SELECT trade_date,market_state,state_confidence,sentiment_score,observations_json,
+                      model_version,available_time FROM dc_market_context_snapshot
+               ORDER BY trade_date DESC LIMIT ?""", (limit,)
+        ).fetchall()]
+    for row in rows:
+        try:
+            row["observations"] = json.loads(row.pop("observations_json") or "{}")
+        except (TypeError, json.JSONDecodeError):
+            row["observations"] = {}
+    rows.reverse()
+    transitions = []
+    for previous, current in zip(rows, rows[1:]):
+        if previous["market_state"] != current["market_state"]:
+            transitions.append({"trade_date": current["trade_date"], "from": previous["market_state"], "to": current["market_state"], "confidence": current["state_confidence"]})
+    return {"ok": True, "items": rows, "transitions": transitions, "count": len(rows)}
+
+
+def rebuild_market_context_history(limit: int = 120) -> dict[str, Any]:
+    """Materialize historical transparent-state snapshots from raw daily bars."""
+    with _conn() as c:
+        date_rows = c.execute(
+            """SELECT DISTINCT trade_date FROM dc_tushare_raw_records
+               WHERE api_name='daily' ORDER BY trade_date DESC LIMIT ?""", (max(2, min(500, limit)),)
+        ).fetchall()
+        dates = list(reversed([str(dict(row).get("trade_date") or "") for row in date_rows]))
+        written = 0
+        for index, trade_date in enumerate(dates):
+            prior_dates = dates[max(0, index - 5):index]
+            if not prior_dates:
+                continue
+            row = dict(c.execute(
+                """SELECT COUNT(*) total,
+                          SUM(CASE WHEN NULLIF(payload_json::jsonb->>'pct_chg','')::double precision>0 THEN 1 ELSE 0 END) rising,
+                          AVG(NULLIF(payload_json::jsonb->>'pct_chg','')::double precision/100.0) average_return,
+                          SUM(NULLIF(payload_json::jsonb->>'amount','')::double precision) amount,
+                          SUM(CASE WHEN NULLIF(payload_json::jsonb->>'pct_chg','')::double precision>=9.7 THEN 1 ELSE 0 END) limit_up,
+                          SUM(CASE WHEN NULLIF(payload_json::jsonb->>'pct_chg','')::double precision<=-9.7 THEN 1 ELSE 0 END) limit_down
+                   FROM dc_tushare_raw_records WHERE api_name='daily' AND trade_date=?""", (trade_date,)
+            ).fetchone())
+            placeholders = ",".join("?" for _ in prior_dates)
+            prior = [dict(x) for x in c.execute(
+                f"""SELECT trade_date,SUM(NULLIF(payload_json::jsonb->>'amount','')::double precision) amount
+                    FROM dc_tushare_raw_records WHERE api_name='daily' AND trade_date IN ({placeholders}) GROUP BY trade_date""", tuple(prior_dates)
+            ).fetchall()]
+            prior_amounts = [float(x.get("amount") or 0) for x in prior if float(x.get("amount") or 0) > 0]
+            total = int(row.get("total") or 0)
+            if total <= 0:
+                continue
+            observations = {
+                "breadth": int(row.get("rising") or 0) / total,
+                "average_return": float(row.get("average_return") or 0),
+                "volume_ratio": float(row.get("amount") or 0) / (sum(prior_amounts) / len(prior_amounts)) if prior_amounts else 1.0,
+                "limit_up_ratio": int(row.get("limit_up") or 0) / total,
+                "limit_down_ratio": int(row.get("limit_down") or 0) / total,
+                "northbound_flow_z": 0.0, "leader_persistence": 0.0, "price_fundamental_divergence": 0.0, "crowding": 0.0,
+            }
+            sentiment = score_market_sentiment(**observations)
+            score = float(sentiment["score"])
+            average_return = float(observations["average_return"])
+            state = "bull" if score >= 65 and average_return > 0 else "recovery" if score >= 55 and average_return > 0 else "stress" if score <= 30 and average_return < 0 else "bear" if score <= 40 and average_return < 0 else "sideways"
+            confidence = min(.85, .45 + abs(score - 50) / 100)
+            now = datetime.now().isoformat(timespec="seconds")
+            payload = {"ok": True, "status": "ready", "trade_date": trade_date, "market_state": {"state": state, "confidence": round(confidence, 4), "model": "transparent_state_machine_v1", "reason": "historical_raw_daily_backfill"}, "sentiment": sentiment, "observations": observations, "evidence": {"symbols": total, "prior_amount_dates": len(prior_amounts)}, "limitations": ["northbound/leader/fundamental observations unavailable and neutralized"], "available_time": now}
+            c.execute(
+                """INSERT INTO dc_market_context_snapshot(trade_date,market_state,state_confidence,sentiment_score,observations_json,result_json,model_version,available_time,created_at,updated_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(trade_date) DO UPDATE SET market_state=excluded.market_state,state_confidence=excluded.state_confidence,sentiment_score=excluded.sentiment_score,observations_json=excluded.observations_json,result_json=excluded.result_json,model_version=excluded.model_version,available_time=excluded.available_time,updated_at=excluded.updated_at""",
+                (trade_date, state, confidence, score, json.dumps(observations, ensure_ascii=False), json.dumps(payload, ensure_ascii=False), "transparent_state_machine_v1", now, now, now),
+            )
+            written += 1
+    return {"ok": True, "dates_considered": len(dates), "snapshots_written": written}

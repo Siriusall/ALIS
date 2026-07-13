@@ -28,6 +28,7 @@ from app.services.backtest_engine import _apply_filters, _factor_value, _score_r
 from app.services.execution_engine import simulate_open_execution
 from app.services.rebalance_allocator import allocate_buy_orders, planned_to_order_results
 from app.services.decision_store import create_decision_snapshot
+from app.services.stock_pool_sync import sync_pool_from_confirmed_execution
 from app.services.cache_consolidation import list_available_trade_dates
 from app.services.strategy_recommender import recommend_strategy_template
 from app.services.strategy_config import parse_strategy_content
@@ -1095,6 +1096,59 @@ def plan_analyze_rebalance(
     if not dry_run:
         add_log("INFO", msg)
 
+    decision_snapshot_ids: list[int] = []
+    decision_snapshot_error = ""
+    pool_sync: dict[str, Any] | None = None
+    if not dry_run and (bought_count > 0 or sold_count > 0):
+        try:
+            decision_time = executed_at or datetime.now().isoformat(timespec="seconds")
+            data_as_of_time = f"{sig}T23:59:59"
+            model_version = f"rebalance_strategy_{sid}" if sid else "analysis_rebalance_v1"
+            shared_context = {
+                "signal_date": sig,
+                "execute_date": execute_date,
+                "mode": rebalance_mode,
+                "target_position_pct": target_pct,
+                "max_single_position_pct": max_single,
+                "selection_scores": scores,
+            }
+            for order in buy_preview:
+                snapshot = create_decision_snapshot({
+                    "ts_code": str(order.get("symbol") or ""), "decision_type": "buy",
+                    "decision_time": decision_time, "price": order.get("exec_price"),
+                    "data_as_of_time": data_as_of_time, "model_version": model_version,
+                    "market_state": shared_context,
+                    "research_state": {"selection_score": order.get("score"), "name": order.get("name")},
+                    "valuation": {}, "portfolio_context": {"equity": portfolio["total_equity"], "cash_before": cash_balance, "buy_cost": total_buy_cost},
+                    "reason": f"确认执行调仓买入；评分={order.get('score')}; {execution_note}",
+                    "invalidation_conditions": ["触发组合风险门控", "目标权重或选股评分失效", "交易约束禁止继续持有"],
+                })
+                decision_snapshot_ids.append(int(snapshot["id"]))
+            for order in sell_preview:
+                if str(order.get("status") or "") not in {"filled", "executed", "simulated"}:
+                    continue
+                snapshot = create_decision_snapshot({
+                    "ts_code": str(order.get("symbol") or ""), "decision_type": "sell",
+                    "decision_time": decision_time, "price": order.get("price"),
+                    "data_as_of_time": data_as_of_time, "model_version": model_version,
+                    "market_state": shared_context, "research_state": {}, "valuation": {},
+                    "portfolio_context": {"equity": portfolio["total_equity"], "cash_before": cash_balance},
+                    "reason": str(order.get("message") or "确认执行调仓卖出"),
+                    "invalidation_conditions": [],
+                })
+                decision_snapshot_ids.append(int(snapshot["id"]))
+        except Exception as exc:  # Decision logging must not roll back a completed simulated execution.
+            decision_snapshot_error = str(exc)[:240]
+            add_log("ERROR", f"决策快照写入失败：{decision_snapshot_error}")
+        try:
+            pool_sync = sync_pool_from_confirmed_execution(
+                buy_orders=buy_preview, sell_orders=sell_preview, execution_id=execution_id, executed_at=decision_time,
+            )
+        except Exception as exc:  # Pool state is secondary to a completed execution but remains observable.
+            detail = str(exc)[:240]
+            add_log("ERROR", f"股票池执行状态同步失败：{detail}")
+            pool_sync = {"ok": False, "error": detail}
+
     return {
         "ok": dry_run or bought_count > 0 or sold_count > 0,
         "dry_run": dry_run,
@@ -1126,6 +1180,9 @@ def plan_analyze_rebalance(
         "buy_orders": buy_preview,
         "blocked_events": sell_blocked + blocked_buy_orders,
         "orders": buy_preview + blocked_buy_orders,
+        "decision_snapshot_ids": decision_snapshot_ids,
+        "decision_snapshot_error": decision_snapshot_error or None,
+        "pool_sync": pool_sync,
     }
 
 

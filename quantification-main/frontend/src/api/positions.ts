@@ -1,9 +1,5 @@
-import axios from "axios";
+import { api } from "./client";
 import type { ExecutionListItem, Operation, Position, PositionsListResponse } from "../types";
-
-const api = axios.create({
-  baseURL: import.meta.env.VITE_API_BASE || ""
-});
 
 export async function fetchPositions(): Promise<PositionsListResponse> {
   const { data } = await api.get<PositionsListResponse>("/api/positions");

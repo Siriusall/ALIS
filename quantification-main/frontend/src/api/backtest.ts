@@ -1,4 +1,4 @@
-import axios from "axios";
+import { api } from "./client";
 
 export interface BacktestMetrics {
   total_return: number;
@@ -106,9 +106,6 @@ export interface BacktestJobResponse {
   daily_records: BacktestDailyProgress[];
 }
 
-const api = axios.create({
-  baseURL: import.meta.env.VITE_API_BASE || "",
-});
 const DETAIL_TIMEOUT_MS = 30_000;
 
 export async function runBacktest(body: {

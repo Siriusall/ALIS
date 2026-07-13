@@ -1,4 +1,4 @@
-import axios from "axios";
+import { api } from "./client";
 import {
   Candidate,
   ConsolidatedCacheResponse,
@@ -8,10 +8,6 @@ import {
   QuantRunStatus,
   SignalDetail
 } from "../types";
-
-const api = axios.create({
-  baseURL: import.meta.env.VITE_API_BASE || ""
-});
 
 export async function fetchOverview(): Promise<Overview> {
   const { data } = await api.get<Overview>("/api/overview");

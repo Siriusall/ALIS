@@ -137,8 +137,22 @@ def research_state(dimensions: dict[str, dict[str, Any]], risk: dict[str, Any]) 
         label = "景气反转"
     else:
         label = "研究观察"
-    confidence = min([float(v.get("confidence") or 0) for v in dimensions.values()] or [0.0])
-    return {"classification": label, "scores": scores, "confidence": round(confidence, 4), "eligible": bool(risk.get("eligible"))}
+    # Missing optional dimensions must reduce confidence, not force it to zero.
+    # The previous minimum made a real quality/growth assessment indistinguishable
+    # from an assessment with no observations whenever one planned dimension had
+    # not yet been ingested.  Average over the complete contract so missing
+    # evidence remains an explicit penalty while observed evidence is retained.
+    confidence_values = [float(v.get("confidence") or 0) for v in dimensions.values()]
+    confidence = sum(confidence_values) / len(CONTRACTS) if confidence_values else 0.0
+    covered_dimensions = sum(1 for value in dimensions.values() if float(value.get("coverage") or 0) > 0)
+    return {
+        "classification": label,
+        "scores": scores,
+        "confidence": round(confidence, 4),
+        "covered_dimensions": covered_dimensions,
+        "total_dimensions": len(CONTRACTS),
+        "eligible": bool(risk.get("eligible")),
+    }
 
 
 def capability_registry() -> list[dict[str, Any]]:
@@ -195,6 +209,46 @@ def _payloads(ts_code: str, api: str, limit: int = 12) -> list[dict[str, Any]]:
     return values
 
 
+def _forecast_history(ts_code: str, limit: int = 16) -> list[dict[str, Any]]:
+    """Return point-in-time company forecast notices with their announcement dates.
+
+    Tushare ``forecast`` is a company performance notice, not analyst
+    consensus.  Keeping it separate prevents the UI and gates from presenting
+    a management notice as a sell-side estimate.
+    """
+    with _conn() as c:
+        rows = c.execute(
+            """SELECT period,ann_date,available_time,payload_json FROM dc_tushare_raw_records
+               WHERE api_name='forecast' AND ts_code=?
+               ORDER BY ann_date DESC, available_time DESC LIMIT ?""",
+            (ts_code, limit),
+        ).fetchall()
+    values: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for row in rows:
+        item = dict(row)
+        key = (str(item.get("period") or ""), str(item.get("ann_date") or ""))
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            payload = json.loads(item.get("payload_json") or "{}")
+        except (TypeError, json.JSONDecodeError):
+            payload = {}
+        lower, upper = payload.get("p_change_min"), payload.get("p_change_max")
+        try:
+            change_mid = (float(lower) + float(upper)) / 2 if lower is not None and upper is not None else None
+        except (TypeError, ValueError):
+            change_mid = None
+        values.append({
+            "period": key[0], "ann_date": key[1], "available_time": item.get("available_time"),
+            "type": payload.get("type"), "p_change_min": lower, "p_change_max": upper,
+            "net_profit_min": payload.get("net_profit_min"), "net_profit_max": payload.get("net_profit_max"),
+            "change_mid": change_mid,
+        })
+    return values
+
+
 def _yoy(rows: list[dict[str, Any]], field: str) -> float | None:
     if not rows:
         return None
@@ -211,7 +265,7 @@ def _yoy(rows: list[dict[str, Any]], field: str) -> float | None:
     return (float(current_value) / abs(float(prior_value)) - (1.0 if float(prior_value) > 0 else 0.0)) * 100.0
 
 
-def build_stock_research(ts_code: str) -> dict[str, Any]:
+def build_stock_research(ts_code: str, *, persist: bool = True) -> dict[str, Any]:
     code = str(ts_code).strip().upper()
     with _conn() as c:
         master_row = c.execute("SELECT * FROM dc_stock_master WHERE ts_code=?", (code,)).fetchone()
@@ -280,7 +334,7 @@ def build_stock_research(ts_code: str) -> dict[str, Any]:
         {"api": api, "period": rows[0]["period"], "available_time": rows[0]["available_time"]}
         for api, rows in (("income", income), ("balancesheet", balance), ("cashflow", cashflow), ("fina_indicator", indicator)) if rows
     ]
-    return {
+    result = {
         "ok": True,
         "ts_code": code,
         "profile": {"name": name, "industry": master.get("industry"), "list_date": master.get("list_date"), "trade_date": snapshot.get("trade_date")},
@@ -292,6 +346,17 @@ def build_stock_research(ts_code: str) -> dict[str, Any]:
         "evidence": evidence,
         "limitations": ["扣非利润、ROIC、自由现金流、质押与监管事件尚未完成统一字段映射", "估值历史分位和行业相对值尚未计算"]
     }
+    if persist:
+        as_of = max((str(x.get("available_time") or "") for x in evidence), default=str(snapshot.get("available_time") or datetime.now().isoformat(timespec="seconds")))
+        confidence = float(result["research_state"].get("confidence") or 0)
+        now = datetime.now().isoformat(timespec="seconds")
+        with _business_conn() as c:
+            c.execute(
+                """INSERT INTO research_score_snapshots(ts_code,as_of_time,model_version,dimensions_json,evidence_json,confidence,created_at)
+                   VALUES(?,?,?,?,?,?,?)""",
+                (code, as_of, "research_contract_v1", json.dumps(dimensions, ensure_ascii=False), json.dumps(evidence, ensure_ascii=False), confidence, now),
+            )
+    return result
 
 
 def _prior_year(rows: list[dict[str, Any]], period: str) -> dict[str, Any] | None:
@@ -304,7 +369,19 @@ def _prior_year(rows: list[dict[str, Any]], period: str) -> dict[str, Any] | Non
 def build_expectation_state(ts_code: str, *, persist_baseline: bool = True) -> dict[str, Any]:
     code = str(ts_code).strip().upper()
     income, indicator = _payloads(code, "income", 16), _payloads(code, "fina_indicator", 16)
+    forecast_history = _forecast_history(code, 16)
     if not income:
+        if forecast_history:
+            return {
+                "ok": True, "ts_code": code, "status": "insufficient_financial_data",
+                "observations": {}, "dimension": score_dimension("expectation", {}), "baseline": None,
+                "external_forecast": {
+                    "kind": "company_performance_notice_not_consensus", "status": "unscorable",
+                    "latest": forecast_history[0], "history": forecast_history[:8],
+                },
+                "limitations": ["已同步公司业绩预告，但缺少同期财务报表，不能计算超预期、趋势或预测基线", "公司业绩预告不等同于分析师一致预期"],
+                "evidence": [{"api": "forecast", "period": x["period"], "available_time": x["available_time"]} for x in forecast_history[:4]],
+            }
         return {"ok": False, "reason": "financial_data_missing", "ts_code": code}
     latest_period = str(income[0]["period"])
     revenue_yoy, profit_yoy = _yoy(income, "total_revenue"), _yoy(income, "n_income")
@@ -319,7 +396,17 @@ def build_expectation_state(ts_code: str, *, persist_baseline: bool = True) -> d
     prior_indicator = (_prior_year(indicator, str(indicator[0]["period"])) or {}).get("payload", {}) if indicator else {}
     current_margin, prior_margin = latest_indicator.get("netprofit_margin"), prior_indicator.get("netprofit_margin")
     margin_change = None if current_margin is None or prior_margin is None else float(current_margin) - float(prior_margin)
+    latest_forecast = forecast_history[0] if forecast_history else None
+    forecast_revision = None
+    if len(forecast_history) >= 2:
+        current_mid, prior_mid = forecast_history[0].get("change_mid"), forecast_history[1].get("change_mid")
+        if current_mid is not None and prior_mid is not None:
+            forecast_revision = float(current_mid) - float(prior_mid)
+    # A notice that predates the latest reported period has no admission value
+    # for the current decision.  It remains visible as historical evidence.
+    forecast_current = bool(latest_forecast and str(latest_forecast.get("period") or "") >= latest_period)
     dimension = score_dimension("expectation", {
+        "forecast_revision": _linear(forecast_revision, -20, 20) if forecast_current else None,
         "growth_acceleration": _linear(acceleration, -20, 20),
         "margin_trend": _linear(margin_change, -5, 5),
     })
@@ -346,11 +433,17 @@ def build_expectation_state(ts_code: str, *, persist_baseline: bool = True) -> d
                 )
     return {
         "ok": True, "ts_code": code, "latest_period": latest_period,
-        "observations": {"revenue_yoy": revenue_yoy, "profit_yoy": profit_yoy, "previous_revenue_yoy": previous_revenue_yoy, "previous_profit_yoy": previous_profit_yoy, "growth_acceleration": acceleration, "net_margin_change": margin_change},
+        "observations": {"revenue_yoy": revenue_yoy, "profit_yoy": profit_yoy, "previous_revenue_yoy": previous_revenue_yoy, "previous_profit_yoy": previous_profit_yoy, "growth_acceleration": acceleration, "net_margin_change": margin_change, "forecast_revision": forecast_revision},
         "dimension": dimension, "baseline": baseline,
         "status": "ready" if dimension["status"] == "ready" and baseline else "insufficient_data",
-        "limitations": ["尚无可靠一致预期，系统基线置信度最高0.55", "行业确认和管理层指引尚未映射"],
-        "evidence": [{"api": "income", "period": x["period"], "available_time": x["available_time"]} for x in income[:4]],
+        "external_forecast": {
+            "kind": "company_performance_notice_not_consensus",
+            "status": "current" if forecast_current else "stale" if latest_forecast else "missing",
+            "latest": latest_forecast,
+            "history": forecast_history[:8],
+        },
+        "limitations": ["尚无可靠一致预期，系统基线置信度最高0.55", "公司业绩预告不等同于分析师一致预期", "行业确认和管理层指引尚未映射"],
+        "evidence": ([{"api": "income", "period": x["period"], "available_time": x["available_time"]} for x in income[:4]] + [{"api": "forecast", "period": x["period"], "available_time": x["available_time"]} for x in forecast_history[:4]]),
     }
 
 

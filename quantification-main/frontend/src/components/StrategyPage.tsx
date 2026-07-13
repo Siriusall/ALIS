@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { CartesianGrid, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 import { fetchBacktest, fetchBacktestJob, runBacktestAsync, type BacktestRunResponse } from "../api/backtest";
 import {
@@ -7,6 +7,9 @@ import {
   fetchModelTrainRun,
   startModelTraining,
   autoTuneModels,
+  rollbackModelVersion,
+  compareModelVersions,
+  type ModelComparison,
   type ModelStrategyStatus,
   type ModelTrainRun,
   type ModelConstitution,
@@ -22,6 +25,8 @@ export default function StrategyPage() {
   const [tuning, setTuning] = useState(false);
   const [validation, setValidation] = useState<BacktestRunResponse | null>(null);
   const [error, setError] = useState("");
+  const [rollingBackId, setRollingBackId] = useState<number | null>(null);
+  const [comparison, setComparison] = useState<ModelComparison | null>(null);
   const pollRef = useRef<number | null>(null);
 
   useEffect(() => {
@@ -121,6 +126,27 @@ export default function StrategyPage() {
     } finally {
       setTuning(false);
     }
+  }
+
+  async function handleRollback(modelVersionId: number) {
+    setRollingBackId(modelVersionId);
+    setError("");
+    try {
+      const result = await rollbackModelVersion(modelVersionId);
+      setError(`已从当前版本回退到模型 #${result.model_version_id}`);
+      await refreshStatus();
+    } catch (e: unknown) {
+      setError((e as Error).message || "模型回退失败");
+    } finally {
+      setRollingBackId(null);
+    }
+  }
+
+  async function handleCompare(modelVersionId: number) {
+    if (!active?.id || active.id === modelVersionId) return;
+    setError("");
+    try { setComparison(await compareModelVersions(active.id, modelVersionId)); }
+    catch (e: unknown) { setError((e as Error).message || "模型比较失败"); }
   }
 
   const active = status?.active_version ?? null;
@@ -264,6 +290,7 @@ export default function StrategyPage() {
           </div>
         )}
 
+        {comparison && <div className="card"><h3>Champion / Challenger 比较</h3><p>{comparison.champion_version || comparison.champion_id} → {comparison.challenger_version || comparison.challenger_id}：{comparison.decision}</p><div className="decision-two-col">{Object.entries(comparison.deltas).map(([key, value]) => <React.Fragment key={key}><span>{key}</span><strong>{Number(value).toFixed(4)}</strong></React.Fragment>)}<span>门禁</span><strong>{Object.entries(comparison.gates).filter(([, passed]) => passed).length}/{Object.keys(comparison.gates).length} 通过</strong><span>配置差异</span><strong>{Object.keys(comparison.config_diff).length} 项</strong></div>{comparison.blocked_reasons.length > 0 && <div className="alert">阻断原因：{comparison.blocked_reasons.join("、")}</div>}</div>}
         <div className="card">
           <h3>模型版本</h3>
           <div className="table-scroll">
@@ -276,11 +303,12 @@ export default function StrategyPage() {
                   <th>Lift</th>
                   <th>命中率</th>
                   <th>时间</th>
+                  <th>操作</th>
                 </tr>
               </thead>
               <tbody>
                 {versions.length === 0 ? (
-                  <tr><td colSpan={6} className="empty">暂无模型版本，点击开始自动训练。</td></tr>
+                  <tr><td colSpan={7} className="empty">暂无模型版本，点击开始自动训练。</td></tr>
                 ) : (
                   versions.map((v) => (
                     <tr key={v.id}>
@@ -290,6 +318,7 @@ export default function StrategyPage() {
                       <td>{num(v.metrics?.lift)}</td>
                       <td>{pct(v.metrics?.hit_rate, 1)}</td>
                       <td>{v.created_at.slice(0, 19).replace("T", " ")}</td>
+                      <td>{v.is_active ? "当前版本" : <><button type="button" className="button ghost" onClick={() => void handleCompare(v.id)} disabled={!active}>比较</button> <button type="button" className="button ghost" disabled={rollingBackId !== null || String(v.validation?.status || "") !== "passed"} onClick={() => void handleRollback(v.id)}>{rollingBackId === v.id ? "回退中…" : "回退至此"}</button></>}</td>
                     </tr>
                   ))
                 )}

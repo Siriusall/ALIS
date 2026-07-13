@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 from app.integrations.tushare_client import get_tushare_client
+from app.data_platform.db import _conn
 
 logger = logging.getLogger("quant.backtest_data_source")
 
@@ -59,6 +60,73 @@ class BacktestDataSource:
         self._daily_basic_cache: Dict[str, Dict[str, Dict[str, float]]] = {}
         self.data_warnings: List[str] = []
         self.fallback_events: List[Dict[str, str]] = []
+
+    def _postgres_trade_dates(self, start: str, end: str) -> List[str]:
+        try:
+            with _conn() as conn:
+                rows = conn.execute(
+                    """SELECT DISTINCT trade_date FROM dc_tushare_raw_records
+                       WHERE api_name='daily' AND trade_date BETWEEN ? AND ? ORDER BY trade_date""",
+                    (start.replace("-", ""), end.replace("-", "")),
+                ).fetchall()
+            return [self._fmt_date(str(dict(row).get("trade_date") or "")) for row in rows]
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("PostgreSQL backtest calendar read failed: %s", str(exc)[:160])
+            return []
+
+    def _postgres_daily_rows(self, ymd: str, symbol: str = "") -> List[dict]:
+        try:
+            sql = "SELECT ts_code,trade_date,payload_json FROM dc_tushare_raw_records WHERE api_name='daily' AND trade_date=?"
+            params: tuple = (ymd,)
+            if symbol:
+                code = str(symbol).strip().split(".", 1)[0].zfill(6)
+                suffix = ".SH" if code.startswith(("6", "9")) else ".SZ" if code.startswith(("0", "3")) else ".BJ"
+                sql += " AND ts_code=?"
+                params = (ymd, f"{code}{suffix}")
+            with _conn() as conn:
+                rows = conn.execute(sql, params).fetchall()
+            return [dict(row) for row in rows]
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("PostgreSQL backtest daily read failed: %s", str(exc)[:160])
+            return []
+
+    def preload_histories(self, symbols: List[str]) -> None:
+        """Batch-load PostgreSQL history to avoid one query per factor row."""
+        wanted = []
+        for raw in symbols:
+            code = str(raw or "").strip().split(".", 1)[0].zfill(6)
+            if not code or code in self._hist_cache:
+                continue
+            suffix = ".SH" if code.startswith(("6", "9")) else ".SZ" if code.startswith(("0", "3")) else ".BJ"
+            wanted.append((code, f"{code}{suffix}"))
+        if not wanted:
+            return
+        grouped: Dict[str, List[HistBar]] = {code: [] for code, _ in wanted}
+        try:
+            for offset in range(0, len(wanted), 500):
+                batch = wanted[offset : offset + 500]
+                placeholders = ",".join("?" for _ in batch)
+                with _conn() as conn:
+                    rows = conn.execute(
+                        f"""SELECT ts_code,trade_date,payload_json FROM dc_tushare_raw_records
+                            WHERE api_name='daily' AND ts_code IN ({placeholders}) ORDER BY ts_code,trade_date""",
+                        tuple(ts_code for _, ts_code in batch),
+                    ).fetchall()
+                for raw_row in rows:
+                    item = dict(raw_row)
+                    payload = json.loads(str(item.get("payload_json") or "{}"))
+                    code = str(item.get("ts_code") or "").split(".", 1)[0].zfill(6)
+                    if code in grouped:
+                        grouped[code].append(HistBar(
+                            date=self._fmt_date(str(payload.get("trade_date") or item.get("trade_date") or "")),
+                            open=float(payload.get("open") or 0), high=float(payload.get("high") or 0),
+                            low=float(payload.get("low") or 0), close=float(payload.get("close") or 0),
+                            volume=float(payload.get("vol") or 0), turnover=float(payload.get("amount") or 0),
+                        ))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("PostgreSQL backtest history preload failed: %s", str(exc)[:160])
+            return
+        self._hist_cache.update(grouped)
 
     def _daily_basic_data_path_json(self, ymd: str) -> Path:
         return self._daily_basic_data_dir / f"{ymd}.json"
@@ -201,6 +269,10 @@ class BacktestDataSource:
         """
         start = self._fmt_date(start_date)
         end = self._fmt_date(end_date)
+        postgres_dates = self._postgres_trade_dates(start, end)
+        if not postgres_dates:
+            self.data_warnings.append("PostgreSQL 中没有覆盖该区间的日线数据。")
+        return postgres_dates
         out: List[str] = []
         if self._daily_snapshot_dir.exists():
             for p in self._daily_snapshot_dir.glob("*.csv"):
@@ -236,6 +308,27 @@ class BacktestDataSource:
             return self._snapshot_cache[date_iso]
 
         ymd = date_iso.replace("-", "")
+        postgres_rows = self._postgres_daily_rows(ymd)
+        if postgres_rows:
+            rows: List[SnapshotRow] = []
+            for raw in postgres_rows:
+                payload = json.loads(str(raw.get("payload_json") or "{}"))
+                ts_code = str(raw.get("ts_code") or payload.get("ts_code") or "")
+                symbol = ts_code.split(".", 1)[0].zfill(6)
+                if not symbol:
+                    continue
+                rows.append(SnapshotRow(
+                    symbol=symbol, date=self._fmt_date(str(payload.get("trade_date") or ymd)),
+                    open=float(payload.get("open") or 0), high=float(payload.get("high") or 0),
+                    low=float(payload.get("low") or 0), close=float(payload.get("close") or 0),
+                    prev_close=float(payload.get("pre_close") or 0), change_pct=float(payload.get("pct_chg") or 0),
+                    volume=float(payload.get("vol") or 0), turnover=float(payload.get("amount") or 0),
+                ))
+            self._snapshot_cache[date_iso] = rows
+            return rows
+        self.data_warnings.append(f"{ymd} PostgreSQL 快照不可用。")
+        self._snapshot_cache[date_iso] = []
+        return []
         local_path = self._daily_snapshot_dir / f"{ymd}.csv"
         if local_path.exists():
             rows = self._load_snapshot_csv(local_path)
@@ -379,6 +472,31 @@ class BacktestDataSource:
         if code in self._hist_cache:
             return self._hist_cache[code]
 
+        try:
+            suffix = ".SH" if code.startswith(("6", "9")) else ".SZ" if code.startswith(("0", "3")) else ".BJ"
+            with _conn() as conn:
+                rows = conn.execute(
+                    """SELECT trade_date,payload_json FROM dc_tushare_raw_records
+                       WHERE api_name='daily' AND ts_code=? ORDER BY trade_date""",
+                    (f"{code}{suffix}",),
+                ).fetchall()
+            postgres_bars = []
+            for raw in rows:
+                payload = json.loads(str(dict(raw).get("payload_json") or "{}"))
+                postgres_bars.append(HistBar(
+                    date=self._fmt_date(str(payload.get("trade_date") or dict(raw).get("trade_date") or "")),
+                    open=float(payload.get("open") or 0), high=float(payload.get("high") or 0),
+                    low=float(payload.get("low") or 0), close=float(payload.get("close") or 0),
+                    volume=float(payload.get("vol") or 0), turnover=float(payload.get("amount") or 0),
+                ))
+            if postgres_bars:
+                self._hist_cache[code] = postgres_bars
+                return postgres_bars
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("PostgreSQL backtest history read failed: %s", str(exc)[:160])
+
+        self._hist_cache[code] = []
+        return []
         self._build_symbol_index()
         path = self._symbol_file_index.get(code)
         if path is None or not path.exists():
@@ -433,6 +551,34 @@ class BacktestDataSource:
         ymd = date_iso.replace("-", "")
         if ymd in self._daily_basic_cache:
             return self._daily_basic_cache[ymd]
+
+        try:
+            with _conn() as conn:
+                rows = conn.execute(
+                    "SELECT ts_code,payload_json FROM dc_tushare_raw_records WHERE api_name='daily_basic' AND trade_date=?",
+                    (ymd,),
+                ).fetchall()
+            postgres_payload: Dict[str, Dict[str, float]] = {}
+            for raw in rows:
+                item = dict(raw)
+                payload = json.loads(str(item.get("payload_json") or "{}"))
+                symbol = str(item.get("ts_code") or payload.get("ts_code") or "").split(".", 1)[0].zfill(6)
+                if symbol:
+                    postgres_payload[symbol] = {
+                        "total_mv": float(payload.get("total_mv") or 0),
+                        "float_mv": float(payload.get("circ_mv") or 0),
+                        "pe_ttm": float(payload.get("pe_ttm") or 0),
+                        "pb": float(payload.get("pb") or 0),
+                        "turnover_rate": float(payload.get("turnover_rate") or 0),
+                    }
+            if postgres_payload:
+                self._daily_basic_cache[ymd] = postgres_payload
+                return postgres_payload
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("PostgreSQL backtest daily_basic read failed: %s", str(exc)[:160])
+        self.data_warnings.append(f"{ymd} PostgreSQL daily_basic 不可用。")
+        self._daily_basic_cache[ymd] = {}
+        return {}
 
         # 1) 用户长期本地目录优先（.cache/data/daily_basic）
         data_dir_payload = self._load_daily_basic_from_data_dir(ymd)

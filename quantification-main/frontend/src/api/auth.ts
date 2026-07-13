@@ -1,8 +1,4 @@
-import axios from "axios";
-
-const api = axios.create({
-  baseURL: import.meta.env.VITE_API_BASE || "",
-});
+import { api, TOKEN_KEY } from "./client";
 
 export interface UserInfo {
   id: number;
@@ -15,8 +11,6 @@ export interface AuthResult {
   token_type: string;
   user: UserInfo;
 }
-
-const TOKEN_KEY = "quant_token";
 
 export function getStoredToken(): string | null {
   return localStorage.getItem(TOKEN_KEY);
@@ -47,14 +41,8 @@ export async function fetchCurrentUser(): Promise<UserInfo | null> {
   const token = getStoredToken();
   if (!token) return null;
   setAuthHeader(token);
-  try {
-    const { data } = await api.get<UserInfo | null>("/api/auth/me");
-    return data ?? null;
-  } catch {
-    setStoredToken(null);
-    setAuthHeader(null);
-    return null;
-  }
+  const { data } = await api.get<UserInfo | null>("/api/auth/me");
+  return data ?? null;
 }
 
 export async function logout(): Promise<void> {

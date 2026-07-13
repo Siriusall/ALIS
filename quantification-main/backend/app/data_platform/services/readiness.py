@@ -15,7 +15,10 @@ _CACHE_TTL = 30.0
 
 
 def _value(row: Any, key: str, default: Any = 0) -> Any:
-    return dict(row).get(key, default) if row is not None else default
+    if row is None:
+        return default
+    value = dict(row).get(key, default)
+    return default if value is None else value
 
 
 def _metrics() -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:

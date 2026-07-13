@@ -1,46 +1,58 @@
-import { useEffect, useState } from "react";
-import type { SectionId } from "../components/Layout";
-import type { LogEntry } from "../types";
-import { fetchLogs } from "../api/market";
+import { lazy, useEffect, useMemo } from "react";
+import { useNavigate, useParams } from "react-router-dom";
+import { isSectionId, type SectionId } from "../components/Layout";
 import { useAuth } from "../context/AuthContext";
 import Layout from "../components/Layout";
-import StrategyPage from "../components/StrategyPage";
-import FactorLibraryPage from "../components/FactorLibraryPage";
-import PositionPage from "../components/PositionPage";
-import TaskLogs from "../components/TaskLogs";
-import QuantRunPanel from "../components/QuantRunPanel";
-import DecisionPage from "../components/DecisionPage";
-import DataCenterPage from "../components/DataCenterPage";
-import ProductModulePage from "../components/ProductModulePage";
-import StockResearchPage from "../components/StockResearchPage";
-import ThesisPage from "../components/ThesisPage";
-import IndustryResearchPage from "../components/IndustryResearchPage";
-import EventCenterPage from "../components/EventCenterPage";
-import SentimentPage from "../components/SentimentPage";
-import ExpectationPage from "../components/ExpectationPage";
-import ValuationPage from "../components/ValuationPage";
+const StrategyPage = lazy(() => import("../components/StrategyPage"));
+const PositionPage = lazy(() => import("../components/PositionPage"));
+const QuantRunPanel = lazy(() => import("../components/QuantRunPanel"));
+const DecisionPage = lazy(() => import("../components/DecisionPage"));
+const DataCenterPage = lazy(() => import("../components/DataCenterPage"));
+const ProductModulePage = lazy(() => import("../components/ProductModulePage"));
+const StockResearchPage = lazy(() => import("../components/StockResearchPage"));
+const ThesisPage = lazy(() => import("../components/ThesisPage"));
+const IndustryResearchPage = lazy(() => import("../components/IndustryResearchPage"));
+const EventCenterPage = lazy(() => import("../components/EventCenterPage"));
+const SentimentPage = lazy(() => import("../components/SentimentPage"));
+const ExpectationPage = lazy(() => import("../components/ExpectationPage"));
+const ValuationPage = lazy(() => import("../components/ValuationPage"));
+const PositionRiskPage = lazy(() => import("../components/PositionRiskPage"));
+const GovernancePage = lazy(() => import("../components/GovernancePage"));
+const DecisionAuditPage = lazy(() => import("../components/DecisionAuditPage"));
+const StockPoolPage = lazy(() => import("../components/StockPoolPage"));
+const ReviewPage = lazy(() => import("../components/ReviewPage"));
 
 export default function DashboardPage() {
   const { user, logout } = useAuth();
-  const [currentSection, setCurrentSection] = useState<SectionId>("market");
-  const [logs, setLogs] = useState<LogEntry[]>([]);
-  const [error, setError] = useState("");
+  const { section } = useParams();
+  const navigate = useNavigate();
+  const currentSection: SectionId = isSectionId(section) ? section : "market";
 
   useEffect(() => {
-    let active = true;
-    fetchLogs().then((data) => {
-      if (active) setLogs(Array.isArray(data) ? data : []);
-    });
-    return () => {
-      active = false;
-    };
-  }, []);
+    if (!isSectionId(section)) navigate("/app/market", { replace: true });
+  }, [navigate, section]);
 
-  // 切换到「任务日志」时重新拉取，避免只显示进入页面的旧数据
-  useEffect(() => {
-    if (currentSection !== "decisionLogs") return;
-    fetchLogs().then((data) => setLogs(Array.isArray(data) ? data : []));
-  }, [currentSection]);
+  const setCurrentSection = (next: SectionId) => navigate(`/app/${next}`);
+  const sections = useMemo(() => ({
+    market: <DecisionPage onNavigate={setCurrentSection} />,
+    dataCenter: <DataCenterPage />,
+    stockResearch: <StockResearchPage />,
+    industryResearch: <IndustryResearchPage />,
+    events: <EventCenterPage />,
+    sentiment: <SentimentPage />,
+    themes: <ProductModulePage capabilityKey="themes" />,
+    expectation: <ExpectationPage />,
+    valuation: <ValuationPage />,
+    stockPool: <StockPoolPage />,
+    thesis: <ThesisPage />,
+    portfolio: <PositionPage />,
+    positionRisk: <PositionRiskPage />,
+    validation: <QuantRunPanel />,
+    decisionLogs: <DecisionAuditPage />,
+    review: <ReviewPage />,
+    governance: <GovernancePage />,
+    strategy: <StrategyPage />,
+  }), []);
 
   const header = (
     <>
@@ -49,7 +61,6 @@ export default function DashboardPage() {
           <h1>ALIS 研究与组合决策平台</h1>
         </div>
       </div>
-      {error && <div className="alert">{error}</div>}
     </>
   );
 
@@ -58,31 +69,13 @@ export default function DashboardPage() {
   return (
     <Layout
       header={header}
+      sections={sections}
       currentSection={currentSection}
       onSectionChange={setCurrentSection}
       user={user}
       onLogout={logout}
       onLoginClick={() => {}}
       onRegisterClick={() => {}}
-    >
-      <DecisionPage onNavigate={setCurrentSection} />
-      <DataCenterPage />
-      <StockResearchPage />
-      <IndustryResearchPage />
-      <EventCenterPage />
-      <SentimentPage />
-      <ProductModulePage capabilityKey="themes" />
-      <ExpectationPage />
-      <ValuationPage />
-      <FactorLibraryPage />
-      <ThesisPage />
-      <PositionPage />
-      <ProductModulePage capabilityKey="risk" />
-      <QuantRunPanel />
-      <TaskLogs logs={logs} />
-      <ProductModulePage capabilityKey="review" />
-      <ProductModulePage capabilityKey="governance" />
-      <StrategyPage />
-    </Layout>
+    />
   );
 }

@@ -471,6 +471,7 @@ def run_backtest(
         factor_values: Dict[str, Dict[str, float]] = {}
         max_lookback = max(lookback, 20)
         total_universe = len(snapshot)
+        ds.preload_histories([row.symbol for row in snapshot])
         _emit_progress(
             {
                 "date": d,

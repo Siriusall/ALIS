@@ -591,11 +591,26 @@ def _run_step(step: dict[str, Any]) -> dict[str, Any]:
         )
     if action == "sync_market_batch":
         results = []
-        for trade_date in params.get("trade_dates") or []:
+        trade_dates = list(params.get("trade_dates") or [])
+        for date_index, trade_date in enumerate(trade_dates, start=1):
             missing_apis = (params.get("missing_apis") or {}).get(trade_date) or ["daily", "daily_basic", "stk_limit"]
+            _set(
+                message=(
+                    f"正在同步行情 {trade_date} "
+                    f"（本批第 {date_index}/{len(trade_dates)} 天）"
+                ),
+                activity={
+                    "event": "market_batch_progress",
+                    "trade_date": trade_date,
+                    "date_index": date_index,
+                    "date_total": len(trade_dates),
+                    "apis": missing_apis,
+                    "text": f"{trade_date}: {', '.join(missing_apis)}",
+                },
+            )
             results.append(sync_market_bundle(trade_date, include_suspend=bool(params.get("include_suspend")), apis=missing_apis))
         ok = all(bool(r.get("ok")) for r in results) if results else True
-        return {"ok": ok, "results": results, "dates": params.get("trade_dates") or []}
+        return {"ok": ok, "results": results, "dates": trade_dates}
     if action == "sync_financial_batch":
         result = sync_financial_batch(
             str(params.get("period") or ""),

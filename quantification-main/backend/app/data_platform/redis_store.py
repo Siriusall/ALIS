@@ -13,25 +13,35 @@ except Exception:  # pragma: no cover
     redis = None
 
 _client = None
-_disabled = False
+_last_connection_failure_at = 0.0
+_CLIENT_RETRY_SECONDS = 5.0
+_client_lock = threading.Lock()
 _worker_started = False
 
 
 def client():
-    global _client, _disabled
-    if _client is not None or _disabled or redis is None:
+    global _client, _last_connection_failure_at
+    if _client is not None or redis is None:
         return _client
-    try:
-        value = redis.Redis.from_url(
-            os.getenv("REDIS_URL", "redis://127.0.0.1:6379/0"),
-            socket_connect_timeout=0.5,
-            socket_timeout=1.0,
-            decode_responses=True,
-        )
-        value.ping()
-        _client = value
-    except Exception:
-        _disabled = True
+    if time.monotonic() - _last_connection_failure_at < _CLIENT_RETRY_SECONDS:
+        return None
+    with _client_lock:
+        if _client is not None:
+            return _client
+        if time.monotonic() - _last_connection_failure_at < _CLIENT_RETRY_SECONDS:
+            return None
+        try:
+            value = redis.Redis.from_url(
+                os.getenv("REDIS_URL", "redis://127.0.0.1:6379/0"),
+                socket_connect_timeout=0.5,
+                socket_timeout=1.0,
+                decode_responses=True,
+            )
+            value.ping()
+            _client = value
+            _last_connection_failure_at = 0.0
+        except Exception:
+            _last_connection_failure_at = time.monotonic()
     return _client
 
 

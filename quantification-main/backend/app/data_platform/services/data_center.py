@@ -72,7 +72,7 @@ TUSHARE_CATALOG: list[TushareCatalogItem] = [
     TushareCatalogItem("stock_basic", "基础", "股票基础信息", "股票主数据、行业初始分类、上市状态", "weekly", "ts_code,symbol,name,area,industry,market,list_date", {"exchange": "", "list_status": "L"}),
     TushareCatalogItem("trade_cal", "基础", "交易日历", "调度、回测、可用时间判断", "monthly", "exchange,cal_date,is_open,pretrade_date", {"exchange": "SSE"}),
     TushareCatalogItem("namechange", "基础", "曾用名", "ST/名称变更历史、治理风险辅助", "monthly", "ts_code,name,start_date,end_date,change_reason", {"ts_code": "000001.SZ"}),
-    TushareCatalogItem("daily", "行情", "A股日线", "价格、成交量、技术面和回测基础", "daily", "ts_code,trade_date,open,high,low,close,vol,amount", {"trade_date": ""}),
+    TushareCatalogItem("daily", "行情", "A股日线", "价格、成交量、技术面和回测基础", "daily", "ts_code,trade_date,open,high,low,close,pre_close,change,pct_chg,vol,amount", {"trade_date": ""}),
     TushareCatalogItem("weekly", "行情", "周线", "长线趋势辅助", "weekly", "ts_code,trade_date,open,high,low,close,vol,amount", {"ts_code": ""}),
     TushareCatalogItem("monthly", "行情", "月线", "长线趋势辅助", "monthly", "ts_code,trade_date,open,high,low,close,vol,amount", {"ts_code": ""}),
     TushareCatalogItem("adj_factor", "行情", "复权因子", "历史价格复权和收益计算", "daily", "ts_code,trade_date,adj_factor", {"ts_code": ""}),
@@ -1095,6 +1095,9 @@ def build_stock_daily_snapshot(trade_date: str) -> dict[str, Any]:
                     str(info.get("name") or ""),
                     str(info.get("industry") or ""),
                     close,
+                    _float_or_none(price.get("pct_chg")),
+                    _float_or_none(price.get("vol")),
+                    _float_or_none(price.get("amount")),
                     _float_or_none(basic.get("total_mv")),
                     _float_or_none(basic.get("circ_mv")),
                     _float_or_none(basic.get("pe_ttm")),
@@ -1147,13 +1150,13 @@ def _upsert_snapshot_row(c: Any, values: tuple[Any, ...]) -> None:
         c.execute(
             """
             INSERT INTO dc_stock_daily_snapshot
-                (ts_code, trade_date, symbol, name, industry, close, total_mv, circ_mv, pe_ttm, pb,
+                (ts_code, trade_date, symbol, name, industry, close, change_pct, volume, turnover, total_mv, circ_mv, pe_ttm, pb,
                  turnover_rate, up_limit, down_limit, is_suspended, data_quality_score, quality_flags_json,
                  source_code, available_time, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON DUPLICATE KEY UPDATE
                 symbol = VALUES(symbol), name = VALUES(name), industry = VALUES(industry),
-                close = VALUES(close), total_mv = VALUES(total_mv), circ_mv = VALUES(circ_mv),
+                close = VALUES(close), change_pct = VALUES(change_pct), volume = VALUES(volume), turnover = VALUES(turnover), total_mv = VALUES(total_mv), circ_mv = VALUES(circ_mv),
                 pe_ttm = VALUES(pe_ttm), pb = VALUES(pb), turnover_rate = VALUES(turnover_rate),
                 up_limit = VALUES(up_limit), down_limit = VALUES(down_limit), is_suspended = VALUES(is_suspended),
                 data_quality_score = VALUES(data_quality_score), quality_flags_json = VALUES(quality_flags_json),
@@ -1165,15 +1168,18 @@ def _upsert_snapshot_row(c: Any, values: tuple[Any, ...]) -> None:
         c.execute(
             """
             INSERT INTO dc_stock_daily_snapshot
-                (ts_code, trade_date, symbol, name, industry, close, total_mv, circ_mv, pe_ttm, pb,
+                (ts_code, trade_date, symbol, name, industry, close, change_pct, volume, turnover, total_mv, circ_mv, pe_ttm, pb,
                  turnover_rate, up_limit, down_limit, is_suspended, data_quality_score, quality_flags_json,
                  source_code, available_time, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(ts_code, trade_date) DO UPDATE SET
                 symbol = excluded.symbol,
                 name = excluded.name,
                 industry = excluded.industry,
                 close = excluded.close,
+                change_pct = excluded.change_pct,
+                volume = excluded.volume,
+                turnover = excluded.turnover,
                 total_mv = excluded.total_mv,
                 circ_mv = excluded.circ_mv,
                 pe_ttm = excluded.pe_ttm,

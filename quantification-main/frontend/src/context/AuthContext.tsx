@@ -11,6 +11,7 @@ import { login as apiLogin, register as apiRegister } from "../api/auth";
 interface AuthContextValue {
   user: UserInfo | null;
   loading: boolean;
+  serviceError: string | null;
   login: (username: string, password: string) => Promise<void>;
   register: (username: string, password: string) => Promise<void>;
   logout: () => void;
@@ -21,12 +22,16 @@ const AuthContext = createContext<AuthContextValue | null>(null);
 export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [user, setUser] = useState<UserInfo | null>(null);
   const [loading, setLoading] = useState(true);
+  const [serviceError, setServiceError] = useState<string | null>(null);
 
   useEffect(() => {
     let active = true;
     fetchCurrentUser()
       .then((u) => {
-        if (active) setUser(u ?? null);
+        if (active) { setUser(u ?? null); setServiceError(null); }
+      })
+      .catch(() => {
+        if (active) setServiceError("后端服务暂时不可用，请检查 PostgreSQL 和后端进程后重试。");
       })
       .finally(() => {
         if (active) setLoading(false);
@@ -34,6 +39,12 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     return () => {
       active = false;
     };
+  }, []);
+
+  useEffect(() => {
+    const expire = () => setUser(null);
+    window.addEventListener("alis:session-expired", expire);
+    return () => window.removeEventListener("alis:session-expired", expire);
   }, []);
 
   const login = useCallback(async (username: string, password: string) => {
@@ -55,7 +66,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     setUser(null);
   }, []);
 
-  const value: AuthContextValue = { user, loading, login, register, logout };
+  const value: AuthContextValue = { user, loading, serviceError, login, register, logout };
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
 }

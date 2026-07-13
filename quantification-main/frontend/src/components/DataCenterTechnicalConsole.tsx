@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   fetchDailyUpdateStatus, fetchDataCenterStatus, fetchDataObservability, fetchReadiness,
   fetchSimpleDataHealth, fetchDataAssets, startDailyUpdate, syncFinancialBatch, syncMarket, startWebFallbackCrawl,
@@ -28,8 +28,11 @@ export default function TechnicalConsole({ section }: { section: SectionKey }) {
   const [selectedConsumer, setSelectedConsumer] = useState("backtest");
   const [message, setMessage] = useState("");
   const [loading, setLoading] = useState(true);
+  const refreshRunning = useRef(false);
 
   async function refresh(quiet = false) {
+    if (refreshRunning.current) return;
+    refreshRunning.current = true;
     if (!quiet) setLoading(true);
     try {
       const results = await Promise.allSettled([
@@ -44,19 +47,14 @@ export default function TechnicalConsole({ section }: { section: SectionKey }) {
       if (failed?.status === "rejected") setMessage(failed.reason instanceof Error ? failed.reason.message : String(failed.reason));
       else setMessage("");
     }
-    finally { setLoading(false); }
+    finally { refreshRunning.current = false; setLoading(false); }
   }
   useEffect(() => { refresh(); }, []);
   useEffect(() => {
-    if (!update?.running) return;
+    if (!update?.running && section !== "logs") return;
     const timer = window.setInterval(() => refresh(true), 2000);
     return () => window.clearInterval(timer);
-  }, [update?.running]);
-  useEffect(() => {
-    if (section !== "logs") return;
-    const timer = window.setInterval(() => refresh(true), 2000);
-    return () => window.clearInterval(timer);
-  }, [section]);
+  }, [section, update?.running]);
 
   async function latestUpdate() {
     setMessage("");
@@ -155,6 +153,7 @@ function Repair(c: Ctx) {
   const [plan,setPlan]=useState<BackfillPlan|null>(null);
   const [backfill,setBackfill]=useState<BackfillStatus|null>(null);
   const [planning,setPlanning]=useState(false);
+  const backfillPollRunning=useRef(false);
 
   async function run(label:string, fn:()=>Promise<any>){
     setMsg(`${label}执行中…`);
@@ -213,6 +212,8 @@ function Repair(c: Ctx) {
     if(!backfill?.running) return;
     let cancelled=false;
     const timer=window.setInterval(async()=>{
+      if(backfillPollRunning.current) return;
+      backfillPollRunning.current=true;
       try{
         const status=await fetchBackfillStatus();
         if(cancelled) return;
@@ -221,7 +222,7 @@ function Repair(c: Ctx) {
           window.clearInterval(timer);
           await finishBackfill(status);
         }
-      }catch{/* ignore poll errors */}
+      }catch{/* ignore poll errors */}finally{backfillPollRunning.current=false}
     },2000);
     return ()=>{cancelled=true; window.clearInterval(timer);};
   },[backfill?.running]);

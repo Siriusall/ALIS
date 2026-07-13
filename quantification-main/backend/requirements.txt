@@ -11,6 +11,7 @@ tushare==1.4.24
 pymysql>=1.1.0
 psycopg[binary]>=3.2.0
 redis
+pytest>=8.0.0
 # Fixed cross-sectional model dependency; installation is validated separately
 # because SciPy/LightGBM wheels are platform-specific on Python 3.11.
 scipy>=1.13,<2

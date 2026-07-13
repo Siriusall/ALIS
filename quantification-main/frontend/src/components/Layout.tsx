@@ -1,7 +1,7 @@
-import React, { ReactNode, useEffect, useState } from "react";
+import React, { ReactNode, Suspense, useEffect, useState } from "react";
 import type { UserInfo } from "../api/auth";
 
-const NAV_ITEMS = [
+export const NAV_ITEMS = [
   { id: "market", label: "市场总览", group: "研究" },
   { id: "dataCenter", label: "数据中台", group: "研究" },
   { id: "stockResearch", label: "股票研究", group: "研究" },
@@ -24,8 +24,12 @@ const NAV_ITEMS = [
 
 export type SectionId = (typeof NAV_ITEMS)[number]["id"];
 
+export function isSectionId(value: string | undefined): value is SectionId {
+  return NAV_ITEMS.some((item) => item.id === value);
+}
+
 interface LayoutProps {
-  children: ReactNode;
+  sections: Partial<Record<SectionId, ReactNode>>;
   header: ReactNode;
   /** 当前选中的板块，由父组件控制 */
   currentSection: SectionId;
@@ -39,7 +43,7 @@ interface LayoutProps {
 
 /** 子组件顺序须与 NAV_ITEMS 一致。 */
 export default function Layout({
-  children,
+  sections,
   header,
   currentSection,
   onSectionChange,
@@ -49,9 +53,7 @@ export default function Layout({
   onRegisterClick,
 }: LayoutProps) {
   const [sidebarOpen, setSidebarOpen] = useState(false);
-  const childArray = React.Children.toArray(children);
-  const index = NAV_ITEMS.findIndex((item) => item.id === currentSection);
-  const currentChild = index >= 0 ? childArray[index] : childArray[0];
+  const currentChild = sections[currentSection] ?? sections.market;
 
   useEffect(() => {
     const onResize = () => {
@@ -132,7 +134,11 @@ export default function Layout({
         </aside>
         <div className="dashboard-main">
           <header className="dashboard-header">{header}</header>
-          <div className="dashboard-content">{currentChild}</div>
+          <div className="dashboard-content">
+            <Suspense fallback={<div className="auth-loading">模块加载中…</div>}>
+              {currentChild}
+            </Suspense>
+          </div>
         </div>
       </div>
     </div>

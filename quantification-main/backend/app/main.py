@@ -1,8 +1,9 @@
 import logging
 import sys
 import time
+from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.routes import (
@@ -26,10 +27,13 @@ from app.api.routes import (
     strategies,
 )
 from app.core.config import settings
-from app.db.store import init_db
+from app.db.store import database_health as primary_database_health, init_db
 from app.services.quant_task_runner import resume_quant_tasks_on_startup, start_auto_simulation_scheduler
+from app.services.model_governance_scheduler import start_model_governance_scheduler
+from app.data_platform.db import database_health as data_platform_database_health
 from app.data_platform.db import init_db as init_data_platform_db
 from app.data_platform.redis_store import start_task_worker
+from app.data_platform.redis_store import health as redis_health
 from app.data_platform.routes.data_center import router as data_center_router
 from app.data_platform.services.backfill import process_stream_task, recover_interrupted_backfill
 from app.data_platform.services.runtime_logs import write_runtime_log
@@ -43,10 +47,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger("quant")
 
-app = FastAPI(title=settings.app_name)
-
-
-@app.on_event("startup")
 def startup() -> None:
     """Keep service startup light.
 
@@ -63,6 +63,7 @@ def startup() -> None:
         if paused > 0:
             logger.info("Paused interrupted quant tasks on startup: %d", paused)
         start_auto_simulation_scheduler()
+        start_model_governance_scheduler()
     except Exception as exc:  # noqa: BLE001
         logger.warning("Failed to reconcile interrupted quant tasks: %s", str(exc)[:120])
     try:
@@ -76,35 +77,66 @@ def startup() -> None:
     logger.info("Service startup completed in %.3fs. Use POST /api/init to refresh market data.", time.perf_counter() - startup_t0)
 
 
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    startup()
+    yield
+
+
+app = FastAPI(title=settings.app_name, lifespan=lifespan)
+
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=settings.allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 app.include_router(auth.router, prefix="/api")
-app.include_router(account.router, prefix="/api")
-app.include_router(strategies.router, prefix="/api")
-app.include_router(overview.router, prefix="/api")
-app.include_router(candidates.router, prefix="/api")
-app.include_router(signals.router, prefix="/api")
-app.include_router(execute.router, prefix="/api")
-app.include_router(equity.router, prefix="/api")
-app.include_router(positions.router, prefix="/api")
-app.include_router(backtest.router, prefix="/api")
-app.include_router(logs.router, prefix="/api")
-app.include_router(check.router, prefix="/api")
-app.include_router(data_center_router, prefix="/api")
-app.include_router(decision.router, prefix="/api")
-app.include_router(factors.router, prefix="/api")
-app.include_router(init_routes.router, prefix="/api")
-app.include_router(quant_runs.router, prefix="/api")
-app.include_router(model_strategy.router, prefix="/api")
-app.include_router(research.router, prefix="/api")
+protected_dependencies = [Depends(auth.require_current_user)]
+for protected_router in (
+    account.router,
+    strategies.router,
+    overview.router,
+    candidates.router,
+    signals.router,
+    execute.router,
+    equity.router,
+    positions.router,
+    backtest.router,
+    logs.router,
+    check.router,
+    data_center_router,
+    decision.router,
+    factors.router,
+    init_routes.router,
+    quant_runs.router,
+    model_strategy.router,
+    research.router,
+):
+    app.include_router(
+        protected_router,
+        prefix="/api",
+        dependencies=protected_dependencies,
+    )
 
 
 @app.get("/api/health")
 def health() -> dict:
-    return {"status": "ok"}
+    primary = primary_database_health()
+    data_platform = data_platform_database_health()
+    ready = primary.get("status") == "ok" and data_platform.get("status") == "ok"
+    redis = redis_health()
+    return {
+        "status": "ok" if ready else "error",
+        "ready": ready,
+        "degraded": ready and not redis.get("available", False),
+        "issues": [] if redis.get("available", False) else ["Redis unavailable: durable stream tasks are disabled"],
+        "dependencies": {
+            "primary_database": primary,
+            "data_platform_database": data_platform,
+            "redis": redis,
+        },
+    }

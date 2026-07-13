@@ -1,10 +1,6 @@
-import axios from "axios";
+import { api } from "./client";
 import type { DataHealthReport } from "../types";
 import type { ModelStrategyStatus } from "./modelStrategy";
-
-const api = axios.create({
-  baseURL: import.meta.env.VITE_API_BASE || "",
-});
 
 export interface DecisionGate {
   tone: "go" | "hold" | "stop";
@@ -23,7 +19,49 @@ export interface DecisionLedger {
   cash_pct: number;
   max_position_pct: number;
   max_position_symbol: string;
+  initial_cash: number;
+  high_water_mark: number;
+  drawdown: number;
   account_risks: Array<{ code: string; level: string; message: string }>;
+}
+
+export interface DecisionMarketOverview {
+  ok: boolean;
+  status: string;
+  reason?: string;
+  trade_date?: string;
+  available_time?: string;
+  market_state: null | {
+    state: string;
+    label: string;
+    confidence: number;
+    model: string;
+    reason: string;
+    risk_budget_multiplier: number;
+  };
+  sentiment: null | {
+    score: number;
+    state: string;
+    crowding_penalty: number;
+    components: Record<string, number>;
+  };
+  observations?: Record<string, number>;
+  evidence?: { latest_date?: string; previous_date?: string; symbols?: number; amount_dates?: number };
+  portfolio_risk?: {
+    ok?: boolean;
+    status?: string;
+    breaches?: Array<{ code?: string; level?: string; message?: string }>;
+    limitations?: string[];
+  };
+  position_gate?: {
+    allow_new_exposure: boolean;
+    market_multiplier: number;
+    portfolio_multiplier: number;
+    combined_risk_budget_multiplier: number;
+    reason: string;
+  };
+  themes: { status: string; items: Array<{ theme: string; score: number; state: string }>; reason?: string };
+  limitations: string[];
 }
 
 export interface DecisionExecutionOperation {
@@ -61,6 +99,7 @@ export interface DecisionSummary {
   data_health: DataHealthReport;
   ledger: DecisionLedger;
   model_status: ModelStrategyStatus;
+  market_overview: DecisionMarketOverview;
   gate_decision: DecisionGate;
   recent_execution: DecisionRecentExecution | null;
   latest_model_validation: DecisionModelValidation | null;

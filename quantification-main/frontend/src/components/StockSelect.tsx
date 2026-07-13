@@ -1,8 +1,9 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { Candidate, Strategy } from "../types";
 import { fetchAccount } from "../api/account";
 import { fetchCandidates, fetchQuantRunStatus } from "../api/market";
 import { fetchStrategies } from "../api/strategies";
+import { apiErrorMessage } from "../api/client";
 
 type ExchangeFilter = "ALL" | "HS" | "CYB" | "BJ";
 
@@ -28,6 +29,7 @@ export default function StockSelect() {
   const [quantRunning, setQuantRunning] = useState(false);
   const [exchange, setExchange] = useState<ExchangeFilter>("HS");
   const [error, setError] = useState("");
+  const statusPollRunning = useRef(false);
 
   useEffect(() => {
     let active = true;
@@ -64,6 +66,8 @@ export default function StockSelect() {
   useEffect(() => {
     let active = true;
     const pull = async () => {
+      if (statusPollRunning.current) return;
+      statusPollRunning.current = true;
       try {
         const st = await fetchQuantRunStatus();
         if (!active) return;
@@ -71,6 +75,8 @@ export default function StockSelect() {
       } catch {
         if (!active) return;
         setQuantRunning(false);
+      } finally {
+        statusPollRunning.current = false;
       }
     };
     pull();
@@ -94,9 +100,9 @@ export default function StockSelect() {
         if (!active) return;
         setCandidates(res.candidates);
         setCandidateWarnings(res.warnings ?? []);
-      } catch {
+      } catch (error) {
         if (!active) return;
-        setError("选股数据加载失败");
+        setError(apiErrorMessage(error, "选股数据加载失败"));
         setCandidates([]);
         setCandidateWarnings([]);
       } finally {

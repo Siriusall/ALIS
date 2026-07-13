@@ -1,4 +1,4 @@
-import axios from "axios";
+import { api } from "./client";
 import type {
   QuantAnalyzeResponse,
   QuantExecuteBuyResponse,
@@ -10,10 +10,6 @@ import type {
   QuantTaskRunDetailResponse,
   QuantTaskItem,
 } from "../types";
-
-const api = axios.create({
-  baseURL: import.meta.env.VITE_API_BASE || "",
-});
 
 export interface QuantRunStartPayload {
   strategy_id: number;

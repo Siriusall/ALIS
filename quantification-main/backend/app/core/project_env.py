@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from dotenv import load_dotenv
+from dotenv import dotenv_values, load_dotenv
 
 _PROJECT_ROOT: Path | None = None
 _ENV_LOADED = False
@@ -43,12 +43,26 @@ def get_primary_env_path() -> Path:
 
 
 def load_project_env(*, override: bool = False) -> list[Path]:
-    """Load .env from project root and backend/.env once per process."""
+    """Load .env from project root and backend/.env once per process.
+
+    A non-empty operating-system variable always wins unless ``override`` is
+    explicitly requested.  An empty inherited variable is treated as unset so
+    it cannot accidentally mask a value newly added to the project ``.env``
+    while the service is running under a launcher.
+    """
 
     global _ENV_LOADED
     loaded: list[Path] = []
     for env_path in get_env_file_paths():
-        load_dotenv(env_path, override=override)
+        if override:
+            load_dotenv(env_path, override=True)
+        else:
+            # python-dotenv's ``override=False`` considers an empty string a
+            # configured value.  That prevents a real token in .env from
+            # taking effect when a launcher exported ``TUSHARE_TOKEN=``.
+            for key, value in dotenv_values(env_path).items():
+                if value is not None and not os.getenv(key, "").strip():
+                    os.environ[key] = value
         loaded.append(env_path)
 
     if not loaded and not _ENV_LOADED:

@@ -61,8 +61,24 @@ def compare_champion_challenger(champion: dict[str, Any], challenger: dict[str, 
     cm, xm = champion.get("metrics") or {}, challenger.get("metrics") or {}
     keys = ("lift", "walk_forward_lift", "hit_rate", "walk_forward_hit_rate")
     deltas = {key: round(float(xm.get(key, 0) or 0) - float(cm.get(key, 0) or 0), 6) for key in keys}
-    challenger_wins = deltas["lift"] > 0 and deltas["walk_forward_lift"] > 0 and deltas["hit_rate"] >= -0.02
-    return {"champion_id": champion.get("id"), "challenger_id": challenger.get("id"), "deltas": deltas, "decision": "promote_challenger" if challenger_wins else "keep_champion"}
+    validation = challenger.get("validation") or {}
+    gates = {
+        "validation_passed": str(validation.get("status")) == "passed",
+        "holdout_lift_positive": float(xm.get("lift", 0) or 0) > 0,
+        "walk_forward_lift_positive": float(xm.get("walk_forward_lift", 0) or 0) > 0,
+        "hit_rate_not_materially_lower": deltas["hit_rate"] >= -0.02,
+    }
+    config_a, config_b = champion.get("config") or {}, challenger.get("config") or {}
+    config_keys = sorted(set(config_a) | set(config_b))
+    config_diff = {key: {"champion": config_a.get(key), "challenger": config_b.get(key)} for key in config_keys if config_a.get(key) != config_b.get(key)}
+    reasons = [key for key, passed in gates.items() if not passed]
+    return {
+        "champion_id": champion.get("id"), "challenger_id": challenger.get("id"),
+        "champion_version": champion.get("version"), "challenger_version": challenger.get("version"),
+        "deltas": deltas, "config_diff": config_diff, "gates": gates,
+        "decision": "promote_challenger" if not reasons else "keep_champion",
+        "blocked_reasons": reasons,
+    }
 
 
 def models_root() -> Path:

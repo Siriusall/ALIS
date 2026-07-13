@@ -17,8 +17,10 @@ if (-not (Test-Path (Join-Path $frontendDir "node_modules"))) {
   throw "Frontend node_modules is not ready."
 }
 
-Start-Process powershell -ArgumentList @(
-  "-NoExit",
+& (Join-Path $root "scripts\start_redis.ps1")
+
+Start-Process powershell -WindowStyle Hidden -ArgumentList @(
+  "-NoProfile",
   "-ExecutionPolicy",
   "Bypass",
   "-Command",
@@ -27,8 +29,8 @@ Start-Process powershell -ArgumentList @(
 
 Start-Sleep -Seconds 2
 
-Start-Process powershell -ArgumentList @(
-  "-NoExit",
+Start-Process powershell -WindowStyle Hidden -ArgumentList @(
+  "-NoProfile",
   "-ExecutionPolicy",
   "Bypass",
   "-Command",

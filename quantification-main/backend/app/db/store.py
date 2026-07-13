@@ -150,7 +150,11 @@ def _conn():
         if url.startswith("postgresql+psycopg://"):
             url = url.replace("postgresql+psycopg://", "postgresql://", 1)
         logger.debug("PostgreSQL 连接: %s", url.split("@")[-1])
-        raw = psycopg.connect(url, row_factory=dict_row)
+        raw = psycopg.connect(
+            url,
+            row_factory=dict_row,
+            connect_timeout=settings.database_connect_timeout_seconds,
+        )
         try:
             w = _ConnWrapper(raw, is_mysql=False, is_postgres=True)
             yield w
@@ -526,7 +530,7 @@ CREATE TABLE IF NOT EXISTS account (
     balance REAL NOT NULL DEFAULT 0,
     high_water_mark REAL NOT NULL DEFAULT 0
 );
-INSERT OR IGNORE INTO account (id, balance, high_water_mark) VALUES (1, 100000.0, 100000.0);
+INSERT OR IGNORE INTO account (id, balance, high_water_mark) VALUES (1, 200000.0, 200000.0);
 CREATE TABLE IF NOT EXISTS positions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     symbol TEXT NOT NULL UNIQUE,
@@ -808,7 +812,45 @@ def init_db() -> None:
         with _conn() as c:
             logger.info("数据库连接成功，正在建表...")
             if _is_postgres():
-                logger.info("数据库: PostgreSQL；使用已迁移schema，跳过SQLite/MySQL建表脚本")
+                logger.info("数据库: PostgreSQL；校验并补齐运行 schema")
+                postgres_ddl = _SQLITE_DDL.replace(
+                    "INTEGER PRIMARY KEY AUTOINCREMENT", "BIGSERIAL PRIMARY KEY"
+                ).replace(
+                    "INSERT OR IGNORE INTO account", "INSERT INTO account"
+                ).replace(
+                    "VALUES (1, 200000.0, 200000.0);",
+                    "VALUES (1, 200000.0, 200000.0) ON CONFLICT (id) DO NOTHING;",
+                )
+                c.executescript(postgres_ddl)
+                c.executescript("""
+                ALTER TABLE positions ADD COLUMN IF NOT EXISTS name VARCHAR(255) NOT NULL DEFAULT '';
+                ALTER TABLE positions ADD COLUMN IF NOT EXISTS bought_at VARCHAR(32) NULL;
+                ALTER TABLE operations ADD COLUMN IF NOT EXISTS name VARCHAR(255) NOT NULL DEFAULT '';
+                ALTER TABLE operations ALTER COLUMN execution_id DROP NOT NULL;
+                ALTER TABLE quant_run_task_runs ADD COLUMN IF NOT EXISTS detail_json TEXT NULL;
+                CREATE TABLE IF NOT EXISTS quant_run_task_meta (
+                    task_id BIGINT PRIMARY KEY REFERENCES quant_run_tasks(id),
+                    strategy_snapshot_json TEXT NOT NULL,
+                    risk_config_json TEXT NOT NULL,
+                    created_at VARCHAR(64) NOT NULL,
+                    updated_at VARCHAR(64) NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS quant_run_task_health (
+                    task_id BIGINT PRIMARY KEY REFERENCES quant_run_tasks(id),
+                    heartbeat_at VARCHAR(64),
+                    last_step_latency_ms BIGINT NOT NULL DEFAULT 0,
+                    avg_step_latency_ms BIGINT NOT NULL DEFAULT 0,
+                    step_count INTEGER NOT NULL DEFAULT 0,
+                    risk_hit_count INTEGER NOT NULL DEFAULT 0,
+                    consecutive_pause_count INTEGER NOT NULL DEFAULT 0,
+                    last_risk_code VARCHAR(64) NOT NULL DEFAULT '',
+                    updated_at VARCHAR(64) NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_ops_execution_at ON operations (execution_id, at);
+                CREATE INDEX IF NOT EXISTS idx_ops_symbol_at ON operations (symbol, at);
+                CREATE INDEX IF NOT EXISTS idx_task_runs_task_execute ON quant_run_task_runs (task_id, execute_date);
+                CREATE INDEX IF NOT EXISTS idx_tasks_status_updated ON quant_run_tasks (status, updated_at);
+                """)
                 c.execute("ALTER TABLE account ADD COLUMN IF NOT EXISTS high_water_mark DOUBLE PRECISION NOT NULL DEFAULT 0")
                 c.execute("UPDATE account SET high_water_mark = GREATEST(high_water_mark, balance) WHERE id = 1")
                 # A previous SQLite/MySQL migration can leave PostgreSQL
@@ -817,7 +859,7 @@ def init_db() -> None:
                 # an existing primary key.
                 for table in ("backtests", "executions", "operations", "quant_run_tasks", "quant_run_task_runs"):
                     c.execute(
-                        "SELECT setval(pg_get_serial_sequence(%s, 'id'), COALESCE((SELECT MAX(id) FROM " + table + "), 1), true)",
+                        "SELECT setval(pg_get_serial_sequence(%s, 'id'), COALESCE((SELECT MAX(id) FROM " + table + "), 1), EXISTS (SELECT 1 FROM " + table + "))",
                         (table,),
                     )
                 c.execute("""CREATE TABLE IF NOT EXISTS quant_performance_reports (
@@ -872,6 +914,7 @@ def init_db() -> None:
                     market_state_json TEXT NOT NULL, research_state_json TEXT NOT NULL,
                     valuation_json TEXT NOT NULL, portfolio_context_json TEXT NOT NULL,
                     reason TEXT NOT NULL, invalidation_conditions_json TEXT NOT NULL,
+                    evidence_hash VARCHAR(128) NOT NULL DEFAULT '', evidence_schema_version VARCHAR(64) NOT NULL DEFAULT 'evidence_freeze_v1',
                     created_at VARCHAR(64) NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_decision_symbol_time ON decision_snapshots(ts_code,decision_time);
@@ -906,6 +949,9 @@ def init_db() -> None:
                 _migrate_quant_task_perf_schema(c)
                 _migrate_quant_task_status_semantics(c)
                 _migrate_quant_run_task_detail_json(c)
+            else:
+                c.execute("ALTER TABLE decision_snapshots ADD COLUMN IF NOT EXISTS evidence_hash VARCHAR(128) NOT NULL DEFAULT ''")
+                c.execute("ALTER TABLE decision_snapshots ADD COLUMN IF NOT EXISTS evidence_schema_version VARCHAR(64) NOT NULL DEFAULT 'evidence_freeze_v1'")
             cur = c.execute(
                 "SELECT id FROM strategies WHERE name = ?", (_DEFAULT_STRATEGY_NAME,)
             )
@@ -925,6 +971,19 @@ def init_db() -> None:
     except Exception as e:
         logger.exception("数据库初始化失败: %s", e)
         raise
+
+
+def database_health() -> dict[str, Any]:
+    """Run a cheap readiness probe against the configured primary database."""
+    try:
+        with _conn() as conn:
+            conn.execute("SELECT 1").fetchone()
+        return {
+            "status": "ok",
+            "engine": "postgresql" if _is_postgres() else "mysql",
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {"status": "error", "error": str(exc)[:200]}
 
 
 def get_default_strategy_id() -> Optional[int]:

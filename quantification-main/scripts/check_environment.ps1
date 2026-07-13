@@ -30,18 +30,29 @@ function Write-Check {
 Write-Host "Quantification environment check" -ForegroundColor Cyan
 Write-Host ("Root: {0}" -f $root) -ForegroundColor DarkCyan
 
-$py311Ok = $false
-$py311Detail = ""
-try {
-  $py311Detail = (py -3.11 --version 2>&1 | Out-String).Trim()
-  $py311Ok = $LASTEXITCODE -eq 0 -and $py311Detail -match "Python 3\.11"
-} catch {
-  $py311Detail = $_.Exception.Message
-}
-Write-Check "Python 3.11 launcher" $py311Ok $py311Detail "Install Python 3.11, then run: npm run install:backend"
-
 $venvOk = Test-Path $venvPython
 Write-Check "Backend virtualenv" $venvOk $venvPython "Run: npm run install:backend"
+
+$py311Ok = $false
+$py311Detail = ""
+if ($venvOk) {
+  $py311Detail = (& $venvPython --version 2>&1 | Out-String).Trim()
+  $py311Ok = $LASTEXITCODE -eq 0 -and $py311Detail -match "Python 3\.11"
+} else {
+  $uv = Get-Command uv -ErrorAction SilentlyContinue
+  try {
+    if ($uv) {
+      $py311Detail = (& $uv.Source python find 3.11 2>&1 | Out-String).Trim()
+      $py311Ok = $LASTEXITCODE -eq 0 -and [bool]$py311Detail
+    } else {
+      $py311Detail = (py -3.11 --version 2>&1 | Out-String).Trim()
+      $py311Ok = $LASTEXITCODE -eq 0 -and $py311Detail -match "Python 3\.11"
+    }
+  } catch {
+    $py311Detail = $_.Exception.Message
+  }
+}
+Write-Check "Python 3.11 runtime" $py311Ok $py311Detail "Install Python 3.11 or uv, then run: npm run install:backend"
 
 if ($venvOk) {
   $fastapiOk = $false
@@ -53,6 +64,19 @@ if ($venvOk) {
     $fastapiDetail = $_.Exception.Message
   }
   Write-Check "Backend imports" $fastapiOk $fastapiDetail "Run: npm run install:backend"
+
+  $dbOk = $false
+  $dbDetail = ""
+  try {
+    Push-Location $backendDir
+    $dbDetail = (& $venvPython -c "from app.db.store import database_health; from app.data_platform.db import database_health as data_health; print({'primary': database_health(), 'data_platform': data_health()})" 2>&1 | Out-String).Trim()
+    $dbOk = $LASTEXITCODE -eq 0 -and $dbDetail -match "'status': 'ok'"
+  } catch {
+    $dbDetail = $_.Exception.Message
+  } finally {
+    Pop-Location -ErrorAction SilentlyContinue
+  }
+  Write-Check "PostgreSQL databases" $dbOk $dbDetail "Start PostgreSQL and verify DATABASE_URL / DATA_PLATFORM_DATABASE_URL in .env."
 }
 
 $reqOk = Test-Path $backendRequirements

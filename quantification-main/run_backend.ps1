@@ -15,6 +15,8 @@ if (-not (Test-Path $venvPython)) {
   throw "Python 3.11 backend environment is not ready."
 }
 
+& (Join-Path $root "scripts\start_redis.ps1")
+
 Set-Location $backendDir
 Write-Host "Backend: http://127.0.0.1:8000" -ForegroundColor Green
 & $venvPython -m uvicorn app.main:app --host 127.0.0.1 --port 8000

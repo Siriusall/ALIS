@@ -29,6 +29,7 @@ backend/.cache/
 # 构建产物
 frontend/dist/
 backend/build/
+.runtime/
 
 # IDE
 .idea/

@@ -63,7 +63,6 @@ def get_cache_all(
 
     from app.services.cache_consolidation import (
         MAX_SYMBOL_ROWS_PER_REQUEST,
-        build_consolidated_cache_bundle,
         compute_factor_coverage,
         read_consolidated_cache,
     )
@@ -80,7 +79,14 @@ def get_cache_all(
     symbol_list = [s.strip() for s in symbols.split(",") if s.strip()] if symbols else None
     payload = read_consolidated_cache(date=date, symbols=symbol_list)
     if payload is None:
-        payload = build_consolidated_cache_bundle(trade_date=date)
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={
+                "code": "postgres_snapshot_not_found",
+                "message": "No PostgreSQL market snapshot exists for this date. Run data-center sync/backfill first.",
+                "date": date,
+            },
+        )
 
     counts = payload.get("counts") or {}
     rows = int(counts.get("symbol_rows") or 0)
@@ -114,30 +120,19 @@ def get_cache_all(
 def post_init_full_sync(
     all_in_one_only: bool = Query(default=True, description="Clean source caches after full sync."),
 ) -> dict:
-    """Trigger historical all-in-one cache merge in the background."""
-
-    from app.services.cache_consolidation import get_full_sync_status, run_full_sync_background
-
-    started = run_full_sync_background(skip_existing=True, cleanup_sources=all_in_one_only)
-    if started:
-        return {
-            "ok": True,
-            "message": "Full-sync started. Check GET /api/init/full-sync/status for progress.",
-        }
+    """PostgreSQL is already the historical source of truth; no file merge runs."""
     return {
-        "ok": False,
-        "message": "A full-sync task is already running or recently finished.",
-        "status": get_full_sync_status(),
+        "ok": True,
+        "started": False,
+        "storage": "postgresql",
+        "message": "No all-in-one file merge is required. Use data-center backfill to extend PostgreSQL history.",
     }
 
 
 @router.get("/init/full-sync/status")
 def get_init_full_sync_status() -> dict:
-    """Return full-sync task status: idle/running/completed/failed."""
-
-    from app.services.cache_consolidation import get_full_sync_status
-
-    return get_full_sync_status()
+    """Return PostgreSQL canonical-storage status for legacy callers."""
+    return {"status": "not_required", "storage": "postgresql", "message": "Historical data is read directly from PostgreSQL."}
 
 
 @router.post("/init/backfill-merge-meta")
@@ -147,13 +142,10 @@ def post_init_backfill_merge_meta(
 ) -> dict:
     """Manually backfill all-in-one merge metadata."""
 
-    from app.services.cache_consolidation import (
-        backfill_merge_meta_for_existing_all_in_one,
-        trigger_backfill_merge_meta_async,
-    )
-
-    if async_run:
-        result = trigger_backfill_merge_meta_async(reason="manual_api", force=force)
-        return {"ok": True, **result}
-    result = backfill_merge_meta_for_existing_all_in_one(force=force)
-    return {"ok": True, "started": False, "running": False, "result": result}
+    return {
+        "ok": True,
+        "started": False,
+        "running": False,
+        "storage": "postgresql",
+        "message": "Merge metadata belongs to retired file caches and is not required.",
+    }

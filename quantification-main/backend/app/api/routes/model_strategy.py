@@ -1,16 +1,19 @@
 from __future__ import annotations
 
 import threading
+from typing import Any
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
-from app.db.store import create_model_train_run, get_active_model_version, get_model_version, list_model_versions, set_active_model_version
+from app.db.store import create_model_train_run, get_active_model_version, get_model_version, set_active_model_version
 from app.services.model_registry import compare_champion_challenger, evaluate_model_drift, get_model_constitution, get_model_status, get_train_run_status
+from app.services.model_governance_scheduler import auto_tune_models_once
 from app.services.model_training import run_model_training
 from app.services.quant_risk import bocpd_change_probability, constrained_cvar_weights, garch11_forecast, historical_cvar, hrp_fallback_weights, hsmm_regime, kalman_level, ledoit_wolf_covariance
-from app.services.market_context import live_market_context, score_market_sentiment, score_theme_narratives
+from app.services.market_context import live_market_context, market_context_history, rebuild_market_context_history, score_market_sentiment, score_theme_narratives
 from app.services.strategy_gate import evaluate_strategy_gate
+from app.services.advanced_controls import black_litterman_weights, evaluate_slo, multi_period_oos_report
 
 router = APIRouter()
 
@@ -61,6 +64,23 @@ class StrategyGateRequest(BaseModel):
     theme_verified: bool = False
 
 
+class BlackLittermanRequest(BaseModel):
+    prior_weights: dict[str, float] = Field(default_factory=dict)
+    views: dict[str, float] = Field(default_factory=dict)
+    confidences: dict[str, float] = Field(default_factory=dict)
+    max_weight: float = Field(.25, gt=0, le=1)
+
+
+class SLORequest(BaseModel):
+    samples: list[dict[str, Any]] = Field(default_factory=list, max_length=10000)
+    freshness_seconds: float = Field(86400, gt=0)
+    success_target: float = Field(.99, gt=0, le=1)
+
+
+class OOSReportRequest(BaseModel):
+    periods: list[dict[str, Any]] = Field(default_factory=list, max_length=1000)
+
+
 @router.get("/model-strategy/status")
 def model_strategy_status() -> dict:
     return get_model_status()
@@ -109,6 +129,16 @@ def model_strategy_live_market_context() -> dict:
     return live_market_context()
 
 
+@router.get("/model-strategy/market-context/history")
+def model_strategy_market_context_history(limit: int = 120) -> dict:
+    return market_context_history(limit=max(1, min(500, limit)))
+
+
+@router.post("/model-strategy/market-context/rebuild-history")
+def model_strategy_rebuild_market_context_history(limit: int = 120) -> dict:
+    return rebuild_market_context_history(limit=limit)
+
+
 @router.post("/model-strategy/gate")
 def model_strategy_gate(req: StrategyGateRequest) -> dict:
     return evaluate_strategy_gate(**req.model_dump())
@@ -125,6 +155,21 @@ def model_strategy_portfolio_risk(req: PortfolioRiskRequest) -> dict:
         weights = hrp_fallback_weights(observations, max_single=req.max_single)
         optimizer = "hrp_inverse_volatility_fallback_v1"
     return {"optimizer": optimizer, "weights": weights, "covariance": covariance, "weight_sum": round(sum(weights.values()), 8)}
+
+
+@router.post("/model-strategy/black-litterman")
+def model_strategy_black_litterman(req: BlackLittermanRequest) -> dict:
+    return black_litterman_weights(req.prior_weights, req.views, req.confidences, max_weight=req.max_weight)
+
+
+@router.post("/model-strategy/slo/evaluate")
+def model_strategy_slo(req: SLORequest) -> dict:
+    return evaluate_slo(req.samples, freshness_seconds=req.freshness_seconds, success_target=req.success_target)
+
+
+@router.post("/model-strategy/oos/report")
+def model_strategy_oos_report(req: OOSReportRequest) -> dict:
+    return multi_period_oos_report(req.periods)
 
 
 @router.post("/model-strategy/drift")
@@ -146,6 +191,21 @@ def model_strategy_promote(model_version_id: int) -> dict:
     return {"ok": True, "model_version_id": model_version_id, "status": "active"}
 
 
+@router.post("/model-strategy/rollback/{model_version_id}")
+def model_strategy_rollback(model_version_id: int) -> dict:
+    """Return to a previously validated version without bypassing promotion gates."""
+    target = get_model_version(model_version_id)
+    if not target:
+        raise HTTPException(status_code=404, detail="模型版本不存在")
+    validation = target.get("validation") or {}
+    metrics = target.get("metrics") or {}
+    if str(validation.get("status")) != "passed" or float(metrics.get("lift", 0) or 0) <= 0 or float(metrics.get("walk_forward_lift", 0) or 0) <= 0:
+        raise HTTPException(status_code=409, detail="只能回退到已通过验证的模型版本")
+    previous = get_active_model_version("main")
+    set_active_model_version(model_version_id)
+    return {"ok": True, "status": "rolled_back", "previous_model_version_id": previous.get("id") if previous else None, "model_version_id": model_version_id}
+
+
 @router.post("/model-strategy/compare")
 def model_strategy_compare(champion_id: int, challenger_id: int) -> dict:
     champion = get_model_version(champion_id)
@@ -158,16 +218,7 @@ def model_strategy_compare(champion_id: int, challenger_id: int) -> dict:
 @router.post("/model-strategy/auto-tune")
 def model_strategy_auto_tune() -> dict:
     """Evaluate candidate versions and promote at most one safe challenger."""
-    champion = get_active_model_version("main")
-    candidates = [x for x in list_model_versions("main", limit=50) if not x.get("is_active") and str(x.get("status")) in {"candidate", "watch"}]
-    if not champion:
-        return {"decision": "no_champion", "evaluated": 0}
-    evaluations = [compare_champion_challenger(champion, candidate) for candidate in candidates]
-    winner = next((x for x in evaluations if x.get("decision") == "promote_challenger"), None)
-    if winner:
-        set_active_model_version(int(winner["challenger_id"]))
-        return {"decision": "promoted", "evaluated": len(evaluations), "winner": winner, "champion_id": champion.get("id")}
-    return {"decision": "keep_champion", "evaluated": len(evaluations), "evaluations": evaluations, "champion_id": champion.get("id")}
+    return auto_tune_models_once()
 
 
 @router.get("/model-strategy/train-runs/{run_id}")

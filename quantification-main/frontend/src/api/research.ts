@@ -1,3 +1,5 @@
+import { apiFetch } from "./client";
+
 export type CapabilityStatus = "ready" | "partial" | "building" | "missing";
 
 export interface ResearchCapability {
@@ -15,7 +17,7 @@ export interface ResearchCapabilitiesResponse {
 }
 
 export async function fetchResearchCapabilities(): Promise<ResearchCapabilitiesResponse> {
-  const response = await fetch("/api/research/capabilities");
+  const response = await apiFetch("/api/research/capabilities");
   if (!response.ok) throw new Error(`能力状态读取失败（HTTP ${response.status}）`);
   return response.json();
 }
@@ -35,7 +37,7 @@ export interface StockResearchResult {
 }
 
 export async function fetchStockResearch(tsCode: string): Promise<StockResearchResult> {
-  const response = await fetch(`/api/research/stocks/${encodeURIComponent(tsCode)}`);
+  const response = await apiFetch(`/api/research/stocks/${encodeURIComponent(tsCode)}`);
   if (!response.ok) throw new Error(`股票研究读取失败（HTTP ${response.status}）`);
   return response.json();
 }
@@ -44,34 +46,66 @@ export interface ThesisHypothesis { id: number; statement: string; metric: strin
 export interface InvestmentThesis { id: number; ts_code: string; title: string; thesis_type: string; core_thesis: string; status: string; confidence: number; next_review_at?: string; derived_status: string; derived_confidence: number; hypotheses: ThesisHypothesis[] }
 
 export async function fetchTheses(): Promise<InvestmentThesis[]> {
-  const response = await fetch("/api/research/theses");
+  const response = await apiFetch("/api/research/theses");
   if (!response.ok) throw new Error(`投资逻辑读取失败（HTTP ${response.status}）`);
   const data = await response.json();
   return data.items ?? [];
 }
 
 export async function createThesis(payload: Record<string, unknown>): Promise<InvestmentThesis> {
-  const response = await fetch("/api/research/theses", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+  const response = await apiFetch("/api/research/theses", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
   if (!response.ok) throw new Error(`投资逻辑创建失败（HTTP ${response.status}）`);
   return (await response.json()).item;
 }
 
 export async function updateHypothesis(id: number, status: string): Promise<InvestmentThesis> {
-  const response = await fetch(`/api/research/hypotheses/${id}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ status, evidence: [{ source: "manual_review", checked_at: new Date().toISOString() }] }) });
+  const response = await apiFetch(`/api/research/hypotheses/${id}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ status, evidence: [{ source: "manual_review", checked_at: new Date().toISOString() }] }) });
   if (!response.ok) throw new Error(`假设状态更新失败（HTTP ${response.status}）`);
   return (await response.json()).item;
 }
+export async function reviewThesis(id:number):Promise<InvestmentThesis>{const response=await apiFetch(`/api/research/theses/${id}/review`,{method:"POST"});if(!response.ok)throw new Error(`投资逻辑自动复核失败（HTTP ${response.status}）`);return (await response.json()).item}
+export async function reviewDueTheses():Promise<{due:number;reviewed:Array<{thesis_id:number}>;failed:Array<{thesis_id:number;error:string}>}>{const response=await apiFetch("/api/research/theses/review-due",{method:"POST"});if(!response.ok)throw new Error(`到期投资逻辑复核失败（HTTP ${response.status}）`);return response.json()}
 
-export interface IndustryResearchItem { industry_code: string; industry_name: string; total_evidence_points: number; metrics: Array<{ metric_code: string; metric_name: string; frequency: string; source_code: string; value_count: number; first_date?: string; last_date?: string }>; state: { score: number; coverage: number; status: string; lifecycle: string; missing: string[] }; limitations: string[] }
-export async function fetchIndustries(): Promise<IndustryResearchItem[]> { const response = await fetch("/api/research/industries"); if (!response.ok) throw new Error(`行业研究读取失败（HTTP ${response.status}）`); return (await response.json()).items ?? []; }
+export interface IndustryResearchItem { industry_code: string; industry_name: string; total_evidence_points: number; company_count: number; companies: Array<{ts_code:string;name:string}>; metrics: Array<{ metric_code: string; metric_name: string; frequency: string; source_code: string; value_count: number; first_date?: string; last_date?: string }>; state: { score: number; coverage: number; status: string; lifecycle: string; missing: string[] }; limitations: string[] }
+export async function fetchIndustries(): Promise<IndustryResearchItem[]> { const response = await apiFetch("/api/research/industries"); if (!response.ok) throw new Error(`行业研究读取失败（HTTP ${response.status}）`); return (await response.json()).items ?? []; }
 
-export interface ResearchEvent { id: number; ts_code: string; event_type: string; impact_direction: string; severity: string; confidence: number; event_date: string; title: string; summary: string; evidence: { title: string; url: string; available_time: string; excerpt: string }; impact: { score: number; decayed_score: number; age_days: number; half_life_days: number } }
-export async function fetchResearchEvents(tsCode = ""): Promise<ResearchEvent[]> { const query = tsCode ? `?ts_code=${encodeURIComponent(tsCode)}` : ""; const response = await fetch(`/api/research/events${query}`); if (!response.ok) throw new Error(`公告事件读取失败（HTTP ${response.status}）`); return (await response.json()).items ?? []; }
+export interface ResearchEvent { id: number; ts_code: string; event_type: string; impact_direction: string; severity: string; confidence: number; event_date: string; title: string; summary: string; evidence: { title: string; url: string; available_time: string; excerpt: string }; impact: { score: number; decayed_score: number; age_days: number; half_life_days: number };thesis_link:null|{thesis_id:number;title:string;status:string};follow_up:{status:string;next_action:string;requires_thesis_review:boolean} }
+export async function reviewLinkedEventTheses(): Promise<{candidates:number;reviewed:Array<{thesis_id:number}>;failed:Array<{thesis_id:number;error:string}>}> { const response = await apiFetch("/api/research/events/review-linked?limit=100", { method: "POST" }); if (!response.ok) throw new Error(`关联逻辑复核失败（HTTP ${response.status}）`); return response.json(); }
+export async function fetchResearchEvents(tsCode = ""): Promise<ResearchEvent[]> { const query = tsCode ? `?ts_code=${encodeURIComponent(tsCode)}` : ""; const response = await apiFetch(`/api/research/events${query}`); if (!response.ok) throw new Error(`公告事件读取失败（HTTP ${response.status}）`); return (await response.json()).items ?? []; }
 
 export interface LiveMarketContext { ok:boolean;trade_date:string;market_state:{state:string;confidence:number;model:string;reason:string};sentiment:{score:number;state:string;base_score:number;crowding_penalty:number;components:Record<string,number>;weights:Record<string,number>};observations:Record<string,number>;evidence:{latest_date:string;previous_date:string;symbols:number;amount_dates:number};limitations:string[];available_time:string }
-export async function fetchLiveMarketContext():Promise<LiveMarketContext>{const response=await fetch("/api/model-strategy/market-context/live");if(!response.ok)throw new Error(`市场环境读取失败（HTTP ${response.status}）`);return response.json()}
+export async function fetchLiveMarketContext():Promise<LiveMarketContext>{const response=await apiFetch("/api/model-strategy/market-context/live");if(!response.ok)throw new Error(`市场环境读取失败（HTTP ${response.status}）`);const data=await response.json();if(data?.ok===false)throw new Error(data.reason||"市场环境数据不足");return data}
+export interface MarketContextHistory {ok:boolean;count:number;items:Array<{trade_date:string;market_state:string;state_confidence:number;sentiment_score:number;model_version:string;available_time:string;observations:Record<string,number>}>;transitions:Array<{trade_date:string;from:string;to:string;confidence:number}>}
+export async function fetchMarketContextHistory():Promise<MarketContextHistory>{const response=await apiFetch("/api/model-strategy/market-context/history?limit=120");if(!response.ok)throw new Error(`市场环境历史读取失败（HTTP ${response.status}）`);return response.json()}
 
-export interface ExpectationState {ok:boolean;reason?:string;ts_code:string;latest_period?:string;status?:string;observations?:Record<string,number|null>;dimension?:{score:number;coverage:number;confidence:number;status:string;missing:string[]};baseline?:{target_period:string;revenue_forecast:number;profit_forecast:number;confidence:number;model_version:string}|null;limitations?:string[];evidence?:Array<{api:string;period:string;available_time:string}>}
-export async function fetchExpectation(code:string):Promise<ExpectationState>{const response=await fetch(`/api/research/expectations/${encodeURIComponent(code)}`);if(!response.ok)throw new Error(`预期数据读取失败（HTTP ${response.status}）`);return response.json()}
+export interface ExpectationState {ok:boolean;reason?:string;ts_code:string;latest_period?:string;status?:string;observations?:Record<string,number|null>;dimension?:{score:number;coverage:number;confidence:number;status:string;missing:string[]};baseline?:{target_period:string;revenue_forecast:number;profit_forecast:number;confidence:number;model_version:string}|null;external_forecast?:{kind:string;status:string;latest?:{period:string;ann_date:string;p_change_min?:number|null;p_change_max?:number|null;change_mid?:number|null};history?:Array<{period:string;ann_date:string;p_change_min?:number|null;p_change_max?:number|null;change_mid?:number|null}>};limitations?:string[];evidence?:Array<{api:string;period:string;available_time:string}>}
+export async function fetchExpectation(code:string):Promise<ExpectationState>{const response=await apiFetch(`/api/research/expectations/${encodeURIComponent(code)}`);if(!response.ok)throw new Error(`预期数据读取失败（HTTP ${response.status}）`);return response.json()}
 export interface ValuationState {ok:boolean;reason?:string;ts_code:string;status?:string;method?:string;trade_date?:string;current_price?:number;current_multiple?:number;history_percentile?:number;industry_percentile?:number;scenarios?:{bear:number;base:number;bull:number};dimension?:{score:number;coverage:number;status:string;missing:string[]};evidence?:{history_points:number;peer_count:number;available_time:string};limitations?:string[]}
-export async function fetchValuation(code:string):Promise<ValuationState>{const response=await fetch(`/api/research/valuations/${encodeURIComponent(code)}`);if(!response.ok)throw new Error(`估值数据读取失败（HTTP ${response.status}）`);return response.json()}
+export async function fetchValuation(code:string):Promise<ValuationState>{const response=await apiFetch(`/api/research/valuations/${encodeURIComponent(code)}`);if(!response.ok)throw new Error(`估值数据读取失败（HTTP ${response.status}）`);return response.json()}
+
+export interface PortfolioRiskOverview {ok:boolean;status:string;as_of:string;account:{cash:number;market_value:number;equity:number;high_water_mark:number;drawdown:number};tail_risk:{confidence:number;var:number;cvar:number;observations:number};optimizer:string;target_weights:Record<string,number>;weight_explanations:Array<{symbol:string;current_weight:number;target_weight:number;delta:number;reason:string}>;industry_exposures:Array<{industry:string;weight:number;limit:number;status:string}>;exposures:Array<{symbol:string;name:string;industry?:string;market_value:number;weight:number;observations:number;thesis_status:string;thesis_confidence:number}>;breaches:Array<{code:string;symbol?:string;industry?:string;severity:string;message:string}>;stress_tests:Array<{code:string;name:string;pnl:number;equity_after:number;loss_pct:number;assumption:string;severity:string}>;deleveraging_actions:Array<{action:string;symbol?:string;industry?:string;priority:string;target_weight?:number;risk_budget_multiplier?:number;reason:string}>;position_state_recommendations:Array<{symbol:string;current_state:string;recommended_state:string;reason:string;evidence:{thesis_status:string;thesis_confidence:number;risk_breaches:string[]};requires_confirmation:boolean}>;limitations:string[]}
+export async function fetchPortfolioRisk():Promise<PortfolioRiskOverview>{const response=await apiFetch("/api/research/portfolio-risk/live");if(!response.ok)throw new Error(`持仓风险读取失败（HTTP ${response.status}）`);return response.json()}
+export async function confirmPositionState(payload:{ts_code:string;to_state:string;reason:string;evidence:Record<string,unknown>[];confirmed:true}):Promise<Record<string,unknown>>{const response=await apiFetch("/api/research/position-state/confirm",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)});if(!response.ok)throw new Error(`持仓状态确认失败（HTTP ${response.status}）`);return response.json()}
+
+export interface GovernanceOverview {ok:boolean;gates:Array<{key:string;status:string;detail:string}>;capabilities:Record<string,number>;model:{active_version?:{version?:string};latest_train_run?:{status?:string};version_count:number};tasks:{recent:Array<Record<string,unknown>>;failed_or_paused:Array<Record<string,unknown>>};data:{health:{ok:boolean;issues?:Array<unknown>};readiness:{consumers?:Array<{key:string;name:string;status:string}>};failed_runs:Array<Record<string,unknown>>}}
+export async function fetchGovernanceOverview():Promise<GovernanceOverview>{const response=await apiFetch("/api/research/governance/overview");if(!response.ok)throw new Error(`治理总览读取失败（HTTP ${response.status}）`);return response.json()}
+
+export interface DecisionAuditOverview {ok:boolean;counts:{decisions:number;reviews:number;awaiting_review:number};quality:{future_data_violations:number;missing_evidence:number};decisions:Array<Record<string,unknown>>;reviews:Array<Record<string,unknown>>}
+export async function fetchDecisionAudit():Promise<DecisionAuditOverview>{const response=await apiFetch("/api/research/decision-audit");if(!response.ok)throw new Error(`决策审计读取失败（HTTP ${response.status}）`);return response.json()}
+
+export interface DecisionSnapshot {
+  id:number; ts_code:string; decision_type:string; decision_time:string; price?:number|null;
+  data_as_of_time:string; model_version:string; reason:string; invalidation_conditions?:string[];
+  market_state?:Record<string,unknown>; research_state?:Record<string,unknown>; valuation?:Record<string,unknown>; portfolio_context?:Record<string,unknown>;
+}
+export interface ReviewRecord { id:number; decision_snapshot_id?:number|null; review_time:string; outcome:Record<string,unknown>; attribution:Record<string,unknown>; error_type?:string|null; lessons:string; created_at:string }
+export async function fetchDecisionSnapshots(limit=100):Promise<DecisionSnapshot[]>{const response=await apiFetch(`/api/research/decisions?limit=${limit}`);if(!response.ok)throw new Error(`决策快照读取失败（HTTP ${response.status}）`);return ((await response.json()).items??[]) as DecisionSnapshot[]}
+export async function fetchReviews(limit=100):Promise<ReviewRecord[]>{const response=await apiFetch(`/api/research/reviews?limit=${limit}`);if(!response.ok)throw new Error(`复盘记录读取失败（HTTP ${response.status}）`);return ((await response.json()).items??[]) as ReviewRecord[]}
+export async function createReview(payload:{decision_snapshot_id?:number;outcome:Record<string,unknown>;attribution:Record<string,unknown>;error_type?:string;lessons:string}):Promise<ReviewRecord>{const response=await apiFetch("/api/research/reviews",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)});if(!response.ok)throw new Error(`保存复盘失败（HTTP ${response.status}）`);return (await response.json()).item as ReviewRecord}
+export async function fetchReviewSuggestion(id:number):Promise<{ok:boolean;reason?:string;outcome?:{directional_return?:number;note?:string};attribution?:{method?:string;limitations?:string[]}}>{const response=await apiFetch(`/api/research/reviews/suggestion/${id}`);if(!response.ok)throw new Error(`复盘结果计算失败（HTTP ${response.status}）`);return response.json()}
+
+export interface StockPoolMember {id:number;ts_code:string;pool_type:string;reason:string;status:string;entered_at:string;updated_at:string}
+export async function fetchStockPools():Promise<StockPoolMember[]>{const response=await apiFetch("/api/research/pools");if(!response.ok)throw new Error(`股票池读取失败（HTTP ${response.status}）`);return (await response.json()).items??[]}
+export async function stageCandidateWatchPool(limit=20):Promise<{staged:number}>{const response=await apiFetch(`/api/research/pools/stage-candidates?limit=${limit}`,{method:"POST"});if(!response.ok)throw new Error(`候选入池失败（HTTP ${response.status}）`);return response.json()}
+export async function saveStockPoolMember(ts_code:string,pool_type:string,reason:string):Promise<StockPoolMember>{const response=await apiFetch("/api/research/pools",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({ts_code,pool_type,reason})});if(!response.ok)throw new Error(`股票池更新失败（HTTP ${response.status}）`);return (await response.json()).item}
+export async function removeStockPoolMember(id:number):Promise<void>{const response=await apiFetch(`/api/research/pools/${id}`,{method:"DELETE"});if(!response.ok)throw new Error(`股票池移除失败（HTTP ${response.status}）`)}

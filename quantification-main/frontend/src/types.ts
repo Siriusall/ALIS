@@ -437,12 +437,9 @@ export interface DataHealthIssue {
 export interface DataHealthReport {
   ok: boolean;
   limit_days: number;
-  cache_roots?: {
-    backend_cache?: string;
-    data_root?: string;
-  };
+  storage: "postgresql" | string;
   trade_dates: DataHealthDateSummary;
-  all_in_one: DataHealthDateSummary & {
+  market_snapshots: DataHealthDateSummary & {
     recent_days?: Array<{
       date: string;
       symbol_rows: number;
@@ -452,14 +449,10 @@ export interface DataHealthReport {
     weak_days?: unknown[];
   };
   snapshots: {
-    tushare_snapshot: DataHealthDateSummary;
-    backtest_snapshot: DataHealthDateSummary;
-    local_snapshot_csv: DataHealthDateSummary;
+    postgresql_snapshot: DataHealthDateSummary;
   };
   daily_basic: {
-    backtest_cache: DataHealthDateSummary;
-    local_json: DataHealthDateSummary;
-    local_csv: DataHealthDateSummary;
+    postgresql: DataHealthDateSummary;
   };
   factor_keys?: string[];
   issues: DataHealthIssue[];

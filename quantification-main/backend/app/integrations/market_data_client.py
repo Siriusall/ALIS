@@ -13,6 +13,7 @@ from typing import Any, Dict, List, Optional
 import pandas as pd
 
 from app.core.trade_calendar import get_last_trade_date, get_last_trade_date_str
+from app.data_platform.db import _conn
 from app.integrations.tushare_client import get_tushare_client
 from app.services.tushare_universe import get_basic_info_map
 
@@ -157,6 +158,49 @@ def _load_latest_file_cache() -> Optional[List["StockQuote"]]:
     return None
 
 
+def _load_quotes_from_postgres(trade_date: Optional[str] = None) -> Optional[List["StockQuote"]]:
+    """Read the normalized PostgreSQL snapshot; files are not durable storage."""
+    try:
+        with _conn() as conn:
+            if trade_date is None:
+                date_row = conn.execute("SELECT MAX(trade_date) AS trade_date FROM dc_stock_daily_snapshot").fetchone()
+                target_date = str(dict(date_row).get("trade_date") or "") if date_row else ""
+            else:
+                target_date = str(trade_date)
+            if not target_date:
+                return None
+            rows = conn.execute(
+                """SELECT symbol,name,close,change_pct,volume,turnover
+                   FROM dc_stock_daily_snapshot
+                   WHERE trade_date=? AND close IS NOT NULL ORDER BY symbol""",
+                (target_date,),
+            ).fetchall()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("PostgreSQL market snapshot read failed: %s", str(exc)[:160])
+        return None
+    quotes = []
+    for row in rows:
+        item = dict(row)
+        symbol = _normalize_symbol(str(item.get("symbol") or ""))
+        if symbol:
+            quotes.append(StockQuote(
+                symbol=symbol, name=str(item.get("name") or ""),
+                price=float(item.get("close") or 0), change_pct=float(item.get("change_pct") or 0),
+                volume=float(item.get("volume") or 0), turnover=float(item.get("turnover") or 0),
+            ))
+    return quotes or None
+
+
+def _refresh_market_in_postgres(trade_date: str) -> None:
+    """Route remote refresh through the durable data-platform ingestion flow."""
+    from app.data_platform.services.data_center import build_stock_daily_snapshot, sync_stock_basic, sync_tushare_api_raw
+
+    sync_stock_basic()
+    for api_name in ("daily", "daily_basic", "stk_limit", "suspend_d"):
+        sync_tushare_api_raw(api_name, {"trade_date": trade_date})
+    build_stock_daily_snapshot(trade_date)
+
+
 def _to_quote_dict(rows: List["StockQuote"]) -> Dict[str, "StockQuote"]:
     return {q.symbol: q for q in rows if q.symbol}
 
@@ -258,33 +302,29 @@ def fetch_a_share_spot(limit: Optional[int] = None, allow_remote: bool = False) 
     if cached:
         return cached[:limit] if limit is not None else cached
 
-    file_quotes = _load_quotes_from_file()
-    if file_quotes:
-        _set_quotes_cache(file_quotes)
-        return file_quotes[:limit] if limit is not None else file_quotes
+    postgres_quotes = _load_quotes_from_postgres()
+    if postgres_quotes:
+        _set_quotes_cache(postgres_quotes)
+        return postgres_quotes[:limit] if limit is not None else postgres_quotes
 
     with _fetch_lock:
         cached = _get_quotes_cache()
         if cached:
             return cached[:limit] if limit is not None else cached
-        file_quotes = _load_quotes_from_file()
-        if file_quotes:
-            _set_quotes_cache(file_quotes)
-            return file_quotes[:limit] if limit is not None else file_quotes
+        postgres_quotes = _load_quotes_from_postgres()
+        if postgres_quotes:
+            _set_quotes_cache(postgres_quotes)
+            return postgres_quotes[:limit] if limit is not None else postgres_quotes
         if not allow_remote:
             return []
         try:
-            quotes = _fetch_spot_from_tushare()
+            _refresh_market_in_postgres(_today_trade_date())
+            quotes = _load_quotes_from_postgres(_today_trade_date()) or []
             if quotes:
                 _set_quotes_cache(quotes)
-                _save_quotes_to_file(quotes)
                 return quotes[:limit] if limit is not None else quotes
         except Exception as e:  # noqa: BLE001
             logger.warning("TuShare 行情: 拉取失败，将回退历史缓存 | %s", str(e)[:120])
-        fallback = _load_latest_file_cache()
-        if fallback:
-            _set_quotes_cache(fallback)
-            return fallback[:limit] if limit is not None else fallback
         return []
 
 
