@@ -6,12 +6,14 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query, status
 
-from app.services.data_center import (
+from app.data_platform.services.data_center import (
     build_stock_daily_snapshot,
     ensure_data_center_seeded,
     estimate_data_center_runtime,
     get_data_center_status,
     import_industry_metrics,
+    list_failed_tushare_requests,
+    resume_failed_tushare_requests,
     run_data_quality_checks,
     sync_cninfo_announcements,
     sync_expectation_bundle,
@@ -24,10 +26,128 @@ from app.services.data_center import (
     sync_stock_basic,
     sync_trade_calendar,
     sync_tushare_api_raw,
+    sync_tushare_date_batch,
+    sync_tushare_stock_batch,
     sync_tushare_catalog_from_probe,
 )
+from app.data_platform.services.web_fallback import (
+    get_web_fallback_crawl_status,
+    import_legacy_news_db,
+    list_web_factors,
+    start_web_fallback_crawl,
+)
+from app.data_platform.services.daily_update import daily_update_status, simple_health, start_daily_update
+from app.data_platform.services.observability import get_observability
+from app.data_platform.services.readiness import readiness_overview
+from app.data_platform.services.assets import get_data_assets
+from app.data_platform.services.backfill import build_backfill_plan, get_backfill_status, start_backfill
 
 router = APIRouter(tags=["data-center"])
+
+
+@router.get("/data-center/simple-health")
+def data_center_simple_health() -> dict[str, Any]:
+    return simple_health()
+
+
+@router.get("/data-center/observability")
+def data_center_observability(limit_logs: int = Query(default=50, ge=1, le=200)) -> dict[str, Any]:
+    return get_observability(limit_logs=limit_logs)
+
+
+@router.get("/data-center/readiness")
+def data_center_readiness() -> dict[str, Any]:
+    return readiness_overview()
+
+
+@router.get("/data-center/assets")
+def data_center_assets() -> dict[str, Any]:
+    return get_data_assets()
+
+
+@router.post("/data-center/daily-update")
+def data_center_start_daily_update() -> dict[str, Any]:
+    result = start_daily_update()
+    if not result.get("ok"):
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=result)
+    return result
+
+
+@router.get("/data-center/daily-update/status")
+def data_center_daily_update_status() -> dict[str, Any]:
+    return daily_update_status()
+
+
+@router.get("/data-center/backfill/plan")
+def data_center_backfill_plan(
+    market_batch_days: int = Query(default=20, ge=1, le=60),
+    financial_batch_size: int = Query(default=50, ge=1, le=200),
+) -> dict[str, Any]:
+    """Generate a historical completion plan from audit-window gaps."""
+    return build_backfill_plan(
+        market_batch_days=market_batch_days,
+        financial_batch_size=financial_batch_size,
+    )
+
+
+@router.post("/data-center/backfill/start")
+def data_center_backfill_start(
+    max_steps: int = Query(default=0, ge=0, le=500),
+    market_batch_days: int = Query(default=10, ge=1, le=30),
+    financial_batch_size: int = Query(default=20, ge=1, le=100),
+) -> dict[str, Any]:
+    """Execute the historical plan. max_steps=0 runs all auto-runnable steps."""
+    result = start_backfill(
+        max_steps=max_steps,
+        market_batch_days=market_batch_days,
+        financial_batch_size=financial_batch_size,
+    )
+    if not result.get("ok"):
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=result)
+    return result
+
+
+@router.get("/data-center/backfill/status")
+def data_center_backfill_status() -> dict[str, Any]:
+    return get_backfill_status()
+
+
+@router.post("/data-center/web-fallback/import-legacy")
+def data_center_import_legacy_news(
+    path: str = Query(default="../news/data/news.db", description="Legacy news.db path."),
+) -> dict[str, Any]:
+    """Import the latest legacy news crawl into the unified data-center database."""
+    p = Path(path).expanduser()
+    if not p.is_absolute():
+        p = Path(__file__).resolve().parents[2] / p
+    try:
+        return import_legacy_news_db(p)
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+
+@router.get("/data-center/web-fallback/factors")
+def data_center_web_factors(
+    q: str = Query(default=""), limit: int = Query(default=50, ge=1, le=200), offset: int = Query(default=0, ge=0),
+) -> dict[str, Any]:
+    return list_web_factors(q=q, limit=limit, offset=offset)
+
+
+@router.post("/data-center/web-fallback/crawl")
+def data_center_start_web_crawl(
+    codes: str = Query(default="", description="Comma-separated stock codes; empty uses the web universe."),
+    limit: int = Query(default=20, ge=1, le=5000),
+) -> dict[str, Any]:
+    code_list = [item.strip() for item in codes.split(",") if item.strip()]
+    result = start_web_fallback_crawl(codes=code_list, limit=limit)
+    if not result.get("ok"):
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=result)
+    return result
+
+
+@router.get("/data-center/web-fallback/crawl/status")
+def data_center_web_crawl_status() -> dict[str, Any]:
+    return get_web_fallback_crawl_status()
 
 
 @router.get("/data-center/status")
@@ -80,7 +200,7 @@ def data_center_import_probe_result(path: str = Query(..., description="Local pr
 
     p = Path(path).expanduser()
     if not p.is_absolute():
-        backend_root = Path(__file__).resolve().parents[3]
+        backend_root = Path(__file__).resolve().parents[2]
         p = backend_root / p
     if not p.exists():
         raise HTTPException(
@@ -120,6 +240,43 @@ def data_center_sync_tushare_api(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail={"code": "tushare_api_sync_failed", "api": api_name, "message": str(exc)[:500]},
         ) from exc
+
+
+@router.get("/data-center/tushare/failed-requests")
+def data_center_failed_tushare_requests(
+    request_status: str = Query(default="pending", alias="status", pattern="^(pending|resuming|resolved)$"),
+    limit: int = Query(default=100, ge=1, le=500),
+) -> dict[str, Any]:
+    """List persisted failed calls available for selective recovery."""
+    return list_failed_tushare_requests(status=request_status, limit=limit)
+
+
+@router.post("/data-center/tushare/failed-requests/resume")
+def data_center_resume_failed_tushare_requests(
+    limit: int = Query(default=20, ge=1, le=100),
+) -> dict[str, Any]:
+    """Retry only persisted failed TuShare calls; successful calls are not replayed."""
+    return resume_failed_tushare_requests(limit=limit)
+
+
+@router.post("/data-center/sync/tushare-stock-batch/{api_name}")
+def data_center_sync_tushare_stock_batch(
+    api_name: str,
+    period: str = Query(default=""),
+    start_date: str = Query(default=""),
+    end_date: str = Query(default=""),
+    limit: int = Query(default=20, ge=1, le=500),
+) -> dict[str, Any]:
+    return sync_tushare_stock_batch(api_name, period=period, start_date=start_date, end_date=end_date, limit=limit)
+
+
+@router.post("/data-center/sync/tushare-date-batch/{api_name}")
+def data_center_sync_tushare_date_batch(
+    api_name: str,
+    trade_dates: str = Query(..., description="Comma-separated YYYYMMDD dates"),
+    limit: int = Query(default=10, ge=1, le=60),
+) -> dict[str, Any]:
+    return sync_tushare_date_batch(api_name, trade_dates=[x.strip() for x in trade_dates.split(",") if x.strip()], limit=limit)
 
 
 @router.post("/data-center/sync/market")

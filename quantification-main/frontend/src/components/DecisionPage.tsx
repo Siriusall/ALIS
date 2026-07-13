@@ -278,7 +278,7 @@ export default function DecisionPage({ onNavigate }: DecisionPageProps) {
         <div className="card decision-panel">
           <div className="quant-analyze-section-head">
             <h3>最新分析摘要</h3>
-            <button type="button" className="quant-analyze-secondary-btn" onClick={() => onNavigate?.("quantRun")}>
+            <button type="button" className="quant-analyze-secondary-btn" onClick={() => onNavigate?.("validation")}>
               前往量化分析
             </button>
           </div>

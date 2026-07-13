@@ -34,6 +34,8 @@ from app.db.store import (
     list_recent_quant_run_task_records,
     list_quant_run_task_records,
     list_quant_run_tasks,
+    save_performance_reports,
+    list_performance_reports,
     upsert_quant_run_task_meta,
     update_quant_run_task,
 )
@@ -180,7 +182,7 @@ def _utc_now_iso() -> str:
 
 
 def _default_task_risk_config() -> dict:
-    return {
+    result = {
         "enforce_trading_session_gate": str(os.getenv("QUANT_ENFORCE_TRADING_SESSION_GATE", "0")).strip().lower() in {"1", "true", "yes", "on"},
         "enable_data_health_gate": str(os.getenv("QUANT_ENABLE_DATA_HEALTH_GATE", "1")).strip().lower() in {"1", "true", "yes", "on"},
         "scoring_timeout_sec": max(10, min(int(os.getenv("QUANT_SCORING_TIMEOUT_SEC", "90")), 1800)),
@@ -354,6 +356,11 @@ def quant_run_curve(limit: int = 250, benchmark: str = "000300", task_id: int | 
 
     holdings: dict[str, int] = defaultdict(int)
     last_price_by_symbol: dict[str, float] = {}
+    # Replay cash from the fixed simulation baseline instead of valuing only
+    # the currently held shares. This keeps idle cash and partial allocations
+    # in the performance curve and prevents false 100% losses when positions
+    # are small relative to the account.
+    replay_cash = float(get_account_baseline() or 200000.0)
     benchmark_raw: list[float] = []
     strategy_raw: list[float] = []
     series: list[dict] = []
@@ -371,10 +378,12 @@ def quant_run_curve(limit: int = 250, benchmark: str = "000300", task_id: int | 
             trade_price = _safe_float(o.get("price"))
             if side == "BUY":
                 holdings[sym] += qty
+                replay_cash -= trade_price * qty
                 if trade_price > 0:
                     last_price_by_symbol[sym] = trade_price
             elif side == "SELL":
                 holdings[sym] = max(0, holdings[sym] - qty)
+                replay_cash += trade_price * qty
                 if trade_price > 0:
                     last_price_by_symbol[sym] = trade_price
 
@@ -404,7 +413,7 @@ def quant_run_curve(limit: int = 250, benchmark: str = "000300", task_id: int | 
             bm = _safe_float(snapshot_close_map.get(str(benchmark).strip().zfill(6)))
         if bm <= 0:
             bm = _safe_float(index_close_map.get(d))
-        strategy_raw.append(stock_value)
+        strategy_raw.append(max(0.0, replay_cash) + stock_value)
         benchmark_raw.append(_safe_float(bm))
 
     # 归一化为指数
@@ -683,7 +692,7 @@ def quant_run_task_run_detail(task_id: int, execute_date: str = Query(..., descr
     data_warning = None
     if sold_cnt > 0 and not has_sell_ops:
         data_warning = "该记录来自旧版本，卖出操作未关联 execution_id；节点收益仅覆盖已关联成交。"
-    return {
+    result = {
         "task_id": task_id,
         "execute_date": execute_date,
         "signal_date": target.get("signal_date"),
@@ -768,6 +777,57 @@ def quant_run_ledger_summary() -> dict:
         "position_count": len(positions),
         "valuation_date": latest_date,
     }
+
+
+@router.get("/quant-runs/performance")
+def quant_run_performance(task_id: int | None = Query(None, ge=1), benchmark: str = "000300") -> dict:
+    """Return weekly/monthly/yearly performance aggregates for the simulator."""
+    curve = quant_run_curve(limit=1000, benchmark=benchmark, task_id=task_id)
+    series = [x for x in (curve.get("series") or []) if x.get("date") and x.get("strategy_equity") is not None]
+
+    def aggregate(key_fn):
+        buckets: dict[str, list[dict]] = defaultdict(list)
+        for point in series:
+            buckets[key_fn(str(point["date"]))].append(point)
+        out = []
+        for key, points in sorted(buckets.items()):
+            first, last = points[0], points[-1]
+            start = _safe_float(first.get("strategy_equity")) or 100.0
+            end = _safe_float(last.get("strategy_equity")) or start
+            bm_start = _safe_float(first.get("benchmark_equity"))
+            bm_end = _safe_float(last.get("benchmark_equity")) or bm_start
+            drawdowns = [_safe_float(x.get("drawdown_pct")) for x in points]
+            out.append({
+                "period": key,
+                "start_date": first["date"],
+                "end_date": last["date"],
+                "return_pct": round((end / start - 1.0) * 100.0, 4) if start else 0.0,
+                "benchmark_return_pct": round((bm_end / bm_start - 1.0) * 100.0, 4) if bm_start else None,
+                "max_drawdown_pct": round(min(drawdowns), 4) if drawdowns else 0.0,
+                "points": len(points),
+            })
+        return out
+
+    result = {
+        "task_id": task_id,
+        "benchmark": benchmark,
+        "weekly": aggregate(lambda d: f"{d[:4]}-W{datetime.fromisoformat(d).isocalendar().week:02d}"),
+        "monthly": aggregate(lambda d: d[:7]),
+        "yearly": aggregate(lambda d: d[:4]),
+        "source_summary": curve.get("summary") or {},
+    }
+    try:
+        result["persisted_reports"] = save_performance_reports(
+            task_id, {k: result[k] for k in ("weekly", "monthly", "yearly")}
+        )
+    except Exception:
+        result["persisted_reports"] = 0
+    return result
+
+
+@router.get("/quant-runs/performance/reports")
+def quant_run_performance_reports(task_id: int | None = Query(None, ge=1), limit: int = Query(100, ge=1, le=500)) -> dict:
+    return {"items": list_performance_reports(task_id=task_id, limit=limit)}
 
 
 @router.post("/quant-runs/tasks/{task_id}/stop")

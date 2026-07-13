@@ -2,20 +2,59 @@ from __future__ import annotations
 
 import json
 import hashlib
+import os
+import time
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import pandas as pd
 import requests
 
-from app.db.store import _conn, _is_mysql
-from app.integrations.tushare_client import get_tushare_client
+from app.data_platform.db import _conn, _is_mysql
+from app.data_platform.tushare_client import get_tushare_client, reset_tushare_client
+from app.data_platform.services.runtime_logs import write_runtime_log
+from app.data_platform.redis_store import set_add as redis_set_add, set_remove as redis_set_remove
 
 SOURCE_TUSHARE = "tushare"
 SOURCE_CNINFO = "cninfo"
 SOURCE_MANUAL = "manual"
+
+_tushare_activity_local = threading.local()
+
+
+def set_tushare_activity_hook(hook: Callable[[dict[str, Any]], None] | None) -> None:
+    """Attach a short-lived observer used by background repair status UI."""
+    _tushare_activity_local.hook = hook
+
+
+def _emit_tushare_activity(event: str, api_name: str, params: dict[str, Any], **extra: Any) -> None:
+    if event in {"request", "retry", "failed", "saved"}:
+        level = "ERROR" if event == "failed" else "WARNING" if event == "retry" else "INFO"
+        write_runtime_log(level, "tushare", f"{event} {api_name}", {"params": params, **extra})
+    hook = getattr(_tushare_activity_local, "hook", None)
+    if hook is None:
+        return
+    hook({"event": event, "api": api_name, "params": params, "at": _now(), **extra})
+
+
+def _parallel_tushare_map(items: list[Any], fn: Callable[[Any], Any], *, prefix: str) -> tuple[list[Any], int]:
+    """Run bounded upstream calls concurrently while preserving order and UI activity."""
+    workers = max(1, min(int(os.getenv("TUSHARE_CONCURRENCY", "3") or 3), 6, len(items) or 1))
+    parent_hook = getattr(_tushare_activity_local, "hook", None)
+
+    def wrapped(item: Any) -> Any:
+        set_tushare_activity_hook(parent_hook)
+        try:
+            return fn(item)
+        finally:
+            set_tushare_activity_hook(None)
+
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix=prefix) as pool:
+        return list(pool.map(wrapped, items)), workers
 
 
 @dataclass(frozen=True)
@@ -59,11 +98,86 @@ TUSHARE_CATALOG: list[TushareCatalogItem] = [
     TushareCatalogItem("index_basic", "指数", "指数基础信息", "行业/宽基指数主数据", "monthly", "ts_code,name,market,publisher,category,base_date,list_date", {"market": "SSE"}),
     TushareCatalogItem("index_daily", "指数", "指数日线", "市场/行业趋势与基准", "daily", "ts_code,trade_date,open,high,low,close,vol,amount", {"ts_code": ""}),
     TushareCatalogItem("index_weight", "指数", "指数权重", "沪深300/中证指数成分与权重", "monthly", "index_code,con_code,trade_date,weight", {"index_code": ""}),
+    TushareCatalogItem("cn_gdp", "宏观", "国内生产总值", "经济周期与增长判断", "quarterly", "quarter,gdp,gdp_yoy,pi,pi_yoy,si,si_yoy,ti,ti_yoy", {}),
+    TushareCatalogItem("cn_cpi", "宏观", "居民消费价格指数", "通胀与政策环境判断", "monthly", "month,nt_val,nt_yoy,nt_mom,nt_accu,town_val,town_yoy,cnt_val,cnt_yoy", {}),
+    TushareCatalogItem("cn_pmi", "宏观", "采购经理指数", "制造业与非制造业景气判断", "monthly", "MONTH,PMI010000,PMI020100,PMI030000", {}),
+    TushareCatalogItem("shibor", "宏观", "上海银行间同业拆放利率", "流动性和利率环境", "daily", "date,on,1w,2w,1m,3m,6m,9m,1y", {}),
+    TushareCatalogItem("fx_daily", "宏观", "美元离岸人民币", "汇率与外围风险", "daily", "ts_code,trade_date,bid_open,bid_close,bid_high,bid_low,ask_open,ask_close,ask_high,ask_low", {"ts_code": "USDCNH.FXCM"}),
 ]
 
 
 def _now() -> str:
     return datetime.utcnow().isoformat(timespec="seconds")
+
+
+def _invalidate_asset_views() -> None:
+    # Local import avoids the assets -> data_center planning dependency cycle.
+    try:
+        from app.data_platform.services.assets import invalidate_data_assets_cache
+        invalidate_data_assets_cache()
+    except Exception:
+        pass
+
+
+def classify_tushare_error(exc: Exception) -> str:
+    """Classify upstream failures so retry and operator actions are predictable."""
+    message = str(exc).lower()
+    if any(x in message for x in ("token", "unauthorized", "401", "登录", "认证")):
+        return "authentication"
+    if any(x in message for x in ("权限", "permission", "forbidden", "403", "积分")):
+        return "permission"
+    if any(x in message for x in ("频率", "限流", "rate limit", "too many", "429")):
+        return "rate_limit"
+    if any(x in message for x in ("timeout", "timed out", "connection", "proxy", "502", "503", "504", "temporarily")):
+        return "transient"
+    if any(x in message for x in ("invalid", "参数", "parameter", "字段")):
+        return "invalid_request"
+    return "unknown"
+
+
+def _request_key(api_name: str, params: dict[str, Any], limit_rows: int | None) -> str:
+    raw = json.dumps({"api": api_name, "params": params, "limit_rows": limit_rows}, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _record_failed_tushare_request(api_name: str, params: dict[str, Any], limit_rows: int | None, category: str, error: str) -> None:
+    key, now = _request_key(api_name, params, limit_rows), _now()
+    with _conn() as c:
+        c.execute(
+            """
+            INSERT INTO dc_tushare_failed_requests
+                (request_key,api_name,params_json,limit_rows,error_category,last_error,status,attempts,first_failed_at,last_failed_at)
+            VALUES (?,?,?,?,?,?,'pending',1,?,?)
+            ON CONFLICT(request_key) DO UPDATE SET
+                error_category=excluded.error_category,last_error=excluded.last_error,status='pending',
+                attempts=dc_tushare_failed_requests.attempts+1,last_failed_at=excluded.last_failed_at
+            """,
+            (key, api_name, json.dumps(params, ensure_ascii=False, sort_keys=True), limit_rows, category, error[:1000], now, now),
+        )
+    redis_set_add("alis:data-platform:tushare:failed", key)
+
+
+def _resolve_failed_tushare_request(api_name: str, params: dict[str, Any], limit_rows: int | None) -> None:
+    key = _request_key(api_name, params, limit_rows)
+    with _conn() as c:
+        c.execute(
+            "UPDATE dc_tushare_failed_requests SET status='resolved',resolved_at=? WHERE request_key=? AND status<>'resolved'",
+            (_now(), key),
+        )
+    redis_set_remove("alis:data-platform:tushare:failed", key)
+
+
+def _record_request_coverage(api_name: str, params: dict[str, Any], limit_rows: int | None, rows_read: int) -> None:
+    key = _request_key(api_name, params, limit_rows)
+    with _conn() as c:
+        c.execute(
+            """INSERT INTO dc_tushare_request_coverage
+               (request_key,api_name,ts_code,trade_date,period,params_json,rows_read,checked_at)
+               VALUES(?,?,?,?,?,?,?,?)
+               ON CONFLICT(request_key) DO UPDATE SET rows_read=excluded.rows_read,checked_at=excluded.checked_at""",
+            (key, api_name, str(params.get("ts_code") or ""), str(params.get("trade_date") or ""),
+             str(params.get("period") or params.get("enddate") or ""), json.dumps(params, ensure_ascii=False, sort_keys=True), rows_read, _now()),
+        )
 
 
 def _recent_calendar_window(days_back: int = 30, days_forward: int = 60) -> tuple[str, str]:
@@ -388,6 +502,8 @@ def _upsert_trade_calendar(df: pd.DataFrame) -> int:
 
 def get_data_center_status(limit_runs: int = 10) -> dict[str, Any]:
     ensure_data_center_seeded()
+    from app.data_platform.services.web_fallback import ensure_web_fallback_source
+    ensure_web_fallback_source()
     with _conn() as c:
         source_rows = c.execute("SELECT * FROM data_sources ORDER BY priority ASC, code ASC").fetchall()
         catalog_rows = c.execute(
@@ -407,6 +523,7 @@ def get_data_center_status(limit_runs: int = 10) -> dict[str, Any]:
         event_count = c.execute("SELECT COUNT(*) AS cnt FROM dc_announcement_event").fetchone()
         industry_metric_count = c.execute("SELECT COUNT(*) AS cnt FROM dc_industry_metric_definition").fetchone()
         industry_value_count = c.execute("SELECT COUNT(*) AS cnt FROM dc_industry_metric_value").fetchone()
+        web_factor_count = c.execute("SELECT COUNT(*) AS cnt FROM dc_web_factor_snapshot").fetchone()
         runs = c.execute(
             """
             SELECT id, job_name, source_code, status, started_at, finished_at,
@@ -431,6 +548,7 @@ def get_data_center_status(limit_runs: int = 10) -> dict[str, Any]:
             "announcement_event_rows": _row_count(event_count),
             "industry_metric_definitions": _row_count(industry_metric_count),
             "industry_metric_values": _row_count(industry_value_count),
+            "web_factor_rows": _row_count(web_factor_count),
         },
         "recent_runs": [_row_to_dict(row) for row in runs],
     }
@@ -478,18 +596,85 @@ def sync_tushare_api_raw(api_name: str, params: dict[str, Any] | None = None, *,
     ensure_data_center_seeded()
     item = _catalog_item(api_name)
     run_id = start_ingestion_run(f"tushare.{api_name}", {"api": api_name, "params": params or {}, "limit_rows": limit_rows})
+    request_params = params or {}
     try:
-        df = _call_tushare_api(api_name, params=params, fields=item.fields)
+        retry_delays = (1.0, 3.0, 8.0)
+        df: pd.DataFrame | None = None
+        last_exc: Exception | None = None
+        for attempt in range(len(retry_delays) + 1):
+            try:
+                _emit_tushare_activity("request", api_name, request_params, attempt=attempt + 1)
+                df = _call_tushare_api(api_name, params=request_params, fields=item.fields)
+                _emit_tushare_activity("response", api_name, request_params, attempt=attempt + 1, rows=len(df))
+                last_exc = None
+                break
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+                category = classify_tushare_error(exc)
+                _emit_tushare_activity(
+                    "retry" if category in {"authentication", "transient", "rate_limit"} else "failed",
+                    api_name,
+                    request_params,
+                    attempt=attempt + 1,
+                    category=category,
+                    error=str(exc)[:300],
+                )
+                if category == "authentication" and attempt == 0:
+                    reset_tushare_client()
+                    continue
+                if category not in {"transient", "rate_limit"} or attempt >= len(retry_delays):
+                    raise
+                delay = retry_delays[attempt] * (3 if category == "rate_limit" else 1)
+                time.sleep(delay)
+        if last_exc is not None:
+            raise last_exc
+        if df is None:
+            df = pd.DataFrame()
         if limit_rows is not None and limit_rows > 0 and isinstance(df, pd.DataFrame):
             df = df.head(int(limit_rows))
         written = _upsert_raw_records(api_name, df)
         finish_ingestion_run(run_id, status="completed", rows_read=len(df), rows_written=written, meta={"api": api_name, "params": params or {}})
         _record_probe(api_name, "ok" if written else "empty", len(df))
+        _record_request_coverage(api_name, request_params, limit_rows, len(df))
+        _resolve_failed_tushare_request(api_name, request_params, limit_rows)
+        if written:
+            _invalidate_asset_views()
+        _emit_tushare_activity("saved", api_name, request_params, rows=len(df), written=written)
         return {"ok": True, "api": api_name, "run_id": run_id, "rows_read": len(df), "rows_written": written}
     except Exception as exc:  # noqa: BLE001
+        category = classify_tushare_error(exc)
         finish_ingestion_run(run_id, status="failed", rows_read=0, rows_written=0, error=str(exc), meta={"api": api_name, "params": params or {}})
         _record_probe(api_name, "failed", 0, str(exc))
+        _record_failed_tushare_request(api_name, request_params, limit_rows, category, str(exc))
         raise
+
+
+def list_failed_tushare_requests(*, status: str = "pending", limit: int = 100) -> dict[str, Any]:
+    with _conn() as c:
+        rows = c.execute(
+            """SELECT id,api_name,params_json,limit_rows,error_category,last_error,status,attempts,
+                      first_failed_at,last_failed_at,resumed_at,resolved_at
+               FROM dc_tushare_failed_requests WHERE status=? ORDER BY last_failed_at ASC LIMIT ?""",
+            (status, max(1, min(limit, 500))),
+        ).fetchall()
+    items = [dict(row) for row in rows]
+    for item in items:
+        item["params"] = json.loads(item.pop("params_json") or "{}")
+    return {"ok": True, "status": status, "total": len(items), "items": items}
+
+
+def resume_failed_tushare_requests(*, limit: int = 20) -> dict[str, Any]:
+    pending = list_failed_tushare_requests(status="pending", limit=limit)["items"]
+    results = []
+    for item in pending:
+        with _conn() as c:
+            c.execute("UPDATE dc_tushare_failed_requests SET status='resuming',resumed_at=? WHERE id=?", (_now(), item["id"]))
+        try:
+            result = sync_tushare_api_raw(item["api_name"], params=item["params"], limit_rows=item["limit_rows"])
+            results.append({"id": item["id"], "ok": True, "result": result})
+        except Exception as exc:  # noqa: BLE001
+            results.append({"id": item["id"], "ok": False, "category": classify_tushare_error(exc), "error": str(exc)[:500]})
+    return {"ok": all(x["ok"] for x in results), "attempted": len(results), "succeeded": sum(1 for x in results if x["ok"]), "results": results}
 
 
 def _upsert_raw_records(api_name: str, df: pd.DataFrame) -> int:
@@ -501,7 +686,7 @@ def _upsert_raw_records(api_name: str, df: pd.DataFrame) -> int:
         for idx, row in df.iterrows():
             payload = _clean_payload(row.to_dict())
             ts_code = str(payload.get("ts_code") or payload.get("con_code") or "").strip()
-            trade_date = str(payload.get("trade_date") or "").strip()
+            trade_date = str(payload.get("trade_date") or payload.get("date") or payload.get("month") or payload.get("MONTH") or payload.get("quarter") or "").strip()
             period = str(payload.get("period") or payload.get("end_date") or "").strip()
             ann_date = str(payload.get("ann_date") or "").strip()
             record_key = _record_key(api_name, payload, idx)
@@ -598,17 +783,19 @@ def _record_key(api_name: str, payload: dict[str, Any], idx: Any) -> str:
     return "|".join(parts)[:240]
 
 
-def sync_market_bundle(trade_date: str, *, include_suspend: bool = False) -> dict[str, Any]:
+def sync_market_bundle(trade_date: str, *, include_suspend: bool = False, apis: list[str] | None = None) -> dict[str, Any]:
     """Sync daily market/valuation/trading-status bundle for one trade date."""
 
-    apis = ["daily", "daily_basic", "stk_limit"]
-    if include_suspend:
-        apis.append("suspend_d")
+    requested_apis = list(apis or ["daily", "daily_basic", "stk_limit"])
+    if include_suspend and "suspend_d" not in requested_apis:
+        requested_apis.append("suspend_d")
+    allowed = {"daily", "daily_basic", "stk_limit", "suspend_d"}
+    requested_apis = [api for api in requested_apis if api in allowed]
     results = []
-    for api in apis:
+    for api in requested_apis:
         results.append(_safe_sync_raw(api, {"trade_date": trade_date}))
     snapshot = build_stock_daily_snapshot(trade_date)
-    return {"ok": True, "trade_date": trade_date, "results": results, "snapshot": snapshot}
+    return {"ok": all(bool(x.get("ok")) for x in results), "trade_date": trade_date, "apis": requested_apis, "results": results, "snapshot": snapshot}
 
 
 def sync_financial_bundle(ts_code: str, period: str, *, include_yearly: bool = True) -> dict[str, Any]:
@@ -617,13 +804,22 @@ def sync_financial_bundle(ts_code: str, period: str, *, include_yearly: bool = T
     apis = ["income", "balancesheet", "cashflow", "fina_indicator"]
     if include_yearly:
         apis.extend(["fina_audit", "fina_mainbz"])
+    with _conn() as c:
+        existing = {
+            str(dict(row).get("api_name") or "")
+            for row in c.execute(
+                "SELECT DISTINCT api_name FROM dc_tushare_raw_records WHERE ts_code=? AND period=?",
+                (ts_code, period),
+            ).fetchall()
+        }
+    apis = [api for api in apis if api not in existing]
     results = []
     for api in apis:
         params = {"ts_code": ts_code, "period": period}
         if api == "fina_mainbz":
             params["type"] = "P"
         results.append(_safe_sync_raw(api, params))
-    return {"ok": True, "ts_code": ts_code, "period": period, "results": results}
+    return {"ok": all(bool(x.get("ok")) for x in results), "ts_code": ts_code, "period": period, "skipped_existing": sorted(existing), "results": results}
 
 
 def sync_financial_period_bundle(period: str, *, include_yearly: bool = False) -> dict[str, Any]:
@@ -651,6 +847,8 @@ def sync_financial_batch(
     codes: list[str] | None = None,
     limit: int = 20,
     include_yearly: bool = False,
+    allow_partial: bool = False,
+    completion_api: str = "core",
 ) -> dict[str, Any]:
     """Sync financial data by stock in resumable batches.
 
@@ -661,33 +859,47 @@ def sync_financial_batch(
     ensure_data_center_seeded()
     target_codes = [c.strip() for c in (codes or []) if c.strip()]
     if not target_codes:
-        target_codes = _load_stock_codes(limit=limit)
+        # A batch must advance across repeated runs.  Selecting the first N
+        # symbols every time only rewrites the same stocks forever.
+        target_codes = _load_financial_missing_codes(period, limit=limit, completion_api=completion_api)
     if limit and limit > 0:
         target_codes = target_codes[:limit]
     started = _now()
     results = []
     ok_count = 0
     failed_count = 0
-    for ts_code in target_codes:
+    errors: list[str] = []
+    def fetch_one(ts_code: str) -> dict[str, Any]:
         try:
-            result = sync_financial_bundle(ts_code, period, include_yearly=include_yearly)
-            result_ok = all(bool(item.get("ok")) for item in result.get("results", []))
-            if result_ok:
-                ok_count += 1
-            else:
-                failed_count += 1
-            results.append(result)
+            return sync_financial_bundle(ts_code, period, include_yearly=include_yearly)
         except Exception as exc:  # noqa: BLE001
+            msg = str(exc)[:500]
+            return {"ok": False, "ts_code": ts_code, "period": period, "error": msg, "results": []}
+
+    results, workers = _parallel_tushare_map(target_codes, fetch_one, prefix="tushare-financial")
+    for ts_code, result in zip(target_codes, results):
+        result_ok = bool(result.get("ok", True)) and all(bool(item.get("ok")) for item in result.get("results", []))
+        if result_ok:
+            ok_count += 1
+        else:
             failed_count += 1
-            results.append({"ok": False, "ts_code": ts_code, "period": period, "error": str(exc)[:500]})
+            if result.get("error"):
+                errors.append(f"{ts_code}: {result['error']}")
+            for item in result.get("results") or []:
+                if not item.get("ok"):
+                    errors.append(f"{ts_code}/{item.get('api')}: {item.get('error') or 'failed'}")
+    total = len(target_codes)
+    soft_ok = allow_partial and ok_count > 0 and failed_count <= max(1, total // 5)
     return {
-        "ok": failed_count == 0,
+        "ok": failed_count == 0 or soft_ok,
         "period": period,
         "started_at": started,
         "finished_at": _now(),
-        "total": len(target_codes),
+        "total": total,
         "success": ok_count,
         "failed": failed_count,
+        "concurrency": workers,
+        "error": "; ".join(errors[:5])[:1000] if errors else "",
         "results": results,
     }
 
@@ -699,6 +911,88 @@ def _load_stock_codes(limit: int = 20) -> list[str]:
             (max(1, int(limit or 20)),),
         ).fetchall()
     return [str(_row_to_dict(row).get("ts_code") or "") for row in rows]
+
+
+def _load_financial_missing_codes(period: str, limit: int = 20, completion_api: str = "core") -> list[str]:
+    """Return the next symbols whose completion API is absent for period."""
+    allowed_apis = {"core", "income", "fina_audit"}
+    if completion_api not in allowed_apis:
+        raise ValueError(f"unsupported financial completion API: {completion_api}")
+    required = ["income", "balancesheet", "cashflow", "fina_indicator"] if completion_api == "core" else [completion_api]
+    placeholders = ",".join("?" for _ in required)
+    with _conn() as c:
+        rows = c.execute(
+            f"""
+            SELECT s.ts_code
+            FROM dc_stock_master s
+            LEFT JOIN dc_tushare_raw_records r
+              ON r.ts_code=s.ts_code AND r.period=? AND r.api_name IN ({placeholders})
+            GROUP BY s.ts_code
+            HAVING COUNT(DISTINCT r.api_name) < ?
+            ORDER BY s.ts_code ASC
+            LIMIT ?
+            """,
+            (period, *required, len(required), max(1, int(limit or 20))),
+        ).fetchall()
+    return [str(_row_to_dict(row).get("ts_code") or "") for row in rows]
+
+
+def sync_tushare_stock_batch(
+    api_name: str,
+    *,
+    period: str = "",
+    start_date: str = "",
+    end_date: str = "",
+    limit: int = 20,
+) -> dict[str, Any]:
+    """Progress a per-stock API without repeating already checked requests."""
+    _catalog_item(api_name)
+    with _conn() as c:
+        rows = c.execute(
+            """SELECT s.ts_code FROM dc_stock_master s
+               WHERE NOT EXISTS (
+                 SELECT 1 FROM dc_tushare_request_coverage q
+                 WHERE q.api_name=? AND q.ts_code=s.ts_code AND q.period=?
+               )
+               ORDER BY s.ts_code LIMIT ?""",
+            (api_name, period, max(1, min(int(limit), 500))),
+        ).fetchall()
+    codes = [str(dict(row).get("ts_code") or "") for row in rows]
+    def fetch_one(ts_code: str) -> dict[str, Any]:
+        params: dict[str, Any] = {"ts_code": ts_code}
+        if period:
+            params["enddate" if api_name == "stk_holdernumber" else "period"] = period
+        if start_date:
+            params["start_date"] = start_date
+        if end_date:
+            params["end_date"] = end_date
+        return _safe_sync_raw(api_name, params)
+    results, workers = _parallel_tushare_map(codes, fetch_one, prefix=f"tushare-{api_name}")
+    return {
+        "ok": all(bool(x.get("ok")) for x in results), "api": api_name, "period": period,
+        "total": len(results), "success": sum(1 for x in results if x.get("ok")),
+        "failed": sum(1 for x in results if not x.get("ok")), "concurrency": workers, "results": results,
+    }
+
+
+def sync_tushare_date_batch(api_name: str, *, trade_dates: list[str], limit: int = 10) -> dict[str, Any]:
+    """Progress a date-based API, treating successful empty responses as checked."""
+    _catalog_item(api_name)
+    wanted = list(dict.fromkeys(str(x) for x in trade_dates if str(x)))
+    with _conn() as c:
+        checked = {str(dict(row).get("trade_date") or "") for row in c.execute(
+            f"SELECT trade_date FROM dc_tushare_request_coverage WHERE api_name=? AND trade_date IN ({','.join('?' for _ in wanted)})",
+            (api_name, *wanted),
+        ).fetchall()} if wanted else set()
+    pending = [d for d in wanted if d not in checked][:max(1, min(int(limit), 60))]
+    results, workers = _parallel_tushare_map(
+        pending, lambda d: _safe_sync_raw(api_name, {"trade_date": d}), prefix=f"tushare-{api_name}"
+    )
+    return {
+        "ok": all(bool(x.get("ok")) for x in results), "api": api_name,
+        "total": len(results), "success": sum(1 for x in results if x.get("ok")),
+        "failed": sum(1 for x in results if not x.get("ok")), "concurrency": workers, "results": results,
+    }
 
 
 def sync_governance_bundle(ts_code: str, period: str | None = None) -> dict[str, Any]:
@@ -741,7 +1035,7 @@ def sync_index_bundle(index_code: str = "000300.SH", start_date: str | None = No
         _safe_sync_raw("index_daily", {"ts_code": index_code, "start_date": start_date, "end_date": end_date}),
         _safe_sync_raw("index_weight", {"index_code": index_code, "start_date": start_date, "end_date": end_date}),
     ]
-    return {"ok": True, "index_code": index_code, "start_date": start_date, "end_date": end_date, "results": results}
+    return {"ok": all(bool(x.get("ok")) for x in results), "index_code": index_code, "start_date": start_date, "end_date": end_date, "results": results}
 
 
 def _safe_sync_raw(api_name: str, params: dict[str, Any] | None = None) -> dict[str, Any]:

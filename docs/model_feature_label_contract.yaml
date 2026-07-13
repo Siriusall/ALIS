@@ -1,0 +1,13 @@
+version: v1
+features:
+  point_in_time: true
+  allowed_lookback_days: [20, 60, 120, 252]
+  groups: [quality, growth, cashflow, governance, industry, expectation, valuation, sentiment, narrative, technical, risk]
+labels:
+  horizons_days: [5, 10, 20]
+  target: forward_total_return_after_cost
+training:
+  split: expanding_walk_forward
+  minimum_rows: 200
+  promotion_requires: [holdout_lift_gt_zero, walk_forward_lift_gt_zero]
+  fallback: elastic_net_or_linear

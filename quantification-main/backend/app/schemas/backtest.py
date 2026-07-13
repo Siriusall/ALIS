@@ -10,7 +10,7 @@ class BacktestRunRequest(BaseModel):
     model_version_id: Optional[int] = Field(None, ge=1)
     start_date: str = Field(..., description="YYYY-MM-DD 或 YYYYMMDD")
     end_date: str = Field(..., description="YYYY-MM-DD 或 YYYYMMDD")
-    initial_cash: float = Field(1_000_000, ge=1000)
+    initial_cash: float = Field(200_000, ge=1000)
     rebalance_freq: Optional[str] = Field(None, description="daily|weekly|monthly")
     benchmark_symbol: str = Field("000300")
     exchange_group: str = Field("HS", description="ALL|HS|CYB|BJ")

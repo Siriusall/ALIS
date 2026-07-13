@@ -3,18 +3,23 @@ import { CartesianGrid, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YA
 import { fetchBacktest, fetchBacktestJob, runBacktestAsync, type BacktestRunResponse } from "../api/backtest";
 import {
   fetchModelStrategyStatus,
+  fetchModelConstitution,
   fetchModelTrainRun,
   startModelTraining,
+  autoTuneModels,
   type ModelStrategyStatus,
   type ModelTrainRun,
+  type ModelConstitution,
 } from "../api/modelStrategy";
 import { chartGridStroke, chartLinePrimary, chartTooltipStyle } from "../chartTheme";
 
 export default function StrategyPage() {
   const [status, setStatus] = useState<ModelStrategyStatus | null>(null);
+  const [constitution, setConstitution] = useState<ModelConstitution | null>(null);
   const [trainRun, setTrainRun] = useState<ModelTrainRun | null>(null);
   const [training, setTraining] = useState(false);
   const [validating, setValidating] = useState(false);
+  const [tuning, setTuning] = useState(false);
   const [validation, setValidation] = useState<BacktestRunResponse | null>(null);
   const [error, setError] = useState("");
   const pollRef = useRef<number | null>(null);
@@ -31,6 +36,7 @@ export default function StrategyPage() {
     try {
       const data = await fetchModelStrategyStatus();
       setStatus(data);
+      setConstitution(await fetchModelConstitution());
       setTrainRun(data.latest_train_run ?? null);
       setTraining(data.latest_train_run?.status === "running");
     } catch {
@@ -79,7 +85,7 @@ export default function StrategyPage() {
         model_version_id: activeId,
         start_date: "2026-05-07",
         end_date: "2026-07-06",
-        initial_cash: 100000,
+        initial_cash: 200000,
         rebalance_freq: "daily",
         benchmark_symbol: "000300",
         exchange_group: "HS",
@@ -100,6 +106,20 @@ export default function StrategyPage() {
     } catch (e: unknown) {
       setValidating(false);
       setError((e as Error).message || "模型验证失败");
+    }
+  }
+
+  async function handleAutoTune() {
+    setTuning(true);
+    setError("");
+    try {
+      const result = await autoTuneModels();
+      setError(result.decision === "promoted" ? "Challenger 已通过门槛并晋升" : `自动调优完成：${result.decision}（评估 ${result.evaluated} 个候选）`);
+      await refreshStatus();
+    } catch (e: unknown) {
+      setError((e as Error).message || "自动调优失败");
+    } finally {
+      setTuning(false);
     }
   }
 
@@ -154,8 +174,25 @@ export default function StrategyPage() {
             <button type="button" className="quant-analyze-secondary-btn" onClick={refreshStatus}>
               刷新状态
             </button>
+            <button type="button" className="quant-analyze-secondary-btn" onClick={handleAutoTune} disabled={tuning}>
+              {tuning ? "调优中…" : "运行自动调优"}
+            </button>
           </div>
         </div>
+
+        {constitution && (
+          <div className="card">
+            <h3>固定模型构成与实现状态</h3>
+            <div className="table-scroll">
+              <table>
+                <thead><tr><th>组件</th><th>规定模型</th><th>当前状态</th></tr></thead>
+                <tbody>{Object.entries(constitution.components).map(([key, item]) => (
+                  <tr key={key}><td>{key}</td><td>{item.model}</td><td>{item.status}</td></tr>
+                ))}</tbody>
+              </table>
+            </div>
+          </div>
+        )}
 
         <div className="metrics-row">
           <div className="card metric-card">

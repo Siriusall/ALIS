@@ -10,6 +10,7 @@ from app.db.store import get_active_model_version, get_model_version
 from app.services.backtest_data_source import BacktestDataSource, SnapshotRow
 from app.services.backtest_engine import _factor_value
 from app.services.model_registry import MODEL_KEY
+from app.services.quant_risk import model_risk_multiplier
 
 
 def _safe_float(v: Any) -> float:
@@ -65,6 +66,17 @@ def score_snapshot_rows(
             for row in matrix
         ]
     ranked = list(zip(rows, preds))
+    # Apply the constitution's bounded market-risk overlay to every candidate
+    # using its own recent return evidence. Ranking remains model-driven, while
+    # contraction/high-tail-risk regimes reduce portfolio aggressiveness.
+    adjusted = []
+    for row, pred in ranked:
+        hist = ds.get_hist_window(row.symbol, signal_date, 30)
+        closes = [_safe_float(getattr(x, "close", 0)) for x in hist]
+        returns = [(closes[i] / closes[i - 1] - 1.0) for i in range(1, len(closes)) if closes[i - 1] > 0 and closes[i] > 0]
+        gate = model_risk_multiplier(returns)
+        adjusted.append((row, float(pred) * float(gate["multiplier"])))
+    ranked = adjusted
     ranked.sort(key=lambda x: x[1], reverse=True)
     return ranked
 

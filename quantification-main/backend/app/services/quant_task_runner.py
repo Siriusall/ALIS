@@ -29,8 +29,9 @@ from app.services.quant_run_engine import (
     ReplayRiskGateError,
     require_consolidated_trade_dates,
     run_for_trade_date,
+    list_consolidated_trade_dates,
 )
-from app.services.quant_risk import RiskPauseDecision, evaluate_consecutive_loss_gate, evaluate_data_health_gate, no_pause, pause_decision
+from app.services.quant_risk import RiskPauseDecision, evaluate_account_drawdown_gate, evaluate_consecutive_loss_gate, evaluate_data_health_gate, no_pause, pause_decision
 from app.services.quant_task_state_machine import can_transition, normalize_status
 
 logger = logging.getLogger("quant.quant_task_runner")
@@ -44,6 +45,35 @@ _DEFAULT_SCORING_TIMEOUT_SEC = max(10, min(int(os.getenv("QUANT_SCORING_TIMEOUT_
 _DEFAULT_MIN_ACCOUNT_BALANCE = max(0.0, float(os.getenv("QUANT_MIN_ACCOUNT_BALANCE", "0") or 0))
 _DEFAULT_MAX_CONSECUTIVE_LOSSES = max(0, min(int(os.getenv("QUANT_MAX_CONSECUTIVE_LOSSES", "3")), 30))
 _DEFAULT_ENABLE_DATA_HEALTH_GATE = str(os.getenv("QUANT_ENABLE_DATA_HEALTH_GATE", "1")).strip().lower() in {"1", "true", "yes", "on"}
+_AUTO_SIMULATION_ENABLED = str(os.getenv("QUANT_AUTO_SIMULATION", "1")).strip().lower() in {"1", "true", "yes", "on"}
+_AUTO_SIMULATION_INTERVAL_SEC = max(60, min(int(os.getenv("QUANT_AUTO_SIMULATION_INTERVAL_SEC", "300")), 3600))
+_auto_scheduler_started = False
+
+
+def _refresh_performance_reports(task_id: int) -> None:
+    """Refresh persisted period reports after a batch is durably written.
+
+    The calculation remains owned by the performance API so the UI and the
+    scheduler share exactly one aggregation definition. Failure is non-fatal:
+    the next scheduler tick retries it and the task ledger is never rolled
+    back because a report refresh is unavailable.
+    """
+    def _request() -> None:
+        try:
+            # Import lazily to avoid the API/router -> task-runner import
+            # cycle during application startup. Calling the same aggregation
+            # function directly also works for single-worker deployments.
+            from app.api.routes.quant_runs import quant_run_performance
+            result = quant_run_performance(task_id=int(task_id))
+            if int(result.get("persisted_reports") or 0) < 0:
+                raise RuntimeError("invalid persisted report count")
+        except Exception as exc:
+            logger.warning("performance report refresh deferred task_id=%s: %s", task_id, exc)
+
+    # Do not call the same sync API while the task worker is still finalizing
+    # its transaction. A short daemon timer lets the worker release DB state
+    # and avoids the self-request connection reset observed under uvicorn.
+    threading.Timer(0.5, _request).start()
 
 
 def _utc_now_iso() -> str:
@@ -61,6 +91,44 @@ def _mark_running(task_id: int, running: bool) -> None:
             _running_task_ids.add(int(task_id))
         else:
             _running_task_ids.discard(int(task_id))
+
+
+def start_auto_simulation_scheduler() -> bool:
+    """Start the close-of-day simulator trigger once per process.
+
+    This only resumes the existing simulated quant-run tasks. The real/manual
+    broker route remains protected by ``ensure_manual_trade_allowed``.
+    """
+    global _auto_scheduler_started
+    if not _AUTO_SIMULATION_ENABLED:
+        return False
+    with _task_lock:
+        if _auto_scheduler_started:
+            return False
+        _auto_scheduler_started = True
+
+    def _loop() -> None:
+        while True:
+            try:
+                now = datetime.now()
+                if now.weekday() < 5 and now.time() >= dtime(15, 35):
+                    dates = list_consolidated_trade_dates()
+                    latest = str(dates[-1]) if dates else ""
+                    if latest:
+                        for task in list_active_quant_run_tasks():
+                            status = str(task.get("status") or "").lower()
+                            if status not in {"pending", "paused"}:
+                                continue
+                            if str(task.get("last_execute_date") or "") == latest:
+                                continue
+                            run_quant_task_async(int(task["id"]))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("自动模拟调度检查失败: %s", str(exc)[:200])
+            threading.Event().wait(_AUTO_SIMULATION_INTERVAL_SEC)
+
+    threading.Thread(target=_loop, name="quant-auto-simulation", daemon=True).start()
+    logger.info("自动模拟调度已启动，收盘后每 %ss 检查一次", _AUTO_SIMULATION_INTERVAL_SEC)
+    return True
 
 
 def _is_tushare_auth_error(exc: Exception) -> bool:
@@ -451,6 +519,15 @@ def run_quant_task_async(task_id: int) -> bool:
                 task_id=task_id,
                 max_consecutive_losses=max_consecutive_losses,
             )
+            drawdown_decision = evaluate_account_drawdown_gate(max_drawdown=0.10)
+            if drawdown_decision.should_pause:
+                _handle_pause(
+                    task_id,
+                    replay_status=drawdown_decision.code,
+                    message=drawdown_decision.message,
+                    decision=drawdown_decision,
+                )
+                return
             if loss_decision.should_pause:
                 _handle_pause(
                     task_id,
@@ -724,6 +801,7 @@ def run_quant_task_async(task_id: int) -> bool:
                     return
 
             remaining_days = max(0, target_end_idx - batch_end_idx)
+            _refresh_performance_reports(task_id)
             task_end = get_quant_run_task(task_id)
             if task_end and bool(task_end.get("stop_requested")):
                 _transition_task_status(
@@ -879,7 +957,7 @@ def resume_quant_tasks_on_startup() -> int:
                 "paused",
                 "startup_pause",
                 finished_at=None,
-                last_message="后端重启，任务已自动暂停，请手动点击继续",
+                last_message="后端重启，任务已安全暂停；下一收盘调度会自动继续，也可手动继续",
             ):
                 paused += 1
     return paused

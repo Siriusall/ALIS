@@ -1,0 +1,25 @@
+version: v1
+database: alis_data
+assets:
+  - key: daily_price
+    frequency: daily
+    primary_source: tushare.daily
+    fallback: [web_quote, ocr_quote]
+    required_fields: [ts_code, trade_date, open, high, low, close, vol, amount]
+    quality: [unique_ts_code_trade_date, close_gt_zero, available_time_required]
+  - key: financial_indicator
+    frequency: quarterly
+    primary_source: tushare.fina_indicator
+    fallback: [exchange_report, web_f10, ocr_report]
+    required_fields: [ts_code, end_date, ann_date]
+    quality: [point_in_time, report_period_required, source_provenance]
+  - key: announcements
+    frequency: event
+    primary_source: exchange_disclosure
+    fallback: [cninfo, web_fallback]
+    quality: [deduplicate_by_source_id, published_at_required, raw_document_hash]
+update_policy:
+  incremental_first: true
+  retry: exponential_jitter
+  empty_result_is_failure: true
+  resume_from_checkpoint: true

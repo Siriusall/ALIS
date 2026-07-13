@@ -1,9 +1,9 @@
 # ALIS
 
-ALIS 是一个面向 A 股长线投资研究的个人版数据中台与量化研究系统。当前项目由两个子系统组成：
+ALIS 是一个面向 A 股长线投资研究的个人版数据中台与量化研究系统。当前由一个统一应用和一个历史采集目录组成：
 
-- `quantification-main/`：主量化系统，包含 FastAPI 后端、React 前端、Tushare 数据接入、数据中台 V1、股票快照、风险检查和研究看板。
-- `news/`：因子与网页数据采集系统，包含 Python Playwright 爬虫、Node.js API 和 React 查询前端。
+- `quantification-main/`：统一应用，包含 FastAPI 后端、React 前端、数据中台、策略、回测、持仓、风控和研究看板。
+- `news/`：历史网页采集实现，只作为迁移来源保留；数据通过主系统 `web_fallback` 接口统一入库，不再独立运行 Node.js API 和 React 前端。
 
 项目目标不是做短线高频交易，而是逐步建设一套可以支撑长线研究的基础设施：
 
@@ -30,46 +30,27 @@ ALIS 当前优先建设数据中台，先解决数据获取、增量更新、数
 
 ```text
 前端：React + TypeScript + Vite
-主后端：FastAPI + SQLAlchemy
+统一后端：FastAPI（业务接口与数据中台接口同属 8000）
 数据采集：Tushare API + Python 爬虫 + Playwright
-因子系统后端：Node.js
-数据库：SQLite/MySQL 兼容，后续建议迁移 PostgreSQL
-缓存/任务队列：后续建议 Redis/BullMQ 或 Celery
-文件存储：后续建议 MinIO
+网页兜底采集：数据中台内置 Playwright 适配器
+数据库：当前模拟主后端使用 PostgreSQL `alis_sim`（历史库 `alis_main` 保留），数据中台使用 PostgreSQL `alis_data`；SQLite 已清理，生产禁止回退到 SQLite
+缓存/任务队列：Redis + Redis Streams
+文件存储：MinIO（本地）/S3兼容对象存储（云端）
 ```
 
 ## 本地启动
 
-主系统：
+统一启动（后端 8000、前端 5173）：
 
 ```bash
-cd quantification-main/backend
-python3.11 -m venv .venv
-. .venv/bin/activate
-pip install -r requirements.txt
-uvicorn app.main:app --host 127.0.0.1 --port 8000
-
-cd ../frontend
-npm install
-npm run dev
+cd quantification-main
+./start.sh
 ```
 
-因子系统：
+网页/F10 兜底采集已并入统一后端，可从“数据中台”页面启动。
 
 ```bash
-cd news/backend
-npm install
-npm run dev
-
-cd ../frontend
-npm install
-npm run dev
-
-cd ../crawler
-python3 -m venv .venv
-. .venv/bin/activate
-pip install -r requirements.txt
-python main.py crawl
+curl -X POST 'http://127.0.0.1:8000/api/data-center/web-fallback/crawl?codes=000001&limit=1'
 ```
 
 ## 环境变量
@@ -78,7 +59,10 @@ python main.py crawl
 
 ```bash
 TUSHARE_TOKEN=你的本地token
-DATABASE_URL=sqlite:///.cache/quant.db
+DATABASE_URL=postgresql://sirius@127.0.0.1:5432/alis_sim
+DATA_PLATFORM_DATABASE_URL=postgresql://sirius@127.0.0.1:5432/alis_data
+# LightGBM native runtime is opt-in until macOS OpenMP loading is verified.
+ALIS_ENABLE_LIGHTGBM=0
 ```
 
 仓库中只应保留 `.env.example` 一类示例文件。
@@ -89,25 +73,25 @@ DATABASE_URL=sqlite:///.cache/quant.db
 cd quantification-main/backend
 
 # 初始化 API 目录元数据
-.venv/bin/python scripts/data_center_v1.py seed
+.venv/bin/python -m scripts.data_center_v1 seed
 
 # 探测当前 Tushare 权限
-.venv/bin/python scripts/probe_tushare_permissions.py --sleep 2 --sample-rows 1
+.venv/bin/python -m scripts.probe_tushare_permissions --sleep 2 --sample-rows 1
 
 # 同步基础数据
-.venv/bin/python scripts/data_center_v1.py sync-basic
+.venv/bin/python -m scripts.data_center_v1 sync-basic
 
 # 同步行情/估值/资金/复权等市场数据
-.venv/bin/python scripts/data_center_v1.py sync-market --trade-date YYYYMMDD
+.venv/bin/python -m scripts.data_center_v1 sync-market --trade-date YYYYMMDD
 
 # 按股票批量同步财务数据
-.venv/bin/python scripts/data_center_v1.py sync-financial-batch --period 20240331 --limit 200
+.venv/bin/python -m scripts.data_center_v1 sync-financial-batch --period 20240331 --limit 200
 
 # 构建每日股票快照
-.venv/bin/python scripts/data_center_v1.py build-snapshot --trade-date YYYYMMDD
+.venv/bin/python -m scripts.data_center_v1 build-snapshot --trade-date YYYYMMDD
 
 # 运行数据质量检查
-.venv/bin/python scripts/data_center_v1.py quality --trade-date YYYYMMDD
+.venv/bin/python -m scripts.data_center_v1 quality --trade-date YYYYMMDD
 ```
 
 ## 文档
@@ -118,4 +102,4 @@ cd quantification-main/backend
 
 ## 注意
 
-本项目仍处于研究系统建设阶段，不构成投资建议。任何策略、评分、筛选结果都需要回测、样本外验证和真实小仓位验证。
+当前阶段为20万元全自动模拟盘，不连接真实券商账户。系统仍处于研究系统建设阶段，不构成投资建议。任何策略、评分、筛选结果都需要回测、样本外验证和模拟盘过程验证。

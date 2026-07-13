@@ -41,6 +41,16 @@ export interface ModelStrategyStatus {
   has_active_model: boolean;
 }
 
+export interface ModelConstitution {
+  model_key: string;
+  components: Record<string, { model: string; status: string }>;
+}
+
+export async function fetchModelConstitution(): Promise<ModelConstitution> {
+  const { data } = await api.get<ModelConstitution>("/api/model-strategy/constitution");
+  return data;
+}
+
 export async function fetchModelStrategyStatus(): Promise<ModelStrategyStatus> {
   const { data } = await api.get<ModelStrategyStatus>("/api/model-strategy/status");
   return data;
@@ -57,5 +67,16 @@ export async function startModelTraining(payload?: {
 
 export async function fetchModelTrainRun(runId: number): Promise<ModelTrainRun> {
   const { data } = await api.get<ModelTrainRun>(`/api/model-strategy/train-runs/${runId}`);
+  return data;
+}
+
+export async function autoTuneModels(): Promise<{ decision: string; evaluated: number; winner?: Record<string, unknown> }> {
+  const { data } = await api.post("/api/model-strategy/auto-tune");
+  return data;
+}
+
+export async function fetchPerformanceReports(taskId?: number): Promise<{ items: Array<{ period_type: string; period: string; payload: Record<string, unknown> }> }> {
+  const query = taskId ? `?task_id=${taskId}` : "";
+  const { data } = await api.get(`/api/quant-runs/performance/reports${query}`);
   return data;
 }

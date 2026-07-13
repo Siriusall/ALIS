@@ -11,7 +11,6 @@ from app.api.routes import (
     backtest,
     candidates,
     check,
-    data_center,
     decision,
     equity,
     factors,
@@ -22,12 +21,18 @@ from app.api.routes import (
     overview,
     positions,
     quant_runs,
+    research,
     signals,
     strategies,
 )
 from app.core.config import settings
 from app.db.store import init_db
-from app.services.quant_task_runner import resume_quant_tasks_on_startup
+from app.services.quant_task_runner import resume_quant_tasks_on_startup, start_auto_simulation_scheduler
+from app.data_platform.db import init_db as init_data_platform_db
+from app.data_platform.redis_store import start_task_worker
+from app.data_platform.routes.data_center import router as data_center_router
+from app.data_platform.services.backfill import process_stream_task, recover_interrupted_backfill
+from app.data_platform.services.runtime_logs import write_runtime_log
 
 logging.basicConfig(
     level=logging.INFO,
@@ -52,12 +57,22 @@ def startup() -> None:
     startup_t0 = time.perf_counter()
     logger.info("Starting service: initializing database schema only.")
     init_db()
+    init_data_platform_db()
     try:
         paused = resume_quant_tasks_on_startup()
         if paused > 0:
             logger.info("Paused interrupted quant tasks on startup: %d", paused)
+        start_auto_simulation_scheduler()
     except Exception as exc:  # noqa: BLE001
         logger.warning("Failed to reconcile interrupted quant tasks: %s", str(exc)[:120])
+    try:
+        recovery = recover_interrupted_backfill()
+        start_task_worker(process_stream_task)
+        if recovery.get("recovered"):
+            write_runtime_log("WARNING", "backfill", "检测到服务重启中断的补数任务，已转换为可续跑状态", recovery)
+        write_runtime_log("INFO", "data-platform", "统一后端中的数据中台已启动")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to initialize data-platform worker: %s", str(exc)[:200])
     logger.info("Service startup completed in %.3fs. Use POST /api/init to refresh market data.", time.perf_counter() - startup_t0)
 
 
@@ -81,12 +96,13 @@ app.include_router(positions.router, prefix="/api")
 app.include_router(backtest.router, prefix="/api")
 app.include_router(logs.router, prefix="/api")
 app.include_router(check.router, prefix="/api")
-app.include_router(data_center.router, prefix="/api")
+app.include_router(data_center_router, prefix="/api")
 app.include_router(decision.router, prefix="/api")
 app.include_router(factors.router, prefix="/api")
 app.include_router(init_routes.router, prefix="/api")
 app.include_router(quant_runs.router, prefix="/api")
 app.include_router(model_strategy.router, prefix="/api")
+app.include_router(research.router, prefix="/api")
 
 
 @app.get("/api/health")

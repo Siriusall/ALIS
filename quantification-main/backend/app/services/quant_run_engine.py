@@ -27,10 +27,12 @@ from app.services.backtest_data_source import BacktestDataSource
 from app.services.backtest_engine import _apply_filters, _factor_value, _score_rows
 from app.services.execution_engine import simulate_open_execution
 from app.services.rebalance_allocator import allocate_buy_orders, planned_to_order_results
+from app.services.decision_store import create_decision_snapshot
 from app.services.cache_consolidation import list_available_trade_dates
 from app.services.strategy_recommender import recommend_strategy_template
 from app.services.strategy_config import parse_strategy_content
 from app.services.trend_model import analyze_trend
+from app.services.quant_risk import cvar_position_multiplier, constrained_cvar_weights, hrp_fallback_weights, ledoit_wolf_covariance
 
 _SCORING_HEARTBEAT_EVERY = max(100, min(int(os.getenv("QUANT_SCORING_HEARTBEAT_EVERY", "300")), 2000))
 _SCORING_TIMEOUT_SEC = max(10, min(int(os.getenv("QUANT_SCORING_TIMEOUT_SEC", "90")), 1800))
@@ -478,11 +480,18 @@ def run_for_trade_date(
         budget_ratio=effective_budget_ratio,
     )
     order_requests: List[OrderRequest] = []
+    score_map = _selection_score_map(selection_detail)
+    returns_by_symbol: Dict[str, List[float]] = {}
     for sym in buy_list:
         px_row = exec_map.get(sym)
         px = _row_trade_price(px_row, prefer_open=True)
         if px <= 0:
             continue
+        hist = ds.get_hist_window(sym, execute_date, 60)
+        closes = [float(getattr(x, "close", 0) or 0) for x in hist]
+        returns = [(closes[i] / closes[i - 1] - 1.0) for i in range(1, len(closes)) if closes[i - 1] > 0 and closes[i] > 0]
+        returns_by_symbol[sym] = returns
+        score_map[sym] = float(score_map.get(sym, 0.0)) * cvar_position_multiplier(returns)
         order_requests.append(
             OrderRequest(
                 symbol=sym,
@@ -496,6 +505,21 @@ def run_for_trade_date(
             )
         )
 
+    # Portfolio-level risk budget: covariance is shrunk before the constrained
+    # CVaR weights are applied, preventing a single volatile name from
+    # consuming the whole buy budget. The covariance snapshot is retained in
+    # the execution detail below for auditability.
+    covariance_snapshot = ledoit_wolf_covariance(returns_by_symbol)
+    cvar_weights = constrained_cvar_weights(returns_by_symbol, max_single=max_single_position_pct)
+    optimizer_name = "ledoit_wolf_shrinkage_plus_constrained_cvar_v1"
+    if not cvar_weights:
+        cvar_weights = hrp_fallback_weights(returns_by_symbol, max_single=max_single_position_pct)
+        optimizer_name = "hrp_inverse_volatility_fallback_v1"
+    if cvar_weights:
+        scale = max(1, len(cvar_weights))
+        for sym, weight in cvar_weights.items():
+            score_map[sym] = float(score_map.get(sym, 0.0)) * float(weight * scale)
+
     _report("正在生成买卖单")
     exec_t0 = time.monotonic()
     result = simulate_open_execution(
@@ -505,7 +529,7 @@ def run_for_trade_date(
         total_equity=portfolio["total_equity"],
         max_single_position_pct=max_single_position_pct,
         existing_position_value=portfolio["position_value_by_symbol"],
-        symbol_scores=_selection_score_map(selection_detail),
+        symbol_scores=score_map,
     )
     exec_latency_ms = max(1, int((time.monotonic() - exec_t0) * 1000))
     filled = _filled_orders(result.orders)
@@ -622,7 +646,43 @@ def run_for_trade_date(
             "avg_slippage_bps": avg_slippage_bps,
             "effective_budget_ratio": round(effective_budget_ratio, 4),
         },
+        "portfolio_risk": {
+            "optimizer": optimizer_name,
+            "weights": cvar_weights,
+            "covariance": covariance_snapshot,
+        },
     }
+    try:
+        selection_by_symbol = {str(x.get("symbol") or ""): x for x in (selection_detail.get("selections") or [])}
+        template = selection_detail.get("strategy_template") or {}
+        model_version = str(template.get("id") or "rule_fallback_v1")
+        market_state = selection_detail.get("trend_analysis") or {}
+        decision_time = f"{execute_date}T09:30:00"
+        data_as_of = f"{signal_date}T23:59:59"
+        for action in buy_actions:
+            symbol = str(action.get("symbol") or "")
+            evidence = selection_by_symbol.get(symbol) or {}
+            create_decision_snapshot({
+                "ts_code": symbol, "decision_type": "buy", "decision_time": decision_time,
+                "price": action.get("price"), "data_as_of_time": data_as_of, "model_version": model_version,
+                "market_state": market_state, "research_state": evidence, "valuation": {},
+                "portfolio_context": detail.get("portfolio_risk") or {},
+                "reason": f"入选目标组合；{template.get('reason') or detail.get('summary')}",
+                "invalidation_conditions": ["跌出目标组合", "硬风险门控触发", "组合风险约束要求减仓"],
+            })
+        for action in sell_triggers:
+            symbol = str(action.get("symbol") or "")
+            create_decision_snapshot({
+                "ts_code": symbol, "decision_type": "sell", "decision_time": decision_time,
+                "price": action.get("price"), "data_as_of_time": data_as_of, "model_version": model_version,
+                "market_state": market_state, "research_state": selection_by_symbol.get(symbol) or {}, "valuation": {},
+                "portfolio_context": detail.get("portfolio_risk") or {},
+                "reason": str(action.get("reason") or "不再满足目标组合条件"),
+                "invalidation_conditions": [],
+            })
+    except Exception as exc:  # decision evidence failure must be visible but cannot corrupt the execution ledger
+        add_log("ERROR", f"决策快照写入失败：{str(exc)[:240]}")
+        detail["decision_snapshot_error"] = str(exc)[:240]
     return QuantRunExecResult(
         signal_date=signal_date,
         execute_date=execute_date,

@@ -18,7 +18,7 @@ class ExecutionState:
 
 def simulate_open_execution(
     candidates: List[OrderRequest],
-    budget: float = 1_000_000.0,
+    budget: float = 200_000.0,
     executed_at: str | None = None,
     *,
     total_equity: float | None = None,
@@ -46,7 +46,7 @@ def simulate_open_execution(
 # 保留旧版简单实现供测试对照（内部不再默认使用）
 def simulate_open_execution_legacy(
     candidates: List[OrderRequest],
-    budget: float = 1_000_000.0,
+    budget: float = 200_000.0,
     executed_at: str | None = None,
 ) -> ExecutionState:
     orders: List[OrderResult] = []

@@ -1,0 +1,14 @@
+version: v1
+initial_cash: 200000
+assets: [CN_STOCK, CN_ETF]
+single_name_limit: 0.15
+core_single_name_limit: 0.25
+industry_limit: 0.25
+max_drawdown_target: 0.10
+max_empty_trade_days_without_explanation: 3
+monthly_turnover_limit: 0.30
+risk:
+  primary: constrained_cvar
+  covariance: ledoit_wolf_shrinkage
+  fallback: hrp_inverse_volatility
+  optimizer_failure: keep_previous_weights_then_risk_budget

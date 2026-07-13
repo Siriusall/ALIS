@@ -1,0 +1,8 @@
+import { useEffect, useState } from "react";
+import { fetchIndustries, type IndustryResearchItem } from "../api/research";
+
+export default function IndustryResearchPage() {
+  const [items, setItems] = useState<IndustryResearchItem[]>([]); const [error, setError] = useState("");
+  useEffect(()=>{fetchIndustries().then(setItems).catch(e=>setError(e instanceof Error?e.message:String(e)))},[]);
+  return <section className="industry-page"><div className="product-module-head"><div><span>INDUSTRY RESEARCH</span><h1>行业研究中心</h1><p>只有需求、价格、库存、产能和盈利等证据覆盖达标后才判断生命周期；单条价格数据不会被包装成行业景气。</p></div></div>{error&&<div className="alert">{error}</div>}<div className="industry-list">{items.map(item=><article className="industry-card" key={item.industry_code}><header><div><span>{item.industry_code}</span><h2>{item.industry_name}</h2></div><div className={`module-state module-state-${item.state.status==="ready"?"ready":"partial"}`}>{item.state.lifecycle}</div></header><div className="industry-facts"><div><strong>{item.total_evidence_points}</strong><span>历史证据点</span></div><div><strong>{(item.state.coverage*100).toFixed(0)}%</strong><span>景气分量覆盖</span></div><div><strong>{item.state.status==="ready"?item.state.score.toFixed(1):"—"}</strong><span>景气评分</span></div></div><div>{item.metrics.map(metric=><div className="industry-metric" key={metric.metric_code}><strong>{metric.metric_name}</strong><span>{metric.frequency} · {metric.source_code||"来源未登记"}</span><small>{metric.value_count} 条 · {metric.first_date||"—"} 至 {metric.last_date||"—"}</small></div>)}</div>{item.limitations.map(value=><p className="module-missing" key={value}>{value}</p>)}</article>)}{!items.length&&!error&&<div className="research-empty"><strong>正在读取行业指标</strong></div>}</div></section>;
+}

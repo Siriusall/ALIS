@@ -6,8 +6,8 @@ TuShare 小样本权限探测。
 
 原则：
 - 严格复用项目现有 TuShare 初始化方式：
-  app.integrations.tushare_client.load_tushare_token_from_env
-  app.integrations.tushare_client.create_strict_tushare_pro
+  app.tushare_client.load_tushare_token_from_env
+  app.tushare_client.create_strict_tushare_pro
 - 每个接口只取极小样本，避免触发限流或拉取大批量数据。
 - 不打印 token。
 
@@ -21,6 +21,7 @@ import json
 import sys
 import time
 from dataclasses import dataclass
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -31,7 +32,7 @@ if __name__ == "__main__":
     if str(backend) not in sys.path:
         sys.path.insert(0, str(backend))
 
-from app.integrations.tushare_client import create_strict_tushare_pro, load_tushare_token_from_env
+from app.data_platform.tushare_client import create_strict_tushare_pro, load_tushare_token_from_env
 
 
 @dataclass(frozen=True)
@@ -43,10 +44,19 @@ class ProbeCase:
     note: str
 
 
-DEFAULT_TRADE_DATE = "20260709"
-DEFAULT_START_DATE = "20260701"
-DEFAULT_END_DATE = "20260709"
-DEFAULT_PERIOD = "20260331"
+def _last_completed_weekday() -> date:
+    """Choose a completed weekday instead of a stale or intraday date."""
+    value = date.today() - timedelta(days=1)
+    while value.weekday() >= 5:
+        value -= timedelta(days=1)
+    return value
+
+
+_PROBE_END = _last_completed_weekday()
+DEFAULT_TRADE_DATE = _PROBE_END.strftime("%Y%m%d")
+DEFAULT_START_DATE = (_PROBE_END - timedelta(days=10)).strftime("%Y%m%d")
+DEFAULT_END_DATE = DEFAULT_TRADE_DATE
+DEFAULT_PERIOD = f"{_PROBE_END.year - 1}1231"
 DEFAULT_TS_CODE = "000001.SZ"
 
 
@@ -69,7 +79,7 @@ PROBE_CASES: list[ProbeCase] = [
     ProbeCase("财务", "fina_audit", {"ts_code": DEFAULT_TS_CODE, "period": "20251231"}, "ts_code,ann_date,end_date,audit_result,audit_fees,audit_agency", "审计意见"),
     ProbeCase("财务", "fina_mainbz", {"ts_code": DEFAULT_TS_CODE, "period": "20251231", "type": "P"}, "ts_code,end_date,bz_item,bz_sales,bz_profit,bz_cost,curr_type", "主营构成"),
     ProbeCase("业绩", "forecast", {"ts_code": DEFAULT_TS_CODE, "ann_date": ""}, "ts_code,ann_date,end_date,type,p_change_min,p_change_max,net_profit_min,net_profit_max,summary", "业绩预告"),
-    ProbeCase("业绩", "express", {"ts_code": DEFAULT_TS_CODE, "period": DEFAULT_PERIOD}, "ts_code,ann_date,end_date,revenue,total_profit,n_income,total_assets", "业绩快报"),
+    ProbeCase("业绩", "express", {"period": DEFAULT_PERIOD}, "ts_code,ann_date,end_date,revenue,total_profit,n_income,total_assets", "业绩快报（全市场已完成报告期）"),
     ProbeCase("分红", "dividend", {"ts_code": DEFAULT_TS_CODE}, "ts_code,end_date,ann_date,div_proc,stk_div,cash_div_tax,record_date,ex_date,pay_date", "分红送股"),
     ProbeCase("股东", "top10_holders", {"ts_code": DEFAULT_TS_CODE, "period": DEFAULT_PERIOD}, "ts_code,ann_date,end_date,holder_name,hold_amount,hold_ratio", "十大股东"),
     ProbeCase("股东", "top10_floatholders", {"ts_code": DEFAULT_TS_CODE, "period": DEFAULT_PERIOD}, "ts_code,ann_date,end_date,holder_name,hold_amount,hold_ratio", "十大流通股东"),

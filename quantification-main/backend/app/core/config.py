@@ -14,9 +14,10 @@ class Settings(BaseModel):
     jwt_secret: str = "quant-secret-change-in-production"
     jwt_algorithm: str = "HS256"
     jwt_expire_minutes: int = 60 * 24 * 7  # 7 天
-    # 数据库：默认 SQLite；可通过环境变量 DATABASE_URL 覆盖
-    # 示例：sqlite:///.cache/quant.db 或 sqlite:////abs/path/quant.db
-    database_url: str = os.getenv("DATABASE_URL", "sqlite:///.cache/quant.db")
+    # 生产数据库必须使用 PostgreSQL；SQLite 不再作为默认回退。
+    database_url: str = os.getenv(
+        "DATABASE_URL", "postgresql://sirius@127.0.0.1:5432/alis_sim"
+    )
 
 
 settings = Settings()

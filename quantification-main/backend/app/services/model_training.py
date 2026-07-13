@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import pickle
 from datetime import datetime
 from pathlib import Path
@@ -91,17 +92,40 @@ def _build_dataset(
     return x_rows, y_rows, meta
 
 
-def _train_sklearn_model(x_train: list[list[float]], y_train: list[float]):
+def _train_sklearn_model(x_train: list[list[float]], y_train: list[float], *, max_iter: int = 80, learning_rate: float = 0.06, max_leaf_nodes: int = 31):
     try:
         from sklearn.ensemble import HistGradientBoostingRegressor
     except Exception:
         return None
     model = HistGradientBoostingRegressor(
-        max_iter=80,
-        learning_rate=0.06,
-        max_leaf_nodes=31,
+        max_iter=max_iter,
+        learning_rate=learning_rate,
+        max_leaf_nodes=max_leaf_nodes,
         l2_regularization=0.01,
         random_state=42,
+    )
+    model.fit(x_train, y_train)
+    return model
+
+
+def _train_lightgbm_model(x_train: list[list[float]], y_train: list[float]):
+    """Use the fixed LightGBM cross-sectional model when the native runtime is available."""
+    # macOS ARM wheels may block while resolving libomp.  Keep production
+    # startup/training safe until the native runtime is explicitly validated.
+    if str(os.getenv("ALIS_ENABLE_LIGHTGBM", "0")).lower() not in {"1", "true", "yes", "on"}:
+        return None
+    try:
+        import lightgbm as lgb
+    except Exception:
+        return None
+    model = lgb.LGBMRegressor(
+        n_estimators=120,
+        learning_rate=0.04,
+        num_leaves=31,
+        max_depth=-1,
+        reg_lambda=0.1,
+        random_state=42,
+        verbosity=-1,
     )
     model.fit(x_train, y_train)
     return model
@@ -112,7 +136,8 @@ def _linear_weights(x_train: list[list[float]], y_train: list[float]) -> dict[st
         return {f: 0.0 for f in FEATURES}
     y_mean = mean(y_train)
     weights: dict[str, float] = {}
-    for col, feature in enumerate(FEATURES):
+    width = min(len(FEATURES), max((len(row) for row in x_train), default=0))
+    for col, feature in enumerate(FEATURES[:width]):
         vals = [row[col] for row in x_train]
         x_mean = mean(vals)
         cov = sum((x - x_mean) * (y - y_mean) for x, y in zip(vals, y_train))
@@ -142,6 +167,33 @@ def _eval_predictions(pred: list[float], y_true: list[float], top_ratio: float =
         "all_mean_label": round(all_mean, 6),
         "lift": round(top_mean - all_mean, 6),
         "hit_rate": round(sum(1 for y in top if y > 0) / len(top), 4),
+    }
+
+
+def _walk_forward_lift(x_rows: list[list[float]], y_rows: list[float], model_type: str, folds: int = 3) -> dict[str, float]:
+    """Expanding-window walk-forward validation used for promotion evidence."""
+    n = len(x_rows)
+    if n < 60:
+        return {"walk_forward_folds": 0, "walk_forward_lift": 0.0, "walk_forward_hit_rate": 0.0}
+    lifts: list[float] = []
+    hits: list[float] = []
+    for fold in range(1, folds + 1):
+        train_end = int(n * (0.45 + 0.12 * fold))
+        val_end = int(n * (0.45 + 0.12 * (fold + 1))) if fold < folds else n
+        if train_end < 30 or val_end <= train_end:
+            continue
+        model = _train_lightgbm_model(x_rows[:train_end], y_rows[:train_end]) if model_type == "lightgbm" else _train_sklearn_model(x_rows[:train_end], y_rows[:train_end])
+        if model is not None:
+            pred = [float(x) for x in model.predict(x_rows[train_end:val_end]).tolist()]
+        else:
+            pred = _predict_linear(x_rows[train_end:val_end], _linear_weights(x_rows[:train_end], y_rows[:train_end]))
+        metrics = _eval_predictions(pred, y_rows[train_end:val_end])
+        lifts.append(float(metrics.get("lift", 0.0)))
+        hits.append(float(metrics.get("hit_rate", 0.0)))
+    return {
+        "walk_forward_folds": len(lifts),
+        "walk_forward_lift": round(sum(lifts) / len(lifts), 6) if lifts else 0.0,
+        "walk_forward_hit_rate": round(sum(hits) / len(hits), 4) if hits else 0.0,
     }
 
 
@@ -190,7 +242,28 @@ def run_model_training(
             x_train, y_train = x_rows[:split], y_rows[:split]
             x_val, y_val = x_rows[split:], y_rows[split:]
             progress("training", 0.55, f"训练机器学习 ranking 模型 horizon={horizon}")
-            model = _train_sklearn_model(x_train, y_train)
+            # Small fixed grid: enough to tune bias/variance without turning
+            # the training job into an unbounded search.
+            grid = [(80, 0.06, 31), (120, 0.04, 31), (60, 0.08, 15)]
+            candidate_models: list[tuple[Any, str, tuple[int, float, int]]] = []
+            lightgbm_model = _train_lightgbm_model(x_train, y_train)
+            if lightgbm_model is not None:
+                candidate_models.append((lightgbm_model, "lightgbm", (120, 0.04, 31)))
+            for params in grid:
+                candidate = _train_sklearn_model(x_train, y_train, max_iter=params[0], learning_rate=params[1], max_leaf_nodes=params[2])
+                if candidate is not None:
+                    candidate_models.append((candidate, "sklearn_hgbr", params))
+            if not candidate_models:
+                candidate_models.append((None, "linear_fallback", (0, 0.0, 0)))
+            model, model_type, model_params = candidate_models[0]
+            best_candidate_score = float("-inf")
+            for candidate, candidate_type, candidate_params in candidate_models:
+                candidate_pred = [float(x) for x in candidate.predict(x_val).tolist()] if candidate is not None else _predict_linear(x_val, _linear_weights(x_train, y_train))
+                candidate_metrics = _eval_predictions(candidate_pred, y_val)
+                candidate_score = float(candidate_metrics.get("lift", 0.0)) + float(candidate_metrics.get("hit_rate", 0.0)) * 0.01
+                if candidate_score > best_candidate_score:
+                    model, model_type, model_params = candidate, candidate_type, candidate_params
+                    best_candidate_score = candidate_score
             artifact: dict[str, Any] = {
                 "model_key": MODEL_KEY,
                 "features": FEATURES,
@@ -199,18 +272,21 @@ def run_model_training(
                 "train_rows": len(x_train),
                 "validation_rows": len(x_val),
                 "created_at": datetime.utcnow().isoformat(),
+                "tuning_grid": grid,
+                "selected_params": model_params,
             }
             artifact_files: dict[str, str] = {}
             if model is not None:
                 pred = [float(x) for x in model.predict(x_val).tolist()] if x_val else []
-                artifact["model_type"] = "sklearn_hgbr"
+                artifact["model_type"] = model_type
             else:
                 weights = _linear_weights(x_train, y_train)
                 pred = _predict_linear(x_val, weights)
-                artifact["model_type"] = "linear_fallback"
+                artifact["model_type"] = model_type
                 artifact["weights"] = weights
             metrics = _eval_predictions(pred, y_val)
             metrics.update({"horizon": horizon, "train_rows": len(x_train), "validation_rows": len(x_val)})
+            metrics.update(_walk_forward_lift(x_rows, y_rows, model_type))
             score = float(metrics.get("lift", 0)) + float(metrics.get("hit_rate", 0)) * 0.01
             if best is None or score > float(best["score"]):
                 best = {
@@ -242,8 +318,9 @@ def run_model_training(
 
         validation = {
             "auto_score": round(float(best["score"]), 6),
-            "status": "passed" if float(best["metrics"].get("lift", 0)) > 0 else "watch",
-            "method": "holdout_then_walk_forward_ready",
+            "status": "passed" if float(best["metrics"].get("lift", 0)) > 0 and float(best["metrics"].get("walk_forward_lift", 0)) > 0 else "watch",
+            "method": "holdout_plus_expanding_walk_forward",
+            "walk_forward_folds": int(best["metrics"].get("walk_forward_folds", 0) or 0),
         }
         model_version_id = create_model_version(
             model_key=MODEL_KEY,

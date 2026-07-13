@@ -3,6 +3,7 @@
 ## 目录结构
 - `backend/` FastAPI 后端（TuShare 数据 + 执行模拟）
 - `frontend/` React 看板（展示真实行情 + 模拟资金/下单）
+- `backend/app/data_platform/` 数据中台模块；与业务接口共同运行在8000，前端直接调用 `/api/data-center/*`
 - `deploy/` Nginx 与 systemd 配置示例
 - `docs/` 文档中心（结构说明、保留策略、索引）
 
@@ -76,9 +77,10 @@ sudo systemctl reload nginx
 | 变量 | 说明 |
 |------|------|
 | `TUSHARE_TOKEN` | 掘金/Tushare 等数据源 Token（按需配置） |
-| `DATABASE_URL` | 数据库连接。不设置时使用 SQLite：`sqlite:///.cache/quant.db`。使用 MySQL 时格式：`mysql+pymysql://用户:密码@host:3306/数据库名`（需先创建数据库，如 `CREATE DATABASE quant CHARACTER SET utf8mb4;`）。SQLite 自定义路径示例：`sqlite:////var/lib/quant/quant.db` |
+| `DATABASE_URL` | 主业务 PostgreSQL 连接，当前本地默认使用 `postgresql://sirius@127.0.0.1:5432/alis_sim`。 |
+| `DATA_PLATFORM_DATABASE_URL` | 数据中台 PostgreSQL 连接；中台接口已并入本后端，但继续与业务事实库物理分库。 |
 
-支持 **SQLite** 与 **MySQL**；首次启动时自动建表并执行内建迁移。
+当前应用运行统一使用 **PostgreSQL**；首次启动时自动建表并执行内建迁移。
 
 ## 统一缓存与初始化
 

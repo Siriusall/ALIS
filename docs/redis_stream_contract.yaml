@@ -1,0 +1,12 @@
+version: v1
+streams:
+  task_queue: alis:data-platform:tasks
+  runtime_logs: alis:data-platform:logs
+consumer_groups:
+  task_queue: data-platform-workers
+message:
+  required: [task_id, task_type, payload, created_at, attempt]
+  ack: after_transactional_write
+  reclaim_after_seconds: 120
+  max_attempts: 5
+  failure_action: persist_dead_letter_and_mark_failed

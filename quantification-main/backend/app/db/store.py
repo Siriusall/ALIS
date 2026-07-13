@@ -1,4 +1,9 @@
-"""Persistence for strategies, executions, and operations. Supports SQLite and MySQL."""
+"""Persistence for strategies, executions, and operations.
+
+PostgreSQL is the required runtime store. The adapter keeps a narrow SQLite
+compatibility path only for explicit migration/test database URLs; production
+startup never creates or falls back to a SQLite file.
+"""
 
 from __future__ import annotations
 
@@ -32,6 +37,11 @@ def _json_load(s: Any, default: Any) -> Any:
 def _is_mysql() -> bool:
     url = (settings.database_url or "").strip().lower()
     return url.startswith("mysql://") or url.startswith("mysql+pymysql://")
+
+
+def _is_postgres() -> bool:
+    url = (settings.database_url or "").strip().lower()
+    return url.startswith("postgresql://") or url.startswith("postgres://") or url.startswith("postgresql+psycopg://")
 
 
 def _db_path() -> Path:
@@ -69,12 +79,21 @@ def _mysql_connect_kwargs() -> dict:
 class _ConnWrapper:
     """统一连接封装：SQLite 与 MySQL 使用相同的 execute / last_insert_id 接口。"""
 
-    def __init__(self, raw_conn, is_mysql: bool):
+    def __init__(self, raw_conn, is_mysql: bool, is_postgres: bool = False):
         self._conn = raw_conn
-        self._is_mysql = is_mysql
+        # Domain code historically uses _is_mysql to select the server-SQL
+        # branch. PostgreSQL shares that branch, while the wrapper handles the
+        # actual driver differences below.
+        self._is_mysql = is_mysql or is_postgres
+        self._is_postgres = is_postgres
         self._last_cursor = None
 
     def execute(self, sql: str, params: Optional[tuple] = None):
+        if self._is_postgres:
+            sql = sql.replace("?", "%s")
+            self._last_cursor = self._conn.cursor()
+            self._last_cursor.execute(sql, params or ())
+            return self._last_cursor
         if self._is_mysql:
             import pymysql.cursors
             sql = sql.replace("?", "%s")
@@ -86,6 +105,11 @@ class _ConnWrapper:
             return self._last_cursor
 
     def executescript(self, sql: str) -> None:
+        if self._is_postgres:
+            for stmt in _split_sql_statements(sql):
+                if stmt.strip():
+                    self.execute(stmt)
+            return
         if self._is_mysql:
             # MySQL 不支持多语句一次执行，按分号拆分并逐条执行（忽略空与注释）
             for stmt in _split_sql_statements(sql):
@@ -96,6 +120,9 @@ class _ConnWrapper:
             self._conn.executescript(sql)
 
     def last_insert_id(self) -> int:
+        if self._is_postgres:
+            row = self._conn.execute("SELECT lastval()").fetchone()
+            return int(row["lastval"] if isinstance(row, dict) else row[0])
         if self._is_mysql:
             return self._conn.insert_id()
         row = self._conn.execute("SELECT last_insert_rowid()").fetchone()
@@ -116,7 +143,21 @@ def _split_sql_statements(sql: str) -> List[str]:
 
 @contextmanager
 def _conn():
-    if _is_mysql():
+    if _is_postgres():
+        import psycopg
+        from psycopg.rows import dict_row
+        url = (settings.database_url or "").strip()
+        if url.startswith("postgresql+psycopg://"):
+            url = url.replace("postgresql+psycopg://", "postgresql://", 1)
+        logger.debug("PostgreSQL 连接: %s", url.split("@")[-1])
+        raw = psycopg.connect(url, row_factory=dict_row)
+        try:
+            w = _ConnWrapper(raw, is_mysql=False, is_postgres=True)
+            yield w
+            w.commit()
+        finally:
+            w.close()
+    elif _is_mysql():
         import pymysql
         kw = _mysql_connect_kwargs()
         logger.debug("MySQL 连接参数: host=%s port=%s database=%s user=%s", kw["host"], kw["port"], kw["database"], kw["user"])
@@ -128,23 +169,9 @@ def _conn():
         finally:
             w.close()
     else:
-        p = _db_path()
-        p.parent.mkdir(parents=True, exist_ok=True)
-        logger.debug("SQLite 路径: %s", p)
-        raw = sqlite3.connect(str(p), timeout=30.0)
-        raw.row_factory = sqlite3.Row
-        try:
-            # 降低并发读写场景下的锁冲突（QuantRun catch-up + 面板轮询）
-            raw.execute("PRAGMA journal_mode=WAL")
-            raw.execute("PRAGMA busy_timeout = 30000")
-        except Exception:
-            pass
-        try:
-            w = _ConnWrapper(raw, is_mysql=False)
-            yield w
-            w.commit()
-        finally:
-            w.close()
+        raise RuntimeError(
+            "DATABASE_URL 未配置为 PostgreSQL；SQLite 已禁用，请设置 DATABASE_URL。"
+        )
 
 
 def _migrate_positions_operations_name(c: _ConnWrapper) -> None:
@@ -459,455 +486,6 @@ def _migrate_quant_task_status_semantics(c: _ConnWrapper) -> None:
     )
 
 
-def _migrate_data_center_schema(c: _ConnWrapper) -> None:
-    """Create data-center V1 tables used by long-term research ingestion."""
-    if c._is_mysql:
-        c.execute(
-            """
-            CREATE TABLE IF NOT EXISTS data_sources (
-                code VARCHAR(64) PRIMARY KEY,
-                name VARCHAR(255) NOT NULL,
-                source_type VARCHAR(32) NOT NULL,
-                priority INT NOT NULL DEFAULT 100,
-                status VARCHAR(32) NOT NULL DEFAULT 'active',
-                description TEXT NULL,
-                created_at VARCHAR(64) NOT NULL,
-                updated_at VARCHAR(64) NOT NULL
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-            """
-        )
-        c.execute(
-            """
-            CREATE TABLE IF NOT EXISTS data_ingestion_runs (
-                id BIGINT AUTO_INCREMENT PRIMARY KEY,
-                job_name VARCHAR(128) NOT NULL,
-                source_code VARCHAR(64) NOT NULL,
-                status VARCHAR(32) NOT NULL,
-                started_at VARCHAR(64) NOT NULL,
-                finished_at VARCHAR(64) NULL,
-                rows_read BIGINT NOT NULL DEFAULT 0,
-                rows_written BIGINT NOT NULL DEFAULT 0,
-                error TEXT NULL,
-                meta_json LONGTEXT NOT NULL,
-                INDEX idx_data_runs_job_started (job_name, started_at),
-                INDEX idx_data_runs_source_started (source_code, started_at)
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-            """
-        )
-        c.execute(
-            """
-            CREATE TABLE IF NOT EXISTS tushare_api_catalog (
-                api_name VARCHAR(64) PRIMARY KEY,
-                category VARCHAR(64) NOT NULL,
-                display_name VARCHAR(255) NOT NULL,
-                use_case TEXT NOT NULL,
-                recommended_frequency VARCHAR(64) NOT NULL,
-                enabled TINYINT NOT NULL DEFAULT 1,
-                last_probe_status VARCHAR(32) NOT NULL DEFAULT 'unknown',
-                last_probe_rows BIGINT NOT NULL DEFAULT 0,
-                last_probe_error TEXT NULL,
-                last_probe_at VARCHAR(64) NULL,
-                fields TEXT NOT NULL,
-                params_json LONGTEXT NOT NULL,
-                updated_at VARCHAR(64) NOT NULL
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-            """
-        )
-        c.execute(
-            """
-            CREATE TABLE IF NOT EXISTS dc_stock_master (
-                ts_code VARCHAR(16) PRIMARY KEY,
-                symbol VARCHAR(16) NOT NULL,
-                name VARCHAR(255) NOT NULL,
-                area VARCHAR(128) NOT NULL DEFAULT '',
-                industry VARCHAR(128) NOT NULL DEFAULT '',
-                market VARCHAR(32) NOT NULL DEFAULT '',
-                list_date VARCHAR(16) NOT NULL DEFAULT '',
-                source_code VARCHAR(64) NOT NULL,
-                available_time VARCHAR(64) NOT NULL,
-                updated_at VARCHAR(64) NOT NULL,
-                INDEX idx_dc_stock_symbol (symbol),
-                INDEX idx_dc_stock_industry (industry)
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-            """
-        )
-        c.execute(
-            """
-            CREATE TABLE IF NOT EXISTS dc_trade_calendar (
-                exchange VARCHAR(16) NOT NULL,
-                cal_date VARCHAR(16) NOT NULL,
-                is_open INT NOT NULL,
-                pretrade_date VARCHAR(16) NOT NULL DEFAULT '',
-                source_code VARCHAR(64) NOT NULL,
-                available_time VARCHAR(64) NOT NULL,
-                updated_at VARCHAR(64) NOT NULL,
-                PRIMARY KEY (exchange, cal_date)
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-            """
-        )
-        c.execute(
-            """
-            CREATE TABLE IF NOT EXISTS dc_tushare_raw_records (
-                id BIGINT AUTO_INCREMENT PRIMARY KEY,
-                api_name VARCHAR(64) NOT NULL,
-                record_key VARCHAR(255) NOT NULL,
-                ts_code VARCHAR(32) NOT NULL DEFAULT '',
-                trade_date VARCHAR(16) NOT NULL DEFAULT '',
-                period VARCHAR(16) NOT NULL DEFAULT '',
-                ann_date VARCHAR(16) NOT NULL DEFAULT '',
-                payload_json LONGTEXT NOT NULL,
-                source_code VARCHAR(64) NOT NULL,
-                available_time VARCHAR(64) NOT NULL,
-                updated_at VARCHAR(64) NOT NULL,
-                UNIQUE KEY uq_dc_raw_api_key (api_name, record_key),
-                INDEX idx_dc_raw_api_date (api_name, trade_date),
-                INDEX idx_dc_raw_api_period (api_name, period),
-                INDEX idx_dc_raw_ts_code (ts_code)
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-            """
-        )
-        c.execute(
-            """
-            CREATE TABLE IF NOT EXISTS dc_stock_daily_snapshot (
-                ts_code VARCHAR(32) NOT NULL,
-                trade_date VARCHAR(16) NOT NULL,
-                symbol VARCHAR(16) NOT NULL DEFAULT '',
-                name VARCHAR(255) NOT NULL DEFAULT '',
-                industry VARCHAR(128) NOT NULL DEFAULT '',
-                close DOUBLE NULL,
-                total_mv DOUBLE NULL,
-                circ_mv DOUBLE NULL,
-                pe_ttm DOUBLE NULL,
-                pb DOUBLE NULL,
-                turnover_rate DOUBLE NULL,
-                up_limit DOUBLE NULL,
-                down_limit DOUBLE NULL,
-                is_suspended TINYINT NOT NULL DEFAULT 0,
-                data_quality_score DOUBLE NOT NULL DEFAULT 0,
-                quality_flags_json LONGTEXT NOT NULL,
-                source_code VARCHAR(64) NOT NULL,
-                available_time VARCHAR(64) NOT NULL,
-                updated_at VARCHAR(64) NOT NULL,
-                PRIMARY KEY (ts_code, trade_date),
-                INDEX idx_dc_snapshot_date (trade_date),
-                INDEX idx_dc_snapshot_symbol (symbol)
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-            """
-        )
-        c.execute(
-            """
-            CREATE TABLE IF NOT EXISTS dc_data_quality_checks (
-                id BIGINT AUTO_INCREMENT PRIMARY KEY,
-                check_name VARCHAR(128) NOT NULL,
-                scope VARCHAR(128) NOT NULL,
-                status VARCHAR(32) NOT NULL,
-                severity VARCHAR(32) NOT NULL,
-                message TEXT NOT NULL,
-                affected_count BIGINT NOT NULL DEFAULT 0,
-                checked_at VARCHAR(64) NOT NULL,
-                meta_json LONGTEXT NOT NULL,
-                INDEX idx_dc_quality_checked (checked_at),
-                INDEX idx_dc_quality_status (status)
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-            """
-        )
-        c.execute(
-            """
-            CREATE TABLE IF NOT EXISTS dc_announcement_raw (
-                id BIGINT AUTO_INCREMENT PRIMARY KEY,
-                source_code VARCHAR(64) NOT NULL,
-                announcement_id VARCHAR(128) NOT NULL,
-                ts_code VARCHAR(32) NOT NULL DEFAULT '',
-                title TEXT NOT NULL,
-                publish_time VARCHAR(64) NOT NULL DEFAULT '',
-                url TEXT NOT NULL,
-                raw_text LONGTEXT NULL,
-                file_path TEXT NULL,
-                content_hash VARCHAR(128) NOT NULL DEFAULT '',
-                available_time VARCHAR(64) NOT NULL,
-                created_at VARCHAR(64) NOT NULL,
-                updated_at VARCHAR(64) NOT NULL,
-                UNIQUE KEY uq_dc_announcement_source_id (source_code, announcement_id),
-                INDEX idx_dc_announcement_ts_time (ts_code, publish_time)
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-            """
-        )
-        c.execute(
-            """
-            CREATE TABLE IF NOT EXISTS dc_announcement_event (
-                id BIGINT AUTO_INCREMENT PRIMARY KEY,
-                announcement_id BIGINT NOT NULL,
-                event_type VARCHAR(64) NOT NULL,
-                impact_direction VARCHAR(32) NOT NULL DEFAULT 'neutral',
-                severity VARCHAR(32) NOT NULL DEFAULT 'medium',
-                confidence DOUBLE NOT NULL DEFAULT 0,
-                event_date VARCHAR(32) NOT NULL DEFAULT '',
-                entities_json LONGTEXT NOT NULL,
-                metrics_json LONGTEXT NOT NULL,
-                summary TEXT NOT NULL,
-                created_at VARCHAR(64) NOT NULL,
-                INDEX idx_dc_event_type (event_type),
-                INDEX idx_dc_event_date (event_date)
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-            """
-        )
-        c.execute(
-            """
-            CREATE TABLE IF NOT EXISTS dc_industry_metric_definition (
-                metric_code VARCHAR(128) PRIMARY KEY,
-                industry_code VARCHAR(64) NOT NULL,
-                industry_name VARCHAR(128) NOT NULL,
-                metric_name VARCHAR(255) NOT NULL,
-                unit VARCHAR(64) NOT NULL DEFAULT '',
-                frequency VARCHAR(32) NOT NULL DEFAULT '',
-                source_code VARCHAR(64) NOT NULL DEFAULT '',
-                description TEXT NULL,
-                created_at VARCHAR(64) NOT NULL,
-                updated_at VARCHAR(64) NOT NULL,
-                INDEX idx_dc_industry_metric_industry (industry_code)
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-            """
-        )
-        c.execute(
-            """
-            CREATE TABLE IF NOT EXISTS dc_industry_metric_value (
-                metric_code VARCHAR(128) NOT NULL,
-                data_date VARCHAR(16) NOT NULL,
-                value DOUBLE NULL,
-                raw_value VARCHAR(255) NOT NULL DEFAULT '',
-                source_code VARCHAR(64) NOT NULL DEFAULT '',
-                available_time VARCHAR(64) NOT NULL,
-                updated_at VARCHAR(64) NOT NULL,
-                PRIMARY KEY (metric_code, data_date),
-                INDEX idx_dc_industry_metric_date (data_date)
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-            """
-        )
-        return
-
-    c.execute(
-        """
-        CREATE TABLE IF NOT EXISTS data_sources (
-            code TEXT PRIMARY KEY,
-            name TEXT NOT NULL,
-            source_type TEXT NOT NULL,
-            priority INTEGER NOT NULL DEFAULT 100,
-            status TEXT NOT NULL DEFAULT 'active',
-            description TEXT,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        )
-        """
-    )
-    c.execute(
-        """
-        CREATE TABLE IF NOT EXISTS data_ingestion_runs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            job_name TEXT NOT NULL,
-            source_code TEXT NOT NULL,
-            status TEXT NOT NULL,
-            started_at TEXT NOT NULL,
-            finished_at TEXT,
-            rows_read INTEGER NOT NULL DEFAULT 0,
-            rows_written INTEGER NOT NULL DEFAULT 0,
-            error TEXT,
-            meta_json TEXT NOT NULL
-        )
-        """
-    )
-    c.execute("CREATE INDEX IF NOT EXISTS idx_data_runs_job_started ON data_ingestion_runs (job_name, started_at)")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_data_runs_source_started ON data_ingestion_runs (source_code, started_at)")
-    c.execute(
-        """
-        CREATE TABLE IF NOT EXISTS tushare_api_catalog (
-            api_name TEXT PRIMARY KEY,
-            category TEXT NOT NULL,
-            display_name TEXT NOT NULL,
-            use_case TEXT NOT NULL,
-            recommended_frequency TEXT NOT NULL,
-            enabled INTEGER NOT NULL DEFAULT 1,
-            last_probe_status TEXT NOT NULL DEFAULT 'unknown',
-            last_probe_rows INTEGER NOT NULL DEFAULT 0,
-            last_probe_error TEXT,
-            last_probe_at TEXT,
-            fields TEXT NOT NULL,
-            params_json TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        )
-        """
-    )
-    c.execute(
-        """
-        CREATE TABLE IF NOT EXISTS dc_stock_master (
-            ts_code TEXT PRIMARY KEY,
-            symbol TEXT NOT NULL,
-            name TEXT NOT NULL,
-            area TEXT NOT NULL DEFAULT '',
-            industry TEXT NOT NULL DEFAULT '',
-            market TEXT NOT NULL DEFAULT '',
-            list_date TEXT NOT NULL DEFAULT '',
-            source_code TEXT NOT NULL,
-            available_time TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        )
-        """
-    )
-    c.execute("CREATE INDEX IF NOT EXISTS idx_dc_stock_symbol ON dc_stock_master (symbol)")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_dc_stock_industry ON dc_stock_master (industry)")
-    c.execute(
-        """
-        CREATE TABLE IF NOT EXISTS dc_trade_calendar (
-            exchange TEXT NOT NULL,
-            cal_date TEXT NOT NULL,
-            is_open INTEGER NOT NULL,
-            pretrade_date TEXT NOT NULL DEFAULT '',
-            source_code TEXT NOT NULL,
-            available_time TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            PRIMARY KEY (exchange, cal_date)
-        )
-        """
-    )
-    c.execute(
-        """
-        CREATE TABLE IF NOT EXISTS dc_tushare_raw_records (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            api_name TEXT NOT NULL,
-            record_key TEXT NOT NULL,
-            ts_code TEXT NOT NULL DEFAULT '',
-            trade_date TEXT NOT NULL DEFAULT '',
-            period TEXT NOT NULL DEFAULT '',
-            ann_date TEXT NOT NULL DEFAULT '',
-            payload_json TEXT NOT NULL,
-            source_code TEXT NOT NULL,
-            available_time TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            UNIQUE (api_name, record_key)
-        )
-        """
-    )
-    c.execute("CREATE INDEX IF NOT EXISTS idx_dc_raw_api_date ON dc_tushare_raw_records (api_name, trade_date)")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_dc_raw_api_period ON dc_tushare_raw_records (api_name, period)")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_dc_raw_ts_code ON dc_tushare_raw_records (ts_code)")
-    c.execute(
-        """
-        CREATE TABLE IF NOT EXISTS dc_stock_daily_snapshot (
-            ts_code TEXT NOT NULL,
-            trade_date TEXT NOT NULL,
-            symbol TEXT NOT NULL DEFAULT '',
-            name TEXT NOT NULL DEFAULT '',
-            industry TEXT NOT NULL DEFAULT '',
-            close REAL,
-            total_mv REAL,
-            circ_mv REAL,
-            pe_ttm REAL,
-            pb REAL,
-            turnover_rate REAL,
-            up_limit REAL,
-            down_limit REAL,
-            is_suspended INTEGER NOT NULL DEFAULT 0,
-            data_quality_score REAL NOT NULL DEFAULT 0,
-            quality_flags_json TEXT NOT NULL,
-            source_code TEXT NOT NULL,
-            available_time TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            PRIMARY KEY (ts_code, trade_date)
-        )
-        """
-    )
-    c.execute("CREATE INDEX IF NOT EXISTS idx_dc_snapshot_date ON dc_stock_daily_snapshot (trade_date)")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_dc_snapshot_symbol ON dc_stock_daily_snapshot (symbol)")
-    c.execute(
-        """
-        CREATE TABLE IF NOT EXISTS dc_data_quality_checks (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            check_name TEXT NOT NULL,
-            scope TEXT NOT NULL,
-            status TEXT NOT NULL,
-            severity TEXT NOT NULL,
-            message TEXT NOT NULL,
-            affected_count INTEGER NOT NULL DEFAULT 0,
-            checked_at TEXT NOT NULL,
-            meta_json TEXT NOT NULL
-        )
-        """
-    )
-    c.execute("CREATE INDEX IF NOT EXISTS idx_dc_quality_checked ON dc_data_quality_checks (checked_at)")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_dc_quality_status ON dc_data_quality_checks (status)")
-    c.execute(
-        """
-        CREATE TABLE IF NOT EXISTS dc_announcement_raw (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            source_code TEXT NOT NULL,
-            announcement_id TEXT NOT NULL,
-            ts_code TEXT NOT NULL DEFAULT '',
-            title TEXT NOT NULL,
-            publish_time TEXT NOT NULL DEFAULT '',
-            url TEXT NOT NULL,
-            raw_text TEXT,
-            file_path TEXT,
-            content_hash TEXT NOT NULL DEFAULT '',
-            available_time TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            UNIQUE (source_code, announcement_id)
-        )
-        """
-    )
-    c.execute("CREATE INDEX IF NOT EXISTS idx_dc_announcement_ts_time ON dc_announcement_raw (ts_code, publish_time)")
-    c.execute(
-        """
-        CREATE TABLE IF NOT EXISTS dc_announcement_event (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            announcement_id INTEGER NOT NULL,
-            event_type TEXT NOT NULL,
-            impact_direction TEXT NOT NULL DEFAULT 'neutral',
-            severity TEXT NOT NULL DEFAULT 'medium',
-            confidence REAL NOT NULL DEFAULT 0,
-            event_date TEXT NOT NULL DEFAULT '',
-            entities_json TEXT NOT NULL,
-            metrics_json TEXT NOT NULL,
-            summary TEXT NOT NULL,
-            created_at TEXT NOT NULL
-        )
-        """
-    )
-    c.execute("CREATE INDEX IF NOT EXISTS idx_dc_event_type ON dc_announcement_event (event_type)")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_dc_event_date ON dc_announcement_event (event_date)")
-    c.execute(
-        """
-        CREATE TABLE IF NOT EXISTS dc_industry_metric_definition (
-            metric_code TEXT PRIMARY KEY,
-            industry_code TEXT NOT NULL,
-            industry_name TEXT NOT NULL,
-            metric_name TEXT NOT NULL,
-            unit TEXT NOT NULL DEFAULT '',
-            frequency TEXT NOT NULL DEFAULT '',
-            source_code TEXT NOT NULL DEFAULT '',
-            description TEXT,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        )
-        """
-    )
-    c.execute("CREATE INDEX IF NOT EXISTS idx_dc_industry_metric_industry ON dc_industry_metric_definition (industry_code)")
-    c.execute(
-        """
-        CREATE TABLE IF NOT EXISTS dc_industry_metric_value (
-            metric_code TEXT NOT NULL,
-            data_date TEXT NOT NULL,
-            value REAL,
-            raw_value TEXT NOT NULL DEFAULT '',
-            source_code TEXT NOT NULL DEFAULT '',
-            available_time TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            PRIMARY KEY (metric_code, data_date)
-        )
-        """
-    )
-    c.execute("CREATE INDEX IF NOT EXISTS idx_dc_industry_metric_date ON dc_industry_metric_value (data_date)")
-
-
 _SQLITE_DDL = """
 CREATE TABLE IF NOT EXISTS users (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -945,9 +523,10 @@ CREATE TABLE IF NOT EXISTS operations (
 );
 CREATE TABLE IF NOT EXISTS account (
     id INTEGER PRIMARY KEY CHECK (id = 1),
-    balance REAL NOT NULL DEFAULT 0
+    balance REAL NOT NULL DEFAULT 0,
+    high_water_mark REAL NOT NULL DEFAULT 0
 );
-INSERT OR IGNORE INTO account (id, balance) VALUES (1, 100000.0);
+INSERT OR IGNORE INTO account (id, balance, high_water_mark) VALUES (1, 100000.0, 100000.0);
 CREATE TABLE IF NOT EXISTS positions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     symbol TEXT NOT NULL UNIQUE,
@@ -1096,9 +675,10 @@ CREATE TABLE IF NOT EXISTS operations (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 CREATE TABLE IF NOT EXISTS account (
     id INT PRIMARY KEY CHECK (id = 1),
-    balance DOUBLE NOT NULL DEFAULT 0
+    balance DOUBLE NOT NULL DEFAULT 0,
+    high_water_mark DOUBLE NOT NULL DEFAULT 0
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-INSERT IGNORE INTO account (id, balance) VALUES (1, 100000.0);
+INSERT IGNORE INTO account (id, balance, high_water_mark) VALUES (1, 100000.0, 100000.0);
 CREATE TABLE IF NOT EXISTS positions (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,
     symbol VARCHAR(32) NOT NULL UNIQUE,
@@ -1213,33 +793,119 @@ CREATE TABLE IF NOT EXISTS model_train_runs (
 def init_db() -> None:
     """Create tables and seed default strategy if missing."""
     url = (settings.database_url or "").strip()
-    if _is_mysql():
+    if _is_postgres():
+        logger.info("数据库: PostgreSQL")
+    elif _is_mysql():
         kw = _mysql_connect_kwargs()
         logger.info(
             "数据库: MySQL %s:%s/%s (user=%s)",
             kw["host"], kw["port"], kw["database"], kw["user"],
         )
     else:
-        p = _db_path()
-        logger.info("数据库: SQLite %s", p)
+        raise RuntimeError("DATABASE_URL 必须指向 PostgreSQL；SQLite 已禁用")
 
     try:
         with _conn() as c:
             logger.info("数据库连接成功，正在建表...")
-            if _is_mysql():
+            if _is_postgres():
+                logger.info("数据库: PostgreSQL；使用已迁移schema，跳过SQLite/MySQL建表脚本")
+                c.execute("ALTER TABLE account ADD COLUMN IF NOT EXISTS high_water_mark DOUBLE PRECISION NOT NULL DEFAULT 0")
+                c.execute("UPDATE account SET high_water_mark = GREATEST(high_water_mark, balance) WHERE id = 1")
+                # A previous SQLite/MySQL migration can leave PostgreSQL
+                # serial sequences behind the copied ids. Reconcile them at
+                # startup so the first new backtest/task cannot collide with
+                # an existing primary key.
+                for table in ("backtests", "executions", "operations", "quant_run_tasks", "quant_run_task_runs"):
+                    c.execute(
+                        "SELECT setval(pg_get_serial_sequence(%s, 'id'), COALESCE((SELECT MAX(id) FROM " + table + "), 1), true)",
+                        (table,),
+                    )
+                c.execute("""CREATE TABLE IF NOT EXISTS quant_performance_reports (
+                    id BIGSERIAL PRIMARY KEY, task_id BIGINT NULL, period_type VARCHAR(16) NOT NULL,
+                    period VARCHAR(32) NOT NULL, payload_json TEXT NOT NULL, created_at VARCHAR(64) NOT NULL,
+                    UNIQUE(task_id, period_type, period))""")
+                c.executescript("""
+                CREATE TABLE IF NOT EXISTS investment_theses (
+                    id BIGSERIAL PRIMARY KEY, ts_code VARCHAR(16) NOT NULL, title VARCHAR(255) NOT NULL,
+                    thesis_type VARCHAR(64) NOT NULL DEFAULT 'quality_growth', core_thesis TEXT NOT NULL DEFAULT '',
+                    status VARCHAR(32) NOT NULL DEFAULT 'watch', confidence DOUBLE PRECISION NOT NULL DEFAULT 0,
+                    next_review_at VARCHAR(64), created_at VARCHAR(64) NOT NULL, updated_at VARCHAR(64) NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_thesis_symbol_status ON investment_theses(ts_code,status);
+                CREATE TABLE IF NOT EXISTS thesis_hypotheses (
+                    id BIGSERIAL PRIMARY KEY, thesis_id BIGINT NOT NULL REFERENCES investment_theses(id) ON DELETE CASCADE,
+                    statement TEXT NOT NULL, metric VARCHAR(128) NOT NULL DEFAULT '', necessary BOOLEAN NOT NULL DEFAULT FALSE,
+                    expected_json TEXT NOT NULL DEFAULT '{}', status VARCHAR(32) NOT NULL DEFAULT 'unverified',
+                    evidence_json TEXT NOT NULL DEFAULT '[]', last_checked_at VARCHAR(64), created_at VARCHAR(64) NOT NULL,
+                    updated_at VARCHAR(64) NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_hypothesis_thesis ON thesis_hypotheses(thesis_id,status);
+                CREATE TABLE IF NOT EXISTS research_score_snapshots (
+                    id BIGSERIAL PRIMARY KEY, ts_code VARCHAR(16) NOT NULL, as_of_time VARCHAR(64) NOT NULL,
+                    model_version VARCHAR(64) NOT NULL, dimensions_json TEXT NOT NULL, evidence_json TEXT NOT NULL,
+                    confidence DOUBLE PRECISION NOT NULL DEFAULT 0, created_at VARCHAR(64) NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_research_snapshot_symbol_time ON research_score_snapshots(ts_code,as_of_time);
+                CREATE TABLE IF NOT EXISTS valuation_snapshots (
+                    id BIGSERIAL PRIMARY KEY, ts_code VARCHAR(16) NOT NULL, as_of_time VARCHAR(64) NOT NULL,
+                    method VARCHAR(64) NOT NULL, bear_value DOUBLE PRECISION, base_value DOUBLE PRECISION,
+                    bull_value DOUBLE PRECISION, current_price DOUBLE PRECISION, assumptions_json TEXT NOT NULL,
+                    evidence_json TEXT NOT NULL, created_at VARCHAR(64) NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS earnings_forecast_baselines (
+                    id BIGSERIAL PRIMARY KEY, ts_code VARCHAR(16) NOT NULL, target_period VARCHAR(8) NOT NULL,
+                    model_version VARCHAR(64) NOT NULL, revenue_forecast DOUBLE PRECISION,
+                    profit_forecast DOUBLE PRECISION, confidence DOUBLE PRECISION NOT NULL DEFAULT 0,
+                    inputs_json TEXT NOT NULL, available_time VARCHAR(64) NOT NULL, created_at VARCHAR(64) NOT NULL,
+                    UNIQUE(ts_code,target_period,model_version)
+                );
+                CREATE TABLE IF NOT EXISTS stock_pool_memberships (
+                    id BIGSERIAL PRIMARY KEY, ts_code VARCHAR(16) NOT NULL, pool_type VARCHAR(32) NOT NULL,
+                    reason TEXT NOT NULL DEFAULT '', status VARCHAR(32) NOT NULL DEFAULT 'active',
+                    entered_at VARCHAR(64) NOT NULL, updated_at VARCHAR(64) NOT NULL,
+                    UNIQUE(ts_code,pool_type)
+                );
+                CREATE TABLE IF NOT EXISTS decision_snapshots (
+                    id BIGSERIAL PRIMARY KEY, ts_code VARCHAR(16) NOT NULL, decision_type VARCHAR(32) NOT NULL,
+                    decision_time VARCHAR(64) NOT NULL, price DOUBLE PRECISION, thesis_id BIGINT,
+                    data_as_of_time VARCHAR(64) NOT NULL, model_version VARCHAR(64) NOT NULL,
+                    market_state_json TEXT NOT NULL, research_state_json TEXT NOT NULL,
+                    valuation_json TEXT NOT NULL, portfolio_context_json TEXT NOT NULL,
+                    reason TEXT NOT NULL, invalidation_conditions_json TEXT NOT NULL,
+                    created_at VARCHAR(64) NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_decision_symbol_time ON decision_snapshots(ts_code,decision_time);
+                CREATE TABLE IF NOT EXISTS review_records (
+                    id BIGSERIAL PRIMARY KEY, decision_snapshot_id BIGINT REFERENCES decision_snapshots(id),
+                    review_time VARCHAR(64) NOT NULL, outcome_json TEXT NOT NULL, attribution_json TEXT NOT NULL,
+                    error_type VARCHAR(64), lessons TEXT NOT NULL DEFAULT '', created_at VARCHAR(64) NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS position_states (
+                    id BIGSERIAL PRIMARY KEY, ts_code VARCHAR(16) NOT NULL UNIQUE,
+                    state VARCHAR(32) NOT NULL, thesis_id BIGINT, reason TEXT NOT NULL,
+                    changed_at VARCHAR(64) NOT NULL, updated_at VARCHAR(64) NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS position_state_history (
+                    id BIGSERIAL PRIMARY KEY, ts_code VARCHAR(16) NOT NULL,
+                    from_state VARCHAR(32), to_state VARCHAR(32) NOT NULL,
+                    reason TEXT NOT NULL, evidence_json TEXT NOT NULL,
+                    changed_at VARCHAR(64) NOT NULL
+                );
+                """)
+            elif _is_mysql():
                 c.executescript(_MYSQL_DDL)
             else:
                 c.executescript(_SQLITE_DDL)
-            _migrate_positions_operations_name(c)
-            _migrate_positions_bought_at(c)
-            _migrate_backtests_data_quality(c)
-            _migrate_backtests_model_version(c)
-            _migrate_operations_execution_id_nullable(c)
-            _migrate_quant_replay_schema(c)
-            _migrate_quant_task_perf_schema(c)
-            _migrate_quant_task_status_semantics(c)
-            _migrate_quant_run_task_detail_json(c)
-            _migrate_data_center_schema(c)
+            if not _is_postgres():
+                _migrate_positions_operations_name(c)
+                _migrate_positions_bought_at(c)
+                _migrate_backtests_data_quality(c)
+                _migrate_backtests_model_version(c)
+                _migrate_operations_execution_id_nullable(c)
+                _migrate_quant_replay_schema(c)
+                _migrate_quant_task_perf_schema(c)
+                _migrate_quant_task_status_semantics(c)
+                _migrate_quant_run_task_detail_json(c)
             cur = c.execute(
                 "SELECT id FROM strategies WHERE name = ?", (_DEFAULT_STRATEGY_NAME,)
             )
@@ -1905,11 +1571,27 @@ def get_account_balance() -> float:
     return float(row["balance"]) if row is not None else 0.0
 
 
+def get_account_high_water_mark() -> float:
+    with _conn() as c:
+        cur = c.execute("SELECT high_water_mark FROM account WHERE id = 1")
+        row = cur.fetchone()
+    return float(row["high_water_mark"] or 0.0) if row is not None and "high_water_mark" in row.keys() else get_account_baseline()
+
+
+def update_account_high_water_mark(equity: float) -> float:
+    equity = max(0.0, round(float(equity), 2))
+    with _conn() as c:
+        c.execute("UPDATE account SET high_water_mark = CASE WHEN high_water_mark < ? THEN ? ELSE high_water_mark END WHERE id = 1", (equity, equity))
+        cur = c.execute("SELECT high_water_mark FROM account WHERE id = 1")
+        row = cur.fetchone()
+    return float(row["high_water_mark"] or 0.0) if row is not None else equity
+
+
 def get_account_baseline() -> float:
     """
-    账户基准本金（默认 100000），用于展示总收益分解。
+    V1模拟账户基准本金（默认 200000），用于展示总收益分解。
     """
-    return 100000.0
+    return 200000.0
 
 
 def set_account_balance(balance: float) -> float:
@@ -1948,7 +1630,7 @@ def create_quant_run_task(
     norm_replay_mode = str(replay_mode or "pragmatic_recover")
     with _conn() as c:
         # SQLite 下显式拿写锁，保证“查重 + 插入”原子性，避免并发重复创建。
-        if not _is_mysql():
+        if not _is_mysql() and not _is_postgres():
             try:
                 c.execute("BEGIN IMMEDIATE")
             except Exception:
@@ -2021,7 +1703,7 @@ def upsert_quant_run_task_meta(
     risk_payload = json.dumps(risk_config or {}, ensure_ascii=False)
     try:
         with _conn() as c:
-            if c._is_mysql:
+            if c._is_mysql and not c._is_postgres:
                 c.execute(
                     """
                     INSERT INTO quant_run_task_meta (
@@ -2095,7 +1777,7 @@ def upsert_quant_run_task_health(task_id: int, **fields: Any) -> None:
     }
     try:
         with _conn() as c:
-            if c._is_mysql:
+            if c._is_mysql and not c._is_postgres:
                 c.execute(
                     """
                     INSERT INTO quant_run_task_health (
@@ -2510,7 +2192,7 @@ def upsert_quant_replay_waterline(
 ) -> None:
     now = datetime.utcnow().isoformat()
     with _conn() as c:
-        if c._is_mysql:
+        if c._is_mysql and not c._is_postgres:
             c.execute(
                 """
                 INSERT INTO quant_replay_waterline (
@@ -2586,7 +2268,7 @@ def list_quant_run_task_records(task_id: int, limit: int = 200) -> List[Dict[str
             "total_buy_cost": float(r["total_buy_cost"] or 0),
             "execution_id": int(r["execution_id"]) if r["execution_id"] is not None else None,
             "message": str(r["message"] or ""),
-            "detail": _load(r["detail_json"], {}) if "detail_json" in r.keys() else {},
+            "detail": _json_load(r["detail_json"], {}) if "detail_json" in r.keys() else {},
             "created_at": str(r["created_at"] or ""),
         }
         for r in rows
@@ -2818,3 +2500,34 @@ def get_latest_model_train_run() -> Optional[Dict[str, Any]]:
         cur = c.execute("SELECT * FROM model_train_runs ORDER BY id DESC LIMIT 1")
         row = cur.fetchone()
     return _train_run_from_row(row) if row else None
+
+
+def save_performance_reports(task_id: int | None, reports: dict[str, list[dict[str, Any]]]) -> int:
+    """Persist the latest period snapshots idempotently."""
+    now = datetime.utcnow().isoformat()
+    saved = 0
+    with _conn() as c:
+        for kind, rows in reports.items():
+            for row in rows:
+                period = str(row.get("period") or "")
+                if not period:
+                    continue
+                c.execute("""INSERT INTO quant_performance_reports
+                    (task_id, period_type, period, payload_json, created_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT (task_id, period_type, period) DO UPDATE SET
+                    payload_json=EXCLUDED.payload_json, created_at=EXCLUDED.created_at""",
+                    (task_id, kind, period, json.dumps(row, ensure_ascii=False), now))
+                saved += 1
+    return saved
+
+
+def list_performance_reports(task_id: int | None = None, limit: int = 100) -> list[dict[str, Any]]:
+    n = max(1, min(int(limit or 100), 500))
+    with _conn() as c:
+        if task_id is None:
+            cur = c.execute("SELECT * FROM quant_performance_reports ORDER BY id DESC LIMIT ?", (n,))
+        else:
+            cur = c.execute("SELECT * FROM quant_performance_reports WHERE task_id = ? ORDER BY id DESC LIMIT ?", (int(task_id), n))
+        rows = cur.fetchall()
+    return [{"id": int(r["id"]), "task_id": r["task_id"], "period_type": r["period_type"], "period": r["period"], "payload": _json_load(r["payload_json"], {}), "created_at": r["created_at"]} for r in rows]

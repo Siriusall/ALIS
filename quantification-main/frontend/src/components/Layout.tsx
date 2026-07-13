@@ -2,14 +2,24 @@ import React, { ReactNode, useEffect, useState } from "react";
 import type { UserInfo } from "../api/auth";
 
 const NAV_ITEMS = [
-  { id: "decision", label: "交易决策" },
-  { id: "dataCenter", label: "数据中台" },
-  { id: "quantRun", label: "量化分析" },
-  { id: "position", label: "持仓" },
-  { id: "strategy", label: "模型策略" },
-  { id: "factorLibrary", label: "因子库" },
-  { id: "account", label: "账户" },
-  { id: "logs", label: "日志" },
+  { id: "market", label: "市场总览", group: "研究" },
+  { id: "dataCenter", label: "数据中台", group: "研究" },
+  { id: "stockResearch", label: "股票研究", group: "研究" },
+  { id: "industryResearch", label: "行业研究", group: "研究" },
+  { id: "events", label: "公告事件", group: "研究" },
+  { id: "sentiment", label: "市场情绪", group: "动态" },
+  { id: "themes", label: "主题叙事", group: "动态" },
+  { id: "expectation", label: "预期变化", group: "动态" },
+  { id: "valuation", label: "估值中心", group: "动态" },
+  { id: "stockPool", label: "股票池", group: "决策" },
+  { id: "thesis", label: "投资逻辑", group: "决策" },
+  { id: "portfolio", label: "组合管理", group: "决策" },
+  { id: "positionRisk", label: "持仓风险", group: "决策" },
+  { id: "validation", label: "回测验证", group: "治理" },
+  { id: "decisionLogs", label: "决策日志", group: "治理" },
+  { id: "review", label: "复盘中心", group: "治理" },
+  { id: "governance", label: "系统治理", group: "治理" },
+  { id: "strategy", label: "策略工作台", group: "治理" },
 ] as const;
 
 export type SectionId = (typeof NAV_ITEMS)[number]["id"];
@@ -27,7 +37,7 @@ interface LayoutProps {
   onRegisterClick: () => void;
 }
 
-/** 子组件顺序须与 NAV_ITEMS 一致：decision, dataCenter, quantRun, position, strategy, factorLibrary, account, logs */
+/** 子组件顺序须与 NAV_ITEMS 一致。 */
 export default function Layout({
   children,
   header,
@@ -78,7 +88,7 @@ export default function Layout({
             <span className="dashboard-sidebar-toggle-bar" />
             <span className="dashboard-sidebar-toggle-bar" />
           </button>
-          <span className="dashboard-topbar-title">量化系统</span>
+          <span className="dashboard-topbar-title">ALIS 长线投资系统</span>
         </div>
         <div className="dashboard-topbar-right">
           {user ? (
@@ -110,15 +120,13 @@ export default function Layout({
       <div className="dashboard-root-inner">
         <aside className="dashboard-sidebar" aria-label="主导航">
           <nav className="dashboard-nav">
-            {NAV_ITEMS.map(({ id, label }) => (
-              <button
-                key={id}
-                type="button"
-                className={`dashboard-nav-item ${currentSection === id ? "active" : ""}`}
-                onClick={() => handleSectionChange(id)}
-              >
-                {label}
-              </button>
+            {NAV_ITEMS.map(({ id, label, group }, itemIndex) => (
+              <React.Fragment key={id}>
+                {(itemIndex === 0 || NAV_ITEMS[itemIndex - 1].group !== group) && <div className="dashboard-nav-group">{group}</div>}
+                <button type="button" className={`dashboard-nav-item ${currentSection === id ? "active" : ""}`} onClick={() => handleSectionChange(id)}>
+                  <span className="dashboard-nav-icon" aria-hidden="true">{label.slice(0, 1)}</span>{label}
+                </button>
+              </React.Fragment>
             ))}
           </nav>
         </aside>

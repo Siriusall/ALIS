@@ -11,8 +11,8 @@ if __name__ == "__main__":
     if str(backend) not in sys.path:
         sys.path.insert(0, str(backend))
 
-from app.db.store import init_db
-from app.services.data_center import (
+from app.data_platform.db import init_db
+from app.data_platform.services.data_center import (
     build_stock_daily_snapshot,
     ensure_data_center_seeded,
     estimate_data_center_runtime,

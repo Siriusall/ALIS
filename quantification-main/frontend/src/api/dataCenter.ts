@@ -50,6 +50,7 @@ export interface DataCenterCoverage {
   announcement_event_rows: number;
   industry_metric_definitions: number;
   industry_metric_values: number;
+  web_factor_rows: number;
 }
 
 export interface DataCenterStatus {
@@ -73,10 +74,220 @@ export interface SyncResponse {
   [key: string]: unknown;
 }
 
+export interface SimpleDataHealth {
+  ok: boolean;
+  level: "healthy" | "stale" | "needs_setup" | string;
+  summary: string;
+  latest_trade_date: string;
+  stock_count: number;
+  snapshot_count: number;
+  latest_announcement?: string | null;
+  failed_runs: number;
+}
+
+export interface DailyUpdateStatus extends SyncResponse {
+  running: boolean;
+  run_id?: number;
+  phase: string;
+  message: string;
+  progress?: number;
+  trade_date?: string;
+  error?: string;
+}
+
+export interface DataObservability {
+  ok: boolean;
+  latest_trade_date: string;
+  quality: {
+    sample_rows: number;
+    quality_pass_rows: number;
+    quality_pass_rate: number;
+    average_quality_score: number;
+    definition: string;
+    checks: Array<{ check_name: string; scope: string; status: string; severity: string; message: string; affected_count: number; checked_at: string }>;
+  };
+  missingness: Array<{ field: string; label: string; category: string; total: number; missing: number; missing_rate: number; coverage_rate: number }>;
+  interface_summary: { total: number; healthy: number; warning: number; failed: number };
+  interfaces: Array<{ api_name: string; category: string; display_name: string; recommended_frequency: string; last_probe_status: string; last_probe_rows: number; last_probe_error?: string; last_probe_at?: string; health: string }>;
+  source_stats: Array<{ source_code: string; total_runs: number; successful_runs: number; failed_runs: number; last_run_at?: string }>;
+  logs: DataIngestionRun[];
+  runtime_logs: Array<{ id:number; level:string; logger:string; message:string; context:Record<string,unknown>; created_at:string }>;
+  redis: { available:boolean; url:string };
+}
+
+export interface ReadinessRequirement {
+  key: string; label: string; threshold: number; policy: "block" | "degrade";
+  status: "ready" | "degraded" | "blocked"; coverage: number;
+  available: number; expected: number; evidence: string;
+}
+
+export interface ConsumerReadiness {
+  key: string; name: string; description: string;
+  status: "ready" | "degraded" | "blocked" | "unknown";
+  blocked_count: number; degraded_count: number; requirements: ReadinessRequirement[];
+}
+
+export interface ReadinessOverview {
+  ok: boolean;
+  scope: { latest_trade_date: string; stock_count: number; known_open_dates: number; stored_history_dates: number };
+  consumers: ConsumerReadiness[];
+  status_definition: Record<string, string>;
+}
+
+export interface DataAssetItem {
+  key:string; name:string; domain:string; consumer:string; weight:number; target_scope:string;
+  frequency:string; source:string; actual_records:number; expected_records:number|null;
+  coverage:number|null; coverage_basis?:number; coverage_expected?:number|null;
+  symbols:number; dates:number; min_date?:string|null; max_date?:string|null;
+  window_start?:string; window_end?:string; window_depth?:string; rationale?:string;
+  periods_actual?:number|null; periods_expected?:number|null;
+  status:"complete"|"partial"|"available"|"missing"; measurement:string;
+}
+export interface DataAssetsResponse {
+  ok:boolean;
+  scope:{
+    market:string; start_date:string; end_date:string; stocks:number; open_days:number; financial:string;
+    open_days_in_calendar?:number; calendar_total_open_days?:number;
+    financial_periods?:string[]; financial_start?:string; financial_end?:string;
+    policy?:{daily_lookback_days:number; financial_quarters:number; financial_annual_years:number; fallback_open_days:number};
+  };
+  summary:{
+    datasets:number; actual_records:number; complete:number; partial:number; missing:number;
+    available?:number; average_coverage?:number;
+  };
+  items:DataAssetItem[];
+}
+
+export interface WebFactorItem {
+  id: number;
+  symbol: string;
+  ts_code: string;
+  name: string;
+  industry: string;
+  source_run_key: string;
+  crawled_at: string;
+  factors: Record<string, string | number | null>;
+}
+
+export interface WebFactorResponse {
+  total: number;
+  items: WebFactorItem[];
+  limit: number;
+  offset: number;
+}
+
 export async function fetchDataCenterStatus(limitRuns = 20): Promise<DataCenterStatus> {
   const { data } = await api.get<DataCenterStatus>("/api/data-center/status", {
     params: { limit_runs: limitRuns },
   });
+  return data;
+}
+
+export async function fetchSimpleDataHealth(): Promise<SimpleDataHealth> {
+  const { data } = await api.get<SimpleDataHealth>("/api/data-center/simple-health");
+  return data;
+}
+
+export async function startDailyUpdate(): Promise<DailyUpdateStatus> {
+  const { data } = await api.post<DailyUpdateStatus>("/api/data-center/daily-update");
+  return data;
+}
+
+export async function fetchDailyUpdateStatus(): Promise<DailyUpdateStatus> {
+  const { data } = await api.get<DailyUpdateStatus>("/api/data-center/daily-update/status");
+  return data;
+}
+
+export async function fetchDataObservability(limitLogs = 50): Promise<DataObservability> {
+  const { data } = await api.get<DataObservability>("/api/data-center/observability", { params: { limit_logs: limitLogs } });
+  return data;
+}
+
+export async function fetchReadiness(): Promise<ReadinessOverview> {
+  const { data } = await api.get<ReadinessOverview>("/api/data-center/readiness");
+  return data;
+}
+
+export async function fetchDataAssets(): Promise<DataAssetsResponse> {
+  const { data } = await api.get<DataAssetsResponse>("/api/data-center/assets"); return data;
+}
+
+export interface BackfillStep {
+  id: string;
+  priority: number;
+  key: string;
+  title: string;
+  why: string;
+  action: string;
+  params: Record<string, unknown>;
+  estimated_calls: number;
+  estimated_minutes: number;
+  status: "needed" | "blocked" | "done" | string;
+  gap?: Record<string, unknown>;
+}
+
+export interface BackfillPlan {
+  ok: boolean;
+  generated_at: string;
+  scope: Record<string, unknown>;
+  summary: {
+    steps_total: number;
+    steps_needed: number;
+    steps_blocked: number;
+    steps_done: number;
+    estimated_minutes: number;
+    estimated_hours: number;
+    asset_gaps: number;
+    next_action: string;
+  };
+  asset_gaps: Array<Record<string, unknown>>;
+  steps: BackfillStep[];
+  execution?: Record<string, unknown>;
+}
+
+export interface BackfillStatus {
+  ok: boolean;
+  running?: boolean;
+  run_id?: number;
+  phase?: string;
+  message?: string;
+  progress?: number;
+  started_at?: string;
+  finished_at?: string;
+  error?: string;
+  plan_summary?: BackfillPlan["summary"];
+  max_steps?: number;
+  activity?: {
+    event: "request" | "retry" | "failed" | "response" | "saved" | string;
+    api: string;
+    params: Record<string, unknown>;
+    at: string;
+    attempt?: number;
+    rows?: number;
+    written?: number;
+    category?: string;
+    error?: string;
+    text: string;
+  };
+}
+
+export async function fetchBackfillPlan(marketBatchDays = 20, financialBatchSize = 50): Promise<BackfillPlan> {
+  const { data } = await api.get<BackfillPlan>("/api/data-center/backfill/plan", {
+    params: { market_batch_days: marketBatchDays, financial_batch_size: financialBatchSize },
+  });
+  return data;
+}
+
+export async function startBackfill(maxSteps = 0, marketBatchDays = 20, financialBatchSize = 50): Promise<BackfillStatus & { plan?: BackfillPlan }> {
+  const { data } = await api.post<BackfillStatus & { plan?: BackfillPlan }>("/api/data-center/backfill/start", null, {
+    params: { max_steps: maxSteps, market_batch_days: marketBatchDays, financial_batch_size: financialBatchSize },
+    timeout: 60 * 1000,
+  });
+  return data;
+}
+
+export async function fetchBackfillStatus(): Promise<BackfillStatus> {
+  const { data } = await api.get<BackfillStatus>("/api/data-center/backfill/status");
   return data;
 }
 
@@ -89,6 +300,27 @@ export async function fetchDataCenterEstimate(years = 5): Promise<DataCenterEsti
 
 export async function seedDataCenter(): Promise<SyncResponse> {
   const { data } = await api.post<SyncResponse>("/api/data-center/seed");
+  return data;
+}
+
+export async function importLegacyNews(path = "../../news/data/news.db"): Promise<SyncResponse> {
+  const { data } = await api.post<SyncResponse>("/api/data-center/web-fallback/import-legacy", null, {
+    params: { path }, timeout: 10 * 60 * 1000,
+  });
+  return data;
+}
+
+export async function fetchWebFactors(q = "", limit = 20): Promise<WebFactorResponse> {
+  const { data } = await api.get<WebFactorResponse>("/api/data-center/web-fallback/factors", {
+    params: { q, limit },
+  });
+  return data;
+}
+
+export async function startWebFallbackCrawl(codes: string, limit = 20): Promise<SyncResponse> {
+  const { data } = await api.post<SyncResponse>("/api/data-center/web-fallback/crawl", null, {
+    params: { codes, limit },
+  });
   return data;
 }
 

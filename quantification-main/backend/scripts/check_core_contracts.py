@@ -107,6 +107,9 @@ def _install_quant_risk_stubs() -> dict[str, object]:
     store_mod = types.ModuleType("app.db.store")
     store_mod.list_quant_run_task_records = lambda task_id, limit=50: records[:limit]
     store_mod.list_operations = lambda execution_id=None, limit=5000: operations.get(int(execution_id or 0), [])
+    store_mod.get_account_balance = lambda: 200000.0
+    store_mod.get_account_baseline = lambda: 200000.0
+    store_mod.get_positions = lambda: []
     sys.modules["app.db.store"] = store_mod
 
     ds_mod = types.ModuleType("app.services.backtest_data_source")
@@ -160,6 +163,17 @@ def check_risk_decisions() -> None:
     disabled = quant_risk.evaluate_consecutive_loss_gate(task_id=1, max_consecutive_losses=0)
     _assert(not disabled.should_pause, "zero max_consecutive_losses must disable the gate")
 
+    cvar = quant_risk.historical_cvar([0.01, -0.02, -0.05, 0.03], confidence=0.75)
+    _assert(cvar["observations"] == 4.0 and cvar["cvar"] == -0.05, "CVaR must use the empirical left tail")
+    garch = quant_risk.garch11_forecast([0.01, -0.02, 0.03])
+    _assert(garch["observations"] == 3.0 and garch["volatility"] > 0, "GARCH forecast must produce positive volatility")
+    kalman = quant_risk.kalman_level([1.0, 1.2, 1.1])
+    _assert(kalman["observations"] == 3.0 and 1.0 < kalman["state"] < 1.2, "Kalman state must update observations")
+    bocpd = quant_risk.bocpd_change_probability([0.01] * 20 + [-0.1])
+    _assert(bocpd["observations"] == 21.0 and bocpd["change_probability"] > 0.5, "BOCPD surprise must detect a regime change")
+    hsmm = quant_risk.hsmm_regime([0.01, 0.02, 0.03])
+    _assert(hsmm["state"] == "expansion" and hsmm["duration"] >= 1, "HSMM regime must classify persistent expansion")
+
 
 def check_startup_init_split() -> None:
     main_path = ROOT / "app" / "main.py"
@@ -198,11 +212,23 @@ def check_startup_init_split() -> None:
     _assert("def run_data_initialization" in init_service_path.read_text(encoding="utf-8"), "init_service must own heavy data initialization")
 
 
+def check_market_context() -> None:
+    from app.services.market_context import score_market_sentiment, score_theme_narratives
+    from app.services.quant_risk import hrp_fallback_weights
+    sentiment = score_market_sentiment(breadth=0.7, average_return=0.02, volume_ratio=1.2, limit_up_ratio=0.03, limit_down_ratio=0.01, northbound_flow_z=1.0)
+    _assert(0 <= sentiment["score"] <= 100, "sentiment score must be bounded")
+    themes = score_theme_narratives([{"theme": "demo", "strength": 0.8, "breadth": 0.8, "persistence": 0.8, "source_diversity": 0.8, "source_types": 2, "related_instruments": 5, "sessions": 3}])
+    _assert(themes and themes[0]["promotable"] is True, "theme promotion gate must pass with complete evidence")
+    fallback = hrp_fallback_weights({"a": [0.01, -0.02, 0.01], "b": [0.03, -0.04, 0.02]}, max_single=0.8)
+    _assert(abs(sum(fallback.values()) - 1.0) < 1e-6, "HRP fallback weights must normalize")
+
+
 def main() -> int:
     checks = [
         ("trading constraints and fees", check_trading_constraints),
         ("risk pause decisions", check_risk_decisions),
         ("startup/data initialization split", check_startup_init_split),
+        ("market sentiment and theme context", check_market_context),
     ]
     for name, fn in checks:
         fn()

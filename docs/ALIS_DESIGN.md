@@ -46,6 +46,8 @@ flowchart TD
 
 这样可以追溯“当时系统到底看到了什么”。
 
+网页/F10 数据采用最低优先级的 `web_fallback` 来源：仅在 Tushare、交易所或正式披露源无权限、失败或字段缺失时使用。实时 Playwright 适配器位于主后端 `app/data_platform/web_fallback`，结果直接进入 `dc_web_factor_snapshot` 和 `data_ingestion_runs`。历史 `news.db` 可由主系统一次性导入，独立 Node API、CSV 交换层和 React 查询端不再属于运行架构。
+
 ### Clean 标准化层
 
 把外部字段统一成内部语义，例如股票代码、交易日期、报告期、公告发布时间、指标名称和数据类型。
@@ -104,7 +106,7 @@ risk_score
 
 ## 3. 当前已实现的数据中台 V1
 
-主系统 `quantification-main` 已经实现数据中台基础能力：
+独立服务 `data-platform` 已经承载数据中台基础能力；主后端通过兼容代理保留 `/api/data-center/*`，因此前端暂时无需调整：
 
 - `data_sources`：数据源登记。
 - `data_ingestion_runs`：采集运行记录。
