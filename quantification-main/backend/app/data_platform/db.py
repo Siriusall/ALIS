@@ -120,6 +120,12 @@ CREATE TABLE dc_stock_daily_snapshot (
             updated_at TEXT NOT NULL,
             PRIMARY KEY (ts_code, trade_date)
         );
+CREATE TABLE dc_available_trade_dates (
+            trade_date TEXT PRIMARY KEY,
+            source_code TEXT NOT NULL DEFAULT '',
+            available_time TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
 CREATE TABLE dc_stock_master (
             ts_code TEXT PRIMARY KEY,
             symbol TEXT NOT NULL,
@@ -156,6 +162,20 @@ CREATE TABLE dc_tushare_raw_records (
             updated_at TEXT NOT NULL,
             UNIQUE (api_name, record_key)
         );
+CREATE TABLE dc_cold_archive_manifest (
+            archive_id TEXT PRIMARY KEY,
+            dataset TEXT NOT NULL,
+            api_names_json TEXT NOT NULL,
+            date_start TEXT NOT NULL DEFAULT '',
+            date_end TEXT NOT NULL DEFAULT '',
+            row_count INTEGER NOT NULL,
+            file_path TEXT NOT NULL,
+            file_sha256 TEXT NOT NULL,
+            schema_json TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'completed',
+            created_at TEXT NOT NULL
+        );
+CREATE INDEX idx_dc_cold_archive_dataset_created ON dc_cold_archive_manifest (dataset, created_at);
 CREATE TABLE dc_tushare_failed_requests (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             request_key TEXT NOT NULL UNIQUE,
@@ -180,6 +200,8 @@ CREATE TABLE dc_tushare_request_coverage (
             period TEXT NOT NULL DEFAULT '',
             params_json TEXT NOT NULL,
             rows_read INTEGER NOT NULL DEFAULT 0,
+            result_status TEXT NOT NULL DEFAULT 'success',
+            result_reason TEXT NOT NULL DEFAULT '',
             checked_at TEXT NOT NULL
         );
 CREATE TABLE dc_runtime_logs (
@@ -189,6 +211,17 @@ CREATE TABLE dc_runtime_logs (
             message TEXT NOT NULL,
             context_json TEXT NOT NULL DEFAULT '{}',
             created_at TEXT NOT NULL
+        );
+CREATE TABLE dc_data_quarantine (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            api_name TEXT NOT NULL,
+            record_key TEXT NOT NULL,
+            ts_code TEXT NOT NULL DEFAULT '',
+            period TEXT NOT NULL DEFAULT '',
+            payload_json TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            quarantined_at TEXT NOT NULL,
+            UNIQUE (api_name, record_key)
         );
 CREATE TABLE dc_web_factor_snapshot (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -248,11 +281,14 @@ CREATE INDEX idx_dc_raw_ts_code ON dc_tushare_raw_records (ts_code);
 CREATE INDEX idx_dc_raw_trade_date ON dc_tushare_raw_records (trade_date);
 CREATE INDEX idx_dc_raw_api_period_ts ON dc_tushare_raw_records (api_name, period, ts_code);
 CREATE INDEX idx_dc_raw_api_date_ts ON dc_tushare_raw_records (api_name, trade_date, ts_code);
+CREATE INDEX idx_dc_raw_api_available ON dc_tushare_raw_records (api_name, available_time, id);
+CREATE INDEX idx_dc_raw_api_ts_available ON dc_tushare_raw_records (api_name, ts_code, available_time, id);
 CREATE INDEX idx_dc_tushare_failed_status ON dc_tushare_failed_requests (status, last_failed_at);
 CREATE INDEX idx_dc_request_coverage_api_symbol ON dc_tushare_request_coverage (api_name,ts_code,period);
 CREATE INDEX idx_dc_request_coverage_api_date ON dc_tushare_request_coverage (api_name,trade_date);
 CREATE INDEX idx_dc_runtime_logs_created ON dc_runtime_logs (created_at);
 CREATE INDEX idx_dc_calendar_open_date ON dc_trade_calendar (is_open, cal_date);
+CREATE INDEX idx_dc_available_trade_dates_updated ON dc_available_trade_dates (updated_at);
 CREATE INDEX idx_dc_snapshot_date ON dc_stock_daily_snapshot (trade_date);
 CREATE INDEX idx_dc_snapshot_symbol ON dc_stock_daily_snapshot (symbol);
 CREATE INDEX idx_dc_snapshot_date_symbol ON dc_stock_daily_snapshot (trade_date, symbol);
@@ -369,6 +405,7 @@ def init_db() -> None:
                 "dc_announcement_event",
                 "dc_announcement_raw",
                 "dc_data_quality_checks",
+                "dc_data_quarantine",
                 "dc_runtime_logs",
                 "dc_tushare_failed_requests",
                 "dc_tushare_raw_records",
@@ -390,9 +427,62 @@ def init_db() -> None:
                 observations_json TEXT NOT NULL, result_json TEXT NOT NULL,
                 model_version VARCHAR(64) NOT NULL, available_time VARCHAR(64) NOT NULL,
                 created_at VARCHAR(64) NOT NULL, updated_at VARCHAR(64) NOT NULL)""")
+            conn.execute("""CREATE TABLE IF NOT EXISTS dc_available_trade_dates (
+                trade_date VARCHAR(8) PRIMARY KEY,
+                source_code VARCHAR(64) NOT NULL DEFAULT '',
+                available_time VARCHAR(64) NOT NULL,
+                updated_at VARCHAR(64) NOT NULL)""")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_dc_available_trade_dates_updated ON dc_available_trade_dates (updated_at)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_dc_market_context_state ON dc_market_context_snapshot (market_state,trade_date)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_dc_snapshot_ts_date_bars ON dc_stock_daily_snapshot (ts_code,trade_date) INCLUDE (close,volume,turnover)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_dc_snapshot_ts_available_date ON dc_stock_daily_snapshot (ts_code,available_time,trade_date DESC) INCLUDE (pe_ttm)")
+            conn.execute("""CREATE TABLE IF NOT EXISTS dc_industry_state_snapshot (
+                as_of_date VARCHAR(8) NOT NULL, industry_name VARCHAR(255) NOT NULL,
+                state_json TEXT NOT NULL, evidence_json TEXT NOT NULL,
+                model_version VARCHAR(64) NOT NULL, available_time VARCHAR(64) NOT NULL,
+                created_at VARCHAR(64) NOT NULL, updated_at VARCHAR(64) NOT NULL,
+                PRIMARY KEY(as_of_date,industry_name))""")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_dc_industry_state_name_date ON dc_industry_state_snapshot(industry_name,as_of_date)")
+            conn.execute("""CREATE TABLE IF NOT EXISTS dc_theme_snapshot (
+                as_of_date VARCHAR(8) NOT NULL, theme_code VARCHAR(255) NOT NULL,
+                theme_name VARCHAR(255) NOT NULL, lifecycle VARCHAR(32) NOT NULL,
+                score DOUBLE PRECISION NOT NULL DEFAULT 0, promotable INTEGER NOT NULL DEFAULT 0,
+                payload_json TEXT NOT NULL, model_version VARCHAR(64) NOT NULL,
+                available_time VARCHAR(64) NOT NULL, created_at VARCHAR(64) NOT NULL,
+                updated_at VARCHAR(64) NOT NULL, PRIMARY KEY(as_of_date,theme_code))""")
+            conn.execute("""CREATE TABLE IF NOT EXISTS dc_theme_company_mapping (
+                as_of_date VARCHAR(8) NOT NULL, theme_code VARCHAR(255) NOT NULL,
+                ts_code VARCHAR(16) NOT NULL, exposure_score DOUBLE PRECISION NOT NULL DEFAULT 0,
+                evidence_json TEXT NOT NULL, updated_at VARCHAR(64) NOT NULL,
+                PRIMARY KEY(as_of_date,theme_code,ts_code))""")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_dc_theme_score_date ON dc_theme_snapshot(promotable,score,as_of_date)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_dc_theme_company_symbol ON dc_theme_company_mapping(ts_code,as_of_date)")
+            conn.execute("""CREATE TABLE IF NOT EXISTS dc_event_followup (
+                event_key VARCHAR(128) PRIMARY KEY, ts_code VARCHAR(16) NOT NULL DEFAULT '',
+                event_type VARCHAR(64) NOT NULL, status VARCHAR(32) NOT NULL,
+                next_followup_date VARCHAR(16), next_action TEXT NOT NULL,
+                thesis_id BIGINT, evidence_json TEXT NOT NULL,
+                intervention_actor VARCHAR(128) NOT NULL DEFAULT '',
+                created_at VARCHAR(64) NOT NULL, updated_at VARCHAR(64) NOT NULL)""")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_dc_event_followup_status_date ON dc_event_followup(status,next_followup_date)")
+            conn.execute("""CREATE TABLE IF NOT EXISTS model_training_history (
+                feature_date VARCHAR(8) PRIMARY KEY, feature_set VARCHAR(64) NOT NULL,
+                features_json TEXT NOT NULL, source_as_of_time VARCHAR(64) NOT NULL,
+                created_at VARCHAR(64) NOT NULL, updated_at VARCHAR(64) NOT NULL)""")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_model_training_feature_set_date ON model_training_history(feature_set,feature_date)")
             for column in ("change_pct", "volume", "turnover"):
                 conn.execute(f"ALTER TABLE dc_stock_daily_snapshot ADD COLUMN IF NOT EXISTS {column} DOUBLE PRECISION")
+            conn.execute("ALTER TABLE dc_tushare_request_coverage ADD COLUMN IF NOT EXISTS result_status VARCHAR(32) NOT NULL DEFAULT 'success'")
+            conn.execute("ALTER TABLE dc_tushare_request_coverage ADD COLUMN IF NOT EXISTS result_reason TEXT NOT NULL DEFAULT ''")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_dc_request_coverage_result ON dc_tushare_request_coverage (result_status,api_name)")
+            conn.execute("""CREATE TABLE IF NOT EXISTS dc_cold_archive_manifest (
+                archive_id VARCHAR(96) PRIMARY KEY, dataset VARCHAR(64) NOT NULL,
+                api_names_json TEXT NOT NULL, date_start VARCHAR(16) NOT NULL DEFAULT '',
+                date_end VARCHAR(16) NOT NULL DEFAULT '', row_count BIGINT NOT NULL,
+                file_path TEXT NOT NULL, file_sha256 VARCHAR(128) NOT NULL,
+                schema_json TEXT NOT NULL, status VARCHAR(32) NOT NULL DEFAULT 'completed',
+                created_at VARCHAR(64) NOT NULL)""")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_dc_cold_archive_dataset_created ON dc_cold_archive_manifest (dataset,created_at)")
             return
         schema = SCHEMA_SQL.replace("CREATE TABLE ", "CREATE TABLE IF NOT EXISTS ")
         schema = schema.replace("CREATE INDEX ", "CREATE INDEX IF NOT EXISTS ")

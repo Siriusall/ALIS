@@ -19,6 +19,7 @@ from app.data_platform.services.data_center import (  # noqa: E402
     _resolve_failed_tushare_request,
     classify_tushare_error,
     list_failed_tushare_requests,
+    sync_financial_batch,
     sync_market_bundle,
 )
 from app.data_platform.services.assets import _report_periods  # noqa: E402
@@ -37,6 +38,12 @@ class FinancialBackfillSelectionTest(unittest.TestCase):
                 api_name TEXT NOT NULL,
                 period TEXT NOT NULL,
                 ts_code TEXT NOT NULL
+            );
+            CREATE TABLE dc_tushare_request_coverage (
+                api_name TEXT NOT NULL,
+                period TEXT NOT NULL,
+                ts_code TEXT NOT NULL,
+                result_status TEXT NOT NULL
             );
             INSERT INTO dc_stock_master VALUES ('000001.SZ'), ('000002.SZ'), ('000003.SZ');
             """
@@ -76,6 +83,32 @@ class FinancialBackfillSelectionTest(unittest.TestCase):
         self.assertEqual(
             _load_financial_missing_codes("20231231", limit=3, completion_api="fina_audit"),
             ["000002.SZ", "000003.SZ"],
+        )
+
+    def test_annual_completion_skips_completed_request_coverage(self) -> None:
+        with db._conn() as conn:
+            conn.execute(
+                "INSERT INTO dc_tushare_request_coverage VALUES (?, ?, ?, ?)",
+                ("fina_audit", "20251231", "000001.SZ", "not_applicable"),
+            )
+            conn.execute(
+                "INSERT INTO dc_tushare_request_coverage VALUES (?, ?, ?, ?)",
+                ("fina_audit", "20251231", "000002.SZ", "deferred_empty"),
+            )
+        self.assertEqual(
+            _load_financial_missing_codes("20251231", limit=3, completion_api="fina_audit"),
+            ["000003.SZ"],
+        )
+
+    def test_empty_pending_is_sorted_after_never_checked_symbols(self) -> None:
+        with db._conn() as conn:
+            conn.execute(
+                "INSERT INTO dc_tushare_request_coverage VALUES (?, ?, ?, ?)",
+                ("fina_audit", "20251231", "000001.SZ", "empty_pending"),
+            )
+        self.assertEqual(
+            _load_financial_missing_codes("20251231", limit=3, completion_api="fina_audit"),
+            ["000002.SZ", "000003.SZ", "000001.SZ"],
         )
 
 
@@ -130,6 +163,29 @@ class PlanningAndBundleCorrectnessTest(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertEqual(result["apis"], ["daily_basic"])
         sync.assert_called_once_with("daily_basic", {"trade_date": "20260710"})
+
+    @patch("app.data_platform.services.data_center.ensure_data_center_seeded")
+    @patch("app.data_platform.services.data_center._load_financial_missing_codes", return_value=["000001.SZ"])
+    @patch("app.data_platform.services.data_center.sync_financial_bundle")
+    @patch("app.data_platform.services.data_center._parallel_tushare_map")
+    def test_audit_backfill_does_not_repeat_core_or_main_business(self, parallel, bundle, _missing, _seed) -> None:
+        bundle.return_value = {"ok": True, "results": []}
+        parallel.side_effect = lambda targets, fn, **_kwargs: ([fn(code) for code in targets], 1)
+
+        result = sync_financial_batch(
+            "20241231",
+            limit=20,
+            include_yearly=True,
+            completion_api="fina_audit",
+        )
+
+        self.assertTrue(result["ok"])
+        bundle.assert_called_once_with(
+            "000001.SZ",
+            "20241231",
+            include_yearly=False,
+            apis_override=["fina_audit"],
+        )
 
 
 if __name__ == "__main__":

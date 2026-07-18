@@ -24,6 +24,12 @@ SOURCE_CNINFO = "cninfo"
 SOURCE_MANUAL = "manual"
 
 _tushare_activity_local = threading.local()
+_tushare_cooldown_lock = threading.Lock()
+_tushare_api_cooldown_until: dict[str, float] = {}
+_tushare_global_cooldown_until = 0.0
+_tushare_reduced_concurrency_until = 0.0
+_tushare_reduced_concurrency = 0
+TUSHARE_RATE_LIMIT_COOLDOWN_SECONDS = int(os.getenv("TUSHARE_RATE_LIMIT_COOLDOWN_SECONDS", "180") or 180)
 
 
 def set_tushare_activity_hook(hook: Callable[[dict[str, Any]], None] | None) -> None:
@@ -43,7 +49,7 @@ def _emit_tushare_activity(event: str, api_name: str, params: dict[str, Any], **
 
 def _parallel_tushare_map(items: list[Any], fn: Callable[[Any], Any], *, prefix: str) -> tuple[list[Any], int]:
     """Run bounded upstream calls concurrently while preserving order and UI activity."""
-    workers = max(1, min(int(os.getenv("TUSHARE_CONCURRENCY", "3") or 3), 6, len(items) or 1))
+    workers = _effective_tushare_workers(len(items))
     parent_hook = getattr(_tushare_activity_local, "hook", None)
 
     def wrapped(item: Any) -> Any:
@@ -55,6 +61,59 @@ def _parallel_tushare_map(items: list[Any], fn: Callable[[Any], Any], *, prefix:
 
     with ThreadPoolExecutor(max_workers=workers, thread_name_prefix=prefix) as pool:
         return list(pool.map(wrapped, items)), workers
+
+
+def _base_tushare_workers(item_count: int) -> int:
+    configured = int(os.getenv("TUSHARE_CONCURRENCY", "16") or 16)
+    return max(1, min(configured, 20, item_count or 1))
+
+
+def _effective_tushare_workers(item_count: int) -> int:
+    base = _base_tushare_workers(item_count)
+    now = time.monotonic()
+    with _tushare_cooldown_lock:
+        if now < _tushare_reduced_concurrency_until and _tushare_reduced_concurrency > 0:
+            return max(1, min(base, _tushare_reduced_concurrency, item_count or 1))
+    return base
+
+
+def _cooldown_remaining(api_name: str) -> int:
+    now = time.monotonic()
+    with _tushare_cooldown_lock:
+        until = max(_tushare_global_cooldown_until, _tushare_api_cooldown_until.get(api_name, 0.0))
+    return max(0, int(until - now))
+
+
+def _activate_rate_limit_cooldown(api_name: str, *, seconds: int | None = None) -> None:
+    global _tushare_global_cooldown_until, _tushare_reduced_concurrency_until, _tushare_reduced_concurrency
+    duration = int(seconds or TUSHARE_RATE_LIMIT_COOLDOWN_SECONDS)
+    until = time.monotonic() + duration
+    base_workers = _base_tushare_workers(999999)
+    reduced_workers = max(1, min(base_workers, max(4, base_workers // 2)))
+    with _tushare_cooldown_lock:
+        _tushare_api_cooldown_until[api_name] = max(_tushare_api_cooldown_until.get(api_name, 0.0), until)
+        _tushare_global_cooldown_until = max(_tushare_global_cooldown_until, time.monotonic() + min(duration, 60))
+        _tushare_reduced_concurrency_until = max(_tushare_reduced_concurrency_until, until)
+        _tushare_reduced_concurrency = reduced_workers
+    write_runtime_log(
+        "WARNING",
+        "tushare",
+        f"cooldown {api_name}",
+        {
+            "api": api_name,
+            "seconds": duration,
+            "reason": "rate_limit",
+            "base_concurrency": base_workers,
+            "reduced_concurrency": reduced_workers,
+        },
+    )
+
+
+class TushareCoolingDown(RuntimeError):
+    def __init__(self, api_name: str, seconds: int):
+        self.api_name = api_name
+        self.seconds = seconds
+        super().__init__(f"Tushare {api_name} cooling down for {seconds}s after rate_limit")
 
 
 @dataclass(frozen=True)
@@ -73,17 +132,19 @@ TUSHARE_CATALOG: list[TushareCatalogItem] = [
     TushareCatalogItem("trade_cal", "基础", "交易日历", "调度、回测、可用时间判断", "monthly", "exchange,cal_date,is_open,pretrade_date", {"exchange": "SSE"}),
     TushareCatalogItem("namechange", "基础", "曾用名", "ST/名称变更历史、治理风险辅助", "monthly", "ts_code,name,start_date,end_date,change_reason", {"ts_code": "000001.SZ"}),
     TushareCatalogItem("daily", "行情", "A股日线", "价格、成交量、技术面和回测基础", "daily", "ts_code,trade_date,open,high,low,close,pre_close,change,pct_chg,vol,amount", {"trade_date": ""}),
-    TushareCatalogItem("weekly", "行情", "周线", "长线趋势辅助", "weekly", "ts_code,trade_date,open,high,low,close,vol,amount", {"ts_code": ""}),
-    TushareCatalogItem("monthly", "行情", "月线", "长线趋势辅助", "monthly", "ts_code,trade_date,open,high,low,close,vol,amount", {"ts_code": ""}),
-    TushareCatalogItem("adj_factor", "行情", "复权因子", "历史价格复权和收益计算", "daily", "ts_code,trade_date,adj_factor", {"ts_code": ""}),
+    TushareCatalogItem("fund_basic", "基金", "场内基金基础信息", "防御ETF主数据与交易状态", "monthly", "ts_code,name,management,custodian,fund_type,found_date,due_date,list_date,issue_date,delist_date,market", {"market": "E"}),
+    TushareCatalogItem("fund_daily", "基金", "场内基金日线", "货币、债券、黄金、低波和红利ETF模拟交易", "daily", "ts_code,trade_date,open,high,low,close,pre_close,change,pct_chg,vol,amount", {"ts_code": ""}),
+    TushareCatalogItem("weekly", "行情", "周线", "长线趋势辅助", "weekly", "ts_code,trade_date,open,high,low,close,vol,amount", {"trade_date": ""}),
+    TushareCatalogItem("monthly", "行情", "月线", "长线趋势辅助", "monthly", "ts_code,trade_date,open,high,low,close,vol,amount", {"trade_date": ""}),
+    TushareCatalogItem("adj_factor", "行情", "复权因子", "历史价格复权和收益计算", "daily", "ts_code,trade_date,adj_factor", {"trade_date": ""}),
     TushareCatalogItem("daily_basic", "估值", "每日指标", "估值、市值、换手、量化快照", "daily", "ts_code,trade_date,close,turnover_rate,volume_ratio,pe,pe_ttm,pb,ps,ps_ttm,total_mv,circ_mv", {"trade_date": ""}),
     TushareCatalogItem("suspend_d", "交易状态", "停复牌", "交易约束、风险过滤", "daily", "ts_code,trade_date,suspend_timing,suspend_type", {"trade_date": ""}),
     TushareCatalogItem("stk_limit", "交易状态", "涨跌停价", "交易约束、涨跌停识别", "daily", "ts_code,trade_date,up_limit,down_limit", {"trade_date": ""}),
-    TushareCatalogItem("moneyflow", "资金", "个股资金流", "资金确认项、短中期风险辅助", "daily", "ts_code,trade_date,buy_sm_vol,sell_sm_vol,buy_lg_vol,sell_lg_vol,net_mf_vol,net_mf_amount", {"ts_code": ""}),
-    TushareCatalogItem("income", "财务", "利润表", "营收、利润、成长能力", "quarterly", "ts_code,ann_date,f_ann_date,end_date,report_type,total_revenue,n_income", {"ts_code": "", "period": ""}),
-    TushareCatalogItem("balancesheet", "财务", "资产负债表", "资产质量、负债、安全性", "quarterly", "ts_code,ann_date,f_ann_date,end_date,total_assets,total_liab,total_hldr_eqy_exc_min_int", {"ts_code": "", "period": ""}),
-    TushareCatalogItem("cashflow", "财务", "现金流量表", "经营现金流、自由现金流质量", "quarterly", "ts_code,ann_date,f_ann_date,end_date,n_cashflow_act,n_cash_flows_inv_act,n_cash_flows_fnc_act", {"ts_code": "", "period": ""}),
-    TushareCatalogItem("fina_indicator", "财务", "财务指标", "ROE、毛利率、净利率、偿债指标", "quarterly", "ts_code,ann_date,end_date,roe,roa,grossprofit_margin,netprofit_margin,debt_to_assets,ocf_to_or", {"ts_code": "", "period": ""}),
+    TushareCatalogItem("moneyflow", "资金", "个股资金流", "资金确认项、短中期风险辅助", "daily", "ts_code,trade_date,buy_sm_vol,sell_sm_vol,buy_lg_vol,sell_lg_vol,net_mf_vol,net_mf_amount", {"trade_date": ""}),
+    TushareCatalogItem("income", "财务", "利润表", "营收、利润、成长能力", "quarterly", "ts_code,ann_date,f_ann_date,end_date,report_type,revenue,total_revenue,operate_profit,total_profit,n_income,n_income_attr_p,basic_eps,diluted_eps", {"ts_code": "", "period": ""}),
+    TushareCatalogItem("balancesheet", "财务", "资产负债表", "资产质量、负债、安全性", "quarterly", "ts_code,ann_date,f_ann_date,end_date,total_assets,total_liab,total_hldr_eqy_exc_min_int,money_cap,accounts_receiv,inventories,goodwill,st_borr,lt_borr,bond_payable,non_cur_liab_due_1y", {"ts_code": "", "period": ""}),
+    TushareCatalogItem("cashflow", "财务", "现金流量表", "经营现金流、自由现金流质量", "quarterly", "ts_code,ann_date,f_ann_date,end_date,n_cashflow_act,n_cash_flows_inv_act,n_cash_flows_fnc_act,c_pay_acq_const_fiolta", {"ts_code": "", "period": ""}),
+    TushareCatalogItem("fina_indicator", "财务", "财务指标", "ROE、毛利率、净利率、偿债指标", "quarterly", "ts_code,ann_date,end_date,roe,roe_waa,roa,roic,grossprofit_margin,netprofit_margin,debt_to_assets,current_ratio,quick_ratio,assets_turn,inv_turn,ar_turn,ocf_to_or,ocf_to_profit,q_sales_yoy,q_profit_yoy", {"ts_code": "", "period": ""}),
     TushareCatalogItem("fina_audit", "财务", "审计意见", "非标审计预警", "yearly", "ts_code,ann_date,end_date,audit_result,audit_fees,audit_agency", {"ts_code": "", "period": ""}),
     TushareCatalogItem("fina_mainbz", "财务", "主营构成", "业务结构和行业暴露", "yearly", "ts_code,end_date,bz_item,bz_sales,bz_profit,bz_cost,curr_type", {"ts_code": "", "period": "", "type": "P"}),
     TushareCatalogItem("forecast", "业绩", "业绩预告", "预期变化和业绩风险", "daily_incremental", "ts_code,ann_date,end_date,type,p_change_min,p_change_max,net_profit_min,net_profit_max,summary", {"ann_date": ""}),
@@ -110,6 +171,22 @@ def _now() -> str:
     return datetime.utcnow().isoformat(timespec="seconds")
 
 
+class EmptyTushareResult(RuntimeError):
+    """Tushare returned no rows for a request that was expected to be checked.
+
+    An empty response is not a successful ingestion: it must remain visible to
+    the quality gate and be eligible for retry/fallback instead of being marked
+    as covered silently.
+    """
+
+
+class TushareUpstreamNotReady(EmptyTushareResult):
+    def __init__(self, api_name: str, trade_date: str):
+        self.api_name = api_name
+        self.trade_date = trade_date
+        super().__init__(f"Tushare {api_name} {trade_date} 今日数据尚未入库，等待上游更新后重试")
+
+
 def _invalidate_asset_views() -> None:
     # Local import avoids the assets -> data_center planning dependency cycle.
     try:
@@ -122,11 +199,15 @@ def _invalidate_asset_views() -> None:
 def classify_tushare_error(exc: Exception) -> str:
     """Classify upstream failures so retry and operator actions are predictable."""
     message = str(exc).lower()
+    if isinstance(exc, TushareUpstreamNotReady) or "今日数据尚未入库" in message:
+        return "upstream_not_ready"
+    if isinstance(exc, EmptyTushareResult) or "empty result" in message or "返回为空" in message:
+        return "empty_pending"
     if any(x in message for x in ("token", "unauthorized", "401", "登录", "认证")):
         return "authentication"
     if any(x in message for x in ("权限", "permission", "forbidden", "403", "积分")):
         return "permission"
-    if any(x in message for x in ("频率", "限流", "rate limit", "too many", "429")):
+    if any(x in message for x in ("频率", "频繁", "限流", "rate limit", "too many", "429")):
         return "rate_limit"
     if any(x in message for x in ("timeout", "timed out", "connection", "proxy", "502", "503", "504", "temporarily")):
         return "transient"
@@ -138,6 +219,10 @@ def classify_tushare_error(exc: Exception) -> str:
 def _request_key(api_name: str, params: dict[str, Any], limit_rows: int | None) -> str:
     raw = json.dumps({"api": api_name, "params": params, "limit_rows": limit_rows}, sort_keys=True, ensure_ascii=False)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+COMPLETED_REQUEST_STATUSES = ("success", "not_applicable", "valid_empty", "deferred_empty")
+DEFER_EMPTY_AFTER_ATTEMPTS = 5
 
 
 def _record_failed_tushare_request(api_name: str, params: dict[str, Any], limit_rows: int | None, category: str, error: str) -> None:
@@ -167,17 +252,48 @@ def _resolve_failed_tushare_request(api_name: str, params: dict[str, Any], limit
     redis_set_remove("alis:data-platform:tushare:failed", key)
 
 
-def _record_request_coverage(api_name: str, params: dict[str, Any], limit_rows: int | None, rows_read: int) -> None:
+def _record_request_coverage(
+    api_name: str, params: dict[str, Any], limit_rows: int | None, rows_read: int,
+    *, result_status: str = "success", result_reason: str = "",
+) -> None:
     key = _request_key(api_name, params, limit_rows)
     with _conn() as c:
         c.execute(
             """INSERT INTO dc_tushare_request_coverage
-               (request_key,api_name,ts_code,trade_date,period,params_json,rows_read,checked_at)
-               VALUES(?,?,?,?,?,?,?,?)
-               ON CONFLICT(request_key) DO UPDATE SET rows_read=excluded.rows_read,checked_at=excluded.checked_at""",
+               (request_key,api_name,ts_code,trade_date,period,params_json,rows_read,result_status,result_reason,checked_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?)
+               ON CONFLICT(request_key) DO UPDATE SET rows_read=excluded.rows_read,result_status=excluded.result_status,
+                   result_reason=excluded.result_reason,checked_at=excluded.checked_at""",
             (key, api_name, str(params.get("ts_code") or ""), str(params.get("trade_date") or ""),
-             str(params.get("period") or params.get("enddate") or ""), json.dumps(params, ensure_ascii=False, sort_keys=True), rows_read, _now()),
+             str(params.get("period") or params.get("enddate") or ""), json.dumps(params, ensure_ascii=False, sort_keys=True),
+             rows_read, result_status, result_reason[:500], _now()),
         )
+
+
+def _failed_request_attempts(api_name: str, params: dict[str, Any], limit_rows: int | None = None) -> int:
+    key = _request_key(api_name, params, limit_rows)
+    with _conn() as c:
+        row = c.execute(
+            "SELECT attempts FROM dc_tushare_failed_requests WHERE request_key=?",
+            (key,),
+        ).fetchone()
+    return int((dict(row) if row else {}).get("attempts") or 0)
+
+
+def _defer_empty_request_if_exhausted(api_name: str, params: dict[str, Any], limit_rows: int | None = None) -> bool:
+    attempts = _failed_request_attempts(api_name, params, limit_rows)
+    if attempts < DEFER_EMPTY_AFTER_ATTEMPTS:
+        return False
+    _record_request_coverage(
+        api_name,
+        params,
+        limit_rows,
+        0,
+        result_status="deferred_empty",
+        result_reason=f"empty_result_after_{attempts}_attempts_deferred_to_fallback",
+    )
+    _resolve_failed_tushare_request(api_name, params, limit_rows)
+    return True
 
 
 def _recent_calendar_window(days_back: int = 30, days_forward: int = 60) -> tuple[str, str]:
@@ -570,6 +686,42 @@ def _row_count(row: Any) -> int:
     return int(data.get("cnt") or 0)
 
 
+def _period_not_applicable(ts_code: str, period: str) -> bool:
+    """A pre-listing report period is a valid no-data case, not an API failure."""
+    if not ts_code or not period or not period.isdigit() or len(period) != 8:
+        return False
+    try:
+        with _conn() as c:
+            row = c.execute("SELECT list_date FROM dc_stock_master WHERE ts_code=?", (ts_code,)).fetchone()
+        listed = str((dict(row) if row else {}).get("list_date") or "")
+        return bool(listed and listed.isdigit() and listed > period)
+    except Exception:
+        return False
+
+
+VALID_EMPTY_TUSHARE_APIS = {
+    # These APIs describe optional events/disclosures. No returned row is a
+    # valid negative observation after a successful request.
+    "express", "pledge_detail", "pledge_stat", "namechange", "suspend_d",
+}
+
+PERIOD_FALLBACK_APIS = {
+    "income", "balancesheet", "cashflow", "fina_indicator", "fina_mainbz", "fina_audit",
+}
+
+FINANCIAL_RESEARCH_REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
+    "income": ("total_revenue", "n_income", "n_income_attr_p"),
+    "balancesheet": ("total_assets", "total_liab", "money_cap"),
+    "cashflow": ("n_cashflow_act", "c_pay_acq_const_fiolta"),
+    "fina_indicator": ("roe", "grossprofit_margin", "netprofit_margin", "debt_to_assets"),
+}
+FINANCIAL_SECTOR_RESEARCH_REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
+    "income": ("total_revenue", "n_income"),
+    "balancesheet": ("total_assets", "total_liab", "total_hldr_eqy_exc_min_int"),
+    "fina_indicator": ("roe",),
+}
+
+
 def _catalog_item(api_name: str) -> TushareCatalogItem:
     for item in TUSHARE_CATALOG:
         if item.api_name == api_name:
@@ -595,6 +747,10 @@ def sync_tushare_api_raw(api_name: str, params: dict[str, Any] | None = None, *,
 
     ensure_data_center_seeded()
     item = _catalog_item(api_name)
+    cooldown = _cooldown_remaining(api_name)
+    if cooldown > 0:
+        _emit_tushare_activity("cooldown", api_name, params or {}, seconds=cooldown)
+        raise TushareCoolingDown(api_name, cooldown)
     run_id = start_ingestion_run(f"tushare.{api_name}", {"api": api_name, "params": params or {}, "limit_rows": limit_rows})
     request_params = params or {}
     try:
@@ -622,16 +778,64 @@ def sync_tushare_api_raw(api_name: str, params: dict[str, Any] | None = None, *,
                 if category == "authentication" and attempt == 0:
                     reset_tushare_client()
                     continue
-                if category not in {"transient", "rate_limit"} or attempt >= len(retry_delays):
+                if category == "rate_limit":
+                    _activate_rate_limit_cooldown(api_name)
                     raise
-                delay = retry_delays[attempt] * (3 if category == "rate_limit" else 1)
+                # Empty responses can be transient upstream/indexing gaps too;
+                # retry them with the same bounded backoff before handing the
+                # request to the failure queue and fallback-source policy.
+                if category not in {"transient", "empty_pending"} or attempt >= len(retry_delays):
+                    raise
+                delay = retry_delays[attempt]
                 time.sleep(delay)
         if last_exc is not None:
             raise last_exc
         if df is None:
             df = pd.DataFrame()
+        # Some Tushare financial endpoints occasionally return empty for an
+        # exact period query although the stock-wide query contains that same
+        # report. Verify with a broader request before declaring a real gap.
+        if isinstance(df, pd.DataFrame) and df.empty and api_name in PERIOD_FALLBACK_APIS:
+            ts_code = str(request_params.get("ts_code") or "")
+            period = str(request_params.get("period") or "")
+            if ts_code and period:
+                broad_params = {k: v for k, v in request_params.items() if k not in {"period", "start_date", "end_date"}}
+                _emit_tushare_activity("request", api_name, broad_params, attempt="period_fallback")
+                broad = _call_tushare_api(api_name, params=broad_params, fields=item.fields)
+                if isinstance(broad, pd.DataFrame) and not broad.empty:
+                    period_col = "end_date" if "end_date" in broad.columns else ("period" if "period" in broad.columns else "")
+                    if period_col:
+                        df = broad[broad[period_col].astype(str) == period].copy()
+                _emit_tushare_activity("response", api_name, broad_params, attempt="period_fallback", rows=len(df))
         if limit_rows is not None and limit_rows > 0 and isinstance(df, pd.DataFrame):
             df = df.head(int(limit_rows))
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            trade_date = str(request_params.get("trade_date") or "")
+            if trade_date and api_name in {"daily", "daily_basic", "stk_limit", "moneyflow", "adj_factor"}:
+                try:
+                    from app.data_platform.services.market_calendar import target_trade_date
+                    with _conn() as c:
+                        is_target = trade_date == target_trade_date(c)
+                except Exception:
+                    is_target = False
+                if is_target:
+                    raise TushareUpstreamNotReady(api_name, trade_date)
+            ts_code = str(request_params.get("ts_code") or "")
+            period = str(request_params.get("period") or "")
+            if _period_not_applicable(ts_code, period):
+                finish_ingestion_run(run_id, status="not_applicable", rows_read=0, rows_written=0, meta={"api": api_name, "params": request_params, "reason": "listed_after_period"})
+                _record_request_coverage(api_name, request_params, limit_rows, 0, result_status="not_applicable", result_reason="listed_after_period")
+                _emit_tushare_activity("skipped", api_name, request_params, rows=0, written=0, category="not_applicable", error="股票上市日晚于报告期")
+                return {"ok": True, "api": api_name, "run_id": run_id, "rows_read": 0, "rows_written": 0, "not_applicable": True}
+            if api_name in VALID_EMPTY_TUSHARE_APIS:
+                finish_ingestion_run(run_id, status="valid_empty", rows_read=0, rows_written=0, meta={"api": api_name, "params": request_params, "reason": "no_optional_event"})
+                _record_request_coverage(api_name, request_params, limit_rows, 0, result_status="valid_empty", result_reason="no_optional_event")
+                _resolve_failed_tushare_request(api_name, request_params, limit_rows)
+                _emit_tushare_activity("skipped", api_name, request_params, rows=0, written=0, category="valid_empty", error="该范围内无可选事件")
+                return {"ok": True, "api": api_name, "run_id": run_id, "rows_read": 0, "rows_written": 0, "valid_empty": True}
+            raise EmptyTushareResult(
+                f"Tushare {api_name} 返回为空，待下一轮复核（empty_pending）"
+            )
         written = _upsert_raw_records(api_name, df)
         finish_ingestion_run(run_id, status="completed", rows_read=len(df), rows_written=written, meta={"api": api_name, "params": params or {}})
         _record_probe(api_name, "ok" if written else "empty", len(df))
@@ -681,15 +885,33 @@ def _upsert_raw_records(api_name: str, df: pd.DataFrame) -> int:
     if not isinstance(df, pd.DataFrame) or df.empty:
         return 0
     now = _now()
+    returned_fields = sorted(str(column) for column in df.columns)
     written = 0
     with _conn() as c:
         for idx, row in df.iterrows():
             payload = _clean_payload(row.to_dict())
+            if api_name in FINANCIAL_RESEARCH_REQUIRED_FIELDS:
+                payload["_returned_fields"] = returned_fields
+                payload["_field_contract_version"] = "financial_research_fields_v1"
             ts_code = str(payload.get("ts_code") or payload.get("con_code") or "").strip()
             trade_date = str(payload.get("trade_date") or payload.get("date") or payload.get("month") or payload.get("MONTH") or payload.get("quarter") or "").strip()
             period = str(payload.get("period") or payload.get("end_date") or "").strip()
             ann_date = str(payload.get("ann_date") or "").strip()
+            available_time = _point_in_time_available_time(api_name, payload, fallback=now)
             record_key = _record_key(api_name, payload, idx)
+            if api_name == "stk_holdernumber":
+                end_date = str(payload.get("end_date") or "")
+                holder_num = payload.get("holder_num")
+                invalid_date = bool(end_date and (not end_date.isdigit() or len(end_date) != 8 or end_date > date.today().strftime("%Y%m%d")))
+                if invalid_date or holder_num is None:
+                    reason = "invalid_future_end_date" if invalid_date else "missing_holder_num"
+                    c.execute(
+                        """INSERT INTO dc_data_quarantine(api_name,record_key,ts_code,period,payload_json,reason,quarantined_at)
+                           VALUES(?,?,?,?,?,?,?) ON CONFLICT(api_name,record_key) DO UPDATE SET
+                           payload_json=excluded.payload_json,reason=excluded.reason,quarantined_at=excluded.quarantined_at""",
+                        (api_name, record_key, ts_code, end_date, json.dumps(payload, ensure_ascii=False, sort_keys=True), reason, now),
+                    )
+                    continue
             values = (
                 api_name,
                 record_key,
@@ -699,7 +921,7 @@ def _upsert_raw_records(api_name: str, df: pd.DataFrame) -> int:
                 ann_date,
                 json.dumps(payload, ensure_ascii=False, sort_keys=True),
                 SOURCE_TUSHARE,
-                now,
+                available_time,
                 now,
             )
             if c._is_mysql:
@@ -731,7 +953,21 @@ def _upsert_raw_records(api_name: str, df: pd.DataFrame) -> int:
                         trade_date = excluded.trade_date,
                         period = excluded.period,
                         ann_date = excluded.ann_date,
-                        payload_json = excluded.payload_json,
+                        payload_json = jsonb_set(
+                            jsonb_strip_nulls(dc_tushare_raw_records.payload_json::jsonb)
+                            || jsonb_strip_nulls(excluded.payload_json::jsonb),
+                            '{_returned_fields}',
+                            COALESCE((
+                                SELECT jsonb_agg(field ORDER BY field)
+                                FROM (
+                                    SELECT DISTINCT field
+                                    FROM jsonb_array_elements_text(
+                                        COALESCE(dc_tushare_raw_records.payload_json::jsonb->'_returned_fields','[]'::jsonb)
+                                        || COALESCE(excluded.payload_json::jsonb->'_returned_fields','[]'::jsonb)
+                                    ) AS field
+                                ) merged_fields
+                            ), '[]'::jsonb)
+                        )::text,
                         source_code = excluded.source_code,
                         available_time = excluded.available_time,
                         updated_at = excluded.updated_at
@@ -740,6 +976,32 @@ def _upsert_raw_records(api_name: str, df: pd.DataFrame) -> int:
                 )
             written += 1
     return written
+
+
+_DISCLOSURE_APIS = {
+    "income", "balancesheet", "cashflow", "fina_indicator", "fina_audit", "forecast", "express",
+    "dividend", "top10_holders", "top10_floatholders", "stk_holdernumber", "pledge_detail", "disclosure_date",
+}
+
+
+def _iso_available_on_date(value: Any, *, hour: int = 23, minute: int = 59, second: int = 59) -> str | None:
+    text = str(value or "").strip().replace("-", "")[:8]
+    if len(text) != 8 or not text.isdigit():
+        return None
+    try:
+        parsed = datetime.strptime(text, "%Y%m%d")
+    except ValueError:
+        return None
+    return parsed.replace(hour=hour, minute=minute, second=second).isoformat(timespec="seconds")
+
+
+def _point_in_time_available_time(api_name: str, payload: dict[str, Any], *, fallback: str) -> str:
+    """Separate economic availability from ingestion time for replay safety."""
+    if api_name in _DISCLOSURE_APIS:
+        disclosed = payload.get("actual_date") or payload.get("f_ann_date") or payload.get("ann_date")
+        return _iso_available_on_date(disclosed) or fallback
+    trade_date = payload.get("trade_date") or payload.get("date")
+    return _iso_available_on_date(trade_date, hour=15, minute=0, second=0) or fallback
 
 
 def _clean_payload(payload: dict[str, Any]) -> dict[str, Any]:
@@ -798,10 +1060,32 @@ def sync_market_bundle(trade_date: str, *, include_suspend: bool = False, apis: 
     return {"ok": all(bool(x.get("ok")) for x in results), "trade_date": trade_date, "apis": requested_apis, "results": results, "snapshot": snapshot}
 
 
-def sync_financial_bundle(ts_code: str, period: str, *, include_yearly: bool = True) -> dict[str, Any]:
+def recover_orphaned_ingestion_runs() -> dict[str, Any]:
+    """Close ingestion runs orphaned by a process restart.
+
+    Workers run in-process in V1.  A persisted ``running`` record from before
+    this API process started cannot still be active, and leaving it running
+    permanently hides the retry/continuation path from both operators and the
+    data-center UI.  Backfill has its own richer recovery routine, so it is
+    intentionally excluded here.
+    """
+    now = _now()
+    message = "服务重启前任务未完成；已标记为中断，可从失败队列或缺口继续"
+    with _conn() as c:
+        cursor = c.execute(
+            """UPDATE data_ingestion_runs
+               SET status='interrupted',finished_at=?,error=CASE WHEN error='' THEN ? ELSE error END
+               WHERE status='running' AND job_name<>'data_platform.backfill'""",
+            (now, message),
+        )
+        recovered = int(cursor.rowcount or 0)
+    return {"ok": True, "recovered": recovered, "at": now}
+
+
+def sync_financial_bundle(ts_code: str, period: str, *, include_yearly: bool = True, apis_override: list[str] | None = None) -> dict[str, Any]:
     """Sync financial statement/indicator bundle for one stock and report period."""
 
-    apis = ["income", "balancesheet", "cashflow", "fina_indicator"]
+    apis = list(apis_override or ["income", "balancesheet", "cashflow", "fina_indicator"])
     if include_yearly:
         apis.extend(["fina_audit", "fina_mainbz"])
     with _conn() as c:
@@ -823,22 +1107,193 @@ def sync_financial_bundle(ts_code: str, period: str, *, include_yearly: bool = T
 
 
 def sync_financial_period_bundle(period: str, *, include_yearly: bool = False) -> dict[str, Any]:
-    """Sync financial bundle for all stocks in one report period.
+    """Sync one report period through the officially supported dimensions.
 
-    This is the preferred full-load path. It avoids 5000+ per-stock calls and
-    keeps TuShare usage closer to one call per API per report period.
+    Core statements use the whole-market VIP endpoints.  Audit opinions and
+    main-business composition require stock codes, so an annual request only
+    advances one resumable stock batch instead of sending invalid period-only
+    calls to those ordinary endpoints.
     """
 
-    apis = ["income", "balancesheet", "cashflow", "fina_indicator"]
+    core = sync_financial_vip_period(period)
+    yearly = None
     if include_yearly:
-        apis.extend(["fina_audit", "fina_mainbz"])
-    results = []
-    for api in apis:
-        params: dict[str, Any] = {"period": period}
-        if api == "fina_mainbz":
-            params["type"] = "P"
-        results.append(_safe_sync_raw(api, params))
-    return {"ok": True, "period": period, "results": results}
+        yearly = sync_financial_batch(
+            period,
+            limit=20,
+            include_yearly=True,
+            completion_api="fina_audit",
+        )
+    return {
+        "ok": bool(core.get("ok")) and (yearly is None or bool(yearly.get("ok"))),
+        "period": period,
+        "mode": "vip_period_with_resumable_yearly_extras" if include_yearly else "vip_period",
+        "core": core,
+        "yearly_extras": yearly,
+        "results": core.get("results", []),
+    }
+
+
+def financial_research_completeness(
+    ts_code: str, *, periods: list[str] | None = None, period_limit: int = 8,
+    as_of_time: str | None = None,
+) -> dict[str, Any]:
+    """Measure field-level research readiness; row/request coverage is not sufficient."""
+    code = str(ts_code or "").strip().upper()
+    with _conn() as c:
+        master = c.execute("SELECT industry FROM dc_stock_master WHERE ts_code=?", (code,)).fetchone()
+        industry = str(dict(master).get("industry") or "") if master else ""
+        required_contract = (
+            FINANCIAL_SECTOR_RESEARCH_REQUIRED_FIELDS
+            if any(label in industry for label in ("银行", "保险", "证券", "多元金融"))
+            else FINANCIAL_RESEARCH_REQUIRED_FIELDS
+        )
+        if periods:
+            target_periods = [str(value) for value in periods if str(value)]
+        else:
+            cutoff_sql = " AND available_time<=?" if as_of_time else ""
+            params: tuple[Any, ...] = (code, str(as_of_time), max(1, min(int(period_limit), 12))) if as_of_time else (code, max(1, min(int(period_limit), 12)))
+            rows = c.execute(
+                """SELECT DISTINCT period FROM dc_tushare_raw_records
+                   WHERE api_name='income' AND ts_code=? AND period<>''
+                   """ + cutoff_sql + " ORDER BY period DESC LIMIT ?",
+                params,
+            ).fetchall()
+            target_periods = [str(dict(row).get("period") or "") for row in rows]
+        details: list[dict[str, Any]] = []
+        for period in target_periods:
+            for api_name, required in required_contract.items():
+                cutoff_sql = " AND available_time<=?" if as_of_time else ""
+                params = (api_name, code, period, str(as_of_time)) if as_of_time else (api_name, code, period)
+                rows = c.execute(
+                    """SELECT payload_json FROM dc_tushare_raw_records
+                       WHERE api_name=? AND ts_code=? AND period=?
+                       """ + cutoff_sql + " ORDER BY available_time DESC,length(payload_json) DESC,id DESC",
+                    params,
+                ).fetchall()
+                merged: dict[str, Any] = {}
+                returned_fields: set[str] = set()
+                for row in reversed(rows):
+                    try:
+                        payload = json.loads(dict(row).get("payload_json") or "{}")
+                    except (TypeError, json.JSONDecodeError):
+                        payload = {}
+                    returned_fields.update(str(field) for field in (payload.get("_returned_fields") or []))
+                    merged.update({key: value for key, value in payload.items() if value is not None})
+                missing = [field for field in required if merged.get(field) is None and field not in returned_fields]
+                any_of_fields: list[str] = []
+                if required_contract is FINANCIAL_RESEARCH_REQUIRED_FIELDS and api_name == "balancesheet":
+                    any_of_fields = ["accounts_receiv", "inventories", "goodwill"]
+                    if not any(merged.get(field) is not None or field in returned_fields for field in any_of_fields):
+                        missing.append("accounts_receiv|inventories|goodwill")
+                details.append({
+                    "period": period, "api": api_name, "required_fields": list(required),
+                    "present_fields": [field for field in required if merged.get(field) is not None or field in returned_fields]
+                                      + ([next((field for field in any_of_fields if merged.get(field) is not None or field in returned_fields), "")] if any_of_fields and any(merged.get(field) is not None or field in returned_fields for field in any_of_fields) else []),
+                    "missing_fields": missing, "complete": not missing,
+                })
+    checks = len(details)
+    complete = sum(1 for item in details if item["complete"])
+    return {
+        "ok": True, "ts_code": code, "industry": industry, "as_of_time": as_of_time, "periods": target_periods,
+        "checks": checks, "complete_checks": complete,
+        "coverage": round(complete / checks, 4) if checks else 0.0,
+        "status": "complete" if checks and complete == checks else "partial" if complete else "missing",
+        "details": details,
+    }
+
+
+def enrich_financial_research_fields(
+    ts_code: str, *, periods: list[str] | None = None, period_limit: int = 8, request_limit: int = 32,
+) -> dict[str, Any]:
+    """Fetch only incomplete company-period statement APIs through ordinary endpoints."""
+    before = financial_research_completeness(ts_code, periods=periods, period_limit=period_limit)
+    gaps = [item for item in before["details"] if not item["complete"]][:max(1, min(int(request_limit), 64))]
+    results = [
+        _safe_sync_raw(item["api"], {"ts_code": before["ts_code"], "period": item["period"]})
+        for item in gaps
+    ]
+    after = financial_research_completeness(ts_code, periods=before["periods"], period_limit=period_limit)
+    return {
+        "ok": all(bool(item.get("ok")) for item in results) and after["status"] == "complete",
+        "ts_code": before["ts_code"], "before": before, "after": after,
+        "requested": len(results), "results": results,
+    }
+
+
+def enrich_financial_research_batch(period: str, *, limit: int = 5) -> dict[str, Any]:
+    """Advance a resumable field-level enrichment batch for one report period."""
+    target_period = str(period or "").strip()
+    if len(target_period) != 8 or not target_period.isdigit():
+        raise ValueError("period must be YYYYMMDD")
+    with _conn() as c:
+        codes = [str(dict(row).get("ts_code") or "") for row in c.execute(
+            "SELECT ts_code FROM dc_stock_master WHERE ts_code<>'' ORDER BY ts_code"
+        ).fetchall()]
+    targets: list[str] = []
+    checked = 0
+    for code in codes:
+        checked += 1
+        state = financial_research_completeness(code, periods=[target_period])
+        if state["status"] != "complete":
+            targets.append(code)
+        if len(targets) >= max(1, min(int(limit), 50)):
+            break
+
+    def enrich(code: str) -> dict[str, Any]:
+        try:
+            return enrich_financial_research_fields(code, periods=[target_period], request_limit=4)
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "ts_code": code, "error": str(exc)[:500]}
+
+    results, workers = _parallel_tushare_map(targets, enrich, prefix="research-field-enrich") if targets else ([], 0)
+    completed = sum(1 for item in results if item.get("after", {}).get("status") == "complete")
+    return {
+        "ok": all(bool(item.get("ok")) for item in results), "period": target_period,
+        "checked_symbols": checked, "target_symbols": targets, "batch_size": len(targets),
+        "completed": completed, "failed": len(results) - completed, "concurrency": workers,
+        "results": results,
+    }
+
+
+def sync_financial_vip_period(period: str) -> dict[str, Any]:
+    """Load a whole report period through TuShare's 5000-point VIP APIs.
+
+    The normal statement endpoints are explicitly single-stock only.  VIP
+    endpoints return the whole period in one request; unsupported VIP APIs
+    are reported as unavailable so the caller can fall back to stock batches.
+    """
+    client = get_tushare_client()
+    results: list[dict[str, Any]] = []
+    vip_fields = {
+        "income": "ts_code,ann_date,f_ann_date,end_date,report_type,revenue,total_revenue,operate_profit,total_profit,n_income,n_income_attr_p,basic_eps,diluted_eps",
+        "balancesheet": "ts_code,ann_date,f_ann_date,end_date,total_assets,total_liab,total_hldr_eqy_exc_min_int,money_cap,accounts_receiv,inventories,goodwill,st_borr,lt_borr,bond_payable,non_cur_liab_due_1y",
+        "cashflow": "ts_code,ann_date,f_ann_date,end_date,n_cashflow_act,n_cash_flows_inv_act,n_cash_flows_fnc_act,c_pay_acq_const_fiolta",
+        "fina_indicator": "ts_code,ann_date,end_date,roe,roe_waa,roa,roic,grossprofit_margin,netprofit_margin,debt_to_assets,current_ratio,quick_ratio,assets_turn,inv_turn,ar_turn,ocf_to_or,ocf_to_profit,q_sales_yoy,q_profit_yoy",
+    }
+    for api in ("income", "balancesheet", "cashflow", "fina_indicator"):
+        vip_api = f"{api}_vip"
+        run_id = start_ingestion_run(f"data_platform.{vip_api}", {"period": period, "mode": "vip_batch"})
+        try:
+            frame = getattr(client.pro, vip_api)(period=period, fields=vip_fields[api])
+            if not isinstance(frame, pd.DataFrame) or frame.empty:
+                raise EmptyTushareResult(f"{vip_api} period={period} returned empty")
+            frame = frame.copy()
+            # VIP results use end_date; our raw store normalizes it to period.
+            written = _upsert_raw_records(api, frame)
+            finish_ingestion_run(run_id, status="completed", rows_read=len(frame), rows_written=written,
+                                 meta={"api": vip_api, "period": period, "mode": "vip_batch"})
+            _record_probe(vip_api, "ok", len(frame))
+            _invalidate_asset_views()
+            results.append({"api": api, "vip_api": vip_api, "ok": True, "rows": len(frame), "written": written})
+        except Exception as exc:  # noqa: BLE001
+            finish_ingestion_run(run_id, status="failed", rows_read=0, rows_written=0, error=str(exc),
+                                 meta={"api": vip_api, "period": period, "mode": "vip_batch"})
+            _record_probe(vip_api, "failed", 0, str(exc))
+            results.append({"api": api, "vip_api": vip_api, "ok": False, "rows": 0, "error": str(exc)[:300]})
+    succeeded = sum(1 for item in results if item.get("ok"))
+    return {"ok": succeeded > 0, "period": period, "mode": "vip_batch", "results": results,
+            "succeeded": succeeded, "total": len(results)}
 
 
 def sync_financial_batch(
@@ -850,13 +1305,29 @@ def sync_financial_batch(
     allow_partial: bool = False,
     completion_api: str = "core",
 ) -> dict[str, Any]:
-    """Sync financial data by stock in resumable batches.
-
-    The current TuShare proxy requires ts_code for statement APIs, so this is
-    the safe path for watchlists and staged full loads.
-    """
+    """Sync financial data with VIP-first core loads and resumable fallbacks."""
 
     ensure_data_center_seeded()
+    # Prefer one whole-period request where the account/proxy exposes the VIP
+    # endpoint.  This turns thousands of stock calls into at most four calls;
+    # the caller retains the ordinary path for VIP APIs that are unavailable.
+    api_override = ["fina_audit"] if completion_api == "fina_audit" else None
+    if not codes and completion_api == "core":
+        vip = sync_financial_vip_period(period)
+        vip_ok = {str(x.get("api")) for x in vip.get("results", []) if x.get("ok")}
+        vip_failed = [str(x.get("api")) for x in vip.get("results", []) if not x.get("ok")]
+        if vip_ok and not vip_failed:
+            return {"ok": True, "period": period, "mode": "vip_batch", "total": vip["total"],
+                    "success": vip["succeeded"], "failed": vip["total"] - vip["succeeded"],
+                    "concurrency": 1, "cooldown": False, "cooldown_seconds": 0,
+                    "error": "; ".join(str(x.get("error")) for x in vip["results"] if x.get("error")),
+                    "results": vip["results"]}
+        if vip_ok:
+            with _conn() as c:
+                codes = [str(dict(r).get("ts_code") or "") for r in c.execute(
+                    "SELECT ts_code FROM dc_stock_master WHERE ts_code<>'' ORDER BY ts_code"
+                ).fetchall()]
+            api_override = vip_failed
     target_codes = [c.strip() for c in (codes or []) if c.strip()]
     if not target_codes:
         # A batch must advance across repeated runs.  Selecting the first N
@@ -871,14 +1342,28 @@ def sync_financial_batch(
     errors: list[str] = []
     def fetch_one(ts_code: str) -> dict[str, Any]:
         try:
-            return sync_financial_bundle(ts_code, period, include_yearly=include_yearly)
+            return sync_financial_bundle(
+                ts_code,
+                period,
+                include_yearly=include_yearly and completion_api != "fina_audit",
+                apis_override=api_override,
+            )
         except Exception as exc:  # noqa: BLE001
             msg = str(exc)[:500]
             return {"ok": False, "ts_code": ts_code, "period": period, "error": msg, "results": []}
 
     results, workers = _parallel_tushare_map(target_codes, fetch_one, prefix="tushare-financial")
+    cooldown = any(bool(item.get("cooldown")) for result in results for item in (result.get("results") or [result]))
+    cooldown_seconds = max(
+        [int(item.get("cooldown_seconds") or 0) for result in results for item in (result.get("results") or [result]) if item.get("cooldown")]
+        or [0]
+    )
     for ts_code, result in zip(target_codes, results):
-        result_ok = bool(result.get("ok", True)) and all(bool(item.get("ok")) for item in result.get("results", []))
+        result_ok = (
+            not cooldown
+            and bool(result.get("ok", True))
+            and all(bool(item.get("ok")) for item in result.get("results", []))
+        )
         if result_ok:
             ok_count += 1
         else:
@@ -891,7 +1376,7 @@ def sync_financial_batch(
     total = len(target_codes)
     soft_ok = allow_partial and ok_count > 0 and failed_count <= max(1, total // 5)
     return {
-        "ok": failed_count == 0 or soft_ok,
+        "ok": (failed_count == 0 or soft_ok) and not cooldown,
         "period": period,
         "started_at": started,
         "finished_at": _now(),
@@ -899,9 +1384,35 @@ def sync_financial_batch(
         "success": ok_count,
         "failed": failed_count,
         "concurrency": workers,
+        "cooldown": cooldown,
+        "cooldown_seconds": cooldown_seconds,
         "error": "; ".join(errors[:5])[:1000] if errors else "",
+        "failed_items": _failed_result_items(results, limit=8),
         "results": results,
     }
+
+
+def _failed_result_items(results: list[dict[str, Any]], *, limit: int = 8) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    for result in results:
+        if result.get("ok") and all(bool(x.get("ok", True)) for x in result.get("results", [])):
+            continue
+        if result.get("error"):
+            items.append({
+                "ts_code": result.get("ts_code", ""),
+                "api": result.get("api", ""),
+                "error": str(result.get("error") or "")[:300],
+            })
+        for sub in result.get("results") or []:
+            if isinstance(sub, dict) and not sub.get("ok"):
+                items.append({
+                    "ts_code": result.get("ts_code") or sub.get("ts_code", ""),
+                    "api": sub.get("api", ""),
+                    "error": str(sub.get("error") or "failed")[:300],
+                })
+        if len(items) >= limit:
+            return items[:limit]
+    return items[:limit]
 
 
 def _load_stock_codes(limit: int = 20) -> list[str]:
@@ -914,25 +1425,54 @@ def _load_stock_codes(limit: int = 20) -> list[str]:
 
 
 def _load_financial_missing_codes(period: str, limit: int = 20, completion_api: str = "core") -> list[str]:
-    """Return the next symbols whose completion API is absent for period."""
+    """Return the next symbols whose completion API is absent for period.
+
+    Completed request coverage counts as done even when no raw row is written
+    (pre-listing, valid empty, or deferred empty).  Empty-pending rows are kept
+    eligible, but sorted after never-checked symbols so a few permanent gaps do
+    not monopolize every batch.
+    """
     allowed_apis = {"core", "income", "fina_audit"}
     if completion_api not in allowed_apis:
         raise ValueError(f"unsupported financial completion API: {completion_api}")
     required = ["income", "balancesheet", "cashflow", "fina_indicator"] if completion_api == "core" else [completion_api]
     placeholders = ",".join("?" for _ in required)
+    completed_placeholders = ",".join("?" for _ in COMPLETED_REQUEST_STATUSES)
     with _conn() as c:
         rows = c.execute(
             f"""
             SELECT s.ts_code
             FROM dc_stock_master s
-            LEFT JOIN dc_tushare_raw_records r
-              ON r.ts_code=s.ts_code AND r.period=? AND r.api_name IN ({placeholders})
+            LEFT JOIN (
+                SELECT ts_code, period, api_name
+                FROM dc_tushare_raw_records
+                WHERE period=? AND api_name IN ({placeholders})
+                UNION
+                SELECT ts_code, period, api_name
+                FROM dc_tushare_request_coverage
+                WHERE period=? AND api_name IN ({placeholders})
+                  AND result_status IN ({completed_placeholders})
+            ) done ON done.ts_code=s.ts_code
+            LEFT JOIN dc_tushare_request_coverage q_any
+              ON q_any.ts_code=s.ts_code AND q_any.period=? AND q_any.api_name IN ({placeholders})
             GROUP BY s.ts_code
-            HAVING COUNT(DISTINCT r.api_name) < ?
-            ORDER BY s.ts_code ASC
+            HAVING COUNT(DISTINCT done.api_name) < ?
+            ORDER BY CASE WHEN COUNT(q_any.api_name) = 0 THEN 0 ELSE 1 END ASC,
+                     MAX(CASE WHEN q_any.result_status='empty_pending' THEN 1 ELSE 0 END) ASC,
+                     s.ts_code ASC
             LIMIT ?
             """,
-            (period, *required, len(required), max(1, int(limit or 20))),
+            (
+                period,
+                *required,
+                period,
+                *required,
+                *COMPLETED_REQUEST_STATUSES,
+                period,
+                *required,
+                len(required),
+                max(1, int(limit or 20)),
+            ),
         ).fetchall()
     return [str(_row_to_dict(row).get("ts_code") or "") for row in rows]
 
@@ -946,19 +1486,76 @@ def sync_tushare_stock_batch(
     limit: int = 20,
 ) -> dict[str, Any]:
     """Progress a per-stock API without repeating already checked requests."""
-    _catalog_item(api_name)
+    item = _catalog_item(api_name)
+    # Full-market report-period VIP endpoints verified with the active account.
+    # Prefer them over 5,000+ ordinary per-stock calls when a period is supplied.
+    period_vip = {
+        "express": ("express_vip", {}),
+        "forecast": ("forecast_vip", {}),
+        "fina_mainbz": ("fina_mainbz_vip", {"type": "P"}),
+    }
+    period_batch = {
+        "top10_holders": ("top10_holders", {}),
+        "top10_floatholders": ("top10_floatholders", {}),
+        "stk_holdernumber": ("stk_holdernumber", {}),
+    }
+    batch_api = period_vip.get(api_name) or period_batch.get(api_name)
+    if batch_api and period:
+        vip_api, extra_params = batch_api
+        if api_name == "stk_holdernumber":
+            try:
+                year = int(period[:4])
+                extra_params = {"start_date": f"{year - 2}{period[4:]}", "end_date": period}
+            except (TypeError, ValueError):
+                extra_params = {"end_date": period}
+        run_id = start_ingestion_run(f"data_platform.{vip_api}", {"period": period, "mode": "vip_batch"})
+        try:
+            request_params = {"period": period, **extra_params}
+            if api_name == "stk_holdernumber":
+                request_params.pop("period", None)
+            frame = getattr(get_tushare_client().pro, vip_api)(fields=item.fields, **request_params)
+            if not isinstance(frame, pd.DataFrame) or frame.empty:
+                raise EmptyTushareResult(f"{vip_api} period={period} returned empty")
+            written = _upsert_raw_records(api_name, frame)
+            finish_ingestion_run(run_id, status="completed", rows_read=len(frame), rows_written=written,
+                                 meta={"api": vip_api, "period": period, "mode": "vip_batch"})
+            _record_request_coverage(api_name, {"period": period, "mode": "vip_batch"}, None, len(frame))
+            _record_probe(vip_api, "ok", len(frame))
+            _invalidate_asset_views()
+            return {"ok": True, "api": api_name, "vip_api": vip_api, "period": period,
+                    "mode": "vip_batch", "rows_read": len(frame), "rows_written": written,
+                    "total": len(frame), "success": len(frame), "failed": 0, "concurrency": 1}
+        except Exception as exc:  # noqa: BLE001
+            finish_ingestion_run(run_id, status="failed", rows_read=0, rows_written=0, error=str(exc),
+                                 meta={"api": vip_api, "period": period, "mode": "vip_batch"})
+            _record_probe(vip_api, "failed", 0, str(exc))
+            # Fall through to the ordinary resumable per-stock path.
     with _conn() as c:
         rows = c.execute(
             """SELECT s.ts_code FROM dc_stock_master s
                WHERE NOT EXISTS (
                  SELECT 1 FROM dc_tushare_request_coverage q
                  WHERE q.api_name=? AND q.ts_code=s.ts_code AND q.period=?
+                   AND q.result_status IN ('success','not_applicable','valid_empty','deferred_empty')
                )
                ORDER BY s.ts_code LIMIT ?""",
             (api_name, period, max(1, min(int(limit), 500))),
         ).fetchall()
     codes = [str(dict(row).get("ts_code") or "") for row in rows]
     def fetch_one(ts_code: str) -> dict[str, Any]:
+        cooldown = _cooldown_remaining(api_name)
+        if cooldown > 0:
+            return {
+                "ok": False,
+                "api": api_name,
+                "params": {"ts_code": ts_code},
+                "rows_read": 0,
+                "rows_written": 0,
+                "cooldown": True,
+                "cooldown_seconds": cooldown,
+                "soft_failed": True,
+                "error": f"Tushare {api_name} cooling down for {cooldown}s",
+            }
         params: dict[str, Any] = {"ts_code": ts_code}
         if period:
             params["enddate" if api_name == "stk_holdernumber" else "period"] = period
@@ -968,31 +1565,58 @@ def sync_tushare_stock_batch(
             params["end_date"] = end_date
         return _safe_sync_raw(api_name, params)
     results, workers = _parallel_tushare_map(codes, fetch_one, prefix=f"tushare-{api_name}")
+    cooldown = any(bool(x.get("cooldown")) for x in results)
+    cooldown_seconds = max([int(x.get("cooldown_seconds") or 0) for x in results if x.get("cooldown")] or [0])
     return {
-        "ok": all(bool(x.get("ok")) for x in results), "api": api_name, "period": period,
-        "total": len(results), "success": sum(1 for x in results if x.get("ok")),
-        "failed": sum(1 for x in results if not x.get("ok")), "concurrency": workers, "results": results,
+        "ok": all(bool(x.get("ok")) for x in results) and not cooldown, "api": api_name, "period": period,
+        "total": len(results), "success": sum(1 for x in results if x.get("ok") and not x.get("cooldown")),
+        "failed": sum(1 for x in results if not x.get("ok")), "concurrency": workers,
+        "cooldown": cooldown,
+        "cooldown_seconds": cooldown_seconds,
+        "error": _batch_error_summary(results),
+        "failed_items": _failed_result_items(results, limit=8),
+        "results": results,
     }
 
 
 def sync_tushare_date_batch(api_name: str, *, trade_dates: list[str], limit: int = 10) -> dict[str, Any]:
-    """Progress a date-based API, treating successful empty responses as checked."""
+    """Progress a date-based API without letting retryable empty rows block forever."""
     _catalog_item(api_name)
     wanted = list(dict.fromkeys(str(x) for x in trade_dates if str(x)))
     with _conn() as c:
         checked = {str(dict(row).get("trade_date") or "") for row in c.execute(
-            f"SELECT trade_date FROM dc_tushare_request_coverage WHERE api_name=? AND trade_date IN ({','.join('?' for _ in wanted)})",
+            f"""SELECT trade_date FROM dc_tushare_request_coverage
+                WHERE api_name=? AND trade_date IN ({','.join('?' for _ in wanted)})
+                  AND result_status IN ('success','not_applicable','valid_empty','deferred_empty')""",
             (api_name, *wanted),
         ).fetchall()} if wanted else set()
     pending = [d for d in wanted if d not in checked][:max(1, min(int(limit), 60))]
     results, workers = _parallel_tushare_map(
         pending, lambda d: _safe_sync_raw(api_name, {"trade_date": d}), prefix=f"tushare-{api_name}"
     )
+    cooldown = any(bool(x.get("cooldown")) for x in results)
+    cooldown_seconds = max([int(x.get("cooldown_seconds") or 0) for x in results if x.get("cooldown")] or [0])
     return {
-        "ok": all(bool(x.get("ok")) for x in results), "api": api_name,
-        "total": len(results), "success": sum(1 for x in results if x.get("ok")),
-        "failed": sum(1 for x in results if not x.get("ok")), "concurrency": workers, "results": results,
+        "ok": all(bool(x.get("ok")) for x in results) and not cooldown, "api": api_name,
+        "total": len(results), "success": sum(1 for x in results if x.get("ok") and not x.get("cooldown")),
+        "failed": sum(1 for x in results if not x.get("ok")), "concurrency": workers,
+        "cooldown": cooldown,
+        "cooldown_seconds": cooldown_seconds,
+        "error": _batch_error_summary(results),
+        "failed_items": _failed_result_items(results, limit=8),
+        "results": results,
     }
+
+
+def _batch_error_summary(results: list[dict[str, Any]]) -> str:
+    errors: list[str] = []
+    for item in _failed_result_items(results, limit=5):
+        code = str(item.get("ts_code") or "").strip()
+        api = str(item.get("api") or "").strip()
+        error = str(item.get("error") or "failed").strip()
+        label = "/".join(x for x in (code, api) if x)
+        errors.append(f"{label}: {error}" if label else error)
+    return "; ".join(errors)[:1000]
 
 
 def sync_governance_bundle(ts_code: str, period: str | None = None) -> dict[str, Any]:
@@ -1038,10 +1662,129 @@ def sync_index_bundle(index_code: str = "000300.SH", start_date: str | None = No
     return {"ok": all(bool(x.get("ok")) for x in results), "index_code": index_code, "start_date": start_date, "end_date": end_date, "results": results}
 
 
+def sync_training_market_date_vip(trade_date: str) -> dict[str, Any]:
+    """Fetch one full-market training day through TuShare's VIP batch path.
+
+    TuShare exposes the stock daily, daily-basic and limit datasets as
+    trade-date batch calls (the entitlement is attached to the token rather
+    than a separate ``*_vip`` method name). Keeping this wrapper explicit
+    prevents training from falling back to per-stock requests or local-only
+    history while still reusing the audited raw-record writer.
+    """
+    value = str(trade_date or "").replace("-", "")[:8]
+    if len(value) != 8 or not value.isdigit():
+        raise ValueError("trade_date must be YYYYMMDD")
+    max_attempts = max(1, min(int(os.getenv("TUSHARE_TRAINING_MAX_RETRIES", "6")), 10))
+    retry_delays = (5, 15, 30, 60, 120, 180, 240, 300, 300)
+    results: list[dict[str, Any]] = []
+    for api_name in ("daily", "daily_basic", "stk_limit"):
+        last_error: Exception | None = None
+        outcome: dict[str, Any] | None = None
+        for attempt in range(1, max_attempts + 1):
+            try:
+                candidate = sync_tushare_api_raw(api_name, {"trade_date": value})
+                if bool(candidate.get("ok")) and int(candidate.get("rows_written") or candidate.get("rows_read") or 0) > 0:
+                    outcome = candidate
+                    break
+                last_error = RuntimeError(str(candidate.get("error") or f"{api_name} returned no rows"))
+            except Exception as exc:  # noqa: BLE001 - historical download is resumable
+                last_error = exc
+            if attempt < max_attempts:
+                delay = retry_delays[min(attempt - 1, len(retry_delays) - 1)]
+                write_runtime_log(
+                    "WARNING", "model-training",
+                    f"{value} {api_name} 返回异常，{delay}秒后重试",
+                    {"trade_date": value, "api": api_name, "attempt": attempt, "max_attempts": max_attempts, "error": str(last_error)[:300]},
+                )
+                reset_tushare_client()
+                time.sleep(delay)
+        if outcome is None:
+            raise RuntimeError(f"训练历史 {value} {api_name} 连续{max_attempts}次下载失败：{str(last_error)[:300]}")
+        results.append(outcome)
+    return {
+        "ok": all(bool(item.get("ok")) for item in results),
+        "trade_date": value,
+        "mode": "tushare_vip_trade_date_batch",
+        "results": results,
+        "rows_written": sum(int(item.get("rows_written") or 0) for item in results),
+    }
+
+
+def training_market_date_ready(trade_date: str) -> bool:
+    """Return whether a retained training day already has all required data."""
+    value = str(trade_date or "").replace("-", "")[:8]
+    if len(value) != 8 or not value.isdigit():
+        return False
+    with _conn() as c:
+        apis = {
+            str(dict(row).get("api_name") or "")
+            for row in c.execute(
+                """SELECT api_name FROM dc_tushare_raw_records
+                   WHERE trade_date=? AND api_name IN ('daily','daily_basic','stk_limit')
+                   GROUP BY api_name HAVING COUNT(*)>0""",
+                (value,),
+            ).fetchall()
+        }
+        snapshot = c.execute(
+            "SELECT COUNT(*) count FROM dc_stock_daily_snapshot WHERE trade_date=? AND close IS NOT NULL",
+            (value,),
+        ).fetchone()
+    return apis == {"daily", "daily_basic", "stk_limit"} and int(dict(snapshot).get("count") or 0) > 0
+
+
 def _safe_sync_raw(api_name: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
     try:
         return sync_tushare_api_raw(api_name, params)
+    except TushareCoolingDown as exc:
+        return {
+            "ok": False,
+            "api": api_name,
+            "params": params or {},
+            "rows_read": 0,
+            "rows_written": 0,
+            "cooldown": True,
+            "cooldown_seconds": exc.seconds,
+            "soft_failed": True,
+            "error": str(exc)[:500],
+        }
     except Exception as exc:  # noqa: BLE001
+        category = classify_tushare_error(exc)
+        if category == "upstream_not_ready":
+            return {
+                "ok": False,
+                "api": api_name,
+                "params": params or {},
+                "rows_read": 0,
+                "rows_written": 0,
+                "cooldown": True,
+                "cooldown_seconds": 600,
+                "soft_failed": True,
+                "error": str(exc)[:500],
+                "category": category,
+            }
+        if category == "empty_pending" and _defer_empty_request_if_exhausted(api_name, params or {}):
+            return {
+                "ok": True,
+                "api": api_name,
+                "params": params or {},
+                "rows_read": 0,
+                "rows_written": 0,
+                "deferred_empty": True,
+                "category": "deferred_empty",
+            }
+        if category == "rate_limit":
+            return {
+                "ok": False,
+                "api": api_name,
+                "params": params or {},
+                "rows_read": 0,
+                "rows_written": 0,
+                "cooldown": True,
+                "cooldown_seconds": TUSHARE_RATE_LIMIT_COOLDOWN_SECONDS,
+                "soft_failed": True,
+                "error": str(exc)[:500],
+                "category": category,
+            }
         return {
             "ok": False,
             "api": api_name,
@@ -1049,7 +1792,34 @@ def _safe_sync_raw(api_name: str, params: dict[str, Any] | None = None) -> dict[
             "rows_read": 0,
             "rows_written": 0,
             "error": str(exc)[:500],
+            "category": category,
         }
+
+
+def purge_temporary_training_market_data(*, fetched_dates: list[str], online_window_start: str) -> dict[str, Any]:
+    """Delete only old, training-created market slices after feature extraction.
+
+    The caller supplies all dates fetched for one training slice.  Dates in or
+    after the normal online window are deliberately excluded, so a failed or
+    repeated training run cannot erase current business data.
+    """
+    from app.services.streaming_training import temporary_dates_for_cleanup
+
+    dates = temporary_dates_for_cleanup(fetched_dates=fetched_dates, online_window_start=online_window_start)
+    if not dates:
+        return {"ok": True, "deleted_dates": [], "raw_records_deleted": 0, "snapshots_deleted": 0}
+    placeholders = ",".join("?" for _ in dates)
+    with _conn() as c:
+        snapshot = c.execute(f"DELETE FROM dc_stock_daily_snapshot WHERE trade_date IN ({placeholders})", tuple(dates))
+        raw = c.execute(
+            f"DELETE FROM dc_tushare_raw_records WHERE trade_date IN ({placeholders}) AND api_name IN ('daily','daily_basic','stk_limit','suspend_d')",
+            tuple(dates),
+        )
+        c.execute(f"DELETE FROM dc_available_trade_dates WHERE trade_date IN ({placeholders})", tuple(dates))
+    return {
+        "ok": True, "deleted_dates": dates, "raw_records_deleted": int(raw.rowcount or 0),
+        "snapshots_deleted": int(snapshot.rowcount or 0),
+    }
 
 
 def build_stock_daily_snapshot(trade_date: str) -> dict[str, Any]:
@@ -1088,6 +1858,7 @@ def build_stock_daily_snapshot(trade_date: str) -> dict[str, Any]:
                 if ts_code in suspended:
                     flags.append("suspended")
                 score = max(0, 100 - len([f for f in flags if f != "suspended"]) * 25)
+                snapshot_available_time = _iso_available_on_date(trade_date, hour=15, minute=0, second=0) or now
                 values = (
                     ts_code,
                     trade_date,
@@ -1109,11 +1880,22 @@ def build_stock_daily_snapshot(trade_date: str) -> dict[str, Any]:
                     float(score),
                     json.dumps(flags, ensure_ascii=False),
                     SOURCE_TUSHARE,
-                    now,
+                    snapshot_available_time,
                     now,
                 )
                 _upsert_snapshot_row(c, values)
                 written += 1
+            if written > 0:
+                available_time = _iso_available_on_date(trade_date, hour=15, minute=0, second=0) or now
+                c.execute(
+                    """INSERT INTO dc_available_trade_dates(trade_date,source_code,available_time,updated_at)
+                       VALUES(?,?,?,?)
+                       ON CONFLICT(trade_date) DO UPDATE SET
+                         source_code=excluded.source_code,
+                         available_time=excluded.available_time,
+                         updated_at=excluded.updated_at""",
+                    (trade_date, SOURCE_TUSHARE, available_time, now),
+                )
         finish_ingestion_run(run_id, status="completed", rows_read=len(all_codes), rows_written=written, meta={"trade_date": trade_date})
         quality = run_data_quality_checks(trade_date=trade_date)
         return {"ok": True, "run_id": run_id, "trade_date": trade_date, "rows_written": written, "quality": quality}
@@ -1484,15 +2266,28 @@ def _upsert_announcements(rows: list[dict[str, Any]]) -> tuple[int, int]:
 
 
 def classify_announcement_event(title: str, publish_time: str = "") -> dict[str, Any] | None:
+    """Classify announcement titles into the public P1 event contract.
+
+    Keep the output vocabulary aligned with ``V1_EVENT_TYPES`` in the
+    research event engine.  In particular, do not merge repurchases with
+    shareholder increases or M&A with private placements: their research
+    horizon and affected dimensions are different.
+    """
     rules = [
-        ("立案|调查|处罚|监管函|问询函|警示函", "regulatory_risk", "negative", "high"),
+        ("立案调查|被立案|立案", "investigation", "negative", "critical"),
+        ("处罚|监管函|问询函|警示函", "regulatory_risk", "negative", "high"),
         ("减持|减持计划", "shareholder_reduction", "negative", "high"),
-        ("质押|解除质押", "share_pledge", "negative", "medium"),
-        ("业绩预告|业绩快报|年度报告|季度报告|半年度报告", "earnings", "neutral", "medium"),
-        ("回购|增持", "buyback_or_increase", "positive", "medium"),
+        ("解除质押", "pledge", "positive", "low"),
+        ("质押", "pledge", "negative", "medium"),
+        ("业绩预告", "earnings_forecast", "neutral", "medium"),
+        ("业绩快报", "earnings_flash", "neutral", "medium"),
+        ("年度报告|季度报告|半年度报告", "earnings", "neutral", "medium"),
+        ("回购", "repurchase", "positive", "medium"),
+        ("增持", "shareholder_increase", "positive", "medium"),
         ("分红|权益分派|利润分配", "dividend", "positive", "low"),
         ("重大合同|中标|订单", "major_contract", "positive", "medium"),
-        ("并购|重组|收购|资产购买|定增|非公开发行", "capital_operation", "neutral", "medium"),
+        ("定增|非公开发行", "private_placement", "neutral", "medium"),
+        ("并购|重组|收购|资产购买", "ma_restructuring", "neutral", "medium"),
     ]
     import re
 
@@ -1507,6 +2302,46 @@ def classify_announcement_event(title: str, publish_time: str = "") -> dict[str,
                 "summary": title[:300],
             }
     return None
+
+
+def reclassify_announcement_events(*, limit: int = 50_000) -> dict[str, Any]:
+    """Rebuild existing rule-based event labels from retained announcement titles.
+
+    The migration is deterministic and only touches records whose standard
+    type/direction/severity differs from the current classifier.  It does not
+    invent event data or modify the source announcement itself.
+    """
+    ensure_data_center_seeded()
+    cap = max(1, min(int(limit), 200_000))
+    with _conn() as c:
+        rows = c.execute(
+            """SELECT e.id,e.event_type,e.impact_direction,e.severity,e.confidence,e.event_date,e.summary,
+                      a.title,a.publish_time
+                 FROM dc_announcement_event e
+                 JOIN dc_announcement_raw a ON a.id=e.announcement_id
+                 ORDER BY e.id ASC LIMIT ?""",
+            (cap,),
+        ).fetchall()
+        changed = 0
+        skipped = 0
+        for raw in rows:
+            row = _row_to_dict(raw)
+            event = classify_announcement_event(str(row.get("title") or ""), str(row.get("publish_time") or ""))
+            if not event:
+                skipped += 1
+                continue
+            expected = (event["event_type"], event["impact_direction"], event["severity"], event["event_date"], event["summary"])
+            actual = (row.get("event_type"), row.get("impact_direction"), row.get("severity"), row.get("event_date"), row.get("summary"))
+            if expected == actual:
+                continue
+            c.execute(
+                """UPDATE dc_announcement_event
+                      SET event_type=?,impact_direction=?,severity=?,confidence=?,event_date=?,summary=?
+                    WHERE id=?""",
+                (event["event_type"], event["impact_direction"], event["severity"], event["confidence"], event["event_date"], event["summary"], row["id"]),
+            )
+            changed += 1
+    return {"ok": True, "examined": len(rows), "changed": changed, "skipped_unclassified": skipped, "contract": "announcement_event_v1_reclassification"}
 
 
 def import_industry_metrics(path: str) -> dict[str, Any]:
@@ -1526,6 +2361,92 @@ def import_industry_metrics(path: str) -> dict[str, Any]:
     except Exception as exc:  # noqa: BLE001
         finish_ingestion_run(run_id, status="failed", rows_read=0, rows_written=0, error=str(exc), meta={"path": str(source_path)})
         raise
+
+
+_PMI_MANUFACTURING_INDUSTRIES = {
+    "专用机械", "元器件", "其他建材", "农用机械", "农药化肥", "化学制药", "化工原料", "化工机械", "化纤",
+    "半导体", "塑料", "家居用品", "家用电器", "工程机械", "日用化工", "普钢", "服饰", "机床制造",
+    "机械基件", "染料涂料", "橡胶", "汽车整车", "汽车配件", "玻璃", "生物制药", "电器仪表", "电气设备",
+    "石油加工", "矿物制品", "纺织", "纺织机械", "船舶", "运输设备", "通信设备", "造纸", "钢加工",
+    "陶瓷", "食品", "IT设备", "中成药", "医疗保健", "医药商业", "白酒", "啤酒", "软饮料", "红黄酒",
+}
+
+_PMI_SERVICE_INDUSTRIES = {
+    "互联网", "仓储物流", "公共交通", "公路", "其他商业", "保险", "全国地产", "商贸代理", "商品城", "多元金融",
+    "广告包装", "建筑工程", "影视音像", "房产服务", "批发业", "旅游景点", "旅游服务", "机场", "水运", "港口",
+    "空运", "航空", "证券", "超市连锁", "软件服务", "酒店餐饮", "铁路", "电信运营", "百货", "电器连锁",
+}
+
+
+def _macro_metric_code(group: str, industry: str) -> str:
+    # Stable ASCII keys keep import/export and object storage paths portable.
+    digest = hashlib.sha256(industry.encode("utf-8")).hexdigest()[:12]
+    return f"cn_pmi_{group}_demand_{digest}"
+
+
+def sync_pmi_industry_proxies() -> dict[str, Any]:
+    """Materialize retained TuShare PMI as a transparent industry demand proxy.
+
+    PMI is a macro observation, not a substitute for product price, capacity
+    utilisation or company orders. It only contributes to the demand/orders
+    component and preserves raw ingestion time for point-in-time reads.
+    """
+    ensure_data_center_seeded()
+    with _conn() as c:
+        raw_rows = c.execute(
+            "SELECT payload_json,available_time FROM dc_tushare_raw_records WHERE api_name='cn_pmi' ORDER BY id ASC"
+        ).fetchall()
+        industries = {
+            str(_row_to_dict(row).get("industry") or "").strip()
+            for row in c.execute("SELECT DISTINCT industry FROM dc_stock_master WHERE industry IS NOT NULL").fetchall()
+        }
+    months: dict[str, dict[str, Any]] = {}
+    for raw in raw_rows:
+        row = _row_to_dict(raw)
+        try:
+            payload = json.loads(str(row.get("payload_json") or "{}"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        month = str(payload.get("MONTH") or payload.get("month") or "").strip()
+        if len(month) != 6 or not month.isdigit():
+            continue
+        months[month] = {"payload": payload, "available_time": str(row.get("available_time") or "")}
+
+    definitions: list[dict[str, Any]] = []
+    values: list[dict[str, Any]] = []
+    group_specs = (
+        ("manufacturing", _PMI_MANUFACTURING_INDUSTRIES & industries, "PMI010000", "制造业PMI（行业需求宏观代理）"),
+        ("service", _PMI_SERVICE_INDUSTRIES & industries, "PMI020100", "非制造业PMI（行业需求宏观代理）"),
+    )
+    for group, mapped_industries, field, metric_name in group_specs:
+        for industry in sorted(mapped_industries):
+            metric_code = _macro_metric_code(group, industry)
+            definitions.append({
+                "metric_code": metric_code, "industry_code": f"master:{industry}", "industry_name": industry,
+                "metric_name": metric_name, "unit": "index", "frequency": "monthly", "source_code": SOURCE_TUSHARE,
+                "description": "TuShare cn_pmi 宏观需求代理；仅补充需求/订单维度，不替代产品价格、库存、产能或行业专属数据。",
+            })
+            for month, item in months.items():
+                payload = item["payload"]
+                value = payload.get(field)
+                fallback = False
+                if value is None and group == "service":
+                    value = payload.get("PMI030000")
+                    fallback = value is not None
+                numeric = _float_or_none(value)
+                if numeric is None or numeric <= 0:
+                    continue
+                values.append({
+                    "metric_code": metric_code, "data_date": f"{month[:4]}-{month[4:]}-01", "value": numeric,
+                    "raw_value": json.dumps({"field": "PMI030000" if fallback else field, "value": value}, ensure_ascii=False),
+                    "source_code": SOURCE_TUSHARE, "available_time": item["available_time"],
+                })
+    return {
+        "ok": True, "definitions": _upsert_industry_metric_definitions(definitions),
+        "values": _upsert_industry_metric_values(values), "months": len(months),
+        "mapped_industries": len(definitions), "contract": "tushare_cn_pmi_industry_demand_proxy_v1",
+        "limitations": ["PMI仅是宏观需求代理；不得据此推断行业产品价格、库存、产能利用率或政策供给。"],
+    }
 
 
 def _load_industry_metric_file(path: Path) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -1680,13 +2601,14 @@ def _upsert_industry_metric_values(rows: list[dict[str, Any]]) -> int:
             if not metric_code or not data_date:
                 continue
             raw_value = str(row.get("raw_value") if row.get("raw_value") is not None else row.get("value") or "")
+            available_time = str(row.get("available_time") or now)
             values = (
                 metric_code,
                 data_date,
                 _float_or_none(row.get("value")),
                 raw_value,
                 str(row.get("source_code") or SOURCE_MANUAL).strip(),
-                now,
+                available_time,
                 now,
             )
             if c._is_mysql:

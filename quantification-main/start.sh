@@ -11,6 +11,10 @@ main_frontend_pid=""
 # PostgreSQL is now the only application database; SQLite has been removed.
 export DATABASE_URL="${DATABASE_URL:-postgresql://sirius@127.0.0.1:5432/alis_sim}"
 export DATA_PLATFORM_DATABASE_URL="${DATA_PLATFORM_DATABASE_URL:-postgresql://sirius@127.0.0.1:5432/alis_data}"
+# LightGBM native runtime for macOS (OpenMP)
+export ALIS_ENABLE_LIGHTGBM=1
+export DYLD_LIBRARY_PATH="${DYLD_LIBRARY_PATH:-}/opt/homebrew/Cellar/libomp/22.1.8/lib"
+export OMP_NUM_THREADS=4
 
 cleanup() {
   if [[ -n "$backend_pid" ]] && kill -0 "$backend_pid" 2>/dev/null; then

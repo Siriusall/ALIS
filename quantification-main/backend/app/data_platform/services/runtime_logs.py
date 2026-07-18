@@ -25,6 +25,25 @@ def list_runtime_logs(limit: int = 200) -> list[dict[str, Any]]:
             "SELECT id,level,logger,message,context_json,created_at FROM dc_runtime_logs ORDER BY id DESC LIMIT ?",
             (max(1, min(limit, 500)),),
         ).fetchall()
+    return _format_runtime_log_rows(rows)
+
+
+def list_runtime_logs_since(after_id: int = 0, limit: int = 100) -> list[dict[str, Any]]:
+    with _conn() as c:
+        rows = c.execute(
+            """
+            SELECT id,level,logger,message,context_json,created_at
+            FROM dc_runtime_logs
+            WHERE id > ?
+            ORDER BY id ASC
+            LIMIT ?
+            """,
+            (max(0, int(after_id or 0)), max(1, min(limit, 500))),
+        ).fetchall()
+    return _format_runtime_log_rows(rows)
+
+
+def _format_runtime_log_rows(rows: list[Any]) -> list[dict[str, Any]]:
     items = []
     for row in rows:
         item = dict(row)

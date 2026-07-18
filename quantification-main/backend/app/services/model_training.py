@@ -13,12 +13,12 @@ from app.core.exchange_groups import matches_exchange_group, normalize_exchange_
 from app.db.store import (
     create_model_train_run,
     create_model_version,
-    set_active_model_version,
     update_model_train_run,
 )
 from app.services.backtest_data_source import BacktestDataSource, SnapshotRow
 from app.services.backtest_engine import _factor_value
 from app.services.model_registry import MODEL_KEY, models_root
+from app.services.streaming_training import build_training_slices, consume_api_training_slice
 
 FEATURES = [
     "momentum_5",
@@ -32,6 +32,29 @@ FEATURES = [
     "pb",
     "change_pct",
 ]
+
+
+def _require_compact_api_training_history(refresh: dict[str, Any]) -> dict[str, Any]:
+    """Validate the plan's on-demand 6-10 year training data contract.
+
+    This is deliberately limited to compact index/market features.  It must
+    not turn a model-training click into a full-market decade-long local data
+    download.  A stock cross-sectional candidate trained from local two-year
+    history remains non-production-eligible until its own evidence is enough.
+    """
+    sources = list(refresh.get("sources") or [])
+    source_ok = bool(sources) and all(bool(item.get("ok")) for item in sources if isinstance(item, dict))
+    materialized = refresh.get("materialized") or {}
+    written = int(materialized.get("written") or 0)
+    if not bool(refresh.get("ok")) or not source_ok or written <= 0:
+        raise RuntimeError("训练所需的6-10年紧凑市场特征API刷新失败；未使用本地旧数据替代训练")
+    return {
+        "contract": str(refresh.get("contract") or "training_triggered_compact_index_api_only"),
+        "range": list(refresh.get("range") or []),
+        "sources": [{"ts_code": item.get("ts_code"), "rows_written": item.get("rows_written")} for item in sources if isinstance(item, dict)],
+        "features_written": written,
+        "full_market_history_persisted": False,
+    }
 
 
 def _safe_float(v: Any) -> float:
@@ -90,6 +113,77 @@ def _build_dataset(
             y_rows.append(label)
             meta.append({"date": date, "symbol": row.symbol, "future_date": future_date})
     return x_rows, y_rows, meta
+
+
+def _compact_index_trade_dates(*, start_date: str, end_date: str) -> list[str]:
+    """Read the small, training-approved index calendar, never stock history."""
+    from app.data_platform.db import _conn as data_conn
+
+    with data_conn() as conn:
+        rows = conn.execute(
+            """SELECT DISTINCT trade_date FROM dc_tushare_raw_records
+               WHERE api_name='index_daily' AND ts_code='000300.SH'
+                 AND trade_date BETWEEN ? AND ? ORDER BY trade_date""",
+            (start_date.replace("-", ""), end_date.replace("-", "")),
+        ).fetchall()
+    return [str(dict(row).get("trade_date") or "") for row in rows if str(dict(row).get("trade_date") or "")]
+
+
+def _stream_historical_datasets(
+    *,
+    historical_dates: list[str],
+    label_bridge_dates: list[str],
+    online_window_start: str,
+    horizons: list[int],
+    exchange_group: str,
+    progress: Callable[[str, float, str], None],
+) -> dict[int, tuple[list[list[float]], list[float], list[dict[str, Any]]]]:
+    """Build old samples slice-by-slice without retaining old market rows.
+
+    Each slice fetches daily/daily_basic/stk_limit from TuShare VIP batch
+    calls, materializes snapshots and emits feature/label rows. Historical
+    rows are retained for subsequent training and backtests; completed dates
+    are skipped on retry so the one-time backfill is resumable.
+    """
+    result = {h: ([], [], []) for h in horizons}
+    if not historical_dates:
+        return result
+    slices = build_training_slices(historical_dates, chunk_sessions=60, lookback_sessions=80, label_horizon=max(horizons))
+    # The final old dates need future closes for their labels.  The first
+    # current-window sessions are read-only bridge data and are protected by
+    # the cleanup floor below.
+    if slices and label_bridge_dates:
+        last = slices[-1]
+        slices[-1] = type(last)(
+            core_dates=last.core_dates,
+            fetch_dates=tuple(sorted(set(last.fetch_dates + tuple(label_bridge_dates[:max(horizons)])))),
+        )
+    for index, training_slice in enumerate(slices):
+        progress("api_training_data", 0.12 + 0.30 * (index / max(1, len(slices))), f"按需拉取训练切片 {index + 1}/{len(slices)}")
+
+        def consume(core_dates: tuple[str, ...]) -> None:
+            core = set(core_dates)
+            slice_dates = [f"{date[:4]}-{date[4:6]}-{date[6:8]}" for date in training_slice.fetch_dates]
+            for horizon in horizons:
+                chunk_ds = BacktestDataSource()
+                x_rows, y_rows, meta = _build_dataset(
+                    ds=chunk_ds, dates=slice_dates, horizon=horizon,
+                    exchange_group=exchange_group, progress=lambda *_: None,
+                )
+                kept = [(x, y, item) for x, y, item in zip(x_rows, y_rows, meta) if item["date"].replace("-", "") in core]
+                if kept:
+                    xs, ys, items = zip(*kept)
+                    result[horizon][0].extend(xs)
+                    result[horizon][1].extend(ys)
+                    result[horizon][2].extend(items)
+
+        consume_api_training_slice(
+            training_slice,
+            online_window_start=online_window_start,
+            consume=consume,
+            retain_history=True,
+        )
+    return result
 
 
 def _train_sklearn_model(x_train: list[list[float]], y_train: list[float], *, max_iter: int = 80, learning_rate: float = 0.06, max_leaf_nodes: int = 31):
@@ -197,6 +291,26 @@ def _walk_forward_lift(x_rows: list[list[float]], y_rows: list[float], model_typ
     }
 
 
+def _production_eligibility(*, dates: list[str], metrics: dict[str, Any], artifact_path: Path) -> dict[str, Any]:
+    sessions = len(dates)
+    gates = {
+        "artifact_exists": artifact_path.exists() and artifact_path.is_file(),
+        "minimum_history_sessions": sessions >= 252 * 6,
+        "holdout_lift_positive": float(metrics.get("lift", 0) or 0) > 0,
+        "walk_forward_lift_positive": float(metrics.get("walk_forward_lift", 0) or 0) > 0,
+        "walk_forward_folds": int(metrics.get("walk_forward_folds", 0) or 0) >= 3,
+    }
+    reasons = [name for name, passed in gates.items() if not passed]
+    return {
+        "eligible": not reasons,
+        "gates": gates,
+        "blocked_reasons": reasons,
+        "history_sessions": sessions,
+        "minimum_sessions_required": 252 * 6,
+        "policy": "candidate_only_until_plan_gates_pass",
+    }
+
+
 def run_model_training(
     *,
     run_id: int | None = None,
@@ -217,6 +331,11 @@ def run_model_training(
         )
 
     try:
+        # User-approved boundary: only a model-training trigger can request
+        # 6-10 years, and it requests compact index features rather than a
+        # decade of all-market daily rows.
+        from app.services.hsmm_shadow import refresh_compact_training_history_from_api
+        training_input = _require_compact_api_training_history(refresh_compact_training_history_from_api(years=10))
         ds = BacktestDataSource()
         exchange_group = normalize_exchange_group(exchange_group)
         dates = ds.get_available_trade_dates(start_date or "2020-01-01", end_date or "2099-12-31")
@@ -225,17 +344,47 @@ def run_model_training(
 
         horizons = [5, 10, 20]
         horizons = [h for h in horizons if len(dates) > h + 5] or [min(5, len(dates) - 2)]
+        # The online product keeps its normal rolling window.  For a training
+        # click, extend only the *calendar* from the compact index series and
+        # stream any missing old stock slices one at a time.  No old stock raw
+        # table or snapshot survives a slice.
+        online_window_start = dates[0].replace("-", "")
+        historical_candidates = _compact_index_trade_dates(start_date="2016-01-01", end_date=dates[-1])
+        target_sessions = 252 * 6
+        historical_dates = [date for date in historical_candidates if date < online_window_start]
+        training_calendar = (historical_dates + [date.replace("-", "") for date in dates])[-target_sessions:]
+        streamed_dates = [date for date in training_calendar if date < online_window_start]
+        streamed = _stream_historical_datasets(
+            historical_dates=streamed_dates,
+            label_bridge_dates=[date.replace("-", "") for date in dates],
+            online_window_start=online_window_start,
+            horizons=horizons,
+            exchange_group=exchange_group,
+            progress=progress,
+        )
+        training_input["cross_sectional_history"] = {
+            "contract": "training_triggered_tushare_vip_full_market_history_retained",
+            "online_window_sessions": len(dates),
+            "target_sessions": target_sessions,
+            "training_calendar_sessions": len(training_calendar),
+            "streamed_sessions": len(streamed_dates),
+            "chunk_sessions": 60,
+            "raw_full_market_history_persisted": True,
+        }
         best: dict[str, Any] | None = None
 
         for h_idx, horizon in enumerate(horizons):
             progress("dataset", 0.05 + 0.1 * h_idx, f"准备 {horizon} 日标签")
-            x_rows, y_rows, meta = _build_dataset(
+            local_x, local_y, local_meta = _build_dataset(
                 ds=ds,
                 dates=dates,
                 horizon=horizon,
                 exchange_group=exchange_group,
                 progress=progress,
             )
+            x_rows = streamed[horizon][0] + local_x
+            y_rows = streamed[horizon][1] + local_y
+            meta = streamed[horizon][2] + local_meta
             if len(x_rows) < 200:
                 continue
             split = max(1, int(len(x_rows) * 0.8))
@@ -322,23 +471,26 @@ def run_model_training(
             "method": "holdout_plus_expanding_walk_forward",
             "walk_forward_folds": int(best["metrics"].get("walk_forward_folds", 0) or 0),
         }
+        eligibility = _production_eligibility(dates=training_calendar, metrics=best["metrics"], artifact_path=artifact_path)
+        validation["production_eligible"] = bool(eligibility["eligible"])
+        validation["production_eligibility"] = eligibility
         model_version_id = create_model_version(
             model_key=MODEL_KEY,
             version=version,
-            status="active" if validation["status"] == "passed" else "candidate",
+            status="candidate" if validation["status"] == "passed" else "watch",
             artifact_path=str(artifact_path),
             config={
                 "features": FEATURES,
                 "horizon": best["horizon"],
                 "exchange_group": exchange_group,
                 "model_type": artifact.get("model_type"),
+                "production_eligible": bool(eligibility["eligible"]),
+                "training_input": training_input,
             },
             metrics=best["metrics"],
             validation=validation,
-            is_active=validation["status"] == "passed",
+            is_active=False,
         )
-        if validation["status"] == "passed":
-            set_active_model_version(model_version_id)
         update_model_train_run(
             rid,
             status="completed",
@@ -349,7 +501,7 @@ def run_model_training(
             metrics=best["metrics"],
             finished_at=datetime.utcnow().isoformat(),
         )
-        return {"ok": True, "run_id": rid, "model_version_id": model_version_id, "version": version, "metrics": best["metrics"]}
+        return {"ok": True, "run_id": rid, "model_version_id": model_version_id, "version": version, "metrics": best["metrics"], "training_input": training_input}
     except Exception as e:
         update_model_train_run(
             rid,

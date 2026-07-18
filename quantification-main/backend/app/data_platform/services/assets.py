@@ -9,6 +9,7 @@ from typing import Any
 
 from app.data_platform.db import _conn
 from app.data_platform.redis_store import delete as redis_delete, get_json, set_json
+from app.data_platform.services.market_calendar import target_trade_day
 
 # Fixed audit policy relative to "today".
 DAILY_LOOKBACK_DAYS = 730  # ~2 years
@@ -26,7 +27,6 @@ _assets_cache: dict[str, Any] = {"at": 0.0, "value": None}
 _SPARSE_RAW_APIS = (
     "namechange",
     "dividend",
-    "pledge_stat",
     "forecast",
     "express",
     "index_basic",
@@ -125,7 +125,8 @@ def invalidate_data_assets_cache() -> None:
 
 def _compute_data_assets() -> dict[str, Any]:
     today = date.today()
-    end = today
+    with _conn() as c:
+        end = target_trade_day(c)
     start = end - timedelta(days=DAILY_LOOKBACK_DAYS)
     start_s, end_s = start.strftime("%Y%m%d"), end.strftime("%Y%m%d")
     quarters = _report_periods(today)
@@ -205,7 +206,22 @@ def _compute_data_assets() -> dict[str, Any]:
                     (start_s, end_s, api),
                 ).fetchone()
             )
+            checked = _d(
+                c.execute(
+                    """
+                    SELECT COUNT(DISTINCT trade_date) n,
+                           MIN(trade_date) min_date,
+                           MAX(trade_date) max_date
+                    FROM dc_tushare_request_coverage
+                    WHERE api_name = ?
+                      AND trade_date BETWEEN ? AND ?
+                      AND result_status IN ('success','valid_empty','not_applicable','deferred_empty')
+                    """,
+                    (api, start_s, end_s),
+                ).fetchone()
+            )
             dates = int(cov.get("n") or 0)
+            checked_dates = int(checked.get("n") or 0)
             raw_daily[api] = {
                 "api_name": api,
                 "records": dates * stocks if dates and stocks else 0,
@@ -213,6 +229,9 @@ def _compute_data_assets() -> dict[str, Any]:
                 "dates": dates,
                 "min_date": cov.get("min_date"),
                 "max_date": cov.get("max_date"),
+                "checked_dates": checked_dates,
+                "checked_min_date": checked.get("min_date"),
+                "checked_max_date": checked.get("max_date"),
             }
         # Prefer exact snapshot row count for the fused daily view.
         if "daily" in raw_daily:
@@ -223,23 +242,32 @@ def _compute_data_assets() -> dict[str, Any]:
                 raw_daily["daily"]["max_date"] = snap.get("max_date") or raw_daily["daily"].get("max_date")
                 raw_daily["daily"]["symbols"] = stocks if raw_daily["daily"]["dates"] else 0
 
-        raw_period = {
-            r["api_name"]: dict(r)
-            for r in c.execute(
+        period_apis = (
+            "income",
+            "balancesheet",
+            "cashflow",
+            "fina_indicator",
+            "fina_audit",
+            "fina_mainbz",
+            "top10_holders",
+            "top10_floatholders",
+            "stk_holdernumber",
+        )
+        raw_period: dict[str, dict[str, Any]] = {}
+        for api in period_apis:
+            row = c.execute(
                 """
-                SELECT api_name,
-                       COUNT(*) records,
-                       COUNT(DISTINCT ts_code) symbols,
-                       COUNT(DISTINCT period) periods,
+                SELECT COUNT(DISTINCT period) periods,
                        MIN(period) min_date,
                        MAX(period) max_date
                 FROM dc_tushare_raw_records
-                WHERE period <> '' AND period BETWEEN ? AND ?
-                GROUP BY api_name
+                WHERE api_name = ?
+                  AND period <> ''
+                  AND period BETWEEN ? AND ?
                 """,
-                (financial_start, financial_end),
-            ).fetchall()
-        }
+                (api, financial_start, financial_end),
+            ).fetchone()
+            raw_period[api] = dict(row) if row else {}
 
         # Only scan sparse APIs — never GROUP BY the whole raw table.
         raw_all: dict[str, dict[str, Any]] = {}
@@ -258,22 +286,56 @@ def _compute_data_assets() -> dict[str, Any]:
                 (api,),
             ).fetchone()
             raw_all[api] = dict(row) if row else {}
-
-        # Financial symbol coverage: reuse period aggregates when available.
-        financial_symbol_counts = {
-            api: int((raw_period.get(api) or {}).get("symbols") or 0)
-            for api in (
-                "income",
-                "balancesheet",
-                "cashflow",
-                "fina_indicator",
-                "fina_audit",
-                "fina_mainbz",
-                "top10_holders",
-                "top10_floatholders",
-                "stk_holdernumber",
-            )
+        pledge_records = _d(
+            c.execute(
+                """
+                SELECT COUNT(*) records,
+                       MIN(period) min_date,
+                       MAX(period) max_date
+                FROM dc_tushare_raw_records
+                WHERE api_name = 'pledge_stat'
+                """
+            ).fetchone()
+        )
+        pledge_symbols = _i(
+            c.execute(
+                """
+                SELECT COUNT(DISTINCT ts_code) n
+                FROM dc_tushare_request_coverage
+                WHERE api_name = 'pledge_stat'
+                  AND result_status IN ('success','not_applicable','valid_empty','deferred_empty')
+                """
+            ).fetchone()
+        )
+        raw_all["pledge_stat"] = {
+            **pledge_records,
+            "symbols": pledge_symbols,
+            "dates": 0,
+            "periods": 0,
         }
+
+        # Financial symbol coverage counts real rows plus terminal request
+        # coverage, so pre-listing and deferred-empty cases do not remain as
+        # permanent false gaps.
+        financial_symbol_counts: dict[str, int] = {}
+        for api in period_apis:
+            row = c.execute(
+                """
+                SELECT COUNT(DISTINCT ts_code) n
+                FROM (
+                    SELECT ts_code
+                    FROM dc_tushare_raw_records
+                    WHERE api_name=? AND period<>'' AND period BETWEEN ? AND ? AND ts_code<>''
+                    UNION
+                    SELECT ts_code
+                    FROM dc_tushare_request_coverage
+                    WHERE api_name=? AND period<>'' AND period BETWEEN ? AND ? AND ts_code<>''
+                      AND result_status IN ('success','not_applicable','valid_empty','deferred_empty')
+                ) done
+                """,
+                (api, financial_start, financial_end, api, financial_start, financial_end),
+            ).fetchone()
+            financial_symbol_counts[api] = int((dict(row) if row else {}).get("n") or 0)
 
         # Period coverage for financial statements.
         financial_period_counts = {
@@ -401,14 +463,14 @@ def _compute_data_assets() -> dict[str, Any]:
             "window_start": start_s,
             "window_end": end_s,
             "window_depth": "2年",
-            "measurement": "coverage_stocks",
-            "actual": int(all_raw("namechange").get("symbols") or 0),
-            "expected": stocks,
+            "measurement": "event_count",
+            "actual": int(all_raw("namechange").get("records") or 0),
+            "expected": None,
             "symbols": int(all_raw("namechange").get("symbols") or 0),
             "dates": int(all_raw("namechange").get("dates") or 0),
             "min_date": all_raw("namechange").get("min_date"),
             "max_date": all_raw("namechange").get("max_date"),
-            "rationale": "治理风险辅助；按股票覆盖度计",
+            "rationale": "事件型；多数股票不会改名或进入 ST，不能按全股票覆盖率判缺失",
         },
         {
             "key": "industry_classification",
@@ -534,13 +596,19 @@ def _compute_data_assets() -> dict[str, Any]:
             "window_end": end_s,
             "window_depth": "~500交易日",
             "measurement": "coverage_dates",
-            "actual": int(daily_raw("suspend_d").get("dates") or 0),
+            "actual": max(
+                int(daily_raw("suspend_d").get("checked_dates") or 0),
+                int(daily_raw("suspend_d").get("dates") or 0),
+            ),
             "expected": open_days_expected,
             "symbols": int(daily_raw("suspend_d").get("symbols") or 0),
-            "dates": int(daily_raw("suspend_d").get("dates") or 0),
-            "min_date": daily_raw("suspend_d").get("min_date"),
-            "max_date": daily_raw("suspend_d").get("max_date"),
-            "rationale": "稀疏事件接口；当前尚未记录空结果检查日期，因此缺口按已返回事件日期保守计算",
+            "dates": max(
+                int(daily_raw("suspend_d").get("checked_dates") or 0),
+                int(daily_raw("suspend_d").get("dates") or 0),
+            ),
+            "min_date": daily_raw("suspend_d").get("checked_min_date") or daily_raw("suspend_d").get("min_date"),
+            "max_date": daily_raw("suspend_d").get("checked_max_date") or daily_raw("suspend_d").get("max_date"),
+            "rationale": "稀疏事件接口；完整度按每日请求检查覆盖率计，空结果代表当日无停复牌事件且属于有效检查",
             "records_actual": int(daily_raw("suspend_d").get("records") or 0),
             "records_expected": None,
         },
@@ -580,13 +648,19 @@ def _compute_data_assets() -> dict[str, Any]:
             "window_end": end_s,
             "window_depth": "2年",
             "measurement": "coverage_dates",
-            "actual": int(daily_raw("moneyflow").get("dates") or 0),
+            "actual": max(
+                int(daily_raw("moneyflow").get("checked_dates") or 0),
+                int(daily_raw("moneyflow").get("dates") or 0),
+            ),
             "expected": open_days_expected,
             "symbols": int(daily_raw("moneyflow").get("symbols") or 0),
-            "dates": int(daily_raw("moneyflow").get("dates") or 0),
-            "min_date": daily_raw("moneyflow").get("min_date"),
-            "max_date": daily_raw("moneyflow").get("max_date"),
-            "rationale": "按交易日覆盖度计",
+            "dates": max(
+                int(daily_raw("moneyflow").get("checked_dates") or 0),
+                int(daily_raw("moneyflow").get("dates") or 0),
+            ),
+            "min_date": daily_raw("moneyflow").get("checked_min_date") or daily_raw("moneyflow").get("min_date"),
+            "max_date": daily_raw("moneyflow").get("checked_max_date") or daily_raw("moneyflow").get("max_date"),
+            "rationale": "按交易日终态覆盖度计；成功写入为完整数据，多次空结果会转入 deferred_empty 并进入备用源/异常报告",
         },
         {
             "key": "income",
@@ -822,14 +896,14 @@ def _compute_data_assets() -> dict[str, Any]:
             "window_start": start_s,
             "window_end": end_s,
             "window_depth": "2年",
-            "measurement": "coverage_stocks",
-            "actual": int(all_raw("pledge_stat").get("symbols") or 0),
-            "expected": expected_financial_stocks,
+            "measurement": "event_count",
+            "actual": int(all_raw("pledge_stat").get("records") or 0),
+            "expected": None,
             "symbols": int(all_raw("pledge_stat").get("symbols") or 0),
             "dates": int(all_raw("pledge_stat").get("periods") or 0),
             "min_date": all_raw("pledge_stat").get("min_date"),
             "max_date": all_raw("pledge_stat").get("max_date"),
-            "rationale": "按股票覆盖度计",
+            "rationale": "事件型；无质押记录不代表数据缺失，不能按全股票覆盖率判缺口",
         },
         {
             "key": "forecast",

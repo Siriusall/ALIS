@@ -109,7 +109,17 @@ export interface DataObservability {
   logs: DataIngestionRun[];
   runtime_logs: Array<{ id:number; level:string; logger:string; message:string; context:Record<string,unknown>; created_at:string }>;
   redis: { available:boolean; url:string };
+  quality_audit?: {
+    status: "ok" | "warning" | "error" | string;
+    summary: { errors:number; warnings:number; info:number; raw_records:number };
+    issues: Array<{
+      code:string; title:string; severity:string; status:string; count:number; message:string;
+      sample?: Array<Record<string,unknown>>;
+    }>;
+  };
 }
+
+export type RuntimeLogItem = DataObservability["runtime_logs"][number];
 
 export interface ReadinessRequirement {
   key: string; label: string; threshold: number; policy: "block" | "degrade";
@@ -154,6 +164,31 @@ export interface DataAssetsResponse {
   items:DataAssetItem[];
 }
 
+export interface ColdArchiveItem {
+  archive_id: string;
+  dataset: string;
+  api_names: string[];
+  date_start: string;
+  date_end: string;
+  row_count: number;
+  file_path: string;
+  file_sha256: string;
+  status: string;
+  created_at: string;
+  file_exists: boolean;
+  file_bytes: number;
+}
+
+export interface ColdArchiveStatus {
+  ok: boolean;
+  storage: "local_filesystem" | string;
+  root: string;
+  exists: boolean;
+  contract: string;
+  disk: { total_bytes: number; free_bytes: number; free_pct: number };
+  items: ColdArchiveItem[];
+}
+
 export interface WebFactorItem {
   id: number;
   symbol: string;
@@ -184,6 +219,26 @@ export async function fetchSimpleDataHealth(): Promise<SimpleDataHealth> {
   return data;
 }
 
+export async function fetchColdArchiveStatus(limit = 30): Promise<ColdArchiveStatus> {
+  const { data } = await api.get<ColdArchiveStatus>("/api/data-center/cold-archive", { params: { limit } });
+  return data;
+}
+
+export async function startColdArchive(payload: {
+  apiNames: string[];
+  startDate: string;
+  endDate: string;
+  maxRows?: number;
+}): Promise<ColdArchiveItem & { ok: boolean }> {
+  const { data } = await api.post<ColdArchiveItem & { ok: boolean }>("/api/data-center/cold-archive/raw", {
+    api_names: payload.apiNames,
+    start_date: payload.startDate,
+    end_date: payload.endDate,
+    max_rows: payload.maxRows ?? 250000,
+  }, { timeout: 5 * 60 * 1000 });
+  return data;
+}
+
 export async function startDailyUpdate(): Promise<DailyUpdateStatus> {
   const { data } = await api.post<DailyUpdateStatus>("/api/data-center/daily-update");
   return data;
@@ -199,13 +254,23 @@ export async function fetchDataObservability(limitLogs = 50): Promise<DataObserv
   return data;
 }
 
+export async function fetchRuntimeLogsAfter(afterId = 0, limit = 100, waitSeconds = 0): Promise<{ ok:boolean; after_id:number; total:number; items:RuntimeLogItem[] }> {
+  const { data } = await api.get<{ ok:boolean; after_id:number; total:number; items:RuntimeLogItem[] }>("/api/data-center/runtime-logs", {
+    params: { after_id: afterId, limit, wait_seconds: waitSeconds },
+    // 实时日志使用长轮询；必须比服务端等待时间多留出网络和序列化余量，不能沿用全局15秒超时。
+    timeout: waitSeconds > 0 ? Math.ceil(waitSeconds * 1000) + 5000 : undefined,
+  });
+  return data;
+}
+
 export async function fetchReadiness(): Promise<ReadinessOverview> {
   const { data } = await api.get<ReadinessOverview>("/api/data-center/readiness");
   return data;
 }
 
 export async function fetchDataAssets(): Promise<DataAssetsResponse> {
-  const { data } = await api.get<DataAssetsResponse>("/api/data-center/assets"); return data;
+  // 资产目录会汇总各数据域的实际行数，查询可能超过通用15秒请求窗口。
+  const { data } = await api.get<DataAssetsResponse>("/api/data-center/assets", { timeout: 60 * 1000 }); return data;
 }
 
 export interface BackfillStep {
@@ -251,6 +316,28 @@ export interface BackfillStatus {
   started_at?: string;
   finished_at?: string;
   error?: string;
+  can_resume?: boolean;
+  resume_action?: string;
+  auto_resume?: boolean;
+  auto_resume_attempt?: number;
+  auto_resume_max_attempts?: number;
+  auto_resume_delay_seconds?: number;
+  auto_resume_at?: string;
+  auto_resume_reason?: string;
+  current_step?: BackfillStep;
+  executed?: Array<Record<string, unknown>>;
+  failure_detail?: {
+    step?: Partial<BackfillStep>;
+    summary?: {
+      error?: string;
+      failed?: number;
+      total?: number;
+      success?: number;
+      failed_items?: Array<{ ts_code?: string; api?: string; error?: string }>;
+      [key: string]: unknown;
+    };
+    resume_hint?: string;
+  };
   plan_summary?: BackfillPlan["summary"];
   max_steps?: number;
   activity?: {
@@ -267,14 +354,14 @@ export interface BackfillStatus {
   };
 }
 
-export async function fetchBackfillPlan(marketBatchDays = 20, financialBatchSize = 50): Promise<BackfillPlan> {
+export async function fetchBackfillPlan(marketBatchDays = 30, financialBatchSize = 100): Promise<BackfillPlan> {
   const { data } = await api.get<BackfillPlan>("/api/data-center/backfill/plan", {
     params: { market_batch_days: marketBatchDays, financial_batch_size: financialBatchSize },
   });
   return data;
 }
 
-export async function startBackfill(maxSteps = 0, marketBatchDays = 20, financialBatchSize = 50): Promise<BackfillStatus & { plan?: BackfillPlan }> {
+export async function startBackfill(maxSteps = 0, marketBatchDays = 30, financialBatchSize = 100): Promise<BackfillStatus & { plan?: BackfillPlan }> {
   const { data } = await api.post<BackfillStatus & { plan?: BackfillPlan }>("/api/data-center/backfill/start", null, {
     params: { max_steps: maxSteps, market_batch_days: marketBatchDays, financial_batch_size: financialBatchSize },
     timeout: 60 * 1000,

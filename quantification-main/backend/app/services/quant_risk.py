@@ -13,6 +13,8 @@ except ImportError:  # lightweight contract-test store shim
 from app.services.backtest_data_source import BacktestDataSource
 from app.services.data_health import build_data_health_report
 
+REQUIRED_MARKET_DAY_APIS = ("daily", "daily_basic", "stk_limit")
+
 
 def historical_cvar(returns: list[float], confidence: float = 0.95) -> dict[str, float]:
     """Compute empirical left-tail VaR/CVaR for portfolio daily returns.
@@ -171,6 +173,92 @@ def evaluate_data_health_gate(limit_days: int = 5) -> RiskPauseDecision:
             "daily_basic": report.get("daily_basic", {}),
         },
     )
+
+
+def evaluate_latest_market_day_gate() -> RiskPauseDecision:
+    from app.data_platform.db import _conn
+
+    with _conn() as conn:
+        latest = conn.execute("SELECT MAX(trade_date) AS latest_trade_date FROM dc_available_trade_dates").fetchone()
+        latest_trade_date = str(dict(latest).get("latest_trade_date") or "")
+        if not latest_trade_date:
+            latest = conn.execute("SELECT MAX(trade_date) AS latest_trade_date FROM dc_stock_daily_snapshot").fetchone()
+            latest_trade_date = str(dict(latest).get("latest_trade_date") or "")
+        if not latest_trade_date:
+            return pause_decision(
+                code="paused_latest_market_day_not_ready",
+                message="最新交易日行情尚未物化，暂停任务执行。",
+                recovery_condition="先完成收盘后的 daily、daily_basic、stk_limit 入库与快照构建，再继续任务。",
+                exit_condition="若连续两次日更后仍缺最新交易日切片，停止自动任务并人工核对数据源。",
+                severity="error",
+                evidence={"latest_trade_date": "", "missing_apis": list(REQUIRED_MARKET_DAY_APIS), "snapshot_ready": False},
+            )
+        rows = conn.execute(
+            f"""SELECT api_name,COUNT(*) AS rows FROM dc_tushare_raw_records
+                WHERE trade_date=? AND api_name IN ({",".join("?" for _ in REQUIRED_MARKET_DAY_APIS)})
+                GROUP BY api_name""",
+            (latest_trade_date, *REQUIRED_MARKET_DAY_APIS),
+        ).fetchall()
+        present = {
+            str(dict(row).get("api_name") or "")
+            for row in rows
+            if int(dict(row).get("rows") or 0) > 0
+        }
+        snapshot = conn.execute("SELECT COUNT(*) AS count FROM dc_stock_daily_snapshot WHERE trade_date=?", (latest_trade_date,)).fetchone()
+    missing = [api for api in REQUIRED_MARKET_DAY_APIS if api not in present]
+    snapshot_ready = int(dict(snapshot).get("count") or 0) > 0
+    if not missing and snapshot_ready:
+        return no_pause()
+    return pause_decision(
+        code="paused_latest_market_day_not_ready",
+        message="最新交易日行情尚未物化，暂停任务执行。",
+        recovery_condition="先完成收盘后的 daily、daily_basic、stk_limit 入库与快照构建，再继续任务。",
+        exit_condition="若连续两次日更后仍缺最新交易日切片，停止自动任务并人工核对数据源。",
+        severity="error",
+        evidence={
+            "latest_trade_date": latest_trade_date,
+            "missing_apis": missing,
+            "snapshot_ready": snapshot_ready,
+            "required_apis": list(REQUIRED_MARKET_DAY_APIS),
+        },
+    )
+
+
+def evaluate_model_readiness_gate(model_status: dict[str, Any] | None = None) -> RiskPauseDecision:
+    """Use one production-model contract for UI decisions and task execution."""
+    if model_status is None:
+        from app.services.model_registry import get_model_status
+
+        model_status = get_model_status()
+    active = dict((model_status or {}).get("active_version") or {})
+    if not active:
+        return pause_decision(
+            code="paused_model_not_ready",
+            message="当前没有已激活的生产模型，暂停自动调仓。",
+            recovery_condition="完成至少1512个交易日的训练与验证，并晋升一个production_eligible模型。",
+            exit_condition="若暂不启用模型，只允许人工分析，不得由后台规则回退自动成交。",
+            severity="error",
+            evidence={"has_active_model": False},
+        )
+    validation = dict(active.get("validation") or {})
+    eligibility = dict(validation.get("production_eligibility") or {})
+    production_eligible = bool(validation.get("production_eligible")) and bool(eligibility.get("eligible", True))
+    if not bool(active.get("is_active")) or str(validation.get("status") or "") != "passed" or not production_eligible:
+        return pause_decision(
+            code="paused_model_not_production_eligible",
+            message="当前模型尚未同时满足激活、样本外验证和生产历史门槛，暂停自动调仓。",
+            recovery_condition="补齐至少1512个交易日并通过holdout与walk-forward后重新晋升模型。",
+            exit_condition="保持模拟任务暂停，禁止静默退回规则模型自动成交。",
+            severity="error",
+            evidence={
+                "model_version_id": active.get("id"),
+                "model_version": active.get("version"),
+                "validation_status": validation.get("status"),
+                "production_eligible": production_eligible,
+                "production_eligibility": eligibility,
+            },
+        )
+    return no_pause()
 
 
 def _safe_float(v: object) -> float:
@@ -357,6 +445,35 @@ def constrained_cvar_weights(returns_by_symbol: dict[str, list[float]], *, max_s
             break
         eligible = next_eligible
     return {s: round(v, 8) for s, v in weights.items()}
+
+
+def enforce_marginal_cvar_limit(
+    weights: dict[str, float], returns_by_symbol: dict[str, list[float]], *, max_contribution: float = .12,
+) -> dict[str, Any]:
+    """Enforce the B11.2 Euler-style standalone tail-risk budget ceiling."""
+    symbols = [symbol for symbol in weights if returns_by_symbol.get(symbol)]
+    limit = max(0.01, min(1.0, float(max_contribution)))
+    minimum_names = math.ceil(1.0 / limit)
+    if len(symbols) < minimum_names:
+        return {"status": "infeasible", "weights": {}, "contributions": {}, "minimum_names": minimum_names, "reason": f"正风险贡献标的少于{minimum_names}只，无法同时满足单股边际CVaR贡献≤{limit:.0%}"}
+    tail_risk = {
+        symbol: max(1e-8, abs(float(historical_cvar(returns_by_symbol[symbol]).get("cvar") or 0)))
+        for symbol in symbols
+    }
+    inverse = {symbol: 1.0 / risk for symbol, risk in tail_risk.items()}
+    total_inverse = sum(inverse.values()) or 1.0
+    risk_parity_weights = {symbol: inverse[symbol] / total_inverse for symbol in symbols}
+    total_risk = sum(risk_parity_weights[symbol] * tail_risk[symbol] for symbol in symbols) or 1.0
+    contributions = {symbol: risk_parity_weights[symbol] * tail_risk[symbol] / total_risk for symbol in symbols}
+    breached = {symbol: value for symbol, value in contributions.items() if value > limit + 1e-8}
+    return {
+        "status": "ready" if not breached else "infeasible",
+        "weights": {symbol: round(value, 8) for symbol, value in risk_parity_weights.items()} if not breached else {},
+        "contributions": {symbol: round(value, 8) for symbol, value in contributions.items()},
+        "minimum_names": minimum_names,
+        "limit": limit,
+        "breaches": breached,
+    }
 
 
 def hrp_fallback_weights(returns_by_symbol: dict[str, list[float]], *, max_single: float = 0.25) -> dict[str, float]:

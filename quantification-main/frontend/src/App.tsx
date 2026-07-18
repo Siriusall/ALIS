@@ -2,13 +2,14 @@ import { Navigate, Route, Routes } from "react-router-dom";
 import ProtectedRoute from "./components/ProtectedRoute";
 import AppErrorBoundary from "./components/AppErrorBoundary";
 import { AuthProvider } from "./context/AuthContext";
+import { StockProvider } from "./context/StockContext";
 import DashboardPage from "./pages/DashboardPage";
 import LoginPage from "./pages/LoginPage";
 import RegisterPage from "./pages/RegisterPage";
 
 export default function App() {
   return (
-    <AppErrorBoundary><AuthProvider>
+    <AppErrorBoundary><AuthProvider><StockProvider>
       <Routes>
         <Route path="/login" element={<LoginPage />} />
         <Route path="/register" element={<RegisterPage />} />
@@ -23,6 +24,6 @@ export default function App() {
         />
         <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>
-    </AuthProvider></AppErrorBoundary>
+    </StockProvider></AuthProvider></AppErrorBoundary>
   );
 }

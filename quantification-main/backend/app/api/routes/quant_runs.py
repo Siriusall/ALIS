@@ -55,6 +55,8 @@ from app.services.quant_run_engine import (
 )
 from app.services.quant_task_runner import run_quant_task_async
 from app.services.quant_task_state_machine import can_transition, normalize_status
+from app.services.decision_store import build_review_outcome_suggestion, list_decision_snapshots, list_position_state_history, list_reviews
+from app.services.simulation_ledger import build_simulation_ledger
 
 router = APIRouter()
 
@@ -376,14 +378,15 @@ def quant_run_curve(limit: int = 250, benchmark: str = "000300", task_id: int | 
                 continue
             side = str(o.get("side", "")).upper()
             trade_price = _safe_float(o.get("price"))
+            trade_fees = sum(_safe_float(o.get(key)) for key in ("commission", "transfer_fee", "stamp_tax"))
             if side == "BUY":
                 holdings[sym] += qty
-                replay_cash -= trade_price * qty
+                replay_cash -= trade_price * qty + trade_fees
                 if trade_price > 0:
                     last_price_by_symbol[sym] = trade_price
             elif side == "SELL":
                 holdings[sym] = max(0, holdings[sym] - qty)
-                replay_cash += trade_price * qty
+                replay_cash += trade_price * qty - trade_fees
                 if trade_price > 0:
                     last_price_by_symbol[sym] = trade_price
 
@@ -444,6 +447,7 @@ def quant_run_curve(limit: int = 250, benchmark: str = "000300", task_id: int | 
             {
                 "date": d,
                 "strategy_equity": strategy_eq[i],
+                "strategy_equity_cny": round(strategy_raw[i], 2),
                 "benchmark_equity": benchmark_eq[i],
                 "drawdown_pct": drawdown[i],
                 "day_return_pct": day_ret_pct[i],
@@ -528,7 +532,7 @@ def quant_run_execute_preview(req: QuantRebalancePreviewRequest) -> dict:
 
 @router.post("/quant-runs/execute-buy")
 def quant_run_execute_buy(req: QuantExecuteBuyRequest) -> dict:
-    """确认执行分析调仓（默认完整调仓：先卖后买）。"""
+    """执行分析调仓模拟（默认完整调仓：先卖后买）。"""
     try:
         ensure_manual_trade_allowed("开仓")
     except RuntimeError as e:
@@ -779,11 +783,94 @@ def quant_run_ledger_summary() -> dict:
     }
 
 
+@router.get("/quant-runs/simulation-ledger")
+def quant_run_simulation_ledger(
+    execution_id: int | None = Query(None, ge=1),
+    limit: int = Query(20, ge=1, le=100),
+) -> dict:
+    return build_simulation_ledger(limit=limit, execution_id=execution_id)
+
+
 @router.get("/quant-runs/performance")
 def quant_run_performance(task_id: int | None = Query(None, ge=1), benchmark: str = "000300") -> dict:
     """Return weekly/monthly/yearly performance aggregates for the simulator."""
     curve = quant_run_curve(limit=1000, benchmark=benchmark, task_id=task_id)
     series = [x for x in (curve.get("series") or []) if x.get("date") and x.get("strategy_equity") is not None]
+    task_runs = list_quant_run_task_records(task_id, limit=2000) if task_id is not None else []
+    if task_id is not None:
+        operations = []
+        for execution_id in {int(x["execution_id"]) for x in task_runs if x.get("execution_id") is not None}:
+            operations.extend(list_operations(execution_id=execution_id, limit=5000))
+    else:
+        operations = list_operations(execution_id=None, limit=5000)
+    operations.sort(key=lambda item: (str(item.get("at") or ""), int(item.get("id") or 0)))
+    try:
+        review_records = list_reviews(limit=2000)
+        intervention_records = list_position_state_history(limit=2000)
+    except Exception:
+        review_records, intervention_records = [], []
+
+    attribution_by_date: dict[str, dict[str, float]] = defaultdict(lambda: defaultdict(float))
+    seen_attribution_lots: set[tuple[int, int, int]] = set()
+    try:
+        decisions = list_decision_snapshots(limit=2000)
+        for decision in decisions:
+            if not decision.get("operation_id"):
+                continue
+            suggestion = build_review_outcome_suggestion(int(decision["id"]))
+            attribution = (suggestion or {}).get("attribution") or {}
+            if attribution.get("method") != "brinson_fifo_execution_v1":
+                continue
+            added_lot = False
+            for lot in attribution.get("lots") or []:
+                key = (int(lot.get("entry_operation_id") or 0), int(lot.get("exit_operation_id") or 0), int(lot.get("quantity") or 0))
+                if key in seen_attribution_lots:
+                    continue
+                seen_attribution_lots.add(key)
+                added_lot = True
+                exit_date = str(lot.get("exit_at") or "")[:10]
+                bucket = attribution_by_date[exit_date]
+                bucket["market"] += float(lot.get("market_attribution") or 0)
+                bucket["industry"] += float(lot.get("industry_attribution") or 0)
+                bucket["selection"] += float(lot.get("selection_attribution") or 0)
+            if added_lot:
+                exit_date = str((attribution.get("lots") or [{}])[-1].get("exit_at") or "")[:10]
+                attribution_by_date[exit_date]["execution"] += float(attribution.get("execution_attribution") or 0)
+    except Exception:
+        attribution_by_date = defaultdict(lambda: defaultdict(float))
+
+    realized_by_date: dict[str, float] = defaultdict(float)
+    lots_by_symbol: dict[str, list[dict[str, float]]] = defaultdict(list)
+    for operation in operations:
+        symbol = str(operation.get("symbol") or "")
+        side = str(operation.get("side") or "").upper()
+        qty = int(operation.get("quantity") or 0)
+        price = _safe_float(operation.get("price"))
+        fees = sum(_safe_float(operation.get(key)) for key in ("commission", "transfer_fee", "stamp_tax"))
+        if not symbol or qty <= 0 or price <= 0:
+            continue
+        if side == "BUY":
+            lots_by_symbol[symbol].append({"remaining": float(qty), "unit_cost": price + fees / qty})
+            continue
+        if side != "SELL":
+            continue
+        remaining = qty
+        net_proceeds = qty * price - fees
+        matched_cost = 0.0
+        matched = 0
+        for lot in lots_by_symbol[symbol]:
+            if remaining <= 0:
+                break
+            used = min(remaining, int(lot["remaining"]))
+            if used <= 0:
+                continue
+            lot["remaining"] -= used
+            remaining -= used
+            matched += used
+            matched_cost += used * lot["unit_cost"]
+        if matched:
+            matched_proceeds = net_proceeds * matched / qty
+            realized_by_date[str(operation.get("at") or "")[:10]] += matched_proceeds - matched_cost
 
     def aggregate(key_fn):
         buckets: dict[str, list[dict]] = defaultdict(list)
@@ -792,18 +879,65 @@ def quant_run_performance(task_id: int | None = Query(None, ge=1), benchmark: st
         out = []
         for key, points in sorted(buckets.items()):
             first, last = points[0], points[-1]
-            start = _safe_float(first.get("strategy_equity")) or 100.0
-            end = _safe_float(last.get("strategy_equity")) or start
+            start_index = _safe_float(first.get("strategy_equity")) or 100.0
+            end_index = _safe_float(last.get("strategy_equity")) or start_index
+            start = _safe_float(first.get("strategy_equity_cny")) or start_index
+            end = _safe_float(last.get("strategy_equity_cny")) or end_index
             bm_start = _safe_float(first.get("benchmark_equity"))
             bm_end = _safe_float(last.get("benchmark_equity")) or bm_start
             drawdowns = [_safe_float(x.get("drawdown_pct")) for x in points]
+            start_date, end_date = str(first["date"]), str(last["date"])
+            period_ops = [x for x in operations if start_date <= str(x.get("at") or "")[:10] <= end_date]
+            traded_amount = sum(_safe_float(x.get("price")) * int(x.get("quantity") or 0) for x in period_ops)
+            transaction_cost = sum(
+                sum(_safe_float(x.get(fee)) for fee in ("commission", "transfer_fee", "stamp_tax"))
+                for x in period_ops
+            )
+            rejected = 0
+            market_gate_blocks = 0
+            for run in task_runs:
+                if not (start_date <= str(run.get("execute_date") or "") <= end_date):
+                    continue
+                detail = run.get("detail") or {}
+                blocked = detail.get("blocked_events") or []
+                rejected += len(blocked)
+                market_gate_blocks += sum(1 for item in blocked if "market" in str(item.get("code") or "").lower())
+            model_error_count = sum(
+                1 for review in review_records
+                if start_date <= str(review.get("review_time") or "")[:10] <= end_date
+                and str(review.get("error_type") or "") not in {"", "运气因素"}
+            )
+            human_interventions = [
+                item for item in intervention_records
+                if start_date <= str(item.get("changed_at") or "")[:10] <= end_date
+                and str(item.get("intervention_type") or "none") != "none"
+            ]
+            realized_selection = sum(value for date, value in realized_by_date.items() if start_date <= date <= end_date)
+            formal_attribution = {key: sum(value.get(key, 0.0) for date, value in attribution_by_date.items() if start_date <= date <= end_date) for key in ("market", "industry", "selection", "execution")}
+            has_formal_attribution = any(start_date <= date <= end_date for date in attribution_by_date)
+            absolute_return = end - start
             out.append({
                 "period": key,
-                "start_date": first["date"],
-                "end_date": last["date"],
-                "return_pct": round((end / start - 1.0) * 100.0, 4) if start else 0.0,
+                "start_date": start_date,
+                "end_date": end_date,
+                "return_pct": round((end_index / start_index - 1.0) * 100.0, 4) if start_index else 0.0,
+                "absolute_return": round(absolute_return, 4),
                 "benchmark_return_pct": round((bm_end / bm_start - 1.0) * 100.0, 4) if bm_start else None,
                 "max_drawdown_pct": round(min(drawdowns), 4) if drawdowns else 0.0,
+                "turnover_rate": round(traded_amount / ((start + end) / 2.0), 6) if (start + end) > 0 else 0.0,
+                "traded_amount": round(traded_amount, 4),
+                "transaction_cost": round(transaction_cost, 4),
+                "cash_defensive_contribution": 0.0,
+                "stock_selection_contribution": round(formal_attribution["selection"] if has_formal_attribution else realized_selection, 4),
+                "industry_allocation_contribution": round(formal_attribution["industry"], 4) if has_formal_attribution else None,
+                "market_contribution": round(formal_attribution["market"], 4) if has_formal_attribution else None,
+                "execution_contribution": round(formal_attribution["execution"], 4) if has_formal_attribution else round(-transaction_cost, 4),
+                "market_state_gate": {"blocked_signals": market_gate_blocks},
+                "model_error_count": model_error_count,
+                "human_unexecuted_difference": {"count": len(human_interventions), "amount": None, "interventions": [{"ts_code": item.get("ts_code"), "type": item.get("intervention_type"), "actor": item.get("intervention_actor")} for item in human_interventions]},
+                "rejected_signal_count": rejected,
+                "attribution_status": "complete" if has_formal_attribution else "partial" if period_ops else "no_trades",
+                "attribution_limitations": [] if has_formal_attribution else ["尚无已实现且绑定决策快照的FIFO批次", "人工未执行差异需存在用户否决记录"],
                 "points": len(points),
             })
         return out
@@ -811,6 +945,11 @@ def quant_run_performance(task_id: int | None = Query(None, ge=1), benchmark: st
     result = {
         "task_id": task_id,
         "benchmark": benchmark,
+        # A daily row is the durable counterpart of the per-run
+        # ``daily_rebalance_report``.  Keep it in the same aggregation path
+        # as the longer horizons so all reports use identical equity, cost,
+        # attribution and gate definitions.
+        "daily": aggregate(lambda d: d),
         "weekly": aggregate(lambda d: f"{d[:4]}-W{datetime.fromisoformat(d).isocalendar().week:02d}"),
         "monthly": aggregate(lambda d: d[:7]),
         "yearly": aggregate(lambda d: d[:4]),
@@ -818,7 +957,7 @@ def quant_run_performance(task_id: int | None = Query(None, ge=1), benchmark: st
     }
     try:
         result["persisted_reports"] = save_performance_reports(
-            task_id, {k: result[k] for k in ("weekly", "monthly", "yearly")}
+            task_id, {k: result[k] for k in ("daily", "weekly", "monthly", "yearly")}
         )
     except Exception:
         result["persisted_reports"] = 0

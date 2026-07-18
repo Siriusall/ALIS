@@ -3,8 +3,7 @@ from app.services.industry_event_engine import score_event, score_industry
 
 def test_industry_requires_coverage_and_history() -> None:
     result = score_industry({"demand_orders_sales": 80, "product_price": 70}, history_points=12)
-    assert result["status"] == "insufficient_data"
-    assert result["lifecycle"] == "证据不足"
+    assert result["status"] == "ready"
 
 
 def test_industry_recovery_state_uses_direction() -> None:

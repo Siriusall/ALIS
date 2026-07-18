@@ -10,6 +10,7 @@ from app.db.store import (
     get_model_train_run,
     get_model_version,
     list_model_versions,
+    update_model_version_status,
 )
 
 
@@ -87,16 +88,41 @@ def models_root() -> Path:
     return root
 
 
+def model_artifact_status(version: dict[str, Any] | None) -> dict[str, Any]:
+    if not version:
+        return {"ok": False, "status": "missing_version", "reason": "model_version_not_found"}
+    path = str(version.get("artifact_path") or "").strip()
+    if not path:
+        return {"ok": False, "status": "missing_artifact_path", "reason": "artifact_path_empty"}
+    p = Path(path)
+    if not p.exists() or not p.is_file():
+        return {"ok": False, "status": "artifact_missing", "reason": "artifact_file_not_found", "artifact_path": path}
+    return {"ok": True, "status": "ready", "artifact_path": path}
+
+
+def reconcile_active_model_artifact(model_key: str = MODEL_KEY) -> dict[str, Any] | None:
+    active = get_active_model_version(model_key)
+    status = model_artifact_status(active)
+    if active and not status.get("ok"):
+        update_model_version_status(int(active["id"]), status=str(status["status"]), is_active=False)
+        return {**active, "artifact_status": status, "is_active": False, "status": str(status["status"])}
+    return None
+
+
 def get_model_status() -> dict[str, Any]:
+    invalid_active = reconcile_active_model_artifact(MODEL_KEY)
     active = get_active_model_version(MODEL_KEY)
     latest_run = get_latest_model_train_run()
     versions = list_model_versions(MODEL_KEY, limit=10)
+    active_artifact = model_artifact_status(active) if active else {"ok": False, "status": "no_active_model"}
     return {
         "model_key": MODEL_KEY,
         "active_version": active,
+        "active_artifact": active_artifact,
+        "invalid_active_version": invalid_active,
         "latest_train_run": latest_run,
         "versions": versions,
-        "has_active_model": active is not None,
+        "has_active_model": active is not None and bool(active_artifact.get("ok")),
         "constitution": MODEL_CONSTITUTION,
     }
 

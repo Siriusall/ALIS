@@ -65,8 +65,8 @@ class BacktestDataSource:
         try:
             with _conn() as conn:
                 rows = conn.execute(
-                    """SELECT DISTINCT trade_date FROM dc_tushare_raw_records
-                       WHERE api_name='daily' AND trade_date BETWEEN ? AND ? ORDER BY trade_date""",
+                    """SELECT trade_date FROM dc_available_trade_dates
+                       WHERE trade_date BETWEEN ? AND ? ORDER BY trade_date""",
                     (start.replace("-", ""), end.replace("-", "")),
                 ).fetchall()
             return [self._fmt_date(str(dict(row).get("trade_date") or "")) for row in rows]
@@ -90,7 +90,7 @@ class BacktestDataSource:
             logger.warning("PostgreSQL backtest daily read failed: %s", str(exc)[:160])
             return []
 
-    def preload_histories(self, symbols: List[str]) -> None:
+    def preload_histories(self, symbols: List[str], *, end_date: str | None = None, lookback: int | None = None) -> None:
         """Batch-load PostgreSQL history to avoid one query per factor row."""
         wanted = []
         for raw in symbols:
@@ -102,26 +102,49 @@ class BacktestDataSource:
         if not wanted:
             return
         grouped: Dict[str, List[HistBar]] = {code: [] for code, _ in wanted}
+        end_ymd = str(end_date or "").replace("-", "")[:8]
+        date_clause = ""
+        date_params: tuple[str, ...] = ()
+        if len(end_ymd) == 8 and end_ymd.isdigit():
+            limit_days = max(1, int(lookback or 0) + 5) if lookback else 0
+            start_ymd = ""
+            if limit_days:
+                with _conn() as conn:
+                    row = conn.execute(
+                        """SELECT MIN(trade_date) AS start_date FROM (
+                             SELECT trade_date FROM dc_available_trade_dates
+                             WHERE trade_date<=?
+                             ORDER BY trade_date DESC LIMIT ?
+                           ) d""",
+                        (end_ymd, limit_days),
+                    ).fetchone()
+                start_ymd = str(dict(row).get("start_date") or "") if row else ""
+            if len(start_ymd) == 8 and start_ymd.isdigit():
+                date_clause = " AND trade_date BETWEEN ? AND ?"
+                date_params = (start_ymd, end_ymd)
+            else:
+                date_clause = " AND trade_date<=?"
+                date_params = (end_ymd,)
         try:
             for offset in range(0, len(wanted), 500):
                 batch = wanted[offset : offset + 500]
                 placeholders = ",".join("?" for _ in batch)
                 with _conn() as conn:
                     rows = conn.execute(
-                        f"""SELECT ts_code,trade_date,payload_json FROM dc_tushare_raw_records
-                            WHERE api_name='daily' AND ts_code IN ({placeholders}) ORDER BY ts_code,trade_date""",
-                        tuple(ts_code for _, ts_code in batch),
+                        f"""SELECT ts_code,trade_date,close,volume,turnover FROM dc_stock_daily_snapshot
+                            WHERE ts_code IN ({placeholders}){date_clause}
+                            ORDER BY ts_code,trade_date""",
+                        tuple(ts_code for _, ts_code in batch) + date_params,
                     ).fetchall()
                 for raw_row in rows:
                     item = dict(raw_row)
-                    payload = json.loads(str(item.get("payload_json") or "{}"))
                     code = str(item.get("ts_code") or "").split(".", 1)[0].zfill(6)
                     if code in grouped:
                         grouped[code].append(HistBar(
-                            date=self._fmt_date(str(payload.get("trade_date") or item.get("trade_date") or "")),
-                            open=float(payload.get("open") or 0), high=float(payload.get("high") or 0),
-                            low=float(payload.get("low") or 0), close=float(payload.get("close") or 0),
-                            volume=float(payload.get("vol") or 0), turnover=float(payload.get("amount") or 0),
+                            date=self._fmt_date(str(item.get("trade_date") or "")),
+                            open=float(item.get("close") or 0), high=float(item.get("close") or 0),
+                            low=float(item.get("close") or 0), close=float(item.get("close") or 0),
+                            volume=float(item.get("volume") or 0), turnover=float(item.get("turnover") or 0),
                         ))
         except Exception as exc:  # noqa: BLE001
             logger.warning("PostgreSQL backtest history preload failed: %s", str(exc)[:160])
@@ -476,18 +499,18 @@ class BacktestDataSource:
             suffix = ".SH" if code.startswith(("6", "9")) else ".SZ" if code.startswith(("0", "3")) else ".BJ"
             with _conn() as conn:
                 rows = conn.execute(
-                    """SELECT trade_date,payload_json FROM dc_tushare_raw_records
-                       WHERE api_name='daily' AND ts_code=? ORDER BY trade_date""",
+                    """SELECT trade_date,close,volume,turnover FROM dc_stock_daily_snapshot
+                       WHERE ts_code=? ORDER BY trade_date""",
                     (f"{code}{suffix}",),
                 ).fetchall()
             postgres_bars = []
             for raw in rows:
-                payload = json.loads(str(dict(raw).get("payload_json") or "{}"))
+                item = dict(raw)
                 postgres_bars.append(HistBar(
-                    date=self._fmt_date(str(payload.get("trade_date") or dict(raw).get("trade_date") or "")),
-                    open=float(payload.get("open") or 0), high=float(payload.get("high") or 0),
-                    low=float(payload.get("low") or 0), close=float(payload.get("close") or 0),
-                    volume=float(payload.get("vol") or 0), turnover=float(payload.get("amount") or 0),
+                    date=self._fmt_date(str(item.get("trade_date") or "")),
+                    open=float(item.get("close") or 0), high=float(item.get("close") or 0),
+                    low=float(item.get("close") or 0), close=float(item.get("close") or 0),
+                    volume=float(item.get("volume") or 0), turnover=float(item.get("turnover") or 0),
                 ))
             if postgres_bars:
                 self._hist_cache[code] = postgres_bars

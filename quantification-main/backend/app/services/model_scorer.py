@@ -23,6 +23,8 @@ def _safe_float(v: Any) -> float:
 @lru_cache(maxsize=16)
 def _load_artifact(path: str) -> dict[str, Any]:
     p = Path(path)
+    if not p.exists() or not p.is_file():
+        raise FileNotFoundError(f"model artifact not found: {path}")
     payload = json.loads(p.read_text(encoding="utf-8"))
     if payload.get("model_path"):
         try:

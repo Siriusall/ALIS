@@ -25,6 +25,14 @@ def simulate_open_execution(
     max_single_position_pct: float = 1.0,
     existing_position_value: dict[str, float] | None = None,
     symbol_scores: dict[str, float] | None = None,
+    industry_by_symbol: dict[str, str] | None = None,
+    existing_industry_value: dict[str, float] | None = None,
+    max_industry_position_pct: float = 1.0,
+    target_weights: dict[str, float] | None = None,
+    symbol_position_limits: dict[str, float] | None = None,
+    max_correlated_industry_pct: float = 1.0,
+    high_risk_symbols: set[str] | None = None,
+    max_order_value_by_symbol: dict[str, float] | None = None,
 ) -> ExecutionState:
     """
     按真实 A 股规则模拟买入：1手=100股、滑点、佣金、过户费。
@@ -38,6 +46,14 @@ def simulate_open_execution(
         max_single_position_pct=max_single_position_pct,
         existing_position_value=existing_position_value,
         symbol_scores=symbol_scores,
+        industry_by_symbol=industry_by_symbol,
+        existing_industry_value=existing_industry_value,
+        max_industry_position_pct=max_industry_position_pct,
+        target_weights=target_weights,
+        symbol_position_limits=symbol_position_limits,
+        max_correlated_industry_pct=max_correlated_industry_pct,
+        high_risk_symbols=high_risk_symbols,
+        max_order_value_by_symbol=max_order_value_by_symbol,
     )
     orders = planned_to_order_results(planned) + blocked
     return ExecutionState(executed_at=executed_at or datetime.utcnow().isoformat(), orders=orders)
@@ -78,7 +94,7 @@ def simulate_open_execution_legacy(
                 )
             )
             continue
-        exec_price = apply_slippage_buy(raw_price)
+        exec_price = apply_slippage_buy(raw_price, order.symbol)
         qty = normalize_lot_quantity(int(per_order_budget / exec_price))
         if qty <= 0:
             orders.append(
@@ -93,7 +109,7 @@ def simulate_open_execution_legacy(
                 )
             )
             continue
-        amount, comm, trans = cost_buy(exec_price, qty)
+        amount, comm, trans = cost_buy(exec_price, qty, order.symbol)
         orders.append(
             OrderResult(
                 symbol=order.symbol,

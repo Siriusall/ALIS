@@ -4,6 +4,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
 from app.api.state import add_log, ensure_manual_trade_allowed
+from app.core.a_share_fees import FEE_SCHEDULE_VERSION
 from app.db.store import (
     add_account_balance,
     create_execution,
@@ -86,6 +87,7 @@ def execute_open(req: ExecuteRequest) -> ExecutionResponse:
     add_account_balance(-total_cost)
     strategy_id_for_db = (strategy or {}).get("id") or get_default_strategy_id()
     filled_orders = [o for o in result.orders if int(getattr(o, "quantity", 0) or 0) > 0]
+    request_price_by_symbol = {str(o.symbol): float(o.price) for o in order_requests}
     orders_payload = [
         {
             "symbol": o.symbol,
@@ -94,6 +96,10 @@ def execute_open(req: ExecuteRequest) -> ExecutionResponse:
             "quantity": o.quantity,
             "commission": getattr(o, "commission", 0),
             "transfer_fee": getattr(o, "transfer_fee", 0),
+            "slippage_bps": round(
+                (float(o.price) / request_price_by_symbol[str(o.symbol)] - 1.0) * 10000.0, 4
+            ) if request_price_by_symbol.get(str(o.symbol)) else 0.0,
+            "fee_schedule_version": FEE_SCHEDULE_VERSION,
             "name": name_by_symbol.get(o.symbol, ""),
         }
         for o in filled_orders

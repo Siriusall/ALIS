@@ -42,12 +42,16 @@ def _derive_thesis_state(hypotheses: list[dict[str, Any]]) -> tuple[str, float]:
     if not hypotheses:
         return "draft", 0.0
     necessary_failed = any(bool(x.get("necessary")) and x.get("status") in {"failed", "invalidated"} for x in hypotheses)
-    core_failed = any(x.get("status") == "invalidated" for x in hypotheses)
+    has_warning = any(x.get("status") in {"warning", "failed"} for x in hypotheses)
     verified = sum(1 for x in hypotheses if x.get("status") == "verified")
     confidence = verified / len(hypotheses) * 100.0
     if necessary_failed:
         confidence = min(confidence, 40.0)
-    status = "invalidated" if core_failed else "warning" if necessary_failed else "valid" if verified == len(hypotheses) else "watch"
+    # A failed necessary condition is the formal falsification of the thesis,
+    # not merely a confidence warning.  Once invalidated it is intentionally
+    # kept out of automated re-entry until an operator explicitly updates the
+    # affected hypothesis through the audited API.
+    status = "invalidated" if necessary_failed else "warning" if has_warning else "valid" if verified == len(hypotheses) else "watch"
     return status, round(confidence, 2)
 
 
@@ -106,7 +110,11 @@ def review_thesis(thesis_id: int) -> dict[str, Any] | None:
         metric = str(hypothesis.get("metric") or "")
         expected = hypothesis.get("expected") or {}
         value = metrics.get(metric)
-        if not metric or value is None:
+        prior_status = str(hypothesis.get("status") or "")
+        if prior_status == "invalidated":
+            status = "invalidated"
+            reason = "此前已触发失效；需要人工显式恢复后才可重新评价"
+        elif not metric or value is None:
             status = "unverified"
             reason = "指标尚无合格点时数据"
         else:
@@ -116,12 +124,13 @@ def review_thesis(thesis_id: int) -> dict[str, Any] | None:
             warning_min = expected.get("warning_min")
             warning_max = expected.get("warning_max")
             warning = (warning_min is not None and float(value) < float(warning_min)) or (warning_max is not None and float(value) > float(warning_max))
-            status = "failed" if failed else "warning" if warning else "verified"
-            reason = "超出失效范围" if failed else "进入预警范围" if warning else "满足预期范围"
+            status = "invalidated" if failed and bool(hypothesis.get("necessary")) else "failed" if failed else "warning" if warning else "verified"
+            reason = "触发必要条件失效" if status == "invalidated" else "超出失效范围" if failed else "进入预警范围" if warning else "满足预期范围"
+        prior_evidence = list(hypothesis.get("evidence") or [])
         update_hypothesis(
             int(hypothesis["id"]),
             status=status,
-            evidence=[{"metric": metric, "value": value, "expected": expected, "reason": reason, "sources": evidence_base, "checked_at": _now()}],
+            evidence=(prior_evidence[-19:] + [{"metric": metric, "value": value, "expected": expected, "reason": reason, "sources": evidence_base, "checked_at": _now()}]),
         )
     return get_thesis(thesis_id)
 
@@ -155,3 +164,75 @@ def review_due_theses(*, limit: int = 100, review_interval_days: int = 30) -> di
         except Exception as exc:  # noqa: BLE001
             failed.append({"thesis_id": thesis_id, "error": str(exc)[:300]})
     return {"ok": not failed, "due": len(rows), "reviewed": reviewed, "failed": failed, "next_review_interval_days": max(1, int(review_interval_days))}
+
+
+def generate_thesis_for_stock(ts_code: str, *, force: bool = False) -> dict[str, Any]:
+    """Create or refresh a falsifiable system thesis from authoritative research facts."""
+    from app.services.research_engine import build_stock_research
+
+    code = str(ts_code).strip().upper()
+    research = build_stock_research(code, persist=True)
+    if not research.get("ok"):
+        return {"ok": False, "ts_code": code, "status": "blocked", "reason": research.get("reason") or "research_unavailable"}
+    if not research.get("risk", {}).get("eligible"):
+        return {"ok": False, "ts_code": code, "status": "blocked", "reason": "risk_hard_veto", "research": research.get("risk")}
+    ready = [key for key, value in (research.get("dimensions") or {}).items() if value.get("status") == "ready"]
+    if len(ready) < 3:
+        return {"ok": False, "ts_code": code, "status": "insufficient_evidence", "reason": "fewer_than_three_ready_dimensions", "ready_dimensions": ready}
+
+    all_existing = [item for item in list_theses(ts_code=code, limit=50) if item.get("thesis_type") == "system_research_v1"]
+    invalidated = [item for item in all_existing if item.get("derived_status") == "invalidated"]
+    if invalidated and not force:
+        return {
+            "ok": False, "ts_code": code, "status": "blocked", "reason": "invalidated_thesis_requires_manual_reset",
+            "item": invalidated[0],
+        }
+    existing = [item for item in all_existing if item.get("derived_status") != "invalidated"]
+    if existing and not force:
+        reviewed = review_thesis(int(existing[0]["id"]))
+        return {"ok": True, "ts_code": code, "status": "reviewed_existing", "created": False, "item": reviewed}
+
+    metrics = research.get("raw_metrics") or {}
+    classification = research.get("research_state", {}).get("classification") or "研究观察"
+    profile = research.get("profile") or {}
+    hypotheses: list[dict[str, Any]] = []
+
+    def add(statement: str, metric: str, *, minimum: float | None = None, maximum: float | None = None, warning_min: float | None = None, warning_max: float | None = None, necessary: bool = True) -> None:
+        if metrics.get(metric) is None:
+            return
+        expected = {key: value for key, value in {"min": minimum, "max": maximum, "warning_min": warning_min, "warning_max": warning_max}.items() if value is not None}
+        hypotheses.append({"statement": statement, "metric": metric, "necessary": necessary, "expected": expected})
+
+    add("收入增长不能持续恶化", "revenue_growth", minimum=-10, warning_min=0)
+    add("核心利润不能进入显著衰退", "core_profit_growth", minimum=-15, warning_min=0)
+    add("经营现金流应能支持账面利润", "cash_conversion", minimum=0, warning_min=.5)
+    add("资产负债水平不得突破风险边界", "debt_to_assets", maximum=90, warning_max=80)
+    add("基准估值情景应保留正安全边际", "valuation_base_upside", minimum=0, warning_min=.1)
+    add("增长加速度不应显著转负", "growth_acceleration", minimum=-20, warning_min=-5, necessary=False)
+    if not hypotheses:
+        return {"ok": False, "ts_code": code, "status": "insufficient_evidence", "reason": "no_machine_checkable_hypotheses"}
+
+    dimension_summary = "、".join(f"{key}:{research['dimensions'][key]['score']:.1f}" for key in ready)
+    item = create_thesis({
+        "ts_code": code,
+        "title": f"{profile.get('name') or code} · {classification}",
+        "thesis_type": "system_research_v1",
+        "core_thesis": f"系统基于{dimension_summary}形成候选逻辑；只有必要条件持续成立且组合风险允许时才可建仓。",
+        "next_review_at": datetime.now().isoformat(timespec="seconds"),
+        "hypotheses": hypotheses,
+    })
+    reviewed = review_thesis(int(item["id"]))
+    return {"ok": True, "ts_code": code, "status": "created_and_reviewed", "created": True, "item": reviewed, "ready_dimensions": ready}
+
+
+def generate_watch_pool_theses(*, limit: int = 100) -> dict[str, Any]:
+    """Generate managed theses for watch candidates without promoting their pool tier."""
+    from app.services.decision_store import list_pool_members
+
+    members = list_pool_members("watch")[:max(1, min(int(limit), 500))]
+    generated: list[dict[str, Any]] = []
+    blocked: list[dict[str, Any]] = []
+    for member in members:
+        result = generate_thesis_for_stock(str(member.get("ts_code") or ""))
+        (generated if result.get("ok") else blocked).append(result)
+    return {"ok": True, "candidates": len(members), "generated_or_reviewed": generated, "blocked": blocked}

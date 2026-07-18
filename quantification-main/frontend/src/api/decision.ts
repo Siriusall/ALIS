@@ -112,3 +112,24 @@ export async function fetchDecisionSummary(limitDays = 30): Promise<DecisionSumm
   });
   return data;
 }
+
+export interface DailyReportSection {
+  title: string;
+  [key: string]: unknown;
+}
+
+export interface DailyRebalanceReport {
+  ok: boolean;
+  generated_at: string;
+  trade_date: string;
+  sections: DailyReportSection[];
+  summary: {
+    decision: string;
+    tone: string;
+  };
+}
+
+export async function fetchDailyReport(): Promise<DailyRebalanceReport> {
+  const { data } = await api.get<DailyRebalanceReport>("/api/decision/daily-report");
+  return data;
+}

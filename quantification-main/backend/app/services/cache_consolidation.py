@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import threading
+import time
 from collections import defaultdict
 from datetime import datetime
 from math import sqrt
@@ -17,6 +18,9 @@ _full_sync_lock = threading.Lock()
 _full_sync_running = False
 _meta_backfill_lock = threading.Lock()
 _meta_backfill_running = False
+_available_trade_dates_cache: tuple[float, List[str]] = (0.0, [])
+_available_trade_dates_lock = threading.Lock()
+_AVAILABLE_TRADE_DATES_TTL_SECONDS = 30.0
 
 # 单次 API 允许返回的最大行数（无 symbols 时的保护上限）
 MAX_SYMBOL_ROWS_PER_REQUEST = 50000
@@ -1169,16 +1173,58 @@ def list_daily_cache_trade_dates() -> List[str]:
 
 def list_available_trade_dates() -> List[str]:
     """可用于合并/量化任务的交易日：已落盘 all-in-one + daily 可展开日期。"""
+    global _available_trade_dates_cache
+    now = time.monotonic()
+    with _available_trade_dates_lock:
+        cached_at, cached_dates = _available_trade_dates_cache
+        if cached_dates and now - cached_at <= _AVAILABLE_TRADE_DATES_TTL_SECONDS:
+            return list(cached_dates)
     try:
         from app.data_platform.db import _conn
         with _conn() as conn:
-            rows = conn.execute(
-                "SELECT DISTINCT trade_date FROM dc_tushare_raw_records WHERE api_name='daily' ORDER BY trade_date"
-            ).fetchall()
-        return [
-            value for value in (str(dict(row).get("trade_date") or "") for row in rows)
-            if _normalize_ymd(value)
-        ]
+            rows = conn.execute("SELECT trade_date FROM dc_available_trade_dates ORDER BY trade_date").fetchall()
+            dates = [
+                value for value in (str(dict(row).get("trade_date") or "") for row in rows)
+                if _normalize_ymd(value)
+            ]
+            if not dates:
+                rows = conn.execute(
+                    """SELECT cal.cal_date AS trade_date
+                       FROM dc_trade_calendar cal
+                       WHERE cal.is_open=1
+                         AND EXISTS (
+                           SELECT 1 FROM dc_stock_daily_snapshot s
+                           WHERE s.trade_date=cal.cal_date
+                           LIMIT 1
+                         )
+                       ORDER BY cal.cal_date"""
+                ).fetchall()
+                dates = [
+                    value for value in (str(dict(row).get("trade_date") or "") for row in rows)
+                    if _normalize_ymd(value)
+                ]
+                stamp = datetime.now().isoformat(timespec="seconds")
+                for value in dates:
+                    conn.execute(
+                        """INSERT INTO dc_available_trade_dates(trade_date,source_code,available_time,updated_at)
+                           VALUES(?,?,?,?)
+                           ON CONFLICT(trade_date) DO UPDATE SET
+                             source_code=excluded.source_code,
+                             available_time=excluded.available_time,
+                             updated_at=excluded.updated_at""",
+                        (value, "dc_stock_daily_snapshot", f"{value[:4]}-{value[4:6]}-{value[6:8]}T15:00:00", stamp),
+                    )
+            if not dates:
+                rows = conn.execute(
+                    "SELECT DISTINCT trade_date FROM dc_tushare_raw_records WHERE api_name='daily' ORDER BY trade_date"
+                ).fetchall()
+                dates = [
+                    value for value in (str(dict(row).get("trade_date") or "") for row in rows)
+                    if _normalize_ymd(value)
+                ]
+        with _available_trade_dates_lock:
+            _available_trade_dates_cache = (time.monotonic(), list(dates))
+        return dates
     except Exception as exc:  # noqa: BLE001
         logger.warning("PostgreSQL available-trade-dates read failed: %s", str(exc)[:120])
         return []
@@ -1292,4 +1338,3 @@ def run_full_sync_background(skip_existing: bool = True, cleanup_sources: bool =
     t = threading.Thread(target=_run, daemon=True)
     t.start()
     return True
-

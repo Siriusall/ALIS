@@ -1,0 +1,204 @@
+from __future__ import annotations
+
+from datetime import datetime
+import json
+from typing import Any
+
+from app.data_platform.db import _conn
+from app.services.market_context import score_theme_narratives
+
+
+def _clip(value: float, low: float = 0.0, high: float = 1.0) -> float:
+    return max(low, min(high, float(value)))
+
+
+def _lifecycle(*, score: float, momentum: float, breadth: float, crowding: float) -> str:
+    if momentum < -.01:
+        return "退潮" if score >= 40 else "沉寂"
+    if score >= 80 and crowding >= .65:
+        return "亢奋"
+    if score >= 70 and breadth >= .65:
+        return "加速"
+    if score >= 55 and breadth >= .55:
+        return "扩散"
+    if score >= 40 and momentum > 0:
+        return "启动"
+    return "萌芽"
+
+
+def materialize_theme_snapshots(*, as_of_time: str | None = None, lookback: int = 20) -> dict[str, Any]:
+    cutoff = str(as_of_time or "")
+    cutoff_date = cutoff[:10].replace("-", "")
+    with _conn() as c:
+        if cutoff_date:
+            date_rows = c.execute(
+                "SELECT DISTINCT trade_date FROM dc_stock_daily_snapshot WHERE trade_date<=? ORDER BY trade_date DESC LIMIT ?",
+                (cutoff_date, max(5, min(int(lookback), 60))),
+            ).fetchall()
+        else:
+            date_rows = c.execute(
+                "SELECT DISTINCT trade_date FROM dc_stock_daily_snapshot ORDER BY trade_date DESC LIMIT ?",
+                (max(5, min(int(lookback), 60)),),
+            ).fetchall()
+        dates = sorted(str(dict(row).get("trade_date") or "") for row in date_rows)
+        if len(dates) < 3:
+            return {"ok": False, "status": "insufficient_data", "reason": "fewer_than_three_market_sessions"}
+        placeholders = ",".join("?" for _ in dates)
+        aggregates = [dict(row) for row in c.execute(
+            f"""SELECT industry,trade_date,COUNT(*) company_count,
+                       AVG(change_pct) average_change_pct,
+                       SUM(CASE WHEN change_pct>0 THEN 1 ELSE 0 END)::double precision/NULLIF(COUNT(*),0) breadth,
+                       SUM(COALESCE(turnover,0)) turnover
+                FROM dc_stock_daily_snapshot
+                WHERE trade_date IN ({placeholders}) AND COALESCE(industry,'')<>''
+                GROUP BY industry,trade_date ORDER BY industry,trade_date""", tuple(dates),
+        ).fetchall()]
+        state_rows = [dict(row) for row in c.execute(
+            """SELECT * FROM (
+                   SELECT industry_name,state_json,evidence_json,as_of_date,
+                          ROW_NUMBER() OVER(PARTITION BY industry_name ORDER BY as_of_date DESC) rn
+                   FROM dc_industry_state_snapshot WHERE as_of_date<=?
+               ) ranked WHERE rn=1""", (dates[-1],),
+        ).fetchall()]
+        latest_companies = [dict(row) for row in c.execute(
+            """SELECT ts_code,name,industry,change_pct,turnover,total_mv,pe_ttm,pb
+               FROM dc_stock_daily_snapshot WHERE trade_date=? AND COALESCE(industry,'')<>''""",
+            (dates[-1],),
+        ).fetchall()]
+
+        by_industry: dict[str, list[dict[str, Any]]] = {}
+        for row in aggregates:
+            by_industry.setdefault(str(row.get("industry") or ""), []).append(row)
+        companies_by_industry: dict[str, list[dict[str, Any]]] = {}
+        for row in latest_companies:
+            companies_by_industry.setdefault(str(row.get("industry") or ""), []).append(row)
+        states: dict[str, dict[str, Any]] = {}
+        for row in state_rows:
+            try:
+                row["state"] = json.loads(row.get("state_json") or "{}")
+                row["evidence"] = json.loads(row.get("evidence_json") or "{}")
+            except (TypeError, json.JSONDecodeError):
+                row["state"], row["evidence"] = {}, {}
+            states[str(row.get("industry_name") or "")] = row
+
+        candidates: list[dict[str, Any]] = []
+        raw_by_name: dict[str, dict[str, Any]] = {}
+        for industry, sessions in by_industry.items():
+            companies = companies_by_industry.get(industry) or []
+            if len(sessions) < 3 or len(companies) < 5:
+                continue
+            changes = [float(item.get("average_change_pct") or 0) / 100.0 for item in sessions]
+            breadth_values = [float(item.get("breadth") or 0) for item in sessions]
+            turnovers = [float(item.get("turnover") or 0) for item in sessions]
+            recent_n = min(5, len(changes))
+            momentum = sum(changes[-recent_n:])
+            prior = sum(changes[:-recent_n]) / max(1, len(changes) - recent_n)
+            price_confirmation = _clip(.5 + (momentum - prior * recent_n) * 5)
+            breadth = _clip(sum(breadth_values[-recent_n:]) / recent_n)
+            persistence = _clip(sum(1 for value in changes[-recent_n:] if value > 0) / recent_n)
+            average_turnover = sum(turnovers[:-recent_n]) / max(1, len(turnovers) - recent_n) if len(turnovers) > recent_n else sum(turnovers) / len(turnovers)
+            liquidity = _clip((sum(turnovers[-recent_n:]) / recent_n) / max(average_turnover, 1e-9) / 2)
+            company_turnover = sorted((float(item.get("turnover") or 0) for item in companies), reverse=True)
+            crowding = _clip(sum(company_turnover[:max(1, len(company_turnover) // 10)]) / max(sum(company_turnover), 1e-9))
+            state = (states.get(industry) or {}).get("state") or {}
+            fundamental = _clip(float(state.get("score") or 0) / 100.0) if state.get("status") == "ready" else 0.0
+            source_types = int(price_confirmation > 0) + int(fundamental > 0)
+            item = {
+                "theme": f"{industry}景气",
+                "narrative_strength": fundamental,
+                "price_confirmation": price_confirmation,
+                "breadth": breadth,
+                "capital_persistence": (persistence + liquidity) / 2,
+                "fundamental_verifiability": fundamental,
+                "catalyst_duration": persistence,
+                "source_policy_credibility": 1.0 if source_types >= 2 else .6,
+                "crowding": crowding,
+                "source_types": source_types,
+                "related_instruments": len(companies),
+                "sessions": len(sessions),
+            }
+            candidates.append(item)
+            raw_by_name[item["theme"]] = {"industry": industry, "companies": companies, "momentum": momentum, "breadth": breadth, "crowding": crowding, "state": state}
+
+        scored = score_theme_narratives(candidates)
+        now = datetime.now().isoformat(timespec="seconds")
+        written = mappings = 0
+        for item in scored:
+            raw = raw_by_name[item["theme"]]
+            item["lifecycle"] = _lifecycle(score=float(item["score"]), momentum=raw["momentum"], breadth=raw["breadth"], crowding=raw["crowding"])
+            item["knowledge_graph"] = {"theme": item["theme"], "industry": raw["industry"], "company_count": len(raw["companies"]), "evidence_types": ["price_volume"] + (["company_financial_aggregate"] if raw["state"].get("status") == "ready" else [])}
+            theme_code = f"industry:{raw['industry']}"
+            c.execute(
+                """INSERT INTO dc_theme_snapshot
+                   (as_of_date,theme_code,theme_name,lifecycle,score,promotable,payload_json,model_version,available_time,created_at,updated_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(as_of_date,theme_code) DO UPDATE SET
+                   theme_name=excluded.theme_name,lifecycle=excluded.lifecycle,score=excluded.score,
+                   promotable=excluded.promotable,payload_json=excluded.payload_json,
+                   model_version=excluded.model_version,available_time=excluded.available_time,updated_at=excluded.updated_at""",
+                (dates[-1], theme_code, item["theme"], item["lifecycle"], item["score"], 1 if item["promotable"] else 0,
+                 json.dumps(item, ensure_ascii=False), "industry_price_fundamental_theme_v1", cutoff or now, now, now),
+            )
+            written += 1
+            max_turnover = max((float(company.get("turnover") or 0) for company in raw["companies"]), default=1.0)
+            for company in sorted(raw["companies"], key=lambda value: float(value.get("turnover") or 0), reverse=True)[:50]:
+                leadership = _clip(float(company.get("turnover") or 0) / max(max_turnover, 1e-9))
+                exposure = round((.6 + .4 * leadership) * 100, 4)
+                evidence = {"industry_membership": raw["industry"], "price_leadership": leadership, "trade_date": dates[-1], "source": "dc_stock_daily_snapshot"}
+                c.execute(
+                    """INSERT INTO dc_theme_company_mapping(as_of_date,theme_code,ts_code,exposure_score,evidence_json,updated_at)
+                       VALUES(?,?,?,?,?,?) ON CONFLICT(as_of_date,theme_code,ts_code) DO UPDATE SET
+                       exposure_score=excluded.exposure_score,evidence_json=excluded.evidence_json,updated_at=excluded.updated_at""",
+                    (dates[-1], theme_code, company.get("ts_code"), exposure, json.dumps(evidence, ensure_ascii=False), now),
+                )
+                mappings += 1
+    return {"ok": True, "as_of_date": dates[-1], "themes_written": written, "company_mappings_written": mappings, "promotable": sum(1 for item in scored if item["promotable"]), "model_version": "industry_price_fundamental_theme_v1"}
+
+
+def list_themes(*, as_of_time: str | None = None, promotable_only: bool = False, limit: int = 100) -> dict[str, Any]:
+    cutoff = str(as_of_time or "")[:10].replace("-", "")
+    with _conn() as c:
+        clauses = []
+        params: list[Any] = []
+        if cutoff:
+            clauses.append("as_of_date<=?"); params.append(cutoff)
+        if promotable_only:
+            clauses.append("promotable=1")
+        where = "WHERE " + " AND ".join(clauses) if clauses else ""
+        rows = [dict(row) for row in c.execute(
+            f"""SELECT * FROM (
+                   SELECT s.*,ROW_NUMBER() OVER(PARTITION BY theme_code ORDER BY as_of_date DESC) rn
+                   FROM dc_theme_snapshot s {where}
+               ) ranked WHERE rn=1 ORDER BY promotable DESC,score DESC LIMIT ?""", tuple(params + [max(1, min(int(limit), 500))]),
+        ).fetchall()]
+        for row in rows:
+            row["payload"] = json.loads(row.pop("payload_json") or "{}")
+            mappings = [dict(item) for item in c.execute(
+                """SELECT ts_code,exposure_score,evidence_json FROM dc_theme_company_mapping
+                   WHERE as_of_date=? AND theme_code=? ORDER BY exposure_score DESC LIMIT 50""",
+                (row["as_of_date"], row["theme_code"]),
+            ).fetchall()]
+            for mapping in mappings:
+                mapping["evidence"] = json.loads(mapping.pop("evidence_json") or "{}")
+            row["companies"] = mappings
+    return {"ok": True, "items": rows, "count": len(rows), "as_of_time": as_of_time}
+
+
+def best_theme_for_stock(ts_code: str, *, as_of_time: str | None = None) -> dict[str, Any] | None:
+    code = str(ts_code or "").strip().upper()
+    cutoff = str(as_of_time or "")[:10].replace("-", "")
+    with _conn() as c:
+        clauses = ["m.ts_code=?", "s.promotable=1"]
+        params: list[Any] = [code]
+        if cutoff:
+            clauses.append("m.as_of_date<=?"); params.append(cutoff)
+        row = c.execute(
+            f"""SELECT s.*,m.exposure_score,m.evidence_json FROM dc_theme_company_mapping m
+                JOIN dc_theme_snapshot s ON s.as_of_date=m.as_of_date AND s.theme_code=m.theme_code
+                WHERE {' AND '.join(clauses)} ORDER BY m.as_of_date DESC,s.score DESC LIMIT 1""", tuple(params),
+        ).fetchone()
+    if not row:
+        return None
+    item = dict(row)
+    item["payload"] = json.loads(item.pop("payload_json") or "{}")
+    item["evidence"] = json.loads(item.pop("evidence_json") or "{}")
+    return item

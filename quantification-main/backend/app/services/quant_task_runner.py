@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import logging
 import threading
-from datetime import datetime, timezone, time as dtime
+from datetime import datetime, timezone, time as dtime, timedelta
 import os
 from time import perf_counter
-from typing import Tuple
+from typing import Any, Tuple
 
 from app.integrations.tushare_client import reset_tushare_client
 from app.core.trade_calendar import is_trade_day
@@ -31,7 +31,7 @@ from app.services.quant_run_engine import (
     run_for_trade_date,
     list_consolidated_trade_dates,
 )
-from app.services.quant_risk import RiskPauseDecision, evaluate_account_drawdown_gate, evaluate_consecutive_loss_gate, evaluate_data_health_gate, no_pause, pause_decision
+from app.services.quant_risk import RiskPauseDecision, evaluate_account_drawdown_gate, evaluate_consecutive_loss_gate, evaluate_data_health_gate, evaluate_latest_market_day_gate, evaluate_model_readiness_gate, no_pause, pause_decision
 from app.services.quant_task_state_machine import can_transition, normalize_status
 
 logger = logging.getLogger("quant.quant_task_runner")
@@ -47,6 +47,10 @@ _DEFAULT_MAX_CONSECUTIVE_LOSSES = max(0, min(int(os.getenv("QUANT_MAX_CONSECUTIV
 _DEFAULT_ENABLE_DATA_HEALTH_GATE = str(os.getenv("QUANT_ENABLE_DATA_HEALTH_GATE", "1")).strip().lower() in {"1", "true", "yes", "on"}
 _AUTO_SIMULATION_ENABLED = str(os.getenv("QUANT_AUTO_SIMULATION", "1")).strip().lower() in {"1", "true", "yes", "on"}
 _AUTO_SIMULATION_INTERVAL_SEC = max(60, min(int(os.getenv("QUANT_AUTO_SIMULATION_INTERVAL_SEC", "300")), 3600))
+_AUTO_SIMULATION_CLOSE_TIME = dtime(
+    max(0, min(int(os.getenv("QUANT_AUTO_SIMULATION_CLOSE_HOUR", "16")), 23)),
+    max(0, min(int(os.getenv("QUANT_AUTO_SIMULATION_CLOSE_MINUTE", "5")), 59)),
+)
 _auto_scheduler_started = False
 
 
@@ -76,6 +80,70 @@ def _refresh_performance_reports(task_id: int) -> None:
     threading.Timer(0.5, _request).start()
 
 
+def _refresh_research_cycle(task_id: int) -> None:
+    """After a durable trading batch, maintain managed theses from new evidence."""
+    limit = max(1, min(int(os.getenv("QUANT_RESEARCH_MAINTENANCE_LIMIT", "100")), 500))
+
+    def _run() -> None:
+        try:
+            from app.data_platform.services.data_center import enrich_financial_research_fields, financial_research_completeness
+            from app.services.decision_store import list_pool_members
+            from app.services.industry_event_engine import materialize_event_followups, materialize_industry_state_snapshots, review_linked_event_theses
+            from app.services.thesis_store import generate_watch_pool_theses, review_due_theses
+            from app.services.theme_engine import materialize_theme_snapshots
+            from app.services.defensive_assets import materialize_defensive_asset_history
+            from app.services.research_engine import materialize_pool_research_snapshots
+            from app.services.research_workflow import process_watch_pool
+
+            pool_codes: list[str] = []
+            for pool_type in ("core", "watch"):
+                for member in list_pool_members(pool_type):
+                    code = str(member.get("ts_code") or "")
+                    if code and code not in pool_codes:
+                        pool_codes.append(code)
+            enriched: list[dict[str, Any]] = []
+            enrich_limit = max(0, min(int(os.getenv("QUANT_RESEARCH_ENRICH_STOCKS", "1")), 5))
+            for code in pool_codes:
+                if len(enriched) >= enrich_limit:
+                    break
+                completeness = financial_research_completeness(code, period_limit=5)
+                if completeness.get("status") != "complete":
+                    result = enrich_financial_research_fields(code, period_limit=5, request_limit=20)
+                    enriched.append({"ts_code": code, "status": result.get("after", {}).get("status"), "requested": result.get("requested")})
+            generated = generate_watch_pool_theses(limit=limit)
+            promoted = process_watch_pool(limit=limit)
+            due = review_due_theses(limit=limit, review_interval_days=1)
+            event_reviews = review_linked_event_theses(limit=limit)
+            followups = materialize_event_followups(limit=500, thesis_reviews=event_reviews.get("reviewed") or [])
+            themes = materialize_theme_snapshots()
+            research_snapshots = materialize_pool_research_snapshots(
+                limit=max(1, min(int(os.getenv("QUANT_RESEARCH_SNAPSHOT_STOCKS", "100")), 500)),
+            )
+            today = datetime.now().date()
+            defensive_assets = materialize_defensive_asset_history(
+                start_date=(today - timedelta(days=10)).strftime("%Y%m%d"),
+                end_date=today.strftime("%Y%m%d"),
+            )
+            logger.info(
+                "research cycle refreshed task_id=%s watch=%s due=%s events=%s",
+                task_id, generated.get("candidates", 0), due.get("due", 0),
+                event_reviews.get("reviewed_count", len(event_reviews.get("reviewed") or [])),
+            )
+            if enriched:
+                materialized = materialize_industry_state_snapshots()
+                logger.info("research financial enrichment task_id=%s items=%s", task_id, enriched)
+                logger.info("industry states materialized task_id=%s result=%s", task_id, materialized)
+            logger.info("themes materialized task_id=%s result=%s", task_id, themes)
+            logger.info("research snapshots materialized task_id=%s result=%s", task_id, research_snapshots)
+            logger.info("watch pool processed task_id=%s result=%s", task_id, promoted)
+            logger.info("event followups materialized task_id=%s result=%s", task_id, followups)
+            logger.info("defensive assets refreshed task_id=%s result=%s", task_id, defensive_assets)
+        except Exception as exc:
+            logger.warning("research cycle refresh deferred task_id=%s: %s", task_id, exc)
+
+    threading.Timer(1.0, _run).start()
+
+
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -91,6 +159,62 @@ def _mark_running(task_id: int, running: bool) -> None:
             _running_task_ids.add(int(task_id))
         else:
             _running_task_ids.discard(int(task_id))
+
+
+def _market_slice_ready(stock_count: int, counts: dict[str, int]) -> bool:
+    """Apply the same daily / valuation / limit contract used by execution."""
+    return bool(stock_count) and (
+        counts["daily_n"] / stock_count >= 0.995
+        and counts["valuation_n"] / stock_count >= 0.95
+        and counts["limit_n"] / stock_count >= 0.99
+    )
+
+
+def _close_data_status() -> tuple[str, bool, dict[str, int]]:
+    """Return the close-of-day market slice status for the execution target.
+
+    The simulator must never silently fall back to yesterday merely because
+    today's market bundle has not been ingested yet.  Keep this check close to
+    the scheduler instead of relying on the short-lived readiness cache.
+    """
+    from app.data_platform.db import _conn
+    from app.data_platform.services.market_calendar import target_trade_date
+
+    with _conn() as c:
+        target = target_trade_date(c)
+        stock_count = int(dict(c.execute("SELECT COUNT(*) n FROM dc_stock_master").fetchone()).get("n") or 0)
+        row = c.execute(
+            """SELECT
+                 SUM(CASE WHEN close IS NOT NULL THEN 1 ELSE 0 END) AS daily_n,
+                 SUM(CASE WHEN total_mv IS NOT NULL THEN 1 ELSE 0 END) AS valuation_n,
+                 SUM(CASE WHEN up_limit IS NOT NULL AND down_limit IS NOT NULL THEN 1 ELSE 0 END) AS limit_n
+               FROM dc_stock_daily_snapshot WHERE trade_date=?""",
+            (target,),
+        ).fetchone()
+    counts = {key: int((dict(row).get(key) if row else 0) or 0) for key in ("daily_n", "valuation_n", "limit_n")}
+    # Keep the same thresholds as the data-contract used by trade decisions.
+    ready = _market_slice_ready(stock_count, counts)
+    return target, ready, {"stock_count": stock_count, **counts}
+
+
+def _ensure_close_data_ready() -> tuple[str, bool]:
+    """Start the durable daily update when today's execution slice is absent.
+
+    ``start_daily_update`` is single-flight, so scheduler ticks safely join an
+    in-progress update.  A later tick runs the simulator only after the bundle
+    has been written and passes the same data contract as the decision page.
+    """
+    target, ready, counts = _close_data_status()
+    if ready:
+        return target, True
+    from app.data_platform.services.daily_update import start_daily_update
+
+    result = start_daily_update()
+    if result.get("ok"):
+        logger.info("收盘日更已启动 target=%s counts=%s", target, counts)
+    elif result.get("reason") != "already_running":
+        logger.warning("收盘日更未启动 target=%s result=%s", target, result)
+    return target, False
 
 
 def start_auto_simulation_scheduler() -> bool:
@@ -111,9 +235,19 @@ def start_auto_simulation_scheduler() -> bool:
         while True:
             try:
                 now = datetime.now()
-                if now.weekday() < 5 and now.time() >= dtime(15, 35):
+                if now.weekday() < 5 and now.time() >= _AUTO_SIMULATION_CLOSE_TIME:
+                    target, data_ready = _ensure_close_data_ready()
+                    if not data_ready:
+                        # Do not execute against the latest *old* slice while
+                        # the target-day market bundle is still being fetched.
+                        threading.Event().wait(_AUTO_SIMULATION_INTERVAL_SEC)
+                        continue
                     dates = list_consolidated_trade_dates()
                     latest = str(dates[-1]) if dates else ""
+                    if latest != target:
+                        logger.warning("收盘日更已通过但合并行情尚未就绪 target=%s latest=%s", target, latest)
+                        threading.Event().wait(_AUTO_SIMULATION_INTERVAL_SEC)
+                        continue
                     if latest:
                         for task in list_active_quant_run_tasks():
                             status = str(task.get("status") or "").lower()
@@ -127,7 +261,7 @@ def start_auto_simulation_scheduler() -> bool:
             threading.Event().wait(_AUTO_SIMULATION_INTERVAL_SEC)
 
     threading.Thread(target=_loop, name="quant-auto-simulation", daemon=True).start()
-    logger.info("自动模拟调度已启动，收盘后每 %ss 检查一次", _AUTO_SIMULATION_INTERVAL_SEC)
+    logger.info("自动模拟调度已启动，%s 后每 %ss 检查日更与执行条件", _AUTO_SIMULATION_CLOSE_TIME.strftime("%H:%M"), _AUTO_SIMULATION_INTERVAL_SEC)
     return True
 
 
@@ -408,6 +542,32 @@ def _persist_step_result(
     exchange_group: str,
     mode: str,
 ) -> int:
+    detail = dict(result.detail or {})
+    current_cash_only = not bool(detail.get("current_positions"))
+    consecutive_cash_days = 1 if current_cash_only else 0
+    if current_cash_only:
+        for record in list_quant_run_task_records(task_id, limit=20):
+            previous_detail = record.get("detail") or {}
+            if "current_positions" not in previous_detail:
+                break
+            if previous_detail.get("current_positions"):
+                break
+            consecutive_cash_days += 1
+    policy = {
+        "consecutive_cash_days": consecutive_cash_days,
+        "status": "explanation_required" if consecutive_cash_days >= 3 else "monitoring" if current_cash_only else "invested",
+        "reason": "研究、估值、风险或交易约束未形成可执行且通过门控的权益订单" if current_cash_only else "组合持有可交易资产",
+        "reentry_conditions": ["数据质量门恢复", "至少一项研究逻辑与安全边际通过", "市场状态允许新增风险暴露"],
+        "defensive_asset_evaluation": {
+            "assets": ["货币ETF", "债券ETF", "黄金ETF", "低波动ETF", "红利ETF"],
+            "status": "required" if consecutive_cash_days >= 3 else "not_due",
+            "decision": "进入防御资产候选评估，不因无权益信号默认长期纯现金" if consecutive_cash_days >= 3 else "达到连续3个交易日后启动专项评估",
+        },
+    }
+    detail["cash_only_policy"] = policy
+    if isinstance(detail.get("daily_report"), dict):
+        detail["daily_report"] = {**detail["daily_report"], "cash_only_policy": policy}
+    result.detail = detail
     rec_id = create_quant_run_task_record(
         task_id=task_id,
         signal_date=result.signal_date,
@@ -417,7 +577,7 @@ def _persist_step_result(
         total_buy_cost=result.total_buy_cost,
         execution_id=result.execution_id,
         message=result.message,
-        detail=result.detail,
+        detail=detail,
     )
     if rec_id == 0:
         logger.info("quant task replay idempotent skip task_id=%s signal_date=%s already_replayed", task_id, result.signal_date)
@@ -508,6 +668,51 @@ def run_quant_task_async(task_id: int) -> bool:
                         last_risk_code=data_decision.code,
                     )
                     return
+                latest_day_decision = evaluate_latest_market_day_gate()
+                if latest_day_decision.should_pause:
+                    try:
+                        _ensure_close_data_ready()
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("latest market day gate tried to start daily update but failed: %s", str(exc)[:160])
+                    _handle_pause(
+                        task_id,
+                        replay_status=latest_day_decision.code,
+                        message=latest_day_decision.message,
+                        decision=latest_day_decision,
+                    )
+                    h = get_quant_run_task_health(task_id)
+                    upsert_quant_run_task_health(
+                        task_id,
+                        heartbeat_at=_utc_now_iso(),
+                        last_step_latency_ms=int(h.get("last_step_latency_ms") or 0),
+                        avg_step_latency_ms=int(h.get("avg_step_latency_ms") or 0),
+                        step_count=int(h.get("step_count") or 0),
+                        risk_hit_count=int(h.get("risk_hit_count") or 0) + 1,
+                        consecutive_pause_count=int(h.get("consecutive_pause_count") or 0) + 1,
+                        last_risk_code=latest_day_decision.code,
+                    )
+                    return
+
+            model_decision = evaluate_model_readiness_gate()
+            if model_decision.should_pause:
+                _handle_pause(
+                    task_id,
+                    replay_status=model_decision.code,
+                    message=model_decision.message,
+                    decision=model_decision,
+                )
+                h = get_quant_run_task_health(task_id)
+                upsert_quant_run_task_health(
+                    task_id,
+                    heartbeat_at=_utc_now_iso(),
+                    last_step_latency_ms=int(h.get("last_step_latency_ms") or 0),
+                    avg_step_latency_ms=int(h.get("avg_step_latency_ms") or 0),
+                    step_count=int(h.get("step_count") or 0),
+                    risk_hit_count=int(h.get("risk_hit_count") or 0) + 1,
+                    consecutive_pause_count=int(h.get("consecutive_pause_count") or 0) + 1,
+                    last_risk_code=model_decision.code,
+                )
+                return
 
             dates = require_consolidated_trade_dates(min_count=2)
 
@@ -802,6 +1007,7 @@ def run_quant_task_async(task_id: int) -> bool:
 
             remaining_days = max(0, target_end_idx - batch_end_idx)
             _refresh_performance_reports(task_id)
+            _refresh_research_cycle(task_id)
             task_end = get_quant_run_task(task_id)
             if task_end and bool(task_end.get("stop_requested")):
                 _transition_task_status(

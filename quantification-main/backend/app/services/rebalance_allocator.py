@@ -26,13 +26,24 @@ class PlannedBuyOrder:
     block_code: str
 
 
-def _total_buy_cost(exec_price: float, quantity: int) -> float:
-    amount, comm, trans = cost_buy(exec_price, quantity)
+def _total_buy_cost(exec_price: float, quantity: int, symbol: str | None = None) -> float:
+    amount, comm, trans = cost_buy(exec_price, quantity, symbol)
     return round(amount + comm + trans, 2)
 
 
-def _min_lot_cost(exec_price: float) -> float:
-    return _total_buy_cost(exec_price, LOT_SIZE)
+def _min_lot_cost(exec_price: float, symbol: str | None = None) -> float:
+    return _total_buy_cost(exec_price, LOT_SIZE, symbol)
+
+
+def correlated_industry_group(industry: str) -> str:
+    value = str(industry or "unclassified")
+    groups = {
+        "financial_property": ("银行", "保险", "证券", "多元金融", "房地产"),
+        "technology": ("半导体", "电子", "计算机", "通信", "软件", "互联网"),
+        "resources": ("煤炭", "石油", "有色", "钢铁", "化工", "采掘"),
+        "consumer": ("食品", "饮料", "家电", "商贸", "零售", "纺织", "服装"),
+    }
+    return next((group for group, keywords in groups.items() if any(key in value for key in keywords)), value)
 
 
 def _build_tradable_orders(
@@ -96,13 +107,13 @@ def _prune_candidates_for_budget(
         per_symbol_budget = budget / len(trial)
         for order in trial:
             raw_price = max(float(order.price or 0), 0.01)
-            exec_price = apply_slippage_buy(raw_price)
+            exec_price = apply_slippage_buy(raw_price, order.symbol)
             cap_room = max(
                 0.0,
                 total_equity * max_single - float(existing_position_value.get(order.symbol, 0) or 0),
             )
             alloc = min(per_symbol_budget, cap_room)
-            if alloc < _min_lot_cost(exec_price):
+            if alloc < _min_lot_cost(exec_price, order.symbol):
                 return False
         return True
 
@@ -124,6 +135,16 @@ def allocate_buy_orders(
     max_single_position_pct: float = 1.0,
     existing_position_value: Dict[str, float] | None = None,
     symbol_scores: Dict[str, float] | None = None,
+    industry_by_symbol: Dict[str, str] | None = None,
+    existing_industry_value: Dict[str, float] | None = None,
+    max_industry_position_pct: float = 1.0,
+    target_weights: Dict[str, float] | None = None,
+    symbol_position_limits: Dict[str, float] | None = None,
+    initial_entry_fraction: float = 0.5,
+    max_correlated_industry_pct: float = 1.0,
+    high_risk_symbols: set[str] | None = None,
+    max_high_risk_total_pct: float = 0.05,
+    max_order_value_by_symbol: Dict[str, float] | None = None,
 ) -> tuple[List[PlannedBuyOrder], List[OrderResult], List[str]]:
     """
     等权 + 单票上限 + 二次分配剩余资金。
@@ -131,6 +152,15 @@ def allocate_buy_orders(
     """
     existing_position_value = dict(existing_position_value or {})
     symbol_scores = dict(symbol_scores or {})
+    industry_by_symbol = dict(industry_by_symbol or {})
+    existing_industry_value = dict(existing_industry_value or {})
+    target_weights = {str(key): max(0.0, float(value or 0)) for key, value in (target_weights or {}).items()}
+    symbol_position_limits = {
+        str(key): max(0.0, min(float(value or 0), float(max_single_position_pct)))
+        for key, value in (symbol_position_limits or {}).items()
+    }
+    high_risk_symbols = {str(symbol) for symbol in (high_risk_symbols or set())}
+    max_order_value_by_symbol = {str(symbol): max(0.0, float(value or 0)) for symbol, value in (max_order_value_by_symbol or {}).items()}
     if budget <= 0 or not candidates:
         return [], [], []
 
@@ -150,50 +180,112 @@ def allocate_buy_orders(
         return [], blocked, pruned
 
     max_single = max(0.0, min(1.0, float(max_single_position_pct or 1.0)))
+    max_industry = max(0.0, min(1.0, float(max_industry_position_pct or 1.0)))
+    max_correlated = max(0.0, min(1.0, float(max_correlated_industry_pct or 1.0)))
+    high_risk_limit = max(0.0, min(1.0, float(max_high_risk_total_pct)))
+    existing_high_risk_value = sum(float(existing_position_value.get(symbol, 0) or 0) for symbol in high_risk_symbols)
     n = len(tradable)
     per_equal = budget / n
+    weight_total = sum(target_weights.get(str(order.symbol), 0.0) for order in tradable)
+    initial_fraction = max(0.0, min(1.0, float(initial_entry_fraction)))
 
     qty_map: Dict[str, int] = {}
     exec_price_map: Dict[str, float] = {}
     request_price_map: Dict[str, float] = {}
     name_map: Dict[str, str] = {}
     score_map: Dict[str, float] = {}
+    industry_map: Dict[str, str] = {}
+    industry_candidate_count: Dict[str, int] = {}
+    group_candidate_count: Dict[str, int] = {}
+    planned_symbol_caps: Dict[str, float] = {}
+    existing_group_value: Dict[str, float] = {}
+    for industry, value in existing_industry_value.items():
+        group = correlated_industry_group(industry)
+        existing_group_value[group] = existing_group_value.get(group, 0.0) + float(value or 0)
+    for order in tradable:
+        industry = str(industry_by_symbol.get(str(order.symbol)) or "unclassified")
+        industry_candidate_count[industry] = industry_candidate_count.get(industry, 0) + 1
+        group = correlated_industry_group(industry)
+        group_candidate_count[group] = group_candidate_count.get(group, 0) + 1
 
     for order in tradable:
         sym = str(order.symbol)
         raw_price = max(float(order.price or 0), 0.01)
-        exec_price = apply_slippage_buy(raw_price)
-        cap_room = max(0.0, total_equity * max_single - float(existing_position_value.get(sym, 0) or 0))
-        alloc = min(per_equal, cap_room)
+        exec_price = apply_slippage_buy(raw_price, sym)
+        symbol_limit = symbol_position_limits.get(sym, max_single)
+        if sym in high_risk_symbols:
+            symbol_limit = min(symbol_limit, .01)
+        cap_room = max(0.0, total_equity * symbol_limit - float(existing_position_value.get(sym, 0) or 0))
+        industry = str(industry_by_symbol.get(sym) or "unclassified")
+        industry_room = max(0.0, total_equity * max_industry - float(existing_industry_value.get(industry, 0) or 0))
+        group = correlated_industry_group(industry)
+        group_room = max(0.0, total_equity * max_correlated - float(existing_group_value.get(group, 0) or 0))
+        high_risk_room = max(0.0, total_equity * high_risk_limit - existing_high_risk_value) if sym in high_risk_symbols else float("inf")
+        desired = budget * target_weights.get(sym, 0.0) / weight_total if weight_total > 0 else per_equal
+        if float(existing_position_value.get(sym, 0) or 0) <= 0:
+            desired *= initial_fraction
+        if sym in max_order_value_by_symbol:
+            desired = min(desired, max_order_value_by_symbol[sym])
+        planned_symbol_caps[sym] = min(total_equity * symbol_limit, float(existing_position_value.get(sym, 0) or 0) + desired)
+        high_risk_count = max(1, sum(1 for order in tradable if str(order.symbol) in high_risk_symbols))
+        alloc = min(desired, cap_room, industry_room / max(1, industry_candidate_count.get(industry, 1)), group_room / max(1, group_candidate_count.get(group, 1)), high_risk_room / high_risk_count)
         qty = normalize_lot_quantity(int(alloc / exec_price))
         qty_map[sym] = qty
         exec_price_map[sym] = exec_price
         request_price_map[sym] = raw_price
         name_map[sym] = str(order.name or "")
         score_map[sym] = float(symbol_scores.get(sym, 0) or 0)
+        industry_map[sym] = industry
 
     def _spent() -> float:
         total = 0.0
         for sym, qty in qty_map.items():
             if qty > 0:
-                total += _total_buy_cost(exec_price_map[sym], qty)
+                total += _total_buy_cost(exec_price_map[sym], qty, sym)
         return round(total, 2)
 
     # 二次分配：按得分从高到低，每次尝试加 1 手
     leftover = round(budget - _spent(), 2)
     ranked_symbols = sorted(qty_map.keys(), key=lambda s: score_map.get(s, 0), reverse=True)
+    planned_industry_value: Dict[str, float] = dict(existing_industry_value)
+    planned_group_value: Dict[str, float] = dict(existing_group_value)
+    planned_high_risk_value = existing_high_risk_value
+    for sym, qty in qty_map.items():
+        industry = industry_map.get(sym, "unclassified")
+        planned_industry_value[industry] = planned_industry_value.get(industry, 0.0) + exec_price_map[sym] * qty
+        group = correlated_industry_group(industry)
+        planned_group_value[group] = planned_group_value.get(group, 0.0) + exec_price_map[sym] * qty
+        if sym in high_risk_symbols:
+            planned_high_risk_value += exec_price_map[sym] * qty
     improved = True
     while leftover > 0 and improved:
         improved = False
         for sym in ranked_symbols:
             exec_price = exec_price_map[sym]
-            incremental = _total_buy_cost(exec_price, LOT_SIZE)
+            incremental = _total_buy_cost(exec_price, LOT_SIZE, sym)
             if incremental > leftover:
                 continue
             current_value = float(existing_position_value.get(sym, 0) or 0) + exec_price_map[sym] * qty_map[sym]
-            if current_value + exec_price * LOT_SIZE > total_equity * max_single + 1e-6:
+            symbol_limit = symbol_position_limits.get(sym, max_single)
+            if sym in high_risk_symbols:
+                symbol_limit = min(symbol_limit, .01)
+            if current_value + exec_price * LOT_SIZE > total_equity * symbol_limit + 1e-6:
+                continue
+            if current_value + exec_price * LOT_SIZE > planned_symbol_caps.get(sym, total_equity * symbol_limit) + 1e-6:
+                continue
+            industry = industry_map.get(sym, "unclassified")
+            if planned_industry_value.get(industry, 0.0) + exec_price * LOT_SIZE > total_equity * max_industry + 1e-6:
+                continue
+            group = correlated_industry_group(industry)
+            if planned_group_value.get(group, 0.0) + exec_price * LOT_SIZE > total_equity * max_correlated + 1e-6:
+                continue
+            if sym in high_risk_symbols and planned_high_risk_value + exec_price * LOT_SIZE > total_equity * high_risk_limit + 1e-6:
                 continue
             qty_map[sym] += LOT_SIZE
+            planned_industry_value[industry] = planned_industry_value.get(industry, 0.0) + exec_price * LOT_SIZE
+            planned_group_value[group] = planned_group_value.get(group, 0.0) + exec_price * LOT_SIZE
+            if sym in high_risk_symbols:
+                planned_high_risk_value += exec_price * LOT_SIZE
             leftover = round(leftover - incremental, 2)
             improved = True
             if leftover <= 0:
@@ -205,6 +297,9 @@ def allocate_buy_orders(
         qty = int(qty_map.get(sym, 0) or 0)
         exec_price = exec_price_map[sym]
         if qty <= 0:
+            industry = industry_map.get(sym, "unclassified")
+            industry_room = total_equity * max_industry - float(existing_industry_value.get(industry, 0) or 0)
+            industry_blocked = industry_room < _min_lot_cost(exec_price, sym)
             blocked.append(
                 OrderResult(
                     symbol=sym,
@@ -212,12 +307,12 @@ def allocate_buy_orders(
                     price=round(exec_price, 2),
                     quantity=0,
                     status="blocked",
-                    message="资金不足以买入 1 手或超过单票上限",
-                    block_code="insufficient_budget_for_lot",
+                    message="行业仓位已达上限" if industry_blocked else "资金不足以买入 1 手或超过单票上限",
+                    block_code="industry_position_limit" if industry_blocked else "insufficient_budget_for_lot",
                 )
             )
             continue
-        amount, comm, trans = cost_buy(exec_price, qty)
+        amount, comm, trans = cost_buy(exec_price, qty, sym)
         total_cost = round(amount + comm + trans, 2)
         position_pct = round((amount / total_equity) * 100.0, 2) if total_equity > 0 else 0.0
         planned.append(

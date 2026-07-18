@@ -306,7 +306,7 @@ def run_backtest(
                 if not tradable.ok:
                     constraint_events.append({"date": d, "symbol": sym, "side": "SELL", "code": tradable.code, "message": tradable.message})
                     continue
-                px = apply_slippage_sell(row.open)
+                px = apply_slippage_sell(row.open, symbol)
                 gross = px * pos.quantity
                 fee_comm = round(commission(gross), 2)
                 fee_trans = round(transfer_fee(gross), 2)
@@ -349,7 +349,7 @@ def run_backtest(
                     if not tradable.ok:
                         constraint_events.append({"date": d, "symbol": sym, "side": "BUY", "code": tradable.code, "message": tradable.message})
                         continue
-                    px = apply_slippage_buy(row.open)
+                    px = apply_slippage_buy(row.open, symbol)
                     qty = int(per_budget / px)
                     qty = normalize_lot_quantity(qty)
                     if qty <= 0:
@@ -471,7 +471,7 @@ def run_backtest(
         factor_values: Dict[str, Dict[str, float]] = {}
         max_lookback = max(lookback, 20)
         total_universe = len(snapshot)
-        ds.preload_histories([row.symbol for row in snapshot])
+        ds.preload_histories([row.symbol for row in snapshot], end_date=d, lookback=max_lookback)
         _emit_progress(
             {
                 "date": d,

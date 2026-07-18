@@ -9,6 +9,7 @@ import type {
   QuantRunStatus,
   QuantTaskRunDetailResponse,
   QuantTaskItem,
+  SimulationLedgerResponse,
 } from "../types";
 
 export interface QuantRunStartPayload {
@@ -177,3 +178,12 @@ export async function getQuantRunLedgerSummary(): Promise<QuantRunLedgerSummary>
   return data;
 }
 
+export async function getSimulationLedger(params?: {
+  execution_id?: number;
+  limit?: number;
+}): Promise<SimulationLedgerResponse> {
+  const { data } = await api.get<SimulationLedgerResponse>("/api/quant-runs/simulation-ledger", {
+    params,
+  });
+  return data;
+}

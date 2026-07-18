@@ -8,6 +8,7 @@ startup never creates or falls back to a SQLite file.
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import re
 import sqlite3
@@ -17,7 +18,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse, unquote
 
-from app.core.a_share_fees import commission, stamp_tax, transfer_fee
+from app.core.a_share_fees import FEE_SCHEDULE_VERSION, commission, stamp_tax, transfer_fee
 from app.core.config import settings
 from app.core.trade_calendar import get_last_trade_date
 
@@ -523,6 +524,13 @@ CREATE TABLE IF NOT EXISTS operations (
     quantity INTEGER NOT NULL,
     at TEXT NOT NULL,
     remark TEXT,
+    name TEXT NOT NULL DEFAULT '',
+    commission REAL NOT NULL DEFAULT 0,
+    transfer_fee REAL NOT NULL DEFAULT 0,
+    stamp_tax REAL NOT NULL DEFAULT 0,
+    slippage_bps REAL NOT NULL DEFAULT 0,
+    fee_schedule_version TEXT NOT NULL DEFAULT '',
+    operation_uid TEXT,
     FOREIGN KEY (execution_id) REFERENCES executions(id)
 );
 CREATE TABLE IF NOT EXISTS account (
@@ -675,6 +683,11 @@ CREATE TABLE IF NOT EXISTS operations (
     at VARCHAR(64) NOT NULL,
     remark TEXT,
     name VARCHAR(255) NOT NULL DEFAULT '',
+    commission DOUBLE NOT NULL DEFAULT 0,
+    transfer_fee DOUBLE NOT NULL DEFAULT 0,
+    stamp_tax DOUBLE NOT NULL DEFAULT 0,
+    slippage_bps DOUBLE NOT NULL DEFAULT 0,
+    fee_schedule_version VARCHAR(64) NOT NULL DEFAULT '',
     FOREIGN KEY (execution_id) REFERENCES executions(id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 CREATE TABLE IF NOT EXISTS account (
@@ -826,6 +839,12 @@ def init_db() -> None:
                 ALTER TABLE positions ADD COLUMN IF NOT EXISTS name VARCHAR(255) NOT NULL DEFAULT '';
                 ALTER TABLE positions ADD COLUMN IF NOT EXISTS bought_at VARCHAR(32) NULL;
                 ALTER TABLE operations ADD COLUMN IF NOT EXISTS name VARCHAR(255) NOT NULL DEFAULT '';
+                ALTER TABLE operations ADD COLUMN IF NOT EXISTS commission DOUBLE PRECISION NOT NULL DEFAULT 0;
+                ALTER TABLE operations ADD COLUMN IF NOT EXISTS transfer_fee DOUBLE PRECISION NOT NULL DEFAULT 0;
+                ALTER TABLE operations ADD COLUMN IF NOT EXISTS stamp_tax DOUBLE PRECISION NOT NULL DEFAULT 0;
+                ALTER TABLE operations ADD COLUMN IF NOT EXISTS slippage_bps DOUBLE PRECISION NOT NULL DEFAULT 0;
+                ALTER TABLE operations ADD COLUMN IF NOT EXISTS fee_schedule_version VARCHAR(64) NOT NULL DEFAULT '';
+                ALTER TABLE operations ADD COLUMN IF NOT EXISTS operation_uid VARCHAR(64);
                 ALTER TABLE operations ALTER COLUMN execution_id DROP NOT NULL;
                 ALTER TABLE quant_run_task_runs ADD COLUMN IF NOT EXISTS detail_json TEXT NULL;
                 CREATE TABLE IF NOT EXISTS quant_run_task_meta (
@@ -847,6 +866,8 @@ def init_db() -> None:
                     updated_at VARCHAR(64) NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_ops_execution_at ON operations (execution_id, at);
+                UPDATE operations SET operation_uid=MD5('legacy:' || id::text) WHERE operation_uid IS NULL OR operation_uid='';
+                CREATE UNIQUE INDEX IF NOT EXISTS uq_operations_uid ON operations(operation_uid);
                 CREATE INDEX IF NOT EXISTS idx_ops_symbol_at ON operations (symbol, at);
                 CREATE INDEX IF NOT EXISTS idx_task_runs_task_execute ON quant_run_task_runs (task_id, execute_date);
                 CREATE INDEX IF NOT EXISTS idx_tasks_status_updated ON quant_run_tasks (status, updated_at);
@@ -857,7 +878,7 @@ def init_db() -> None:
                 # serial sequences behind the copied ids. Reconcile them at
                 # startup so the first new backtest/task cannot collide with
                 # an existing primary key.
-                for table in ("backtests", "executions", "operations", "quant_run_tasks", "quant_run_task_runs"):
+                for table in ("backtests", "executions", "operations", "quant_run_tasks", "quant_run_task_runs", "model_train_runs"):
                     c.execute(
                         "SELECT setval(pg_get_serial_sequence(%s, 'id'), COALESCE((SELECT MAX(id) FROM " + table + "), 1), EXISTS (SELECT 1 FROM " + table + "))",
                         (table,),
@@ -910,6 +931,7 @@ def init_db() -> None:
                 CREATE TABLE IF NOT EXISTS decision_snapshots (
                     id BIGSERIAL PRIMARY KEY, ts_code VARCHAR(16) NOT NULL, decision_type VARCHAR(32) NOT NULL,
                     decision_time VARCHAR(64) NOT NULL, price DOUBLE PRECISION, thesis_id BIGINT,
+                    execution_id BIGINT, operation_id BIGINT,
                     data_as_of_time VARCHAR(64) NOT NULL, model_version VARCHAR(64) NOT NULL,
                     market_state_json TEXT NOT NULL, research_state_json TEXT NOT NULL,
                     valuation_json TEXT NOT NULL, portfolio_context_json TEXT NOT NULL,
@@ -932,6 +954,11 @@ def init_db() -> None:
                     id BIGSERIAL PRIMARY KEY, ts_code VARCHAR(16) NOT NULL,
                     from_state VARCHAR(32), to_state VARCHAR(32) NOT NULL,
                     reason TEXT NOT NULL, evidence_json TEXT NOT NULL,
+                    rule_version VARCHAR(64) NOT NULL DEFAULT '',
+                    model_version VARCHAR(64) NOT NULL DEFAULT '',
+                    automatic_decision_json TEXT NOT NULL DEFAULT '{}',
+                    intervention_type VARCHAR(32) NOT NULL DEFAULT 'none',
+                    intervention_actor VARCHAR(128) NOT NULL DEFAULT '',
                     changed_at VARCHAR(64) NOT NULL
                 );
                 """)
@@ -952,6 +979,14 @@ def init_db() -> None:
             else:
                 c.execute("ALTER TABLE decision_snapshots ADD COLUMN IF NOT EXISTS evidence_hash VARCHAR(128) NOT NULL DEFAULT ''")
                 c.execute("ALTER TABLE decision_snapshots ADD COLUMN IF NOT EXISTS evidence_schema_version VARCHAR(64) NOT NULL DEFAULT 'evidence_freeze_v1'")
+                c.execute("ALTER TABLE decision_snapshots ADD COLUMN IF NOT EXISTS execution_id BIGINT")
+                c.execute("ALTER TABLE decision_snapshots ADD COLUMN IF NOT EXISTS operation_id BIGINT")
+                c.execute("CREATE INDEX IF NOT EXISTS idx_decision_execution ON decision_snapshots(execution_id,operation_id)")
+                c.execute("ALTER TABLE position_state_history ADD COLUMN IF NOT EXISTS rule_version VARCHAR(64) NOT NULL DEFAULT ''")
+                c.execute("ALTER TABLE position_state_history ADD COLUMN IF NOT EXISTS model_version VARCHAR(64) NOT NULL DEFAULT ''")
+                c.execute("ALTER TABLE position_state_history ADD COLUMN IF NOT EXISTS automatic_decision_json TEXT NOT NULL DEFAULT '{}'")
+                c.execute("ALTER TABLE position_state_history ADD COLUMN IF NOT EXISTS intervention_type VARCHAR(32) NOT NULL DEFAULT 'none'")
+                c.execute("ALTER TABLE position_state_history ADD COLUMN IF NOT EXISTS intervention_actor VARCHAR(128) NOT NULL DEFAULT ''")
             cur = c.execute(
                 "SELECT id FROM strategies WHERE name = ?", (_DEFAULT_STRATEGY_NAME,)
             )
@@ -1093,6 +1128,11 @@ def delete_strategy(strategy_id: int) -> bool:
     return cur.rowcount > 0
 
 
+def _operation_uid(execution_id: int | None, symbol: Any, side: Any, at: Any, quantity: Any, price: Any) -> str:
+    payload = "|".join((str(execution_id or 0), str(symbol or "").strip().upper(), str(side or "").strip().upper(), str(at or ""), str(int(quantity or 0)), f"{float(price or 0):.8f}"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def create_execution(strategy_id: int, executed_at: str, budget: float, top_n: int, orders: List[Dict[str, Any]]) -> int:
     """Insert execution and operations (buy orders). Returns execution id."""
     with _conn() as c:
@@ -1103,9 +1143,12 @@ def create_execution(strategy_id: int, executed_at: str, budget: float, top_n: i
         )
         eid = c.last_insert_id()
         for o in orders:
+            operation_uid = _operation_uid(eid, o.get("symbol", ""), o.get("side", "BUY"), executed_at, o.get("quantity", 0), o.get("price", 0))
             c.execute(
-                """INSERT INTO operations (execution_id, symbol, side, price, quantity, at, remark, name)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                """INSERT INTO operations
+                   (execution_id, symbol, side, price, quantity, at, remark, name,
+                    commission, transfer_fee, stamp_tax, slippage_bps, fee_schedule_version, operation_uid)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     eid,
                     o.get("symbol", ""),
@@ -1115,6 +1158,12 @@ def create_execution(strategy_id: int, executed_at: str, budget: float, top_n: i
                     executed_at,
                     None,
                     (o.get("name") or "").strip(),
+                    float(o.get("commission", 0) or 0),
+                    float(o.get("transfer_fee", 0) or 0),
+                    float(o.get("stamp_tax", 0) or 0),
+                    float(o.get("slippage_bps", 0) or 0),
+                    str(o.get("fee_schedule_version") or FEE_SCHEDULE_VERSION),
+                    operation_uid,
                 ),
             )
     return eid
@@ -1131,18 +1180,30 @@ def append_operations_to_execution(execution_id: int, executed_at: str, orders: 
     inserted = 0
     with _conn() as c:
         for o in orders:
+            operation_at = str(o.get("at") or executed_at)
+            operation_uid = _operation_uid(eid, o.get("symbol", ""), o.get("side", ""), operation_at, o.get("quantity", 0), o.get("price", 0))
+            if c.execute("SELECT id FROM operations WHERE operation_uid=?", (operation_uid,)).fetchone():
+                continue
             c.execute(
-                """INSERT INTO operations (execution_id, symbol, side, price, quantity, at, remark, name)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                """INSERT INTO operations
+                   (execution_id, symbol, side, price, quantity, at, remark, name,
+                    commission, transfer_fee, stamp_tax, slippage_bps, fee_schedule_version, operation_uid)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     eid,
                     (o.get("symbol") or "").strip(),
                     str(o.get("side") or "").upper(),
                     float(o.get("price", 0) or 0),
                     int(o.get("quantity", 0) or 0),
-                    str(o.get("at") or executed_at),
+                    operation_at,
                     o.get("remark"),
                     (o.get("name") or "").strip(),
+                    float(o.get("commission", 0) or 0),
+                    float(o.get("transfer_fee", 0) or 0),
+                    float(o.get("stamp_tax", 0) or 0),
+                    float(o.get("slippage_bps", 0) or 0),
+                    str(o.get("fee_schedule_version") or FEE_SCHEDULE_VERSION),
+                    operation_uid,
                 ),
             )
             inserted += 1
@@ -1366,6 +1427,7 @@ def sell_position(
     quantity: Optional[int] = None,
     price: float = 0.0,
     trade_date: Optional[str] = None,
+    record_operation: bool = True,
 ) -> Optional[Dict[str, Any]]:
     """
     卖出持仓（全部或部分）。写入 SELL operation，扣减持仓，卖出所得加回账户余额。
@@ -1401,11 +1463,7 @@ def sell_position(
                 (new_qty, now, position_id),
             )
         # 使用同一连接写 operation，避免 SQLite 嵌套写连接导致 database is locked
-        c.execute(
-            """INSERT INTO operations (execution_id, symbol, side, price, quantity, at, remark, name)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (None, sym, "SELL", sell_price, sell_qty, now, "手动出售", name),
-        )
+        fee_comm = fee_trans = fee_tax = 0.0
         if sell_price > 0:
             amount = round(sell_qty * sell_price, 2)
             fee_comm = round(commission(amount), 2)
@@ -1417,6 +1475,16 @@ def sell_position(
             cur_balance = float(row["balance"]) if row is not None else 0.0
             new_balance = max(0.0, round(cur_balance + net, 2))
             c.execute("UPDATE account SET balance = ? WHERE id = 1", (new_balance,))
+        if record_operation:
+            operation_uid = _operation_uid(None, sym, "SELL", now, sell_qty, sell_price)
+            c.execute(
+                """INSERT INTO operations
+                   (execution_id, symbol, side, price, quantity, at, remark, name,
+                    commission, transfer_fee, stamp_tax, slippage_bps, fee_schedule_version, operation_uid)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (None, sym, "SELL", sell_price, sell_qty, now, "手动出售", name,
+                 fee_comm, fee_trans, fee_tax, 0.0, FEE_SCHEDULE_VERSION, operation_uid),
+            )
     if sell_qty >= pos_qty:
         return None
     out = get_positions()
@@ -1431,13 +1499,15 @@ def list_operations(execution_id: Optional[int] = None, limit: int = 500) -> Lis
     with _conn() as c:
         if execution_id is not None:
             cur = c.execute(
-                """SELECT id, execution_id, symbol, side, price, quantity, at, remark, name
+                """SELECT id, execution_id, symbol, side, price, quantity, at, remark, name,
+                          commission, transfer_fee, stamp_tax, slippage_bps, fee_schedule_version, operation_uid
                    FROM operations WHERE execution_id = ? ORDER BY id DESC LIMIT ?""",
                 (execution_id, limit),
             )
         else:
             cur = c.execute(
-                """SELECT id, execution_id, symbol, side, price, quantity, at, remark, name
+                """SELECT id, execution_id, symbol, side, price, quantity, at, remark, name,
+                          commission, transfer_fee, stamp_tax, slippage_bps, fee_schedule_version, operation_uid
                    FROM operations ORDER BY id DESC LIMIT ?""",
                 (limit,),
             )
@@ -1453,6 +1523,12 @@ def list_operations(execution_id: Optional[int] = None, limit: int = 500) -> Lis
             "at": r["at"],
             "remark": r["remark"],
             "name": r["name"] if "name" in r.keys() else "",
+            "commission": float(r["commission"] or 0),
+            "transfer_fee": float(r["transfer_fee"] or 0),
+            "stamp_tax": float(r["stamp_tax"] or 0),
+            "slippage_bps": float(r["slippage_bps"] or 0),
+            "fee_schedule_version": r["fee_schedule_version"] or "",
+            "operation_uid": r["operation_uid"] or "",
         }
         for r in rows
     ]
@@ -2451,6 +2527,14 @@ def create_model_version(
 ) -> int:
     now = datetime.utcnow().isoformat()
     with _conn() as c:
+        if c._is_postgres:
+            # Databases migrated from SQLite may contain explicit ids while
+            # the PostgreSQL sequence still starts at 1. Synchronize before
+            # inserting so model governance remains append-only.
+            c.execute(
+                """SELECT setval(pg_get_serial_sequence('model_versions','id'),
+                       COALESCE(MAX(id),1), COUNT(*)>0) FROM model_versions"""
+            )
         if is_active:
             c.execute("UPDATE model_versions SET is_active = 0 WHERE model_key = ?", (str(model_key),))
         c.execute(
@@ -2483,6 +2567,35 @@ def set_active_model_version(model_version_id: int) -> None:
         c.execute(
             "UPDATE model_versions SET is_active = 1, status = ?, updated_at = ? WHERE id = ?",
             ("active", datetime.utcnow().isoformat(), int(model_version_id)),
+        )
+
+
+def update_model_version_status(
+    model_version_id: int, *, status: str | None = None, is_active: bool | None = None
+) -> None:
+    fields: List[str] = []
+    params: List[Any] = []
+    if status is not None:
+        fields.append("status = ?")
+        params.append(str(status))
+    if is_active is not None:
+        fields.append("is_active = ?")
+        params.append(1 if is_active else 0)
+    if not fields:
+        return
+    fields.append("updated_at = ?")
+    params.append(datetime.utcnow().isoformat())
+    params.append(int(model_version_id))
+    with _conn() as c:
+        c.execute(f"UPDATE model_versions SET {', '.join(fields)} WHERE id = ?", tuple(params))
+
+
+def update_model_version_validation(model_version_id: int, *, validation: dict[str, Any]) -> None:
+    now = datetime.utcnow().isoformat()
+    with _conn() as c:
+        c.execute(
+            "UPDATE model_versions SET validation_json = ?, updated_at = ? WHERE id = ?",
+            (json.dumps(validation or {}, ensure_ascii=False), now, int(model_version_id)),
         )
 
 
@@ -2559,6 +2672,14 @@ def get_latest_model_train_run() -> Optional[Dict[str, Any]]:
         cur = c.execute("SELECT * FROM model_train_runs ORDER BY id DESC LIMIT 1")
         row = cur.fetchone()
     return _train_run_from_row(row) if row else None
+
+
+def list_model_train_runs(limit: int = 20) -> List[Dict[str, Any]]:
+    n = max(1, min(int(limit or 20), 200))
+    with _conn() as c:
+        cur = c.execute("SELECT * FROM model_train_runs ORDER BY id DESC LIMIT ?", (n,))
+        rows = cur.fetchall()
+    return [_train_run_from_row(r) for r in rows]
 
 
 def save_performance_reports(task_id: int | None, reports: dict[str, list[dict[str, Any]]]) -> int:

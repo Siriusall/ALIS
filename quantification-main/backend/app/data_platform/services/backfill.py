@@ -23,6 +23,7 @@ from app.data_platform.services.data_center import (
     sync_cninfo_announcements,
     sync_financial_batch,
     sync_market_bundle,
+    sync_pmi_industry_proxies,
     sync_trade_calendar,
     sync_tushare_api_raw,
     sync_tushare_date_batch,
@@ -30,10 +31,14 @@ from app.data_platform.services.data_center import (
     sync_index_bundle,
     set_tushare_activity_hook,
 )
+from app.data_platform.services.market_calendar import target_trade_day
 from app.data_platform.redis_store import ack_task, enqueue_task, get_json, set_json
 
 _lock = threading.Lock()
 _state: dict[str, Any] = {"running": False, "phase": "idle", "message": "尚未生成计划"}
+# Zero means recoverable failures retry indefinitely; delay remains capped.
+AUTO_RESUME_MAX_ATTEMPTS = 0
+AUTO_RESUME_DELAYS_SECONDS = (15, 30, 60, 120, 180)
 
 
 def _now() -> str:
@@ -93,27 +98,59 @@ def _financial_symbols(api_name: str, period: str) -> int:
 def _request_coverage_count(api_name: str, period: str = "") -> int:
     with _conn() as c:
         row = c.execute(
-            "SELECT COUNT(DISTINCT ts_code) n FROM dc_tushare_request_coverage WHERE api_name=? AND period=? AND ts_code<>''",
+            "SELECT COUNT(DISTINCT ts_code) n FROM dc_tushare_request_coverage WHERE api_name=? AND period=? AND ts_code<>'' AND result_status IN ('success','not_applicable','valid_empty','deferred_empty')",
             (api_name, period),
         ).fetchone()
     return int(dict(row).get("n") or 0)
 
 
+def _financial_completion_count(api_name: str, period: str) -> int:
+    """Count symbols completed by either raw rows or terminal request coverage."""
+    with _conn() as c:
+        row = c.execute(
+            """
+            SELECT COUNT(DISTINCT ts_code) n
+            FROM (
+                SELECT ts_code
+                FROM dc_tushare_raw_records
+                WHERE api_name=? AND period=? AND ts_code<>''
+                UNION
+                SELECT ts_code
+                FROM dc_tushare_request_coverage
+                WHERE api_name=? AND period=? AND ts_code<>''
+                  AND result_status IN ('success','not_applicable','valid_empty','deferred_empty')
+            ) done
+            """,
+            (api_name, period, api_name, period),
+        ).fetchone()
+    return int(dict(row).get("n") or 0)
+
+
+def _period_batch_checked(api_name: str, period: str) -> bool:
+    """Whether a full-market period request completed successfully."""
+    with _conn() as c:
+        row = c.execute(
+            "SELECT 1 FROM dc_tushare_request_coverage WHERE api_name=? AND period=? AND ts_code='' AND result_status='success' LIMIT 1",
+            (api_name, period),
+        ).fetchone()
+    return row is not None
+
+
 def _request_date_coverage(api_name: str, start: str, end: str) -> int:
     with _conn() as c:
         row = c.execute(
-            "SELECT COUNT(DISTINCT trade_date) n FROM dc_tushare_request_coverage WHERE api_name=? AND trade_date BETWEEN ? AND ?",
+            "SELECT COUNT(DISTINCT trade_date) n FROM dc_tushare_request_coverage WHERE api_name=? AND trade_date BETWEEN ? AND ? AND result_status IN ('success','not_applicable','valid_empty','deferred_empty')",
             (api_name, start, end),
         ).fetchone()
     return int(dict(row).get("n") or 0)
 
 
-def build_backfill_plan(*, market_batch_days: int = 20, financial_batch_size: int = 50) -> dict[str, Any]:
+def build_backfill_plan(*, market_batch_days: int = 30, financial_batch_size: int = 100) -> dict[str, Any]:
     """Build a prioritized historical completion plan from current gaps."""
     today = date.today()
-    start = today - timedelta(days=DAILY_LOOKBACK_DAYS)
-    # Do not treat the current trading day as historical data before close.
-    end = today - timedelta(days=1)
+    with _conn() as c:
+        end = target_trade_day(c)
+    start = end - timedelta(days=DAILY_LOOKBACK_DAYS)
     start_s, end_s = _ymd(start), _ymd(end)
     # TuShare currently publishes the exchange calendar through year-end.  Do
     # not manufacture a permanent gap by demanding next-year dates before the
@@ -226,64 +263,66 @@ def build_backfill_plan(*, market_batch_days: int = 20, financial_batch_size: in
             }
         )
 
-    # 3. Adj factor — often missing entirely; sync by recent window sample then expand.
-    if len(have_adj) < len(open_days) * 0.5:
-        adj_checked = _request_coverage_count("adj_factor")
+    # 3. Adj factor — TuShare officially supports one full-market request per
+    # trade date.  Backfill by date, never by 5,000+ individual stocks.
+    if open_days and len(have_adj) < len(open_days) * 0.995:
+        adj_checked_dates = _request_date_coverage("adj_factor", start_s, end_s)
         add(
             {
                 "priority": 2,
                 "key": "adj_factor",
                 "title": "补全复权因子",
                 "why": f"审计窗口内复权因子交易日覆盖 {len(have_adj)}/{max(len(open_days), FALLBACK_OPEN_DAYS)}",
-                "action": "sync_stock_api_batch",
-                "params": {"api_name": "adj_factor", "start_date": start_s, "end_date": end_s, "limit": financial_batch_size},
-                "estimated_calls": financial_batch_size,
-                "estimated_minutes": round(financial_batch_size * 0.05, 1),
-                "status": "done" if stocks > 0 and adj_checked >= stocks else "needed",
+                "action": "sync_date_api_batch",
+                "params": {"api_name": "adj_factor", "trade_dates": open_days, "limit": market_batch_days},
+                "estimated_calls": min(len(open_days), market_batch_days),
+                "estimated_minutes": round(min(len(open_days), market_batch_days) * 0.2, 1),
+                "status": "done" if open_days and adj_checked_dates >= len(open_days) else "needed",
                 "gap": {"have_dates": len(have_adj), "need_dates": max(len(open_days), FALLBACK_OPEN_DAYS)},
             }
         )
 
-    # 4. Financial periods — one batch per report period for a staged stock limit.
+    # 4. Core financial statements — VIP APIs fetch the whole report period.
+    # Annual-only extras are deliberately separate: a successful VIP return
+    # must not make audit opinions/main-business composition look complete.
     for period in quarters:
         # A successful empty response is still a completed audit for that
         # stock/period.  Use request coverage as well as returned rows so newly
         # listed/non-reporting stocks do not keep the plan partial forever.
-        have = max(_financial_symbols("income", period), _request_coverage_count("income", period))
+        have = _financial_completion_count("income", period)
         if stocks > 0 and have < stocks:
             add(
                 {
                     "priority": 3,
                     "key": f"financial_{period}",
                     "title": f"补全财务 {period}",
-                    "why": f"利润表股票覆盖 {have}/{stocks}；本任务连续补至 {stocks} 只全部检查完成，每 {financial_batch_size} 只持久化一个断点",
+                    "why": f"核心四表股票覆盖 {have}/{stocks}；优先按报告期 VIP 整批获取，单接口失败才逐股补偿",
                     "action": "sync_financial_batch",
-                    "params": {"period": period, "limit": financial_batch_size, "include_yearly": period.endswith("1231"), "completion_api": "core"},
-                    "estimated_calls": financial_batch_size * (6 if period.endswith("1231") else 4),
-                    "estimated_minutes": round(financial_batch_size * 0.4, 1),
+                    "params": {"period": period, "limit": financial_batch_size, "include_yearly": False, "completion_api": "core"},
+                    "estimated_calls": 4,
+                    "estimated_minutes": 1.0,
                     "status": "needed",
                     "gap": {"have_symbols": have, "need_symbols": stocks, "batch": financial_batch_size},
                 }
             )
 
     for period in annuals:
-        # Annual-only extras already covered when quarter ends with 1231 and include_yearly.
-        if period in quarters:
-            continue
-        have = max(_financial_symbols("fina_audit", period), _request_coverage_count("fina_audit", period))
+        have = _financial_completion_count("fina_audit", period)
         if stocks > 0 and have < stocks:
             add(
                 {
                     "priority": 3,
                     "key": f"annual_{period}",
-                    "title": f"补全年度财务附加 {period}",
-                    "why": "审计意见 / 主营构成按年补",
+                    "title": f"补全审计意见 {period}",
+                    "why": "审计意见没有可用 VIP，按股票断点补全；主营构成由独立 VIP 批次处理",
                     "action": "sync_financial_batch",
                     "params": {"period": period, "limit": financial_batch_size, "include_yearly": True, "completion_api": "fina_audit"},
-                    "estimated_calls": financial_batch_size * 6,
-                    "estimated_minutes": round(financial_batch_size * 0.5, 1),
+                    "estimated_calls": financial_batch_size,
+                    "estimated_minutes": round(financial_batch_size * 0.1, 1),
                     "status": "needed",
                     "gap": {"have_symbols": have, "batch": financial_batch_size},
+                    "estimated_calls": max(0, stocks - have),
+                    "estimated_minutes": round(max(0, stocks - have) * 0.1, 1),
                 }
             )
 
@@ -291,6 +330,7 @@ def build_backfill_plan(*, market_batch_days: int = 20, financial_batch_size: in
     latest_period = quarters[0] if quarters else ""
     stock_routes = [
         ("namechange", "补全名称/ST历史", ""),
+        ("forecast", "补全业绩预告", latest_period),
         ("top10_holders", "补全十大股东", latest_period),
         ("top10_floatholders", "补全十大流通股东", latest_period),
         ("stk_holdernumber", "补全股东人数", latest_period),
@@ -298,25 +338,39 @@ def build_backfill_plan(*, market_batch_days: int = 20, financial_batch_size: in
         ("pledge_detail", "补全质押明细", ""),
         ("express", "补全业绩快报", latest_period),
     ]
+    for period in annuals:
+        stock_routes.append(("fina_mainbz", f"补全主营构成 {period}", period))
     for api_name, title, period in stock_routes:
         checked = _request_coverage_count(api_name, period)
+        batch_checked = bool(period) and _period_batch_checked(api_name, period)
+        remaining_symbols = max(0, stocks - checked)
+        is_period_vip = api_name in {"forecast", "express", "fina_mainbz", "top10_holders", "top10_floatholders", "stk_holdernumber"} and bool(period)
+        estimated_calls = 0 if batch_checked else (1 if is_period_vip else remaining_symbols)
+        estimated_minutes = 0.0 if batch_checked else (1.0 if is_period_vip else round(remaining_symbols * 0.15, 1))
         add({
-            "priority": 4, "key": f"stock_api_{api_name}", "title": title,
-            "why": f"{api_name} 已通过真实接口写入验证；连续补至全市场检查完成，每 {financial_batch_size} 只持久化断点，空结果也记录以避免重复请求",
+            "priority": 4,
+            "key": f"stock_api_{api_name}_{period}" if api_name == "fina_mainbz" else f"stock_api_{api_name}",
+            "title": title,
+            "why": f"{api_name} 优先按报告期/日期窗批量获取，失败才逐股断点补偿；空结果也记录以避免重复请求",
             "action": "sync_stock_api_batch",
             "params": {"api_name": api_name, "period": period, "limit": financial_batch_size},
-            "estimated_calls": financial_batch_size, "estimated_minutes": round(financial_batch_size * 0.15, 1),
-            "status": "done" if stocks > 0 and checked >= stocks else "needed",
-            "gap": {"checked_symbols": checked, "need_symbols": stocks, "batch": financial_batch_size},
+            "estimated_calls": estimated_calls, "estimated_minutes": estimated_minutes,
+            "status": "done" if batch_checked or (stocks > 0 and checked >= stocks) else "needed",
+            "gap": {"checked_symbols": checked, "need_symbols": stocks, "batch": financial_batch_size, "period_batch_checked": batch_checked},
         })
     for api_name, title in (("suspend_d", "补全停复牌检查"), ("moneyflow", "补全资金流")):
         checked_dates = _request_date_coverage(api_name, start_s, end_s)
+        remaining_dates = max(0, len(open_days) - checked_dates)
         add({
             "priority": 4, "key": f"date_api_{api_name}", "title": title,
             "why": f"{api_name} 已通过真实接口验证；按交易日分批，成功空结果也记为已检查",
             "action": "sync_date_api_batch",
             "params": {"api_name": api_name, "trade_dates": open_days, "limit": market_batch_days},
-            "estimated_calls": min(len(open_days), market_batch_days), "estimated_minutes": round(min(len(open_days), market_batch_days) * 0.2, 1),
+            # Date requests are executed by the shared 16-worker pool. Keep
+            # the call count exact, but estimate wall time by concurrent waves;
+            # any TuShare cooldown is added dynamically by the worker.
+            "estimated_calls": remaining_dates,
+            "estimated_minutes": round((remaining_dates / 16) * 0.2, 1),
             "status": "done" if open_days and checked_dates >= len(open_days) else "needed",
             "gap": {"checked_dates": checked_dates, "need_dates": len(open_days), "batch": market_batch_days},
         })
@@ -490,17 +544,131 @@ def build_backfill_plan(*, market_batch_days: int = 20, financial_batch_size: in
                 "sync_macro_core",
                 "noop",
             ],
-            "note": "可一键执行可自动步骤；adj_factor 全市场按票拉取成本高，计划中仅提示。",
+            "note": "可一键执行全部自动步骤；复权因子按交易日整批获取，核心财务按报告期 VIP 整批获取，失败接口再降级补偿。",
         },
     }
+
+
+def _step_progress_units(step: dict[str, Any]) -> tuple[float, float]:
+    """Return (done, total) units for a plan step.
+
+    Progress is based on real data coverage rather than the current execution
+    queue index. This keeps the UI from jumping 99% -> 60% when the plan is
+    rebuilt after a batch or auto-resume.
+    """
+    status = str(step.get("status") or "")
+    action = str(step.get("action") or "")
+    if status == "blocked" or action in {"manual_or_fallback_required", "noop"}:
+        return 0.0, 0.0
+    gap = step.get("gap") if isinstance(step.get("gap"), dict) else {}
+
+    total = 0.0
+    done = 0.0
+    for have_key, need_key in (
+        ("have_symbols", "need_symbols"),
+        ("checked_symbols", "need_symbols"),
+        ("have_dates", "need_dates"),
+        ("checked_dates", "need_dates"),
+        ("have", "need"),
+        ("ready_series", "need_series"),
+    ):
+        if need_key in gap:
+            total = float(gap.get(need_key) or 0)
+            done = float(gap.get(have_key) or 0)
+            break
+    if total <= 0 and "count" in gap:
+        total = float(gap.get("count") or 0)
+        done = total if status == "done" else 0.0
+    if total <= 0:
+        total = max(1.0, float(step.get("estimated_calls") or 1))
+        done = total if status == "done" else 0.0
+    if status == "done":
+        done = total
+    return max(0.0, min(done, total)), max(0.0, total)
+
+
+def _plan_progress_percent(plan: dict[str, Any]) -> int:
+    done = 0.0
+    total = 0.0
+    for step in plan.get("steps") or []:
+        if not isinstance(step, dict):
+            continue
+        step_done, step_total = _step_progress_units(step)
+        done += step_done
+        total += step_total
+    if total <= 0:
+        return 100
+    return max(0, min(100, int(round(done / total * 100))))
 
 
 def get_backfill_status() -> dict[str, Any]:
     cached = get_json("alis:data-platform:backfill:state")
     if isinstance(cached, dict):
+        _ensure_auto_resume_alive(cached)
+        if not cached.get("running") and str(cached.get("phase") or "") in {"completed", "completed_with_gaps"}:
+            # A completed state already persists the last plan summary.  The
+            # global status bar polls every few seconds; rebuilding the whole
+            # historical gap plan here turns a cheap status request into a
+            # multi-million-row scan and makes the dashboard time out.
+            summary = cached.get("plan_summary")
+            if isinstance(summary, dict):
+                return {"ok": True, **cached}
+            try:
+                plan = build_backfill_plan()
+                summary = plan.get("summary") if isinstance(plan, dict) else None
+                if isinstance(summary, dict) and int(summary.get("steps_needed") or 0) <= 0:
+                    normalized = {
+                        **cached,
+                        "running": False,
+                        "phase": "completed",
+                        "message": "历史补全已完成，当前无剩余缺口",
+                        "progress": 100,
+                        "plan_summary": summary,
+                        "current_step": None,
+                        "activity": None,
+                        "auto_resume": False,
+                        "can_resume": False,
+                        "resume_action": "",
+                    }
+                    if normalized != cached:
+                        with _lock:
+                            _state.clear()
+                            _state.update(normalized)
+                        set_json("alis:data-platform:backfill:state", normalized, ttl=86400)
+                    return {"ok": True, **normalized}
+            except Exception:
+                # Status must stay cheap and available; fall back to the last
+                # persisted state if plan reconstruction has a transient issue.
+                pass
         return {"ok": True, **cached}
     with _lock:
         return {"ok": True, **_state}
+
+
+def _ensure_auto_resume_alive(snapshot: dict[str, Any]) -> None:
+    """Self-heal stale Redis auto-resume states whose in-process timer was lost."""
+    if snapshot.get("running") or not snapshot.get("auto_resume"):
+        return
+    resume_at = str(snapshot.get("auto_resume_at") or "")
+    due = True
+    if resume_at:
+        try:
+            due = datetime.fromisoformat(resume_at) <= datetime.now()
+        except ValueError:
+            due = True
+    if not due:
+        return
+
+    def _resume_now() -> None:
+        start_backfill(
+            max_steps=int(snapshot.get("max_steps") or 0),
+            market_batch_days=30,
+            financial_batch_size=100,
+            enqueue_stream=True,
+            auto_resume_attempt=max(1, int(snapshot.get("auto_resume_attempt") or 1)),
+        )
+
+    threading.Thread(target=_resume_now, daemon=True, name="backfill-auto-resume-heal").start()
 
 
 def recover_interrupted_backfill() -> dict[str, Any]:
@@ -530,7 +698,32 @@ def recover_interrupted_backfill() -> dict[str, Any]:
             _state.clear()
             _state.update(snapshot)
         set_json("alis:data-platform:backfill:state", snapshot, ttl=86400)
+        _schedule_auto_resume(
+            error="process_restarted",
+            attempt=1,
+            max_steps=int(snapshot.get("max_steps") or 0),
+            market_batch_days=30,
+            financial_batch_size=100,
+        )
         return {"recovered": True, "run_id": run_id, "stale_runs": stale_ids}
+    if isinstance(cached, dict) and cached.get("phase") == "interrupted":
+        _schedule_auto_resume(
+            error=str(cached.get("error") or "process_restarted"),
+            attempt=int(cached.get("auto_resume_attempt") or 0) + 1,
+            max_steps=int(cached.get("max_steps") or 0),
+            market_batch_days=30,
+            financial_batch_size=100,
+        )
+        return {"recovered": True, "run_id": run_id, "stale_runs": [], "auto_resume": True}
+    if isinstance(cached, dict) and cached.get("auto_resume") and not cached.get("running"):
+        _schedule_auto_resume(
+            error=str(cached.get("error") or "process_restarted"),
+            attempt=max(1, int(cached.get("auto_resume_attempt") or 1)),
+            max_steps=int(cached.get("max_steps") or 0),
+            market_batch_days=30,
+            financial_batch_size=100,
+        )
+        return {"recovered": True, "run_id": run_id, "stale_runs": [], "auto_resume": True}
     return {"recovered": False, "stale_runs": []}
 
 
@@ -539,6 +732,89 @@ def _set(**values: Any) -> None:
         _state.update(values)
         snapshot = dict(_state)
     set_json("alis:data-platform:backfill:state", snapshot, ttl=86400)
+
+
+def _is_auto_resumable_error(error: str) -> bool:
+    text = (error or "").lower()
+    if not text:
+        return True
+    fatal_markers = (
+        "unsupported action",
+        "invalid token",
+        "token",
+        "unauthorized",
+        "forbidden",
+        "401",
+        "403",
+        "permission",
+        "权限",
+        "未授权",
+        "积分",
+        "接口权限",
+        "unsupported",
+    )
+    return not any(marker in text for marker in fatal_markers)
+
+
+def _auto_resume_delay(attempt: int) -> int:
+    idx = max(0, min(len(AUTO_RESUME_DELAYS_SECONDS) - 1, attempt - 1))
+    return AUTO_RESUME_DELAYS_SECONDS[idx]
+
+
+def _schedule_auto_resume(
+    *,
+    error: str,
+    attempt: int,
+    max_steps: int,
+    market_batch_days: int,
+    financial_batch_size: int,
+    delay_override_seconds: int | None = None,
+) -> None:
+    if not _is_auto_resumable_error(error):
+        _set(
+            auto_resume=False,
+            auto_resume_reason="fatal_error",
+            message=f"历史补全失败：{error}；该错误不适合自动续跑，请手动处理",
+        )
+        return
+    if AUTO_RESUME_MAX_ATTEMPTS > 0 and attempt > AUTO_RESUME_MAX_ATTEMPTS:
+        _set(
+            auto_resume=False,
+            auto_resume_reason="max_attempts_reached",
+            message=f"历史补全失败：{error}；已自动续跑 {AUTO_RESUME_MAX_ATTEMPTS} 次，暂停等待人工处理",
+        )
+        return
+    delay = max(1, int(delay_override_seconds or _auto_resume_delay(attempt)))
+    resume_at = (datetime.now() + timedelta(seconds=delay)).isoformat(timespec="seconds")
+    _set(
+        auto_resume=True,
+        auto_resume_attempt=attempt,
+        auto_resume_max_attempts=AUTO_RESUME_MAX_ATTEMPTS or None,
+        auto_resume_delay_seconds=delay,
+        auto_resume_at=resume_at,
+        message=f"历史补全失败：{error}；{delay} 秒后自动继续（第 {attempt} 次，不限次数）",
+    )
+
+    def _resume() -> None:
+        should_start = False
+        with _lock:
+            if not _state.get("running"):
+                phase = str(_state.get("phase") or "")
+                should_start = phase in {"failed", "interrupted"} or bool(_state.get("auto_resume"))
+        if not should_start:
+            return
+        start_backfill(
+            max_steps=max_steps,
+            market_batch_days=market_batch_days,
+            financial_batch_size=financial_batch_size,
+            enqueue_stream=True,
+            auto_resume_attempt=attempt,
+        )
+
+    timer = threading.Timer(delay, _resume)
+    timer.daemon = True
+    timer.name = f"backfill-auto-resume-{attempt}"
+    timer.start()
 
 
 def _activity_text(item: dict[str, Any]) -> str:
@@ -554,6 +830,8 @@ def _activity_text(item: dict[str, Any]) -> str:
         return f"请求 {api} · {target} · 第 {item.get('attempt', 1)} 次"
     if event == "retry":
         return f"重试 {api} · {target} · {item.get('category') or '异常'}"
+    if event == "cooldown":
+        return f"冷却 {api} · {target} · 剩余 {item.get('seconds', 0)} 秒"
     if event == "failed":
         return f"失败 {api} · {target} · {item.get('error') or '未知错误'}"
     if event == "response":
@@ -571,8 +849,11 @@ def _result_summary(result: dict[str, Any]) -> dict[str, Any]:
     """Keep polling/status payload small while preserving operator evidence."""
     summary = {k: result.get(k) for k in (
         "ok", "api", "trade_date", "period", "total", "success", "failed",
-        "rows_read", "rows_written", "error", "soft_failed",
+        "rows_read", "rows_written", "error", "soft_failed", "cooldown", "cooldown_seconds",
     ) if k in result}
+    failed_items = result.get("failed_items") or []
+    if failed_items:
+        summary["failed_items"] = failed_items[:8]
     children = result.get("results") or []
     if children:
         summary["subtasks"] = len(children)
@@ -620,7 +901,7 @@ def _run_step(step: dict[str, Any]) -> dict[str, Any]:
             completion_api=str(params.get("completion_api") or "core"),
         )
         # Soft-continue historical plan: one flaky stock must not abort the whole run.
-        if not result.get("ok") and int(result.get("success") or 0) > 0:
+        if not result.get("ok") and not result.get("cooldown") and int(result.get("success") or 0) > 0:
             result = {**result, "ok": True, "soft_failed": True}
         return result
     if action == "sync_stock_api_batch":
@@ -647,7 +928,8 @@ def _run_step(step: dict[str, Any]) -> dict[str, Any]:
             ("fx_daily", {"ts_code": "USDCNH.FXCM", "start_date": start_date, "end_date": end_date}),
         )
         results = [sync_tushare_api_raw(api, call_params) for api, call_params in calls]
-        return {"ok": all(r.get("ok") for r in results), "results": results}
+        pmi_proxy = sync_pmi_industry_proxies() if next((r for r in results if r.get("api") == "cn_pmi" and r.get("ok")), None) else None
+        return {"ok": all(r.get("ok") for r in results), "results": results, "pmi_industry_proxy": pmi_proxy}
     if action == "sync_announcements":
         return sync_cninfo_announcements(
             start_date=str(params.get("start_date") or ""),
@@ -662,10 +944,14 @@ def _run_step(step: dict[str, Any]) -> dict[str, Any]:
     return {"ok": False, "error": f"unsupported action: {action}"}
 
 
-def _worker(plan: dict[str, Any], *, max_steps: int, stream_id: str | None = None) -> None:
+def _worker(plan: dict[str, Any], *, max_steps: int, stream_id: str | None = None, auto_resume_attempt: int = 0) -> None:
     run_id = int(_state.get("run_id") or 0)
     executed: list[dict[str, Any]] = []
+    deferred: list[dict[str, Any]] = []
+    deferred_keys: set[str] = set()
     error = ""
+    should_auto_resume = False
+    auto_resume_delay_override: int | None = None
     set_tushare_activity_hook(_on_tushare_activity)
     try:
         runnable = [
@@ -687,13 +973,20 @@ def _worker(plan: dict[str, Any], *, max_steps: int, stream_id: str | None = Non
             _set(
                 phase=str(step.get("key") or step.get("id")),
                 message=f"正在执行：{step.get('title')}",
-                progress=int((index - 1) / max(total, 1) * 100),
+                progress=_plan_progress_percent(build_backfill_plan(
+                    market_batch_days=int(plan.get("scope", {}).get("policy", {}).get("market_batch_days") or 10),
+                    financial_batch_size=int(plan.get("scope", {}).get("policy", {}).get("financial_batch_size") or 20),
+                )),
                 current_step=step,
             )
             result = _run_step(step)
             executed.append({"step": {k: step.get(k) for k in ("id", "key", "title", "action")}, "result": _result_summary(result)})
             if not result.get("ok") and not result.get("skipped"):
+                if result.get("cooldown"):
+                    auto_resume_delay_override = max(1, int(result.get("cooldown_seconds") or 180))
                 detail = str(result.get("error") or "").strip()
+                if not detail and result.get("cooldown"):
+                    detail = f"Tushare 触发限流，冷却 {auto_resume_delay_override or 180} 秒后自动继续"
                 if not detail and result.get("failed"):
                     detail = f"失败 {result.get('failed')}/{result.get('total')} 只"
                 if not detail:
@@ -702,8 +995,35 @@ def _worker(plan: dict[str, Any], *, max_steps: int, stream_id: str | None = Non
                         if isinstance(sub, dict) and not sub.get("ok"):
                             detail = str(sub.get("error") or sub.get("api") or "子步骤失败")[:300]
                             break
+                # A global rate-limit cooldown pauses the worker. All other
+                # permanent/per-item failures are deferred so obtainable data
+                # can continue through the rest of the plan first.
+                if not result.get("cooldown"):
+                    step_key = str(step.get("key") or step.get("id") or "")
+                    deferred_keys.add(step_key)
+                    deferred.append({
+                        "step": {k: step.get(k) for k in ("id", "key", "title", "action")},
+                        "reason": (detail or "step failed")[:1000],
+                        "summary": _result_summary(result),
+                    })
+                    _set(
+                        message=f"已延后：{step.get('title')}；继续获取其他可用数据",
+                        deferred=deferred,
+                        deferred_count=len(deferred),
+                        failure_detail=None,
+                    )
+                    continue
                 error = detail or "step failed"
                 error = error[:1000]
+                _set(
+                    failure_detail={
+                        "step": {k: step.get(k) for k in ("id", "key", "title", "action")},
+                        "summary": _result_summary(result),
+                        "resume_hint": "已写入的数据会保留；点击继续补全会重新生成缺口计划，从未完成/失败覆盖项继续。",
+                    },
+                    can_resume=True,
+                    resume_action="start_backfill",
+                )
                 break
             # Calendar is a prerequisite. Rebuild the remaining plan after it
             # succeeds so market gaps discovered from the new calendar are
@@ -719,6 +1039,7 @@ def _worker(plan: dict[str, Any], *, max_steps: int, stream_id: str | None = Non
                     if s.get("status") == "needed"
                     and s.get("action") in {"sync_market_batch", "sync_financial_batch", "sync_announcements", "run_quality", "sync_stock_api_batch", "sync_date_api_batch", "sync_index_core", "sync_macro_core"}
                     and str(s.get("key")) not in already
+                    and str(s.get("key") or s.get("id") or "") not in deferred_keys
                 ]
                 runnable = runnable[:index] + remaining
                 if max_steps > 0:
@@ -738,23 +1059,49 @@ def _worker(plan: dict[str, Any], *, max_steps: int, stream_id: str | None = Non
                     s for s in refreshed.get("steps") or []
                     if s.get("status") == "needed"
                     and s.get("action") in {"sync_trade_calendar", "sync_market_batch", "sync_financial_batch", "sync_announcements", "run_quality", "sync_stock_api_batch", "sync_date_api_batch", "sync_index_core", "sync_macro_core"}
+                    and str(s.get("key") or s.get("id") or "") not in deferred_keys
                 ]
                 if remaining:
                     refresh_rounds += 1
                     runnable.extend(remaining)
                     total = len(runnable)
-                    _set(message=f"仍有缺口，继续第 {refresh_rounds + 1} 轮补全", current_step=remaining[0])
-        final = "failed" if error else "completed"
+                    _set(
+                        message=f"仍有缺口，继续第 {refresh_rounds + 1} 轮补全",
+                        progress=_plan_progress_percent(refreshed),
+                        current_step=remaining[0],
+                    )
+        final = "failed" if error else ("completed_with_gaps" if deferred else "completed")
         invalidate_data_assets_cache()
+        final_plan = build_backfill_plan(
+            market_batch_days=int(plan.get("scope", {}).get("policy", {}).get("market_batch_days") or 10),
+            financial_batch_size=int(plan.get("scope", {}).get("policy", {}).get("financial_batch_size") or 20),
+        )
+        final_summary = final_plan.get("summary") if isinstance(final_plan, dict) else {}
+        fully_done = not error and not deferred and int((final_summary or {}).get("steps_needed") or 0) <= 0
         _set(
             running=False,
             phase=final,
-            message=("历史补全失败：" + error) if error else f"已执行 {len(executed)} 个补全步骤",
-            progress=100 if not error else int(len(executed) / max(total, 1) * 100),
+            message=("历史补全失败：" + error) if error else (
+                f"可获取数据已补全；{len(deferred)} 个步骤已延后处理" if deferred
+                else "历史补全已完成，当前无剩余缺口" if fully_done
+                else f"已执行 {len(executed)} 个补全步骤"
+            ),
+            progress=100 if not error and not deferred else _plan_progress_percent(final_plan),
+            plan_summary=final_summary,
+            current_step=None,
+            activity=None,
             finished_at=_now(),
             executed=executed,
+            deferred=deferred,
+            deferred_count=len(deferred),
             error=error,
+            can_resume=bool(error),
+            resume_action="start_backfill" if error else "",
+            auto_resume=False,
+            auto_resume_attempt=auto_resume_attempt,
+            auto_resume_max_attempts=AUTO_RESUME_MAX_ATTEMPTS,
         )
+        should_auto_resume = bool(error)
     except Exception as exc:  # noqa: BLE001
         error = str(exc)[:1000]
         invalidate_data_assets_cache()
@@ -765,7 +1112,18 @@ def _worker(plan: dict[str, Any], *, max_steps: int, stream_id: str | None = Non
             finished_at=_now(),
             executed=executed,
             error=error,
+            failure_detail={
+                "step": dict(_state.get("current_step") or {}),
+                "summary": {"error": error},
+                "resume_hint": "异常已记录；点击继续补全会重新生成缺口计划并从剩余缺口继续。",
+            },
+            can_resume=True,
+            resume_action="start_backfill",
+            auto_resume=False,
+            auto_resume_attempt=auto_resume_attempt,
+            auto_resume_max_attempts=AUTO_RESUME_MAX_ATTEMPTS,
         )
+        should_auto_resume = True
     finally:
         set_tushare_activity_hook(None)
         if stream_id:
@@ -789,9 +1147,19 @@ def _worker(plan: dict[str, Any], *, max_steps: int, stream_id: str | None = Non
                 run_id,
             ),
         )
+    if should_auto_resume:
+        policy = plan.get("scope", {}).get("policy", {}) if isinstance(plan.get("scope"), dict) else {}
+        _schedule_auto_resume(
+            error=error,
+            attempt=auto_resume_attempt + 1,
+            max_steps=max_steps,
+            market_batch_days=int(policy.get("market_batch_days") or 10),
+            financial_batch_size=int(policy.get("financial_batch_size") or 20),
+            delay_override_seconds=auto_resume_delay_override,
+        )
 
 
-def start_backfill(*, max_steps: int = 0, market_batch_days: int = 10, financial_batch_size: int = 20, enqueue_stream: bool = True) -> dict[str, Any]:
+def start_backfill(*, max_steps: int = 0, market_batch_days: int = 30, financial_batch_size: int = 100, enqueue_stream: bool = True, auto_resume_attempt: int = 0) -> dict[str, Any]:
     """Execute auto-runnable steps of a freshly built plan.
 
     max_steps <= 0 runs the entire plan; otherwise only the first N runnable steps.
@@ -800,6 +1168,31 @@ def start_backfill(*, max_steps: int = 0, market_batch_days: int = 10, financial
         if _state.get("running"):
             return {"ok": False, "reason": "already_running", **_state}
         plan = build_backfill_plan(market_batch_days=market_batch_days, financial_batch_size=financial_batch_size)
+        summary = plan.get("summary") if isinstance(plan, dict) else {}
+        steps_needed = int((summary or {}).get("steps_needed") or 0)
+        if steps_needed <= 0:
+            snapshot = {
+                "running": False,
+                "run_id": int(_state.get("run_id") or 0),
+                "phase": "completed",
+                "message": "历史补全已完成，当前无剩余缺口",
+                "progress": 100,
+                "started_at": _state.get("started_at") or _now(),
+                "finished_at": _now(),
+                "plan_summary": summary,
+                "current_step": None,
+                "activity": None,
+                "max_steps": max_steps,
+                "auto_resume": False,
+                "auto_resume_attempt": auto_resume_attempt,
+                "auto_resume_max_attempts": AUTO_RESUME_MAX_ATTEMPTS,
+                "can_resume": False,
+                "resume_action": "",
+            }
+            _state.clear()
+            _state.update(snapshot)
+            set_json("alis:data-platform:backfill:state", dict(_state), ttl=86400)
+            return {"ok": True, "reason": "no_gaps", **snapshot, "plan": plan}
         with _conn() as c:
             c.execute(
                 """
@@ -817,10 +1210,13 @@ def start_backfill(*, max_steps: int = 0, market_batch_days: int = 10, financial
                 "run_id": run_id,
                 "phase": "starting",
                 "message": "正在启动历史补全",
-                "progress": 0,
+                "progress": _plan_progress_percent(plan),
                 "started_at": _now(),
                 "plan_summary": plan.get("summary"),
                 "max_steps": max_steps,
+                "auto_resume": False,
+                "auto_resume_attempt": auto_resume_attempt,
+                "auto_resume_max_attempts": AUTO_RESUME_MAX_ATTEMPTS,
             }
         )
         set_json("alis:data-platform:backfill:state", dict(_state), ttl=86400)
@@ -828,14 +1224,19 @@ def start_backfill(*, max_steps: int = 0, market_batch_days: int = 10, financial
         if enqueue_stream:
             stream_id = enqueue_task(
                 "data_platform.backfill",
-                {"run_id": run_id, "max_steps": max_steps, "plan_generated_at": plan.get("generated_at")},
+                {
+                    "run_id": run_id,
+                    "max_steps": max_steps,
+                    "plan_generated_at": plan.get("generated_at"),
+                    "auto_resume_attempt": auto_resume_attempt,
+                },
             )
         _state["stream_id"] = stream_id
         set_json("alis:data-platform:backfill:state", dict(_state), ttl=86400)
         threading.Thread(
             target=_worker,
             args=(plan,),
-            kwargs={"max_steps": max_steps, "stream_id": stream_id},
+            kwargs={"max_steps": max_steps, "stream_id": stream_id, "auto_resume_attempt": auto_resume_attempt},
             daemon=True,
             name=f"backfill-{run_id}",
         ).start()
@@ -853,4 +1254,5 @@ def process_stream_task(fields: dict[str, str]) -> dict[str, Any]:
     return start_backfill(
         max_steps=int(payload.get("max_steps") or 0),
         enqueue_stream=False,
+        auto_resume_attempt=int(payload.get("auto_resume_attempt") or 0),
     )

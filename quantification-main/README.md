@@ -85,6 +85,13 @@ npm run install:backend
 
 “全部完成”取决于 TuShare 权限、接口覆盖、历史数据可用性和限流；数据源不存在的数据无法自动生成。
 
+## 本地归档与恢复
+
+- 原始数据冷归档使用 ZSTD Parquet，必须显式调用归档接口；归档只写副本，不会删除 PostgreSQL 在线数据。默认目录为 `backend/.cache/cold-archive/`，可通过 `ALIS_COLD_ARCHIVE_ROOT` 改到外接硬盘。
+- 本地全量备份：`./scripts/backup_local_postgres.sh`，默认写入 `.cache/backups/`，包含 `alis_sim` 和 `alis_data` 两个数据库及 SHA-256 清单。
+- 恢复：`./scripts/restore_local_postgres.sh <备份目录>`。只有确认要清空并还原目标库时才增加 `--clean`。
+- 时间点恢复（WAL）需要明确磁盘保留策略，默认不自动启用；先运行 `./scripts/configure_local_wal_archive.sh` 查看启用命令。
+
 ## 主要能力
 
 - 市场总览、状态机、情绪和风险预算门控

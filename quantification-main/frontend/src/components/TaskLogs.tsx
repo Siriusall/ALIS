@@ -1,4 +1,5 @@
 import type { LogEntry } from "../types";
+import { formatGmt8Time } from "../utils/time";
 
 interface TaskLogsProps {
   logs: LogEntry[];
@@ -13,7 +14,7 @@ export default function TaskLogs({ logs }: TaskLogsProps) {
           {logs.map((log, idx) => (
             <li key={`${log.timestamp}-${idx}`}>
               <span className="level">{log.level}</span>
-              <span>{new Date(log.timestamp).toLocaleString()}</span>
+              <span>{formatGmt8Time(log.timestamp)}</span>
               <span>{log.message}</span>
             </li>
           ))}

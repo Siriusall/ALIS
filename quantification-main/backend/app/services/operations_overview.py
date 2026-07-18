@@ -25,6 +25,7 @@ from app.services.quant_risk import (
 )
 from app.services.advanced_controls import black_litterman_weights
 from app.services.quant_run_engine import list_consolidated_trade_dates
+from app.services.rebalance_allocator import correlated_industry_group
 from app.services.research_engine import capability_registry
 from app.services.thesis_store import list_theses
 
@@ -166,11 +167,21 @@ def build_live_portfolio_risk(lookback: int = 120) -> dict[str, Any]:
     for item in exposures:
         industry = str(item.get("industry") or "unclassified")
         by_industry[industry] = by_industry.get(industry, 0.0) + _f(item.get("weight"))
-    industry_limit = 0.40
+    industry_limit = 0.25
     for industry, weight in sorted(by_industry.items(), key=lambda value: value[1], reverse=True):
         industry_exposures.append({"industry": industry, "weight": round(weight, 6), "limit": industry_limit, "status": "breach" if weight > industry_limit else "within_limit"})
         if weight > industry_limit:
             breaches.append({"code": "industry_limit", "industry": industry, "severity": "error", "limit": industry_limit, "message": f"行业权重 {weight:.1%} 超过 {industry_limit:.0%} 上限"})
+    by_correlated_group: dict[str, float] = {}
+    for industry, weight in by_industry.items():
+        group = correlated_industry_group(industry)
+        by_correlated_group[group] = by_correlated_group.get(group, 0.0) + weight
+    correlated_industry_exposures = []
+    for group, weight in sorted(by_correlated_group.items(), key=lambda value: value[1], reverse=True):
+        status = "breach" if weight > .35 else "within_limit"
+        correlated_industry_exposures.append({"group": group, "weight": round(weight, 6), "limit": .35, "status": status})
+        if status == "breach":
+            breaches.append({"code": "correlated_industry_limit", "group": group, "severity": "error", "limit": .35, "message": f"高度相关行业组权重 {weight:.1%} 超过 35% 上限"})
     weight_explanations = []
     for item in exposures:
         target = _f(weights.get(item["symbol"]))
@@ -224,6 +235,7 @@ def build_live_portfolio_risk(lookback: int = 120) -> dict[str, Any]:
         "target_weights": weights,
         "weight_explanations": weight_explanations,
         "industry_exposures": industry_exposures,
+        "correlated_industry_exposures": correlated_industry_exposures,
         "covariance": ledoit_wolf_covariance(returns_by_symbol) if returns_by_symbol else {},
         "exposures": exposures,
         "breaches": breaches,

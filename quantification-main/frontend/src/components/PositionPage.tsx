@@ -10,6 +10,8 @@ import {
   Legend,
 } from "recharts";
 import type { Position, Operation } from "../types";
+import { formatGmt8Time } from "../utils/time";
+import type { SectionId } from "./Layout";
 import {
   addPosition as apiAddPosition,
   deletePosition,
@@ -24,6 +26,10 @@ import { chartGridStroke, chartLinePrimary, chartTooltipStyle } from "../chartTh
 
 type TabId = "positions" | "operations" | "chart";
 
+interface PositionPageProps {
+  onNavigate?: (section: SectionId) => void;
+}
+
 function formatNumber(value: number) {
   return Intl.NumberFormat("zh-CN").format(value);
 }
@@ -36,13 +42,7 @@ function formatAmount(value: number) {
 }
 
 function formatTime(iso: string | null | undefined) {
-  if (!iso) return "—";
-  try {
-    const d = new Date(iso);
-    return d.toLocaleString("zh-CN", { hour12: false });
-  } catch {
-    return iso;
-  }
+  return formatGmt8Time(iso);
 }
 
 function loadPositions(
@@ -60,7 +60,7 @@ function loadPositions(
     });
 }
 
-export default function PositionPage() {
+export default function PositionPage({ onNavigate }: PositionPageProps) {
   const [tab, setTab] = useState<TabId>("positions");
   const [positions, setPositions] = useState<Position[]>([]);
   const [operations, setOperations] = useState<Operation[]>([]);
@@ -185,14 +185,81 @@ export default function PositionPage() {
     () => positions.reduce((sum, p) => sum + p.price * p.quantity, 0),
     [positions]
   );
+  const totalCurrentValue = useMemo(
+    () => positions.reduce((sum, p) => sum + (p.current_value ?? p.price * p.quantity), 0),
+    [positions]
+  );
+  const totalProfitLoss = totalCurrentValue - totalCost;
+  const totalProfitLossPct = totalCost > 0 ? (totalProfitLoss / totalCost) * 100 : null;
+  const largestPosition = useMemo(() => {
+    if (positions.length === 0 || totalCurrentValue <= 0) return null;
+    return positions
+      .map((p) => ({ ...p, weight: (p.current_value ?? p.price * p.quantity) / totalCurrentValue }))
+      .sort((a, b) => b.weight - a.weight)[0];
+  }, [positions, totalCurrentValue]);
 
   return (
     <section id="position" className="dashboard-section" data-section="position">
-      <h2 className="dashboard-section-title">持仓</h2>
-      <div className="dashboard-section-inner">
+      <h2 className="dashboard-section-title">组合管理</h2>
+      <div className="dashboard-section-inner decision-page">
+        <div className="product-module-head">
+          <div>
+            <h1>持仓、模拟执行和风险约束</h1>
+            <p>这里看持仓、执行和风险。</p>
+          </div>
+          <button type="button" className="button ghost" onClick={() => loadPositions(setPositions, setDataSourceTime)}>
+            刷新组合
+          </button>
+        </div>
         <div className="text-muted" style={{ marginBottom: "0.75rem", fontSize: "14px" }}>
           <span>当前时间：{formatTime(currentTime.toISOString())}</span>
-          <span style={{ marginLeft: "1rem" }}>数据源时间：{formatTime(dataSourceTime ?? undefined)}</span>
+          <span style={{ marginLeft: "1rem" }}>行情/数据源时间：{formatTime(dataSourceTime ?? undefined)}</span>
+        </div>
+        <div className="product-module-grid">
+          <article className="product-module-card">
+            <h2>持仓数量</h2>
+            <strong>{positions.length}</strong>
+            <p>当前权益标的</p>
+          </article>
+          <article className="product-module-card">
+            <h2>组合市值</h2>
+            <strong>{formatAmount(totalCurrentValue)}</strong>
+            <p>按当前价格估算</p>
+          </article>
+          <article className="product-module-card">
+            <h2>估算盈亏</h2>
+            <strong style={{ color: totalProfitLoss >= 0 ? "#16a34a" : "#dc2626" }}>
+              {totalCost > 0 ? `${totalProfitLoss >= 0 ? "+" : ""}${formatAmount(totalProfitLoss)}` : "—"}
+            </strong>
+            <p>{totalProfitLossPct == null ? "暂无成本基准" : `${totalProfitLossPct >= 0 ? "+" : ""}${totalProfitLossPct.toFixed(2)}%`}</p>
+          </article>
+          <article className="product-module-card">
+            <h2>最大单票</h2>
+            <strong>{largestPosition ? `${largestPosition.symbol} ${(largestPosition.weight * 100).toFixed(1)}%` : "—"}</strong>
+            <p>看集中度</p>
+          </article>
+        </div>
+        <div className="decision-command-bar" aria-label="组合执行下一步">
+          <div className="decision-command-intro">
+            <span>EXECUTION LOOP</span>
+            <strong>组合动作必须留下证据</strong>
+          </div>
+          <button type="button" onClick={() => onNavigate?.("executionLedger")}>
+            <span>01 · 执行账本</span>
+            <strong>逐笔核对</strong>
+          </button>
+          <button type="button" className={largestPosition && largestPosition.weight >= 0.25 ? "urgent" : ""} onClick={() => onNavigate?.("positionRisk")}>
+            <span>02 · 持仓风险</span>
+            <strong>{largestPosition ? `${(largestPosition.weight * 100).toFixed(1)}%` : "—"}</strong>
+          </button>
+          <button type="button" onClick={() => onNavigate?.("validation")}>
+            <span>03 · 再平衡预览</span>
+            <strong>模拟前置</strong>
+          </button>
+          <button type="button" onClick={() => onNavigate?.("review")}>
+            <span>04 · 复盘归因</span>
+            <strong>闭环</strong>
+          </button>
         </div>
         <div className="strategy-tabs" style={{ marginBottom: "1rem" }}>
           <button
@@ -200,28 +267,31 @@ export default function PositionPage() {
             className={tab === "positions" ? "active" : ""}
             onClick={() => setTab("positions")}
           >
-            所有持仓
+            当前组合
           </button>
           <button
             type="button"
             className={tab === "operations" ? "active" : ""}
             onClick={() => setTab("operations")}
           >
-            操作记录
+            执行记录
           </button>
           <button
             type="button"
             className={tab === "chart" ? "active" : ""}
             onClick={() => setTab("chart")}
           >
-            跟盘折线图
+            组合曲线
           </button>
         </div>
 
         {tab === "positions" && (
           <>
             <div className="card" style={{ marginBottom: "1rem" }}>
-              <h3>添加持仓</h3>
+              <h3>模拟账户校准</h3>
+              <div className="decision-message" style={{ marginBottom: 12 }}>
+                这是低频校准动作，只用于修正本地模拟账户。正式买卖仍应通过“今日决策 → 模拟执行 → 执行账本”留下证据链。
+              </div>
               {positionError && <div className="alert">{positionError}</div>}
               <div style={{ display: "flex", flexWrap: "wrap", gap: "0.75rem", alignItems: "center" }}>
                 <input
@@ -262,14 +332,14 @@ export default function PositionPage() {
                       setAddPrice("");
                       loadPositions(setPositions, setDataSourceTime);
                     } catch (e: unknown) {
-                      setPositionError((e as { response?: { data?: { detail?: string } } })?.response?.data?.detail || "添加失败");
+                      setPositionError((e as { response?: { data?: { detail?: string } } })?.response?.data?.detail || "模拟账户校准失败");
                     } finally {
                       setAdding(false);
                     }
                   }}
                   style={{ padding: "6px 12px", background: "#2563eb", color: "#ffffff", border: "none", borderRadius: "6px", cursor: "pointer" }}
                 >
-                  {adding ? "添加中…" : "添加"}
+                  {adding ? "校准中…" : "登记校准"}
                 </button>
               </div>
             </div>
@@ -403,7 +473,7 @@ export default function PositionPage() {
                               }}
                               style={{ marginRight: "6px", padding: "4px 8px", fontSize: "12px", cursor: "pointer" }}
                             >
-                              调整
+                              校准
                             </button>
                             <button
                               type="button"
@@ -418,14 +488,14 @@ export default function PositionPage() {
                                   loadPositions(setPositions, setDataSourceTime);
                                   fetchOperations().then(setOperations).catch(() => {});
                                 } catch {
-                                  setPositionError("出售失败");
+                                  setPositionError("模拟卖出失败");
                                 } finally {
                                   setSellingId(null);
                                 }
                               }}
                               style={{ marginRight: "6px", padding: "4px 8px", fontSize: "12px", cursor: "pointer", background: "#16a34a", color: "#ffffff", border: "none", borderRadius: "4px" }}
                             >
-                              {sellingId === p.id ? "出售中…" : "出售"}
+                              {sellingId === p.id ? "模拟卖出中…" : "模拟卖出"}
                             </button>
                             <button
                               type="button"
@@ -451,7 +521,7 @@ export default function PositionPage() {
                 </tbody>
               </table>
               {positions.length === 0 && (
-                <div className="empty">暂无持仓，可在此手动添加，或在量化分析页确认执行后自动建仓</div>
+                <div className="empty">暂无持仓。请先从今日决策/量化验证生成模拟执行，必要时再用校准入口补录初始模拟账户。</div>
               )}
             </div>
           </>
@@ -482,7 +552,7 @@ export default function PositionPage() {
               </tbody>
             </table>
             {operations.length === 0 && (
-              <div className="empty">暂无操作记录</div>
+              <div className="empty">暂无执行记录。新的模拟执行会进入“模拟执行账本”，这里保留历史操作流水。</div>
             )}
           </div>
         )}
@@ -546,9 +616,9 @@ export default function PositionPage() {
                   </div>
                 )}
             {curveLoading ? (
-              <div className="empty">加载跟盘曲线中…</div>
+              <div className="empty">加载组合曲线中…</div>
             ) : chartData.length === 0 ? (
-              <div className="empty">暂无持仓或曲线数据，请先添加持仓</div>
+              <div className="empty">暂无持仓或曲线数据，请先形成模拟持仓。</div>
             ) : (
               <div className="chart-wrap chart-fixed-height">
                 <ResponsiveContainer width="100%" height="100%">

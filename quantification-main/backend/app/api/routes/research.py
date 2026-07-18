@@ -16,12 +16,14 @@ from app.services.research_engine import (
     research_state,
     score_dimension,
 )
-from app.services.thesis_store import create_thesis, get_thesis, list_theses, review_due_theses, review_thesis, update_hypothesis
-from app.services.industry_event_engine import industry_detail, list_events, list_industries, review_linked_event_theses, score_event, score_industry
-from app.services.decision_store import build_review_outcome_suggestion, create_decision_snapshot, create_review, list_decision_snapshots, list_pool_members, list_position_states, list_reviews, remove_pool_member, transition_pool_member, transition_position, upsert_pool_member
+from app.services.thesis_store import create_thesis, generate_thesis_for_stock, generate_watch_pool_theses, get_thesis, list_theses, review_due_theses, review_thesis, update_hypothesis
+from app.services.industry_event_engine import industry_detail, list_event_followups, list_events, list_industries, materialize_event_followups, materialize_industry_state_history, materialize_industry_state_snapshots, review_linked_event_theses, score_event, score_industry, update_event_followup
+from app.services.decision_store import build_review_outcome_suggestion, create_decision_snapshot, create_review, diff_decision_snapshots, list_decision_snapshots, list_pool_members, list_position_state_history, list_position_states, list_reviews, remove_pool_member, transition_pool_member, transition_position, upsert_pool_member, verify_decision_snapshot
 from app.services.operations_overview import build_decision_audit, build_governance_overview, build_live_portfolio_risk
 from app.services.stock_pool_sync import stage_candidates_in_watch_pool
+from app.services.research_workflow import evaluate_core_pool_eligibility, process_watch_pool
 from app.services.advanced_controls import bayesian_update, freeze_evidence, trade_attribution
+from app.services.theme_engine import list_themes, materialize_theme_snapshots
 
 router = APIRouter()
 
@@ -70,6 +72,12 @@ class EventScoreRequest(BaseModel):
     event_date: str = ""
 
 
+class EventFollowupUpdateRequest(BaseModel):
+    status: str
+    next_action: str = Field(default="", max_length=2000)
+    actor: str = Field(default="user", max_length=128)
+
+
 class PoolMemberRequest(BaseModel):
     ts_code: str = Field(min_length=6,max_length=16); pool_type: str; reason: str = Field(min_length=3,max_length=2000)
 
@@ -82,7 +90,7 @@ class PoolTransitionRequest(BaseModel):
 
 
 class DecisionSnapshotRequest(BaseModel):
-    ts_code:str;decision_type:str;decision_time:str|None=None;price:float|None=None;thesis_id:int|None=None
+    ts_code:str;decision_type:str;decision_time:str|None=None;price:float|None=None;thesis_id:int|None=None;execution_id:int|None=None;operation_id:int|None=None
     data_as_of_time:str;model_version:str;market_state:dict[str,Any]=Field(default_factory=dict);research_state:dict[str,Any]=Field(default_factory=dict)
     valuation:dict[str,Any]=Field(default_factory=dict);portfolio_context:dict[str,Any]=Field(default_factory=dict);reason:str=Field(min_length=3);invalidation_conditions:list[str]=Field(default_factory=list)
 
@@ -112,14 +120,11 @@ class EvidenceFreezeRequest(BaseModel):
 
 class PositionTransitionRequest(BaseModel):
     ts_code:str;to_state:str;reason:str=Field(min_length=3);thesis_id:int|None=None;evidence:list[dict[str,Any]]=Field(default_factory=list)
+    rule_version:str="position_state_v1";model_version:str="";automatic_decision:dict[str,Any]=Field(default_factory=dict)
+    intervention_type:str="override";intervention_actor:str="user"
 
 
-class PositionStateConfirmRequest(BaseModel):
-    ts_code: str
-    to_state: str
-    reason: str = Field(min_length=3)
-    thesis_id: int | None = None
-    evidence: list[dict[str, Any]] = Field(default_factory=list)
+class PositionStateConfirmRequest(PositionTransitionRequest):
     confirmed: bool = False
 
 
@@ -127,6 +132,19 @@ class PositionStateConfirmRequest(BaseModel):
 def research_capabilities() -> dict[str, Any]:
     items = capability_registry()
     return {"ok": True, "items": items, "counts": {status: sum(1 for x in items if x["status"] == status) for status in ("ready", "partial", "building", "missing")}}
+
+
+@router.get("/research/themes")
+def research_themes(
+    as_of_time: str = "", promotable_only: bool = False,
+    limit: int = Query(default=100, ge=1, le=500),
+) -> dict[str, Any]:
+    return list_themes(as_of_time=as_of_time or None, promotable_only=promotable_only, limit=limit)
+
+
+@router.post("/research/themes/materialize")
+def research_themes_materialize(as_of_time: str = "", lookback: int = Query(default=20, ge=5, le=60)) -> dict[str, Any]:
+    return materialize_theme_snapshots(as_of_time=as_of_time or None, lookback=lookback)
 
 
 @router.get("/research/contracts")
@@ -202,6 +220,16 @@ def research_thesis_review_due(
     return review_due_theses(limit=limit, review_interval_days=interval_days)
 
 
+@router.post("/research/theses/generate/{ts_code}")
+def research_thesis_generate(ts_code: str, force: bool = False) -> dict[str, Any]:
+    return generate_thesis_for_stock(ts_code, force=force)
+
+
+@router.post("/research/theses/generate-watch-pool")
+def research_thesis_generate_watch_pool(limit: int = Query(default=100, ge=1, le=500)) -> dict[str, Any]:
+    return generate_watch_pool_theses(limit=limit)
+
+
 @router.post("/research/theses/{thesis_id}/review")
 def research_thesis_review(thesis_id: int) -> dict[str, Any]:
     item = review_thesis(thesis_id)
@@ -211,8 +239,9 @@ def research_thesis_review(thesis_id: int) -> dict[str, Any]:
 
 
 @router.get("/research/industries")
-def research_industries() -> dict[str, Any]:
-    return list_industries()
+def research_industries(as_of_time: str = "") -> dict[str, Any]:
+    """Read latest or an explicit point-in-time industry-state snapshot."""
+    return list_industries(as_of_time=as_of_time or None)
 
 
 @router.get("/research/industries/{industry_code}")
@@ -223,6 +252,19 @@ def research_industry_detail(industry_code: str) -> dict[str, Any]:
 @router.post("/research/industries/score")
 def research_industry_score(req: IndustryScoreRequest) -> dict[str, Any]:
     return {"ok": True, **score_industry(req.observations, prior_score=req.prior_score, history_points=req.history_points)}
+
+
+@router.post("/research/industries/materialize")
+def research_industry_materialize(as_of_time: str = "") -> dict[str, Any]:
+    return materialize_industry_state_snapshots(as_of_time=as_of_time or None)
+
+
+@router.post("/research/industries/materialize-history")
+def research_industry_materialize_history(
+    anchor_sessions: int = Query(default=20, ge=5, le=60),
+    max_points: int = Query(default=36, ge=1, le=120),
+) -> dict[str, Any]:
+    return materialize_industry_state_history(anchor_sessions=anchor_sessions, max_points=max_points)
 
 
 @router.get("/research/events")
@@ -241,18 +283,56 @@ def research_event_review_linked(limit: int = Query(default=100, ge=1, le=500)) 
     return review_linked_event_theses(limit=limit)
 
 
+@router.post("/research/events/followups/materialize")
+def research_event_followups_materialize(limit: int = Query(default=500, ge=1, le=2000)) -> dict[str, Any]:
+    return materialize_event_followups(limit=limit)
+
+
+@router.get("/research/events/followups")
+def research_event_followups(
+    status: str = "", ts_code: str = "", limit: int = Query(default=500, ge=1, le=2000),
+) -> dict[str, Any]:
+    return list_event_followups(status=status, ts_code=ts_code.strip().upper(), limit=limit)
+
+
+@router.patch("/research/events/followups/{event_key:path}")
+def research_event_followup_update(event_key: str, req: EventFollowupUpdateRequest) -> dict[str, Any]:
+    try:
+        item = update_event_followup(event_key, status=req.status, next_action=req.next_action, actor=req.actor)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if not item:
+        raise HTTPException(status_code=404, detail="event_followup_not_found")
+    return {"ok": True, "item": item}
+
+
 @router.get("/research/pools")
 def research_pools(pool_type:str="")->dict[str,Any]: return {"ok":True,"items":list_pool_members(pool_type)}
 
 
+@router.get("/research/pools/eligibility/{ts_code}")
+def research_pool_eligibility(ts_code: str) -> dict[str, Any]:
+    return evaluate_core_pool_eligibility(ts_code)
+
+
 @router.post("/research/pools")
 def research_pool_add(req:PoolMemberRequest)->dict[str,Any]:
+    if req.pool_type == "core":
+        eligibility = evaluate_core_pool_eligibility(req.ts_code)
+        if not eligibility["eligible_for_core"]:
+            failed = [item["label"] for item in eligibility["gates"] if not item["passed"]]
+            raise HTTPException(status_code=409, detail={"code": "core_pool_gate_failed", "failed_gates": failed, "eligibility": eligibility})
     try:return {"ok":True,"item":upsert_pool_member(ts_code=req.ts_code.strip().upper(),pool_type=req.pool_type,reason=req.reason)}
     except ValueError as exc:raise HTTPException(status_code=422,detail=str(exc)) from exc
 
 
 @router.post("/research/pools/transition")
 def research_pool_transition(req: PoolTransitionRequest) -> dict[str, Any]:
+    if req.to_pool == "core":
+        eligibility = evaluate_core_pool_eligibility(req.ts_code)
+        if not eligibility["eligible_for_core"]:
+            failed = [item["label"] for item in eligibility["gates"] if not item["passed"]]
+            raise HTTPException(status_code=409, detail={"code": "core_pool_gate_failed", "failed_gates": failed, "eligibility": eligibility})
     try:
         item = transition_pool_member(
             ts_code=req.ts_code.strip().upper(), from_pool=req.from_pool,
@@ -271,12 +351,33 @@ def research_pool_stage_candidates(limit: int = Query(default=20, ge=1, le=200))
     return stage_candidates_in_watch_pool(list(result.candidates))
 
 
+@router.post("/research/pools/process-watch")
+def research_pool_process_watch(limit: int = Query(default=100, ge=1, le=500)) -> dict[str, Any]:
+    return process_watch_pool(limit=limit)
+
+
 @router.delete("/research/pools/{member_id}")
 def research_pool_remove(member_id:int)->dict[str,Any]: return {"ok":remove_pool_member(member_id)}
 
 
 @router.get("/research/decisions")
 def research_decisions(ts_code:str="",limit:int=Query(100,ge=1,le=500))->dict[str,Any]:return {"ok":True,"items":list_decision_snapshots(ts_code.strip().upper(),limit)}
+
+
+@router.get("/research/evidence/verify/{decision_snapshot_id}")
+def research_evidence_verify(decision_snapshot_id: int) -> dict[str, Any]:
+    item = verify_decision_snapshot(decision_snapshot_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="decision_snapshot_not_found")
+    return item
+
+
+@router.get("/research/evidence/diff")
+def research_evidence_diff(left_id: int = Query(ge=1), right_id: int = Query(ge=1)) -> dict[str, Any]:
+    item = diff_decision_snapshots(left_id, right_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="decision_snapshot_not_found")
+    return item
 
 
 @router.post("/research/theses/bayesian-review")
@@ -319,7 +420,7 @@ def research_review_create(req:ReviewRequest)->dict[str,Any]:return {"ok":True,"
 
 @router.post("/research/position-state")
 def research_position_transition(req:PositionTransitionRequest)->dict[str,Any]:
-    try:return {"ok":True,"item":transition_position(ts_code=req.ts_code.strip().upper(),to_state=req.to_state,reason=req.reason,thesis_id=req.thesis_id,evidence=req.evidence)}
+    try:return {"ok":True,"item":transition_position(ts_code=req.ts_code.strip().upper(),to_state=req.to_state,reason=req.reason,thesis_id=req.thesis_id,evidence=req.evidence,rule_version=req.rule_version,model_version=req.model_version,automatic_decision=req.automatic_decision,intervention_type=req.intervention_type,intervention_actor=req.intervention_actor)}
     except ValueError as exc:raise HTTPException(status_code=409,detail=str(exc)) from exc
 
 
@@ -331,6 +432,9 @@ def research_position_state_confirm(req: PositionStateConfirmRequest) -> dict[st
         item = transition_position(
             ts_code=req.ts_code.strip().upper(), to_state=req.to_state,
             reason=req.reason, thesis_id=req.thesis_id, evidence=req.evidence,
+            rule_version=req.rule_version, model_version=req.model_version,
+            automatic_decision=req.automatic_decision,
+            intervention_type=req.intervention_type, intervention_actor=req.intervention_actor,
         )
         return {"ok": True, "confirmed": True, "item": item}
     except ValueError as exc:
@@ -340,6 +444,13 @@ def research_position_state_confirm(req: PositionStateConfirmRequest) -> dict[st
 @router.get("/research/position-state")
 def research_position_states() -> dict[str, Any]:
     return {"ok": True, "items": list_position_states()}
+
+
+@router.get("/research/position-state/history")
+def research_position_state_history(
+    ts_code: str = Query("", max_length=16), limit: int = Query(500, ge=1, le=2000),
+) -> dict[str, Any]:
+    return {"ok": True, "items": list_position_state_history(ts_code.strip().upper(), limit)}
 
 
 @router.get("/research/portfolio-risk/live")

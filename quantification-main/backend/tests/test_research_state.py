@@ -17,3 +17,14 @@ def test_research_confidence_retains_partial_real_evidence():
     assert result["confidence"] == 0.2143
     assert result["covered_dimensions"] == 2
     assert result["total_dimensions"] == 7
+
+
+def test_incomplete_dimensions_cannot_claim_high_quality_low_valuation():
+    dimensions = {
+        key: {"score": 90, "coverage": .5, "confidence": .5, "status": "insufficient_data"}
+        for key in ("quality", "growth", "cashflow", "governance", "industry", "expectation", "valuation")
+    }
+
+    result = research_state(dimensions, {"eligible": True})
+
+    assert result["classification"] == "研究观察"

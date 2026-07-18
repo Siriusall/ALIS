@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { analyzeQuantMarket, executeQuantAnalyzeBuy, previewQuantAnalyzeRebalance } from "../api/quantRuns";
+import { analyzeQuantMarket, executeQuantAnalyzeBuy, previewQuantAnalyzeRebalance, runQuantRunOnce } from "../api/quantRuns";
 import type { QuantAnalyzeResponse, QuantRebalancePreviewResponse } from "../types";
 
 const ANALYZE_RESULT_KEY = "quant_analyze_result_v1";
@@ -80,6 +80,7 @@ export default function QuantRunPanel() {
   const [loading, setLoading] = useState(false);
   const [previewing, setPreviewing] = useState(false);
   const [buying, setBuying] = useState(false);
+  const [autoRunning, setAutoRunning] = useState(false);
   const [error, setError] = useState("");
   const [buyMessage, setBuyMessage] = useState("");
   const [rebalanceMode, setRebalanceMode] = useState<RebalanceMode>("full_rebalance");
@@ -132,7 +133,34 @@ export default function QuantRunPanel() {
     }
   }
 
-  async function handleConfirmExecute() {
+  async function handleAutoRunOnce() {
+    setAutoRunning(true);
+    setBuyMessage("");
+    setError("");
+    try {
+      const exec = await runQuantRunOnce();
+      if (!exec.ok) throw new Error(exec.message || "自动模拟执行未完成");
+      setBuyMessage(
+        `自动模拟盘已完成：signal=${exec.signal_date}，execute=${exec.execute_date}，卖出 ${exec.sold_count ?? 0} 只，买入 ${exec.bought_count ?? 0} 只，` +
+          `花费 ${fmtMoney(exec.total_buy_cost)} 元。`
+      );
+      setPreview(null);
+      const refreshed = await analyzeQuantMarket({ signal_date: exec.signal_date, top_n: 10, exchange_group: "HS" });
+      setResult(refreshed);
+      storeAnalyzeResult(refreshed);
+    } catch (e: unknown) {
+      const resp = (e as { response?: { data?: { detail?: string | { message?: string } } } })?.response?.data?.detail;
+      const msg =
+        (e as Error)?.message ||
+        (typeof resp === "string" ? resp : resp?.message) ||
+        "自动模拟执行失败，请稍后重试";
+      setError(msg);
+    } finally {
+      setAutoRunning(false);
+    }
+  }
+
+  async function handleExecuteSimulation() {
     if (!result?.signal_date || !canTrade) return;
     setBuying(true);
     setBuyMessage("");
@@ -159,7 +187,7 @@ export default function QuantRunPanel() {
       const msg =
         (e as Error)?.message ||
         (typeof resp === "string" ? resp : resp?.message) ||
-        "执行失败，请稍后重试";
+        "模拟执行失败，请稍后重试";
       setError(msg);
     } finally {
       setBuying(false);
@@ -183,17 +211,28 @@ export default function QuantRunPanel() {
       <div className="dashboard-section-inner quant-analyze-page">
         <div className="card quant-analyze-hero">
           <p className="text-muted quant-analyze-desc">
-            系统会先判断当日趋势，再基于已通过验证的模型生成目标组合与调仓建议。执行按执行日开盘价模拟，与模型回测/验证口径一致。
+            系统会先判断当日趋势，再按固定成交模型自动模拟执行与记账。预览只用于诊断，不代表用户逐笔审批。
           </p>
-          <button
-            type="button"
-            className="quant-analyze-btn"
-            onClick={handleAnalyze}
-            disabled={loading}
-          >
-            {loading ? "分析中…" : "开始分析"}
-          </button>
+          <div className="quant-analyze-toolbar" style={{ marginTop: 12 }}>
+            <button
+              type="button"
+              className="quant-analyze-btn"
+              onClick={handleAnalyze}
+              disabled={loading || autoRunning}
+            >
+              {loading ? "分析中…" : "生成今日计划"}
+            </button>
+            <button
+              type="button"
+              className="quant-analyze-confirm-btn"
+              onClick={handleAutoRunOnce}
+              disabled={autoRunning || loading}
+            >
+              {autoRunning ? "自动执行中…" : "自动执行今日模拟盘"}
+            </button>
+          </div>
           {error && <div className="alert" style={{ marginTop: 12 }}>{error}</div>}
+          {buyMessage && <div className="quant-analyze-buy-success" style={{ marginTop: 12 }}>{buyMessage}</div>}
         </div>
 
         {result && (
@@ -263,16 +302,15 @@ export default function QuantRunPanel() {
                       <button
                         type="button"
                         className="quant-analyze-confirm-btn"
-                        onClick={handleConfirmExecute}
+                        onClick={handleExecuteSimulation}
                         disabled={buying || loading || previewing}
                       >
-                        {buying ? "执行中…" : "确认执行"}
+                        {buying ? "执行中…" : "执行模拟调仓"}
                       </button>
                     </>
                   )}
                 </div>
               </div>
-              {buyMessage && <div className="quant-analyze-buy-success">{buyMessage}</div>}
               <div className="quant-analyze-actions">
                 <div>
                   <div className="sub">建议买入 ({buyList.length})</div>

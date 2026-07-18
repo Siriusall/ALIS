@@ -97,7 +97,9 @@ def analyze_trend(
 
     momentum_values: List[float] = []
     volatility_values: List[float] = []
-    for row in _sample_rows(tradable_rows, limit=sample_limit):
+    sampled_rows = _sample_rows(tradable_rows, limit=sample_limit)
+    ds.preload_histories([row.symbol for row in sampled_rows], end_date=signal_date, lookback=21)
+    for row in sampled_rows:
         hist = ds.get_hist_window(row.symbol, signal_date, 21)
         momentum = _pct_return(hist, 20)
         volatility = _volatility_pct(hist, 20)
@@ -108,7 +110,7 @@ def analyze_trend(
 
     avg_momentum_20 = mean(momentum_values) if momentum_values else 0.0
     avg_volatility_20 = mean(volatility_values) if volatility_values else 0.0
-    coverage = len(momentum_values) / max(1, len(_sample_rows(tradable_rows, limit=sample_limit)))
+    coverage = len(momentum_values) / max(1, len(sampled_rows))
 
     trend = "sideways"
     risk_level = "normal"

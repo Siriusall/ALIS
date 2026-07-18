@@ -16,7 +16,7 @@ class Settings(BaseModel):
     jwt_expire_minutes: int = 60 * 24 * 7  # 7 天
     # 生产数据库必须使用 PostgreSQL；SQLite 不再作为默认回退。
     database_url: str = os.getenv(
-        "DATABASE_URL", "postgresql://alis_app@127.0.0.1:5432/alis_sim"
+        "DATABASE_URL", "postgresql://sirius@127.0.0.1:5432/alis_sim"
     )
     database_connect_timeout_seconds: int = int(os.getenv("DATABASE_CONNECT_TIMEOUT_SECONDS", "5"))
     cors_origins: str = os.getenv(

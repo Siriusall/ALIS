@@ -5,7 +5,7 @@ CONTRACTS = {
         "name": "交易决策", "description": "生成当日选股和交易建议前的数据条件",
         "requirements": [
             ("trade_calendar", "交易日历", 1.0, "block"),
-            ("latest_daily", "最新日线行情", 0.99, "block"),
+            ("latest_daily", "最新日线行情", 0.995, "block"),
             ("latest_valuation", "最新估值", 0.95, "degrade"),
             ("limit_price", "涨跌停价格", 0.99, "block"),
             ("suspension", "停复牌记录", 0.99, "block"),
@@ -16,7 +16,7 @@ CONTRACTS = {
         "requirements": [
             ("latest_daily", "最新日线行情", 0.99, "block"),
             ("latest_valuation", "最新估值", 0.90, "degrade"),
-            ("financial", "财务指标", 0.80, "degrade"),
+            ("financial", "财务指标", 0.90, "degrade"),
             ("stock_master", "股票主数据", 0.99, "block"),
         ],
     },

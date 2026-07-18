@@ -1,15 +1,20 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query, status
+from pydantic import BaseModel, Field
 
 from app.data_platform.services.data_center import (
     build_stock_daily_snapshot,
     ensure_data_center_seeded,
     estimate_data_center_runtime,
+    enrich_financial_research_fields,
+    enrich_financial_research_batch,
+    financial_research_completeness,
     get_data_center_status,
     import_industry_metrics,
     list_failed_tushare_requests,
@@ -38,11 +43,20 @@ from app.data_platform.services.web_fallback import (
 )
 from app.data_platform.services.daily_update import daily_update_status, simple_health, start_daily_update
 from app.data_platform.services.observability import get_observability
+from app.data_platform.services.runtime_logs import list_runtime_logs_since
 from app.data_platform.services.readiness import readiness_overview
 from app.data_platform.services.assets import get_data_assets
 from app.data_platform.services.backfill import build_backfill_plan, get_backfill_status, start_backfill
+from app.data_platform.services.cold_archive import archive_raw_records, cold_archive_status
 
 router = APIRouter(tags=["data-center"])
+
+
+class ColdArchiveRequest(BaseModel):
+    api_names: list[str] = Field(min_length=1, max_length=20)
+    start_date: str = Field(min_length=8, max_length=10)
+    end_date: str = Field(min_length=8, max_length=10)
+    max_rows: int = Field(default=250_000, ge=1, le=1_000_000)
 
 
 @router.get("/data-center/simple-health")
@@ -55,6 +69,20 @@ def data_center_observability(limit_logs: int = Query(default=50, ge=1, le=200))
     return get_observability(limit_logs=limit_logs)
 
 
+@router.get("/data-center/runtime-logs")
+def data_center_runtime_logs(
+    after_id: int = Query(default=0, ge=0),
+    limit: int = Query(default=100, ge=1, le=500),
+    wait_seconds: float = Query(default=0.0, ge=0.0, le=30.0),
+) -> dict[str, Any]:
+    deadline = time.monotonic() + float(wait_seconds or 0)
+    items = list_runtime_logs_since(after_id=after_id, limit=limit)
+    while not items and wait_seconds > 0 and time.monotonic() < deadline:
+        time.sleep(0.5)
+        items = list_runtime_logs_since(after_id=after_id, limit=limit)
+    return {"ok": True, "after_id": after_id, "total": len(items), "items": items}
+
+
 @router.get("/data-center/readiness")
 def data_center_readiness() -> dict[str, Any]:
     return readiness_overview()
@@ -63,6 +91,23 @@ def data_center_readiness() -> dict[str, Any]:
 @router.get("/data-center/assets")
 def data_center_assets() -> dict[str, Any]:
     return get_data_assets()
+
+
+@router.get("/data-center/cold-archive")
+def data_center_cold_archive_status(limit: int = Query(default=30, ge=1, le=200)) -> dict[str, Any]:
+    return cold_archive_status(limit=limit)
+
+
+@router.post("/data-center/cold-archive/raw")
+def data_center_archive_raw(
+    req: ColdArchiveRequest,
+) -> dict[str, Any]:
+    try:
+        return archive_raw_records(
+            api_names=req.api_names, start_date=req.start_date, end_date=req.end_date, max_rows=req.max_rows,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
 
 
 @router.post("/data-center/daily-update")
@@ -80,8 +125,8 @@ def data_center_daily_update_status() -> dict[str, Any]:
 
 @router.get("/data-center/backfill/plan")
 def data_center_backfill_plan(
-    market_batch_days: int = Query(default=20, ge=1, le=60),
-    financial_batch_size: int = Query(default=50, ge=1, le=200),
+    market_batch_days: int = Query(default=30, ge=1, le=80),
+    financial_batch_size: int = Query(default=100, ge=1, le=300),
 ) -> dict[str, Any]:
     """Generate a historical completion plan from audit-window gaps."""
     return build_backfill_plan(
@@ -93,8 +138,8 @@ def data_center_backfill_plan(
 @router.post("/data-center/backfill/start")
 def data_center_backfill_start(
     max_steps: int = Query(default=0, ge=0, le=500),
-    market_batch_days: int = Query(default=10, ge=1, le=30),
-    financial_batch_size: int = Query(default=20, ge=1, le=100),
+    market_batch_days: int = Query(default=30, ge=1, le=80),
+    financial_batch_size: int = Query(default=100, ge=1, le=300),
 ) -> dict[str, Any]:
     """Execute the historical plan. max_steps=0 runs all auto-runnable steps."""
     result = start_backfill(
@@ -298,6 +343,29 @@ def data_center_sync_financial(
     """Sync financial statement/indicator bundle for one stock and report period."""
 
     return sync_financial_bundle(ts_code, period, include_yearly=include_yearly)
+
+
+@router.get("/data-center/financial-research-completeness/{ts_code}")
+def data_center_financial_research_completeness(
+    ts_code: str, period_limit: int = Query(default=8, ge=1, le=12),
+) -> dict[str, Any]:
+    return financial_research_completeness(ts_code, period_limit=period_limit)
+
+
+@router.post("/data-center/financial-research-enrich/{ts_code}")
+def data_center_financial_research_enrich(
+    ts_code: str, period_limit: int = Query(default=8, ge=1, le=12),
+    request_limit: int = Query(default=32, ge=1, le=64),
+) -> dict[str, Any]:
+    return enrich_financial_research_fields(ts_code, period_limit=period_limit, request_limit=request_limit)
+
+
+@router.post("/data-center/financial-research-enrich-batch")
+def data_center_financial_research_enrich_batch(
+    period: str = Query(..., description="YYYYMMDD report period"),
+    limit: int = Query(default=5, ge=1, le=50),
+) -> dict[str, Any]:
+    return enrich_financial_research_batch(period, limit=limit)
 
 
 @router.post("/data-center/sync/financial-period")

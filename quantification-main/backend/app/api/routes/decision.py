@@ -4,6 +4,7 @@ from typing import Any
 
 from fastapi import APIRouter, Query
 
+from app.data_platform.db import _conn as data_conn
 from app.db.store import get_account_balance, get_account_baseline, get_account_high_water_mark, get_backtest_result, get_positions, list_backtests, list_executions, list_operations
 from app.services.backtest_data_source import BacktestDataSource
 from app.services.data_health import build_data_health_report
@@ -11,13 +12,18 @@ from app.services.market_context import live_market_context
 from app.services.model_registry import get_model_status
 from app.services.quant_run_engine import list_consolidated_trade_dates
 from app.services.operations_overview import build_live_portfolio_risk
+from app.services.theme_engine import list_themes
+from app.services.daily_rebalance import build_daily_rebalance_report
+from app.services.quant_risk import evaluate_model_readiness_gate
 
 router = APIRouter()
 
 MIN_CASH_FOR_TRADE = 10_000.0
 MAX_SINGLE_POSITION_PCT = 0.40
+REQUIRED_DECISION_MARKET_APIS = ("daily", "daily_basic", "stk_limit")
 
 MARKET_STATE_LABELS = {
+    "S0": "风险扩张", "S1": "震荡分化", "S2": "风险收缩", "S3": "恐慌修复",
     "bull": "风险扩张",
     "sideways": "震荡分化",
     "bear": "风险收缩",
@@ -26,6 +32,7 @@ MARKET_STATE_LABELS = {
 }
 
 MARKET_RISK_BUDGETS = {
+    "S0": 1.00, "S1": 0.85, "S2": 0.55, "S3": 0.70,
     "bull": 1.00,
     "sideways": 0.85,
     "bear": 0.55,
@@ -126,12 +133,17 @@ def _market_overview() -> dict[str, Any]:
     state = str((context.get("market_state") or {}).get("state") or "unknown")
     context["market_state"]["label"] = MARKET_STATE_LABELS.get(state, "状态待确认")
     context["market_state"]["risk_budget_multiplier"] = MARKET_RISK_BUDGETS.get(state, 0.55)
-    # The current live context has no qualified theme observations. Keep this
-    # explicit instead of turning an empty list into a neutral theme signal.
+    try:
+        theme_items = list_themes(promotable_only=True, limit=20).get("items") or []
+    except Exception as exc:  # noqa: BLE001
+        theme_items = []
+        theme_error = str(exc)[:160]
+    else:
+        theme_error = ""
     context["themes"] = {
-        "status": "unavailable",
-        "items": [],
-        "reason": "尚无满足多来源、至少5个关联标的和3个交易日确认门的真实主题观测",
+        "status": "ready" if theme_items else "insufficient_data",
+        "items": theme_items,
+        "reason": "" if theme_items else theme_error or "尚无满足两类来源、至少5个关联标的和3个交易日确认门的主题",
     }
     try:
         portfolio_risk = build_live_portfolio_risk()
@@ -190,6 +202,53 @@ def _recent_execution_summary() -> dict[str, Any] | None:
     }
 
 
+def _latest_decision_data_contract() -> dict[str, Any]:
+    with data_conn() as conn:
+        latest = conn.execute("SELECT MAX(trade_date) AS latest_trade_date FROM dc_available_trade_dates").fetchone()
+        latest_trade_date = str(dict(latest).get("latest_trade_date") or "")
+        if not latest_trade_date:
+            latest = conn.execute("SELECT MAX(trade_date) AS latest_trade_date FROM dc_stock_daily_snapshot").fetchone()
+            latest_trade_date = str(dict(latest).get("latest_trade_date") or "")
+        if not latest_trade_date:
+            return {
+                "ok": False,
+                "latest_trade_date": "",
+                "required_apis": list(REQUIRED_DECISION_MARKET_APIS),
+                "present_apis": [],
+                "missing_apis": list(REQUIRED_DECISION_MARKET_APIS),
+                "snapshot_ready": False,
+                "reason": "还没有可用交易日快照",
+            }
+        rows = conn.execute(
+            f"""SELECT api_name,COUNT(*) AS rows FROM dc_tushare_raw_records
+                WHERE trade_date=? AND api_name IN ({",".join("?" for _ in REQUIRED_DECISION_MARKET_APIS)})
+                GROUP BY api_name""",
+            (latest_trade_date, *REQUIRED_DECISION_MARKET_APIS),
+        ).fetchall()
+        present_apis = sorted(
+            str(dict(row).get("api_name") or "")
+            for row in rows
+            if int(dict(row).get("rows") or 0) > 0
+        )
+        snapshot_row = conn.execute(
+            "SELECT COUNT(*) AS count FROM dc_stock_daily_snapshot WHERE trade_date=?",
+            (latest_trade_date,),
+        ).fetchone()
+    missing_apis = [api for api in REQUIRED_DECISION_MARKET_APIS if api not in present_apis]
+    snapshot_ready = int(dict(snapshot_row).get("count") or 0) > 0
+    return {
+        "ok": not missing_apis and snapshot_ready,
+        "latest_trade_date": latest_trade_date,
+        "required_apis": list(REQUIRED_DECISION_MARKET_APIS),
+        "present_apis": present_apis,
+        "missing_apis": missing_apis,
+        "snapshot_ready": snapshot_ready,
+        "reason": ""
+        if (not missing_apis and snapshot_ready)
+        else f"{latest_trade_date} 尚未完成 daily/daily_basic/stk_limit 入库或当日快照构建",
+    }
+
+
 def _latest_model_validation(model_status: dict[str, Any]) -> dict[str, Any] | None:
     active = model_status.get("active_version")
     if not active:
@@ -215,10 +274,20 @@ def _latest_model_validation(model_status: dict[str, Any]) -> dict[str, Any] | N
 def _build_gate_decision(
     *,
     data_health: dict[str, Any],
+    latest_data_contract: dict[str, Any],
     ledger: dict[str, Any],
     model_status: dict[str, Any],
     market_overview: dict[str, Any],
 ) -> dict[str, Any]:
+    if not latest_data_contract.get("ok"):
+        missing = list(latest_data_contract.get("missing_apis") or [])
+        missing_text = "、".join(missing) if missing else "当日快照"
+        return {
+            "tone": "stop",
+            "title": "今天先不要调仓",
+            "detail": f"最新交易日 {latest_data_contract.get('latest_trade_date') or '—'} 还缺 {missing_text}，或当日快照尚未构建；必须先完成收盘后入库。",
+            "reason_code": "latest_market_day_not_materialized",
+        }
     issues = list(data_health.get("issues") or [])
     error_count = sum(1 for x in issues if str(x.get("level") or "") == "error")
     warning_count = sum(1 for x in issues if str(x.get("level") or "") == "warning")
@@ -249,22 +318,14 @@ def _build_gate_decision(
             "reason_code": "portfolio_risk_gate",
         }
 
-    active = model_status.get("active_version")
-    if not active:
+    model_decision = evaluate_model_readiness_gate(model_status)
+    if model_decision.should_pause:
         return {
             "tone": "hold",
-            "title": "模型尚未就绪",
-            "detail": "请先在模型策略页完成训练并生成可用版本。",
-            "reason_code": "no_active_model",
-        }
-
-    validation = dict(active.get("validation") or {})
-    if not active.get("is_active") and str(validation.get("status") or "") != "passed":
-        return {
-            "tone": "hold",
-            "title": "模型尚未通过验证",
-            "detail": "请先在模型策略页验证最新模型，再进入量化分析确认调仓。",
-            "reason_code": "model_not_validated",
+            "title": "生产模型尚未就绪",
+            "detail": model_decision.message,
+            "reason_code": model_decision.code,
+            "recovery_condition": model_decision.recovery_condition,
         }
 
     cash = float(ledger.get("cash_balance") or 0)
@@ -277,7 +338,7 @@ def _build_gate_decision(
         }
 
     state = str((market_overview.get("market_state") or {}).get("state") or "")
-    if state in {"bear", "stress"}:
+    if state in {"S2", "bear", "stress"}:
         multiplier = float((market_overview.get("market_state") or {}).get("risk_budget_multiplier") or .55)
         return {
             "tone": "hold",
@@ -290,7 +351,7 @@ def _build_gate_decision(
         return {
             "tone": "hold",
             "title": "可以分析，但需谨慎",
-            "detail": "存在弱因子覆盖或估值数据回退警告，建议先核对数据健康后再确认执行。",
+            "detail": "存在弱因子覆盖或估值数据回退警告，建议先核对数据健康，再运行自动模拟调仓。",
             "reason_code": "weak_data_coverage",
         }
 
@@ -305,25 +366,32 @@ def _build_gate_decision(
     return {
         "tone": "go",
         "title": "可以去量化分析",
-        "detail": "数据、模型与资金门槛均满足，可在量化分析页生成目标组合并人工确认执行。",
+        "detail": "数据、模型与资金门槛均满足，可在回测验证页生成目标组合并自动模拟执行。",
         "reason_code": "ready",
     }
 
 
+@router.get("/decision/daily-report")
+def decision_daily_report() -> dict[str, Any]:
+    """P3-7 每日调仓报告"""
+    return build_daily_rebalance_report()
 @router.get("/decision/summary")
 def decision_summary(limit_days: int = Query(30, ge=1, le=250)) -> dict[str, Any]:
     data_health = build_data_health_report(limit_days=limit_days)
+    latest_data_contract = _latest_decision_data_contract()
     ledger = _ledger_summary()
     model_status = get_model_status()
     market_overview = _market_overview()
     gate_decision = _build_gate_decision(
         data_health=data_health,
+        latest_data_contract=latest_data_contract,
         ledger=ledger,
         model_status=model_status,
         market_overview=market_overview,
     )
     return {
         "data_health": data_health,
+        "latest_data_contract": latest_data_contract,
         "ledger": ledger,
         "model_status": model_status,
         "market_overview": market_overview,

@@ -1,9 +1,18 @@
 from __future__ import annotations
 
 from collections import Counter
+import threading
+import time
 from typing import Any
 
 from app.services.cache_consolidation import FACTOR_KEYS_FOR_COVERAGE
+
+
+# The dashboard polls this report frequently.  It must never scan the entire
+# multi-million-row raw table merely to render a status card.
+_health_cache_lock = threading.Lock()
+_health_cache: dict[int, tuple[float, dict[str, Any]]] = {}
+_HEALTH_CACHE_TTL_SECONDS = 20.0
 
 
 def _summarize_dates(dates: list[str]) -> dict[str, Any]:
@@ -11,6 +20,15 @@ def _summarize_dates(dates: list[str]) -> dict[str, Any]:
         "count": len(dates),
         "first": dates[0] if dates else None,
         "last": dates[-1] if dates else None,
+    }
+
+
+def _summarize_date_row(row: Any) -> dict[str, Any]:
+    values = dict(row) if row else {}
+    return {
+        "count": int(values.get("count") or 0),
+        "first": str(values.get("first") or "") or None,
+        "last": str(values.get("last") or "") or None,
     }
 
 
@@ -53,21 +71,25 @@ def build_data_health_report(limit_days: int = 30) -> dict[str, Any]:
     """Return a local, read-only data coverage report."""
 
     limit_days = max(1, min(int(limit_days or 30), 250))
-    postgres_snapshot_dates: list[str] = []
-    postgres_daily_basic_dates: list[str] = []
+    now = time.monotonic()
+    with _health_cache_lock:
+        cached = _health_cache.get(limit_days)
+        if cached and now - cached[0] < _HEALTH_CACHE_TTL_SECONDS:
+            return cached[1]
+
     market_snapshots = _summarize_postgresql_market_snapshots(limit_days)
     from app.data_platform.db import _conn
     with _conn() as conn:
-        postgres_snapshot_dates = [
-            str(dict(row).get("trade_date") or "")
-            for row in conn.execute("SELECT DISTINCT trade_date FROM dc_stock_daily_snapshot ORDER BY trade_date").fetchall()
-        ]
-        postgres_daily_basic_dates = [
-            str(dict(row).get("trade_date") or "")
-            for row in conn.execute("SELECT DISTINCT trade_date FROM dc_tushare_raw_records WHERE api_name='daily_basic' ORDER BY trade_date").fetchall()
-        ]
-
-    available_trade_dates = sorted(set(postgres_snapshot_dates))
+        # This compact table is maintained while materializing a daily
+        # snapshot.  It is the authoritative dashboard index and avoids a
+        # full DISTINCT scan across daily_basic raw records on every poll.
+        date_summary = _summarize_date_row(conn.execute(
+            "SELECT COUNT(*) AS count,MIN(trade_date) AS first,MAX(trade_date) AS last FROM dc_available_trade_dates"
+        ).fetchone())
+        if not date_summary["count"]:
+            date_summary = _summarize_date_row(conn.execute(
+                "SELECT COUNT(DISTINCT trade_date) AS count,MIN(trade_date) AS first,MAX(trade_date) AS last FROM dc_stock_daily_snapshot"
+            ).fetchone())
 
     issues: list[dict[str, Any]] = []
     if market_snapshots["count"] <= 0:
@@ -78,7 +100,7 @@ def build_data_health_report(limit_days: int = 30) -> dict[str, Any]:
                 "message": "No PostgreSQL market snapshots found. Run data-center sync/backfill before trusting selection or backtest outputs.",
             }
         )
-    if not postgres_daily_basic_dates:
+    if not date_summary["count"]:
         issues.append(
             {
                 "level": "warning",
@@ -109,18 +131,23 @@ def build_data_health_report(limit_days: int = 30) -> dict[str, Any]:
             }
         )
 
-    return {
+    report = {
         "ok": not any(x.get("level") == "error" for x in issues),
         "limit_days": limit_days,
         "storage": "postgresql",
-        "trade_dates": _summarize_dates(available_trade_dates),
+        "trade_dates": date_summary,
         "market_snapshots": market_snapshots,
         "snapshots": {
-            "postgresql_snapshot": _summarize_dates(postgres_snapshot_dates),
+            "postgresql_snapshot": date_summary,
         },
         "daily_basic": {
-            "postgresql": _summarize_dates(postgres_daily_basic_dates),
+            # Daily snapshots are only marked available after daily_basic is
+            # merged, so their compact date index is the status contract.
+            "postgresql": date_summary,
         },
         "factor_keys": list(FACTOR_KEYS_FOR_COVERAGE),
         "issues": issues,
     }
+    with _health_cache_lock:
+        _health_cache[limit_days] = (time.monotonic(), report)
+    return report

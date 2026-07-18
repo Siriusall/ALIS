@@ -19,7 +19,7 @@ class PositionResponse(BaseModel):
 
 class OperationResponse(BaseModel):
     id: int
-    execution_id: int
+    execution_id: Optional[int] = None
     symbol: str
     side: str
     price: float
@@ -27,6 +27,11 @@ class OperationResponse(BaseModel):
     at: str
     remark: str | None = None
     name: str = ""
+    commission: float = 0.0
+    transfer_fee: float = 0.0
+    stamp_tax: float = 0.0
+    slippage_bps: float = 0.0
+    fee_schedule_version: str = ""
 
 
 class PositionsListResponse(BaseModel):

@@ -74,7 +74,11 @@ def sync_pool_from_confirmed_execution(
         elif current in {"warning", "reduce"}:
             path = ["holding"]
         for next_state in path:
-            transition_position(ts_code=code, to_state=next_state, reason=f"{evidence_prefix}; confirmed_buy", thesis_id=None, evidence=evidence)
+            transition_position(
+                ts_code=code, to_state=next_state, reason=f"{evidence_prefix}; confirmed_buy",
+                thesis_id=None, evidence=evidence, rule_version="confirmed_execution_state_v1",
+                automatic_decision={"source": "confirmed_execution", "execution_id": execution_id, "side": "BUY", "path": path},
+            )
         if path:
             state_entered.append({"ts_code": code, "from_state": current or "uninitialized", "to_state": "holding", "path": path})
     for order in sell_orders:
@@ -99,7 +103,11 @@ def sync_pool_from_confirmed_execution(
         elif current in {"holding", "warning", "reduce"}:
             exit_path = ["exit"]
         for next_state in exit_path:
-            transition_position(ts_code=code, to_state=next_state, reason=f"{evidence_prefix}; confirmed_sell", thesis_id=None, evidence=evidence)
+            transition_position(
+                ts_code=code, to_state=next_state, reason=f"{evidence_prefix}; confirmed_sell",
+                thesis_id=None, evidence=evidence, rule_version="confirmed_execution_state_v1",
+                automatic_decision={"source": "confirmed_execution", "execution_id": execution_id, "side": "SELL", "path": exit_path},
+            )
         if exit_path:
             state_exited.append({"ts_code": code, "from_state": current, "to_state": "exit", "path": exit_path})
     return {"ok": True, "entered_holding": entered, "removed_holding": exited, "position_states_entered": state_entered, "position_states_exited": state_exited}

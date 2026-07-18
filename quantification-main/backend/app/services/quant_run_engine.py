@@ -6,9 +6,11 @@ import os
 from pathlib import Path
 import time
 from typing import Any, Callable, Dict, List, Optional
+from types import SimpleNamespace
 
 from app.api.state import add_log
 from app.core.trading_constraints import check_open_trade_constraints
+from app.core.a_share_fees import ETF_FEE_SCHEDULE_VERSION, FEE_SCHEDULE_VERSION, is_exchange_etf, sell_cost_breakdown
 from app.core.exchange_groups import matches_exchange_group, normalize_exchange_group
 from app.db.store import (
     add_account_balance,
@@ -18,6 +20,7 @@ from app.db.store import (
     get_active_model_version,
     get_positions,
     get_strategy,
+    list_operations,
     list_strategies,
     merge_execution_into_positions,
     sell_position,
@@ -28,12 +31,13 @@ from app.services.backtest_engine import _apply_filters, _factor_value, _score_r
 from app.services.execution_engine import simulate_open_execution
 from app.services.rebalance_allocator import allocate_buy_orders, planned_to_order_results
 from app.services.decision_store import create_decision_snapshot
+from app.services.advanced_controls import black_litterman_weights
 from app.services.stock_pool_sync import sync_pool_from_confirmed_execution
 from app.services.cache_consolidation import list_available_trade_dates
 from app.services.strategy_recommender import recommend_strategy_template
 from app.services.strategy_config import parse_strategy_content
 from app.services.trend_model import analyze_trend
-from app.services.quant_risk import cvar_position_multiplier, constrained_cvar_weights, hrp_fallback_weights, ledoit_wolf_covariance
+from app.services.quant_risk import cvar_position_multiplier, constrained_cvar_weights, enforce_marginal_cvar_limit, hrp_fallback_weights, ledoit_wolf_covariance
 
 _SCORING_HEARTBEAT_EVERY = max(100, min(int(os.getenv("QUANT_SCORING_HEARTBEAT_EVERY", "300")), 2000))
 _SCORING_TIMEOUT_SEC = max(10, min(int(os.getenv("QUANT_SCORING_TIMEOUT_SEC", "90")), 1800))
@@ -74,6 +78,150 @@ class QuantRunExecResult:
     avg_slippage_bps: float = 0.0
     exec_latency_ms: int = 0
     detail: Dict[str, Any] | None = None
+
+
+def _ts_code(symbol: str) -> str:
+    value = str(symbol or "").strip().upper()
+    if "." in value:
+        return value
+    return f"{value}.SH" if value[:1] in {"5", "6", "9"} else f"{value}.SZ"
+
+
+def _apply_research_admission(target_symbols: List[str], *, as_of_time: str | None = None) -> tuple[List[str], List[Dict[str, Any]]]:
+    """Admit model selections only after current core-pool evidence gates pass."""
+    from app.services.decision_store import list_pool_members
+    from app.services.research_workflow import evaluate_core_pool_eligibility
+
+    core_codes = {
+        str(item.get("ts_code") or "").strip().upper()
+        for item in list_pool_members("core")
+        if not as_of_time or (item.get("entered_at") and str(item.get("entered_at")) <= str(as_of_time))
+    }
+    admitted: List[str] = []
+    blocked: List[Dict[str, Any]] = []
+    for symbol in target_symbols:
+        code = _ts_code(symbol)
+        if code not in core_codes:
+            blocked.append({"symbol": symbol, "ts_code": code, "side": "BUY", "code": "not_in_core_pool", "message": "未进入核心候选池，模型排名不能绕过研究准入"})
+            continue
+        eligibility = evaluate_core_pool_eligibility(code, as_of_time=as_of_time)
+        if not eligibility.get("eligible_for_core"):
+            failed = [gate.get("label") for gate in eligibility.get("gates") or [] if not gate.get("passed")]
+            blocked.append({"symbol": symbol, "ts_code": code, "side": "BUY", "code": "core_evidence_gate_failed", "message": f"核心候选证据已失效：{'、'.join(str(x) for x in failed)}", "eligibility": eligibility})
+            continue
+        admitted.append(symbol)
+    return admitted, blocked
+
+
+def _apply_dynamic_strategy_gate(
+    target_symbols: List[str], *, as_of_time: str,
+) -> tuple[List[str], List[Dict[str, Any]], Dict[str, Any]]:
+    """Apply P2 environment/expectation/valuation gates to already research-admitted names."""
+    from app.services.market_context import market_context_as_of
+    from app.services.defensive_assets import defensive_allocation_for_state
+    from app.services.research_engine import build_stock_research
+    from app.services.strategy_gate import evaluate_strategy_gate
+    from app.services.theme_engine import best_theme_for_stock
+
+    market = market_context_as_of(as_of_time)
+    market_state = str((market.get("market_state") or {}).get("state") or "unknown")
+    sentiment_score = float((market.get("sentiment") or {}).get("score") or 50)
+    admitted: List[str] = []
+    blocked: List[Dict[str, Any]] = []
+    items: List[Dict[str, Any]] = []
+    for symbol in target_symbols:
+        research = build_stock_research(_ts_code(symbol), persist=True, as_of_time=as_of_time)
+        dimensions = research.get("dimensions") or {}
+        research_state = research.get("research_state") or {}
+        ready_scores = [
+            float(value.get("score") or 0) for key, value in dimensions.items()
+            if key not in {"expectation", "valuation"} and value.get("status") == "ready"
+        ]
+        research_score = sum(ready_scores) / len(ready_scores) if ready_scores else 0.0
+        expectation_score = float((dimensions.get("expectation") or {}).get("score") or 0)
+        valuation_score = float((dimensions.get("valuation") or {}).get("score") or 0)
+        valuation = (research.get("linked_states") or {}).get("valuation") or {}
+        scenarios = valuation.get("scenarios") or {}
+        current_price = float(valuation.get("current_price") or 0)
+        valuation_upside = (
+            float(scenarios.get("base")) / current_price - 1.0
+            if current_price > 0 and scenarios.get("base") is not None else None
+        )
+        theme = best_theme_for_stock(_ts_code(symbol), as_of_time=as_of_time)
+        gate = evaluate_strategy_gate(
+            research_score=research_score,
+            confidence=float(research_state.get("confidence") or 0),
+            data_quality=100.0 if research.get("risk", {}).get("eligible") else 0.0,
+            risk_eligible=bool(research.get("risk", {}).get("eligible")),
+            market_state=market_state, sentiment_score=sentiment_score,
+            expectation_score=expectation_score, valuation_score=valuation_score,
+            valuation_upside=valuation_upside,
+            theme_score=float((theme or {}).get("score") or 0),
+            theme_verified=bool(theme and theme.get("promotable")),
+            change_alarm_probability=float((market.get("change_alarm") or {}).get("p_change_1d") or 0),
+        )
+        item = {"symbol": symbol, "ts_code": _ts_code(symbol), "gate": gate, "theme": theme, "risk": research.get("risk") or {}}
+        items.append(item)
+        if gate.get("admitted"):
+            admitted.append(symbol)
+        else:
+            blocked.append({
+                "symbol": symbol, "ts_code": _ts_code(symbol), "side": "BUY",
+                "code": "dynamic_strategy_gate_failed",
+                "message": "；".join(str(x) for x in gate.get("blockers") or ["动态策略门控未通过"]),
+                "gate": gate,
+            })
+    multipliers = [float(item["gate"].get("risk_budget_multiplier") or 0) for item in items if item["gate"].get("admitted")]
+    summary = {
+        "as_of_time": as_of_time, "market_context": market, "items": items,
+        "risk_budget_multiplier": min(multipliers) if multipliers else 0.0,
+        "cash_target": max((float(item["gate"].get("cash_target") or 0) for item in items), default=1.0),
+        "defensive_allocation": defensive_allocation_for_state(market_state, as_of_date=str(as_of_time)[:10]),
+    }
+    return admitted, blocked, summary
+
+
+def _frozen_research_evidence(symbol: str, *, as_of_time: str) -> tuple[Dict[str, Any], Dict[str, Any]]:
+    """Build the replay-safe research and valuation payload frozen with a trade decision."""
+    from app.services.research_engine import build_stock_research, build_valuation_state
+    from app.services.thesis_store import list_theses
+
+    code = _ts_code(symbol)
+    research = build_stock_research(code, persist=True, as_of_time=as_of_time)
+    valuation = build_valuation_state(code, persist=True, as_of_time=as_of_time)
+    theses = [item for item in list_theses(ts_code=code, limit=20) if not item.get("created_at") or str(item.get("created_at")) <= as_of_time]
+    thesis = next((item for item in theses if item.get("derived_status") not in {"invalidated", "failed"}), theses[0] if theses else None)
+    if thesis:
+        thesis = dict(thesis)
+        thesis["hypotheses"] = [
+            {**hypothesis, "evidence": [evidence for evidence in (hypothesis.get("evidence") or []) if not evidence.get("checked_at") or str(evidence.get("checked_at")) <= as_of_time]}
+            for hypothesis in thesis.get("hypotheses") or []
+            if not hypothesis.get("created_at") or str(hypothesis.get("created_at")) <= as_of_time
+        ]
+    research_payload = {
+        "ts_code": code,
+        "as_of_time": as_of_time,
+        "profile": research.get("profile"),
+        "classification": research.get("classification"),
+        "risk": research.get("risk"),
+        "dimensions": research.get("dimensions"),
+        "research_state": research.get("research_state"),
+        "raw_metrics": research.get("raw_metrics"),
+        "evidence": research.get("evidence"),
+        "thesis": None if not thesis else {
+            "id": thesis.get("id"), "title": thesis.get("title"), "thesis_type": thesis.get("thesis_type"),
+            "derived_status": thesis.get("derived_status"), "derived_confidence": thesis.get("derived_confidence"),
+            "hypotheses": thesis.get("hypotheses"),
+        },
+    }
+    valuation_payload = {
+        key: valuation.get(key) for key in (
+            "ts_code", "status", "method", "trade_date", "current_price", "current_multiple",
+            "history_percentile", "industry_percentile", "scenarios", "dimension", "evidence", "limitations",
+        )
+    }
+    valuation_payload["as_of_time"] = as_of_time
+    return research_payload, valuation_payload
 
 
 def _repo_root() -> Path:
@@ -143,6 +291,13 @@ def _portfolio_state(ds: BacktestDataSource, valuation_date: str) -> Dict[str, A
         if not sym or qty <= 0:
             continue
         px = float(ds.get_price_on_date(sym, valuation_date, field="close") or 0)
+        if px <= 0 and is_exchange_etf(sym):
+            try:
+                from app.services.defensive_assets import defensive_asset_bar
+                bar = defensive_asset_bar(_ts_code(sym), valuation_date)
+                px = float((bar or {}).get("close") or 0)
+            except Exception:  # noqa: BLE001
+                px = 0.0
         if px <= 0:
             px = float(pos.get("price") or 0)
         val = round(px * qty, 2)
@@ -160,6 +315,32 @@ def _portfolio_state(ds: BacktestDataSource, valuation_date: str) -> Dict[str, A
     }
 
 
+def _industry_exposure_inputs(
+    symbols: List[str], position_value_by_symbol: Dict[str, float],
+) -> tuple[Dict[str, str], Dict[str, float]]:
+    from app.data_platform.db import _conn as data_conn
+
+    normalized = {_ts_code(symbol): str(symbol).split(".")[0] for symbol in symbols if str(symbol).strip()}
+    industry_by_symbol: Dict[str, str] = {}
+    if normalized:
+        placeholders = ",".join("?" for _ in normalized)
+        with data_conn() as c:
+            rows = c.execute(
+                f"SELECT ts_code,industry FROM dc_stock_master WHERE ts_code IN ({placeholders})",
+                tuple(normalized),
+            ).fetchall()
+        for row in rows:
+            item = dict(row)
+            raw_symbol = normalized.get(str(item.get("ts_code") or ""))
+            if raw_symbol:
+                industry_by_symbol[raw_symbol] = str(item.get("industry") or "unclassified")
+    existing_industry_value: Dict[str, float] = {}
+    for symbol, value in position_value_by_symbol.items():
+        industry = industry_by_symbol.get(str(symbol).split(".")[0], "unclassified")
+        existing_industry_value[industry] = existing_industry_value.get(industry, 0.0) + float(value or 0)
+    return industry_by_symbol, existing_industry_value
+
+
 def _compute_buy_budget(
     *,
     total_equity: float,
@@ -172,6 +353,36 @@ def _compute_buy_budget(
     need_to_buy = max(0.0, target_invested - float(position_market_value))
     ratio = max(0.0, min(1.0, float(budget_ratio)))
     return max(0.0, round(min(float(cash_balance), need_to_buy) * ratio, 2))
+
+
+def _monthly_turnover_budget(execute_date: str, total_equity: float) -> Dict[str, float]:
+    month = str(execute_date)[:7]
+    used = sum(
+        float(item.get("price") or 0) * int(item.get("quantity") or 0)
+        for item in list_operations(execution_id=None, limit=200000)
+        if str(item.get("at") or "")[:7] == month
+    )
+    limit = max(0.0, float(total_equity)) * .30
+    return {"limit": round(limit, 2), "used_before": round(used, 2), "remaining": round(max(0.0, limit - used), 2)}
+
+
+def _pretrade_symbol_limits(symbols: List[str], *, cutoff: str, max_single: float) -> Dict[str, float]:
+    from app.services.thesis_store import list_theses
+    theses = {
+        str(item.get("ts_code") or "").split(".")[0]: item
+        for item in list_theses(limit=500)
+        if (not item.get("created_at") or str(item.get("created_at")) <= cutoff)
+        and (not item.get("updated_at") or str(item.get("updated_at")) <= cutoff)
+    }
+    limits: Dict[str, float] = {}
+    for symbol in symbols:
+        if is_exchange_etf(symbol):
+            limits[symbol] = min(max_single, .25)
+            continue
+        thesis = theses.get(str(symbol).split(".")[0]) or {}
+        core = float(thesis.get("derived_confidence") or 0) >= 75 and str(thesis.get("derived_status") or "") in {"active", "confirmed", "valid"}
+        limits[symbol] = min(max_single, .25 if core else .15)
+    return limits
 
 
 def _selection_score_map(detail: Dict[str, Any]) -> Dict[str, float]:
@@ -280,6 +491,7 @@ def _build_target_symbols(
     factor_values: Dict[str, Dict[str, float]] = {}
     if progress_callback is not None:
         progress_callback("正在计算打分")
+    ds.preload_histories([row.symbol for row in snapshot], end_date=signal_date, lookback=max_lookback)
     t0 = time.monotonic()
     total = len(snapshot)
     timeout_sec = int(scoring_timeout_sec) if scoring_timeout_sec else _SCORING_TIMEOUT_SEC
@@ -368,7 +580,21 @@ def run_for_trade_date(
         progress_callback=_report,
         scoring_timeout_sec=scoring_timeout_sec,
     )
-    blocked_events: List[Dict[str, Any]] = list(selection_detail.get("blocked_events") or [])
+    target_symbols, research_blocks = _apply_research_admission(target_symbols, as_of_time=f"{signal_date}T23:59:59")
+    target_symbols, dynamic_blocks, dynamic_gate = _apply_dynamic_strategy_gate(
+        target_symbols, as_of_time=f"{signal_date}T23:59:59"
+    )
+    equity_target_symbols = list(target_symbols)
+    defensive_policy = dynamic_gate.get("defensive_allocation") or {}
+    defensive_weights = {str(code).split(".")[0]: float(weight) for code, weight in (defensive_policy.get("target_weights") or {}).items()}
+    high_risk_symbols = {
+        str(item.get("symbol") or "") for item in (dynamic_gate.get("items") or [])
+        if str((item.get("risk") or {}).get("risk_level") or "") == "high"
+    }
+    target_symbols = list(dict.fromkeys(equity_target_symbols + list(defensive_weights)))
+    selection_detail["research_admission"] = {"admitted": equity_target_symbols, "blocked": research_blocks}
+    selection_detail["dynamic_strategy_gate"] = dynamic_gate
+    blocked_events: List[Dict[str, Any]] = list(selection_detail.get("blocked_events") or []) + research_blocks + dynamic_blocks
     sell_triggers: List[Dict[str, Any]] = []
     strategy = get_strategy(strategy_id)
     config = parse_strategy_content(strategy.get("content"), strategy.get("type", "formula")) if strategy else None
@@ -392,7 +618,29 @@ def run_for_trade_date(
                 code="future_guard_execute_snapshot",
             )
     exec_map = {x.symbol: x for x in exec_rows}
+    if defensive_weights:
+        from app.services.defensive_assets import DEFENSIVE_ASSETS, defensive_asset_bar
+        defensive_meta = {item["ts_code"].split(".")[0]: item for item in DEFENSIVE_ASSETS}
+        for symbol in defensive_weights:
+            meta = defensive_meta.get(symbol) or {}
+            bar = defensive_asset_bar(str(meta.get("ts_code") or _ts_code(symbol)), execute_date)
+            if not bar:
+                blocked_events.append({"date": execute_date, "symbol": symbol, "side": "BUY", "code": "defensive_asset_price_missing", "message": "防御ETF执行日行情缺失"})
+                continue
+            exec_map[symbol] = SimpleNamespace(
+                symbol=symbol, name=meta.get("name") or symbol, date=execute_date,
+                open=float(bar.get("open") or 0), close=float(bar.get("close") or 0),
+                change_pct=float(bar.get("pct_chg") or 0), volume=float(bar.get("vol") or 0),
+            )
     executed_at = f"{execute_date}T09:30:00"
+    pretrade_portfolio = _portfolio_state(ds, execute_date)
+    turnover_budget = _monthly_turnover_budget(execute_date, pretrade_portfolio["total_equity"])
+    turnover_remaining = float(turnover_budget["remaining"])
+    from app.services.thesis_store import list_theses as _list_theses_for_turnover
+    thesis_status_by_symbol = {
+        str(item.get("ts_code") or "").split(".")[0]: str(item.get("derived_status") or "")
+        for item in _list_theses_for_turnover(limit=500)
+    }
 
     # 先卖出（仅对不在目标池且满足 T+1 / hold_days 的仓位）
     sold_count = 0
@@ -439,27 +687,38 @@ def run_for_trade_date(
             blocked_events.append(event)
             add_log("WARN", f"QuantRun 卖出被交易约束拦截: {tradable.message}")
             continue
+        proposed_turnover = px * int(pos.get("quantity") or 0)
+        hard_risk_exit = thesis_status_by_symbol.get(sym) in {"invalidated", "failed"}
+        if proposed_turnover > turnover_remaining + 1e-6 and not hard_risk_exit:
+            blocked_count += 1
+            blocked_events.append({"date": execute_date, "symbol": sym, "side": "SELL", "code": "monthly_turnover_budget", "message": "月度双边换手预算30%已用尽，非硬风险退出延后"})
+            continue
         try:
-            sell_position(int(pos["id"]), quantity=int(pos["quantity"]), price=px, trade_date=execute_date)
+            fee = sell_cost_breakdown(px, int(pos["quantity"]), sym)
+            exec_price = float(fee["executed_price"])
+            sell_position(int(pos["id"]), quantity=int(pos["quantity"]), price=exec_price, trade_date=execute_date, record_operation=False)
             sold_count += 1
+            turnover_remaining = max(0.0, turnover_remaining - proposed_turnover)
             sell_triggers.append(
                 {
                     "symbol": sym,
                     "reason": "调仓卖出",
                     "detail": "不在目标池且满足持有期/T+1",
                     "quantity": int(pos["quantity"]),
-                    "price": round(px, 4),
+                    "price": exec_price,
+                    "requested_price": round(px, 4),
                 }
             )
             sold_ops_payload.append(
                 {
                     "symbol": sym,
                     "side": "SELL",
-                    "price": px,
+                    "price": exec_price,
                     "quantity": int(pos["quantity"]),
                     "at": executed_at,
                     "remark": "量化任务卖出（关联执行）",
                     "name": str(pos.get("name") or "").strip(),
+                    **{k: fee[k] for k in ("commission", "transfer_fee", "stamp_tax", "slippage_bps", "fee_schedule_version")},
                 }
             )
         except ValueError:
@@ -472,7 +731,8 @@ def run_for_trade_date(
     risk_budget = selection_detail.get("risk_budget") if isinstance(selection_detail.get("risk_budget"), dict) else {}
     target_position_pct, max_single_position_pct = _parse_risk_budget(risk_budget)
     portfolio = _portfolio_state(ds, execute_date)
-    effective_budget_ratio = max(0.0, min(1.0, float(budget_ratio)))
+    defensive_target_weight = sum(defensive_weights.values())
+    effective_budget_ratio = max(0.0, min(1.0, float(budget_ratio))) * min(1.0, float(dynamic_gate.get("risk_budget_multiplier") or 0) + defensive_target_weight)
     available_balance = _compute_buy_budget(
         total_equity=portfolio["total_equity"],
         position_market_value=portfolio["position_market_value"],
@@ -480,17 +740,28 @@ def run_for_trade_date(
         target_position_pct=target_position_pct,
         budget_ratio=effective_budget_ratio,
     )
+    available_balance = min(available_balance, turnover_remaining)
     order_requests: List[OrderRequest] = []
     score_map = _selection_score_map(selection_detail)
     returns_by_symbol: Dict[str, List[float]] = {}
+    liquidity_caps: Dict[str, float] = {}
     for sym in buy_list:
         px_row = exec_map.get(sym)
         px = _row_trade_price(px_row, prefer_open=True)
         if px <= 0:
             continue
-        hist = ds.get_hist_window(sym, execute_date, 60)
-        closes = [float(getattr(x, "close", 0) or 0) for x in hist]
-        returns = [(closes[i] / closes[i - 1] - 1.0) for i in range(1, len(closes)) if closes[i - 1] > 0 and closes[i] > 0]
+        if sym in defensive_weights:
+            from app.services.defensive_assets import defensive_asset_returns
+            returns = defensive_asset_returns(next(code for code in (defensive_policy.get("target_weights") or {}) if str(code).split(".")[0] == sym), signal_date)
+            average_amount_thousand = float((defensive_asset_bar(next(code for code in (defensive_policy.get("target_weights") or {}) if str(code).split(".")[0] == sym), signal_date) or {}).get("amount") or 0)
+        else:
+            hist = ds.get_hist_window(sym, execute_date, 60)
+            closes = [float(getattr(x, "close", 0) or 0) for x in hist]
+            returns = [(closes[i] / closes[i - 1] - 1.0) for i in range(1, len(closes)) if closes[i - 1] > 0 and closes[i] > 0]
+            amounts = [float(getattr(item, "turnover", 0) or 0) for item in hist[-20:] if float(getattr(item, "turnover", 0) or 0) > 0]
+            average_amount_thousand = sum(amounts) / len(amounts) if amounts else 0.0
+        if average_amount_thousand > 0:
+            liquidity_caps[sym] = average_amount_thousand * 1000.0 * .01
         returns_by_symbol[sym] = returns
         score_map[sym] = float(score_map.get(sym, 0.0)) * cvar_position_multiplier(returns)
         order_requests.append(
@@ -512,16 +783,57 @@ def run_for_trade_date(
     # the execution detail below for auditability.
     covariance_snapshot = ledoit_wolf_covariance(returns_by_symbol)
     cvar_weights = constrained_cvar_weights(returns_by_symbol, max_single=max_single_position_pct)
+    bl_result: Dict[str, Any] = {}
     optimizer_name = "ledoit_wolf_shrinkage_plus_constrained_cvar_v1"
     if not cvar_weights:
         cvar_weights = hrp_fallback_weights(returns_by_symbol, max_single=max_single_position_pct)
         optimizer_name = "hrp_inverse_volatility_fallback_v1"
+    if cvar_weights:
+        score_values = [float(score_map.get(symbol, 0) or 0) for symbol in cvar_weights]
+        score_mean = sum(score_values) / len(score_values) if score_values else 0.0
+        views = {symbol: (float(score_map.get(symbol, 0) or 0) - score_mean) / 100.0 for symbol in cvar_weights}
+        confidences = {symbol: min(1.0, len(returns_by_symbol.get(symbol, [])) / 60.0) for symbol in cvar_weights}
+        bl_result = black_litterman_weights(cvar_weights, views, confidences, max_weight=max_single_position_pct)
+        cvar_weights = dict(bl_result.get("weights") or cvar_weights)
+        optimizer_name = f"{optimizer_name}+{bl_result.get('method', 'black_litterman_diagonal_v1')}"
+    equity_weights = {symbol: weight for symbol, weight in cvar_weights.items() if symbol not in defensive_weights}
+    equity_returns = {symbol: returns_by_symbol[symbol] for symbol in equity_weights if returns_by_symbol.get(symbol)}
+    marginal_cvar = enforce_marginal_cvar_limit(equity_weights, equity_returns) if equity_weights else {"status": "not_applicable", "weights": {}, "contributions": {}, "reason": "无股票风险袖套"}
+    if marginal_cvar.get("status") in {"ready", "not_applicable"}:
+        equity_weights = dict(marginal_cvar.get("weights") or {})
+        equity_total = sum(equity_weights.values()) or 1.0
+        equity_sleeve = max(0.0, 1.0 - defensive_target_weight)
+        cvar_weights = {symbol: weight / equity_total * equity_sleeve for symbol, weight in equity_weights.items()}
+        cvar_weights.update(defensive_weights)
+        optimizer_name += "+marginal_cvar_12pct_v1"
+        if defensive_weights:
+            optimizer_name += "+fixed_defensive_sleeve_v1"
+    else:
+        cvar_weights = dict(defensive_weights)
+        if defensive_weights:
+            order_requests = [order for order in order_requests if str(order.symbol) in defensive_weights]
+        else:
+            available_balance = 0.0
+        blocked_events.append({"date": execute_date, "side": "BUY", "code": "marginal_cvar_infeasible", "message": marginal_cvar.get("reason") or "单股边际CVaR贡献12%硬约束不可行"})
     if cvar_weights:
         scale = max(1, len(cvar_weights))
         for sym, weight in cvar_weights.items():
             score_map[sym] = float(score_map.get(sym, 0.0)) * float(weight * scale)
 
     _report("正在生成买卖单")
+    industry_by_symbol, existing_industry_value = _industry_exposure_inputs(
+        list(portfolio["position_value_by_symbol"]) + [str(order.symbol) for order in order_requests],
+        portfolio["position_value_by_symbol"],
+    )
+    if defensive_weights:
+        from app.services.defensive_assets import DEFENSIVE_ASSETS
+        defensive_classes = {item["ts_code"].split(".")[0]: f"defensive_{item['asset_class']}" for item in DEFENSIVE_ASSETS}
+        for symbol in defensive_weights:
+            industry_by_symbol[symbol] = defensive_classes.get(symbol, "defensive")
+        existing_industry_value = {}
+        for symbol, value in portfolio["position_value_by_symbol"].items():
+            industry = industry_by_symbol.get(str(symbol).split(".")[0], "unclassified")
+            existing_industry_value[industry] = existing_industry_value.get(industry, 0.0) + float(value or 0)
     exec_t0 = time.monotonic()
     result = simulate_open_execution(
         order_requests,
@@ -531,6 +843,14 @@ def run_for_trade_date(
         max_single_position_pct=max_single_position_pct,
         existing_position_value=portfolio["position_value_by_symbol"],
         symbol_scores=score_map,
+        industry_by_symbol=industry_by_symbol,
+        existing_industry_value=existing_industry_value,
+        max_industry_position_pct=.25,
+        max_correlated_industry_pct=.35,
+        target_weights=cvar_weights,
+        symbol_position_limits=_pretrade_symbol_limits([str(order.symbol) for order in order_requests], cutoff=f"{signal_date}T23:59:59", max_single=max_single_position_pct),
+        high_risk_symbols=high_risk_symbols,
+        max_order_value_by_symbol=liquidity_caps,
     )
     exec_latency_ms = max(1, int((time.monotonic() - exec_t0) * 1000))
     filled = _filled_orders(result.orders)
@@ -548,8 +868,10 @@ def run_for_trade_date(
             }
         )
     total_buy_cost = _calc_total_buy_cost(filled)
+    turnover_remaining = max(0.0, turnover_remaining - sum(float(o.price) * int(o.quantity) for o in filled))
     if total_buy_cost > 0:
         add_account_balance(-total_buy_cost)
+    req_price_map = {str(x.symbol): float(x.price) for x in order_requests}
     orders_payload = [
         {
             "symbol": o.symbol,
@@ -558,12 +880,16 @@ def run_for_trade_date(
             "quantity": o.quantity,
             "commission": getattr(o, "commission", 0),
             "transfer_fee": getattr(o, "transfer_fee", 0),
+            "slippage_bps": round(
+                (float(o.price) / req_price_map[str(o.symbol)] - 1.0) * 10000.0, 4
+            ) if req_price_map.get(str(o.symbol)) else 0.0,
+            "fee_schedule_version": ETF_FEE_SCHEDULE_VERSION if is_exchange_etf(o.symbol) else FEE_SCHEDULE_VERSION,
         }
         for o in result.orders
         if int(getattr(o, "quantity", 0) or 0) > 0
     ]
     execution_id: int | None = None
-    if orders_payload:
+    if orders_payload or sold_ops_payload:
         execution_id = create_execution(
             strategy_id=int(strategy_id),
             executed_at=executed_at,
@@ -573,12 +899,12 @@ def run_for_trade_date(
         )
         if sold_ops_payload:
             append_operations_to_execution(execution_id, executed_at, sold_ops_payload)
-        merge_execution_into_positions(orders_payload, executed_at)
+        if orders_payload:
+            merge_execution_into_positions(orders_payload, executed_at)
 
     planned_buy_count = len(order_requests)
     bought_count = len(filled)
     fill_rate_pct = round((bought_count / planned_buy_count) * 100.0, 2) if planned_buy_count > 0 else 0.0
-    req_price_map = {str(x.symbol): float(x.price) for x in order_requests}
     slippage_bps: list[float] = []
     for o in filled:
         qty = int(getattr(o, "quantity", 0) or 0)
@@ -650,7 +976,49 @@ def run_for_trade_date(
         "portfolio_risk": {
             "optimizer": optimizer_name,
             "weights": cvar_weights,
+            "black_litterman": bl_result,
             "covariance": covariance_snapshot,
+            "hard_constraints": {"max_single_position_pct": max_single_position_pct, "max_industry_position_pct": .25, "max_correlated_industry_pct": .35},
+            "monthly_turnover_budget": {**turnover_budget, "remaining_after": round(turnover_remaining, 2)},
+            "marginal_cvar": marginal_cvar,
+        },
+    }
+    transaction_cost = round(sum(
+        sum(float(order.get(key, 0) or 0) for key in ("commission", "transfer_fee", "stamp_tax"))
+        for order in (orders_payload + sold_ops_payload)
+    ), 2)
+    detail["daily_report"] = {
+        "schema_version": "daily_rebalance_report_v1",
+        "signal_date": signal_date,
+        "execute_date": execute_date,
+        "market_environment": {
+            "current": selection_detail.get("trend_analysis") or {},
+            "change_from_previous": (selection_detail.get("trend_analysis") or {}).get("change_from_previous"),
+        },
+        "portfolio": {
+            "equity": portfolio.get("total_equity"),
+            "cash": portfolio.get("cash_balance"),
+            "risk_budget": risk_budget,
+            "optimizer": optimizer_name,
+        },
+        "simulated_trades": {"buys": buy_actions, "sells": sell_triggers, "transaction_cost": transaction_cost},
+        "trade_reasons": {
+            "new_facts_and_scores": selection_detail.get("selections") or [],
+            "valuation_and_risk": selection_detail.get("filter_summary") or {},
+        },
+        "unchanged_holdings": [
+            {"symbol": symbol, "reason": "仍在目标组合且未触发逻辑/风险退出条件", "next_trigger": "目标池、逻辑或风险状态变化"}
+            for symbol in sorted(held_after_sell.intersection(set(target_symbols)))
+        ],
+        "rejected_signals": blocked_events,
+        "next_observations": [
+            {"symbol": str(item.get("symbol") or ""), "conditions": ["新公告与财务证据", "估值安全边际", "投资逻辑失效条件"]}
+            for item in (selection_detail.get("selections") or [])[:20]
+        ],
+        "learning_and_challenger": {
+            "strategy_template": selection_detail.get("strategy_template") or {},
+            "model_version": (selection_detail.get("strategy_template") or {}).get("id") or "rule_fallback_v1",
+            "experiments": selection_detail.get("challenger_experiments") or [],
         },
     }
     try:
@@ -663,20 +1031,25 @@ def run_for_trade_date(
         for action in buy_actions:
             symbol = str(action.get("symbol") or "")
             evidence = selection_by_symbol.get(symbol) or {}
+            frozen_research, frozen_valuation = _frozen_research_evidence(symbol, as_of_time=data_as_of)
+            frozen_research["selection"] = evidence
             create_decision_snapshot({
-                "ts_code": symbol, "decision_type": "buy", "decision_time": decision_time,
+                "ts_code": _ts_code(symbol), "decision_type": "buy", "decision_time": decision_time,
+                "execution_id": execution_id,
                 "price": action.get("price"), "data_as_of_time": data_as_of, "model_version": model_version,
-                "market_state": market_state, "research_state": evidence, "valuation": {},
+                "market_state": market_state, "research_state": frozen_research, "valuation": frozen_valuation,
                 "portfolio_context": detail.get("portfolio_risk") or {},
                 "reason": f"入选目标组合；{template.get('reason') or detail.get('summary')}",
                 "invalidation_conditions": ["跌出目标组合", "硬风险门控触发", "组合风险约束要求减仓"],
             })
         for action in sell_triggers:
             symbol = str(action.get("symbol") or "")
+            frozen_research, frozen_valuation = _frozen_research_evidence(symbol, as_of_time=data_as_of)
             create_decision_snapshot({
-                "ts_code": symbol, "decision_type": "sell", "decision_time": decision_time,
+                "ts_code": _ts_code(symbol), "decision_type": "sell", "decision_time": decision_time,
+                "execution_id": execution_id,
                 "price": action.get("price"), "data_as_of_time": data_as_of, "model_version": model_version,
-                "market_state": market_state, "research_state": selection_by_symbol.get(symbol) or {}, "valuation": {},
+                "market_state": market_state, "research_state": frozen_research, "valuation": frozen_valuation,
                 "portfolio_context": detail.get("portfolio_risk") or {},
                 "reason": str(action.get("reason") or "不再满足目标组合条件"),
                 "invalidation_conditions": [],
@@ -738,6 +1111,12 @@ def analyze_market_plan(
         exchange_group=exchange_group,
         scoring_timeout_sec=scoring_timeout_sec,
     )
+    targets, research_blocks = _apply_research_admission(targets, as_of_time=f"{sig}T23:59:59")
+    targets, dynamic_blocks, dynamic_gate = _apply_dynamic_strategy_gate(
+        targets, as_of_time=f"{sig}T23:59:59"
+    )
+    detail["research_admission"] = {"admitted": list(targets), "blocked": research_blocks}
+    detail["dynamic_strategy_gate"] = dynamic_gate
     target_set = set(targets)
     positions = get_positions()
     held: Dict[str, Dict[str, Any]] = {}
@@ -832,7 +1211,7 @@ def analyze_market_plan(
             "buy": buy_actions,
             "sell": sell_actions,
             "hold": hold_symbols,
-            "blocked": [],
+            "blocked": research_blocks + dynamic_blocks,
         },
         "current_positions": current_positions,
         "summary": summary,
@@ -875,15 +1254,24 @@ def plan_analyze_rebalance(
         raise ReplayRiskGateError(f"执行日 {execute_date} 快照缺失", code="paused_data_not_ready")
     exec_map = {str(getattr(r, "symbol", "") or "").strip(): r for r in exec_rows}
 
-    pool = {str(s).strip() for s in (target_symbols or symbols or []) if str(s).strip()}
-    buy_symbols = [str(s).strip() for s in symbols if str(s).strip()]
+    requested_targets = [str(s).strip() for s in (target_symbols or symbols or []) if str(s).strip()]
+    research_targets, research_blocks = _apply_research_admission(requested_targets, as_of_time=f"{sig}T23:59:59")
+    gated_targets, dynamic_blocks, dynamic_gate = _apply_dynamic_strategy_gate(
+        research_targets, as_of_time=f"{sig}T23:59:59"
+    )
+    high_risk_symbols = {
+        str(item.get("symbol") or "") for item in (dynamic_gate.get("items") or [])
+        if str((item.get("risk") or {}).get("risk_level") or "") == "high"
+    }
+    pool = set(gated_targets)
+    buy_symbols = [str(s).strip() for s in symbols if str(s).strip() in pool]
     scores = dict(selection_scores or {})
     for sym in buy_symbols:
         scores.setdefault(sym, 0.0)
 
     rebalance_mode = str(mode or "full_rebalance").strip().lower()
     sell_preview: List[Dict[str, Any]] = []
-    sell_blocked: List[Dict[str, Any]] = []
+    sell_blocked: List[Dict[str, Any]] = list(research_blocks) + list(dynamic_blocks)
     sold_count = 0
     sold_ops_payload: List[Dict[str, Any]] = []
     executed_at = f"{execute_date}T09:30:00"
@@ -927,11 +1315,15 @@ def plan_analyze_rebalance(
                 volume=float(getattr(px_row, "volume", 0) or 0) if px_row else 0.0,
             )
             qty = int(pos.get("quantity") or 0)
+            fee = sell_cost_breakdown(px, qty, sym)
+            exec_price = float(fee["executed_price"])
             item = {
                 "symbol": sym,
                 "name": str(pos.get("name") or ""),
                 "quantity": qty,
-                "price": round(px, 4),
+                "price": exec_price,
+                "requested_price": round(px, 4),
+                **{k: fee[k] for k in ("commission", "transfer_fee", "stamp_tax", "slippage_bps", "fee_schedule_version")},
                 "status": "simulated" if tradable.ok else "blocked",
                 "message": tradable.message,
                 "block_code": tradable.code,
@@ -944,17 +1336,18 @@ def plan_analyze_rebalance(
             if dry_run:
                 continue
             try:
-                sell_position(int(pos["id"]), quantity=qty, price=px, trade_date=execute_date)
+                sell_position(int(pos["id"]), quantity=qty, price=exec_price, trade_date=execute_date, record_operation=False)
                 sold_count += 1
                 sold_ops_payload.append(
                     {
                         "symbol": sym,
                         "side": "SELL",
-                        "price": px,
+                        "price": exec_price,
                         "quantity": qty,
                         "at": executed_at,
                         "remark": "量化分析调仓卖出",
                         "name": str(pos.get("name") or "").strip(),
+                        **{k: fee[k] for k in ("commission", "transfer_fee", "stamp_tax", "slippage_bps", "fee_schedule_version")},
                     }
                 )
             except ValueError as e:
@@ -969,8 +1362,11 @@ def plan_analyze_rebalance(
         )
 
     risk_budget = {
-        "target_position_pct": target_position_pct if target_position_pct is not None else 1.0,
-        "max_single_position_pct": max_single_position_pct if max_single_position_pct is not None else 1.0,
+        "target_position_pct": min(
+            target_position_pct if target_position_pct is not None else 1.0,
+            float(dynamic_gate.get("risk_budget_multiplier") or 0),
+        ),
+        "max_single_position_pct": min(max_single_position_pct if max_single_position_pct is not None else .25, .25),
     }
     target_pct, max_single = _parse_risk_budget(risk_budget)
     buy_budget = _compute_buy_budget(
@@ -1004,6 +1400,42 @@ def plan_analyze_rebalance(
             )
         )
 
+    industry_by_symbol, existing_industry_value = _industry_exposure_inputs(
+        list(portfolio["position_value_by_symbol"]) + [str(order.symbol) for order in order_requests],
+        portfolio["position_value_by_symbol"],
+    )
+    plan_returns: Dict[str, List[float]] = {}
+    plan_liquidity_caps: Dict[str, float] = {}
+    for order in order_requests:
+        hist = ds.get_hist_window(str(order.symbol), sig, 60)
+        closes = [float(getattr(item, "close", 0) or 0) for item in hist]
+        plan_returns[str(order.symbol)] = [
+            closes[index] / closes[index - 1] - 1.0
+            for index in range(1, len(closes)) if closes[index - 1] > 0 and closes[index] > 0
+        ]
+        amounts = [float(getattr(item, "turnover", 0) or 0) for item in hist[-20:] if float(getattr(item, "turnover", 0) or 0) > 0]
+        if amounts:
+            plan_liquidity_caps[str(order.symbol)] = sum(amounts) / len(amounts) * 1000.0 * .01
+    target_weights = constrained_cvar_weights(plan_returns, max_single=max_single)
+    plan_optimizer = "ledoit_wolf_shrinkage_plus_constrained_cvar_v1"
+    if not target_weights:
+        target_weights = hrp_fallback_weights(plan_returns, max_single=max_single)
+        plan_optimizer = "hrp_inverse_volatility_fallback_v1"
+    plan_bl: Dict[str, Any] = {}
+    if target_weights:
+        values = [float(scores.get(symbol, 0) or 0) for symbol in target_weights]
+        mean_score = sum(values) / len(values) if values else 0.0
+        plan_bl = black_litterman_weights(
+            target_weights,
+            {symbol: (float(scores.get(symbol, 0) or 0) - mean_score) / 100.0 for symbol in target_weights},
+            {symbol: min(1.0, len(plan_returns.get(symbol, [])) / 60.0) for symbol in target_weights},
+            max_weight=max_single,
+        )
+        target_weights = dict(plan_bl.get("weights") or target_weights)
+        plan_optimizer += "+black_litterman_diagonal_v1"
+    symbol_position_limits = _pretrade_symbol_limits(
+        [str(order.symbol) for order in order_requests], cutoff=f"{sig}T23:59:59", max_single=max_single,
+    )
     planned, buy_blocked, pruned = allocate_buy_orders(
         order_requests,
         budget=buy_budget,
@@ -1011,6 +1443,14 @@ def plan_analyze_rebalance(
         max_single_position_pct=max_single,
         existing_position_value=portfolio["position_value_by_symbol"],
         symbol_scores=scores,
+        industry_by_symbol=industry_by_symbol,
+        existing_industry_value=existing_industry_value,
+        max_industry_position_pct=.25,
+        max_correlated_industry_pct=.35,
+        target_weights=target_weights,
+        symbol_position_limits=symbol_position_limits,
+        high_risk_symbols=high_risk_symbols,
+        max_order_value_by_symbol=plan_liquidity_caps,
     )
     buy_preview = [
         {
@@ -1053,7 +1493,7 @@ def plan_analyze_rebalance(
 
     execution_id: int | None = None
     bought_count = 0
-    if not dry_run and buy_preview:
+    if not dry_run and (buy_preview or sold_ops_payload):
         filled_results = planned_to_order_results(planned)
         orders_payload = [
             {
@@ -1063,12 +1503,18 @@ def plan_analyze_rebalance(
                 "quantity": o.quantity,
                 "commission": getattr(o, "commission", 0),
                 "transfer_fee": getattr(o, "transfer_fee", 0),
+                "slippage_bps": round(
+                    (float(o.price) / float(next((x.request_price for x in planned if x.symbol == o.symbol), o.price)) - 1.0) * 10000.0,
+                    4,
+                ),
+                "fee_schedule_version": ETF_FEE_SCHEDULE_VERSION if is_exchange_etf(o.symbol) else FEE_SCHEDULE_VERSION,
                 "name": name_by_symbol.get(o.symbol, ""),
             }
             for o in filled_results
         ]
-        if orders_payload:
-            add_account_balance(-total_buy_cost)
+        if orders_payload or sold_ops_payload:
+            if orders_payload:
+                add_account_balance(-total_buy_cost)
             execution_id = create_execution(
                 strategy_id=int(sid),
                 executed_at=executed_at,
@@ -1078,7 +1524,8 @@ def plan_analyze_rebalance(
             )
             if sold_ops_payload:
                 append_operations_to_execution(execution_id, executed_at, sold_ops_payload)
-            merge_execution_into_positions(orders_payload, executed_at, name_by_symbol=name_by_symbol)
+            if orders_payload:
+                merge_execution_into_positions(orders_payload, executed_at, name_by_symbol=name_by_symbol)
             bought_count = len(orders_payload)
 
     planned_buy_count = len(order_requests)
@@ -1113,27 +1560,35 @@ def plan_analyze_rebalance(
                 "selection_scores": scores,
             }
             for order in buy_preview:
+                symbol = str(order.get("symbol") or "")
+                frozen_research, frozen_valuation = _frozen_research_evidence(symbol, as_of_time=data_as_of_time)
+                frozen_research["selection_score"] = order.get("score")
+                frozen_research["name"] = order.get("name")
                 snapshot = create_decision_snapshot({
-                    "ts_code": str(order.get("symbol") or ""), "decision_type": "buy",
+                    "ts_code": _ts_code(symbol), "decision_type": "buy",
+                    "execution_id": execution_id,
                     "decision_time": decision_time, "price": order.get("exec_price"),
                     "data_as_of_time": data_as_of_time, "model_version": model_version,
                     "market_state": shared_context,
-                    "research_state": {"selection_score": order.get("score"), "name": order.get("name")},
-                    "valuation": {}, "portfolio_context": {"equity": portfolio["total_equity"], "cash_before": cash_balance, "buy_cost": total_buy_cost},
-                    "reason": f"确认执行调仓买入；评分={order.get('score')}; {execution_note}",
+                    "research_state": frozen_research,
+                    "valuation": frozen_valuation, "portfolio_context": {"equity": portfolio["total_equity"], "cash_before": cash_balance, "buy_cost": total_buy_cost},
+                    "reason": f"自动模拟调仓买入；评分={order.get('score')}; {execution_note}",
                     "invalidation_conditions": ["触发组合风险门控", "目标权重或选股评分失效", "交易约束禁止继续持有"],
                 })
                 decision_snapshot_ids.append(int(snapshot["id"]))
             for order in sell_preview:
                 if str(order.get("status") or "") not in {"filled", "executed", "simulated"}:
                     continue
+                symbol = str(order.get("symbol") or "")
+                frozen_research, frozen_valuation = _frozen_research_evidence(symbol, as_of_time=data_as_of_time)
                 snapshot = create_decision_snapshot({
-                    "ts_code": str(order.get("symbol") or ""), "decision_type": "sell",
+                    "ts_code": _ts_code(symbol), "decision_type": "sell",
+                    "execution_id": execution_id,
                     "decision_time": decision_time, "price": order.get("price"),
                     "data_as_of_time": data_as_of_time, "model_version": model_version,
-                    "market_state": shared_context, "research_state": {}, "valuation": {},
+                    "market_state": shared_context, "research_state": frozen_research, "valuation": frozen_valuation,
                     "portfolio_context": {"equity": portfolio["total_equity"], "cash_before": cash_balance},
-                    "reason": str(order.get("message") or "确认执行调仓卖出"),
+                    "reason": str(order.get("message") or "自动模拟调仓卖出"),
                     "invalidation_conditions": [],
                 })
                 decision_snapshot_ids.append(int(snapshot["id"]))
@@ -1183,6 +1638,9 @@ def plan_analyze_rebalance(
         "decision_snapshot_ids": decision_snapshot_ids,
         "decision_snapshot_error": decision_snapshot_error or None,
         "pool_sync": pool_sync,
+        "research_admission": {"admitted": research_targets, "blocked": research_blocks},
+        "dynamic_strategy_gate": dynamic_gate,
+        "portfolio_optimizer": {"method": plan_optimizer, "weights": target_weights, "black_litterman": plan_bl, "hard_constraints": {"max_single_position_pct": max_single, "max_industry_position_pct": .25, "max_correlated_industry_pct": .35}},
     }
 
 

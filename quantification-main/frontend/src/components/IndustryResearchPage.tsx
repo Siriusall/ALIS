@@ -1,20 +1,55 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { fetchIndustries, type IndustryResearchItem } from "../api/research";
 
 export default function IndustryResearchPage() {
   const [items, setItems] = useState<IndustryResearchItem[]>([]);
   const [error, setError] = useState("");
+  const [asOfTime, setAsOfTime] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [query, setQuery] = useState("");
+  const [stateFilter, setStateFilter] = useState<"ready" | "all" | "insufficient">("ready");
+
+  async function load(value = asOfTime) {
+    setLoading(true);
+    try {
+      setItems(await fetchIndustries(value ? `${value}T23:59:59` : ""));
+      setError("");
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setLoading(false);
+    }
+  }
 
   useEffect(() => {
-    fetchIndustries().then(setItems).catch((e) => setError(e instanceof Error ? e.message : String(e)));
+    void load("");
+    // Initial latest-state load only.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  const visibleItems = useMemo(() => items.filter((item) => {
+    const matchesQuery = !query.trim() || `${item.industry_code} ${item.industry_name}`.toLowerCase().includes(query.trim().toLowerCase());
+    const matchesState = stateFilter === "all" || (stateFilter === "ready" ? item.state.status === "ready" : item.state.status !== "ready");
+    return matchesQuery && matchesState;
+  }), [items, query, stateFilter]);
 
   return (
     <section className="industry-page">
-      <div className="product-module-head"><div><span>INDUSTRY RESEARCH</span><h1>行业研究中心</h1><p>行业景气仅在需求、价格、库存、产能和盈利等证据覆盖达标后判定；公司映射来自 PostgreSQL 股票主数据。</p></div></div>
+      <div className="product-module-head"><div><span>INDUSTRY RESEARCH</span><h1>行业研究中心</h1><p>只看证据够不够、结论稳不稳。</p></div></div>
+      <div className="stock-research-search workspace-search">
+        <input aria-label="行业状态历史日期" type="date" value={asOfTime} onInput={(event) => setAsOfTime(event.currentTarget.value)} onChange={(event) => setAsOfTime(event.target.value)} />
+        <button type="button" onClick={() => void load()} disabled={loading}>{loading ? "正在回放…" : asOfTime ? "读取历史时点" : "读取最新状态"}</button>
+        {asOfTime && <button type="button" className="button ghost" onClick={() => { setAsOfTime(""); void load(""); }}>回到最新</button>}
+      </div>
+      <div className="decision-command-bar" aria-label="行业研究筛选">
+        <div className="decision-command-intro"><span>INDUSTRY FOCUS</span><strong>默认先看可评价行业</strong></div>
+        <input aria-label="搜索行业" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索行业名称或代码" />
+        <select aria-label="行业状态筛选" value={stateFilter} onChange={(event) => setStateFilter(event.target.value as typeof stateFilter)}><option value="ready">仅可评价</option><option value="insufficient">仅证据不足</option><option value="all">全部行业</option></select>
+        <strong>{visibleItems.length} / {items.length}</strong>
+      </div>
       {error && <div className="alert">{error}</div>}
       <div className="industry-list">
-        {items.map((item) => (
+        {visibleItems.map((item) => (
           <article className="industry-card" key={item.industry_code}>
             <header><div><span>{item.industry_code}</span><h2>{item.industry_name}</h2></div><div className={`module-state module-state-${item.state.status === "ready" ? "ready" : "partial"}`}>{item.state.lifecycle}</div></header>
             <div className="industry-facts">
@@ -23,12 +58,14 @@ export default function IndustryResearchPage() {
               <div><strong>{(item.state.coverage * 100).toFixed(0)}%</strong><span>景气分量覆盖</span></div>
               <div><strong>{item.state.status === "ready" ? item.state.score.toFixed(1) : "—"}</strong><span>景气评分</span></div>
             </div>
-            {item.companies.length > 0 && <p className="module-missing">公司样本：{item.companies.slice(0, 4).map((x) => `${x.name}(${x.ts_code})`).join("、")}</p>}
-            <div>{item.metrics.map((metric) => <div className="industry-metric" key={metric.metric_code}><strong>{metric.metric_name}</strong><span>{metric.frequency} · {metric.source_code || "来源未登记"}</span><small>{metric.value_count} 条 · {metric.first_date || "—"} 至 {metric.last_date || "—"}</small></div>)}</div>
+            {item.state_as_of_date && <p className="text-muted">状态时点：{item.state_as_of_date} · {item.state_model_version || "历史代理模型"}</p>}
+            {item.companies.length > 0 && <p className="text-muted">公司样本：{item.companies.slice(0, 4).map((x) => `${x.name}(${x.ts_code})`).join("、")}</p>}
+            <div>{item.metrics.map((metric) => <div className="industry-metric" key={metric.metric_code}><strong>{metric.metric_name}</strong><span>{metric.frequency} · {metric.source_code || "来源未登记"}</span><em>{metric.value_count} 条 · {metric.first_date || "—"} 至 {metric.last_date || "—"}</em></div>)}</div>
             {item.limitations.map((value) => <p className="module-missing" key={value}>{value}</p>)}
           </article>
         ))}
         {!items.length && !error && <div className="research-empty"><strong>正在读取行业指标和公司映射</strong></div>}
+        {!!items.length && !visibleItems.length && <div className="research-empty"><strong>当前筛选没有匹配行业</strong><span>可切换到“全部行业”继续查看。</span></div>}
       </div>
     </section>
   );

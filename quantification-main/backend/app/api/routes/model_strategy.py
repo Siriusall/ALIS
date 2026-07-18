@@ -1,19 +1,36 @@
 from __future__ import annotations
 
 import threading
+from datetime import datetime
 from typing import Any
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
-from app.db.store import create_model_train_run, get_active_model_version, get_model_version, set_active_model_version
-from app.services.model_registry import compare_champion_challenger, evaluate_model_drift, get_model_constitution, get_model_status, get_train_run_status
+from app.db.store import create_model_train_run, get_active_model_version, get_model_version, set_active_model_version, update_model_version_validation
+from app.services.model_registry import compare_champion_challenger, evaluate_model_drift, get_model_constitution, get_model_status, get_train_run_status, model_artifact_status
 from app.services.model_governance_scheduler import auto_tune_models_once
 from app.services.model_training import run_model_training
 from app.services.quant_risk import bocpd_change_probability, constrained_cvar_weights, garch11_forecast, historical_cvar, hrp_fallback_weights, hsmm_regime, kalman_level, ledoit_wolf_covariance
-from app.services.market_context import live_market_context, market_context_history, rebuild_market_context_history, score_market_sentiment, score_theme_narratives
+from app.services.market_context import (
+    live_market_context,
+    market_context_history,
+    market_state_model_governance,
+    materialize_market_training_history,
+    rebuild_market_context_history,
+    score_market_sentiment,
+    score_theme_narratives,
+)
 from app.services.strategy_gate import evaluate_strategy_gate
 from app.services.advanced_controls import black_litterman_weights, evaluate_slo, multi_period_oos_report
+from app.services.performance_reports import list_performance_reports, validate_performance_reports, build_multi_period_validation
+from app.services.news_theme_cluster import cluster_news_themes
+from app.services.analyst_consensus import build_analyst_consensus, batch_analyst_consensus
+from app.services.auto_pipeline import run_daily_maintenance
+from app.services.defensive_assets import defensive_allocation_for_state, list_defensive_assets, materialize_defensive_asset_history
+from app.services.hsmm_shadow import train_hsmm_shadow
+from app.services.backend_acceptance import backend_acceptance_matrix
+from app.services.strategy_workbench import build_strategy_workbench
 
 router = APIRouter()
 
@@ -81,9 +98,25 @@ class OOSReportRequest(BaseModel):
     periods: list[dict[str, Any]] = Field(default_factory=list, max_length=1000)
 
 
+class HsmmReviewRequest(BaseModel):
+    reviewer: str = Field(..., min_length=1, max_length=120)
+    decision: str = Field(..., pattern="^(approved|rejected)$")
+    comment: str = Field("", max_length=2000)
+
+
 @router.get("/model-strategy/status")
 def model_strategy_status() -> dict:
     return get_model_status()
+
+
+@router.get("/model-strategy/backend-acceptance")
+def model_strategy_backend_acceptance() -> dict:
+    return backend_acceptance_matrix()
+
+
+@router.get("/model-strategy/workbench")
+def model_strategy_workbench(limit: int = 10, include_details: bool = False) -> dict:
+    return build_strategy_workbench(limit=limit, include_details=include_details)
 
 
 @router.get("/model-strategy/constitution")
@@ -139,6 +172,72 @@ def model_strategy_rebuild_market_context_history(limit: int = 120) -> dict:
     return rebuild_market_context_history(limit=limit)
 
 
+@router.get("/model-strategy/market-context/governance")
+def model_strategy_market_context_governance() -> dict:
+    """Report the production regime model and the evidence for promotion gates."""
+    return market_state_model_governance()
+
+
+@router.post("/model-strategy/market-context/materialize-training-history")
+def model_strategy_materialize_market_training_history() -> dict:
+    """Refresh the point-in-time 6-10 year index feature layer used by regime models."""
+    return materialize_market_training_history()
+
+
+@router.get("/model-strategy/defensive-assets")
+def model_strategy_defensive_assets(as_of_date: str | None = None) -> dict:
+    return list_defensive_assets(as_of_date=as_of_date)
+
+
+@router.post("/model-strategy/defensive-assets/materialize")
+def model_strategy_materialize_defensive_assets(start_date: str | None = None, end_date: str | None = None) -> dict:
+    return materialize_defensive_asset_history(start_date=start_date, end_date=end_date)
+
+
+@router.post("/model-strategy/market-context/hsmm/train-shadow")
+def model_strategy_train_hsmm_shadow() -> dict:
+    """Fit and OOS-validate the fixed four-state HSMM without promoting it."""
+    return train_hsmm_shadow()
+
+
+@router.post("/model-strategy/market-context/hsmm/review/{model_version_id}")
+def model_strategy_review_hsmm_shadow(model_version_id: int, req: HsmmReviewRequest) -> dict:
+    version = get_model_version(model_version_id)
+    if not version or str(version.get("model_key") or "") != "market_regime":
+        raise HTTPException(status_code=404, detail="HSMM影子版本不存在")
+    validation = dict(version.get("validation") or {})
+    if str(validation.get("status") or "") != "passed":
+        raise HTTPException(status_code=409, detail="只有通过OOS验证的HSMM影子版本才能进入上线评审")
+    governance = market_state_model_governance()
+    hsmm = governance.get("hsmm") or {}
+    if str(hsmm.get("latest_shadow_version") or "") != str(version.get("version") or ""):
+        raise HTTPException(status_code=409, detail="仅允许评审最新HSMM影子版本")
+    if str(hsmm.get("status") or "") not in {"shadow_live_observation_review_ready", "shadow_review_rejected", "shadow_promoted_ready"}:
+        raise HTTPException(status_code=409, detail="HSMM影子观察期尚未达标，暂不能进入上线评审")
+    review_payload = {
+        "status": req.decision,
+        "reviewer": req.reviewer.strip(),
+        "comment": req.comment.strip(),
+        "reviewed_at": datetime.utcnow().isoformat(timespec="seconds"),
+    }
+    validation["review"] = review_payload
+    validation["production_eligible"] = req.decision == "approved"
+    update_model_version_validation(model_version_id, validation=validation)
+    return {
+        "ok": True,
+        "model_version_id": model_version_id,
+        "version": version.get("version"),
+        "review": review_payload,
+        "production_eligible": validation["production_eligible"],
+        "governance": market_state_model_governance(),
+    }
+
+
+@router.get("/model-strategy/defensive-assets/allocation")
+def model_strategy_defensive_allocation(market_state: str, as_of_date: str) -> dict:
+    return defensive_allocation_for_state(market_state, as_of_date=as_of_date)
+
+
 @router.post("/model-strategy/gate")
 def model_strategy_gate(req: StrategyGateRequest) -> dict:
     return evaluate_strategy_gate(**req.model_dump())
@@ -158,6 +257,44 @@ def model_strategy_portfolio_risk(req: PortfolioRiskRequest) -> dict:
 
 
 @router.post("/model-strategy/black-litterman")
+@router.get("/model-strategy/performance-reports")
+def model_strategy_performance_reports(period_type: str | None = None, limit: int = 12) -> dict:
+    return list_performance_reports(period_type=period_type, limit=limit)
+
+
+@router.get("/model-strategy/performance-reports/validate")
+def model_strategy_validate_reports() -> dict:
+    return validate_performance_reports()
+
+
+@router.get("/model-strategy/validation/multi-period")
+def model_strategy_multi_period_validation() -> dict:
+    return build_multi_period_validation()
+
+
+
+@router.post("/model-strategy/themes/cluster-news")
+def model_strategy_cluster_news() -> dict:
+    return cluster_news_themes()
+
+
+@router.get("/model-strategy/analyst-consensus/{ts_code}")
+def model_strategy_analyst_consensus(ts_code: str) -> dict:
+    return build_analyst_consensus(ts_code)
+
+
+@router.get("/model-strategy/analyst-consensus/batch")
+def model_strategy_analyst_consensus_batch(limit: int = 100) -> dict:
+    return batch_analyst_consensus(limit=limit)
+
+
+
+@router.post("/model-strategy/daily-maintenance")
+def model_strategy_daily_maintenance() -> dict:
+    return run_daily_maintenance()
+
+
+
 def model_strategy_black_litterman(req: BlackLittermanRequest) -> dict:
     return black_litterman_weights(req.prior_weights, req.views, req.confidences, max_weight=req.max_weight)
 
@@ -185,6 +322,17 @@ def model_strategy_promote(model_version_id: int) -> dict:
         raise HTTPException(status_code=404, detail="模型版本不存在")
     validation = version.get("validation") or {}
     metrics = version.get("metrics") or {}
+    artifact = model_artifact_status(version)
+    if not artifact.get("ok"):
+        raise HTTPException(status_code=409, detail={"code": "model_artifact_unavailable", **artifact})
+    if not bool(validation.get("production_eligible")):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "model_not_production_eligible",
+                "production_eligibility": validation.get("production_eligibility") or {},
+            },
+        )
     if str(validation.get("status")) != "passed" or float(metrics.get("lift", 0) or 0) <= 0 or float(metrics.get("walk_forward_lift", 0) or 0) <= 0:
         raise HTTPException(status_code=409, detail="模型未同时通过 holdout 与 walk-forward 晋升门槛")
     set_active_model_version(model_version_id)
@@ -199,6 +347,17 @@ def model_strategy_rollback(model_version_id: int) -> dict:
         raise HTTPException(status_code=404, detail="模型版本不存在")
     validation = target.get("validation") or {}
     metrics = target.get("metrics") or {}
+    artifact = model_artifact_status(target)
+    if not artifact.get("ok"):
+        raise HTTPException(status_code=409, detail={"code": "model_artifact_unavailable", **artifact})
+    if not bool(validation.get("production_eligible")):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "model_not_production_eligible",
+                "production_eligibility": validation.get("production_eligibility") or {},
+            },
+        )
     if str(validation.get("status")) != "passed" or float(metrics.get("lift", 0) or 0) <= 0 or float(metrics.get("walk_forward_lift", 0) or 0) <= 0:
         raise HTTPException(status_code=409, detail="只能回退到已通过验证的模型版本")
     previous = get_active_model_version("main")

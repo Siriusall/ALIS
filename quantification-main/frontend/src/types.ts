@@ -421,6 +421,70 @@ export interface QuantRunLedgerSummary {
   valuation_date: string;
 }
 
+export interface SimulationLedgerOperation {
+  operation_id: number;
+  operation_uid: string;
+  execution_id: number;
+  symbol: string;
+  name?: string;
+  side: "BUY" | "SELL" | string;
+  quantity: number;
+  simulated_price: number;
+  trade_time: string;
+  assumption: {
+    price_rule: string;
+    slippage_bps: number;
+    fee_schedule_version: string;
+    remark?: string;
+  };
+  fees: {
+    commission: number;
+    transfer_fee: number;
+    stamp_tax: number;
+    total: number;
+  };
+  close_price?: number | null;
+  mark_to_market_pnl?: number | null;
+}
+
+export interface SimulationLedgerItem {
+  execution_id: number;
+  strategy_id?: number;
+  executed_at: string;
+  signal_date?: string | null;
+  execute_date?: string | null;
+  source: "quant_task" | "manual_or_legacy" | string;
+  message?: string;
+  strategy_version?: string;
+  model_version?: string;
+  target_positions: Array<Record<string, unknown>>;
+  current_positions_before: Array<Record<string, unknown>>;
+  orders: Array<Record<string, unknown>>;
+  operations: SimulationLedgerOperation[];
+  blocked_signals: Array<Record<string, unknown>>;
+  summary: {
+    operation_count: number;
+    buy_count: number;
+    sell_count: number;
+    gross_turnover: number;
+    total_fees: number;
+    unfilled_count: number;
+  };
+  links: {
+    task_run_detail?: string | null;
+    operations?: string | null;
+    equity_curve?: string | null;
+  };
+}
+
+export interface SimulationLedgerResponse {
+  ok: boolean;
+  schema_version: "simulation_ledger_v1" | string;
+  generated_at: string;
+  items: SimulationLedgerItem[];
+  limitations: string[];
+}
+
 export interface DataHealthDateSummary {
   count: number;
   first?: string | null;

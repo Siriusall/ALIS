@@ -33,10 +33,31 @@ def black_litterman_weights(
         c = max(0.0, min(1.0, float(conf.get(key, 0) or 0)))
         view = float(views.get(key, 0) or 0)
         raw[key] = max(0.0, prior[key] + c * view)
-    capped = {k: min(max(0.0, float(max_weight)), v) for k, v in raw.items()}
-    total = sum(capped.values()) or 1.0
-    weights = {k: round(v / total, 8) for k, v in capped.items()}
-    return {"weights": weights, "prior_weights": prior, "adjustments": {k: round(weights[k] - prior[k], 8) for k in keys}, "method": "black_litterman_diagonal_v1", "max_weight": max_weight}
+    cap = max(0.0, float(max_weight))
+    weights = {k: min(cap, v) for k, v in raw.items()}
+    total = sum(weights.values())
+    if total > 1.0:
+        weights = {k: v / total for k, v in weights.items()}
+    else:
+        remainder = 1.0 - total
+        eligible = [key for key in keys if weights[key] < cap - 1e-12]
+        while remainder > 1e-10 and eligible:
+            addition = remainder / len(eligible)
+            progressed = 0.0
+            next_eligible = []
+            for key in eligible:
+                increment = min(addition, cap - weights[key])
+                weights[key] += increment
+                progressed += increment
+                if weights[key] < cap - 1e-12:
+                    next_eligible.append(key)
+            remainder -= progressed
+            if progressed <= 1e-12:
+                break
+            eligible = next_eligible
+    weights = {k: round(v, 8) for k, v in weights.items()}
+    cash_weight = round(max(0.0, 1.0 - sum(weights.values())), 8)
+    return {"weights": weights, "cash_weight": cash_weight, "prior_weights": prior, "adjustments": {k: round(weights[k] - prior[k], 8) for k in keys}, "method": "black_litterman_diagonal_v1", "max_weight": max_weight}
 
 
 def bayesian_update(prior: float, evidence: list[dict[str, Any]]) -> dict[str, Any]:

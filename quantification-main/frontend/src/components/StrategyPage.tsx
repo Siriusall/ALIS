@@ -1,63 +1,97 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
-import { CartesianGrid, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
-import { fetchBacktest, fetchBacktestJob, runBacktestAsync, type BacktestRunResponse } from "../api/backtest";
+import { useEffect, useRef, useState } from "react";
 import {
-  fetchModelStrategyStatus,
-  fetchModelConstitution,
-  fetchModelTrainRun,
-  startModelTraining,
   autoTuneModels,
-  rollbackModelVersion,
-  compareModelVersions,
-  type ModelComparison,
-  type ModelStrategyStatus,
+  fetchModelTrainRun,
+  fetchStrategyWorkbench,
+  startHsmmShadowTraining,
+  startModelTraining,
   type ModelTrainRun,
-  type ModelConstitution,
+  type StrategyWorkbenchResponse,
 } from "../api/modelStrategy";
-import { chartGridStroke, chartLinePrimary, chartTooltipStyle } from "../chartTheme";
+import { formatGmt8Time } from "../utils/time";
+
+function pct(value: unknown, digits = 1) {
+  const n = Number(value);
+  return Number.isFinite(n) ? `${(n * 100).toFixed(digits)}%` : "—";
+}
+
+function num(value: unknown, digits = 4) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n.toFixed(digits) : "—";
+}
+
+function statusText(value: string) {
+  const map: Record<string, string> = {
+    blocked: "阻塞",
+    ready: "就绪",
+    partial: "部分就绪",
+    linked: "可下钻",
+    passed: "通过",
+    failed: "失败",
+    transparent_rule_fallback: "透明规则降级",
+    shadow_oos_validated_live_observation_pending: "影子观察期",
+    shadow_live_observation: "影子观察中",
+    shadow_live_observation_review_ready: "影子观察达标",
+    shadow_promoted_ready: "评审通过待晋升",
+    shadow_review_rejected: "评审未通过",
+    shadow_ready_for_implementation_and_validation: "待影子验证",
+    shadow_validation_failed: "影子验证失败",
+    shadow_blocked_insufficient_history: "历史不足",
+  };
+  return map[value] || value || "—";
+}
+
+function evidenceText(value: unknown) {
+  if (value == null) return "—";
+  if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") return String(value);
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return "—";
+  }
+}
 
 export default function StrategyPage() {
-  const [status, setStatus] = useState<ModelStrategyStatus | null>(null);
-  const [constitution, setConstitution] = useState<ModelConstitution | null>(null);
+  const [workbench, setWorkbench] = useState<StrategyWorkbenchResponse | null>(null);
   const [trainRun, setTrainRun] = useState<ModelTrainRun | null>(null);
+  const [loading, setLoading] = useState(false);
   const [training, setTraining] = useState(false);
-  const [validating, setValidating] = useState(false);
+  const [hsmmTraining, setHsmmTraining] = useState(false);
   const [tuning, setTuning] = useState(false);
-  const [validation, setValidation] = useState<BacktestRunResponse | null>(null);
-  const [error, setError] = useState("");
-  const [rollingBackId, setRollingBackId] = useState<number | null>(null);
-  const [comparison, setComparison] = useState<ModelComparison | null>(null);
+  const [message, setMessage] = useState("");
   const pollRef = useRef<number | null>(null);
 
   useEffect(() => {
-    refreshStatus();
+    refresh();
     return () => {
       if (pollRef.current != null) window.clearTimeout(pollRef.current);
     };
   }, []);
 
-  async function refreshStatus() {
-    setError("");
+  async function refresh() {
+    setLoading(true);
+    setMessage("");
     try {
-      const data = await fetchModelStrategyStatus();
-      setStatus(data);
-      setConstitution(await fetchModelConstitution());
-      setTrainRun(data.latest_train_run ?? null);
-      setTraining(data.latest_train_run?.status === "running");
-    } catch {
-      setError("模型状态加载失败");
+      const result = await fetchStrategyWorkbench({ limit: 10, include_details: true });
+      setWorkbench(result);
+      setTrainRun(result.model.latest_train_run ?? null);
+      setTraining(result.model.latest_train_run?.status === "running");
+    } catch (err) {
+      setMessage(err instanceof Error ? err.message : "策略工作台读取失败");
+    } finally {
+      setLoading(false);
     }
   }
 
   async function handleTrain() {
     setTraining(true);
-    setError("");
+    setMessage("");
     try {
-      const res = await startModelTraining({ exchange_group: "HS" });
-      pollTrainRun(res.run_id);
-    } catch (e: unknown) {
+      const result = await startModelTraining({ exchange_group: "HS" });
+      pollTrainRun(result.run_id);
+    } catch (err) {
       setTraining(false);
-      setError((e as Error).message || "启动训练失败");
+      setMessage(err instanceof Error ? err.message : "启动训练失败");
     }
   }
 
@@ -66,265 +100,270 @@ export default function StrategyPage() {
       const run = await fetchModelTrainRun(runId);
       setTrainRun(run);
       if (run.status === "running") {
-        pollRef.current = window.setTimeout(() => pollTrainRun(runId), 1000);
+        pollRef.current = window.setTimeout(() => pollTrainRun(runId), 1200);
         return;
       }
       setTraining(false);
-      await refreshStatus();
-    } catch {
+      await refresh();
+    } catch (err) {
       setTraining(false);
-      setError("训练进度查询失败");
-    }
-  }
-
-  async function handleValidate() {
-    const activeId = status?.active_version?.id;
-    if (!activeId) {
-      setError("还没有通过验证的模型版本，请先训练模型");
-      return;
-    }
-    setValidating(true);
-    setError("");
-    try {
-      const res = await runBacktestAsync({
-        model_version_id: activeId,
-        start_date: "2026-05-07",
-        end_date: "2026-07-06",
-        initial_cash: 200000,
-        rebalance_freq: "daily",
-        benchmark_symbol: "000300",
-        exchange_group: "HS",
-      });
-      const loop = async () => {
-        const job = await fetchBacktestJob(res.job_id);
-        if (job.status === "completed" && job.backtest_id) {
-          setValidation(await fetchBacktest(job.backtest_id));
-          setValidating(false);
-          return;
-        }
-        if (job.status === "failed") {
-          throw new Error(job.error || "模型验证失败");
-        }
-        pollRef.current = window.setTimeout(loop, 800);
-      };
-      await loop();
-    } catch (e: unknown) {
-      setValidating(false);
-      setError((e as Error).message || "模型验证失败");
+      setMessage(err instanceof Error ? err.message : "训练进度读取失败");
     }
   }
 
   async function handleAutoTune() {
     setTuning(true);
-    setError("");
+    setMessage("");
     try {
       const result = await autoTuneModels();
-      setError(result.decision === "promoted" ? "Challenger 已通过门槛并晋升" : `自动调优完成：${result.decision}（评估 ${result.evaluated} 个候选）`);
-      await refreshStatus();
-    } catch (e: unknown) {
-      setError((e as Error).message || "自动调优失败");
+      setMessage(`自动调优完成：${result.decision}，评估 ${result.evaluated} 个候选`);
+      await refresh();
+    } catch (err) {
+      setMessage(err instanceof Error ? err.message : "自动调优失败");
     } finally {
       setTuning(false);
     }
   }
 
-  async function handleRollback(modelVersionId: number) {
-    setRollingBackId(modelVersionId);
-    setError("");
+  async function handleHsmmShadowTraining() {
+    setHsmmTraining(true);
+    setMessage("");
     try {
-      const result = await rollbackModelVersion(modelVersionId);
-      setError(`已从当前版本回退到模型 #${result.model_version_id}`);
-      await refreshStatus();
-    } catch (e: unknown) {
-      setError((e as Error).message || "模型回退失败");
+      const result = await startHsmmShadowTraining();
+      let resultMessage: string;
+      if (!result.ok) {
+        resultMessage = `HSMM 影子训练未完成：${result.status || "训练历史不足或 API 数据不可用"}`;
+      } else {
+        const validation = String(result.validation?.status || "完成");
+        resultMessage = `HSMM 影子训练完成：${result.version || "新版本"}，OOS 验证=${validation}。仅使用三条指数的紧凑 API 训练数据。`;
+      }
+      await refresh();
+      setMessage(resultMessage);
+    } catch (err) {
+      setMessage(err instanceof Error ? err.message : "HSMM 影子训练失败");
     } finally {
-      setRollingBackId(null);
+      setHsmmTraining(false);
     }
   }
 
-  async function handleCompare(modelVersionId: number) {
-    if (!active?.id || active.id === modelVersionId) return;
-    setError("");
-    try { setComparison(await compareModelVersions(active.id, modelVersionId)); }
-    catch (e: unknown) { setError((e as Error).message || "模型比较失败"); }
-  }
-
-  const active = status?.active_version ?? null;
-  const latestMetrics = active?.metrics ?? trainRun?.metrics ?? {};
-  const versions = status?.versions ?? [];
-  const chartData = useMemo(() => {
-    if (!validation) return [];
-    return [
-      { name: "总收益", value: Number(validation.metrics.total_return || 0) * 100 },
-      { name: "超额", value: Number(validation.metrics.excess_return || 0) * 100 },
-      { name: "夏普", value: Number(validation.metrics.sharpe || 0) },
-    ];
-  }, [validation]);
-
-  function pct(v: unknown, digits = 2) {
-    const n = Number(v);
-    return Number.isFinite(n) ? `${(n * 100).toFixed(digits)}%` : "—";
-  }
-
-  function num(v: unknown, digits = 4) {
-    const n = Number(v);
-    return Number.isFinite(n) ? n.toFixed(digits) : "—";
-  }
+  const active = workbench?.model.active ?? null;
+  const challengers = workbench?.model.challengers ?? [];
+  const experiments = workbench?.model.experiments ?? [];
+  const failed = workbench?.model.failed_experiments ?? [];
+  const decisions = workbench?.pending_user_decisions ?? [];
+  const acceptance = workbench?.backend_acceptance;
+  const acceptanceChecks = acceptance?.checks ?? [];
 
   return (
     <section id="strategy" className="dashboard-section" data-section="strategy">
-      <h2 className="dashboard-section-title">模型策略</h2>
+      <h2 className="dashboard-section-title">策略工作台</h2>
       <div className="dashboard-section-inner decision-page">
+        <div className="product-module-head">
+          <div>
+            <h1>模型、规则、影子实验和调优决议</h1>
+            <p>先看当前分析来源，再看候选、失败实验和待处理决议。</p>
+          </div>
+          <button type="button" className="button ghost" onClick={refresh} disabled={loading}>
+            {loading ? "刷新中" : "刷新"}
+          </button>
+        </div>
+
+        {message && <div className="alert">{message}</div>}
+
+        <div className="product-module-grid">
+          <article className="product-module-card">
+            <h2>总体状态</h2>
+            <strong>{statusText(workbench?.status.overall || "")}</strong>
+            <p>当前是否可运行</p>
+          </article>
+          <article className="product-module-card">
+            <h2>评分来源</h2>
+            <strong>{statusText(workbench?.current_analysis.scoring_source || "")}</strong>
+            <p>当前打分口径</p>
+          </article>
+          <article className="product-module-card">
+            <h2>市场状态模型</h2>
+            <strong>{statusText(workbench?.status.market_regime || "")}</strong>
+            <p>当前状态来源</p>
+          </article>
+          <article className="product-module-card">
+            <h2>生成时间</h2>
+            <strong>{workbench ? formatGmt8Time(workbench.generated_at) : "—"}</strong>
+            <p>当前快照时间</p>
+          </article>
+        </div>
+
         <div className="card">
-          <h3>主模型</h3>
-          {error && <div className="alert">{error}</div>}
+          <h3>当前分析口径</h3>
           <div className="decision-two-col">
-            <span>当前版本</span>
-            <strong>{active?.version || "尚未生成"}</strong>
-            <span>状态</span>
-            <strong>{active ? (active.is_active ? "已通过验证" : active.status) : "待训练"}</strong>
-            <span>模型类型</span>
-            <strong>{String(active?.config?.model_type || "机器学习 ranking")}</strong>
-            <span>收益假设</span>
-            <strong>用历史因子学习目标组合排序，优先选择风险调整后收益更高的股票</strong>
-            <span>失效场景</span>
-            <strong>市场风格突变、数据覆盖不足、交易约束导致无法成交</strong>
-          </div>
-          <div className="quant-analyze-toolbar" style={{ marginTop: 12 }}>
-            <button type="button" className="quant-analyze-confirm-btn" onClick={handleTrain} disabled={training}>
-              {training ? "训练中…" : "开始自动训练"}
-            </button>
-            <button type="button" className="quant-analyze-secondary-btn" onClick={handleValidate} disabled={validating || !active}>
-              {validating ? "验证中…" : "验证最新模型"}
-            </button>
-            <button type="button" className="quant-analyze-secondary-btn" onClick={refreshStatus}>
-              刷新状态
-            </button>
-            <button type="button" className="quant-analyze-secondary-btn" onClick={handleAutoTune} disabled={tuning}>
-              {tuning ? "调优中…" : "运行自动调优"}
-            </button>
+            <span>模式</span><strong>{workbench?.current_analysis.mode || "—"}</strong>
+            <span>成交规则</span><strong>{workbench?.current_analysis.execution_rule || "—"}</strong>
+            <span>生产模型</span><strong>{active?.version || "无 active ML，使用透明规则"}</strong>
+            <span>Artifact</span><strong>{String(workbench?.model.active_artifact?.status || "—")}</strong>
           </div>
         </div>
 
-        {constitution && (
+        {decisions.length > 0 && (
           <div className="card">
-            <h3>固定模型构成与实现状态</h3>
-            <div className="table-scroll">
-              <table>
-                <thead><tr><th>组件</th><th>规定模型</th><th>当前状态</th></tr></thead>
-                <tbody>{Object.entries(constitution.components).map(([key, item]) => (
-                  <tr key={key}><td>{key}</td><td>{item.model}</td><td>{item.status}</td></tr>
-                ))}</tbody>
-              </table>
+            <h3>待关注决议</h3>
+            <div className="product-module-grid">
+              {decisions.map((item) => (
+                <article className="product-module-card" key={item.key}>
+                  <h2>{item.key}</h2>
+                  <div className="module-output"><i />{statusText(item.status)}</div>
+                  <p>{item.message}</p>
+                </article>
+              ))}
             </div>
           </div>
         )}
 
-        <div className="metrics-row">
-          <div className="card metric-card">
-            <div className="sub">Top 组合收益提升</div>
-            <div className="metric">{num(latestMetrics.lift)}</div>
-          </div>
-          <div className="card metric-card">
-            <div className="sub">Top 命中率</div>
-            <div className="metric">{pct(latestMetrics.hit_rate, 1)}</div>
-          </div>
-          <div className="card metric-card">
-            <div className="sub">训练样本</div>
-            <div className="metric">{latestMetrics.train_rows ? String(latestMetrics.train_rows) : "—"}</div>
-          </div>
-          <div className="card metric-card">
-            <div className="sub">验证样本</div>
-            <div className="metric">{latestMetrics.validation_rows ? String(latestMetrics.validation_rows) : "—"}</div>
-          </div>
-        </div>
-
-        {trainRun && (
+        <div className="decision-two-column-grid">
           <div className="card">
-            <h3>训练进度</h3>
+            <h3>Champion / 当前版本</h3>
             <div className="decision-two-col">
-              <span>任务</span>
-              <strong>#{trainRun.id} {trainRun.status}</strong>
-              <span>阶段</span>
-              <strong>{trainRun.phase || "—"}</strong>
-              <span>进度</span>
-              <strong>{Math.round(Number(trainRun.progress || 0) * 100)}%</strong>
-              <span>消息</span>
-              <strong>{trainRun.error || trainRun.message || "—"}</strong>
+              <span>版本</span><strong>{active?.version || "—"}</strong>
+              <span>状态</span><strong>{active?.status || "transparent_rule_fallback"}</strong>
+              <span>生产资格</span><strong>{active?.production_eligible ? "已满足" : "未满足"}</strong>
+              <span>Lift</span><strong>{num(active?.metrics?.lift)}</strong>
+              <span>命中率</span><strong>{pct(active?.metrics?.hit_rate)}</strong>
+              <span>阻塞原因</span><strong>{active?.blocked_reasons?.join("、") || "—"}</strong>
             </div>
           </div>
-        )}
 
-        {validation && (
           <div className="card">
-            <h3>最近验证</h3>
-            <div className="metrics-row">
-              <div className="card metric-card">
-                <div className="sub">总收益</div>
-                <div className="metric">{pct(validation.metrics.total_return)}</div>
-              </div>
-              <div className="card metric-card">
-                <div className="sub">最大回撤</div>
-                <div className="metric">{pct(validation.metrics.max_drawdown)}</div>
-              </div>
-              <div className="card metric-card">
-                <div className="sub">夏普</div>
-                <div className="metric">{num(validation.metrics.sharpe, 2)}</div>
-              </div>
-              <div className="card metric-card">
-                <div className="sub">超额收益</div>
-                <div className="metric">{pct(validation.metrics.excess_return)}</div>
-              </div>
+            <h3>训练与调优</h3>
+            <div className="decision-two-col">
+              <span>最近任务</span><strong>{trainRun ? `#${trainRun.id} ${trainRun.status}` : "—"}</strong>
+              <span>阶段</span><strong>{trainRun?.phase || "—"}</strong>
+              <span>进度</span><strong>{Math.round(Number(trainRun?.progress || 0) * 100)}%</strong>
+              <span>消息</span><strong>{trainRun?.error || trainRun?.message || "—"}</strong>
+              <span>HSMM 数据范围</span><strong>训练触发时 API 拉取 3 条指数；不落全市场十年明细</strong>
             </div>
-            <div style={{ height: 220, marginTop: 12 }}>
-              <ResponsiveContainer width="100%" height="100%">
-                <LineChart data={chartData}>
-                  <CartesianGrid stroke={chartGridStroke} strokeDasharray="3 3" />
-                  <XAxis dataKey="name" />
-                  <YAxis />
-                  <Tooltip contentStyle={chartTooltipStyle} />
-                  <Line type="monotone" dataKey="value" stroke={chartLinePrimary} dot />
-                </LineChart>
-              </ResponsiveContainer>
+            <div className="quant-analyze-toolbar" style={{ marginTop: 12 }}>
+              <button type="button" className="quant-analyze-confirm-btn" onClick={handleTrain} disabled={training}>
+                {training ? "训练中" : "训练 Challenger"}
+              </button>
+              <button type="button" className="quant-analyze-secondary-btn" onClick={handleAutoTune} disabled={tuning}>
+                {tuning ? "调优中" : "运行自动调优"}
+              </button>
+              <button type="button" className="quant-analyze-secondary-btn" onClick={handleHsmmShadowTraining} disabled={hsmmTraining || training}>
+                {hsmmTraining ? "HSMM 训练中" : "训练 HSMM 影子模型"}
+              </button>
             </div>
           </div>
-        )}
+        </div>
 
-        {comparison && <div className="card"><h3>Champion / Challenger 比较</h3><p>{comparison.champion_version || comparison.champion_id} → {comparison.challenger_version || comparison.challenger_id}：{comparison.decision}</p><div className="decision-two-col">{Object.entries(comparison.deltas).map(([key, value]) => <React.Fragment key={key}><span>{key}</span><strong>{Number(value).toFixed(4)}</strong></React.Fragment>)}<span>门禁</span><strong>{Object.entries(comparison.gates).filter(([, passed]) => passed).length}/{Object.keys(comparison.gates).length} 通过</strong><span>配置差异</span><strong>{Object.keys(comparison.config_diff).length} 项</strong></div>{comparison.blocked_reasons.length > 0 && <div className="alert">阻断原因：{comparison.blocked_reasons.join("、")}</div>}</div>}
         <div className="card">
-          <h3>模型版本</h3>
+          <h3>Challenger 与失败实验</h3>
           <div className="table-scroll">
             <table>
               <thead>
-                <tr>
-                  <th>版本</th>
-                  <th>状态</th>
-                  <th>模型</th>
-                  <th>Lift</th>
-                  <th>命中率</th>
-                  <th>时间</th>
-                  <th>操作</th>
-                </tr>
+                <tr><th>版本/任务</th><th>状态</th><th>生产资格</th><th>Lift</th><th>Walk-forward</th><th>阻塞/错误</th></tr>
               </thead>
               <tbody>
-                {versions.length === 0 ? (
-                  <tr><td colSpan={7} className="empty">暂无模型版本，点击开始自动训练。</td></tr>
-                ) : (
-                  versions.map((v) => (
-                    <tr key={v.id}>
-                      <td>{v.version}</td>
-                      <td>{v.is_active ? "active" : v.status}</td>
-                      <td>{String(v.config?.model_type || "—")}</td>
-                      <td>{num(v.metrics?.lift)}</td>
-                      <td>{pct(v.metrics?.hit_rate, 1)}</td>
-                      <td>{v.created_at.slice(0, 19).replace("T", " ")}</td>
-                      <td>{v.is_active ? "当前版本" : <><button type="button" className="button ghost" onClick={() => void handleCompare(v.id)} disabled={!active}>比较</button> <button type="button" className="button ghost" disabled={rollingBackId !== null || String(v.validation?.status || "") !== "passed"} onClick={() => void handleRollback(v.id)}>{rollingBackId === v.id ? "回退中…" : "回退至此"}</button></>}</td>
-                    </tr>
-                  ))
+                {challengers.map((item) => (
+                  <tr key={`version-${item.id}`}>
+                    <td>{item.version}</td>
+                    <td>{item.status}</td>
+                    <td>{item.production_eligible ? "可晋升" : "不可晋升"}</td>
+                    <td>{num(item.metrics?.lift)}</td>
+                    <td>{num(item.metrics?.walk_forward_lift)}</td>
+                    <td>{item.blocked_reasons?.join("、") || "—"}</td>
+                  </tr>
+                ))}
+                {failed.map((item) => (
+                  <tr key={`run-${item.id}`}>
+                    <td>训练任务 #{item.id}</td>
+                    <td>{item.status}</td>
+                    <td>不可晋升</td>
+                    <td>{num(item.metrics?.lift)}</td>
+                    <td>{num(item.metrics?.walk_forward_lift)}</td>
+                    <td>{item.error || item.message || "—"}</td>
+                  </tr>
+                ))}
+                {challengers.length === 0 && failed.length === 0 && (
+                  <tr><td colSpan={6} className="empty">暂无 Challenger 或失败实验</td></tr>
                 )}
               </tbody>
             </table>
           </div>
+        </div>
+
+        <div className="card">
+          <h3>固定模型构成</h3>
+          <div className="table-scroll">
+            <table>
+              <thead><tr><th>组件</th><th>计划书规定模型</th><th>当前实现状态</th></tr></thead>
+              <tbody>
+                {Object.entries(workbench?.model.constitution ?? {}).map(([key, item]) => (
+                  <tr key={key}><td>{key}</td><td>{item.model}</td><td>{item.status}</td></tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <div className="card">
+          <h3>计划书验收矩阵</h3>
+          <div className="metrics-row" style={{ marginTop: 8 }}>
+            <div className="card metric-card">
+              <div className="sub">验收状态</div>
+              <div className="metric">{statusText(acceptance?.status || "")}</div>
+            </div>
+            <div className="card metric-card">
+              <div className="sub">通过</div>
+              <div className="metric">{acceptance?.counts?.passed ?? 0}</div>
+            </div>
+            <div className="card metric-card">
+              <div className="sub">部分</div>
+              <div className="metric">{acceptance?.counts?.partial ?? 0}</div>
+            </div>
+            <div className="card metric-card">
+              <div className="sub">失败</div>
+              <div className="metric">{acceptance?.counts?.failed ?? 0}</div>
+            </div>
+          </div>
+          <div className="table-scroll" style={{ marginTop: 12 }}>
+            <table>
+              <thead><tr><th>验收项</th><th>状态</th><th>计划书要求</th><th>当前证据</th></tr></thead>
+              <tbody>
+                {acceptanceChecks.map((raw) => (
+                  <tr key={String(raw.key)}>
+                    <td>{String(raw.name || raw.key || "—")}</td>
+                    <td>{statusText(String(raw.status || ""))}</td>
+                    <td>{String(raw.requirement || "—")}</td>
+                    <td>{evidenceText(raw.evidence)}</td>
+                  </tr>
+                ))}
+                {acceptanceChecks.length === 0 && (
+                  <tr><td colSpan={4} className="empty">暂无验收明细</td></tr>
+                )}
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <div className="card">
+          <h3>最近实验记录</h3>
+          <div className="table-scroll">
+            <table>
+              <thead><tr><th>任务</th><th>状态</th><th>阶段</th><th>进度</th><th>更新时间</th><th>消息</th></tr></thead>
+              <tbody>
+                {experiments.map((item) => (
+                  <tr key={item.id}>
+                    <td>#{item.id}</td>
+                    <td>{item.status}</td>
+                    <td>{item.phase || "—"}</td>
+                    <td>{Math.round(Number(item.progress || 0) * 100)}%</td>
+                    <td>{item.updated_at ? formatGmt8Time(item.updated_at) : "—"}</td>
+                    <td>{item.error || item.message || "—"}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          {experiments.length === 0 && <div className="empty">暂无训练或调优记录</div>}
         </div>
       </div>
     </section>

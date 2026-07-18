@@ -8,6 +8,7 @@ Thumbs.db
 
 # Git metadata from source subprojects when packaging ALIS as one repository
 **/.git/
+**/.git.local-backup/
 
 # Secrets and local environment
 .env
@@ -50,5 +51,10 @@ data/
 *.tar.gz
 
 # Generated crawler/debug files
-news/crawler/_*.txt
+news/
+news/crawler/_*
 news/crawler/probe_web_sources.py
+
+# Finder/conflict duplicate copies; canonical source files have no " 2" suffix.
+* 2.tsx
+* 2.json

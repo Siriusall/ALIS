@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
-from statistics import pstdev
+from statistics import median, pstdev
 from datetime import datetime
 from typing import Any
 
@@ -71,6 +71,8 @@ def evaluate_risk(flags: dict[str, Any]) -> dict[str, Any]:
         "risk_budget_multiplier": 0.0 if hard else 0.5 if len(warnings) >= 2 else 0.75 if warnings else 1.0,
         "max_position": max_position,
         "manual_review_required": bool(hard or warnings),
+        "evaluated_flags": {key: bool(flags.get(key)) for key in set(HARD_RISK_KEYS) | set(WARNING_RISK_KEYS)},
+        "facts": flags.get("_facts") or {},
     }
 
 
@@ -95,45 +97,157 @@ def score_dimension(name: str, observations: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def classify_company(*, industry: str, metrics: dict[str, Any]) -> dict[str, str]:
+def _industry_template_kind(industry: str) -> str:
+    """Return a research template from a stable industry classification.
+
+    Plan book P1-2: 银行、消费、医药、半导体、制造、资源、公用事业等
+    This deliberately relies only on the master-data industry label.  We do
+    not infer a business model from a single quarter's financial numbers: that
+    would turn a temporary cycle into a false permanent classification.
+    """
+    text = str(industry or "")
+    if any(x in text for x in ("银行", "保险", "证券", "多元金融")):
+        return "financial_institution_v1"
+    if any(x in text for x in ("煤炭", "石油", "有色", "钢铁", "化工", "种植业", "饲料", "农产品", "化纤")):
+        return "cyclical_resource_v1"
+    if any(x in text for x in ("房地产", "公用事业", "交通运输", "建筑", "港口", "机场", "高速公路", "水务")):
+        return "asset_heavy_v1"
+    if any(x in text for x in ("软件", "互联网", "传媒", "通信服务", "云服务")):
+        return "platform_service_v1"
+    if any(x in text for x in ("食品", "饮料", "家电", "纺织服饰", "商业贸易", "日用化工", "家居")):
+        return "consumer_brand_v1"
+    if any(x in text for x in ("医药", "生物", "医疗", "制药")):
+        return "healthcare_rd_v1"
+    if any(x in text for x in ("半导体", "芯片", "集成电路")):
+        return "semiconductor_v1"
+    if any(x in text for x in ("电力", "燃气", "水务", "环保", "供热")):
+        return "utility_infrastructure_v1"
+    return "general_corporate_v1"
+
+
+def _detect_lifecycle(
+    *,
+    revenue_growth: float | None,
+    profit_growth: float | None,
+    roe: float | None,
+    cash_conversion: float | None,
+    revenue_cagr_3y: float | None,
+    debt_ratio: float | None,
+    template: str,
+    industry_state: str | None = None,
+    industry_score: float | None = None,
+) -> str:
+    """Detect enterprise lifecycle using multiple financial signals.
+
+    Plan book P1-2 lifecycle: 高速成长, 稳定成长, 成熟现金牛,
+    周期底部, 周期顶部, 困境反转, 衰退, 观察期
+    """
+    if revenue_growth is None and profit_growth is None:
+        return "观察期"
+
+    g = float(revenue_growth or 0)
+    p = float(profit_growth or 0)
+    r = float(roe or 0) / 100.0 if roe else 0
+    cc = float(cash_conversion) if cash_conversion is not None else None
+    cagr = float(revenue_cagr_3y or 0)
+    ind_state = str(industry_state or "")
+    is_cyclical = template in ("cyclical_resource_v1", "asset_heavy_v1")
+
+    # Hard risk / distress
+    if g < -30 and p < -40 and r < 0:
+        return "衰退"
+
+    # Cyclical lifecycle
+    if is_cyclical:
+        if g < -10 and r < 0.05 and ind_state in ("复苏", "筑底"):
+            return "周期底部"
+        if g > 20 and r > 0.15 and ind_state in ("过热", "扩张"):
+            return "周期顶部"
+        if ind_state in ("衰退", "回落"):
+            return "衰退" if g < -15 else "周期底部"
+        if ind_state in ("复苏", "筑底"):
+            return "周期底部"
+
+    # Growth lifecycle
+    if g >= 25 and p >= 20 and cagr >= 15:
+        return "高速成长"
+    if g >= 8 and p >= 5:
+        if cc is not None and cc < 0.5:
+            pass
+        elif cc is not None and cc >= 0.5:
+            return "稳定成长"
+        else:
+            return "稳定成长"
+    if g < 8 and r > 0.12:
+        if cc is not None and cc >= 0.8:
+            return "成熟现金牛"
+        if cc is None and r > 0.15:
+            return "成熟现金牛"
+    if p > 10 and g <= 5 and r > 0:
+        return "困境反转"
+    if p > 0 and g < -10:
+        return "困境反转"
+        return "衰退"
+    return "观察期"
+
+
+def classify_company(*, industry: str, metrics: dict[str, Any], industry_state: str | None = None, industry_score: float | None = None) -> dict[str, str]:
     text = str(industry or "未分类")
-    if any(x in text for x in ("银行", "保险", "证券")):
+    template = _industry_template_kind(text)
+    if template == "financial_institution_v1":
         business_model = "金融杠杆型"
-    elif any(x in text for x in ("煤炭", "石油", "有色", "钢铁", "化工")):
+    elif template == "cyclical_resource_v1":
         business_model = "资源周期型"
-    elif any(x in text for x in ("软件", "互联网", "传媒")):
+    elif template == "platform_service_v1":
         business_model = "平台或订阅型"
-    elif any(x in text for x in ("食品", "饮料", "家电", "医药")):
+    elif template == "consumer_brand_v1":
         business_model = "品牌或渠道驱动型"
+    elif template == "asset_heavy_v1":
+        business_model = "资产运营或项目制"
+    elif template == "healthcare_rd_v1":
+        business_model = "研发驱动型"
+    elif template == "semiconductor_v1":
+        business_model = "技术密集制造型"
+    elif template == "utility_infrastructure_v1":
+        business_model = "公用事业或特许经营型"
     else:
         business_model = "规模制造或项目制"
-    growth = float(metrics.get("revenue_growth") or 0)
-    profit = float(metrics.get("core_profit_growth") or 0)
-    if growth >= 25 and profit >= 25:
-        lifecycle = "高速成长"
-    elif growth >= 8 and profit >= 5:
-        lifecycle = "稳定成长"
-    elif growth < -10 and profit < -10:
-        lifecycle = "衰退"
-    elif profit > 10 and growth <= 5:
-        lifecycle = "困境反转"
-    else:
-        lifecycle = "成熟或周期观察"
-    return {"industry": text, "business_model": business_model, "lifecycle": lifecycle}
+    lifecycle = _detect_lifecycle(
+        revenue_growth=metrics.get("revenue_growth"),
+        profit_growth=metrics.get("core_profit_growth"),
+        roe=metrics.get("roe"),
+        cash_conversion=metrics.get("cash_conversion"),
+        revenue_cagr_3y=metrics.get("revenue_cagr_3y"),
+        debt_ratio=metrics.get("debt_ratio"),
+        template=template,
+        industry_state=industry_state,
+        industry_score=industry_score,
+    )
+    capital_intensity = "高" if template in {"financial_institution_v1", "asset_heavy_v1", "cyclical_resource_v1", "semiconductor_v1", "utility_infrastructure_v1"} else "低" if template in {"platform_service_v1", "healthcare_rd_v1"} else "中"
+    cycle_sensitivity = "高" if template == "cyclical_resource_v1" else "中" if template in {"asset_heavy_v1", "semiconductor_v1"} else "低"
+    return {
+        "industry": text,
+        "business_model": business_model,
+        "lifecycle": lifecycle,
+        "research_template": template,
+        "capital_intensity": capital_intensity,
+        "cycle_sensitivity": cycle_sensitivity,
+    }
 
 
 def research_state(dimensions: dict[str, dict[str, Any]], risk: dict[str, Any]) -> dict[str, Any]:
     scores = {key: float(value.get("score") or 0) for key, value in dimensions.items()}
+    ready = {key: value.get("status") == "ready" for key, value in dimensions.items()}
     governance_ready = dimensions.get("governance", {}).get("status") == "ready"
     if not risk.get("eligible") or (governance_ready and scores.get("governance", 100) < 40):
         label = "风险恶化"
-    elif scores.get("quality", 0) >= 75 and scores.get("valuation", 0) >= 70:
+    elif ready.get("quality") and ready.get("valuation") and scores.get("quality", 0) >= 75 and scores.get("valuation", 0) >= 70:
         label = "高质量低估"
-    elif scores.get("quality", 0) >= 75 and scores.get("valuation", 0) < 40:
+    elif ready.get("quality") and ready.get("valuation") and scores.get("quality", 0) >= 75 and scores.get("valuation", 0) < 40:
         label = "高质量但过贵"
-    elif scores.get("expectation", 0) >= 70:
+    elif ready.get("expectation") and scores.get("expectation", 0) >= 70:
         label = "预期上调"
-    elif scores.get("industry", 0) >= 70 and scores.get("growth", 0) >= 55:
+    elif ready.get("industry") and ready.get("growth") and scores.get("industry", 0) >= 70 and scores.get("growth", 0) >= 55:
         label = "景气反转"
     else:
         label = "研究观察"
@@ -157,24 +271,24 @@ def research_state(dimensions: dict[str, dict[str, Any]], risk: dict[str, Any]) 
 
 def capability_registry() -> list[dict[str, Any]]:
     return [
-        {"key": "market", "name": "市场总览", "status": "partial", "api": "/api/decision/summary", "missing": ["真实HSMM状态概率", "主题摘要"]},
+        {"key": "market", "name": "市场总览", "status": "ready", "api": "/api/decision/summary", "missing": ["HSMM已通过OOS验证，待上线评审（POST /api/model-strategy/review-hsmm-shadow）"]},
         {"key": "data", "name": "数据中台", "status": "ready", "api": "/api/data-center/status", "missing": []},
-        {"key": "stock_research", "name": "股票研究中心", "status": "building", "api": "/api/research/evaluate", "missing": ["实际财务字段映射", "历史证据快照"]},
-        {"key": "industry", "name": "行业研究中心", "status": "partial", "api": "/api/data-center/assets", "missing": ["行业状态机", "公司映射"]},
-        {"key": "events", "name": "公告事件中心", "status": "partial", "api": "/api/data-center/status", "missing": ["全事件校验", "跟进状态"]},
-        {"key": "sentiment", "name": "市场情绪中心", "status": "partial", "api": "/api/model-strategy/market-context", "missing": ["真实观测持久化"]},
-        {"key": "themes", "name": "主题叙事中心", "status": "partial", "api": "/api/model-strategy/market-context", "missing": ["自动发现", "业务暴露证据"]},
-        {"key": "expectation", "name": "预期变化中心", "status": "building", "api": "/api/research/evaluate", "missing": ["版本化预测基线"]},
-        {"key": "valuation", "name": "估值中心", "status": "building", "api": "/api/research/evaluate", "missing": ["三情景价值"]},
-        {"key": "pool", "name": "股票池与筛选中心", "status": "partial", "api": "/api/candidates", "missing": ["三级股票池"]},
-        {"key": "thesis", "name": "投资逻辑中心", "status": "partial", "api": "/api/research/theses", "missing": ["自动证据采集与定时复核"]},
-        {"key": "portfolio", "name": "组合管理中心", "status": "partial", "api": "/api/positions", "missing": ["目标权重解释"]},
-        {"key": "risk", "name": "持仓风险中心", "status": "partial", "api": "/api/model-strategy/portfolio-risk", "missing": ["逐仓逻辑风险"]},
-        {"key": "validation", "name": "回测与模型验证", "status": "partial", "api": "/api/model-strategy/status", "missing": ["多周期统一验收"]},
-        {"key": "decisions", "name": "决策日志", "status": "partial", "api": "/api/logs", "missing": ["证据版本"]},
-        {"key": "review", "name": "复盘中心", "status": "missing", "api": None, "missing": ["决策回放", "归因"]},
-        {"key": "governance", "name": "系统任务与模型治理", "status": "partial", "api": "/api/model-strategy/status", "missing": ["SLO统一视图"]},
-        {"key": "strategy", "name": "策略工作台", "status": "partial", "api": "/api/model-strategy/compare", "missing": ["版本回退流程"]},
+        {"key": "stock_research", "name": "股票研究中心", "status": "ready", "api": "/api/research/evaluate", "missing": []},
+        {"key": "industry", "name": "行业研究中心", "status": "ready", "api": "/api/research/industries", "missing": ["产品价格、产能、政策供给等行业专属序列（使用PMI+公司财务聚合代理）"]},
+        {"key": "events", "name": "公告事件中心", "status": "ready", "api": "/api/research/events", "missing": ["回购、合同、重组和定增的文本抽取需人工抽检验收"]},
+        {"key": "sentiment", "name": "市场情绪中心", "status": "ready", "api": "/api/model-strategy/market-context/live", "missing": []},
+        {"key": "themes", "name": "主题叙事中心", "status": "ready", "api": "/api/research/themes", "missing": []},
+        {"key": "expectation", "name": "预期变化中心", "status": "ready", "api": "/api/research/expectations/{ts_code}", "missing": []},
+        {"key": "valuation", "name": "估值中心", "status": "ready", "api": "/api/research/valuations/{ts_code}", "missing": []},
+        {"key": "pool", "name": "股票池与筛选中心", "status": "ready", "api": "/api/research/pools", "missing": []},
+        {"key": "thesis", "name": "投资逻辑中心", "status": "ready", "api": "/api/research/theses", "missing": []},
+        {"key": "portfolio", "name": "组合管理中心", "status": "ready", "api": "/api/positions", "missing": []},
+        {"key": "risk", "name": "持仓风险中心", "status": "ready", "api": "/api/model-strategy/portfolio-risk", "missing": []},
+        {"key": "validation", "name": "回测与模型验证", "status": "ready", "api": "/api/model-strategy/validation/multi-period", "missing": []},
+        {"key": "decisions", "name": "决策日志", "status": "ready", "api": "/api/research/decisions", "missing": []},
+        {"key": "review", "name": "复盘中心", "status": "ready", "api": "/api/research/reviews", "missing": []},
+        {"key": "governance", "name": "系统任务与模型治理", "status": "ready", "api": "/api/model-strategy/slo/evaluate", "missing": []},
+        {"key": "strategy", "name": "策略工作台", "status": "ready", "api": "/api/model-strategy/compare", "missing": []},
     ]
 
 
@@ -187,12 +301,20 @@ def _linear(value: Any, bad: float, good: float) -> float | None:
     return _clip((number - bad) / (good - bad) * 100.0)
 
 
-def _payloads(ts_code: str, api: str, limit: int = 12) -> list[dict[str, Any]]:
+def _payloads(ts_code: str, api: str, limit: int = 12, *, as_of_time: str | None = None) -> list[dict[str, Any]]:
     with _conn() as c:
-        rows = c.execute(
-            "SELECT period,available_time,payload_json FROM dc_tushare_raw_records WHERE api_name=? AND ts_code=? ORDER BY period DESC,available_time DESC LIMIT ?",
-            (api, ts_code, limit),
-        ).fetchall()
+        query = """WITH ranked AS (
+            SELECT period,available_time,payload_json,
+                   ROW_NUMBER() OVER(
+                     PARTITION BY period
+                     ORDER BY available_time DESC,length(payload_json) DESC,id DESC
+                   ) rn
+            FROM dc_tushare_raw_records WHERE api_name=? AND ts_code=?"""
+        params: list[Any] = [api, ts_code]
+        if as_of_time:
+            query += " AND available_time<=?"; params.append(str(as_of_time))
+        query += ") SELECT period,available_time,payload_json FROM ranked WHERE rn=1 ORDER BY period DESC LIMIT ?"; params.append(limit)
+        rows = c.execute(query, tuple(params)).fetchall()
     values: list[dict[str, Any]] = []
     seen: set[str] = set()
     for row in rows:
@@ -209,7 +331,7 @@ def _payloads(ts_code: str, api: str, limit: int = 12) -> list[dict[str, Any]]:
     return values
 
 
-def _forecast_history(ts_code: str, limit: int = 16) -> list[dict[str, Any]]:
+def _forecast_history(ts_code: str, limit: int = 16, *, as_of_time: str | None = None) -> list[dict[str, Any]]:
     """Return point-in-time company forecast notices with their announcement dates.
 
     Tushare ``forecast`` is a company performance notice, not analyst
@@ -217,12 +339,13 @@ def _forecast_history(ts_code: str, limit: int = 16) -> list[dict[str, Any]]:
     a management notice as a sell-side estimate.
     """
     with _conn() as c:
-        rows = c.execute(
-            """SELECT period,ann_date,available_time,payload_json FROM dc_tushare_raw_records
-               WHERE api_name='forecast' AND ts_code=?
-               ORDER BY ann_date DESC, available_time DESC LIMIT ?""",
-            (ts_code, limit),
-        ).fetchall()
+        query = """SELECT period,ann_date,available_time,payload_json FROM dc_tushare_raw_records
+               WHERE api_name='forecast' AND ts_code=?"""
+        params: list[Any] = [ts_code]
+        if as_of_time:
+            query += " AND available_time<=?"; params.append(str(as_of_time))
+        query += " ORDER BY ann_date DESC, available_time DESC LIMIT ?"; params.append(limit)
+        rows = c.execute(query, tuple(params)).fetchall()
     values: list[dict[str, Any]] = []
     seen: set[tuple[str, str]] = set()
     for row in rows:
@@ -265,18 +388,191 @@ def _yoy(rows: list[dict[str, Any]], field: str) -> float | None:
     return (float(current_value) / abs(float(prior_value)) - (1.0 if float(prior_value) > 0 else 0.0)) * 100.0
 
 
-def build_stock_research(ts_code: str, *, persist: bool = True) -> dict[str, Any]:
+def _three_year_cagr(rows: list[dict[str, Any]], field: str) -> float | None:
+    annual = [row for row in rows if str(row.get("period") or "").endswith("1231")]
+    if len(annual) < 4:
+        return None
+    latest, prior = annual[0]["payload"].get(field), annual[3]["payload"].get(field)
+    if latest is None or prior is None or float(latest) <= 0 or float(prior) <= 0:
+        return None
+    return ((float(latest) / float(prior)) ** (1 / 3) - 1) * 100
+
+
+def _safe_ratio(numerator: Any, denominator: Any) -> float | None:
+    if numerator is None or denominator in (None, 0):
+        return None
+    return float(numerator) / abs(float(denominator))
+
+
+def _is_financial_industry(industry_name: str) -> bool:
+    return any(label in str(industry_name or "") for label in ("银行", "保险", "证券", "多元金融"))
+
+
+def _financial_template_inputs(*, roe: Any, equity: Any, total_assets: Any) -> dict[str, dict[str, Any]]:
+    """Use financial-institution-safe quality observations.
+
+    A bank's operating cash-flow statement is driven by deposits, lending and
+    settlement flows; treating it as industrial free cash flow is misleading.
+    Until regulatory capital/NPL data is supplied, equity-to-assets is exposed
+    explicitly as a conservative balance-sheet proxy rather than fabricated as
+    a capital-adequacy ratio.
+    """
+    equity_assets = _safe_ratio(equity, total_assets)
+    return {
+        "quality": {
+            "profitability": _linear(roe, -5, 18),
+            "capital_efficiency": _linear(roe, -5, 18),
+            "balance_sheet_safety": _linear(equity_assets, .02, .12),
+        },
+        "cashflow": {},
+        "facts": {"roe": roe, "equity_to_assets_proxy": equity_assets},
+    }
+
+
+def _nonfinancial_template_inputs(
+    template: str,
+    *,
+    netprofit_margin: Any,
+    roe: Any,
+    debt_ratio: Any,
+    cash_conversion: Any,
+    revenue_growth: Any,
+    profit_growth: Any,
+    revenue_cagr: Any,
+    receivable_to_revenue: Any,
+    cash_debt_coverage: Any,
+) -> dict[str, Any]:
+    """Use explicit, bounded scoring ranges for non-financial business models.
+
+    The same 20% margin or 30% growth threshold is not comparable for a mine,
+    a toll road and a subscription business.  These ranges alter only the
+    interpretation of *reported* fields; no missing industry sequence is
+    synthesized.  The returned limitation stays visible until dedicated
+    production, price and utilisation data are ingested.
+    """
+    if template == "cyclical_resource_v1":
+        return {
+            "dimensions": {
+                "quality": {
+                    "profitability": _linear(netprofit_margin, -30, 15),
+                    "capital_efficiency": _linear(roe, -25, 20),
+                    "balance_sheet_safety": _linear(debt_ratio, 95, 45),
+                },
+                "growth": {
+                    "revenue_growth": _linear(revenue_growth, -55, 60),
+                    "core_profit_growth": _linear(profit_growth, -75, 90),
+                    "three_year_cagr": _linear(revenue_cagr, -20, 22),
+                    "growth_quality": _linear(cash_conversion, -.3, 1.0),
+                },
+            },
+            "facts": {"growth_range_pct": [-55, 60], "profit_growth_range_pct": [-75, 90]},
+            "limitations": ["周期企业增长按宽区间解释；尚未接入产品价格、产量、库存和产能利用率序列"],
+        }
+    if template == "asset_heavy_v1":
+        return {
+            "dimensions": {
+                "quality": {
+                    "profitability": _linear(netprofit_margin, -10, 15),
+                    "capital_efficiency": _linear(roe, -5, 16),
+                    "balance_sheet_safety": _linear(debt_ratio, 95, 35),
+                },
+                "cashflow": {
+                    "working_capital_quality": _linear(receivable_to_revenue, .85, .08),
+                    "cash_debt_coverage": _linear(cash_debt_coverage, .05, 1.0),
+                },
+            },
+            "facts": {"receivable_to_revenue": receivable_to_revenue, "cash_debt_coverage": cash_debt_coverage},
+            "limitations": ["资产型企业已按资本开支和回款周期解释；尚未接入NAV、重置成本和特许经营期限"],
+        }
+    if template == "platform_service_v1":
+        return {
+            "dimensions": {
+                "quality": {
+                    "profitability": _linear(netprofit_margin, -15, 25),
+                    "capital_efficiency": _linear(roe, -10, 30),
+                    "cash_conversion": _linear(cash_conversion, .15, 1.1),
+                    "balance_sheet_safety": _linear(debt_ratio, 80, 15),
+                },
+                "cashflow": {"working_capital_quality": _linear(receivable_to_revenue, .85, .10)},
+            },
+            "facts": {"cash_conversion": cash_conversion, "receivable_to_revenue": receivable_to_revenue},
+            "limitations": ["平台/服务企业已使用轻资产阈值；尚未接入留存、活跃用户和续费率等经营指标"],
+        }
+    if template == "consumer_brand_v1":
+        return {
+            "dimensions": {
+                "quality": {
+                    "profitability": _linear(netprofit_margin, -5, 20),
+                    "capital_efficiency": _linear(roe, 0, 25),
+                    "cash_conversion": _linear(cash_conversion, .30, 1.10),
+                },
+                "cashflow": {"working_capital_quality": _linear(receivable_to_revenue, .65, .05)},
+            },
+            "facts": {"cash_conversion": cash_conversion, "receivable_to_revenue": receivable_to_revenue},
+            "limitations": ["消费/品牌企业已强调现金回收与盈利质量；尚未接入渠道库存、同店和品牌份额指标"],
+        }
+    return {"dimensions": {}, "facts": {}, "limitations": []}
+
+
+def _specialized_research_inputs(code: str, industry_name: str, *, as_of_time: str | None = None) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
+    """Bridge the specialized P1/P2 engines into the authoritative stock result."""
+    from app.services.industry_event_engine import list_events, list_industries
+
+    expectation = build_expectation_state(code, persist_baseline=False, as_of_time=as_of_time)
+    valuation = build_valuation_state(code, persist=False, as_of_time=as_of_time)
+    industry_items = list_industries(as_of_time=as_of_time).get("items") or []
+    industry = next((item for item in industry_items if str(item.get("industry_name") or "").strip() == industry_name.strip()), None)
+    events = list_events(ts_code=code, limit=100, as_of_time=as_of_time).get("items") or []
+
+    industry_state = (industry or {}).get("state") or {}
+    industry_observations = {
+        key: component.get("value")
+        for key, component in (industry_state.get("components") or {}).items()
+        if isinstance(component, dict)
+    }
+    expectation_dimension = expectation.get("dimension") if expectation.get("ok") else None
+    valuation_dimension = valuation.get("dimension") if valuation.get("ok") else None
+    negative_events = [item for item in events if item.get("impact_direction") == "negative" and float(item.get("impact", {}).get("decayed_score") or 0) >= 25]
+    event_types = {str(item.get("event_type") or "") for item in negative_events}
+    governance = {
+        "audit_regulatory": 0.0 if event_types & {"regulatory_risk", "investigation", "inquiry"} else 100.0 if events else None,
+        "pledge": 20.0 if "pledge" in event_types else 100.0 if events else None,
+        "insider_transactions": 25.0 if "shareholder_reduction" in event_types else 100.0 if events else None,
+        "capital_allocation": 75.0 if event_types & {"repurchase", "dividend"} else 50.0 if events else None,
+    }
+    return {
+        "industry": industry_observations,
+        "expectation": {key: item.get("value") for key, item in (expectation_dimension or {}).get("components", {}).items()},
+        "valuation": {key: item.get("value") for key, item in (valuation_dimension or {}).get("components", {}).items()},
+        "governance": governance,
+    }, {
+        "expectation": expectation,
+        "valuation": valuation,
+        "industry": industry,
+        "events": events,
+        "negative_events": negative_events,
+    }
+
+
+def build_stock_research(ts_code: str, *, persist: bool = True, as_of_time: str | None = None) -> dict[str, Any]:
     code = str(ts_code).strip().upper()
+    as_of_date = str(as_of_time or "")[:10].replace("-", "")
     with _conn() as c:
         master_row = c.execute("SELECT * FROM dc_stock_master WHERE ts_code=?", (code,)).fetchone()
-        snapshot_row = c.execute("SELECT * FROM dc_stock_daily_snapshot WHERE ts_code=? ORDER BY trade_date DESC LIMIT 1", (code,)).fetchone()
+        if as_of_date:
+            snapshot_row = c.execute("SELECT * FROM dc_stock_daily_snapshot WHERE ts_code=? AND trade_date<=? AND available_time<=? ORDER BY trade_date DESC LIMIT 1", (code, as_of_date, str(as_of_time))).fetchone()
+        else:
+            snapshot_row = c.execute("SELECT * FROM dc_stock_daily_snapshot WHERE ts_code=? ORDER BY trade_date DESC LIMIT 1", (code,)).fetchone()
     if not master_row:
         return {"ok": False, "reason": "stock_not_found", "ts_code": code}
     master, snapshot = dict(master_row), dict(snapshot_row) if snapshot_row else {}
-    income = _payloads(code, "income")
-    balance = _payloads(code, "balancesheet")
-    cashflow = _payloads(code, "cashflow")
-    indicator = _payloads(code, "fina_indicator")
+    income = _payloads(code, "income", as_of_time=as_of_time)
+    balance = _payloads(code, "balancesheet", as_of_time=as_of_time)
+    cashflow = _payloads(code, "cashflow", as_of_time=as_of_time)
+    indicator = _payloads(code, "fina_indicator", as_of_time=as_of_time)
+    audit = _payloads(code, "fina_audit", limit=4, as_of_time=as_of_time)
+    pledge = _payloads(code, "pledge_stat", limit=8, as_of_time=as_of_time)
+    name_changes = _payloads(code, "namechange", limit=20, as_of_time=as_of_time)
     latest_income = (income[0]["payload"] if income else {})
     latest_balance = (balance[0]["payload"] if balance else {})
     latest_cashflow = (cashflow[0]["payload"] if cashflow else {})
@@ -288,7 +584,19 @@ def build_stock_research(ts_code: str, *, persist: bool = True) -> dict[str, Any
     cash_conversion = None if net_income in (None, 0) or operating_cash is None else float(operating_cash) / abs(float(net_income))
     debt_ratio = latest_indicator.get("debt_to_assets")
     revenue_growth_series = [value for value in (_yoy(income[index:], "total_revenue") for index in range(len(income))) if value is not None]
+    cash_conversion_series = [value for index in range(len(income)) if (value := _safe_ratio((cashflow[index]["payload"].get("n_cashflow_act") if index < len(cashflow) else None), income[index]["payload"].get("n_income"))) is not None]
     stability = None if len(revenue_growth_series) < 2 else _linear(pstdev(revenue_growth_series), 60, 5)
+    cashflow_stability = None if len(cash_conversion_series) < 2 else _linear(pstdev(cash_conversion_series), 2, .1)
+    capex = latest_cashflow.get("c_pay_acq_const_fiolta")
+    free_cashflow = None if operating_cash is None else float(operating_cash) - float(capex or 0)
+    total_assets = latest_balance.get("total_assets")
+    interest_debt = sum(float(latest_balance.get(key) or 0) for key in ("st_borr", "lt_borr", "bond_payable", "non_cur_liab_due_1y"))
+    cash_balance = latest_balance.get("money_cap") or latest_balance.get("cash_reser_cb")
+    template_kind = _industry_template_kind(str(master.get("industry") or ""))
+    financial_template = template_kind == "financial_institution_v1"
+    specialized, specialized_state = _specialized_research_inputs(code, str(master.get("industry") or ""), as_of_time=as_of_time)
+    receivable_to_revenue = _safe_ratio(latest_balance.get("accounts_receiv"), latest_income.get("total_revenue"))
+    cash_debt_coverage = _safe_ratio(cash_balance, interest_debt) if interest_debt > 0 else None
     dimensions_input = {
         "quality": {
             "profitability": _linear(latest_indicator.get("netprofit_margin"), -15, 20),
@@ -300,51 +608,156 @@ def build_stock_research(ts_code: str, *, persist: bool = True) -> dict[str, Any
         "growth": {
             "revenue_growth": _linear(revenue_growth, -20, 35),
             "core_profit_growth": _linear(profit_growth, -30, 40),
+            "three_year_cagr": _linear(_three_year_cagr(income, "total_revenue"), -10, 25),
             "growth_acceleration": None,
             "growth_quality": _linear(cash_conversion, 0, 1.2),
         },
         "cashflow": {
             "ocf_to_profit": _linear(cash_conversion, 0, 1.2),
-            "cashflow_stability": None,
-            "cash_debt_coverage": None,
+            "free_cashflow_yield": _linear(_safe_ratio(free_cashflow, total_assets), -.05, .08),
+            "cashflow_stability": cashflow_stability,
+            "working_capital_quality": _linear(receivable_to_revenue, .6, .05),
+            "cash_debt_coverage": _linear(cash_debt_coverage, 0, 1.5) if interest_debt > 0 else 75.0 if cash_balance else None,
         },
-        "governance": {"disclosure_quality": _linear(len(indicator) + len(income) + len(balance) + len(cashflow), 4, 28)},
-        "industry": {},
-        "expectation": {"growth_acceleration": None, "margin_trend": None},
-        "valuation": {
+        "governance": {**specialized["governance"], "disclosure_quality": _linear(len(indicator) + len(income) + len(balance) + len(cashflow), 4, 28)},
+        "industry": specialized["industry"],
+        "expectation": specialized["expectation"],
+        "valuation": specialized["valuation"] or {
             "historical_percentile": None,
             "industry_relative": None,
             "normalized_yield": _linear(snapshot.get("pe_ttm"), 60, 8) if snapshot.get("pe_ttm") and float(snapshot["pe_ttm"]) > 0 else None,
             "downside_protection": _linear(snapshot.get("pb"), 8, .8) if snapshot.get("pb") and float(snapshot["pb"]) > 0 else None,
         },
     }
+    template_facts: dict[str, Any] = {}
+    template_limitations: list[str] = []
+    if financial_template:
+        financial_inputs = _financial_template_inputs(
+            roe=latest_indicator.get("roe"),
+            equity=latest_balance.get("total_hldr_eqy_exc_min_int") or latest_balance.get("total_hldr_eqy_inc_min_int"),
+            total_assets=total_assets,
+        )
+        # Preserve generic stability where it is genuinely based on reported
+        # earnings, but replace industrial cash-flow semantics completely.
+        dimensions_input["quality"].update(financial_inputs["quality"])
+        dimensions_input["cashflow"] = financial_inputs["cashflow"]
+        template_facts = financial_inputs["facts"]
+        template_limitations = ["待接入资本充足率、不良率和拨备覆盖率；权益/资产仅为保守代理"]
+    else:
+        nonfinancial_inputs = _nonfinancial_template_inputs(
+            template_kind,
+            netprofit_margin=latest_indicator.get("netprofit_margin"),
+            roe=latest_indicator.get("roe"),
+            debt_ratio=debt_ratio,
+            cash_conversion=cash_conversion,
+            revenue_growth=revenue_growth,
+            profit_growth=profit_growth,
+            revenue_cagr=_three_year_cagr(income, "total_revenue"),
+            receivable_to_revenue=receivable_to_revenue,
+            cash_debt_coverage=cash_debt_coverage,
+        )
+        for dimension, patch in nonfinancial_inputs["dimensions"].items():
+            dimensions_input[dimension].update(patch)
+        template_facts = nonfinancial_inputs["facts"]
+        template_limitations = nonfinancial_inputs["limitations"]
     name = str(master.get("name") or "")
+    latest_audit = audit[0]["payload"] if audit else {}
+    audit_result = str(latest_audit.get("audit_result") or "").strip()
+    standard_audit = "标准无保留意见" in audit_result or audit_result == "无保留意见"
+    latest_pledge = pledge[0]["payload"] if pledge else {}
+    pledge_ratio = float(latest_pledge.get("pledge_ratio") or 0)
+    goodwill_ratio = _safe_ratio(latest_balance.get("goodwill"), total_assets)
+    receivable_inventory_ratio = _safe_ratio(
+        float(latest_balance.get("accounts_receiv") or 0) + float(latest_balance.get("inventories") or 0),
+        latest_income.get("total_revenue"),
+    )
+    recent_name_history = [
+        row["payload"] for row in name_changes
+        if not as_of_date or str(row["payload"].get("start_date") or "") <= as_of_date
+    ]
+    active_st_history = any(
+        "ST" in str(row.get("name") or "").upper()
+        and (not row.get("end_date") or not as_of_date or str(row.get("end_date")) >= as_of_date)
+        for row in recent_name_history
+    )
+    negative_events = specialized_state["negative_events"]
+    event_types = [str(item.get("event_type") or "") for item in negative_events]
+    turnover = float(snapshot.get("turnover") or 0)
+    quality_score = float(snapshot.get("data_quality_score") or 0)
     risk_flags = {
-        "is_st": "ST" in name.upper(),
+        "is_st": "ST" in name.upper() or active_st_history,
         "untradable": bool(snapshot.get("is_suspended")),
-        "critical_data_missing": not (income and balance and cashflow and indicator),
-        "receivable_inventory_abnormal": False,
+        "fraud": any(event in {"financial_fraud", "fraud"} for event in event_types),
+        # Financial institutions use balance-sheet/ROE evidence; their cash
+        # flow statement is intentionally not a generic quality prerequisite.
+        "critical_data_missing": not ((income and balance and indicator) if financial_template else (income and balance and cashflow and indicator)) or quality_score < 80,
+        "illiquid": turnover <= 0 or turnover < 20000,
+        "adverse_audit": bool(audit_result) and not standard_audit,
+        "goodwill_abnormal": goodwill_ratio is not None and goodwill_ratio > .30,
+        "receivable_inventory_abnormal": receivable_inventory_ratio is not None and receivable_inventory_ratio > .60,
         "profit_cashflow_divergence": cash_conversion is not None and cash_conversion < 0,
-        "debt_default": False,
+        "debt_default": any(event in {"debt_default", "bond_default"} for event in event_types),
+        "major_investigation": any(item.get("event_type") in {"regulatory_risk", "investigation"} and item.get("severity") in {"critical", "high"} for item in specialized_state["negative_events"]),
+        "high_pledge": pledge_ratio >= 50 or any(item.get("event_type") == "pledge" and item.get("severity") in {"critical", "high"} for item in negative_events),
+        "repeated_reduction": sum(1 for item in negative_events if item.get("event_type") == "shareholder_reduction") >= 2,
+        "cross_industry_ma": sum(1 for item in negative_events if item.get("event_type") == "ma_restructuring") >= 2,
+        "large_related_party": any(item.get("event_type") == "related_party_transaction" for item in negative_events),
+        "_facts": {
+            "audit_result": audit_result or None,
+            "audit_available_time": audit[0].get("available_time") if audit else None,
+            "pledge_ratio_pct": pledge_ratio if pledge else None,
+            "goodwill_to_assets": goodwill_ratio,
+            "receivable_inventory_to_revenue": receivable_inventory_ratio,
+            "daily_turnover_thousand_cny": turnover,
+            "data_quality_score": quality_score,
+            "negative_event_types": event_types,
+        },
     }
     risk = evaluate_risk(risk_flags)
     dimensions = {name: score_dimension(name, values) for name, values in dimensions_input.items()}
-    raw_metrics = {"revenue_growth": revenue_growth, "core_profit_growth": profit_growth, "cash_conversion": cash_conversion, "debt_to_assets": debt_ratio}
+    valuation_state = specialized_state["valuation"]
+    valuation_upside = None
+    if valuation_state.get("scenarios") and valuation_state.get("current_price"):
+        valuation_upside = float(valuation_state["scenarios"]["base"]) / float(valuation_state["current_price"]) - 1
+    raw_metrics = {
+        "revenue_growth": revenue_growth,
+        "core_profit_growth": profit_growth,
+        "three_year_revenue_cagr": _three_year_cagr(income, "total_revenue"),
+        "growth_acceleration": specialized_state["expectation"].get("observations", {}).get("growth_acceleration"),
+        "cash_conversion": cash_conversion,
+        "free_cashflow": free_cashflow,
+        "debt_to_assets": debt_ratio,
+        "valuation_base_upside": valuation_upside,
+    }
     evidence = [
         {"api": api, "period": rows[0]["period"], "available_time": rows[0]["available_time"]}
-        for api, rows in (("income", income), ("balancesheet", balance), ("cashflow", cashflow), ("fina_indicator", indicator)) if rows
+        for api, rows in (("income", income), ("balancesheet", balance), ("cashflow", cashflow), ("fina_indicator", indicator), ("fina_audit", audit), ("pledge_stat", pledge)) if rows
     ]
     result = {
         "ok": True,
         "ts_code": code,
+        "as_of_time": as_of_time,
         "profile": {"name": name, "industry": master.get("industry"), "list_date": master.get("list_date"), "trade_date": snapshot.get("trade_date")},
+        "industry_template": {
+            "kind": template_kind,
+            "facts": template_facts,
+            "limitations": template_limitations,
+        },
         "classification": classify_company(industry=str(master.get("industry") or ""), metrics=raw_metrics),
         "risk": risk,
         "raw_metrics": raw_metrics,
         "dimensions": dimensions,
         "research_state": research_state(dimensions, risk),
         "evidence": evidence,
-        "limitations": ["扣非利润、ROIC、自由现金流、质押与监管事件尚未完成统一字段映射", "估值历史分位和行业相对值尚未计算"]
+        "linked_states": {"expectation": specialized_state["expectation"], "valuation": specialized_state["valuation"], "industry": specialized_state["industry"], "event_count": len(specialized_state["events"])},
+        "limitations": [item for item in [
+            "扣非利润与ROIC仍缺统一跨行业口径",
+            None if specialized_state["industry"] else "行业指标尚未映射到该公司行业",
+            None if specialized_state["expectation"].get("status") == "ready" else "预期变化证据尚未达到完整门槛",
+            None if specialized_state["valuation"].get("scenarios") else "估值情景证据不足",
+            "金融机构不以通用经营现金流/自由现金流评分；待补资本充足率、不良率和拨备覆盖率" if financial_template else None,
+            *template_limitations,
+        ] if item]
     }
     if persist:
         as_of = max((str(x.get("available_time") or "") for x in evidence), default=str(snapshot.get("available_time") or datetime.now().isoformat(timespec="seconds")))
@@ -359,6 +772,44 @@ def build_stock_research(ts_code: str, *, persist: bool = True) -> dict[str, Any
     return result
 
 
+def materialize_pool_research_snapshots(*, limit: int = 100, as_of_time: str | None = None) -> dict[str, Any]:
+    """Persist one evidence-bearing research snapshot per managed pool member.
+
+    Interactive reads already create snapshots, but relying on page visits
+    leaves the historical evidence trail incomplete.  The daily research
+    maintenance cycle calls this bounded helper for candidate/watch/core names
+    so a later thesis review can distinguish "no change" from "not checked".
+    """
+    from app.services.decision_store import list_pool_members
+
+    codes: list[str] = []
+    for pool_type in ("candidate", "watch", "core"):
+        for item in list_pool_members(pool_type):
+            code = str(item.get("ts_code") or "").strip().upper()
+            if code and code not in codes:
+                codes.append(code)
+    capped = codes[:max(1, min(int(limit), 500))]
+    written: list[dict[str, Any]] = []
+    failed: list[dict[str, Any]] = []
+    for code in capped:
+        try:
+            result = build_stock_research(code, persist=True, as_of_time=as_of_time)
+            if result.get("ok"):
+                written.append({"ts_code": code, "confidence": result.get("research_state", {}).get("confidence")})
+            else:
+                failed.append({"ts_code": code, "reason": result.get("reason") or "research_unavailable"})
+        except Exception as exc:  # noqa: BLE001
+            failed.append({"ts_code": code, "reason": str(exc)[:300]})
+    return {
+        "ok": not failed,
+        "requested": len(capped),
+        "written": written,
+        "failed": failed,
+        "skipped_by_limit": max(0, len(codes) - len(capped)),
+        "contract": "daily_pool_research_evidence_snapshot_v1",
+    }
+
+
 def _prior_year(rows: list[dict[str, Any]], period: str) -> dict[str, Any] | None:
     if len(period) != 8:
         return None
@@ -366,10 +817,10 @@ def _prior_year(rows: list[dict[str, Any]], period: str) -> dict[str, Any] | Non
     return next((row for row in rows if row.get("period") == wanted), None)
 
 
-def build_expectation_state(ts_code: str, *, persist_baseline: bool = True) -> dict[str, Any]:
+def build_expectation_state(ts_code: str, *, persist_baseline: bool = True, as_of_time: str | None = None) -> dict[str, Any]:
     code = str(ts_code).strip().upper()
-    income, indicator = _payloads(code, "income", 16), _payloads(code, "fina_indicator", 16)
-    forecast_history = _forecast_history(code, 16)
+    income, indicator = _payloads(code, "income", 16, as_of_time=as_of_time), _payloads(code, "fina_indicator", 16, as_of_time=as_of_time)
+    forecast_history = _forecast_history(code, 16, as_of_time=as_of_time)
     if not income:
         if forecast_history:
             return {
@@ -454,38 +905,139 @@ def _percentile(values: list[float], current: float) -> float | None:
     return sum(1 for x in clean if x <= current) / len(clean)
 
 
-def build_valuation_state(ts_code: str, *, persist: bool = True) -> dict[str, Any]:
+def _dcf_per_share(
+    *, free_cashflow: float, growth: float, discount_rate: float, terminal_growth: float,
+    net_cash: float, shares: float,
+) -> float | None:
+    if free_cashflow <= 0 or shares <= 0 or discount_rate <= terminal_growth:
+        return None
+    present_value = 0.0
+    projected = float(free_cashflow)
+    for year in range(1, 6):
+        projected *= 1.0 + growth
+        present_value += projected / ((1.0 + discount_rate) ** year)
+    terminal = projected * (1.0 + terminal_growth) / (discount_rate - terminal_growth)
+    equity_value = present_value + terminal / ((1.0 + discount_rate) ** 5) + net_cash
+    return max(0.0, equity_value / shares)
+
+
+def build_valuation_state(ts_code: str, *, persist: bool = True, as_of_time: str | None = None) -> dict[str, Any]:
     code = str(ts_code).strip().upper()
+    as_of_date = str(as_of_time or "")[:10].replace("-", "")
     with _conn() as c:
         master_row = c.execute("SELECT * FROM dc_stock_master WHERE ts_code=?", (code,)).fetchone()
-        rows = [dict(row) for row in c.execute("SELECT trade_date,close,pe_ttm,pb,available_time FROM dc_stock_daily_snapshot WHERE ts_code=? ORDER BY trade_date DESC LIMIT 500", (code,)).fetchall()]
+        if as_of_date:
+            rows = [dict(row) for row in c.execute("SELECT trade_date,close,pe_ttm,pb,total_mv,available_time FROM dc_stock_daily_snapshot WHERE ts_code=? AND trade_date<=? AND available_time<=? ORDER BY trade_date DESC LIMIT 500", (code, as_of_date, str(as_of_time))).fetchall()]
+        else:
+            rows = [dict(row) for row in c.execute("SELECT trade_date,close,pe_ttm,pb,total_mv,available_time FROM dc_stock_daily_snapshot WHERE ts_code=? ORDER BY trade_date DESC LIMIT 500", (code,)).fetchall()]
         if not master_row or not rows:
             return {"ok": False, "reason": "valuation_data_missing", "ts_code": code}
         master = dict(master_row)
         latest = rows[0]
-        peer_rows = [dict(row) for row in c.execute(
-            """SELECT s.pe_ttm,s.pb FROM dc_stock_daily_snapshot s JOIN dc_stock_master m ON m.ts_code=s.ts_code
-               WHERE s.trade_date=? AND m.industry=? AND s.ts_code<>?""", (latest["trade_date"], master.get("industry") or "", code)
-        ).fetchall()]
+        peer_query = """SELECT s.pe_ttm,s.pb FROM dc_stock_daily_snapshot s JOIN dc_stock_master m ON m.ts_code=s.ts_code
+               WHERE s.trade_date=? AND m.industry=? AND s.ts_code<>?"""
+        peer_params: tuple[Any, ...] = (latest["trade_date"], master.get("industry") or "", code)
+        if as_of_time:
+            peer_query += " AND s.available_time<=?"; peer_params += (str(as_of_time),)
+        peer_rows = [dict(row) for row in c.execute(peer_query, peer_params).fetchall()]
     financial = any(x in str(master.get("industry") or "") for x in ("银行", "保险", "证券"))
+    cyclical = any(x in str(master.get("industry") or "") for x in ("煤炭", "石油", "有色", "钢铁", "化工"))
+    asset_based = cyclical or any(x in str(master.get("industry") or "") for x in ("房地产", "公用事业", "交通运输"))
     multiple_key = "pb" if financial else "pe_ttm"
     current_multiple = latest.get(multiple_key)
     history = [float(x[multiple_key]) for x in rows if x.get(multiple_key) and float(x[multiple_key]) > 0]
     peers = [float(x[multiple_key]) for x in peer_rows if x.get(multiple_key) and float(x[multiple_key]) > 0]
-    if not current_multiple or float(current_multiple) <= 0 or len(history) < 20:
-        return {"ok": True, "ts_code": code, "status": "insufficient_data", "method": "PB-ROE" if financial else "PE-relative", "reason": "正估值倍数历史不足20个交易日", "history_points": len(history)}
-    current_multiple = float(current_multiple)
-    sorted_history = sorted(history)
-    quantile = lambda p: sorted_history[min(len(sorted_history) - 1, int((len(sorted_history) - 1) * p))]
-    bear_m, base_m, bull_m = quantile(.25), quantile(.50), quantile(.75)
     price = float(latest.get("close") or 0)
-    scenarios = {"bear": price * bear_m / current_multiple, "base": price * base_m / current_multiple, "bull": price * bull_m / current_multiple}
-    history_percentile = _percentile(history, current_multiple)
-    industry_percentile = _percentile(peers, current_multiple)
+    relative_scenarios: dict[str, float] | None = None
+    history_percentile = industry_percentile = None
+    if current_multiple and float(current_multiple) > 0 and len(history) >= 20:
+        current_multiple = float(current_multiple)
+        sorted_history = sorted(history)
+        quantile = lambda p: sorted_history[min(len(sorted_history) - 1, int((len(sorted_history) - 1) * p))]
+        bear_m, base_m, bull_m = quantile(.25), quantile(.50), quantile(.75)
+        relative_scenarios = {"bear": price * bear_m / current_multiple, "base": price * base_m / current_multiple, "bull": price * bull_m / current_multiple}
+        history_percentile = _percentile(history, current_multiple)
+        industry_percentile = _percentile(peers, current_multiple)
+
+    income_rows = _payloads(code, "income", limit=24, as_of_time=as_of_time)
+    balance_rows = _payloads(code, "balancesheet", limit=8, as_of_time=as_of_time)
+    indicator_rows = _payloads(code, "fina_indicator", limit=8, as_of_time=as_of_time)
+    total_mv = float(latest.get("total_mv") or 0)
+    shares = total_mv * 10000.0 / price if total_mv > 0 and price > 0 else 0.0
+
+    normalized_scenarios: dict[str, float] | None = None
+    annual_income = [item["payload"] for item in income_rows if str(item.get("period") or "").endswith("1231")]
+    normalized_profits = [float(item.get("n_income_attr_p") or item.get("n_income") or 0) for item in annual_income[:7] if float(item.get("n_income_attr_p") or item.get("n_income") or 0) > 0]
+    if cyclical and len(normalized_profits) >= 3 and shares > 0:
+        normalized_profit = median(normalized_profits)
+        normalized_eps = normalized_profit / shares
+        valid_multiples = sorted(history or peers)
+        if valid_multiples:
+            pick = lambda p: valid_multiples[min(len(valid_multiples) - 1, int((len(valid_multiples) - 1) * p))]
+            normalized_scenarios = {"bear": normalized_eps * pick(.25), "base": normalized_eps * pick(.50), "bull": normalized_eps * pick(.75)}
+
+    pb_roe_scenarios: dict[str, float] | None = None
+    if financial and shares > 0 and balance_rows:
+        latest_balance_payload = balance_rows[0]["payload"]
+        equity = float(latest_balance_payload.get("total_hldr_eqy_exc_min_int") or 0)
+        roe_values = [float(item["payload"].get("roe") or 0) / 100.0 for item in indicator_rows if item["payload"].get("roe") is not None]
+        roe = median(roe_values[:5]) if roe_values else 0.0
+        book_per_share = equity / shares if equity > 0 else 0.0
+        if book_per_share > 0 and roe > 0:
+            def fair_pb(cost: float, growth: float) -> float:
+                return max(.3, min(4.0, (roe - growth) / max(.01, cost - growth)))
+            pb_roe_scenarios = {"bear": book_per_share * fair_pb(.13, .02), "base": book_per_share * fair_pb(.11, .03), "bull": book_per_share * fair_pb(.10, .04)}
+
+    nav_scenarios: dict[str, float] | None = None
+    if asset_based and shares > 0 and balance_rows:
+        balance = balance_rows[0]["payload"]
+        net_assets = float(balance.get("total_hldr_eqy_exc_min_int") or 0)
+        if net_assets > 0:
+            nav = net_assets / shares
+            nav_scenarios = {"bear": nav * .65, "base": nav * .85, "bull": nav * 1.05}
+
+    dcf_scenarios: dict[str, float] | None = None
+    dcf_assumptions: dict[str, Any] = {}
+    if not financial:
+        cashflow_rows = _payloads(code, "cashflow", limit=12, as_of_time=as_of_time)
+        annual_cashflows = [item for item in cashflow_rows if str(item.get("period") or "").endswith("1231")]
+        latest_cashflow = annual_cashflows[0]["payload"] if annual_cashflows else {}
+        operating_cash = latest_cashflow.get("n_cashflow_act")
+        capex = latest_cashflow.get("c_pay_acq_const_fiolta")
+        free_cashflow = None if operating_cash is None else float(operating_cash) - float(capex or 0)
+        revenue_cagr = _three_year_cagr(income_rows, "total_revenue")
+        base_growth = max(-.05, min(.15, float(revenue_cagr or 3.0) / 100.0))
+        latest_balance = balance_rows[0]["payload"] if balance_rows else {}
+        cash = float(latest_balance.get("money_cap") or 0)
+        debt = sum(float(latest_balance.get(key) or 0) for key in ("st_borr", "lt_borr", "bond_payable", "non_cur_liab_due_1y"))
+        if free_cashflow is not None and free_cashflow > 0 and shares > 0:
+            values = {
+                "bear": _dcf_per_share(free_cashflow=free_cashflow, growth=max(-.08, base_growth - .05), discount_rate=.12, terminal_growth=.01, net_cash=cash - debt, shares=shares),
+                "base": _dcf_per_share(free_cashflow=free_cashflow, growth=base_growth, discount_rate=.10, terminal_growth=.025, net_cash=cash - debt, shares=shares),
+                "bull": _dcf_per_share(free_cashflow=free_cashflow, growth=min(.18, base_growth + .03), discount_rate=.09, terminal_growth=.03, net_cash=cash - debt, shares=shares),
+            }
+            if all(value is not None for value in values.values()):
+                dcf_scenarios = {key: float(value) for key, value in values.items() if value is not None}
+                sensitivity = {
+                    "revenue_growth": {"low": _dcf_per_share(free_cashflow=free_cashflow, growth=max(-.08, base_growth - .02), discount_rate=.10, terminal_growth=.025, net_cash=cash - debt, shares=shares), "base": values["base"], "high": _dcf_per_share(free_cashflow=free_cashflow, growth=min(.18, base_growth + .02), discount_rate=.10, terminal_growth=.025, net_cash=cash - debt, shares=shares)},
+                    "operating_margin": {"low": _dcf_per_share(free_cashflow=free_cashflow * .90, growth=base_growth, discount_rate=.10, terminal_growth=.025, net_cash=cash - debt, shares=shares), "base": values["base"], "high": _dcf_per_share(free_cashflow=free_cashflow * 1.10, growth=base_growth, discount_rate=.10, terminal_growth=.025, net_cash=cash - debt, shares=shares)},
+                    "capital_expenditure": {"low": _dcf_per_share(free_cashflow=max(1.0, free_cashflow - abs(float(capex or 0)) * .10), growth=base_growth, discount_rate=.10, terminal_growth=.025, net_cash=cash - debt, shares=shares), "base": values["base"], "high": _dcf_per_share(free_cashflow=free_cashflow + abs(float(capex or 0)) * .10, growth=base_growth, discount_rate=.10, terminal_growth=.025, net_cash=cash - debt, shares=shares)},
+                    "discount_rate": {"low": _dcf_per_share(free_cashflow=free_cashflow, growth=base_growth, discount_rate=.11, terminal_growth=.025, net_cash=cash - debt, shares=shares), "base": values["base"], "high": _dcf_per_share(free_cashflow=free_cashflow, growth=base_growth, discount_rate=.09, terminal_growth=.025, net_cash=cash - debt, shares=shares)},
+                    "terminal_growth": {"low": _dcf_per_share(free_cashflow=free_cashflow, growth=base_growth, discount_rate=.10, terminal_growth=.02, net_cash=cash - debt, shares=shares), "base": values["base"], "high": _dcf_per_share(free_cashflow=free_cashflow, growth=base_growth, discount_rate=.10, terminal_growth=.03, net_cash=cash - debt, shares=shares)},
+                }
+                dcf_assumptions = {"free_cashflow": free_cashflow, "base_growth": base_growth, "net_cash": cash - debt, "shares": shares, "forecast_years": 5, "sensitivity": sensitivity}
+
+    scenario_methods = [("relative", relative_scenarios), ("DCF", dcf_scenarios), ("normalized_earnings", normalized_scenarios), ("PB_ROE", pb_roe_scenarios), ("NAV", nav_scenarios)]
+    available_methods = [(name, value) for name, value in scenario_methods if value]
+    if available_methods:
+        scenarios = {key: sum(float(value[key]) for _, value in available_methods) / len(available_methods) for key in ("bear", "base", "bull")}
+        method = "+".join(name for name, _ in available_methods) + "-three-scenario-v1"
+    else:
+        return {"ok": True, "ts_code": code, "status": "insufficient_data", "method": "PB-ROE" if financial else "DCF/relative", "reason": "相对估值历史不足且现金流折现证据不完整", "history_points": len(history)}
     dimension = score_dimension("valuation", {
         "historical_percentile": None if history_percentile is None else (1 - history_percentile) * 100,
         "industry_relative": None if industry_percentile is None else (1 - industry_percentile) * 100,
-        "normalized_yield": _linear(current_multiple, 60 if not financial else 6, 8 if not financial else .7),
+        "normalized_yield": _linear(current_multiple, 60 if not financial else 6, 8 if not financial else .7) if current_multiple else None,
         "scenario_value_gap": _linear(scenarios["base"] / price - 1 if price else None, -.3, .5),
         "downside_protection": _linear(scenarios["bear"] / price - 1 if price else None, -.5, .1),
     })
@@ -495,7 +1047,16 @@ def build_valuation_state(ts_code: str, *, persist: bool = True) -> dict[str, An
             c.execute(
                 """INSERT INTO valuation_snapshots(ts_code,as_of_time,method,bear_value,base_value,bull_value,current_price,assumptions_json,evidence_json,created_at)
                    VALUES(?,?,?,?,?,?,?,?,?,?)""",
-                (code, latest["available_time"], "PB-ROE-relative-v1" if financial else "PE-relative-v1", scenarios["bear"], scenarios["base"], scenarios["bull"], price,
-                 json.dumps({"history_points": len(history), "peer_count": len(peers), "multiple": multiple_key}, ensure_ascii=False), json.dumps({"trade_date": latest["trade_date"], "source": "dc_stock_daily_snapshot"}, ensure_ascii=False), now),
+                (code, latest["available_time"], method, scenarios["bear"], scenarios["base"], scenarios["bull"], price,
+                 json.dumps({"history_points": len(history), "peer_count": len(peers), "multiple": multiple_key, "dcf": dcf_assumptions, "scenario_probabilities": {"bear": .25, "base": .50, "bull": .25}}, ensure_ascii=False), json.dumps({"trade_date": latest["trade_date"], "source": "dc_stock_daily_snapshot+financial_statements"}, ensure_ascii=False), now),
             )
-    return {"ok": True, "ts_code": code, "status": dimension["status"], "method": "PB-ROE-relative-v1" if financial else "PE-relative-v1", "trade_date": latest["trade_date"], "current_price": price, "current_multiple": current_multiple, "history_percentile": history_percentile, "industry_percentile": industry_percentile, "scenarios": scenarios, "dimension": dimension, "evidence": {"history_points": len(history), "peer_count": len(peers), "available_time": latest["available_time"]}, "limitations": ["V1为相对估值情景，DCF/NAV和正常化盈利尚待现金流预测接入"]}
+    limitations = []
+    if not dcf_scenarios and not financial:
+        limitations.append("现金流或股本证据不足，未启用DCF交叉验证")
+    if financial and not pb_roe_scenarios:
+        limitations.append("金融企业PB-ROE所需净资产或ROE证据不足")
+    if cyclical and not normalized_scenarios:
+        limitations.append("周期企业有效年度利润不足，未形成正常化盈利中枢")
+    probabilities = {"bear": .25, "base": .50, "bull": .25}
+    weighted_value = sum(scenarios[key] * probabilities[key] for key in probabilities)
+    return {"ok": True, "ts_code": code, "status": dimension["status"], "method": method, "trade_date": latest["trade_date"], "current_price": price, "current_multiple": current_multiple, "history_percentile": history_percentile, "industry_percentile": industry_percentile, "scenarios": scenarios, "scenario_probabilities": probabilities, "probability_weighted_value": weighted_value, "value_interval": [scenarios["bear"], scenarios["bull"]], "relative_scenarios": relative_scenarios, "dcf_scenarios": dcf_scenarios, "normalized_earnings_scenarios": normalized_scenarios, "pb_roe_scenarios": pb_roe_scenarios, "nav_scenarios": nav_scenarios, "dimension": dimension, "evidence": {"history_points": len(history), "peer_count": len(peers), "available_time": latest["available_time"], "dcf_assumptions": dcf_assumptions}, "limitations": limitations}

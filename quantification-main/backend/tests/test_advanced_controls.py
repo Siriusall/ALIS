@@ -13,6 +13,9 @@ def test_black_litterman_is_capped_and_explainable():
     assert abs(sum(result["weights"].values()) - 1) < 1e-6
     assert max(result["weights"].values()) <= .6
     assert result["adjustments"]
+    concentrated = black_litterman_weights({"A": .5, "B": .5}, {"A": 0, "B": 0}, max_weight=.25)
+    assert max(concentrated["weights"].values()) <= .25
+    assert concentrated["cash_weight"] == .5
 
 
 def test_bayesian_review_and_attribution():
