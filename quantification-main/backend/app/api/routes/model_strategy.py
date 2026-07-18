@@ -1,16 +1,14 @@
 from __future__ import annotations
 
-import threading
 from datetime import datetime
 from typing import Any
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
-from app.db.store import create_model_train_run, get_active_model_version, get_model_version, set_active_model_version, update_model_version_validation
+from app.db.store import get_active_model_version, get_model_version, set_active_model_version, update_model_version_validation
 from app.services.model_registry import compare_champion_challenger, evaluate_model_drift, get_model_constitution, get_model_status, get_train_run_status, model_artifact_status
-from app.services.model_governance_scheduler import auto_tune_models_once
-from app.services.model_training import run_model_training
+from app.services.model_governance_scheduler import auto_tune_models_once, request_model_training
 from app.services.quant_risk import bocpd_change_probability, constrained_cvar_weights, garch11_forecast, historical_cvar, hrp_fallback_weights, hsmm_regime, kalman_level, ledoit_wolf_covariance
 from app.services.market_context import (
     live_market_context,
@@ -390,15 +388,9 @@ def model_strategy_train_run(run_id: int) -> dict:
 
 @router.post("/model-strategy/train")
 def model_strategy_train(req: ModelTrainRequest) -> dict:
-    run_id = create_model_train_run("训练任务已创建")
-
-    def _worker() -> None:
-        run_model_training(
-            run_id=run_id,
-            start_date=req.start_date,
-            end_date=req.end_date,
-            exchange_group=req.exchange_group,
-        )
-
-    threading.Thread(target=_worker, daemon=True, name=f"model-train-{run_id}").start()
-    return {"ok": True, "run_id": run_id, "status": "running"}
+    return request_model_training(
+        start_date=req.start_date,
+        end_date=req.end_date,
+        exchange_group=req.exchange_group,
+        force=True,
+    )

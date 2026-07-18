@@ -370,6 +370,7 @@ def run_model_training(
             "streamed_sessions": len(streamed_dates),
             "chunk_sessions": 60,
             "raw_full_market_history_persisted": True,
+            "latest_trade_date": training_calendar[-1] if training_calendar else "",
         }
         best: dict[str, Any] | None = None
 
