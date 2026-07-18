@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { diffDecisionEvidence, fetchDecisionAudit, verifyDecisionEvidence, type DecisionAuditOverview, type DecisionEvidenceDiff, type DecisionEvidenceVerification } from "../api/research";
 import { formatGmt8Time } from "../utils/time";
+import LoadingState from "./LoadingState";
 
 function text(value: unknown) {
   if (value == null || value === "") return "—";
@@ -52,6 +53,10 @@ export default function DecisionAuditPage() {
     if (!compareIds[0] || !compareIds[1]) return;
     try { setDiff(await diffDecisionEvidence(compareIds[0], compareIds[1])); }
     catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)); }
+  }
+
+  if (loading && !data) {
+    return <LoadingState variant="page" title="正在读取决策审计" detail="正在汇总决策快照、证据版本和复核状态" rows={5} />;
   }
 
   return (

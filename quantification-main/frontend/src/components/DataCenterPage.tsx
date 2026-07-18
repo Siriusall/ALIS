@@ -12,7 +12,7 @@ import {
   type SimpleDataHealth,
 } from "../api/dataCenter";
 import DataCenterTechnicalConsole, { type SectionKey } from "./DataCenterTechnicalConsole";
-import { DATA_CENTER_SECTION_EVENT, DATA_CENTER_SECTIONS, DATA_CENTER_SECTION_STORAGE_KEY } from "./dataCenterSections";
+import { DATA_CENTER_SECTION_EVENT, DATA_CENTER_SECTION_STORAGE_KEY } from "./dataCenterSections";
 import "./DataCenterTechnicalConsole.css";
 
 export default function DataCenterPage() {
@@ -83,14 +83,6 @@ export default function DataCenterPage() {
           <h1>数据中台</h1>
           <p>先看能不能支撑决策，再处理缺口。</p>
         </div>
-      </div>
-
-      <div className="data-platform-tabs" aria-label="数据中台导航">
-        {DATA_CENTER_SECTIONS.map((item) => (
-          <button key={item.key} type="button" className={section === item.key ? "active" : ""} onClick={() => changeSection(item.key)}>
-            <strong>{item.label}</strong>
-          </button>
-        ))}
       </div>
 
       {section === "overview" && (

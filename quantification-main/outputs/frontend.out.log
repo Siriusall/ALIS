@@ -1,0 +1,56 @@
+
+> quant-dashboard@0.1.0 dev
+> vite --host 127.0.0.1
+
+
+  [32m[1mVITE[22m v5.4.21[39m  [2mready in [0m[1m374[22m[2m[0m ms[22m
+
+  [32m➜[39m  [1mLocal[22m:   [36mhttp://127.0.0.1:[1m5173[22m/[39m
+[2m15:38:09[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/DecisionPage.tsx[22m
+[2m15:38:09[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/DecisionPage.tsx[22m
+[2m15:38:09[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/DecisionPage.tsx[22m
+[2m15:38:27[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/DecisionPage.tsx[22m
+[2m15:39:57[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/styles.css[22m
+[2m15:41:42[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/styles.css[22m
+[2m15:49:35[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/Layout.tsx[22m
+[2m15:49:35[22m [36m[1m[vite][22m[39m [33mhmr invalidate [39m[2m/src/components/Layout.tsx[22m Could not Fast Refresh ("ALL_SECTION_IDS" export is incompatible). Learn more at https://github.com/vitejs/vite-plugin-react/tree/main/packages/plugin-react#consistent-components-exports
+[2m15:49:35[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/pages/DashboardPage.tsx[22m
+[2m15:49:55[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/styles.css[22m
+[2m15:50:08[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/styles.css[22m
+[2m15:50:25[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/styles.css[22m
+[2m15:52:26[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/Layout.tsx[22m
+[2m15:52:26[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/DataCenterPage.tsx[22m
+[2m15:52:26[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/styles.css[22m
+[2m15:52:26[22m [36m[1m[vite][22m[39m [33mhmr invalidate [39m[2m/src/components/Layout.tsx[22m Could not Fast Refresh ("ALL_SECTION_IDS" export is incompatible). Learn more at https://github.com/vitejs/vite-plugin-react/tree/main/packages/plugin-react#consistent-components-exports
+[2m15:52:26[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/pages/DashboardPage.tsx[22m
+[2m15:55:10[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/ResearchWorkbenchPage.tsx[22m
+[2m15:55:10[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/ReviewWorkbenchPage.tsx[22m
+[2m15:55:10[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/styles.css[22m
+[2m15:55:10[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/PortfolioWorkbenchPage.tsx[22m
+[2m15:57:26[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/Layout.tsx[22m
+[2m15:57:26[22m [36m[1m[vite][22m[39m [33mhmr invalidate [39m[2m/src/components/Layout.tsx[22m Could not Fast Refresh ("ALL_SECTION_IDS" export is incompatible). Learn more at https://github.com/vitejs/vite-plugin-react/tree/main/packages/plugin-react#consistent-components-exports
+[2m15:57:26[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/pages/DashboardPage.tsx[22m
+[2m16:06:20[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/styles.css[22m
+[2m16:06:20[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/PositionPage.tsx[22m
+[2m16:07:44[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/DataCenterTechnicalConsole.css[22m
+[2m16:08:16[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/DataCenterTechnicalConsole.css[22m
+[2m16:10:51[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/styles.css[22m
+[2m16:14:10[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/DataCenterTechnicalConsole.css[22m
+[2m16:17:19[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/styles.css[22m
+[2m16:17:32[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/styles.css[22m
+[2m16:18:20[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/styles.css[22m
+[2m17:52:12[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/context/AuthContext.tsx, /src/components/BackfillStatusBar.tsx, /src/components/DataCenterPage.tsx, /src/components/DataCenterTechnicalConsole.tsx, /src/components/DecisionPage.tsx, /src/components/PortfolioWorkbenchPage.tsx, /src/components/PositionPage.tsx, /src/components/GovernancePage.tsx, /src/components/EventCenterPage.tsx, /src/components/ValuationPage.tsx, /src/components/PositionRiskPage.tsx, /src/components/DecisionAuditPage.tsx, /src/components/SentimentPage.tsx, /src/components/ExpectationPage.tsx, /src/components/StockPoolPage.tsx, /src/components/ThesisPage.tsx, /src/components/ReviewPage.tsx, /src/components/StockResearchPage.tsx, /src/components/IndustryResearchPage.tsx, /src/components/ProductModulePage.tsx, /src/components/TradeHistory.tsx, /src/components/QuantRunPanel.tsx, /src/components/StrategyPage.tsx[22m
+[2m17:52:12[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/StrategyPage.tsx, /src/components/ReviewPage.tsx[22m
+[2m17:52:12[22m [36m[1m[vite][22m[39m [33mhmr invalidate [39m[2m/src/context/AuthContext.tsx[22m Could not Fast Refresh ("useAuth" export is incompatible). Learn more at https://github.com/vitejs/vite-plugin-react/tree/main/packages/plugin-react#consistent-components-exports
+[2m17:52:12[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/App.tsx, /src/components/ProtectedRoute.tsx, /src/pages/LoginPage.tsx, /src/pages/RegisterPage.tsx, /src/pages/DashboardPage.tsx[22m
+[2m17:54:54[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/ProtectedRoute.tsx[22m
+[2m17:54:54[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/Layout.tsx[22m
+[2m17:54:54[22m [36m[1m[vite][22m[39m [33mhmr invalidate [39m[2m/src/components/Layout.tsx[22m Could not Fast Refresh ("ALL_SECTION_IDS" export is incompatible). Learn more at https://github.com/vitejs/vite-plugin-react/tree/main/packages/plugin-react#consistent-components-exports
+[2m17:54:54[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/pages/DashboardPage.tsx[22m
+[2m17:55:26[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/PositionPage.tsx[22m
+[2m17:55:26[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/StockResearchPage.tsx[22m
+[2m17:55:26[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/StrategyPage.tsx[22m
+[2m17:55:46[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/styles.css[22m
+[2m17:56:12[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/DataCenterTechnicalConsole.tsx[22m
+[2m17:56:12[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/DecisionAuditPage.tsx[22m
+[2m17:56:12[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/GovernancePage.tsx[22m

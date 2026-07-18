@@ -218,16 +218,14 @@ export default function PortfolioWorkbenchPage({ onNavigate }: PortfolioWorkbenc
 
       <div className="workbench-grid">
         {MODULES.map((item) => (
-          <article key={item.id} className="workbench-card">
+          <button key={item.id} type="button" className="workbench-card workbench-card-link" onClick={() => onNavigate?.(item.id)}>
             <div className="workbench-card-top">
               <span>{item.badge}</span>
               <h2>{item.title}</h2>
             </div>
             <p>{item.description}</p>
-            <button type="button" className="button ghost" onClick={() => onNavigate?.(item.id)}>
-              打开模块
-            </button>
-          </article>
+            <span className="workbench-card-enter">进入工作台 <b>→</b></span>
+          </button>
         ))}
       </div>
     </section>

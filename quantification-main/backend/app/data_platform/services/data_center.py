@@ -1048,10 +1048,13 @@ def _record_key(api_name: str, payload: dict[str, Any], idx: Any) -> str:
 def sync_market_bundle(trade_date: str, *, include_suspend: bool = False, apis: list[str] | None = None) -> dict[str, Any]:
     """Sync daily market/valuation/trading-status bundle for one trade date."""
 
-    requested_apis = list(apis or ["daily", "daily_basic", "stk_limit"])
+    # Suspension/resumption and money flow are core daily inputs, not optional
+    # enrichments. Include both in every normal market update so an empty
+    # result is also persisted as evidence that the date was checked.
+    requested_apis = list(apis or ["daily", "daily_basic", "stk_limit", "suspend_d", "moneyflow"])
     if include_suspend and "suspend_d" not in requested_apis:
         requested_apis.append("suspend_d")
-    allowed = {"daily", "daily_basic", "stk_limit", "suspend_d"}
+    allowed = {"daily", "daily_basic", "stk_limit", "suspend_d", "moneyflow"}
     requested_apis = [api for api in requested_apis if api in allowed]
     results = []
     for api in requested_apis:

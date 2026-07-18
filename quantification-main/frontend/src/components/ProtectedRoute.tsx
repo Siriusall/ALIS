@@ -1,6 +1,7 @@
 import { ReactNode } from "react";
 import { Navigate, useLocation } from "react-router-dom";
 import { useAuth } from "../context/AuthContext";
+import LoadingState from "./LoadingState";
 
 interface ProtectedRouteProps {
   children: ReactNode;
@@ -12,11 +13,7 @@ export default function ProtectedRoute({ children }: ProtectedRouteProps) {
   const location = useLocation();
 
   if (loading) {
-    return (
-      <div className="auth-loading">
-        <span>加载中…</span>
-      </div>
-    );
+    return <LoadingState variant="page" title="正在进入 ALIS" detail="正在确认登录状态和后端连接" rows={4} />;
   }
 
   if (serviceError) {

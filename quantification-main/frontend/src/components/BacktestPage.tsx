@@ -26,6 +26,7 @@ import {
 } from "../api/backtest";
 import type { Strategy } from "../types";
 import { chartGridStroke, chartLineBenchmark, chartLinePrimary, chartTooltipStyle } from "../chartTheme";
+import LoadingState from "./LoadingState";
 
 const JOB_POLL_INTERVAL_MS = 400;
 
@@ -250,7 +251,7 @@ export default function BacktestPage() {
       <div className="dashboard-section-inner" style={{ overflowY: "auto" }}>
         <div className="card">
           <h3>新建回测</h3>
-          <div style={{ display: "flex", gap: "12px", flexWrap: "wrap", alignItems: "center" }}>
+          <div className="backtest-config-form">
             <label>
               策略：
               <select
@@ -314,7 +315,7 @@ export default function BacktestPage() {
                 <option value="BJ">北交所</option>
               </select>
             </label>
-            <button type="button" onClick={handleRun} disabled={running || strategyId == null}>
+            <button type="button" className="button primary" onClick={handleRun} disabled={running || strategyId == null}>
               {running ? "回测中…" : "开始回测"}
             </button>
           </div>
@@ -409,7 +410,7 @@ export default function BacktestPage() {
         <div className="card" style={{ marginTop: 8 }}>
           <h3>净值曲线（策略 vs 基准）</h3>
           {loadingDetail ? (
-            <div className="empty">加载中…</div>
+            <LoadingState title="正在读取回测结果" detail="正在加载净值、交易和归因明细" />
           ) : chartData.length === 0 ? (
             <div className="empty">暂无回测曲线，请先执行一次回测</div>
           ) : (

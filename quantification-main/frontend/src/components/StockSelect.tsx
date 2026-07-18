@@ -4,6 +4,7 @@ import { fetchAccount } from "../api/account";
 import { fetchCandidates, fetchQuantRunStatus } from "../api/market";
 import { fetchStrategies } from "../api/strategies";
 import { apiErrorMessage } from "../api/client";
+import LoadingState from "./LoadingState";
 
 type ExchangeFilter = "ALL" | "HS" | "CYB" | "BJ";
 
@@ -167,7 +168,7 @@ export default function StockSelect() {
           </div>
         )}
         {loading && candidates.length === 0 ? (
-          <div className="empty">加载中…（带市值/日线因子的策略可能需 1～3 分钟，请稍候）</div>
+          <LoadingState title="正在生成候选股票" detail="正在计算市值、行情和策略因子，复杂策略可能需要较长时间" rows={4} />
         ) : (
           <div className="table-scroll">
             <table>

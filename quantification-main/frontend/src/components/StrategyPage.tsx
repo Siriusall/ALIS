@@ -9,6 +9,7 @@ import {
   type StrategyWorkbenchResponse,
 } from "../api/modelStrategy";
 import { formatGmt8Time } from "../utils/time";
+import LoadingState from "./LoadingState";
 
 function pct(value: unknown, digits = 1) {
   const n = Number(value);
@@ -153,6 +154,15 @@ export default function StrategyPage() {
   const decisions = workbench?.pending_user_decisions ?? [];
   const acceptance = workbench?.backend_acceptance;
   const acceptanceChecks = acceptance?.checks ?? [];
+
+  if (loading && !workbench) {
+    return (
+      <section id="strategy" className="dashboard-section" data-section="strategy">
+        <h2 className="dashboard-section-title">策略工作台</h2>
+        <LoadingState variant="page" title="正在建立策略工作台" detail="正在汇总模型、验收矩阵和治理证据" rows={5} />
+      </section>
+    );
+  }
 
   return (
     <section id="strategy" className="dashboard-section" data-section="strategy">

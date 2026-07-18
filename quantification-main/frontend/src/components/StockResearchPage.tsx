@@ -13,6 +13,7 @@ import {
 } from "../api/research";
 import { useStockContext } from "../context/StockContext";
 import type { SectionId } from "./Layout";
+import LoadingState from "./LoadingState";
 
 const DIMENSION_NAMES: Record<string, string> = {
   quality: "企业质量", growth: "成长", cashflow: "现金流", governance: "治理",
@@ -120,7 +121,9 @@ export default function StockResearchPage({ onNavigate }: StockResearchPageProps
       <button onClick={() => void run()} disabled={loading}>{loading ? "正在汇总证据…" : "刷新完整研究"}</button>
     </div>
     {error && <div className="alert">{error}</div>}
-    {!data && !error && <div className="research-empty"><strong>{loading ? "正在建立研究工作区" : "选择一只沪深股票"}</strong><span>输入代码后开始研究。</span></div>}
+    {!data && !error && (loading
+      ? <LoadingState title="正在建立研究工作区" detail="正在汇总财务、行业、事件、预期和估值证据" rows={4} />
+      : <div className="research-empty"><strong>选择一只沪深股票</strong><span>输入代码后开始研究。</span></div>)}
     {data && <>
       {data.partialErrors.map((item) => <div className="decision-issue warning" key={item}>{item}；其他研究证据仍可使用。</div>)}
       <div className="decision-command-bar" aria-label="单股研究下一步">

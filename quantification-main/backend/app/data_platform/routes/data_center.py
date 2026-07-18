@@ -327,7 +327,7 @@ def data_center_sync_tushare_date_batch(
 @router.post("/data-center/sync/market")
 def data_center_sync_market(
     trade_date: str = Query(..., description="YYYYMMDD"),
-    include_suspend: bool = Query(default=False),
+    include_suspend: bool = Query(default=True),
 ) -> dict[str, Any]:
     """Sync daily market bundle and build snapshot for one trade date."""
 

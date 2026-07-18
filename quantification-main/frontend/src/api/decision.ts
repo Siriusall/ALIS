@@ -109,6 +109,8 @@ export interface DecisionSummary {
 export async function fetchDecisionSummary(limitDays = 30): Promise<DecisionSummary> {
   const { data } = await api.get<DecisionSummary>("/api/decision/summary", {
     params: { limit_days: limitDays },
+    // 决策摘要需要聚合数据健康、账户、市场状态与模型信息；冷启动时明显慢于普通接口。
+    timeout: 60_000,
   });
   return data;
 }

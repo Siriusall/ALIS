@@ -121,6 +121,9 @@ export async function fetchStrategyWorkbench(params?: {
 }): Promise<StrategyWorkbenchResponse> {
   const { data } = await api.get<StrategyWorkbenchResponse>("/api/model-strategy/workbench", {
     params,
+    // This endpoint aggregates model governance, plan acceptance and
+    // operations evidence across the PostgreSQL store.
+    timeout: 60_000,
   });
   return data;
 }

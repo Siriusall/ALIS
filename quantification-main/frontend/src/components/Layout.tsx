@@ -1,7 +1,13 @@
 import React, { ReactNode, Suspense, useEffect, useState } from "react";
 import type { UserInfo } from "../api/auth";
 import BackfillStatusBar from "./BackfillStatusBar";
-import { useStockContext } from "../context/StockContext";
+import LoadingState from "./LoadingState";
+import {
+  DATA_CENTER_SECTIONS,
+  DATA_CENTER_SECTION_EVENT,
+  DATA_CENTER_SECTION_STORAGE_KEY,
+} from "./dataCenterSections";
+import type { SectionKey as DataCenterSectionKey } from "./DataCenterTechnicalConsole";
 
 export const ALL_SECTION_IDS = [
   "market",
@@ -109,9 +115,11 @@ export default function Layout({
   onLoginClick,
   onRegisterClick,
 }: LayoutProps) {
-  const { activeStock, setActiveStock } = useStockContext();
-  const [stockDraft, setStockDraft] = useState(activeStock);
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [dataCenterOpen, setDataCenterOpen] = useState(currentSection === "dataCenter");
+  const [dataCenterSection, setDataCenterSection] = useState<DataCenterSectionKey>(() => {
+    return (window.localStorage.getItem(DATA_CENTER_SECTION_STORAGE_KEY) as DataCenterSectionKey | null) || "overview";
+  });
   const currentChild = sections[currentSection] ?? sections.market;
   const navSection = getNavSection(currentSection);
 
@@ -131,11 +139,21 @@ export default function Layout({
   }, [sidebarOpen]);
 
   useEffect(() => {
-    setStockDraft(activeStock);
-  }, [activeStock]);
+    if (navSection === "dataCenter") setDataCenterOpen(true);
+  }, [navSection]);
+
+  useEffect(() => {
+    const onDataCenterSection = (event: Event) => {
+      const section = (event as CustomEvent<DataCenterSectionKey>).detail;
+      if (section) setDataCenterSection(section);
+    };
+    window.addEventListener(DATA_CENTER_SECTION_EVENT, onDataCenterSection);
+    return () => window.removeEventListener(DATA_CENTER_SECTION_EVENT, onDataCenterSection);
+  }, []);
 
   function handleSectionChange(id: SectionId) {
     onSectionChange(id);
+    if (id !== "dataCenter") setDataCenterOpen(false);
     if (window.innerWidth < 768) setSidebarOpen(false);
   }
 
@@ -144,9 +162,21 @@ export default function Layout({
     if (window.innerWidth < 768) setSidebarOpen(false);
   }
 
-  function openStockResearch() {
-    setActiveStock(stockDraft);
-    onSectionChange("stockResearch");
+  function handleDataCenterParent() {
+    if (navSection !== "dataCenter") {
+      onSectionChange("dataCenter");
+      setDataCenterOpen(true);
+      return;
+    }
+    setDataCenterOpen((open) => !open);
+  }
+
+  function handleDataCenterSection(section: DataCenterSectionKey) {
+    setDataCenterSection(section);
+    window.localStorage.setItem(DATA_CENTER_SECTION_STORAGE_KEY, section);
+    onSectionChange("dataCenter");
+    window.dispatchEvent(new CustomEvent(DATA_CENTER_SECTION_EVENT, { detail: section }));
+    if (window.innerWidth < 768) setSidebarOpen(false);
   }
 
   return (
@@ -165,17 +195,7 @@ export default function Layout({
             <span className="dashboard-sidebar-toggle-bar" />
           </button>
           <span className="dashboard-topbar-title">ALIS</span>
-        </div>
-        <div className="dashboard-stock-context" role="search">
-          <span>研究标的</span>
-          <input
-            aria-label="当前研究股票代码"
-            value={stockDraft}
-            onChange={(event) => setStockDraft(event.target.value.toUpperCase())}
-            onKeyDown={(event) => event.key === "Enter" && openStockResearch()}
-            placeholder="000001.SZ"
-          />
-          <button type="button" onClick={openStockResearch}>打开研究</button>
+          <span className="dashboard-topbar-section">{NAV_ITEMS.find((item) => item.id === navSection)?.label || "决策系统"}</span>
         </div>
         <div className="dashboard-topbar-right">
           {user ? (
@@ -207,7 +227,23 @@ export default function Layout({
       <div className="dashboard-root-inner">
         <aside className="dashboard-sidebar" aria-label="主导航">
           <nav className="dashboard-nav">
-            {NAV_ITEMS.map(({ id, label, icon }) => (
+            {NAV_ITEMS.map(({ id, label, icon }) => id === "dataCenter" ? (
+              <div className={`dashboard-nav-group ${dataCenterOpen || navSection === "dataCenter" ? "open" : ""}`} key={id}>
+                <button type="button" className={`dashboard-nav-item dashboard-nav-parent ${navSection === id ? "active" : ""}`} onClick={handleDataCenterParent} aria-expanded={dataCenterOpen || navSection === "dataCenter"}>
+                  <NavIcon name={icon} />
+                  <span>{label}</span>
+                  <i className="dashboard-nav-caret" aria-hidden="true" />
+                </button>
+                <div className="dashboard-subnav" aria-label="数据中台子导航">
+                  {DATA_CENTER_SECTIONS.map((item) => (
+                    <button key={item.key} type="button" className={navSection === "dataCenter" && dataCenterSection === item.key ? "active" : ""} onClick={() => handleDataCenterSection(item.key)}>
+                      <span>{item.label}</span>
+                      <small>{item.hint}</small>
+                    </button>
+                  ))}
+                </div>
+              </div>
+            ) : (
               <button key={id} type="button" className={`dashboard-nav-item ${navSection === id ? "active" : ""}`} onClick={() => handleSectionChange(id)}>
                 <NavIcon name={icon} />
                 <span>{label}</span>
@@ -219,7 +255,7 @@ export default function Layout({
           <header className="dashboard-header">{header}</header>
           <BackfillStatusBar onOpenDataCenter={openDataCenter} />
           <div className="dashboard-content">
-            <Suspense fallback={<div className="auth-loading">模块加载中…</div>}>
+            <Suspense fallback={<LoadingState variant="page" title="正在打开模块" detail="正在准备页面结构和数据接口" rows={4} />}>
               {currentChild}
             </Suspense>
           </div>

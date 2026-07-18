@@ -8,6 +8,7 @@ import {
   type BackfillPlan, type BackfillStatus, type BackfillStep,
 } from "../api/dataCenter";
 import { elapsedMinutesFromServerTime, formatGmt8Date, formatGmt8Time } from "../utils/time";
+import LoadingState from "./LoadingState";
 
 export type SectionKey = "overview" | "readiness" | "assets" | "archive" | "repair" | "quality" | "sources" | "logs";
 
@@ -66,6 +67,9 @@ export default function TechnicalConsole({ section }: { section: SectionKey }) {
 
   const selected = readiness?.consumers.find((item) => item.key === selectedConsumer);
   const context = { health, readiness, observability, status, update, assets, archive, selected, selectedConsumer, setSelectedConsumer, refresh, latestUpdate, message, loading };
+  if (loading && !health && !readiness && !observability && !status) {
+    return <LoadingState variant="page" title="正在读取数据中台" detail="正在汇总数据健康、完整度、任务和存储状态" rows={5} />;
+  }
   return <>
     {message && <div className="notice-bar"><span>!</span>{message}<button onClick={() => setMessage("")}>×</button></div>}
     {section === "overview" && <Overview {...context} />}

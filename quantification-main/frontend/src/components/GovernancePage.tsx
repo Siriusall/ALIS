@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { fetchGovernanceOverview, type GovernanceOverview } from "../api/research";
+import LoadingState from "./LoadingState";
 
 const LABEL: Record<string, string> = {
   data_health: "数据健康",
@@ -47,6 +48,10 @@ export default function GovernancePage() {
   const failedTasks = data?.tasks.failed_or_paused ?? [];
   const consumers = data?.data.readiness.consumers ?? [];
   const urgentGates = data?.gates.filter((item) => item.status !== "ready") ?? [];
+
+  if (loading && !data) {
+    return <LoadingState variant="page" title="正在读取系统治理" detail="正在检查数据、模型、任务和上线门控" rows={5} />;
+  }
 
   return (
     <section className="product-module-page">

@@ -1,7 +1,10 @@
 import axios from "axios";
 
 export const TOKEN_KEY = "quant_token";
-const REQUEST_TIMEOUT_MS = 15_000;
+// PostgreSQL-backed aggregate reads can exceed 15 seconds on a cold cache,
+// especially while model training is using the same local machine. Keep a
+// sensible global ceiling while allowing heavier endpoints to override it.
+const REQUEST_TIMEOUT_MS = 30_000;
 
 export const api = axios.create({
   baseURL: import.meta.env.VITE_API_BASE || "",

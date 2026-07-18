@@ -12,6 +12,7 @@ import {
 import type { Position, Operation } from "../types";
 import { formatGmt8Time } from "../utils/time";
 import type { SectionId } from "./Layout";
+import LoadingState from "./LoadingState";
 import {
   addPosition as apiAddPosition,
   deletePosition,
@@ -293,13 +294,12 @@ export default function PositionPage({ onNavigate }: PositionPageProps) {
                 这是低频校准动作，只用于修正本地模拟账户。正式买卖仍应通过“今日决策 → 模拟执行 → 执行账本”留下证据链。
               </div>
               {positionError && <div className="alert">{positionError}</div>}
-              <div style={{ display: "flex", flexWrap: "wrap", gap: "0.75rem", alignItems: "center" }}>
+              <div className="position-calibration-form">
                 <input
                   type="text"
                   placeholder="代码"
                   value={addSymbol}
                   onChange={(e) => setAddSymbol(e.target.value.trim().toUpperCase())}
-                  style={{ width: "90px", padding: "6px 8px" }}
                 />
                 <input
                   type="number"
@@ -308,7 +308,6 @@ export default function PositionPage({ onNavigate }: PositionPageProps) {
                   step={100}
                   value={addQuantity}
                   onChange={(e) => setAddQuantity(e.target.value)}
-                  style={{ width: "100px", padding: "6px 8px" }}
                 />
                 <input
                   type="number"
@@ -317,7 +316,6 @@ export default function PositionPage({ onNavigate }: PositionPageProps) {
                   step={0.01}
                   value={addPrice}
                   onChange={(e) => setAddPrice(e.target.value)}
-                  style={{ width: "90px", padding: "6px 8px" }}
                 />
                 <button
                   type="button"
@@ -337,7 +335,7 @@ export default function PositionPage({ onNavigate }: PositionPageProps) {
                       setAdding(false);
                     }
                   }}
-                  style={{ padding: "6px 12px", background: "#2563eb", color: "#ffffff", border: "none", borderRadius: "6px", cursor: "pointer" }}
+                  className="button primary"
                 >
                   {adding ? "校准中…" : "登记校准"}
                 </button>
@@ -616,7 +614,7 @@ export default function PositionPage({ onNavigate }: PositionPageProps) {
                   </div>
                 )}
             {curveLoading ? (
-              <div className="empty">加载组合曲线中…</div>
+              <LoadingState title="正在读取组合曲线" detail="正在计算持仓收益与基准走势" />
             ) : chartData.length === 0 ? (
               <div className="empty">暂无持仓或曲线数据，请先形成模拟持仓。</div>
             ) : (

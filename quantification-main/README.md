@@ -106,9 +106,7 @@ npm run install:backend
 
 - `docs/ALIS长线投资系统工程计划书.md`：完整计划书
 - `docs/ALIS_DESIGN.md`：总体设计
-- `docs/PLAN_IMPLEMENTATION_MATRIX.md`：计划与实现对照
-- `docs/COMPLETION_AUDIT.md`：当前完成度审计
-- `docs/IMPLEMENTATION_CONFLICTS.md`：实现冲突登记
+- `docs/ALIS_IMPLEMENTATION_AUDIT.md`：计划对照、完成度和实现冲突的统一审计
 - `docs/*_contract.yaml`、`docs/*_schema.json`：数据和接口契约
 - `docs/conversations/`：项目对话记录
 
