@@ -21,6 +21,7 @@ from app.db.store import (
     get_latest_model_train_run,
     list_model_versions,
     set_active_model_version,
+    update_model_version_status,
     update_model_train_run,
 )
 from app.services.model_registry import compare_champion_challenger
@@ -192,7 +193,16 @@ def auto_tune_models_once(*, allow_retrain: bool = True) -> dict[str, Any]:
         except Exception as exc:  # noqa: BLE001
             logger.exception("Failed to train monthly HSMM shadow")
             hsmm_shadow = {"ok": False, "error": str(exc)[:300]}
+    from app.services.review_learning import materialize_decision_outcomes, model_feedback_gate
+    review_learning = materialize_decision_outcomes()
     champion = get_active_model_version("main")
+    degraded_champion = None
+    if champion:
+        champion_feedback = model_feedback_gate(str(champion.get("version") or ""), strict_version=True)
+        if champion_feedback.get("should_degrade"):
+            update_model_version_status(int(champion["id"]), status="feedback_degraded", is_active=False)
+            degraded_champion = {"id": champion.get("id"), "version": champion.get("version"), "review_feedback": champion_feedback}
+            champion = None
     all_candidates = [x for x in list_model_versions("main", limit=50) if not x.get("is_active") and str(x.get("status")) in {"candidate", "watch"}]
     candidates = [
         x for x in all_candidates
@@ -200,6 +210,7 @@ def auto_tune_models_once(*, allow_retrain: bool = True) -> dict[str, Any]:
         and str((x.get("validation") or {}).get("status")) == "passed"
         and float((x.get("metrics") or {}).get("lift", 0) or 0) > 0
         and float((x.get("metrics") or {}).get("walk_forward_lift", 0) or 0) > 0
+        and bool(model_feedback_gate(str(x.get("version") or "")).get("passed"))
     ]
     if not champion and candidates:
         winner = max(
@@ -220,6 +231,8 @@ def auto_tune_models_once(*, allow_retrain: bool = True) -> dict[str, Any]:
         else:
             result = {"decision": "keep_champion", "evaluated": len(evaluations), "excluded": len(all_candidates) - len(candidates), "evaluations": evaluations, "champion_id": champion.get("id")}
     result["market_training_history"] = training_history
+    result["review_learning"] = review_learning
+    result["degraded_champion"] = degraded_champion
     result["hsmm_shadow"] = hsmm_shadow
     result["retraining"] = request_model_training() if allow_retrain else {"started": False, "reason": "post_training_evaluation"}
     try:

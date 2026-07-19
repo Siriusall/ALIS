@@ -74,3 +74,38 @@ def test_market_state_model_governance_marks_pending_when_no_live_period(monkeyp
 
     assert result["hsmm"]["status"] in ("shadow_oos_validated_live_observation_pending", "shadow_live_observation_review_ready")
     assert result["hsmm"]["live_observation_weeks"] >= 0
+
+
+def test_production_regime_reason_does_not_report_insufficient_history_after_oos_passed():
+    reason = market_context._production_regime_reason({
+        "hsmm": {
+            "history_years": 9.3,
+            "minimum_years": 6,
+            "live_observation_weeks": 0.143,
+            "minimum_live_observation_weeks": 4,
+            "production_eligible": False,
+            "validation": {"status": "passed"},
+            "review": {},
+        },
+    })
+
+    assert "历史OOS已通过" in reason
+    assert "0.14/4周" in reason
+    assert "历史不足" not in reason
+
+
+def test_production_regime_reason_reports_history_gate_only_when_actually_insufficient():
+    reason = market_context._production_regime_reason({
+        "hsmm": {
+            "history_years": 4.8,
+            "minimum_years": 6,
+            "live_observation_weeks": 0,
+            "minimum_live_observation_weeks": 4,
+            "production_eligible": False,
+            "validation": {},
+            "review": {},
+        },
+    })
+
+    assert "仅4.80年" in reason
+    assert "尚未达到6年要求" in reason

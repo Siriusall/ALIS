@@ -25,6 +25,7 @@ const StockPoolPage = lazy(() => import("../components/StockPoolPage"));
 const ReviewPage = lazy(() => import("../components/ReviewPage"));
 const ReviewWorkbenchPage = lazy(() => import("../components/ReviewWorkbenchPage"));
 const TradeHistory = lazy(() => import("../components/TradeHistory"));
+const BackendLogsPage = lazy(() => import("../components/BackendLogsPage"));
 
 export default function DashboardPage() {
   const { user, logout } = useAuth();
@@ -60,6 +61,7 @@ export default function DashboardPage() {
     review: <ReviewPage />,
     governance: <GovernancePage />,
     strategy: <StrategyPage />,
+    backendLogs: <BackendLogsPage />,
   }), [setCurrentSection]);
 
   const header = (

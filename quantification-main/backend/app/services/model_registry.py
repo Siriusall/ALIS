@@ -63,11 +63,14 @@ def compare_champion_challenger(champion: dict[str, Any], challenger: dict[str, 
     keys = ("lift", "walk_forward_lift", "hit_rate", "walk_forward_hit_rate")
     deltas = {key: round(float(xm.get(key, 0) or 0) - float(cm.get(key, 0) or 0), 6) for key in keys}
     validation = challenger.get("validation") or {}
+    from app.services.review_learning import model_feedback_gate
+    feedback = model_feedback_gate(str(challenger.get("version") or ""))
     gates = {
         "validation_passed": str(validation.get("status")) == "passed",
         "holdout_lift_positive": float(xm.get("lift", 0) or 0) > 0,
         "walk_forward_lift_positive": float(xm.get("walk_forward_lift", 0) or 0) > 0,
         "hit_rate_not_materially_lower": deltas["hit_rate"] >= -0.02,
+        "review_feedback_passed": bool(feedback.get("passed")),
     }
     config_a, config_b = champion.get("config") or {}, challenger.get("config") or {}
     config_keys = sorted(set(config_a) | set(config_b))
@@ -76,7 +79,7 @@ def compare_champion_challenger(champion: dict[str, Any], challenger: dict[str, 
     return {
         "champion_id": champion.get("id"), "challenger_id": challenger.get("id"),
         "champion_version": champion.get("version"), "challenger_version": challenger.get("version"),
-        "deltas": deltas, "config_diff": config_diff, "gates": gates,
+        "deltas": deltas, "config_diff": config_diff, "gates": gates, "review_feedback": feedback,
         "decision": "promote_challenger" if not reasons else "keep_champion",
         "blocked_reasons": reasons,
     }
@@ -115,6 +118,8 @@ def get_model_status() -> dict[str, Any]:
     latest_run = get_latest_model_train_run()
     versions = list_model_versions(MODEL_KEY, limit=10)
     active_artifact = model_artifact_status(active) if active else {"ok": False, "status": "no_active_model"}
+    from app.services.review_learning import model_feedback_gate
+    version_feedback = {str(item.get("version") or ""): model_feedback_gate(str(item.get("version") or "")) for item in versions}
     return {
         "model_key": MODEL_KEY,
         "active_version": active,
@@ -122,6 +127,7 @@ def get_model_status() -> dict[str, Any]:
         "invalid_active_version": invalid_active,
         "latest_train_run": latest_run,
         "versions": versions,
+        "review_feedback": version_feedback,
         "has_active_model": active is not None and bool(active_artifact.get("ok")),
         "constitution": MODEL_CONSTITUTION,
     }

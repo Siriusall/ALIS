@@ -3,6 +3,7 @@ import type { SectionId } from "./Layout";
 import { fetchDecisionSummary, fetchDailyReport, type DecisionSummary, type DailyRebalanceReport } from "../api/decision";
 import type { QuantAnalyzeResponse } from "../types";
 import { useStockContext } from "../context/StockContext";
+import LoadingState from "./LoadingState";
 
 const ANALYZE_RESULT_KEY = "quant_analyze_result_v1";
 
@@ -214,6 +215,21 @@ export default function DecisionPage({ onNavigate }: DecisionPageProps) {
     }
   }
 
+  if (loading && !summary) {
+    return (
+      <section id="decision" className="dashboard-section" data-section="decision">
+        <div className="dashboard-section-inner decision-page decision-dashboard">
+          <LoadingState
+            variant="page"
+            title="正在生成今日调仓建议"
+            detail="正在读取数据门控、市场状态、生产模型、账户持仓和组合风险"
+            rows={5}
+          />
+        </div>
+      </section>
+    );
+  }
+
   return (
     <section id="decision" className="dashboard-section" data-section="decision">
       <div className="dashboard-section-inner decision-page decision-dashboard">
@@ -228,6 +244,15 @@ export default function DecisionPage({ onNavigate }: DecisionPageProps) {
             <button type="button" className="button ghost" onClick={() => void refresh()} disabled={loading}>刷新数据</button>
           </div>
         </header>
+
+        {loading && summary && (
+          <LoadingState
+            variant="inline"
+            className="decision-refresh-loading"
+            title="正在更新今日调仓建议"
+            detail="保留当前结果，待最新数据返回后自动替换"
+          />
+        )}
 
         <div className={`decision-verdict ${gate?.tone || "hold"}`}>
           <div className="decision-verdict-copy">

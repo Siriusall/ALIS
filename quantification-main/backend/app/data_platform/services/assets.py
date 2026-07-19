@@ -184,6 +184,7 @@ def _compute_data_assets() -> dict[str, Any]:
             "stk_limit",
             "adj_factor",
             "moneyflow",
+            "moneyflow_hsgt",
             "index_daily",
             "suspend_d",
         )

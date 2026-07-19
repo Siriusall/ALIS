@@ -147,11 +147,8 @@ export interface HsmmShadowTrainingResult {
   api_refresh?: Record<string, unknown>;
 }
 
-/**
- * Explicitly starts the only long-history data pull in the normal product.
- * The backend limits it to three compact index series; it never backfills a
- * decade of the full stock market.
- */
+/** Builds HSMM observations from persisted full-market daily aggregates and
+ * refreshes three broad-index anchors before fitting the shadow model. */
 export async function startHsmmShadowTraining(): Promise<HsmmShadowTrainingResult> {
   const { data } = await api.post<HsmmShadowTrainingResult>("/api/model-strategy/market-context/hsmm/train-shadow");
   return data;
@@ -169,6 +166,11 @@ export async function autoTuneModels(): Promise<{ decision: string; evaluated: n
 
 export async function rollbackModelVersion(modelVersionId: number): Promise<{ ok: boolean; status: string; previous_model_version_id?: number | null; model_version_id: number }> {
   const { data } = await api.post(`/api/model-strategy/rollback/${modelVersionId}`);
+  return data;
+}
+
+export async function promoteModelVersion(modelVersionId: number): Promise<{ ok: boolean; status: string; model_version_id: number }> {
+  const { data } = await api.post(`/api/model-strategy/promote/${modelVersionId}`);
   return data;
 }
 

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import httpx
+
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 
@@ -24,6 +26,10 @@ from app.services.stock_pool_sync import stage_candidates_in_watch_pool
 from app.services.research_workflow import evaluate_core_pool_eligibility, process_watch_pool
 from app.services.advanced_controls import bayesian_update, freeze_evidence, trade_attribution
 from app.services.theme_engine import list_themes, materialize_theme_snapshots
+from app.services.manual_review_queue import build_manual_review_queue, submit_manual_review_action
+from app.services.llm_review_assistant import generate_review_draft, llm_token_budget_status
+from app.services.review_learning import materialize_decision_outcomes, review_learning_overview
+from app.services.manual_review_triage import run_manual_review_triage_once, start_manual_review_triage, triage_status
 
 router = APIRouter()
 
@@ -97,6 +103,15 @@ class DecisionSnapshotRequest(BaseModel):
 
 class ReviewRequest(BaseModel):
     decision_snapshot_id:int|None=None;review_time:str|None=None;outcome:dict[str,Any]=Field(default_factory=dict);attribution:dict[str,Any]=Field(default_factory=dict);error_type:str|None=None;lessons:str=""
+
+
+class ManualReviewActionRequest(BaseModel):
+    review_key: str
+    item_kind: str
+    action: str
+    error_type: str = ""
+    comment: str = ""
+    llm_draft: dict[str, Any] = Field(default_factory=dict)
 
 
 class BayesianReviewRequest(BaseModel):
@@ -406,12 +421,66 @@ def research_decision_create(req:DecisionSnapshotRequest)->dict[str,Any]:
 def research_reviews(limit:int=Query(100,ge=1,le=500))->dict[str,Any]:return {"ok":True,"items":list_reviews(limit)}
 
 
+@router.get("/research/reviews/learning-overview")
+def research_review_learning_overview() -> dict[str, Any]:
+    return review_learning_overview()
+
+
+@router.post("/research/reviews/materialize-outcomes")
+def research_materialize_review_outcomes(limit: int = Query(default=1000, ge=1, le=5000)) -> dict[str, Any]:
+    return materialize_decision_outcomes(limit=limit)
+
+
+@router.get("/research/manual-review/queue")
+def research_manual_review_queue(limit: int = Query(200, ge=1, le=500)) -> dict[str, Any]:
+    result = build_manual_review_queue(limit)
+    if int((result.get("ai_triage") or {}).get("pending") or 0) > 0:
+        start_manual_review_triage(limit=limit)
+    result["ai_triage"] = {**(result.get("ai_triage") or {}), **triage_status()}
+    result["llm_budget"] = llm_token_budget_status()
+    return result
+
+
+@router.get("/research/llm/token-budget")
+def research_llm_token_budget() -> dict[str, Any]:
+    return llm_token_budget_status()
+
+
+@router.post("/research/manual-review/triage")
+def research_manual_review_triage(limit: int = Query(default=100, ge=1, le=500)) -> dict[str, Any]:
+    return run_manual_review_triage_once(limit=limit)
+
+
+@router.get("/research/manual-review/triage/status")
+def research_manual_review_triage_status() -> dict[str, Any]:
+    return {"ok": True, **triage_status()}
+
+
+@router.post("/research/manual-review/action")
+def research_manual_review_action(req: ManualReviewActionRequest) -> dict[str, Any]:
+    try:
+        return {"ok": True, "item": submit_manual_review_action(**req.model_dump(), actor="authenticated_user")}
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
 @router.get("/research/reviews/suggestion/{decision_snapshot_id}")
 def research_review_suggestion(decision_snapshot_id: int) -> dict[str, Any]:
     item = build_review_outcome_suggestion(decision_snapshot_id)
     if not item:
         raise HTTPException(status_code=404, detail="决策快照不存在")
     return item
+
+
+@router.post("/research/reviews/llm-draft/{decision_snapshot_id}")
+def research_review_llm_draft(decision_snapshot_id: int) -> dict[str, Any]:
+    try:
+        return generate_review_draft(decision_snapshot_id)
+    except ValueError as exc:
+        detail = str(exc)
+        raise HTTPException(status_code=503 if detail == "deepseek_api_key_not_configured" else 404, detail=detail) from exc
+    except (RuntimeError, httpx.HTTPError) as exc:
+        raise HTTPException(status_code=502, detail=str(exc)[:500]) from exc
 
 
 @router.post("/research/reviews")

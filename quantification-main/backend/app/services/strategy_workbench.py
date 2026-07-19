@@ -104,7 +104,7 @@ def build_strategy_workbench(limit: int = 10, *, include_details: bool = False) 
         {
             "key": "hsmm_shadow",
             "status": (market_governance.get("hsmm") or {}).get("status"),
-            "message": "市场状态生产门控仍以透明四状态为主，HSMM 保持影子/观察状态。",
+            "message": (market_governance.get("hsmm") or {}).get("blocking_reason") or "HSMM已完成生产上线门控。",
             "evidence": market_governance.get("hsmm") or {},
         },
     ]

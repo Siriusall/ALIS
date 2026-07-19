@@ -54,3 +54,82 @@
 [2m17:56:12[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/DataCenterTechnicalConsole.tsx[22m
 [2m17:56:12[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/DecisionAuditPage.tsx[22m
 [2m17:56:12[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/GovernancePage.tsx[22m
+[2m19:13:36[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/StrategyPage.tsx[22m
+[2m19:17:24[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/styles.css[22m
+[2m19:20:47[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/StrategyPage.tsx[22m
+[2m19:21:37[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/StrategyPage.tsx, /src/components/ReviewPage.tsx[22m
+[2m19:21:37[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/StrategyPage.tsx[22m
+[2m19:33:28[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/Layout.tsx[22m
+[2m19:33:28[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/pages/DashboardPage.tsx[22m
+[2m19:33:28[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/styles.css[22m
+[2m19:33:28[22m [36m[1m[vite][22m[39m [33mhmr invalidate [39m[2m/src/components/Layout.tsx[22m Could not Fast Refresh ("ALL_SECTION_IDS" export is incompatible). Learn more at https://github.com/vitejs/vite-plugin-react/tree/main/packages/plugin-react#consistent-components-exports
+[2m19:33:28[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/pages/DashboardPage.tsx[22m
+[2m19:38:54[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/BackendLogsPage.tsx[22m
+[2m19:41:35[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/styles.css[22m
+[2m19:44:00[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/GovernancePage.tsx[22m
+[2m19:44:00[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/PortfolioWorkbenchPage.tsx, /src/components/GovernancePage.tsx, /src/components/EventCenterPage.tsx, /src/components/ValuationPage.tsx, /src/components/PositionRiskPage.tsx, /src/components/DecisionAuditPage.tsx, /src/components/SentimentPage.tsx, /src/components/ExpectationPage.tsx, /src/components/StockPoolPage.tsx, /src/components/ThesisPage.tsx, /src/components/ReviewPage.tsx, /src/components/StockResearchPage.tsx, /src/components/IndustryResearchPage.tsx, /src/components/ProductModulePage.tsx[22m
+[2m19:49:37[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/StrategyPage.tsx, /src/components/ReviewPage.tsx[22m
+[2m19:49:37[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/GovernancePage.tsx[22m
+[2m19:50:23[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/styles.css[22m
+[2m19:52:33[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/Layout.tsx[22m
+[2m19:52:33[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/GovernancePage.tsx[22m
+[2m19:52:33[22m [36m[1m[vite][22m[39m [33mhmr invalidate [39m[2m/src/components/Layout.tsx[22m Could not Fast Refresh ("ALL_SECTION_IDS" export is incompatible). Learn more at https://github.com/vitejs/vite-plugin-react/tree/main/packages/plugin-react#consistent-components-exports
+[2m19:52:33[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/pages/DashboardPage.tsx[22m
+[2m19:55:59[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/GovernancePage.tsx[22m
+[2m19:56:36[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/styles.css[22m
+[2m19:59:10[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/DecisionPage.tsx[22m
+[2m20:04:01[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/PortfolioWorkbenchPage.tsx, /src/components/GovernancePage.tsx, /src/components/EventCenterPage.tsx, /src/components/ValuationPage.tsx, /src/components/PositionRiskPage.tsx, /src/components/DecisionAuditPage.tsx, /src/components/SentimentPage.tsx, /src/components/ExpectationPage.tsx, /src/components/StockPoolPage.tsx, /src/components/ThesisPage.tsx, /src/components/ReviewPage.tsx, /src/components/StockResearchPage.tsx, /src/components/IndustryResearchPage.tsx, /src/components/ProductModulePage.tsx[22m
+[2m20:04:01[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/SentimentPage.tsx[22m
+[2m20:06:38[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/SentimentPage.tsx[22m
+[2m20:13:17[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/PortfolioWorkbenchPage.tsx, /src/components/GovernancePage.tsx, /src/components/EventCenterPage.tsx, /src/components/ValuationPage.tsx, /src/components/PositionRiskPage.tsx, /src/components/DecisionAuditPage.tsx, /src/components/SentimentPage.tsx, /src/components/ExpectationPage.tsx, /src/components/StockPoolPage.tsx, /src/components/ThesisPage.tsx, /src/components/ReviewPage.tsx, /src/components/StockResearchPage.tsx, /src/components/IndustryResearchPage.tsx, /src/components/ProductModulePage.tsx[22m
+[2m20:13:17[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/SentimentPage.tsx[22m
+[2m20:13:17[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/styles.css[22m
+[2m20:15:49[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/SentimentPage.tsx[22m
+[2m20:32:19[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/SentimentPage.tsx[22m
+[2m20:36:06[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/GovernancePage.tsx[22m
+[2m20:39:14[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/GovernancePage.tsx[22m
+[2m20:53:53[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/Layout.tsx[22m
+[2m20:53:53[22m [36m[1m[vite][22m[39m [33mhmr invalidate [39m[2m/src/components/Layout.tsx[22m Could not Fast Refresh ("ALL_SECTION_IDS" export is incompatible). Learn more at https://github.com/vitejs/vite-plugin-react/tree/main/packages/plugin-react#consistent-components-exports
+[2m20:53:53[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/pages/DashboardPage.tsx[22m
+[2m21:09:12[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/Layout.tsx[22m
+[2m21:09:12[22m [36m[1m[vite][22m[39m [33mhmr invalidate [39m[2m/src/components/Layout.tsx[22m Could not Fast Refresh ("ALL_SECTION_IDS" export is incompatible). Learn more at https://github.com/vitejs/vite-plugin-react/tree/main/packages/plugin-react#consistent-components-exports
+[2m21:09:12[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/pages/DashboardPage.tsx[22m
+[2m21:14:26[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/PortfolioWorkbenchPage.tsx, /src/components/GovernancePage.tsx, /src/components/EventCenterPage.tsx, /src/components/ValuationPage.tsx, /src/components/PositionRiskPage.tsx, /src/components/DecisionAuditPage.tsx, /src/components/SentimentPage.tsx, /src/components/ExpectationPage.tsx, /src/components/StockPoolPage.tsx, /src/components/ThesisPage.tsx, /src/components/ReviewPage.tsx, /src/components/StockResearchPage.tsx, /src/components/IndustryResearchPage.tsx, /src/components/ProductModulePage.tsx[22m
+[2m21:14:53[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/ReviewWorkbenchPage.tsx[22m
+[2m21:16:01[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/PortfolioWorkbenchPage.tsx, /src/components/GovernancePage.tsx, /src/components/EventCenterPage.tsx, /src/components/ValuationPage.tsx, /src/components/PositionRiskPage.tsx, /src/components/DecisionAuditPage.tsx, /src/components/SentimentPage.tsx, /src/components/ExpectationPage.tsx, /src/components/StockPoolPage.tsx, /src/components/ThesisPage.tsx, /src/components/ReviewPage.tsx, /src/components/StockResearchPage.tsx, /src/components/IndustryResearchPage.tsx, /src/components/ProductModulePage.tsx, /src/components/ReviewWorkbenchPage.tsx[22m
+[2m21:16:01[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/ReviewWorkbenchPage.tsx[22m
+[2m21:19:53[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/ReviewPage.tsx[22m
+[2m21:19:53[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/ReviewWorkbenchPage.tsx[22m
+[2m21:25:26[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/PortfolioWorkbenchPage.tsx, /src/components/GovernancePage.tsx, /src/components/EventCenterPage.tsx, /src/components/ValuationPage.tsx, /src/components/PositionRiskPage.tsx, /src/components/DecisionAuditPage.tsx, /src/components/SentimentPage.tsx, /src/components/ExpectationPage.tsx, /src/components/StockPoolPage.tsx, /src/components/ThesisPage.tsx, /src/components/ReviewPage.tsx, /src/components/StockResearchPage.tsx, /src/components/IndustryResearchPage.tsx, /src/components/ProductModulePage.tsx, /src/components/ReviewWorkbenchPage.tsx[22m
+[2m21:25:40[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/ReviewPage.tsx[22m
+[2m21:25:52[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/ReviewPage.tsx[22m
+[2m21:25:59[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/ReviewPage.tsx[22m
+[2m21:31:40[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/PortfolioWorkbenchPage.tsx, /src/components/GovernancePage.tsx, /src/components/EventCenterPage.tsx, /src/components/ValuationPage.tsx, /src/components/PositionRiskPage.tsx, /src/components/DecisionAuditPage.tsx, /src/components/SentimentPage.tsx, /src/components/ExpectationPage.tsx, /src/components/StockPoolPage.tsx, /src/components/ThesisPage.tsx, /src/components/ReviewPage.tsx, /src/components/StockResearchPage.tsx, /src/components/IndustryResearchPage.tsx, /src/components/ProductModulePage.tsx, /src/components/ReviewWorkbenchPage.tsx[22m
+[2m21:32:23[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/ReviewWorkbenchPage.tsx[22m
+[2m21:32:50[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/ReviewWorkbenchPage.tsx[22m
+[2m21:32:50[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/styles.css[22m
+[2m21:51:21[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/ReviewWorkbenchPage.tsx[22m
+[2m21:52:01[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/styles.css[22m
+[2m21:53:06[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/ReviewWorkbenchPage.tsx[22m
+[2m21:54:11[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/ReviewWorkbenchPage.tsx[22m
+[2m21:55:09[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/ReviewWorkbenchPage.tsx[22m
+[2m22:01:58[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/ReviewWorkbenchPage.tsx[22m
+[2m22:01:58[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/styles.css[22m
+[2m22:02:20[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/ReviewWorkbenchPage.tsx[22m
+[2m22:12:57[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/PortfolioWorkbenchPage.tsx, /src/components/GovernancePage.tsx, /src/components/EventCenterPage.tsx, /src/components/ValuationPage.tsx, /src/components/PositionRiskPage.tsx, /src/components/DecisionAuditPage.tsx, /src/components/SentimentPage.tsx, /src/components/ExpectationPage.tsx, /src/components/StockPoolPage.tsx, /src/components/ThesisPage.tsx, /src/components/ReviewPage.tsx, /src/components/StockResearchPage.tsx, /src/components/IndustryResearchPage.tsx, /src/components/ProductModulePage.tsx, /src/components/ReviewWorkbenchPage.tsx[22m
+[2m22:12:57[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/ReviewWorkbenchPage.tsx[22m
+[2m22:12:57[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/styles.css[22m
+[2m22:25:18[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/PortfolioWorkbenchPage.tsx, /src/components/GovernancePage.tsx, /src/components/EventCenterPage.tsx, /src/components/ValuationPage.tsx, /src/components/PositionRiskPage.tsx, /src/components/DecisionAuditPage.tsx, /src/components/SentimentPage.tsx, /src/components/ExpectationPage.tsx, /src/components/StockPoolPage.tsx, /src/components/ThesisPage.tsx, /src/components/ReviewPage.tsx, /src/components/StockResearchPage.tsx, /src/components/IndustryResearchPage.tsx, /src/components/ProductModulePage.tsx, /src/components/ReviewWorkbenchPage.tsx[22m
+[2m22:25:18[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/ReviewWorkbenchPage.tsx[22m
+[2m22:25:30[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/styles.css[22m
+[2m22:25:59[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/ReviewWorkbenchPage.tsx[22m
+[2m22:29:46[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/ReviewWorkbenchPage.tsx[22m
+[2m22:34:24[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/PortfolioWorkbenchPage.tsx, /src/components/GovernancePage.tsx, /src/components/EventCenterPage.tsx, /src/components/ValuationPage.tsx, /src/components/PositionRiskPage.tsx, /src/components/DecisionAuditPage.tsx, /src/components/SentimentPage.tsx, /src/components/ExpectationPage.tsx, /src/components/StockPoolPage.tsx, /src/components/ThesisPage.tsx, /src/components/ReviewPage.tsx, /src/components/StockResearchPage.tsx, /src/components/IndustryResearchPage.tsx, /src/components/ProductModulePage.tsx, /src/components/ReviewWorkbenchPage.tsx[22m
+[2m22:34:24[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/ReviewWorkbenchPage.tsx[22m
+[2m22:34:24[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/styles.css[22m
+[2m22:42:01[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/PortfolioWorkbenchPage.tsx, /src/components/GovernancePage.tsx, /src/components/EventCenterPage.tsx, /src/components/ValuationPage.tsx, /src/components/PositionRiskPage.tsx, /src/components/DecisionAuditPage.tsx, /src/components/SentimentPage.tsx, /src/components/ExpectationPage.tsx, /src/components/StockPoolPage.tsx, /src/components/ThesisPage.tsx, /src/components/ReviewPage.tsx, /src/components/StockResearchPage.tsx, /src/components/IndustryResearchPage.tsx, /src/components/ProductModulePage.tsx, /src/components/ReviewWorkbenchPage.tsx[22m
+[2m22:42:39[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/ReviewWorkbenchPage.tsx[22m
+[2m22:42:51[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/ReviewWorkbenchPage.tsx[22m
+[2m22:47:21[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/ReviewWorkbenchPage.tsx[22m
+[2m22:47:37[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/components/ReviewWorkbenchPage.tsx[22m
+[2m22:47:37[22m [36m[1m[vite][22m[39m [32mhmr update [39m[2m/src/styles.css[22m

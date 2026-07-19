@@ -3,6 +3,7 @@ import {
   createReview,
   fetchDecisionSnapshots,
   fetchReviewSuggestion,
+  generateLlmReviewDraft,
   fetchReviews,
   type DecisionSnapshot,
   type ReviewRecord,
@@ -40,6 +41,8 @@ export default function ReviewPage() {
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [suggesting, setSuggesting] = useState(false);
+  const [llmDrafting, setLlmDrafting] = useState(false);
+  const [llmMeta, setLlmMeta] = useState("");
   const [error, setError] = useState("");
 
   const reviewedIds = useMemo(
@@ -85,6 +88,30 @@ export default function ReviewPage() {
       setError(reason instanceof Error ? reason.message : String(reason));
     } finally {
       setSuggesting(false);
+    }
+  }
+
+  async function generateDraft() {
+    const target = selected ?? selectedOrFirstAwaiting;
+    if (!target) { setError("请先选择一条待复核决策。"); return; }
+    setSelectedId(target.id);
+    setLlmDrafting(true);
+    setError("");
+    try {
+      const result = await generateLlmReviewDraft(target.id);
+      setErrorType(result.draft.error_type || "其他");
+      setAttribution([
+        result.draft.summary,
+        result.draft.outcome_assessment,
+        result.draft.attribution,
+        ...result.draft.evidence_points.map((item) => `证据：${item}`),
+      ].filter(Boolean).join("\n"));
+      setLessons(result.draft.lessons || "");
+      setLlmMeta(`${result.model} · 置信度 ${(result.draft.confidence * 100).toFixed(0)}%${result.draft.limitations.length ? ` · 限制：${result.draft.limitations.join("；")}` : ""}`);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setLlmDrafting(false);
     }
   }
 
@@ -137,6 +164,20 @@ export default function ReviewPage() {
       </div>
 
       {error && <div className="alert">{error}</div>}
+
+      <div className="card decision-panel">
+        <div className="quant-analyze-section-head">
+          <h3>你在复核什么？</h3>
+          <em>这里仅处理历史决策复盘</em>
+        </div>
+        <div className="decision-issue warning">
+          <strong>核心问题：系统当时的这次买入、卖出或持有判断，事后看是否正确？</strong>
+          <br />
+          先从待复核队列选择一条决策；系统可以估算后续收益，你再确认错误类型、补充归因，并写下以后应如何改进。
+          <br />
+          公告证据确认、模型上线审批、异常任务和数据质量问题不在本页处理，请返回“人工复核队列”进入对应模块。
+        </div>
+      </div>
 
       <div className="decision-grid decision-metrics">
         <div className="card metric-card">
@@ -229,6 +270,14 @@ export default function ReviewPage() {
           <div className="review-focus-actions">
             <button
               type="button"
+              className="button primary"
+              disabled={!selectedOrFirstAwaiting || llmDrafting}
+              onClick={() => void generateDraft()}
+            >
+              {llmDrafting ? "DeepSeek 分析中…" : "DeepSeek 生成复核草稿"}
+            </button>
+            <button
+              type="button"
               className="button ghost"
               disabled={!selectedOrFirstAwaiting}
               onClick={() => {
@@ -246,6 +295,7 @@ export default function ReviewPage() {
               {suggesting ? "计算中…" : "自动估算后续价格收益"}
             </button>
           </div>
+          {llmMeta && <div className="module-output"><i />{llmMeta} · 草稿必须人工确认后保存</div>}
         </div>
       </div>
 

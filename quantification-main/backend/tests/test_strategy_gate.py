@@ -1,6 +1,6 @@
 import pytest
 
-from app.services.market_context import _transparent_regime, bocpd_change_alarm, score_market_sentiment, score_theme_narratives
+from app.services.market_context import _transparent_regime, bocpd_change_alarm, classify_market_profile, score_market_sentiment, score_theme_narratives
 from app.services.strategy_gate import evaluate_strategy_gate
 
 
@@ -84,3 +84,41 @@ def test_bocpd_extreme_change_triggers_temporary_risk_protection() -> None:
     )
     assert gate["risk_budget_multiplier"] == .70
     assert gate["change_alarm_multiplier"] == .70
+
+
+def test_hierarchical_market_profiles_cover_twelve_explainable_substates() -> None:
+    cases = [
+        ("S0", {"breadth": .75, "average_return": .02, "volume_ratio": 1.1, "crowding": .3}, "P01"),
+        ("S0", {"breadth": .50, "average_return": .01, "volume_ratio": 1.2, "crowding": .3}, "P02"),
+        ("S0", {"breadth": .75, "average_return": .02, "volume_ratio": 1.2, "crowding": .8}, "P03"),
+        ("S1", {"breadth": .50, "average_return": 0, "volume_ratio": 1.0}, "P04"),
+        ("S1", {"breadth": .30, "average_return": 0, "volume_ratio": 1.0}, "P05"),
+        ("S1", {"breadth": .50, "average_return": 0, "volume_ratio": .7}, "P06"),
+        ("S2", {"breadth": .35, "average_return": -.01, "volume_ratio": 1.0}, "P07"),
+        ("S2", {"breadth": .35, "average_return": -.01, "volume_ratio": .7}, "P08"),
+        ("S2", {"breadth": .15, "average_return": -.04, "volume_ratio": 1.2}, "P09"),
+        ("S3", {"breadth": .65, "average_return": .01, "volume_ratio": 1.0}, "P10"),
+        ("S3", {"breadth": .45, "average_return": .01, "volume_ratio": 1.2}, "P11"),
+        ("S3", {"breadth": .45, "average_return": .01, "volume_ratio": .9}, "P12"),
+    ]
+    profiles = [classify_market_profile(state, observations) for state, observations, _ in cases]
+
+    assert [profile["code"] for profile in profiles] == [expected for _, _, expected in cases]
+    assert len({profile["code"] for profile in profiles}) == 12
+    assert all(.85 <= profile["risk_budget_multiplier"] <= 1 for profile in profiles)
+    assert all(profile["parent_state"] == case[0] for profile, case in zip(profiles, cases))
+
+
+def test_market_profile_can_only_reduce_parent_risk_budget() -> None:
+    baseline = evaluate_strategy_gate(
+        research_score=80, confidence=.8, data_quality=90, risk_eligible=True,
+        market_state="S1", sentiment_score=70, expectation_score=70, valuation_score=70,
+    )
+    profiled = evaluate_strategy_gate(
+        research_score=80, confidence=.8, data_quality=90, risk_eligible=True,
+        market_state="S1", sentiment_score=70, expectation_score=70, valuation_score=70,
+        market_profile_multiplier=.90,
+    )
+
+    assert profiled["risk_budget_multiplier"] < baseline["risk_budget_multiplier"]
+    assert profiled["market_profile_multiplier"] == .90

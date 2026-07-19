@@ -403,7 +403,7 @@ risk_score
 - 全市场估值和股债收益差
 - 大小盘、成长价值和高低波动风格
 
-生产路线固定为附录 B 的四状态 HSMM + BOCPD。历史数据不足六年时，规则状态机是唯一生产门控，HSMM影子运行；满足训练和上线硬指标后，HSMM自动进入既定生产角色，不再重新选模型。
+生产路线固定为附录 B 的层级市场状态模型：四状态 HSMM 负责稳定的生产风险门控，十二类市场画像负责状态内解释、选股偏好和保守仓位微调，BOCPD负责突变报警。历史数据不足六年时，透明四状态机是唯一生产门控，HSMM影子运行；满足训练和上线硬指标后，HSMM进入既定生产角色。十二类画像不得突破父状态风险预算上限。
 
 ## P2-2 市场情绪引擎
 
@@ -1105,9 +1105,11 @@ event_impact(t) = initial_impact × exp(-t / half_life)
 | 盈利周期 | 20% |
 | 估值与风险溢价 | 15% |
 
-市场状态实现固定遵循附录B：数据不足六年时透明状态机生产运行；达到上线条件后四状态HSMM生产运行；BOCPD始终作为突变报警器。普通HMM不进入候选。短期波动每日更新，相关性每周更新，基本面状态在新数据披露时更新。
+市场状态实现固定遵循附录B：数据不足六年时透明四状态机生产运行；达到上线条件后四状态HSMM生产运行；十二类市场画像始终作为第二层解释和微调层；BOCPD始终作为突变报警器。普通HMM不进入候选。短期波动和市场画像每日更新，相关性每周更新，基本面状态在新数据披露时更新。
 
 ### A3.10 市场情绪引擎
+
+日度观测的生产数据源与覆盖门控：北向资金使用 TuShare `moneyflow_hsgt` 的 `north_money`，每日同步并保留原始证据；龙头持续性使用成交额前 50 且当日上涨股票的滚动 Jaccard 持续度；价格—基本面背离使用点时可得的 `fina_indicator`（优先利润同比，其次营收同比，最后 ROE）与市场价格信号计算。任一观测无合格覆盖时才按中性值处理，并在接口中返回覆盖数和限制说明。
 
 | 子项 | 权重 |
 |---|---:|
@@ -1355,7 +1357,7 @@ LLM 的文本判断必须单独测量字段准确率、证据引用正确率、�
 | 投资逻辑状态 | 贝叶斯证据更新 + 必要条件状态机 | 规则告警 | LLM自由裁决逻辑是否成立 |
 | 模型解释 | SHAP + 单调性/局部敏感度 | 规则证据链 | 只展示一个总分 |
 
-## B3. 市场状态：固定采用 HSMM + BOCPD
+## B3. 市场状态：四状态 HSMM + 十二类市场画像 + BOCPD
 
 ### B3.1 为什么不是普通马尔可夫链
 
@@ -1371,6 +1373,25 @@ S3 恐慌修复：极端风险后波动高但宽度和流动性边际修复
 ```
 
 状态含义固定，模型标签不得因训练结果任意互换。训练后根据状态中心特征自动映射，再由规则校验。
+
+四状态是生产风险门控的第一层，不承担全部市场描述。系统在每个父状态内继续识别三个可解释子状态，形成十二类市场画像：
+
+| 父状态 | 子状态代码 | 市场画像 | 主要识别特征 | 风险预算微调 |
+|---|---|---|---|---:|
+| S0 风险扩张 | P01 | 全面扩张 | 宽度强、收益正、结构健康 | 1.00 |
+| S0 风险扩张 | P02 | 流动性驱动 | 宽度一般、成交改善、趋势向上 | 0.98 |
+| S0 风险扩张 | P03 | 拥挤扩张 | 高拥挤或涨停集中 | 0.90 |
+| S1 震荡分化 | P04 | 均衡震荡 | 宽度、收益和流动性均衡 | 1.00 |
+| S1 震荡分化 | P05 | 宽度分化 | 指数与宽度分离或横截面分化 | 0.95 |
+| S1 震荡分化 | P06 | 缩量震荡 | 成交收缩、方向不明确 | 0.90 |
+| S2 风险收缩 | P07 | 趋势收缩 | 趋势偏弱但未出现流动性冲击 | 0.95 |
+| S2 风险收缩 | P08 | 流动性收缩 | 缩量、换手下降或非流动性上升 | 0.90 |
+| S2 风险收缩 | P09 | 恐慌抛售 | 极端负收益或跌停压力显著 | 0.85 |
+| S3 恐慌修复 | P10 | 宽度修复 | 上涨宽度率先恢复 | 1.00 |
+| S3 恐慌修复 | P11 | 流动性修复 | 成交和风险偏好率先恢复 | 0.98 |
+| S3 恐慌修复 | P12 | 脆弱反弹 | 价格反弹但宽度和流动性尚弱 | 0.90 |
+
+子状态只允许在父状态预算内做保守微调，最终市场预算为 `父状态预算 × 子状态微调`，不得因子状态、主题或模型置信度突破父状态上限。子状态每日更新并冻结到决策快照，用于解释、风格偏好、候选排序和仓位微调，不单独触发生产级牛熊切换。
 
 ### B3.3 固定输入
 
@@ -1388,7 +1409,8 @@ S3 恐慌修复：极端风险后波动高但宽度和流动性边际修复
 ### B3.4 固定分布与持续期
 
 - 观测分布：多元 Student-t，降低肥尾和异常值影响。
-- 状态数：固定 4，不根据样本内 BIC 临时改成 2、3、5 状态。
+- 生产父状态数：固定 4，不根据样本内 BIC 临时改成 2、3、5 状态。
+- 市场画像数：生产字典固定 12；允许在 Challenger 研究中比较 4、6、8、10、12 个候选聚类，但不得直接替换四状态父层或绕过生产晋升流程。
 - 持续期：截断 Negative Binomial；最短 2 周，最长 52 周。
 - 训练窗口：最近 10 年或全部高质量历史，取较短者；少于 6 年不得上线。
 - 参数更新：每月重估；状态概率每日过滤更新。
@@ -1416,6 +1438,8 @@ p_change_1d ≥ 0.80 → 临时将新增风险预算乘以 0.70
 | S3 恐慌修复 | 0.70 | 0.50 | 1.25 | 0.75 |
 
 乘数是组合门控，不修改公司历史质量分。
+
+十二类市场画像的微调乘数在上述父状态乘数之后执行，且只允许取 `0.85～1.00`。上线验收除收益和回撤外，还必须检查画像覆盖率、月度稳定性、状态占用下限、切换频率、交易成本后收益和跨训练窗口语义一致性；任一画像长期样本不足或语义漂移时，自动合并回父状态，不允许为了追求更多状态而保留无稳定证据的类别。
 
 ## B4. 宏观和行业周期：动态因子模型 + Kalman Filter
 
@@ -2049,3 +2073,199 @@ BLOCKED：无可执行路线，需要外部权限/数据源/产品决策
 7. ADR-0001，声明本计划书附录A/B/C为V1基线。
 
 这些是编码输入，不是待讨论方案。
+
+# 附录 D：架构基线与机器可执行契约
+
+本附录合并并取代原独立文档 `ADR-0001-v1-baseline.md`、`ALIS_DESIGN.md`、
+`postgresql_partition_inventory.md`、`data_asset_contract.yaml`、
+`model_feature_label_contract.yaml`、`portfolio_constraints.yaml`、
+`redis_stream_contract.yaml` 和 `llm_evidence_schema.json`。
+
+实施状态、当前缺口和完成度不在本附录维护，以独立审计文档为准；开发任务状态以开发任务分解表为准。
+
+## D1. ADR-0001：V1 计划书基线
+
+状态：`accepted`
+
+ALIS V1 以本计划书及附录 A/B/C/D 作为实现基线。固定模型职责、数据时间一致性、风险硬规则、模拟盘与真实交易隔离不得在编码过程中临时改写。
+
+允许调整的内容仅包括：经滚动样本外验证证明有必要的模型参数、数据源优先级、性能参数和经审计的运行配置。所有调整必须保留版本、证据和回退路径。
+
+## D2. 系统分层与职责
+
+```mermaid
+flowchart TD
+  A["外部数据源"] --> B["采集调度层"]
+  B --> C["Raw 原始留痕层"]
+  C --> D["Clean 标准化层"]
+  D --> E["Feature 指标与因子层"]
+  E --> F["Research 研究状态层"]
+  F --> G["Decision 投资逻辑与组合层"]
+  G --> H["Review 复盘学习层"]
+```
+
+- 外部数据源：Tushare、交易所与巨潮正式披露、网页补充源和受控人工导入。
+- Raw 层：保存 `source`、`api_name`、`params`、`payload`、业务日期、`available_time` 和 `ingestion_time`，支持追溯当时可见事实。
+- Clean 层：统一股票代码、交易日期、报告期、公告发布时间、指标名称和数据类型。
+- Feature 层：计算质量、成长、现金流、治理、行业、预期、估值、情绪、叙事、技术和风险特征。
+- Research 层：输出多维研究状态，不允许用单一总分替代证据和状态。
+- Decision 层：维护投资逻辑、假设、必要条件、目标权重、组合约束和决策快照。
+- Review 层：基于冻结证据完成收益归因、错误分类、模型复核和改进闭环。
+
+网页/F10 数据只作为最低优先级 `web_fallback`，仅在正式源无权限、失败或字段缺失时使用。任何补充源都必须记录来源、采集时间和可用时间。
+
+## D3. 数据资产契约 V1
+
+```yaml
+version: v1
+database: alis_data
+assets:
+  - key: daily_price
+    frequency: daily
+    primary_source: tushare.daily
+    fallback: [web_quote, ocr_quote]
+    required_fields: [ts_code, trade_date, open, high, low, close, vol, amount]
+    quality: [unique_ts_code_trade_date, close_gt_zero, available_time_required]
+  - key: financial_indicator
+    frequency: quarterly
+    primary_source: tushare.fina_indicator
+    fallback: [exchange_report, web_f10, ocr_report]
+    required_fields: [ts_code, end_date, ann_date]
+    quality: [point_in_time, report_period_required, source_provenance]
+  - key: announcements
+    frequency: event
+    primary_source: exchange_disclosure
+    fallback: [cninfo, web_fallback]
+    quality: [deduplicate_by_source_id, published_at_required, raw_document_hash]
+update_policy:
+  incremental_first: true
+  retry: exponential_jitter
+  empty_result_is_failure: true
+  resume_from_checkpoint: true
+```
+
+## D4. 模型特征与标签契约 V1
+
+```yaml
+version: v1
+features:
+  point_in_time: true
+  allowed_lookback_days: [20, 60, 120, 252]
+  groups: [quality, growth, cashflow, governance, industry, expectation, valuation, sentiment, narrative, technical, risk]
+labels:
+  horizons_days: [5, 10, 20]
+  target: forward_total_return_after_cost
+training:
+  split: expanding_walk_forward
+  minimum_rows: 200
+  promotion_requires: [holdout_lift_gt_zero, walk_forward_lift_gt_zero]
+  fallback: elastic_net_or_linear
+```
+
+所有训练、验证和回测必须使用当时可见数据，按 `available_time` 防止前视偏差。模型晋升不得绕过 holdout 与 walk-forward 双重验收。
+
+## D5. 组合约束契约 V1
+
+```yaml
+version: v1
+initial_cash: 200000
+assets: [CN_STOCK, CN_ETF]
+single_name_limit: 0.15
+core_single_name_limit: 0.25
+industry_limit: 0.25
+max_drawdown_target: 0.10
+max_empty_trade_days_without_explanation: 3
+monthly_turnover_limit: 0.30
+risk:
+  primary: constrained_cvar
+  covariance: ledoit_wolf_shrinkage
+  fallback: hrp_inverse_volatility
+  optimizer_failure: keep_previous_weights_then_risk_budget
+```
+
+组合约束是硬门控，不得被研究评分、LLM 建议或优化器软目标覆盖。优化失败时必须保留原权重并进入风险预算降级路径。
+
+## D6. Redis Stream 契约 V1
+
+```yaml
+version: v1
+streams:
+  task_queue: alis:data-platform:tasks
+  runtime_logs: alis:data-platform:logs
+consumer_groups:
+  task_queue: data-platform-workers
+message:
+  required: [task_id, task_type, payload, created_at, attempt]
+  ack: after_transactional_write
+  reclaim_after_seconds: 120
+  max_attempts: 5
+  failure_action: persist_dead_letter_and_mark_failed
+```
+
+任务消息只在数据库事务写入成功后确认。超过最大尝试次数时必须持久化死信并标记失败，不允许静默丢弃。
+
+## D7. LLM 证据输出契约 V1
+
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": ["event_type", "direction", "confidence", "evidence"],
+  "properties": {
+    "event_type": {"type": "string"},
+    "direction": {"enum": ["positive", "negative", "neutral"]},
+    "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+    "evidence": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["quote", "location"],
+        "properties": {
+          "quote": {"type": "string"},
+          "location": {"type": "string"}
+        }
+      }
+    },
+    "entities": {"type": "array", "items": {"type": "string"}},
+    "impact_horizon": {"enum": ["short", "medium", "long", "unknown"]}
+  },
+  "additionalProperties": false
+}
+```
+
+LLM 只能生成结构化研究候选和证据引用，不能直接写入最终事实、绕过人工或规则校验，也不能直接决定交易。
+
+## D8. PostgreSQL 分区与索引清单 V1
+
+账户、策略、持仓、任务和事件状态等业务状态表保持普通表，使用主键、外键和业务查询索引。
+
+以下时间序列表按 `trade_date` 或 `available_time` 规划年度分区：
+
+- `daily_price`
+- `daily_basic`
+- `financial_indicator`
+- `factor_value`
+- `valuation_snapshot`
+- `quant_run_task_runs`
+- `quant_performance_reports`
+
+核心索引：
+
+- `(ts_code, trade_date)` 唯一索引。
+- `(available_time, source)` 时间一致性索引。
+- `(task_id, execute_date)` 任务断点索引。
+- `(period_type, period, task_id)` 绩效幂等索引。
+
+具体分区大小按线上行数、写入吞吐和查询延迟扩容。V1 不预先引入 ClickHouse；只有 PostgreSQL 的容量或查询 SLO 经持续测量无法满足，才启动存储架构 ADR。
+
+## D9. 文档输出与维护约束
+
+后续 AI 参与项目维护时，默认禁止新增 `.md` 文档文件；只能修改既有 `.md` 文档，或在用户明确指定的非 Markdown 交付物中工作。
+
+新信息应按职责合并进现有文件：
+- 工程计划、架构决议、接口契约和实现边界，统一维护在本计划书。
+- 当前实现差距、验收状态和缺口，统一维护在审计文档。
+- 开发任务拆解、状态跟踪、测试状态和完成状态，统一维护在开发任务分解表。
+- 对话记录只维护在既有 `docs/conversations/` 文件中。
+
+如确需新增 `.md`，必须先获得用户明确同意，并说明为什么不能合并进既有文档。

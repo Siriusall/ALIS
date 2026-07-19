@@ -8,7 +8,7 @@ def evaluate_strategy_gate(
     market_state: str, sentiment_score: float, expectation_score: float, valuation_score: float,
     theme_score: float = 0.0, theme_verified: bool = False,
     valuation_upside: float | None = None, required_base_margin: float = .10,
-    change_alarm_probability: float = 0.0,
+    change_alarm_probability: float = 0.0, market_profile_multiplier: float = 1.0,
 ) -> dict[str, Any]:
     blockers: list[str] = []
     if not risk_eligible: blockers.append("硬风险门控未通过")
@@ -24,6 +24,8 @@ def evaluate_strategy_gate(
     valuation_multiplier = .75 + max(0.0, min(100.0, valuation_score)) / 400.0
     theme_bonus = min(.10, max(0.0, theme_score - 60) / 400.0) if theme_verified else 0.0
     risk_budget_multiplier = 0.0 if not admitted else min(1.0, market_multiplier * sentiment_multiplier * expectation_multiplier * valuation_multiplier + theme_bonus)
+    profile_multiplier = max(.85, min(1.0, float(market_profile_multiplier or 1.0)))
+    risk_budget_multiplier *= profile_multiplier
     safety_margin_multiplier = 1.35 if state in {"S2", "stress", "bear"} else 1.25 if state in {"S3", "recovery"} else 1.10 if state in {"S1", "sideways"} else 1.0
     required_safety_margin = max(0.0, float(required_base_margin)) * safety_margin_multiplier
     if valuation_upside is not None and float(valuation_upside) < required_safety_margin:
@@ -42,6 +44,7 @@ def evaluate_strategy_gate(
         "valuation_upside": None if valuation_upside is None else round(float(valuation_upside), 6),
         "change_alarm_probability": round(float(change_alarm_probability or 0), 6),
         "change_alarm_multiplier": change_alarm_multiplier,
+        "market_profile_multiplier": profile_multiplier,
         "theme_used": bool(theme_verified),
         "explanation": "硬门控决定能否进入候选；市场、情绪、预期和估值只调整风险预算，不覆盖企业事实。",
     }

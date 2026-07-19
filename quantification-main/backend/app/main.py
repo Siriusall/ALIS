@@ -31,6 +31,7 @@ from app.db.store import database_health as primary_database_health, init_db
 from app.services.quant_task_runner import resume_quant_tasks_on_startup, start_auto_simulation_scheduler
 from app.data_platform.services.daily_update import start_daily_update_scheduler
 from app.services.model_governance_scheduler import start_model_governance_scheduler
+from app.services.manual_review_triage import start_manual_review_triage_scheduler
 from app.data_platform.db import database_health as data_platform_database_health
 from app.data_platform.db import init_db as init_data_platform_db
 from app.data_platform.redis_store import start_task_worker
@@ -67,6 +68,7 @@ def startup() -> None:
         start_auto_simulation_scheduler()
         start_daily_update_scheduler()
         start_model_governance_scheduler()
+        start_manual_review_triage_scheduler()
     except Exception as exc:  # noqa: BLE001
         logger.warning("Failed to reconcile interrupted quant tasks: %s", str(exc)[:120])
     try:

@@ -132,7 +132,11 @@ def _market_overview() -> dict[str, Any]:
         }
     state = str((context.get("market_state") or {}).get("state") or "unknown")
     context["market_state"]["label"] = MARKET_STATE_LABELS.get(state, "状态待确认")
-    context["market_state"]["risk_budget_multiplier"] = MARKET_RISK_BUDGETS.get(state, 0.55)
+    parent_multiplier = MARKET_RISK_BUDGETS.get(state, 0.55)
+    profile_multiplier = max(.85, min(1.0, float((context.get("market_profile") or {}).get("risk_budget_multiplier") or 1.0)))
+    context["market_state"]["parent_risk_budget_multiplier"] = parent_multiplier
+    context["market_state"]["profile_risk_budget_multiplier"] = profile_multiplier
+    context["market_state"]["risk_budget_multiplier"] = round(parent_multiplier * profile_multiplier, 4)
     try:
         theme_items = list_themes(promotable_only=True, limit=20).get("items") or []
     except Exception as exc:  # noqa: BLE001
@@ -157,6 +161,8 @@ def _market_overview() -> dict[str, Any]:
     context["position_gate"] = {
         "allow_new_exposure": bool(context.get("ok")) and risk_status != "blocked",
         "market_multiplier": state_multiplier,
+        "parent_market_multiplier": parent_multiplier,
+        "market_profile_multiplier": profile_multiplier,
         "portfolio_multiplier": portfolio_multiplier,
         "combined_risk_budget_multiplier": combined_multiplier,
         "reason": "组合风险存在硬约束" if risk_status == "blocked" else "组合风险存在告警，按收缩预算执行" if risk_status == "warning" else "市场与组合风险门控通过" if risk_status == "ready" else "组合风险数据不足，保守收缩预算",

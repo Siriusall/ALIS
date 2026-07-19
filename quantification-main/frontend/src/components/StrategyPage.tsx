@@ -76,7 +76,12 @@ export default function StrategyPage() {
       const result = await fetchStrategyWorkbench({ limit: 10, include_details: true });
       setWorkbench(result);
       setTrainRun(result.model.latest_train_run ?? null);
-      setTraining(result.model.latest_train_run?.status === "running");
+      const latestRun = result.model.latest_train_run ?? null;
+      const isRunning = latestRun?.status === "running" || latestRun?.status === "queued";
+      setTraining(isRunning);
+      if (isRunning && latestRun && pollRef.current == null) {
+        pollRef.current = window.setTimeout(() => pollTrainRun(latestRun.id), 1200);
+      }
     } catch (err) {
       setMessage(err instanceof Error ? err.message : "策略工作台读取失败");
     } finally {
@@ -97,10 +102,11 @@ export default function StrategyPage() {
   }
 
   async function pollTrainRun(runId: number) {
+    pollRef.current = null;
     try {
       const run = await fetchModelTrainRun(runId);
       setTrainRun(run);
-      if (run.status === "running") {
+      if (run.status === "running" || run.status === "queued") {
         pollRef.current = window.setTimeout(() => pollTrainRun(runId), 1200);
         return;
       }
@@ -136,7 +142,7 @@ export default function StrategyPage() {
         resultMessage = `HSMM 影子训练未完成：${result.status || "训练历史不足或 API 数据不可用"}`;
       } else {
         const validation = String(result.validation?.status || "完成");
-        resultMessage = `HSMM 影子训练完成：${result.version || "新版本"}，OOS 验证=${validation}。仅使用三条指数的紧凑 API 训练数据。`;
+        resultMessage = `HSMM 影子训练完成：${result.version || "新版本"}，OOS 验证=${validation}。已使用全市场历史聚合特征和三条宽基指数锚点。`;
       }
       await refresh();
       setMessage(resultMessage);
@@ -179,6 +185,32 @@ export default function StrategyPage() {
         </div>
 
         {message && <div className="alert">{message}</div>}
+
+        <div className={`card model-training-status model-training-status-${trainRun?.status || "idle"}`}>
+          <div className="product-module-head">
+            <div>
+              <h3>模型训练状态</h3>
+              <p>
+                {trainRun
+                  ? `任务 #${trainRun.id} · ${trainRun.status === "running" ? "正在训练" : trainRun.status}`
+                  : "当前没有训练记录"}
+              </p>
+            </div>
+            <strong>{Math.round(Number(trainRun?.progress || 0) * 100)}%</strong>
+          </div>
+          {trainRun && (
+            <>
+              <div className="task-progress" aria-label="模型训练进度">
+                <div className="bar"><i style={{ width: `${Math.round(Number(trainRun.progress || 0) * 100)}%` }} /></div>
+              </div>
+              <div className="decision-two-col" style={{ marginTop: 12 }}>
+                <span>当前阶段</span><strong>{trainRun.phase || "准备中"}</strong>
+                <span>实时消息</span><strong>{trainRun.error || trainRun.message || "等待进度更新"}</strong>
+                <span>最近更新</span><strong>{trainRun.updated_at ? formatGmt8Time(trainRun.updated_at) : "—"}</strong>
+              </div>
+            </>
+          )}
+        </div>
 
         <div className="product-module-grid">
           <article className="product-module-card">
@@ -248,7 +280,7 @@ export default function StrategyPage() {
               <span>阶段</span><strong>{trainRun?.phase || "—"}</strong>
               <span>进度</span><strong>{Math.round(Number(trainRun?.progress || 0) * 100)}%</strong>
               <span>消息</span><strong>{trainRun?.error || trainRun?.message || "—"}</strong>
-              <span>HSMM 数据范围</span><strong>训练触发时 API 拉取 3 条指数；不落全市场十年明细</strong>
+              <span>HSMM 数据范围</span><strong>全市场历史日线聚合特征 + 沪深300 / 中证500 / 中证1000指数锚点</strong>
             </div>
             <div className="quant-analyze-toolbar" style={{ marginTop: 12 }}>
               <button type="button" className="quant-analyze-confirm-btn" onClick={handleTrain} disabled={training}>

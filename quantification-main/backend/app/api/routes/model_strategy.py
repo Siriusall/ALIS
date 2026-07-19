@@ -77,6 +77,7 @@ class StrategyGateRequest(BaseModel):
     valuation_score: float = Field(50, ge=0, le=100)
     theme_score: float = Field(0, ge=0, le=100)
     theme_verified: bool = False
+    market_profile_multiplier: float = Field(1.0, ge=.85, le=1.0)
 
 
 class BlackLittermanRequest(BaseModel):
@@ -333,8 +334,12 @@ def model_strategy_promote(model_version_id: int) -> dict:
         )
     if str(validation.get("status")) != "passed" or float(metrics.get("lift", 0) or 0) <= 0 or float(metrics.get("walk_forward_lift", 0) or 0) <= 0:
         raise HTTPException(status_code=409, detail="模型未同时通过 holdout 与 walk-forward 晋升门槛")
+    from app.services.review_learning import model_feedback_gate
+    feedback = model_feedback_gate(str(version.get("version") or ""))
+    if not feedback.get("passed"):
+        raise HTTPException(status_code=409, detail={"code": "review_feedback_gate_blocked", "review_feedback": feedback})
     set_active_model_version(model_version_id)
-    return {"ok": True, "model_version_id": model_version_id, "status": "active"}
+    return {"ok": True, "model_version_id": model_version_id, "status": "active", "review_feedback": feedback}
 
 
 @router.post("/model-strategy/rollback/{model_version_id}")

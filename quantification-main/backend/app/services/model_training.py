@@ -37,10 +37,8 @@ FEATURES = [
 def _require_compact_api_training_history(refresh: dict[str, Any]) -> dict[str, Any]:
     """Validate the plan's on-demand 6-10 year training data contract.
 
-    This is deliberately limited to compact index/market features.  It must
-    not turn a model-training click into a full-market decade-long local data
-    download.  A stock cross-sectional candidate trained from local two-year
-    history remains non-production-eligible until its own evidence is enough.
+    Broad indices are refreshed from the API while the persisted full-market
+    daily history is aggregated locally into stable regime observations.
     """
     sources = list(refresh.get("sources") or [])
     source_ok = bool(sources) and all(bool(item.get("ok")) for item in sources if isinstance(item, dict))
@@ -49,11 +47,11 @@ def _require_compact_api_training_history(refresh: dict[str, Any]) -> dict[str, 
     if not bool(refresh.get("ok")) or not source_ok or written <= 0:
         raise RuntimeError("训练所需的6-10年紧凑市场特征API刷新失败；未使用本地旧数据替代训练")
     return {
-        "contract": str(refresh.get("contract") or "training_triggered_compact_index_api_only"),
+        "contract": str(refresh.get("contract") or "full_market_daily_aggregates_plus_broad_index_anchors_v2"),
         "range": list(refresh.get("range") or []),
         "sources": [{"ts_code": item.get("ts_code"), "rows_written": item.get("rows_written")} for item in sources if isinstance(item, dict)],
         "features_written": written,
-        "full_market_history_persisted": False,
+        "full_market_history_persisted": True,
     }
 
 
@@ -115,6 +113,49 @@ def _build_dataset(
     return x_rows, y_rows, meta
 
 
+def _build_multi_horizon_dataset(
+    *,
+    ds: BacktestDataSource,
+    dates: list[str],
+    horizons: list[int],
+    exchange_group: str,
+    progress: Callable[[float, str], None],
+) -> dict[int, tuple[list[list[float]], list[float], list[dict[str, Any]]]]:
+    """Build all label horizons in one pass so expensive features are computed once."""
+    result = {h: ([], [], []) for h in horizons}
+    if not dates or not horizons:
+        return result
+    total = max(1, len(dates) - min(horizons))
+    for idx, date in enumerate(dates):
+        valid_horizons = [h for h in horizons if idx + h < len(dates)]
+        if not valid_horizons:
+            break
+        progress(idx / total, f"处理交易日 {idx + 1}/{total} · {date}")
+        snapshot = ds.load_snapshot(date.replace("-", ""))
+        if exchange_group != "ALL":
+            snapshot = [row for row in snapshot if matches_exchange_group(row.symbol, exchange_group)]
+        usable_rows = [row for row in snapshot if row.volume > 0 and row.close > 0]
+        if not usable_rows:
+            continue
+        # A single datasource shares snapshot, daily-basic and history caches
+        # across every horizon. Feature rows are horizon-independent.
+        daily_basic = ds.get_daily_basic_map(date.replace("-", ""))
+        feature_by_symbol = {row.symbol: _feature_row(ds, row, date, daily_basic) for row in usable_rows}
+        for horizon in valid_horizons:
+            future_date = dates[idx + horizon]
+            future_map = {row.symbol: row for row in ds.load_snapshot(future_date.replace("-", ""))}
+            x_rows, y_rows, meta = result[horizon]
+            for row in usable_rows:
+                label = _future_label(row, future_map.get(row.symbol))
+                if label is None:
+                    continue
+                x_rows.append(feature_by_symbol[row.symbol])
+                y_rows.append(label)
+                meta.append({"date": date, "symbol": row.symbol, "future_date": future_date})
+    progress(1.0, f"本地样本构建完成 · {len(dates)} 个交易日")
+    return result
+
+
 def _compact_index_trade_dates(*, start_date: str, end_date: str) -> list[str]:
     """Read the small, training-approved index calendar, never stock history."""
     from app.data_platform.db import _conn as data_conn
@@ -140,10 +181,9 @@ def _stream_historical_datasets(
 ) -> dict[int, tuple[list[list[float]], list[float], list[dict[str, Any]]]]:
     """Build old samples slice-by-slice without retaining old market rows.
 
-    Each slice fetches daily/daily_basic/stk_limit from TuShare VIP batch
-    calls, materializes snapshots and emits feature/label rows. Historical
-    rows are retained for subsequent training and backtests; completed dates
-    are skipped on retry so the one-time backfill is resumable.
+    Each slice reads daily/daily_basic/stk_limit from PostgreSQL, materializes
+    missing derived snapshots locally and emits feature/label rows. Network
+    market-data calls are forbidden in this training path.
     """
     result = {h: ([], [], []) for h in horizons}
     if not historical_dates:
@@ -159,17 +199,23 @@ def _stream_historical_datasets(
             fetch_dates=tuple(sorted(set(last.fetch_dates + tuple(label_bridge_dates[:max(horizons)])))),
         )
     for index, training_slice in enumerate(slices):
-        progress("api_training_data", 0.12 + 0.30 * (index / max(1, len(slices))), f"按需拉取训练切片 {index + 1}/{len(slices)}")
+        progress("local_training_data", 0.12 + 0.30 * (index / max(1, len(slices))), f"本地训练切片 {index + 1}/{len(slices)} · 准备数据")
 
         def consume(core_dates: tuple[str, ...]) -> None:
             core = set(core_dates)
             slice_dates = [f"{date[:4]}-{date[4:6]}-{date[6:8]}" for date in training_slice.fetch_dates]
+            chunk_ds = BacktestDataSource()
+            datasets = _build_multi_horizon_dataset(
+                ds=chunk_ds, dates=slice_dates, horizons=horizons,
+                exchange_group=exchange_group,
+                progress=lambda fraction, message: progress(
+                    "local_training_data",
+                    0.12 + 0.30 * ((index + fraction) / max(1, len(slices))),
+                    f"本地训练切片 {index + 1}/{len(slices)} · {message}",
+                ),
+            )
             for horizon in horizons:
-                chunk_ds = BacktestDataSource()
-                x_rows, y_rows, meta = _build_dataset(
-                    ds=chunk_ds, dates=slice_dates, horizon=horizon,
-                    exchange_group=exchange_group, progress=lambda *_: None,
-                )
+                x_rows, y_rows, meta = datasets[horizon]
                 kept = [(x, y, item) for x, y, item in zip(x_rows, y_rows, meta) if item["date"].replace("-", "") in core]
                 if kept:
                     xs, ys, items = zip(*kept)
@@ -311,6 +357,15 @@ def _production_eligibility(*, dates: list[str], metrics: dict[str, Any], artifa
     }
 
 
+def _model_selection_rank(metrics: dict[str, Any], score: float) -> tuple[int, float, float, float]:
+    """Prefer models that can satisfy production gates before secondary score."""
+    lift = float(metrics.get("lift", 0) or 0)
+    walk_forward_lift = float(metrics.get("walk_forward_lift", 0) or 0)
+    folds = int(metrics.get("walk_forward_folds", 0) or 0)
+    eligible_metrics = lift > 0 and walk_forward_lift > 0 and folds >= 3
+    return (1 if eligible_metrics else 0, float(score), lift, walk_forward_lift)
+
+
 def run_model_training(
     *,
     run_id: int | None = None,
@@ -332,10 +387,11 @@ def run_model_training(
 
     try:
         # User-approved boundary: only a model-training trigger can request
-        # 6-10 years, and it requests compact index features rather than a
-        # decade of all-market daily rows.
-        from app.services.hsmm_shadow import refresh_compact_training_history_from_api
-        training_input = _require_compact_api_training_history(refresh_compact_training_history_from_api(years=10))
+        # 6-10 years, using only persisted PostgreSQL full-market aggregates
+        # and broad-index anchors. This path never calls the market-data API.
+        from app.services.hsmm_shadow import refresh_market_regime_training_history
+        progress("local_regime_features", 0.01, "校验 PostgreSQL 本地市场状态训练数据")
+        training_input = _require_compact_api_training_history(refresh_market_regime_training_history(years=10))
         ds = BacktestDataSource()
         exchange_group = normalize_exchange_group(exchange_group)
         dates = ds.get_available_trade_dates(start_date or "2020-01-01", end_date or "2099-12-31")
@@ -345,7 +401,7 @@ def run_model_training(
         horizons = [5, 10, 20]
         horizons = [h for h in horizons if len(dates) > h + 5] or [min(5, len(dates) - 2)]
         # The online product keeps its normal rolling window.  For a training
-        # click, extend only the *calendar* from the compact index series and
+        # click, extend only the *calendar* from the broad-index anchors and
         # stream any missing old stock slices one at a time.  No old stock raw
         # table or snapshot survives a slice.
         online_window_start = dates[0].replace("-", "")
@@ -363,7 +419,7 @@ def run_model_training(
             progress=progress,
         )
         training_input["cross_sectional_history"] = {
-            "contract": "training_triggered_tushare_vip_full_market_history_retained",
+            "contract": "postgresql_local_full_market_history_retained_v2",
             "online_window_sessions": len(dates),
             "target_sessions": target_sessions,
             "training_calendar_sessions": len(training_calendar),
@@ -386,6 +442,26 @@ def run_model_training(
             x_rows = streamed[horizon][0] + local_x
             y_rows = streamed[horizon][1] + local_y
             meta = streamed[horizon][2] + local_meta
+            from app.services.review_learning import training_feedback_rows
+            review_feedback = training_feedback_rows(horizon)
+            feedback_added = 0
+            for feedback in review_feedback:
+                feedback_date = str(feedback.get("entry_date") or "")
+                snapshot = ds.load_snapshot(feedback_date)
+                symbol = str(feedback.get("ts_code") or "").split(".")[0]
+                source_row = next((row for row in snapshot if str(row.symbol).split(".")[0] == symbol), None)
+                if source_row is None:
+                    continue
+                daily_basic = ds.get_daily_basic_map(feedback_date)
+                directional = float(feedback.get("directional_return") or 0)
+                reviewed_label = float(feedback.get("label") or 0)
+                target = directional if reviewed_label > 0 else -abs(directional)
+                repeats = max(1, min(3, round(float(feedback.get("sample_weight") or 1))))
+                for _ in range(repeats):
+                    x_rows.append(_feature_row(ds, source_row, feedback_date, daily_basic))
+                    y_rows.append(target)
+                    meta.append({"date": feedback_date, "symbol": symbol, "source": "human_review_feedback"})
+                    feedback_added += 1
             if len(x_rows) < 200:
                 continue
             split = max(1, int(len(x_rows) * 0.8))
@@ -424,6 +500,7 @@ def run_model_training(
                 "created_at": datetime.utcnow().isoformat(),
                 "tuning_grid": grid,
                 "selected_params": model_params,
+                "review_feedback_rows": feedback_added,
             }
             artifact_files: dict[str, str] = {}
             if model is not None:
@@ -438,12 +515,14 @@ def run_model_training(
             metrics.update({"horizon": horizon, "train_rows": len(x_train), "validation_rows": len(x_val)})
             metrics.update(_walk_forward_lift(x_rows, y_rows, model_type))
             score = float(metrics.get("lift", 0)) + float(metrics.get("hit_rate", 0)) * 0.01
-            if best is None or score > float(best["score"]):
+            rank = _model_selection_rank(metrics, score)
+            if best is None or rank > best["rank"]:
                 best = {
                     "horizon": horizon,
                     "artifact": artifact,
                     "metrics": metrics,
                     "score": score,
+                    "rank": rank,
                     "model": model,
                     "artifact_files": artifact_files,
                     "sample_meta": meta[-5:],

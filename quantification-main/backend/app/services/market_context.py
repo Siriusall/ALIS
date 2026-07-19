@@ -118,6 +118,12 @@ def score_theme_narratives(themes: list[dict[str, Any]]) -> list[dict[str, Any]]
 
 
 REGIME_LABELS = {"S0": "风险扩张", "S1": "震荡分化", "S2": "风险收缩", "S3": "恐慌修复"}
+MARKET_PROFILE_LABELS = {
+    "P01": "全面扩张", "P02": "流动性驱动", "P03": "拥挤扩张",
+    "P04": "均衡震荡", "P05": "宽度分化", "P06": "缩量震荡",
+    "P07": "趋势收缩", "P08": "流动性收缩", "P09": "恐慌抛售",
+    "P10": "宽度修复", "P11": "流动性修复", "P12": "脆弱反弹",
+}
 HSMM_MINIMUM_LIVE_OBSERVATION_WEEKS = max(
     1, int(os.getenv("HSMM_MINIMUM_LIVE_OBSERVATION_WEEKS", "4"))
 )
@@ -131,6 +137,66 @@ def _transparent_regime(score: float, average_return: float, previous_state: str
     if previous_state == "S2" and score >= 50 and average_return > 0:
         return "S3"
     return "S1"
+
+
+def classify_market_profile(market_state: str, observations: dict[str, Any]) -> dict[str, Any]:
+    """Map a stable production state to one of twelve explainable market profiles.
+
+    Profiles add decision detail without replacing the four-state production
+    risk ceiling.  Their multiplier can only preserve or reduce that ceiling.
+    """
+    def number(key: str, default: float) -> float:
+        value = observations.get(key)
+        return default if value is None else float(value)
+
+    breadth = number("breadth", 0.5)
+    average_return = number("average_return", 0.0)
+    volume_ratio = number("volume_ratio", 1.0)
+    limit_up = number("limit_up_ratio", 0.0)
+    limit_down = number("limit_down_ratio", 0.0)
+    crowding = number("crowding", 0.0)
+
+    if market_state == "S0":
+        code = "P03" if crowding >= .65 or limit_up >= .05 else "P01" if breadth >= .62 and average_return >= .008 else "P02"
+    elif market_state == "S2":
+        code = "P09" if average_return <= -.025 or limit_down >= .05 else "P08" if volume_ratio <= .85 else "P07"
+    elif market_state == "S3":
+        code = "P10" if breadth >= .55 else "P11" if volume_ratio >= 1.10 else "P12"
+    else:
+        code = "P06" if volume_ratio <= .85 else "P05" if breadth <= .38 or breadth >= .62 or abs(average_return) >= .015 else "P04"
+
+    risk_multipliers = {
+        "P01": 1.00, "P02": .98, "P03": .90,
+        "P04": 1.00, "P05": .95, "P06": .90,
+        "P07": .95, "P08": .90, "P09": .85,
+        "P10": 1.00, "P11": .98, "P12": .90,
+    }
+    dimensions = [
+        "宽度偏强" if breadth >= .60 else "宽度偏弱" if breadth <= .40 else "宽度中性",
+        "上涨" if average_return >= .005 else "下跌" if average_return <= -.005 else "收益平稳",
+        "放量" if volume_ratio >= 1.10 else "缩量" if volume_ratio <= .90 else "流动性正常",
+        "拥挤" if crowding >= .65 else "拥挤度可控",
+        "跌停压力" if limit_down >= .03 else "涨停扩散" if limit_up >= .03 else "涨跌停平稳",
+    ]
+    separation = max(
+        abs(breadth - .5) * 2,
+        min(1.0, abs(average_return) / .03),
+        min(1.0, abs(volume_ratio - 1.0)),
+        min(1.0, max(limit_up, limit_down) / .08),
+        min(1.0, crowding),
+    )
+    return {
+        "code": code,
+        "label": MARKET_PROFILE_LABELS[code],
+        "parent_state": market_state,
+        "parent_label": REGIME_LABELS.get(market_state, market_state),
+        "confidence": round(min(.90, .55 + .35 * separation), 4),
+        "risk_budget_multiplier": risk_multipliers[code],
+        "risk_ceiling_policy": "cannot_exceed_parent_state",
+        "dimensions": dimensions,
+        "method": "hierarchical_market_profile_v1",
+        "profile_count": len(MARKET_PROFILE_LABELS),
+    }
 
 
 def _normal_pdf(value: float, mean: float, variance: float) -> float:
@@ -184,7 +250,7 @@ def market_state_model_governance() -> dict[str, Any]:
             "SELECT MIN(trade_date) first_date,MAX(trade_date) last_date,COUNT(DISTINCT trade_date) sessions FROM dc_tushare_raw_records WHERE api_name='daily'"
         ).fetchone()
         training_row = c.execute(
-            "SELECT MIN(feature_date) first_date,MAX(feature_date) last_date,COUNT(*) observations FROM model_training_history WHERE feature_set='market_regime_index_v1'"
+            "SELECT MIN(feature_date) first_date,MAX(feature_date) last_date,COUNT(*) observations FROM model_training_history WHERE feature_set='market_regime_full_market_v2'"
         ).fetchone()
     item = dict(row) if row else {}
     first, last = str(item.get("first_date") or ""), str(item.get("last_date") or "")
@@ -256,15 +322,21 @@ def market_state_model_governance() -> dict[str, Any]:
         # Having enough history only opens the shadow-validation gate.  It must
         # never silently promote a regime model without persisted OOS evidence.
         "production_model": "transparent_four_state_v1",
-        "hsmm": {"status": live_status, "history_years": round(index_years, 3), "breadth_history_years": round(years, 3), "minimum_years": 6, "state_count": 4, "observation_distribution": "multivariate_student_t", "duration_distribution": "truncated_negative_binomial", "duration_weeks": [2, 52], "production_eligible": production_eligible, "blocking_reason": blocking_reason, "latest_shadow_version": (latest_shadow or {}).get("version"), "validation": shadow_validation, "review_required": review_required, "review_completed": review_completed, "review": review, "live_observation_start": live_observation_start, "live_observation_end": live_observation_end, "live_observation_weeks": round(live_observation_weeks, 3), "live_observation_sessions": live_observation_sessions, "minimum_live_observation_weeks": HSMM_MINIMUM_LIVE_OBSERVATION_WEEKS},
+        "hsmm": {"status": live_status, "history_years": round(index_years, 3), "breadth_history_years": round(years, 3), "minimum_years": 6, "state_count": 4, "profile_state_count": len(MARKET_PROFILE_LABELS), "profile_model": "hierarchical_market_profile_v1", "observation_distribution": "multivariate_student_t", "duration_distribution": "truncated_negative_binomial", "duration_weeks": [2, 52], "production_eligible": production_eligible, "blocking_reason": blocking_reason, "latest_shadow_version": (latest_shadow or {}).get("version"), "validation": shadow_validation, "review_required": review_required, "review_completed": review_completed, "review": review, "live_observation_start": live_observation_start, "live_observation_end": live_observation_end, "live_observation_weeks": round(live_observation_weeks, 3), "live_observation_sessions": live_observation_sessions, "minimum_live_observation_weeks": HSMM_MINIMUM_LIVE_OBSERVATION_WEEKS},
         "bocpd": {"status": "active", "model": "bocpd_gaussian_v1"},
         "history": {"first_date": first, "last_date": last, "sessions": int(item.get("sessions") or 0)},
-        "index_training_history": {"first_date": training.get("first_date"), "last_date": training.get("last_date"), "observations": int(training.get("observations") or 0), "history_years": round(index_years, 3), "status": "ready" if index_years >= 6 else "insufficient"},
+        "market_training_history": {"feature_set": "market_regime_full_market_v2", "first_date": training.get("first_date"), "last_date": training.get("last_date"), "observations": int(training.get("observations") or 0), "history_years": round(index_years, 3), "status": "ready" if index_years >= 6 else "insufficient"},
     }
 
 
 def materialize_market_training_history() -> dict[str, Any]:
-    """Build the small 6-10 year index feature layer required by the model constitution."""
+    """Build point-in-time market-regime features from the full equity market.
+
+    Individual stocks are aggregated into stable daily market observations;
+    the three broad indices remain as size/style anchors.  This avoids feeding
+    thousands of changing instruments directly into the HSMM while still
+    using the complete cross-section available in the data platform.
+    """
     index_codes = ("000300.SH", "000905.SH", "000852.SH")
     placeholders = ",".join("?" for _ in index_codes)
     with _conn() as c:
@@ -283,7 +355,25 @@ def materialize_market_training_history() -> dict[str, Any]:
             if close is None:
                 continue
             by_code[str(row.get("ts_code") or "")][str(row.get("trade_date") or "")] = {"close": float(close), "amount": float(payload.get("amount") or 0), "available_time": row.get("available_time")}
-        common_dates = sorted(set.intersection(*(set(by_code[code]) for code in index_codes))) if all(by_code.values()) else []
+        market_rows = [dict(row) for row in c.execute(
+            """SELECT trade_date,
+                      COUNT(*) AS instrument_count,
+                      AVG(CASE WHEN NULLIF(payload_json::jsonb->>'pct_chg','')::double precision > 0 THEN 1.0 ELSE 0.0 END) AS breadth,
+                      AVG(NULLIF(payload_json::jsonb->>'pct_chg','')::double precision / 100.0) AS average_return,
+                      STDDEV_POP(NULLIF(payload_json::jsonb->>'pct_chg','')::double precision / 100.0) AS return_dispersion,
+                      AVG(CASE WHEN NULLIF(payload_json::jsonb->>'pct_chg','')::double precision >= 9.7 THEN 1.0 ELSE 0.0 END) AS limit_up_ratio,
+                      AVG(CASE WHEN NULLIF(payload_json::jsonb->>'pct_chg','')::double precision <= -9.7 THEN 1.0 ELSE 0.0 END) AS limit_down_ratio,
+                      SUM(COALESCE(NULLIF(payload_json::jsonb->>'amount','')::double precision, 0.0)) AS total_amount,
+                      MAX(available_time) AS source_as_of_time
+               FROM dc_tushare_raw_records
+               WHERE api_name='daily'
+               GROUP BY trade_date
+               ORDER BY trade_date"""
+        ).fetchall()]
+        market_by_date = {str(row.get("trade_date") or ""): row for row in market_rows}
+        common_dates = sorted(
+            set.intersection(*(set(by_code[code]) for code in index_codes), set(market_by_date))
+        ) if all(by_code.values()) and market_by_date else []
         written = 0
         now = datetime.now().isoformat(timespec="seconds")
         for index, feature_date in enumerate(common_dates):
@@ -301,18 +391,176 @@ def materialize_market_training_history() -> dict[str, Any]:
                 features[f"{prefix}_realized_vol_20d"] = (sum(value * value for value in recent_returns) / len(recent_returns)) ** .5 if recent_returns else None
                 features[f"{prefix}_amount"] = by_code[code][feature_date]["amount"]
                 source_times.append(str(by_code[code][feature_date].get("available_time") or ""))
+            market = market_by_date[feature_date]
+            recent_dates = common_dates[max(0, index - 19):index + 1]
+            recent_amounts = [float(market_by_date[value].get("total_amount") or 0.0) for value in recent_dates]
+            amount_baseline = sum(recent_amounts[:-1]) / len(recent_amounts[:-1]) if len(recent_amounts) > 1 else 0.0
+            total_amount = float(market.get("total_amount") or 0.0)
+            features.update({
+                "market_breadth": float(market.get("breadth") or 0.0),
+                "market_average_return": float(market.get("average_return") or 0.0),
+                "market_return_dispersion": float(market.get("return_dispersion") or 0.0),
+                "market_limit_up_ratio": float(market.get("limit_up_ratio") or 0.0),
+                "market_limit_down_ratio": float(market.get("limit_down_ratio") or 0.0),
+                "market_limit_balance": float(market.get("limit_up_ratio") or 0.0) - float(market.get("limit_down_ratio") or 0.0),
+                "market_amount_ratio_20d": total_amount / amount_baseline if amount_baseline > 0 else 1.0,
+                "market_instrument_count": int(market.get("instrument_count") or 0),
+            })
+            source_times.append(str(market.get("source_as_of_time") or ""))
             c.execute(
                 """INSERT INTO model_training_history(feature_date,feature_set,features_json,source_as_of_time,created_at,updated_at)
                    VALUES(?,?,?,?,?,?) ON CONFLICT(feature_date) DO UPDATE SET feature_set=excluded.feature_set,
                    features_json=excluded.features_json,source_as_of_time=excluded.source_as_of_time,updated_at=excluded.updated_at""",
-                (feature_date, "market_regime_index_v1", json.dumps(features, ensure_ascii=False), max(source_times), now, now),
+                (feature_date, "market_regime_full_market_v2", json.dumps(features, ensure_ascii=False), max(source_times), now, now),
             )
             written += 1
-    return {"ok": True, "feature_set": "market_regime_index_v1", "source_rows": len(rows), "common_dates": len(common_dates), "written": written, "range": [common_dates[0], common_dates[-1]] if common_dates else []}
+    return {
+        "ok": bool(written),
+        "feature_set": "market_regime_full_market_v2",
+        "sources": ["full_market_daily", *index_codes],
+        "source_rows": len(rows),
+        "market_sessions": len(market_rows),
+        "common_dates": len(common_dates),
+        "written": written,
+        "range": [common_dates[0], common_dates[-1]] if common_dates else [],
+    }
+
+
+def _production_regime_reason(governance: dict[str, Any]) -> str:
+    """Explain the active production regime without conflating history and promotion gates."""
+    hsmm = governance.get("hsmm") or {}
+    history_years = float(hsmm.get("history_years") or 0)
+    minimum_years = float(hsmm.get("minimum_years") or 6)
+    live_weeks = float(hsmm.get("live_observation_weeks") or 0)
+    minimum_live_weeks = float(hsmm.get("minimum_live_observation_weeks") or 4)
+    validation = hsmm.get("validation") or {}
+    review = hsmm.get("review") or {}
+
+    if hsmm.get("production_eligible"):
+        return "HSMM已通过历史OOS、真实影子观察和上线评审，可按审批结果接管生产状态"
+    if str(review.get("status") or "") == "rejected":
+        return "HSMM上线评审未通过，生产状态继续使用透明四状态机"
+    if str(validation.get("status") or "") == "passed":
+        if live_weeks >= minimum_live_weeks:
+            return "HSMM历史OOS和真实影子观察期已通过，等待上线评审；评审前生产状态继续使用透明四状态机"
+        return (
+            f"HSMM历史OOS已通过，正在进行真实影子观察（{live_weeks:.2f}/{minimum_live_weeks:g}周）；"
+            "观察期和上线评审完成前生产状态继续使用透明四状态机"
+        )
+    if history_years >= minimum_years:
+        return "HSMM训练历史已满足六年要求，仍需通过历史OOS验证、真实影子观察和上线评审；当前生产状态使用透明四状态机"
+    return (
+        f"HSMM训练历史仅{history_years:.2f}年，尚未达到{minimum_years:g}年要求；"
+        "当前生产状态使用透明四状态机"
+    )
+
+
+def _market_enrichment_observations(latest: str, *, as_of_time: str | None = None) -> dict[str, Any]:
+    """Build the three previously-neutralized daily market observations."""
+    cutoff = str(as_of_time or "") or f"{latest[:4]}-{latest[4:6]}-{latest[6:8]}T23:59:59"
+    result: dict[str, Any] = {
+        "northbound_flow_z": None,
+        "leader_persistence": None,
+        "price_fundamental_divergence": None,
+        "coverage": {"northbound": 0, "leader_sessions": 0, "fundamental_codes": 0},
+    }
+    with _conn() as c:
+        north_rows = [dict(row) for row in c.execute(
+            "SELECT trade_date,payload_json FROM dc_tushare_raw_records WHERE api_name='moneyflow_hsgt' AND trade_date<=? AND available_time<=? ORDER BY trade_date DESC LIMIT 61",
+            (latest, cutoff),
+        ).fetchall()]
+        north_values: list[float] = []
+        for row in north_rows:
+            try:
+                value = json.loads(row.get("payload_json") or "{}").get("north_money")
+                if value is not None:
+                    north_values.append(float(value))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+        if north_values:
+            center = median(north_values[1:]) if len(north_values) > 1 else north_values[0]
+            mad = median(abs(value - center) for value in north_values[1:]) if len(north_values) > 2 else 0.0
+            scale = max(1e-6, 1.4826 * mad)
+            result["northbound_flow_z"] = round(max(-3.0, min(3.0, (north_values[0] - center) / scale)), 6)
+            result["coverage"]["northbound"] = len(north_values)
+
+        date_rows = [str(dict(row).get("trade_date") or "") for row in c.execute(
+            "SELECT DISTINCT trade_date FROM dc_tushare_raw_records WHERE api_name='daily' AND trade_date<=? AND available_time<=? ORDER BY trade_date DESC LIMIT 21",
+            (latest, cutoff),
+        ).fetchall()]
+        if date_rows:
+            placeholders = ",".join("?" for _ in date_rows)
+            daily_rows = [dict(row) for row in c.execute(
+                f"SELECT trade_date,ts_code,payload_json FROM dc_tushare_raw_records WHERE api_name='daily' AND trade_date IN ({placeholders}) AND available_time<=?",
+                (*date_rows, cutoff),
+            ).fetchall()]
+            leaders_by_date: dict[str, set[str]] = {}
+            for row in daily_rows:
+                try:
+                    payload = json.loads(row.get("payload_json") or "{}")
+                    pct = float(payload.get("pct_chg") or 0)
+                    amount = float(payload.get("amount") or 0)
+                    code = str(row.get("ts_code") or "")
+                    if code and pct > 0 and amount > 0:
+                        leaders_by_date.setdefault(str(row.get("trade_date") or ""), set()).add(code)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    continue
+            for day, codes in list(leaders_by_date.items()):
+                ranked = sorted(
+                    (row for row in daily_rows if str(row.get("trade_date") or "") == day and str(row.get("ts_code") or "") in codes),
+                    key=lambda row: float(json.loads(row.get("payload_json") or "{}").get("amount") or 0),
+                    reverse=True,
+                )
+                leaders_by_date[day] = {str(row.get("ts_code") or "") for row in ranked[:50]}
+            current = leaders_by_date.get(latest, set())
+            prior_sets = [leaders_by_date.get(day, set()) for day in date_rows[1:] if leaders_by_date.get(day)]
+            if current and prior_sets:
+                result["leader_persistence"] = round(sum(len(current & previous) / max(1, len(current | previous)) for previous in prior_sets) / len(prior_sets), 6)
+                result["coverage"]["leader_sessions"] = len(prior_sets) + 1
+
+        periods = [str(dict(row).get("period") or "") for row in c.execute(
+            "SELECT DISTINCT period FROM dc_tushare_raw_records WHERE api_name='fina_indicator' AND period<>'' AND available_time<=? ORDER BY period DESC LIMIT 2",
+            (cutoff,),
+        ).fetchall()]
+        fundamental_by_period: dict[str, dict[str, float]] = {}
+        for period in periods:
+            rows = c.execute(
+                "SELECT ts_code,payload_json FROM dc_tushare_raw_records WHERE api_name='fina_indicator' AND period=? AND available_time<=?",
+                (period, cutoff),
+            ).fetchall()
+            values: dict[str, float] = {}
+            for row in rows:
+                try:
+                    payload = json.loads(dict(row).get("payload_json") or "{}")
+                    # TuShare 的 q_profit_yoy 在部分财报批次为空；使用同一口径的
+                    # q_sales_yoy，再退化到 ROE，避免整段基本面观测被误判为缺失。
+                    value = next((payload.get(key) for key in ("q_profit_yoy", "q_sales_yoy", "roe") if payload.get(key) is not None), None)
+                    if value is not None:
+                        values[str(dict(row).get("ts_code") or "")] = float(value)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    continue
+            fundamental_by_period[period] = values
+        if fundamental_by_period:
+            current_values = fundamental_by_period[periods[0]]
+            prior_values = fundamental_by_period.get(periods[1], {}) if len(periods) > 1 else {}
+            comparable = [current_values[code] - prior_values[code] for code in current_values.keys() & prior_values.keys()]
+            fundamental_signal = median(current_values.values()) / 50.0 if current_values else 0.0
+            if comparable:
+                fundamental_signal = (fundamental_signal + median(comparable) / 50.0) / 2.0
+            price_rows = c.execute(
+                """SELECT trade_date,AVG(NULLIF(payload_json::jsonb->>'pct_chg','')::double precision) average_return
+                   FROM dc_tushare_raw_records WHERE api_name='daily' AND trade_date<=? AND available_time<=?
+                   GROUP BY trade_date ORDER BY trade_date DESC LIMIT 20""",
+                (latest, cutoff),
+            ).fetchall()
+            price_signal = (sum(float(dict(row).get("average_return") or 0) for row in price_rows) / max(1, len(price_rows))) / 3.0
+            result["price_fundamental_divergence"] = round(max(-1.0, min(1.0, price_signal - fundamental_signal)), 6)
+            result["coverage"]["fundamental_codes"] = len(current_values)
+    return result
 
 
 def live_market_context() -> dict[str, Any]:
-    cached = get_json("alis:market-context:live:v2")
+    cached = get_json("alis:market-context:live:v5")
     if isinstance(cached, dict):
         return cached
     with _conn() as c:
@@ -373,6 +621,11 @@ def live_market_context() -> dict[str, Any]:
         "price_fundamental_divergence": 0.0,
         "crowding": crowding,
     }
+    enrichment = _market_enrichment_observations(latest)
+    observations.update({
+        key: float(enrichment[key]) if enrichment.get(key) is not None else 0.0
+        for key in ("northbound_flow_z", "leader_persistence", "price_fundamental_divergence")
+    })
     observation_history: list[dict[str, Any]] = []
     prior_signals: list[float] = []
     for row in reversed(history_rows):
@@ -391,15 +644,23 @@ def live_market_context() -> dict[str, Any]:
     average_return = observations["average_return"]
     previous_state = str(dict(previous_context).get("market_state") or "") if previous_context else ""
     market_state = _transparent_regime(score, average_return, previous_state)
+    market_profile = classify_market_profile(market_state, observations)
     confidence = min(.85, .45 + abs(score - 50) / 100)
     now = datetime.now().isoformat(timespec="seconds")
+    model_governance = market_state_model_governance()
     payload = {
         "ok": True, "status": "ready", "trade_date": latest,
-        "market_state": {"state": market_state, "label": REGIME_LABELS[market_state], "confidence": round(confidence, 4), "model": "transparent_four_state_v1", "reason": "可用历史不足六年，按计划书使用透明四状态机；HSMM不冒充生产状态"},
+        "market_state": {"state": market_state, "label": REGIME_LABELS[market_state], "confidence": round(confidence, 4), "model": "transparent_four_state_v1", "reason": _production_regime_reason(model_governance)},
+        "market_profile": market_profile,
         "sentiment": sentiment, "observations": observations, "change_alarm": change_alarm,
-        "model_governance": market_state_model_governance(),
+        "model_governance": model_governance,
         "evidence": {"latest_date": latest, "previous_date": previous, "symbols": total, "amount_dates": len(amount_rows)},
-        "limitations": ["北向资金、龙头持续性和价格基本面背离尚无合格日度观测，当前按中性值处理"],
+        "observation_evidence": enrichment.get("coverage") or {},
+        "limitations": [
+            *([] if enrichment.get("coverage", {}).get("northbound") else ["北向资金原始观测暂不可用，当前按中性值处理"]),
+            *([] if enrichment.get("coverage", {}).get("leader_sessions") else ["龙头持续性日度样本不足，当前按中性值处理"]),
+            *([] if enrichment.get("coverage", {}).get("fundamental_codes") else ["价格与基本面背离日度样本不足，当前按中性值处理"]),
+        ],
         "available_time": now,
     }
     with _conn() as c:
@@ -410,7 +671,7 @@ def live_market_context() -> dict[str, Any]:
                available_time=excluded.available_time,updated_at=excluded.updated_at""",
             (latest, market_state, confidence, score, json.dumps(observations, ensure_ascii=False), json.dumps(payload, ensure_ascii=False), "transparent_four_state_v1", now, now, now),
         )
-    set_json("alis:market-context:live:v2", payload, ttl=300)
+    set_json("alis:market-context:live:v5", payload, ttl=300)
     return payload
 
 
@@ -426,6 +687,7 @@ def market_context_history(limit: int = 120) -> dict[str, Any]:
             row["observations"] = json.loads(row.pop("observations_json") or "{}")
         except (TypeError, json.JSONDecodeError):
             row["observations"] = {}
+        row["market_profile"] = classify_market_profile(str(row.get("market_state") or "S1"), row["observations"])
     rows.reverse()
     transitions = []
     for previous, current in zip(rows, rows[1:]):
@@ -499,6 +761,11 @@ def rebuild_market_context_history(limit: int = 120) -> dict[str, Any]:
                 "limit_down_ratio": int(row.get("limit_down") or 0) / total,
                 "northbound_flow_z": 0.0, "leader_persistence": 0.0, "price_fundamental_divergence": 0.0, "crowding": 0.0,
             }
+            enrichment = _market_enrichment_observations(trade_date)
+            observations.update({
+                key: float(enrichment[key]) if enrichment.get(key) is not None else 0.0
+                for key in ("northbound_flow_z", "leader_persistence", "price_fundamental_divergence")
+            })
             sentiment = score_market_sentiment(**observations)
             composite_signal = _market_change_signal(observation_history, observations)
             change_signals.append(composite_signal)
@@ -508,9 +775,10 @@ def rebuild_market_context_history(limit: int = 120) -> dict[str, Any]:
             average_return = float(observations["average_return"])
             previous_state = state if written else ""
             state = _transparent_regime(score, average_return, previous_state)
+            market_profile = classify_market_profile(state, observations)
             confidence = min(.85, .45 + abs(score - 50) / 100)
             now = datetime.now().isoformat(timespec="seconds")
-            payload = {"ok": True, "status": "ready", "trade_date": trade_date, "market_state": {"state": state, "label": REGIME_LABELS[state], "confidence": round(confidence, 4), "model": "transparent_four_state_v1", "reason": "historical_raw_daily_backfill"}, "sentiment": sentiment, "observations": observations, "change_alarm": change_alarm, "model_governance": {"production_model": "transparent_four_state_v1", "hsmm": {"status": "shadow_blocked_insufficient_history", "minimum_years": 6}, "bocpd": {"status": "active", "model": "bocpd_gaussian_v1"}}, "evidence": {"symbols": total, "prior_amount_dates": len(prior_amounts)}, "limitations": ["northbound/leader/fundamental observations unavailable and neutralized"], "available_time": now}
+            payload = {"ok": True, "status": "ready", "trade_date": trade_date, "market_state": {"state": state, "label": REGIME_LABELS[state], "confidence": round(confidence, 4), "model": "transparent_four_state_v1", "reason": "历史回放固定使用当时可解释的透明四状态机，不代表当前HSMM训练历史不足"}, "market_profile": market_profile, "sentiment": sentiment, "observations": observations, "observation_evidence": enrichment.get("coverage") or {}, "change_alarm": change_alarm, "model_governance": {"production_model": "transparent_four_state_v1", "hsmm": {"status": "historical_transparent_rule", "minimum_years": 6, "state_count": 4, "profile_state_count": 12}, "bocpd": {"status": "active", "model": "bocpd_gaussian_v1"}}, "evidence": {"symbols": total, "prior_amount_dates": len(prior_amounts)}, "limitations": [], "available_time": now}
             c.execute(
                 """INSERT INTO dc_market_context_snapshot(trade_date,market_state,state_confidence,sentiment_score,observations_json,result_json,model_version,available_time,created_at,updated_at)
                    VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(trade_date) DO UPDATE SET market_state=excluded.market_state,state_confidence=excluded.state_confidence,sentiment_score=excluded.sentiment_score,observations_json=excluded.observations_json,result_json=excluded.result_json,model_version=excluded.model_version,available_time=excluded.available_time,updated_at=excluded.updated_at""",

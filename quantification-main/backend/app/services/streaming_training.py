@@ -58,18 +58,20 @@ def consume_api_training_slice(
     features and future labels and is never allowed to leak into duplicate
     training samples.
     """
-    from app.data_platform.services.data_center import build_stock_daily_snapshot, purge_temporary_training_market_data, sync_training_market_date_vip, training_market_date_ready
+    from app.data_platform.services.data_center import build_stock_daily_snapshot, purge_temporary_training_market_data, training_market_date_ready
 
     fetched = list(training_slice.fetch_dates)
     try:
         for trade_date in fetched:
             if not training_market_date_ready(trade_date):
-                outcome = sync_training_market_date_vip(trade_date)
-                if not isinstance(outcome, dict) or not bool(outcome.get("ok")):
-                    raise RuntimeError(f"训练切片 {trade_date} 的 TuShare VIP 全市场批量拉取失败")
-                snapshot = build_stock_daily_snapshot(trade_date)
-                if not isinstance(snapshot, dict) or not bool(snapshot.get("ok")):
-                    raise RuntimeError(f"训练切片 {trade_date} 快照构建失败")
+                # Restored PostgreSQL history may already contain all three raw
+                # datasets while the derived daily snapshot has not been built.
+                # Materialize locally first; only genuine raw-data gaps may call
+                # TuShare.  This avoids re-downloading complete historical days.
+                local_snapshot = build_stock_daily_snapshot(trade_date)
+                if isinstance(local_snapshot, dict) and bool(local_snapshot.get("ok")) and training_market_date_ready(trade_date):
+                    continue
+                raise RuntimeError(f"训练切片 {trade_date} 本地数据不完整；严格本地训练禁止调用 TuShare")
         return consume(training_slice.core_dates)
     finally:
         # Cleanup is deliberately in finally: a rate-limit, feature failure,

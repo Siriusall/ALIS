@@ -14,30 +14,35 @@ from app.data_platform.db import _conn as data_conn
 from app.db.store import create_model_version
 
 
-def refresh_compact_training_history_from_api(*, years: int = 10) -> dict[str, Any]:
-    """Refresh only compact index history when training is explicitly invoked."""
+def refresh_market_regime_training_history(*, years: int = 10) -> dict[str, Any]:
+    """Rebuild training features strictly from locally stored PostgreSQL history."""
     from datetime import date, timedelta
-    from app.data_platform.services.data_center import sync_tushare_api_raw
     from app.services.market_context import materialize_market_training_history
 
     end = date.today().strftime("%Y%m%d")
     start = (date.today() - timedelta(days=max(6, min(int(years), 10)) * 366)).strftime("%Y%m%d")
     results = []
-    for code in ("000300.SH", "000905.SH", "000852.SH"):
-        result = sync_tushare_api_raw("index_daily", {"ts_code": code, "start_date": start, "end_date": end})
-        results.append({
-            "ts_code": code,
-            "ok": bool(result.get("ok")),
-            "rows_written": int(result.get("rows_written") or 0),
-            "source": "tushare_api",
-            "error": str(result.get("error") or "")[:300],
-        })
+    with data_conn() as c:
+        for code in ("000300.SH", "000905.SH", "000852.SH"):
+            row = c.execute(
+                """SELECT COUNT(*) count,MIN(trade_date) first_date,MAX(trade_date) last_date
+                   FROM dc_tushare_raw_records WHERE api_name='index_daily' AND ts_code=?
+                     AND trade_date BETWEEN ? AND ?""", (code, start, end),
+            ).fetchone()
+            item = dict(row)
+            count = int(item.get("count") or 0)
+            results.append({"ts_code": code, "ok": count > 0, "rows": count, "first_date": item.get("first_date"), "last_date": item.get("last_date"), "source": "postgresql_local", "error": "" if count else "local_index_history_missing"})
     materialized = materialize_market_training_history()
     return {
         "ok": bool(materialized.get("ok")) and all(item["ok"] for item in results),
         "range": [start, end], "sources": results, "materialized": materialized,
-        "contract": "training_triggered_compact_index_api_only",
+        "contract": "postgresql_local_full_market_plus_broad_index_anchors_v3",
     }
+
+
+# Backward-compatible import for older callers. The implementation now uses
+# the full-market aggregate feature layer rather than index-only observations.
+refresh_compact_training_history_from_api = refresh_market_regime_training_history
 
 
 STATES = ("S0", "S1", "S2", "S3")
@@ -45,6 +50,9 @@ FEATURES = (
     "000300_return_20d", "000300_return_60d", "000300_realized_vol_20d",
     "000905_return_20d", "000905_return_60d", "000905_realized_vol_20d",
     "000852_return_20d", "000852_return_60d", "000852_realized_vol_20d",
+    "market_breadth", "market_average_return", "market_return_dispersion",
+    "market_limit_up_ratio", "market_limit_down_ratio", "market_limit_balance",
+    "market_amount_ratio_20d",
 )
 
 
@@ -52,7 +60,7 @@ def _load_weekly_features() -> tuple[list[str], np.ndarray]:
     with data_conn() as c:
         rows = c.execute(
             """SELECT feature_date,features_json FROM model_training_history
-               WHERE feature_set='market_regime_index_v1' ORDER BY feature_date"""
+               WHERE feature_set='market_regime_full_market_v2' ORDER BY feature_date"""
         ).fetchall()
     weekly: dict[tuple[int, int], tuple[str, dict[str, Any]]] = {}
     for row in rows:
@@ -106,10 +114,15 @@ def _semantic_seed(values: np.ndarray) -> np.ndarray:
     returns20 = np.mean(values[:, [0, 3, 6]], axis=1)
     returns60 = np.mean(values[:, [1, 4, 7]], axis=1)
     volatility = np.mean(values[:, [2, 5, 8]], axis=1)
+    has_market_cross_section = values.shape[1] >= len(FEATURES)
+    breadth = values[:, FEATURES.index("market_breadth")] if has_market_cross_section else np.zeros(len(values))
+    market_return = values[:, FEATURES.index("market_average_return")] if has_market_cross_section else np.zeros(len(values))
+    dispersion = values[:, FEATURES.index("market_return_dispersion")] if has_market_cross_section else volatility
+    limit_balance = values[:, FEATURES.index("market_limit_balance")] if has_market_cross_section else np.zeros(len(values))
     labels = np.full(len(values), 1, dtype=int)
-    labels[(returns60 > .25) & (volatility < .25)] = 0
-    labels[(returns60 < -.25) | ((returns20 < -.20) & (volatility > .25))] = 2
-    labels[(returns20 > .10) & (volatility > .40) & (returns60 <= .25)] = 3
+    labels[(returns60 > .25) & (volatility < .25) & (breadth > -.20)] = 0
+    labels[(returns60 < -.25) | ((returns20 < -.20) & (volatility > .25)) | ((market_return < -.35) & (breadth < -.35))] = 2
+    labels[(returns20 > .10) & ((volatility > .40) | (dispersion > .40)) & (returns60 <= .25) & (limit_balance > -.35)] = 3
     return labels
 
 
@@ -206,7 +219,9 @@ def _max_drawdown(returns: np.ndarray) -> float:
 
 
 def train_hsmm_shadow(*, refresh_api: bool = True) -> dict[str, Any]:
-    api_refresh = refresh_compact_training_history_from_api() if refresh_api else {"status": "skipped"}
+    from app.services.market_context import MARKET_PROFILE_LABELS
+
+    api_refresh = refresh_market_regime_training_history() if refresh_api else {"status": "skipped"}
     dates, raw = _load_weekly_features()
     if len(raw) < 52 * 6:
         return {"ok": False, "status": "insufficient_history", "observations": len(raw), "minimum": 52 * 6, "api_refresh": api_refresh}
@@ -224,7 +239,16 @@ def train_hsmm_shadow(*, refresh_api: bool = True) -> dict[str, Any]:
     stress_recall = float(np.mean(np.isin(states[worst], [2, 3]))) if np.any(worst) else 0.0
     return_ranges = [float(np.mean(test_scaled[states == state][:, [0, 1, 3, 4, 6, 7]])) if np.any(states == state) else 0 for state in range(4)]
     vol_ranges = [float(np.mean(test_scaled[states == state][:, [2, 5, 8]])) if np.any(states == state) else 0 for state in range(4)]
-    differentiation = int((max(return_ranges) - min(return_ranges) > .35)) + int((max(vol_ranges) - min(vol_ranges) > .35))
+    breadth_index = FEATURES.index("market_breadth")
+    stress_indices = [FEATURES.index("market_return_dispersion"), FEATURES.index("market_limit_balance")]
+    breadth_ranges = [float(np.mean(test_scaled[states == state][:, breadth_index])) if np.any(states == state) else 0 for state in range(4)]
+    stress_ranges = [float(np.mean(test_scaled[states == state][:, stress_indices])) if np.any(states == state) else 0 for state in range(4)]
+    differentiation = (
+        int((max(return_ranges) - min(return_ranges) > .35))
+        + int((max(vol_ranges) - min(vol_ranges) > .35))
+        + int((max(breadth_ranges) - min(breadth_ranges) > .35))
+        + int((max(stress_ranges) - min(stress_ranges) > .35))
+    )
     validation = {
         "status": "passed" if differentiation >= 2 and gated_dd >= baseline_dd and stress_recall >= .40 else "shadow_failed",
         "oos_start": dates[split], "oos_end": dates[-1], "oos_observations": len(states),
@@ -236,7 +260,15 @@ def train_hsmm_shadow(*, refresh_api: bool = True) -> dict[str, Any]:
     artifact_dir = Path(__file__).resolve().parents[2] / ".cache" / "models" / "market_regime"
     artifact_dir.mkdir(parents=True, exist_ok=True)
     artifact_path = artifact_dir / f"{version}.json"
-    artifact = {"version": version, "states": list(STATES), "features": list(FEATURES), "scaler": scaler, "model": model, "validation": validation, "latest_shadow_state": STATES[int(states[-1])], "dates": {"train_start": dates[0], "train_end": dates[split - 1], "oos_end": dates[-1]}}
+    profile_layer = {
+        "method": "hierarchical_market_profile_v1",
+        "count": len(MARKET_PROFILE_LABELS),
+        "labels": MARKET_PROFILE_LABELS,
+        "parent_states": list(STATES),
+        "risk_ceiling_policy": "cannot_exceed_parent_state",
+        "risk_multiplier_range": [.85, 1.0],
+    }
+    artifact = {"version": version, "states": list(STATES), "market_profile_layer": profile_layer, "features": list(FEATURES), "feature_set": "market_regime_full_market_v2", "data_contract": "full_market_daily_aggregates_plus_broad_index_anchors_v2", "scaler": scaler, "model": model, "validation": validation, "latest_shadow_state": STATES[int(states[-1])], "dates": {"train_start": dates[0], "train_end": dates[split - 1], "oos_end": dates[-1]}}
     artifact_path.write_text(json.dumps(artifact, ensure_ascii=False), encoding="utf-8")
-    model_version_id = create_model_version(model_key="market_regime", version=version, status="shadow_validated" if validation["status"] == "passed" else "shadow_failed", artifact_path=str(artifact_path), config={"family": "four_state_hsmm", "observation": "multivariate_student_t", "duration": "truncated_negative_binomial", "min_weeks": 2, "max_weeks": 52}, metrics={"log_likelihood": log_likelihood, **validation}, validation=validation, is_active=False)
+    model_version_id = create_model_version(model_key="market_regime", version=version, status="shadow_validated" if validation["status"] == "passed" else "shadow_failed", artifact_path=str(artifact_path), config={"family": "hierarchical_four_state_hsmm_with_12_profiles", "feature_set": "market_regime_full_market_v2", "data_contract": "full_market_daily_aggregates_plus_broad_index_anchors_v2", "observation": "multivariate_student_t", "duration": "truncated_negative_binomial", "min_weeks": 2, "max_weeks": 52, "profile_layer": profile_layer}, metrics={"log_likelihood": log_likelihood, **validation}, validation=validation, is_active=False)
     return {"ok": True, "model_version_id": model_version_id, "version": version, "latest_shadow_state": artifact["latest_shadow_state"], "validation": validation, "artifact_path": str(artifact_path), "api_refresh": api_refresh}

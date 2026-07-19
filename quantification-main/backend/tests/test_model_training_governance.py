@@ -6,7 +6,7 @@ import pytest
 from fastapi import HTTPException
 
 from app.api.routes import model_strategy
-from app.services.model_training import _production_eligibility
+from app.services.model_training import _model_selection_rank, _production_eligibility
 
 
 def test_training_candidate_is_not_production_eligible_without_six_year_window(tmp_path):
@@ -35,6 +35,21 @@ def test_training_candidate_is_history_eligible_with_1512_streamed_calendar_sess
 
     assert result["eligible"] is True
     assert result["history_sessions"] == 1512
+
+
+def test_model_selection_prefers_positive_holdout_and_walk_forward_over_secondary_score():
+    negative_holdout = {
+        "lift": -0.002,
+        "walk_forward_lift": 0.02,
+        "walk_forward_folds": 3,
+    }
+    production_ready_metrics = {
+        "lift": 0.001,
+        "walk_forward_lift": 0.001,
+        "walk_forward_folds": 3,
+    }
+
+    assert _model_selection_rank(production_ready_metrics, 0.002) > _model_selection_rank(negative_holdout, 0.01)
 
 
 def test_promote_rejects_candidate_without_production_eligibility(monkeypatch, tmp_path):

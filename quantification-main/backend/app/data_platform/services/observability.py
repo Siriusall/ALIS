@@ -116,7 +116,7 @@ def _quality_audit(c: Any) -> dict[str, Any]:
         """
     ).fetchall()]
 
-    daily_apis = ("daily", "daily_basic", "adj_factor", "moneyflow", "suspend_d")
+    daily_apis = ("daily", "daily_basic", "adj_factor", "moneyflow", "moneyflow_hsgt", "suspend_d")
     invalid_trade_total = int(_value(c.execute(
         """
         SELECT COUNT(*) n

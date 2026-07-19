@@ -39,6 +39,8 @@ class IndexConstituent:
 
 _basic_info_cache: Dict[str, BasicInfo] = {}
 _index_constituents_cache: Dict[str, List[IndexConstituent]] = {}
+_basic_cache_warning_logged = False
+_index_cache_warning_logged: set[str] = set()
 _RETRY_DELAYS_SEC = (0.8, 1.5)
 
 
@@ -48,13 +50,13 @@ def get_basic_info_map(refresh: bool = False, cache_only: bool = False) -> Dict[
     默认缓存结果，如需强制刷新传 refresh=True。
     cache_only=True 时仅读缓存，无缓存则返回 {} 且不请求 TuShare（业务侧在非 init 路径传 True）。
     """
-    global _basic_info_cache
+    global _basic_info_cache, _basic_cache_warning_logged
     if _basic_info_cache and not refresh:
         return _basic_info_cache
     if cache_only:
-        logger.info(
-            "TuShare 基础信息: cache_only=True 且无缓存，返回空；请先执行初始化 POST /api/init"
-        )
+        if not _basic_cache_warning_logged:
+            logger.warning("TuShare 基础信息缓存未初始化；请通过已登录会话执行 POST /api/init（后续请求不再重复刷屏）")
+            _basic_cache_warning_logged = True
         return {}
     client = get_tushare_client()
     df = None
@@ -113,10 +115,9 @@ def get_index_constituents(
     if use_cache and key in _index_constituents_cache:
         return _index_constituents_cache[key]
     if cache_only:
-        logger.info(
-            "TuShare 指数成分: cache_only=True 且无缓存（%s），返回空；请先执行初始化 POST /api/init",
-            key,
-        )
+        if key not in _index_cache_warning_logged:
+            logger.warning("TuShare 指数成分缓存未初始化（%s）；请通过已登录会话执行 POST /api/init", key)
+            _index_cache_warning_logged.add(key)
         return []
     client = get_tushare_client()
     df = None

@@ -95,6 +95,8 @@ def build_daily_rebalance_report() -> dict[str, Any]:
     section1 = {
         "title": "一、今日市场环境",
         "market_state": ms.get("label", ms.get("state", "未知")),
+        "market_profile": (market.get("market_profile") or {}).get("label", "待识别"),
+        "market_profile_dimensions": (market.get("market_profile") or {}).get("dimensions", []),
         "market_confidence": ms.get("confidence"),
         "risk_budget_multiplier": ms.get("risk_budget_multiplier", 1.0),
         "sentiment_state": sent.get("state", "未知"),

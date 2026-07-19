@@ -125,6 +125,7 @@ def _apply_dynamic_strategy_gate(
 
     market = market_context_as_of(as_of_time)
     market_state = str((market.get("market_state") or {}).get("state") or "unknown")
+    market_profile_multiplier = float((market.get("market_profile") or {}).get("risk_budget_multiplier") or 1.0)
     sentiment_score = float((market.get("sentiment") or {}).get("score") or 50)
     admitted: List[str] = []
     blocked: List[Dict[str, Any]] = []
@@ -159,6 +160,7 @@ def _apply_dynamic_strategy_gate(
             theme_score=float((theme or {}).get("score") or 0),
             theme_verified=bool(theme and theme.get("promotable")),
             change_alarm_probability=float((market.get("change_alarm") or {}).get("p_change_1d") or 0),
+            market_profile_multiplier=market_profile_multiplier,
         )
         item = {"symbol": symbol, "ts_code": _ts_code(symbol), "gate": gate, "theme": theme, "risk": research.get("risk") or {}}
         items.append(item)

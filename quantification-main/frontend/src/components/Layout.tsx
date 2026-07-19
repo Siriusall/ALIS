@@ -8,6 +8,12 @@ import {
   DATA_CENTER_SECTION_STORAGE_KEY,
 } from "./dataCenterSections";
 import type { SectionKey as DataCenterSectionKey } from "./DataCenterTechnicalConsole";
+import {
+  GOVERNANCE_SECTIONS,
+  GOVERNANCE_SECTION_EVENT,
+  GOVERNANCE_SECTION_STORAGE_KEY,
+  type GovernanceSectionKey,
+} from "./governanceSections";
 
 export const ALL_SECTION_IDS = [
   "market",
@@ -32,6 +38,7 @@ export const ALL_SECTION_IDS = [
   "dataCenter",
   "governance",
   "strategy",
+  "backendLogs",
 ] as const;
 
 export const NAV_ITEMS = [
@@ -41,6 +48,7 @@ export const NAV_ITEMS = [
   { id: "reviewWorkbench", label: "人工复核", icon: "review" },
   { id: "dataCenter", label: "数据中台", icon: "data" },
   { id: "governance", label: "系统治理", icon: "governance" },
+  { id: "backendLogs", label: "后端日志", icon: "logs" },
 ] as const;
 
 export type SectionId = (typeof ALL_SECTION_IDS)[number];
@@ -82,6 +90,7 @@ function NavIcon({ name }: { name: NavIconName }) {
     review: <><path d="M5 4h14v16H5z" /><path d="m8 12 2 2 5-5" /></>,
     data: <><ellipse cx="12" cy="5" rx="7" ry="3" /><path d="M5 5v7c0 1.7 3.1 3 7 3s7-1.3 7-3V5" /><path d="M5 12v7c0 1.7 3.1 3 7 3s7-1.3 7-3v-7" /></>,
     governance: <><path d="M4 7h10M18 7h2M4 17h2M10 17h10" /><circle cx="16" cy="7" r="2" /><circle cx="8" cy="17" r="2" /></>,
+    logs: <><path d="M5 4h14v16H5z" /><path d="M8 8h8M8 12h8M8 16h5" /></>,
   }[name];
 
   return (
@@ -117,8 +126,12 @@ export default function Layout({
 }: LayoutProps) {
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [dataCenterOpen, setDataCenterOpen] = useState(currentSection === "dataCenter");
+  const [governanceOpen, setGovernanceOpen] = useState(currentSection === "governance" || currentSection === "strategy");
   const [dataCenterSection, setDataCenterSection] = useState<DataCenterSectionKey>(() => {
     return (window.localStorage.getItem(DATA_CENTER_SECTION_STORAGE_KEY) as DataCenterSectionKey | null) || "overview";
+  });
+  const [governanceSection, setGovernanceSection] = useState<GovernanceSectionKey>(() => {
+    return (window.localStorage.getItem(GOVERNANCE_SECTION_STORAGE_KEY) as GovernanceSectionKey | null) || "overview";
   });
   const currentChild = sections[currentSection] ?? sections.market;
   const navSection = getNavSection(currentSection);
@@ -140,6 +153,7 @@ export default function Layout({
 
   useEffect(() => {
     if (navSection === "dataCenter") setDataCenterOpen(true);
+    if (navSection === "governance") setGovernanceOpen(true);
   }, [navSection]);
 
   useEffect(() => {
@@ -151,9 +165,36 @@ export default function Layout({
     return () => window.removeEventListener(DATA_CENTER_SECTION_EVENT, onDataCenterSection);
   }, []);
 
+  useEffect(() => {
+    const onGovernanceSection = (event: Event) => {
+      const section = (event as CustomEvent<GovernanceSectionKey>).detail;
+      if (section) setGovernanceSection(section);
+    };
+    window.addEventListener(GOVERNANCE_SECTION_EVENT, onGovernanceSection);
+    return () => window.removeEventListener(GOVERNANCE_SECTION_EVENT, onGovernanceSection);
+  }, []);
+
   function handleSectionChange(id: SectionId) {
     onSectionChange(id);
     if (id !== "dataCenter") setDataCenterOpen(false);
+    if (id !== "governance" && id !== "strategy") setGovernanceOpen(false);
+    if (window.innerWidth < 768) setSidebarOpen(false);
+  }
+
+  function handleGovernanceParent() {
+    if (navSection !== "governance") {
+      onSectionChange("governance");
+      setGovernanceOpen(true);
+      return;
+    }
+    setGovernanceOpen((open) => !open);
+  }
+
+  function handleGovernanceSection(section: GovernanceSectionKey) {
+    setGovernanceSection(section);
+    window.localStorage.setItem(GOVERNANCE_SECTION_STORAGE_KEY, section);
+    onSectionChange("governance");
+    window.dispatchEvent(new CustomEvent(GOVERNANCE_SECTION_EVENT, { detail: section }));
     if (window.innerWidth < 768) setSidebarOpen(false);
   }
 
@@ -228,8 +269,8 @@ export default function Layout({
         <aside className="dashboard-sidebar" aria-label="主导航">
           <nav className="dashboard-nav">
             {NAV_ITEMS.map(({ id, label, icon }) => id === "dataCenter" ? (
-              <div className={`dashboard-nav-group ${dataCenterOpen || navSection === "dataCenter" ? "open" : ""}`} key={id}>
-                <button type="button" className={`dashboard-nav-item dashboard-nav-parent ${navSection === id ? "active" : ""}`} onClick={handleDataCenterParent} aria-expanded={dataCenterOpen || navSection === "dataCenter"}>
+              <div className={`dashboard-nav-group ${dataCenterOpen ? "open" : ""}`} key={id}>
+                <button type="button" className={`dashboard-nav-item dashboard-nav-parent ${navSection === id ? "active" : ""}`} onClick={handleDataCenterParent} aria-expanded={dataCenterOpen}>
                   <NavIcon name={icon} />
                   <span>{label}</span>
                   <i className="dashboard-nav-caret" aria-hidden="true" />
@@ -237,6 +278,22 @@ export default function Layout({
                 <div className="dashboard-subnav" aria-label="数据中台子导航">
                   {DATA_CENTER_SECTIONS.map((item) => (
                     <button key={item.key} type="button" className={navSection === "dataCenter" && dataCenterSection === item.key ? "active" : ""} onClick={() => handleDataCenterSection(item.key)}>
+                      <span>{item.label}</span>
+                      <small>{item.hint}</small>
+                    </button>
+                  ))}
+                </div>
+              </div>
+            ) : id === "governance" ? (
+              <div className={`dashboard-nav-group ${governanceOpen ? "open" : ""}`} key={id}>
+                <button type="button" className={`dashboard-nav-item dashboard-nav-parent ${navSection === id ? "active" : ""}`} onClick={handleGovernanceParent} aria-expanded={governanceOpen}>
+                  <NavIcon name={icon} />
+                  <span>{label}</span>
+                  <i className="dashboard-nav-caret" aria-hidden="true" />
+                </button>
+                <div className="dashboard-subnav" aria-label="系统治理子导航">
+                  {GOVERNANCE_SECTIONS.map((item) => (
+                    <button key={item.key} type="button" className={navSection === "governance" && governanceSection === item.key ? "active" : ""} onClick={() => handleGovernanceSection(item.key)}>
                       <span>{item.label}</span>
                       <small>{item.hint}</small>
                     </button>

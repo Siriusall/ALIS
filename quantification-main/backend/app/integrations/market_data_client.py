@@ -198,6 +198,7 @@ def _refresh_market_in_postgres(trade_date: str) -> None:
     sync_stock_basic()
     for api_name in ("daily", "daily_basic", "stk_limit", "suspend_d"):
         sync_tushare_api_raw(api_name, {"trade_date": trade_date})
+    sync_tushare_api_raw("moneyflow_hsgt", {"start_date": trade_date, "end_date": trade_date})
     build_stock_daily_snapshot(trade_date)
 
 

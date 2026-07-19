@@ -271,7 +271,7 @@ def research_state(dimensions: dict[str, dict[str, Any]], risk: dict[str, Any]) 
 
 def capability_registry() -> list[dict[str, Any]]:
     return [
-        {"key": "market", "name": "市场总览", "status": "ready", "api": "/api/decision/summary", "missing": ["HSMM已通过OOS验证，待上线评审（POST /api/model-strategy/review-hsmm-shadow）"]},
+        {"key": "market", "name": "市场总览", "status": "ready", "api": "/api/decision/summary", "missing": ["HSMM已通过历史OOS，当前处于真实影子观察期；观察期达标后才进入上线评审"]},
         {"key": "data", "name": "数据中台", "status": "ready", "api": "/api/data-center/status", "missing": []},
         {"key": "stock_research", "name": "股票研究中心", "status": "ready", "api": "/api/research/evaluate", "missing": []},
         {"key": "industry", "name": "行业研究中心", "status": "ready", "api": "/api/research/industries", "missing": ["产品价格、产能、政策供给等行业专属序列（使用PMI+公司财务聚合代理）"]},

@@ -141,6 +141,7 @@ TUSHARE_CATALOG: list[TushareCatalogItem] = [
     TushareCatalogItem("suspend_d", "交易状态", "停复牌", "交易约束、风险过滤", "daily", "ts_code,trade_date,suspend_timing,suspend_type", {"trade_date": ""}),
     TushareCatalogItem("stk_limit", "交易状态", "涨跌停价", "交易约束、涨跌停识别", "daily", "ts_code,trade_date,up_limit,down_limit", {"trade_date": ""}),
     TushareCatalogItem("moneyflow", "资金", "个股资金流", "资金确认项、短中期风险辅助", "daily", "ts_code,trade_date,buy_sm_vol,sell_sm_vol,buy_lg_vol,sell_lg_vol,net_mf_vol,net_mf_amount", {"trade_date": ""}),
+    TushareCatalogItem("moneyflow_hsgt", "资金", "沪深港通资金流向", "北向资金净流入和南向资金观测", "daily", "trade_date,ggt_ss,ggt_sz,hgt,sgt,north_money,south_money", {"start_date": "", "end_date": ""}),
     TushareCatalogItem("income", "财务", "利润表", "营收、利润、成长能力", "quarterly", "ts_code,ann_date,f_ann_date,end_date,report_type,revenue,total_revenue,operate_profit,total_profit,n_income,n_income_attr_p,basic_eps,diluted_eps", {"ts_code": "", "period": ""}),
     TushareCatalogItem("balancesheet", "财务", "资产负债表", "资产质量、负债、安全性", "quarterly", "ts_code,ann_date,f_ann_date,end_date,total_assets,total_liab,total_hldr_eqy_exc_min_int,money_cap,accounts_receiv,inventories,goodwill,st_borr,lt_borr,bond_payable,non_cur_liab_due_1y", {"ts_code": "", "period": ""}),
     TushareCatalogItem("cashflow", "财务", "现金流量表", "经营现金流、自由现金流质量", "quarterly", "ts_code,ann_date,f_ann_date,end_date,n_cashflow_act,n_cash_flows_inv_act,n_cash_flows_fnc_act,c_pay_acq_const_fiolta", {"ts_code": "", "period": ""}),
@@ -811,7 +812,7 @@ def sync_tushare_api_raw(api_name: str, params: dict[str, Any] | None = None, *,
             df = df.head(int(limit_rows))
         if not isinstance(df, pd.DataFrame) or df.empty:
             trade_date = str(request_params.get("trade_date") or "")
-            if trade_date and api_name in {"daily", "daily_basic", "stk_limit", "moneyflow", "adj_factor"}:
+            if trade_date and api_name in {"daily", "daily_basic", "stk_limit", "moneyflow", "moneyflow_hsgt", "adj_factor"}:
                 try:
                     from app.data_platform.services.market_calendar import target_trade_date
                     with _conn() as c:
@@ -1051,10 +1052,10 @@ def sync_market_bundle(trade_date: str, *, include_suspend: bool = False, apis: 
     # Suspension/resumption and money flow are core daily inputs, not optional
     # enrichments. Include both in every normal market update so an empty
     # result is also persisted as evidence that the date was checked.
-    requested_apis = list(apis or ["daily", "daily_basic", "stk_limit", "suspend_d", "moneyflow"])
+    requested_apis = list(apis or ["daily", "daily_basic", "stk_limit", "suspend_d", "moneyflow", "moneyflow_hsgt"])
     if include_suspend and "suspend_d" not in requested_apis:
         requested_apis.append("suspend_d")
-    allowed = {"daily", "daily_basic", "stk_limit", "suspend_d", "moneyflow"}
+    allowed = {"daily", "daily_basic", "stk_limit", "suspend_d", "moneyflow", "moneyflow_hsgt"}
     requested_apis = [api for api in requested_apis if api in allowed]
     results = []
     for api in requested_apis:
