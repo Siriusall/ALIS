@@ -172,39 +172,68 @@ def _market_overview() -> dict[str, Any]:
 
 
 def _recent_execution_summary() -> dict[str, Any] | None:
-    executions = list_executions(limit=1)
+    executions = list_executions(limit=50)
     if not executions:
         return None
     ex = executions[0]
-    ops = list_operations(execution_id=int(ex["id"]), limit=50)
-    buy_count = sum(1 for o in ops if str(o.get("side") or "").upper() == "BUY")
-    sell_count = sum(1 for o in ops if str(o.get("side") or "").upper() == "SELL")
+    latest_trade_date = str(ex.get("executed_at") or "")[:10]
+    day_executions = [item for item in executions if str(item.get("executed_at") or "")[:10] == latest_trade_date]
+    ops = []
+    for execution in day_executions:
+        ops.extend(list_operations(execution_id=int(execution["id"]), limit=100))
+    position_names = {str(item.get("symbol") or ""): str(item.get("name") or "") for item in get_positions()}
+    symbols = {str(operation.get("symbol") or "") for operation in ops if operation.get("symbol")}
+    if symbols:
+        placeholders = ",".join("?" for _ in symbols)
+        with data_conn() as conn:
+            rows = conn.execute(
+                f"SELECT ts_code,name FROM dc_stock_master WHERE split_part(ts_code,'.',1) IN ({placeholders})",
+                tuple(sorted(symbols)),
+            ).fetchall()
+        for row in rows:
+            item = dict(row)
+            position_names[str(item.get("ts_code") or "").split(".")[0]] = str(item.get("name") or "")
+    grouped: dict[tuple[str, str], dict[str, Any]] = {}
+    for operation in ops:
+        symbol = str(operation.get("symbol") or "")
+        side = str(operation.get("side") or "").upper()
+        if not symbol or side not in {"BUY", "SELL"}:
+            continue
+        key = (symbol, side)
+        quantity = int(operation.get("quantity") or 0)
+        price = float(operation.get("price") or 0)
+        item = grouped.setdefault(key, {
+            "symbol": symbol, "name": str(operation.get("name") or position_names.get(symbol) or ""),
+            "side": side, "quantity": 0, "gross_amount": 0.0,
+            "at": str(operation.get("at") or ""), "remark": str(operation.get("remark") or ""),
+        })
+        item["quantity"] += quantity
+        item["gross_amount"] += price * quantity
+        if not item["name"]:
+            item["name"] = position_names.get(symbol, "")
+    aggregated_ops = []
+    for item in grouped.values():
+        quantity = int(item.pop("quantity") or 0)
+        gross = float(item.pop("gross_amount") or 0)
+        aggregated_ops.append({**item, "quantity": quantity, "price": round(gross / quantity, 4) if quantity else 0.0, "amount": round(gross, 2)})
+    aggregated_ops.sort(key=lambda item: (0 if item["side"] == "BUY" else 1, -float(item.get("amount") or 0)))
+    buy_count = sum(1 for o in aggregated_ops if o["side"] == "BUY")
+    sell_count = sum(1 for o in aggregated_ops if o["side"] == "SELL")
     buy_cost = sum(
-        float(o.get("price") or 0) * int(o.get("quantity") or 0)
-        for o in ops
-        if str(o.get("side") or "").upper() == "BUY"
+        float(o.get("amount") or 0) for o in aggregated_ops if o["side"] == "BUY"
     )
     return {
         "execution_id": int(ex["id"]),
+        "execution_ids": [int(item["id"]) for item in day_executions],
+        "trade_date": latest_trade_date,
         "executed_at": str(ex.get("executed_at") or ""),
         "strategy_id": int(ex.get("strategy_id") or 0),
-        "budget": float(ex.get("budget") or 0),
+        "budget": round(sum(float(item.get("budget") or 0) for item in day_executions), 2),
         "top_n": int(ex.get("top_n") or 0),
         "buy_count": buy_count,
         "sell_count": sell_count,
         "total_buy_cost": round(buy_cost, 2),
-        "operations": [
-            {
-                "symbol": str(o.get("symbol") or ""),
-                "name": str(o.get("name") or ""),
-                "side": str(o.get("side") or ""),
-                "price": float(o.get("price") or 0),
-                "quantity": int(o.get("quantity") or 0),
-                "at": str(o.get("at") or ""),
-                "remark": str(o.get("remark") or ""),
-            }
-            for o in ops[:12]
-        ],
+        "operations": aggregated_ops[:20],
     }
 
 
@@ -345,7 +374,11 @@ def _build_gate_decision(
 
     state = str((market_overview.get("market_state") or {}).get("state") or "")
     if state in {"S2", "bear", "stress"}:
-        multiplier = float((market_overview.get("market_state") or {}).get("risk_budget_multiplier") or .55)
+        multiplier = float(
+            position_gate.get("combined_risk_budget_multiplier")
+            or (market_overview.get("market_state") or {}).get("risk_budget_multiplier")
+            or .55
+        )
         return {
             "tone": "hold",
             "title": "市场处于风险收缩，限制新增仓位",
@@ -395,6 +428,17 @@ def decision_summary(limit_days: int = Query(30, ge=1, le=250)) -> dict[str, Any
         model_status=model_status,
         market_overview=market_overview,
     )
+    recent_execution = _recent_execution_summary()
+    if recent_execution and str(recent_execution.get("trade_date") or "").replace("-", "") == str(latest_data_contract.get("latest_trade_date") or "").replace("-", "")[:8]:
+        gate_decision = {
+            "tone": "go",
+            "title": "今日全仓配置已执行",
+            "detail": (
+                f"已买入 {int(recent_execution.get('buy_count') or 0)} 只、卖出 {int(recent_execution.get('sell_count') or 0)} 只；"
+                f"成交买入金额 {float(recent_execution.get('total_buy_cost') or 0):,.2f} 元，当前剩余现金 {float(ledger.get('cash_balance') or 0):,.2f} 元。"
+            ),
+            "reason_code": "daily_allocation_executed",
+        }
     return {
         "data_health": data_health,
         "latest_data_contract": latest_data_contract,
@@ -402,7 +446,7 @@ def decision_summary(limit_days: int = Query(30, ge=1, le=250)) -> dict[str, Any
         "model_status": model_status,
         "market_overview": market_overview,
         "gate_decision": gate_decision,
-        "recent_execution": _recent_execution_summary(),
+        "recent_execution": recent_execution,
         "latest_model_validation": _latest_model_validation(model_status),
         "latest_analyze": None,
     }

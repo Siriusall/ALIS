@@ -208,7 +208,7 @@ def _migrate_positions_bought_at(c: _ConnWrapper) -> None:
 
 def _migrate_backtests_data_quality(c: _ConnWrapper) -> None:
     """Add backtest evidence columns for data/trading-risk review."""
-    if c._is_mysql:
+    if c._is_mysql and not c._is_postgres:
         for col in ("data_quality_json", "trade_constraints_json"):
             cur = c.execute(f"SHOW COLUMNS FROM backtests LIKE '{col}'")
             if cur.fetchone() is None:
@@ -1556,6 +1556,39 @@ def get_positions() -> List[Dict[str, Any]]:
     ]
 
 
+def _merge_position_row(
+    c: Any, *, symbol: str, quantity: int, price: float, updated_at: str,
+    name: str, bought_at: str,
+) -> int:
+    """Atomically insert or merge one holding, including concurrent buyers."""
+    values = (symbol, quantity, round(price, 2), updated_at, name, bought_at)
+    if c._is_mysql and not c._is_postgres:
+        c.execute(
+            """INSERT INTO positions (symbol,quantity,price,updated_at,name,bought_at)
+               VALUES (?,?,?,?,?,?)
+               ON DUPLICATE KEY UPDATE
+                 price=ROUND((quantity*price + VALUES(quantity)*VALUES(price))/(quantity+VALUES(quantity)),2),
+                 quantity=quantity+VALUES(quantity),updated_at=VALUES(updated_at),
+                 name=CASE WHEN VALUES(name)<>'' THEN VALUES(name) ELSE name END,
+                 bought_at=VALUES(bought_at)""",
+            values,
+        )
+    else:
+        c.execute(
+            """INSERT INTO positions (symbol,quantity,price,updated_at,name,bought_at)
+               VALUES (?,?,?,?,?,?)
+               ON CONFLICT(symbol) DO UPDATE SET
+                 price=ROUND(((positions.quantity*positions.price + excluded.quantity*excluded.price)
+                   /(positions.quantity+excluded.quantity))::numeric,2)::double precision,
+                 quantity=positions.quantity+excluded.quantity,updated_at=excluded.updated_at,
+                 name=CASE WHEN excluded.name<>'' THEN excluded.name ELSE positions.name END,
+                 bought_at=excluded.bought_at""",
+            values,
+        )
+    row = c.execute("SELECT id FROM positions WHERE symbol=?", (symbol,)).fetchone()
+    return int(row["id"])
+
+
 def merge_execution_into_positions(
     orders: List[Dict[str, Any]], executed_at: str, name_by_symbol: Optional[Dict[str, str]] = None
 ) -> None:
@@ -1573,21 +1606,10 @@ def merge_execution_into_positions(
                 continue
             name = (name_by_symbol.get(sym) or o.get("name") or "").strip()
             bought_date = (executed_at or now)[:10]
-            cur = c.execute("SELECT id, quantity, price, bought_at FROM positions WHERE symbol = ?", (sym,))
-            row = cur.fetchone()
-            if row:
-                old_q, old_p = int(row["quantity"]), float(row["price"])
-                new_q = old_q + qty
-                new_p = round((old_q * old_p + qty * pr) / new_q, 2) if new_q else 0
-                c.execute(
-                    "UPDATE positions SET quantity = ?, price = ?, updated_at = ?, name = ?, bought_at = ? WHERE id = ?",
-                    (new_q, new_p, now, name or "", bought_date, row["id"]),
-                )
-            else:
-                c.execute(
-                    "INSERT INTO positions (symbol, quantity, price, updated_at, name, bought_at) VALUES (?, ?, ?, ?, ?, ?)",
-                    (sym, qty, round(pr, 2), now, name or "", bought_date),
-                )
+            _merge_position_row(
+                c, symbol=sym, quantity=qty, price=pr, updated_at=now,
+                name=name or "", bought_at=bought_date,
+            )
 
 
 def add_position(symbol: str, quantity: int, price: float) -> Dict[str, Any]:
@@ -1600,23 +1622,10 @@ def add_position(symbol: str, quantity: int, price: float) -> Dict[str, Any]:
     now = datetime.utcnow().isoformat()[:19]
     bought_date = now[:10]
     with _conn() as c:
-        cur = c.execute("SELECT id, quantity, price FROM positions WHERE symbol = ?", (symbol,))
-        row = cur.fetchone()
-        if row:
-            old_q, old_p = int(row["quantity"]), float(row["price"])
-            new_q = old_q + quantity
-            new_p = round((old_q * old_p + quantity * price) / new_q, 2) if new_q else 0
-            c.execute(
-                "UPDATE positions SET quantity = ?, price = ?, updated_at = ? WHERE id = ?",
-                (new_q, new_p, now, row["id"]),
-            )
-            pid = row["id"]
-        else:
-            c.execute(
-                "INSERT INTO positions (symbol, quantity, price, updated_at, name, bought_at) VALUES (?, ?, ?, ?, ?, ?)",
-                (symbol, quantity, price, now, "", bought_date),
-            )
-            pid = c.last_insert_id()
+        pid = _merge_position_row(
+            c, symbol=symbol, quantity=quantity, price=price, updated_at=now,
+            name="", bought_at=bought_date,
+        )
     out = get_positions()
     for p in out:
         if p.get("id") == pid:

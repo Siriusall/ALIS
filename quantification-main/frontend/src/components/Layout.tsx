@@ -68,7 +68,7 @@ const SECTION_PARENT: Partial<Record<SectionId, SectionId>> = {
   positionRisk: "portfolioWorkbench",
   decisionLogs: "reviewWorkbench",
   review: "reviewWorkbench",
-  validation: "reviewWorkbench",
+  validation: "market",
   strategy: "governance",
 };
 

@@ -28,6 +28,12 @@ from app.data_platform.services.data_center import (
     sync_governance_bundle,
     sync_index_bundle,
     sync_market_bundle,
+    sync_capital_structure_bundle,
+    backfill_capital_structure_history,
+    backfill_etf_constituents_history,
+    backfill_etf_price_history,
+    backfill_major_news_history,
+    get_vip_backfill_status,
     sync_stock_basic,
     sync_trade_calendar,
     sync_tushare_api_raw,
@@ -332,6 +338,78 @@ def data_center_sync_market(
     """Sync daily market bundle and build snapshot for one trade date."""
 
     return sync_market_bundle(trade_date, include_suspend=include_suspend)
+
+
+@router.post("/data-center/sync/capital-structure")
+def data_center_sync_capital_structure(
+    trade_date: str = Query(..., description="YYYYMMDD"),
+) -> dict[str, Any]:
+    """Sync northbound, margin, Dragon-Tiger and eligibility evidence."""
+    return sync_capital_structure_bundle(trade_date)
+
+
+@router.post("/data-center/backfill/capital-structure")
+def data_center_backfill_capital_structure(
+    start_date: str = Query(..., description="YYYYMMDD"),
+    end_date: str = Query(..., description="YYYYMMDD"),
+    cursor: str = Query(default="", description="Last completed YYYYMMDD"),
+    limit_dates: int = Query(default=10, ge=1, le=60),
+) -> dict[str, Any]:
+    """Run one resumable historical capital-structure slice."""
+    return backfill_capital_structure_history(
+        start_date=start_date, end_date=end_date, cursor=cursor, limit_dates=limit_dates
+    )
+
+
+@router.post("/data-center/backfill/etf-history")
+def data_center_backfill_etf_history(
+    start_date: str = Query(..., description="YYYYMMDD"),
+    end_date: str = Query(..., description="YYYYMMDD"),
+    cursor: str = Query(default="", description="Last completed ETF ts_code"),
+    limit_funds: int = Query(default=20, ge=1, le=100),
+) -> dict[str, Any]:
+    """Run one resumable ETF price/NAV history slice."""
+    return backfill_etf_price_history(
+        start_date=start_date, end_date=end_date, cursor=cursor, limit_funds=limit_funds
+    )
+
+
+@router.post("/data-center/backfill/etf-constituents")
+def data_center_backfill_etf_constituents(
+    start_date: str = Query(..., description="YYYYMMDD"),
+    end_date: str = Query(..., description="YYYYMMDD"),
+    cursor: str = Query(default="", description="Last completed YYYYMMDD"),
+    limit_dates: int = Query(default=20, ge=1, le=60),
+) -> dict[str, Any]:
+    """Run one resumable Shanghai/Shenzhen ETF basket history slice."""
+    return backfill_etf_constituents_history(
+        start_date=start_date, end_date=end_date, cursor=cursor, limit_dates=limit_dates
+    )
+
+
+@router.post("/data-center/backfill/major-news")
+def data_center_backfill_major_news(
+    start_date: str = Query(..., description="YYYYMMDD"),
+    end_date: str = Query(..., description="YYYYMMDD"),
+    cursor: str = Query(default="", description="Last completed YYYYMMDD"),
+    limit_days: int = Query(default=7, ge=1, le=31),
+) -> dict[str, Any]:
+    """Run one resumable source-by-day long-form news slice."""
+    return backfill_major_news_history(
+        start_date=start_date, end_date=end_date, cursor=cursor, limit_days=limit_days
+    )
+
+
+@router.get("/data-center/backfill/vip-status")
+def data_center_vip_backfill_status(
+    capital_start: str = Query(default="20200101", description="YYYYMMDD"),
+    news_start: str = Query(default="20230719", description="YYYYMMDD"),
+    end_date: str = Query(..., description="YYYYMMDD"),
+) -> dict[str, Any]:
+    """Inspect exact request-slice completion for VIP datasets."""
+    return get_vip_backfill_status(
+        capital_start=capital_start, news_start=news_start, end_date=end_date
+    )
 
 
 @router.post("/data-center/sync/financial")

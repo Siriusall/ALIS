@@ -121,7 +121,7 @@ def _quality_audit(c: Any) -> dict[str, Any]:
         """
         SELECT COUNT(*) n
         FROM dc_tushare_raw_records
-        WHERE api_name IN (?,?,?,?,?)
+        WHERE api_name IN (?,?,?,?,?,?)
           AND trade_date <> ''
           AND trade_date > ?
         """,
@@ -131,7 +131,7 @@ def _quality_audit(c: Any) -> dict[str, Any]:
         """
         SELECT api_name,trade_date,COUNT(*) n
         FROM dc_tushare_raw_records
-        WHERE api_name IN (?,?,?,?,?)
+        WHERE api_name IN (?,?,?,?,?,?)
           AND trade_date <> ''
           AND trade_date > ?
         GROUP BY api_name,trade_date

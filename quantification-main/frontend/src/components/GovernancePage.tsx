@@ -200,7 +200,7 @@ export default function GovernancePage() {
       <div className={`governance-command ${systemReady ? "ready" : "blocked"}`}>
         <div>
           <span>当前运行结论</span>
-          <h2>{systemReady ? "生产模型已就绪" : trainRun?.status === "running" ? "正在建立生产模型" : "生产运行仍被阻塞"}</h2>
+          <h2>{systemReady ? "生产链路全部就绪" : active ? "每日决策已就绪，部分后台能力受限" : trainRun?.status === "running" ? "正在建立生产模型" : "生产运行仍被阻塞"}</h2>
           <p>{active
             ? `当前由 ${active.version} 提供生产评分。`
             : trainRun?.status === "running"

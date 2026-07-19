@@ -3,6 +3,7 @@ import { getSimulationLedger } from "../api/quantRuns";
 import type { SimulationLedgerItem, SimulationLedgerResponse } from "../types";
 import { formatGmt8Time } from "../utils/time";
 import type { SectionId } from "./Layout";
+import SecurityLabel from "./SecurityLabel";
 
 function money(value: number | null | undefined, digits = 2) {
   return Number.isFinite(Number(value)) ? Number(value).toFixed(digits) : "—";
@@ -165,7 +166,7 @@ export default function TradeHistory({ onNavigate }: TradeHistoryProps) {
               <tbody>
                 {(selected?.operations ?? []).map((op) => (
                   <tr key={op.operation_uid || op.operation_id}>
-                    <td>{op.symbol}<div className="sub">{op.name || op.trade_time}</div></td>
+                    <td><SecurityLabel code={op.symbol} name={op.name} /><div className="sub">{op.trade_time}</div></td>
                     <td>{sideText(op.side)}</td>
                     <td>{op.quantity.toLocaleString("zh-CN")}</td>
                     <td>{money(op.simulated_price, 3)}</td>
@@ -191,7 +192,7 @@ export default function TradeHistory({ onNavigate }: TradeHistoryProps) {
                 <tbody>
                   {selected?.blocked_signals.map((item, index) => (
                     <tr key={index}>
-                      <td>{String(item.symbol || item.ts_code || "—")}</td>
+                      <td><SecurityLabel code={String(item.symbol || item.ts_code || "—")} name={String(item.name || "")} /></td>
                       <td>{String(item.side || "—")}</td>
                       <td>{String(item.code || "—")}</td>
                       <td>{String(item.message || item.reason || "—")}</td>

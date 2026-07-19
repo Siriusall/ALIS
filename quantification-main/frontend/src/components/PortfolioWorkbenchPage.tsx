@@ -3,6 +3,8 @@ import { fetchOperations, fetchPositions } from "../api/positions";
 import { fetchPortfolioRisk, fetchStockPools, type PortfolioRiskOverview, type StockPoolMember } from "../api/research";
 import type { Operation, Position } from "../types";
 import type { SectionId } from "./Layout";
+import LoadingState from "./LoadingState";
+import SecurityLabel from "./SecurityLabel";
 
 const MODULES: Array<{
   id: SectionId;
@@ -36,6 +38,8 @@ export default function PortfolioWorkbenchPage({ onNavigate }: PortfolioWorkbenc
   const [positions, setPositions] = useState<Position[]>([]);
   const [operations, setOperations] = useState<Operation[]>([]);
   const [risk, setRisk] = useState<PortfolioRiskOverview | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState("");
 
   useEffect(() => {
     let cancelled = false;
@@ -51,6 +55,9 @@ export default function PortfolioWorkbenchPage({ onNavigate }: PortfolioWorkbenc
       if (results[1].status === "fulfilled") setPositions(results[1].value.positions ?? []);
       if (results[2].status === "fulfilled") setOperations(results[2].value);
       if (results[3].status === "fulfilled") setRisk(results[3].value);
+      const failures = results.filter((result) => result.status === "rejected");
+      setLoadError(failures.length ? `${failures.length} 项组合数据暂时无法读取，页面展示其余已就绪数据。` : "");
+      setLoading(false);
     }
     void load();
     const timer = window.setInterval(load, 15000);
@@ -78,6 +85,10 @@ export default function PortfolioWorkbenchPage({ onNavigate }: PortfolioWorkbenc
       .sort((a, b) => b.value - a.value)[0];
   }, [positions, totalMarketValue]);
 
+  if (loading) {
+    return <LoadingState variant="page" title="正在读取组合与执行" detail="正在汇总股票池、持仓、风险和执行流水" rows={5} />;
+  }
+
   return (
     <section className="product-module-page workbench-page">
       <div className="product-module-head">
@@ -87,6 +98,8 @@ export default function PortfolioWorkbenchPage({ onNavigate }: PortfolioWorkbenc
           <p>这里把研究结论变成组合动作。</p>
         </div>
       </div>
+
+      {loadError && <div className="alert">{loadError}</div>}
 
       <div className="workbench-hero">
         <div>
@@ -174,7 +187,7 @@ export default function PortfolioWorkbenchPage({ onNavigate }: PortfolioWorkbenc
             <span>风险门</span>
             <strong>{risk?.status || "—"}</strong>
             <span>最大单票</span>
-            <strong>{largestPosition ? `${largestPosition.symbol} ${pct(largestPosition.value / totalMarketValue)}` : "—"}</strong>
+            <strong>{largestPosition ? <><SecurityLabel code={largestPosition.symbol} name={largestPosition.name} /> {pct(largestPosition.value / totalMarketValue)}</> : "—"}</strong>
             <span>95% CVaR</span>
             <strong>{pct(risk?.tail_risk.cvar)}</strong>
             <span>最新风险时点</span>
@@ -194,7 +207,7 @@ export default function PortfolioWorkbenchPage({ onNavigate }: PortfolioWorkbenc
             ))}
             {stateRecommendations.slice(0, 4).map((item) => (
               <div key={`${item.symbol}-${item.recommended_state}`} className="decision-issue warning">
-                {item.symbol}：{item.current_state} → {item.recommended_state} · {item.reason}
+                <SecurityLabel code={item.symbol} name={positions.find((position) => position.symbol === item.symbol)?.name} />：{item.current_state} → {item.recommended_state} · {item.reason}
               </div>
             ))}
             {!breaches.length && !stateRecommendations.length && (
@@ -208,7 +221,7 @@ export default function PortfolioWorkbenchPage({ onNavigate }: PortfolioWorkbenc
           <div className="decision-issue-list">
             {recentOps.map((item, index) => (
               <div key={`${item.symbol}-${index}`} className="decision-issue warning">
-                {item.symbol} · {String(item.side || "操作")} · 数量 {item.quantity ?? "—"} · 价格 {item.price ?? "—"}
+                <SecurityLabel code={item.symbol} name={item.name} /> · {String(item.side || "操作")} · 数量 {item.quantity ?? "—"} · 价格 {item.price ?? "—"}
               </div>
             ))}
             {!recentOps.length && <div className="empty">暂无最近执行流水。</div>}

@@ -1,3 +1,5 @@
+import axios from "axios";
+
 import { api, TOKEN_KEY } from "./client";
 
 export interface UserInfo {
@@ -39,10 +41,16 @@ export async function login(username: string, password: string): Promise<AuthRes
 
 export async function fetchCurrentUser(): Promise<UserInfo | null> {
   const token = getStoredToken();
-  if (!token) return null;
   setAuthHeader(token);
-  const { data } = await api.get<UserInfo | null>("/api/auth/me");
-  return data ?? null;
+  try {
+    const { data } = await api.get<UserInfo | null>("/api/auth/me");
+    return data ?? null;
+  } catch (error) {
+    // A production visitor without a session is simply logged out. During
+    // localhost debugging the backend returns the synthetic debug user here.
+    if (axios.isAxiosError(error) && error.response?.status === 401) return null;
+    throw error;
+  }
 }
 
 export async function logout(): Promise<void> {

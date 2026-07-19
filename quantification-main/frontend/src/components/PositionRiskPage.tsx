@@ -1,5 +1,8 @@
 import { useEffect, useState } from "react";
 import { confirmPositionState, fetchPortfolioRisk, type PortfolioRiskOverview } from "../api/research";
+import type { SectionId } from "./Layout";
+import LoadingState from "./LoadingState";
+import SecurityLabel from "./SecurityLabel";
 
 const pct = (value: number | undefined | null) => value == null ? "—" : `${(value * 100).toFixed(1)}%`;
 const money = (value: number | undefined | null) => value == null ? "—" : value.toLocaleString("zh-CN", { maximumFractionDigits: 2 });
@@ -14,7 +17,21 @@ function statusText(value: string) {
   return map[value] || value || "—";
 }
 
-export default function PositionRiskPage() {
+function stateText(value: string) {
+  const map: Record<string, string> = { uninitialized: "未建立", warning: "观察", reduce: "减仓", core: "核心", exit: "退出" };
+  return map[value] || value || "—";
+}
+
+function reasonText(value: string) {
+  const map: Record<string, string> = {
+    investment_thesis_invalidated: "投资逻辑已失效",
+    single_name_risk_limit_breached: "单票风险超过上限",
+    thesis_evidence_missing_or_below_core_threshold: "投资逻辑证据不足或置信度未达核心标准",
+  };
+  return map[value] || value || "—";
+}
+
+export default function PositionRiskPage({ onNavigate }: { onNavigate?: (section: SectionId) => void }) {
   const [data, setData] = useState<PortfolioRiskOverview | null>(null);
   const [error, setError] = useState("");
   const [confirming, setConfirming] = useState("");
@@ -58,6 +75,10 @@ export default function PositionRiskPage() {
   const breachCount = data?.breaches.length ?? 0;
   const stateRecommendations = data?.position_state_recommendations ?? [];
   const deleveraging = data?.deleveraging_actions ?? [];
+
+  if (loading && !data) {
+    return <LoadingState variant="page" title="正在读取持仓风险" detail="正在计算风险突破、状态迁移和压力测试" rows={5} />;
+  }
 
   return (
     <section className="product-module-page">
@@ -155,7 +176,7 @@ export default function PositionRiskPage() {
               <div className="decision-issue-list">
                 {data.breaches.slice(0, 5).map((item, index) => (
                   <div className={`decision-issue ${item.severity}`} key={`${item.code}-${index}`}>
-                    {item.symbol ? `${item.symbol} · ` : item.industry ? `${item.industry} · ` : ""}
+                    {item.symbol ? <><SecurityLabel code={item.symbol} name={data.exposures.find((value) => value.symbol === item.symbol)?.name} /> · </> : item.industry ? `${item.industry} · ` : ""}
                     {item.message}
                   </div>
                 ))}
@@ -170,7 +191,7 @@ export default function PositionRiskPage() {
             {stateRecommendations.length ? (
               stateRecommendations.map((item) => (
                 <div className="decision-issue warning" key={item.symbol}>
-                  <strong>{item.symbol}</strong>：{item.current_state} → {item.recommended_state} · {item.reason}
+                  <strong><SecurityLabel code={item.symbol} name={data.exposures.find((value) => value.symbol === item.symbol)?.name} /></strong>：{stateText(item.current_state)} → {stateText(item.recommended_state)} · {reasonText(item.reason)}
                   <br />
                   <em>
                     逻辑 {item.evidence.thesis_status} / 置信度 {item.evidence.thesis_confidence.toFixed(0)}% / 风险 {item.evidence.risk_breaches.join("、") || "—"}；需留痕确认。
@@ -179,6 +200,9 @@ export default function PositionRiskPage() {
                     <button className="button ghost" onClick={() => void confirm(item)} disabled={confirming === item.symbol}>
                       {confirming === item.symbol ? "确认中…" : "确认迁移"}
                     </button>
+                  )}
+                  {item.current_state === "uninitialized" && (
+                    <button className="button ghost" onClick={() => onNavigate?.("thesis")}>先建立投资逻辑状态</button>
                   )}
                 </div>
               ))
@@ -221,7 +245,7 @@ export default function PositionRiskPage() {
               deleveraging.map((item, index) => (
                 <div className="decision-issue warning" key={`${item.action}-${index}`}>
                   {item.action}
-                  {item.symbol ? ` · ${item.symbol}` : item.industry ? ` · ${item.industry}` : ""}
+                  {item.symbol ? <> · <SecurityLabel code={item.symbol} name={data.exposures.find((value) => value.symbol === item.symbol)?.name} /></> : item.industry ? ` · ${item.industry}` : ""}
                   {item.target_weight != null ? `，目标权重 ${pct(item.target_weight)}` : ""}
                   {item.risk_budget_multiplier != null ? `，风险预算 ${pct(item.risk_budget_multiplier)}` : ""}
                   {" · "}
@@ -234,16 +258,17 @@ export default function PositionRiskPage() {
           </div>
 
           <div className="card decision-panel">
-            <h3>逐仓暴露、目标权重与解释</h3>
+            <h3>逐仓暴露与优化器参考权重</h3>
+            <p className="muted">参考权重用于风险诊断，不代表已获授权的调仓动作；实际执行以“今日调仓建议”为准。</p>
             <div className="table-scroll">
               <table>
-                <thead><tr><th>标的</th><th>行业</th><th>当前</th><th>目标</th><th>调仓差</th><th>解释</th></tr></thead>
+                <thead><tr><th>标的</th><th>行业</th><th>当前</th><th>优化器参考</th><th>参考差</th><th>解释</th></tr></thead>
                 <tbody>
                   {data.weight_explanations.map((item) => {
                     const exposure = data.exposures.find((value) => value.symbol === item.symbol);
                     return (
                       <tr key={item.symbol}>
-                        <td>{item.symbol} {exposure?.name}</td>
+                        <td><SecurityLabel code={item.symbol} name={exposure?.name} /></td>
                         <td>{exposure?.industry || "—"}</td>
                         <td>{pct(item.current_weight)}</td>
                         <td>{pct(item.target_weight)}</td>

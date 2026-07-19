@@ -555,13 +555,13 @@ def _persist_step_result(
             consecutive_cash_days += 1
     policy = {
         "consecutive_cash_days": consecutive_cash_days,
-        "status": "explanation_required" if consecutive_cash_days >= 3 else "monitoring" if current_cash_only else "invested",
+        "status": "blocked" if current_cash_only else "invested",
         "reason": "研究、估值、风险或交易约束未形成可执行且通过门控的权益订单" if current_cash_only else "组合持有可交易资产",
         "reentry_conditions": ["数据质量门恢复", "至少一项研究逻辑与安全边际通过", "市场状态允许新增风险暴露"],
         "defensive_asset_evaluation": {
             "assets": ["货币ETF", "债券ETF", "黄金ETF", "低波动ETF", "红利ETF"],
-            "status": "required" if consecutive_cash_days >= 3 else "not_due",
-            "decision": "进入防御资产候选评估，不因无权益信号默认长期纯现金" if consecutive_cash_days >= 3 else "达到连续3个交易日后启动专项评估",
+            "status": "required" if current_cash_only else "not_due",
+            "decision": "当日立即进入防御资产配置，不允许等待或长期纯现金" if current_cash_only else "账户已持有可交易资产",
         },
     }
     detail["cash_only_policy"] = policy

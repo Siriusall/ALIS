@@ -79,3 +79,27 @@ def test_correlated_industries_share_a_thirty_five_percent_cap() -> None:
         industry_by_symbol={"000001": "银行", "600001": "证券"},
     )
     assert sum(item.amount for item in planned) <= 35_000
+
+
+def test_existing_target_is_topped_up_to_optimizer_weight() -> None:
+    planned, _, _ = allocate_buy_orders(
+        [_order("511880", 1.0), _order("518880", 1.0)],
+        budget=120_000, total_equity=200_000,
+        max_single_position_pct=.25, max_industry_position_pct=1.0,
+        existing_position_value={"511880": 20_000, "518880": 60_000},
+        target_weights={"511880": .50, "518880": .50},
+        symbol_position_limits={"511880": .60, "518880": .60},
+        initial_entry_fraction=1.0,
+    )
+    values = {item.symbol: item.amount for item in planned}
+    assert 79_000 <= values["511880"] <= 80_000
+    assert 39_000 <= values["518880"] <= 40_000
+
+
+def test_asset_specific_etf_limit_can_exceed_general_stock_limit() -> None:
+    planned, _, _ = allocate_buy_orders(
+        [_order("511880", 1.0)], budget=100_000, total_equity=200_000,
+        max_single_position_pct=.15, target_weights={"511880": 1.0},
+        symbol_position_limits={"511880": .45}, initial_entry_fraction=1.0,
+    )
+    assert 89_000 <= planned[0].amount <= 90_000

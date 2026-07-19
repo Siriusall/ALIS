@@ -38,6 +38,7 @@ from app.services.strategy_recommender import recommend_strategy_template
 from app.services.strategy_config import parse_strategy_content
 from app.services.trend_model import analyze_trend
 from app.services.quant_risk import cvar_position_multiplier, constrained_cvar_weights, enforce_marginal_cvar_limit, hrp_fallback_weights, ledoit_wolf_covariance
+from app.services.industry_allocator import apply_industry_targets, build_industry_allocation
 
 _SCORING_HEARTBEAT_EVERY = max(100, min(int(os.getenv("QUANT_SCORING_HEARTBEAT_EVERY", "300")), 2000))
 _SCORING_TIMEOUT_SEC = max(10, min(int(os.getenv("QUANT_SCORING_TIMEOUT_SEC", "90")), 1800))
@@ -102,7 +103,15 @@ def _apply_research_admission(target_symbols: List[str], *, as_of_time: str | No
     for symbol in target_symbols:
         code = _ts_code(symbol)
         if code not in core_codes:
-            blocked.append({"symbol": symbol, "ts_code": code, "side": "BUY", "code": "not_in_core_pool", "message": "未进入核心候选池，模型排名不能绕过研究准入"})
+            from app.services.theme_engine import best_theme_for_stock
+            from app.services.research_engine import build_stock_research
+            theme = best_theme_for_stock(code, as_of_time=as_of_time)
+            research = build_stock_research(code, persist=True, as_of_time=as_of_time)
+            tactical_ok = bool(theme and theme.get("promotable") and theme.get("lifecycle") not in {"退潮", "沉寂"} and (research.get("risk") or {}).get("eligible"))
+            if tactical_ok:
+                admitted.append(symbol)
+                continue
+            blocked.append({"symbol": symbol, "ts_code": code, "side": "BUY", "code": "not_in_core_or_narrative_pool", "message": "既不是长期核心资产，也未通过短期主线与风险准入"})
             continue
         eligibility = evaluate_core_pool_eligibility(code, as_of_time=as_of_time)
         if not eligibility.get("eligible_for_core"):
@@ -174,11 +183,14 @@ def _apply_dynamic_strategy_gate(
                 "gate": gate,
             })
     multipliers = [float(item["gate"].get("risk_budget_multiplier") or 0) for item in items if item["gate"].get("admitted")]
+    equity_target_weight = min(multipliers) if multipliers else 0.0
     summary = {
         "as_of_time": as_of_time, "market_context": market, "items": items,
-        "risk_budget_multiplier": min(multipliers) if multipliers else 0.0,
+        "risk_budget_multiplier": equity_target_weight,
         "cash_target": max((float(item["gate"].get("cash_target") or 0) for item in items), default=1.0),
-        "defensive_allocation": defensive_allocation_for_state(market_state, as_of_date=str(as_of_time)[:10]),
+        "defensive_allocation": defensive_allocation_for_state(
+            market_state, as_of_date=str(as_of_time)[:10], equity_target_weight=equity_target_weight,
+        ),
     }
     return admitted, blocked, summary
 
@@ -529,6 +541,21 @@ def _build_target_symbols(
             ranked = _score_rows(filtered, score_weights, factor_values)
     else:
         ranked = _score_rows(filtered, score_weights, factor_values)
+    # Candidate recall is industry-first: only confirmed, non-fading narrative
+    # industries enter the final stock ranking. This prevents a globally high
+    # stock score from bypassing the current market story.
+    from app.services.theme_engine import list_themes, materialize_theme_snapshots
+    materialize_theme_snapshots(as_of_time=f"{signal_date}T23:59:59")
+    themes = list_themes(as_of_time=f"{signal_date}T23:59:59", promotable_only=True, limit=100).get("items") or []
+    narrative_codes = {
+        str(company.get("ts_code") or "").split(".")[0]
+        for theme in themes if str(theme.get("lifecycle") or "") not in {"退潮", "沉寂"}
+        for company in (theme.get("companies") or [])
+    }
+    narrative_ranked = [item for item in ranked if str(item[0].symbol).split(".")[0] in narrative_codes]
+    if narrative_ranked:
+        ranked = narrative_ranked
+    recall_n = max(top_n, min(80, top_n * 10))
     detail = {
         **empty_detail,
         "filter_summary": {
@@ -540,10 +567,15 @@ def _build_target_symbols(
             ranked,
             weights=score_weights,
             factor_values=factor_values,
-            top_n=top_n,
+            top_n=recall_n,
         ),
+        "narrative_recall": {
+            "method": "industry_story_first_v1",
+            "themes": [{"theme": item.get("theme_name"), "score": item.get("score"), "lifecycle": item.get("lifecycle")} for item in themes],
+            "eligible_symbols": len(narrative_codes),
+        },
     }
-    return [x[0].symbol for x in ranked[:top_n]], detail
+    return [x[0].symbol for x in ranked[:recall_n]], detail
 
 
 def run_for_trade_date(
@@ -586,7 +618,29 @@ def run_for_trade_date(
     target_symbols, dynamic_blocks, dynamic_gate = _apply_dynamic_strategy_gate(
         target_symbols, as_of_time=f"{signal_date}T23:59:59"
     )
+    target_symbols = target_symbols[:max(1, int(top_n))]
     equity_target_symbols = list(target_symbols)
+    score_map = _selection_score_map(selection_detail)
+    market_state = str(((dynamic_gate.get("market_context") or {}).get("market_state") or {}).get("state") or "unknown")
+    industry_allocation = build_industry_allocation(
+        symbols=equity_target_symbols,
+        symbol_scores=score_map,
+        equity_budget=float(dynamic_gate.get("risk_budget_multiplier") or 0),
+        market_state=market_state,
+        as_of_time=f"{signal_date}T23:59:59",
+    )
+    admitted_industries = set((industry_allocation.get("industry_targets") or {}).keys())
+    symbol_industries = industry_allocation.get("symbol_industries") or {}
+    industry_rejected = [symbol for symbol in equity_target_symbols if symbol_industries.get(symbol) not in admitted_industries]
+    for symbol in industry_rejected:
+        dynamic_blocks.append({"symbol": symbol, "ts_code": _ts_code(symbol), "side": "BUY", "code": "industry_budget_gate_failed", "message": "所属行业未获得当日股票风险预算"})
+    equity_target_symbols = [symbol for symbol in equity_target_symbols if symbol not in industry_rejected]
+    allocated_equity_budget = float(industry_allocation.get("allocated_equity_budget") or 0)
+    from app.services.defensive_assets import defensive_allocation_for_state
+    dynamic_gate["risk_budget_multiplier"] = allocated_equity_budget
+    dynamic_gate["defensive_allocation"] = defensive_allocation_for_state(
+        market_state, as_of_date=signal_date, equity_target_weight=allocated_equity_budget,
+    )
     defensive_policy = dynamic_gate.get("defensive_allocation") or {}
     defensive_weights = {str(code).split(".")[0]: float(weight) for code, weight in (defensive_policy.get("target_weights") or {}).items()}
     high_risk_symbols = {
@@ -596,6 +650,7 @@ def run_for_trade_date(
     target_symbols = list(dict.fromkeys(equity_target_symbols + list(defensive_weights)))
     selection_detail["research_admission"] = {"admitted": equity_target_symbols, "blocked": research_blocks}
     selection_detail["dynamic_strategy_gate"] = dynamic_gate
+    selection_detail["industry_allocation"] = industry_allocation
     blocked_events: List[Dict[str, Any]] = list(selection_detail.get("blocked_events") or []) + research_blocks + dynamic_blocks
     sell_triggers: List[Dict[str, Any]] = []
     strategy = get_strategy(strategy_id)
@@ -704,6 +759,7 @@ def run_for_trade_date(
             sell_triggers.append(
                 {
                     "symbol": sym,
+                    "name": str(pos.get("name") or ""),
                     "reason": "调仓卖出",
                     "detail": "不在目标池且满足持有期/T+1",
                     "quantity": int(pos["quantity"]),
@@ -729,9 +785,13 @@ def run_for_trade_date(
 
     # 再买入（等权资金，按总权益目标仓位与单票上限）
     held_after_sell = {str(p.get("symbol") or "").strip() for p in get_positions()}
-    buy_list = [s for s in target_symbols if s not in held_after_sell]
+    # Existing targets may still be below today's optimizer weight. Include
+    # them so idle cash is deployed instead of treating every held name as a
+    # permanent no-op.
+    buy_list = list(target_symbols)
     risk_budget = selection_detail.get("risk_budget") if isinstance(selection_detail.get("risk_budget"), dict) else {}
-    target_position_pct, max_single_position_pct = _parse_risk_budget(risk_budget)
+    _strategy_target_position_pct, max_single_position_pct = _parse_risk_budget(risk_budget)
+    target_position_pct = 1.0
     portfolio = _portfolio_state(ds, execute_date)
     defensive_target_weight = sum(defensive_weights.values())
     effective_budget_ratio = max(0.0, min(1.0, float(budget_ratio))) * min(1.0, float(dynamic_gate.get("risk_budget_multiplier") or 0) + defensive_target_weight)
@@ -742,9 +802,16 @@ def run_for_trade_date(
         target_position_pct=target_position_pct,
         budget_ratio=effective_budget_ratio,
     )
-    available_balance = min(available_balance, turnover_remaining)
+    residual_cash_limit = min(portfolio["total_equity"] * .005, 500.0)
+    full_investment_gap = portfolio["cash_balance"] if portfolio["cash_balance"] > residual_cash_limit else 0.0
+    turnover_capacity = max(turnover_remaining, full_investment_gap) if defensive_weights else turnover_remaining
+    available_balance = min(available_balance, turnover_capacity)
     order_requests: List[OrderRequest] = []
-    score_map = _selection_score_map(selection_detail)
+    narrative_name_by_symbol = {
+        str(candidate.get("symbol") or ""): str(candidate.get("name") or "")
+        for industry in (industry_allocation.get("items") or [])
+        for candidate in (industry.get("candidates") or [])
+    }
     returns_by_symbol: Dict[str, List[float]] = {}
     liquidity_caps: Dict[str, float] = {}
     for sym in buy_list:
@@ -772,7 +839,7 @@ def run_for_trade_date(
                 side="BUY",
                 price=px,
                 quantity=0,
-                name=str(getattr(px_row, "name", "") or ""),
+                name=str(getattr(px_row, "name", "") or narrative_name_by_symbol.get(sym) or ""),
                 change_pct=float(getattr(px_row, "change_pct", 0) or 0),
                 volume=float(getattr(px_row, "volume", 0) or 0),
                 close=float(getattr(px_row, "close", 0) or 0),
@@ -800,9 +867,15 @@ def run_for_trade_date(
         optimizer_name = f"{optimizer_name}+{bl_result.get('method', 'black_litterman_diagonal_v1')}"
     equity_weights = {symbol: weight for symbol, weight in cvar_weights.items() if symbol not in defensive_weights}
     equity_returns = {symbol: returns_by_symbol[symbol] for symbol in equity_weights if returns_by_symbol.get(symbol)}
-    marginal_cvar = enforce_marginal_cvar_limit(equity_weights, equity_returns) if equity_weights else {"status": "not_applicable", "weights": {}, "contributions": {}, "reason": "无股票风险袖套"}
+    adaptive_marginal_limit = max(.12, min(.35, 1.0 / max(1, len(equity_returns)) + .02))
+    marginal_cvar = enforce_marginal_cvar_limit(
+        equity_weights, equity_returns, max_contribution=adaptive_marginal_limit,
+    ) if equity_weights else {"status": "not_applicable", "weights": {}, "contributions": {}, "reason": "无股票风险袖套"}
     if marginal_cvar.get("status") in {"ready", "not_applicable"}:
         equity_weights = dict(marginal_cvar.get("weights") or {})
+        equity_weights = apply_industry_targets(
+            equity_weights, industry_allocation, equity_budget=allocated_equity_budget,
+        )
         equity_total = sum(equity_weights.values()) or 1.0
         equity_sleeve = max(0.0, 1.0 - defensive_target_weight)
         cvar_weights = {symbol: weight / equity_total * equity_sleeve for symbol, weight in equity_weights.items()}
@@ -822,6 +895,18 @@ def run_for_trade_date(
         for sym, weight in cvar_weights.items():
             score_map[sym] = float(score_map.get(sym, 0.0)) * float(weight * scale)
 
+    # Positions that cannot be sold today still consume capital. Scale today's
+    # target sleeve around them so the optimizer does not request more than
+    # 100% of account equity.
+    non_target_value = sum(
+        float(value or 0) for symbol, value in portfolio["position_value_by_symbol"].items()
+        if symbol not in cvar_weights
+    )
+    target_sleeve = max(0.0, 1.0 - non_target_value / max(float(portfolio["total_equity"]), 1.0))
+    weight_sum = sum(cvar_weights.values())
+    if weight_sum > 0:
+        cvar_weights = {symbol: weight / weight_sum * target_sleeve for symbol, weight in cvar_weights.items()}
+
     _report("正在生成买卖单")
     industry_by_symbol, existing_industry_value = _industry_exposure_inputs(
         list(portfolio["position_value_by_symbol"]) + [str(order.symbol) for order in order_requests],
@@ -837,6 +922,19 @@ def run_for_trade_date(
             industry = industry_by_symbol.get(str(symbol).split(".")[0], "unclassified")
             existing_industry_value[industry] = existing_industry_value.get(industry, 0.0) + float(value or 0)
     exec_t0 = time.monotonic()
+    position_limits = _pretrade_symbol_limits(
+        [str(order.symbol) for order in order_requests], cutoff=f"{signal_date}T23:59:59", max_single=max_single_position_pct,
+    )
+    for symbol in defensive_weights:
+        position_limits[symbol] = .45
+    defensive_only_target = bool(cvar_weights) and not any(symbol not in defensive_weights for symbol in cvar_weights)
+    residual_sweep_symbol = None
+    defensive_prices = {
+        str(order.symbol): float(order.price or 0)
+        for order in order_requests if str(order.symbol) in defensive_weights and float(order.price or 0) > 0
+    }
+    if defensive_prices:
+        residual_sweep_symbol = min(defensive_prices, key=defensive_prices.get)
     result = simulate_open_execution(
         order_requests,
         budget=available_balance,
@@ -847,12 +945,14 @@ def run_for_trade_date(
         symbol_scores=score_map,
         industry_by_symbol=industry_by_symbol,
         existing_industry_value=existing_industry_value,
-        max_industry_position_pct=.25,
-        max_correlated_industry_pct=.35,
+        max_industry_position_pct=.45 if defensive_only_target else .25,
+        max_correlated_industry_pct=.45 if defensive_only_target else .35,
         target_weights=cvar_weights,
-        symbol_position_limits=_pretrade_symbol_limits([str(order.symbol) for order in order_requests], cutoff=f"{signal_date}T23:59:59", max_single=max_single_position_pct),
+        symbol_position_limits=position_limits,
         high_risk_symbols=high_risk_symbols,
         max_order_value_by_symbol=liquidity_caps,
+        initial_entry_fraction=1.0,
+        residual_sweep_symbol=residual_sweep_symbol,
     )
     exec_latency_ms = max(1, int((time.monotonic() - exec_t0) * 1000))
     filled = _filled_orders(result.orders)
@@ -874,9 +974,11 @@ def run_for_trade_date(
     if total_buy_cost > 0:
         add_account_balance(-total_buy_cost)
     req_price_map = {str(x.symbol): float(x.price) for x in order_requests}
+    req_name_map = {str(x.symbol): str(x.name or "") for x in order_requests}
     orders_payload = [
         {
             "symbol": o.symbol,
+            "name": req_name_map.get(str(o.symbol), ""),
             "side": o.side,
             "price": o.price,
             "quantity": o.quantity,
@@ -891,6 +993,11 @@ def run_for_trade_date(
         if int(getattr(o, "quantity", 0) or 0) > 0
     ]
     execution_id: int | None = None
+    if sold_count == 0 and not filled:
+        raise ReplayRiskGateError(
+            "正常交易日未形成任何可执行订单；全仓策略禁止将 no_trade 标记为成功",
+            code="blocked_zero_order_full_investment",
+        )
     if orders_payload or sold_ops_payload:
         execution_id = create_execution(
             strategy_id=int(strategy_id),
@@ -930,6 +1037,7 @@ def run_for_trade_date(
     buy_actions = [
         {
             "symbol": str(getattr(o, "symbol", "") or ""),
+            "name": req_name_map.get(str(getattr(o, "symbol", "") or ""), ""),
             "quantity": int(getattr(o, "quantity", 0) or 0),
             "price": round(float(getattr(o, "price", 0) or 0), 4),
         }
@@ -944,6 +1052,22 @@ def run_for_trade_date(
         }
         for p in get_positions()
     ]
+    from app.services.defensive_assets import DEFENSIVE_ASSETS as _DEFENSIVE_ASSETS_FOR_AUDIT
+    defensive_asset_classes = {
+        str(item["ts_code"]).split(".")[0]: str(item["asset_class"])
+        for item in _DEFENSIVE_ASSETS_FOR_AUDIT
+    }
+    asset_function_by_symbol = {}
+    for symbol in target_symbols:
+        asset_class = defensive_asset_classes.get(symbol)
+        if asset_class == "money":
+            asset_function_by_symbol[symbol] = "liquidity"
+        elif asset_class in {"bond", "gold"}:
+            asset_function_by_symbol[symbol] = "diversifier"
+        elif asset_class in {"low_volatility", "dividend"}:
+            asset_function_by_symbol[symbol] = "core"
+        else:
+            asset_function_by_symbol[symbol] = "tactical" if symbol in high_risk_symbols else "core"
     detail = {
         **selection_detail,
         "execute_date": execute_date,
@@ -980,9 +1104,17 @@ def run_for_trade_date(
             "weights": cvar_weights,
             "black_litterman": bl_result,
             "covariance": covariance_snapshot,
-            "hard_constraints": {"max_single_position_pct": max_single_position_pct, "max_industry_position_pct": .25, "max_correlated_industry_pct": .35},
+            "hard_constraints": {"max_single_position_pct": max_single_position_pct, "max_industry_position_pct": .25, "max_correlated_industry_pct": .35, "max_marginal_cvar_contribution": round(adaptive_marginal_limit, 4)},
             "monthly_turnover_budget": {**turnover_budget, "remaining_after": round(turnover_remaining, 2)},
             "marginal_cvar": marginal_cvar,
+            "industry_allocation": industry_allocation,
+            "asset_function_by_symbol": asset_function_by_symbol,
+            "full_investment": {
+                "target_weight": 1.0,
+                "minimum_invested_ratio": .995,
+                "maximum_residual_cash": 500.0,
+                "defensive_target_weight": round(defensive_target_weight, 6),
+            },
         },
     }
     transaction_cost = round(sum(

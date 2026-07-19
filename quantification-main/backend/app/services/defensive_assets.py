@@ -64,30 +64,66 @@ def list_defensive_assets(*, as_of_date: str | None = None) -> dict[str, Any]:
     return {"ok": bool(ready), "status": "ready" if len(ready) == len(items) else "partial" if ready else "missing", "as_of_date": cutoff, "items": items}
 
 
-def defensive_allocation_for_state(market_state: str, *, as_of_date: str) -> dict[str, Any]:
-    """Return the fixed, explainable defensive sleeve permitted by B11.2."""
+def defensive_allocation_for_state(
+    market_state: str,
+    *,
+    as_of_date: str,
+    equity_target_weight: float | None = None,
+) -> dict[str, Any]:
+    """Allocate every non-equity yuan to tradable defensive ETFs.
+
+    The market state supplies preferences, while the requested sleeve is the
+    exact complement of the admitted equity target. Momentum only tilts the
+    mix; it never turns a healthy account back into idle cash.
+    """
     state = str(market_state or "unknown")
-    policies = {
-        "S2": {"money": .20, "bond": .15, "gold": .10},
-        "S3": {"low_volatility": .12, "dividend": .10, "gold": .08},
+    equity_defaults = {
+        "S0": .85, "S1": .75, "S2": .70, "S3": .65,
+        "S4": .50, "S5": .55, "S6": .50, "S7": .45,
+        "S8": .35, "S9": .25, "S10": .10, "S11": .40,
     }
-    requested = policies.get(state, {})
+    equity_weight = equity_defaults.get(state, .50) if equity_target_weight is None else max(0.0, min(1.0, float(equity_target_weight)))
+    defensive_target = round(1.0 - equity_weight, 6)
+    defensive_states = {"S7", "S8", "S9", "S10", "S11"}
+    base_scores = {
+        "money": .28 if state in defensive_states else .12,
+        "bond": .30 if state in defensive_states else .16,
+        "gold": .24 if state in defensive_states else .12,
+        "low_volatility": .12 if state in defensive_states else .32,
+        "dividend": .06 if state in defensive_states else .28,
+    }
     assets = list_defensive_assets(as_of_date=as_of_date)
-    by_class = {item["asset_class"]: item for item in assets["items"] if item["status"] == "ready"}
-    weights = {
-        by_class[asset_class]["ts_code"]: weight
-        for asset_class, weight in requested.items()
-        if asset_class in by_class
-    }
-    missing = [asset_class for asset_class in requested if asset_class not in by_class]
+    ready = [item for item in assets["items"] if item["status"] == "ready"]
+    scores = {}
+    for item in ready:
+        momentum = float(item.get("momentum_20d") or 0)
+        scores[item["ts_code"]] = max(.01, base_scores.get(item["asset_class"], .10) * (1.0 + max(-.5, min(.5, momentum * 5.0))))
+    total_score = sum(scores.values())
+    weights = {code: defensive_target * score / total_score for code, score in scores.items()} if total_score > 0 else {}
+    # Cap concentration, then redistribute the excess to names with room.
+    cap = .45
+    for _ in range(len(weights) + 1):
+        excess = sum(max(0.0, weight - cap) for weight in weights.values())
+        weights = {code: min(cap, weight) for code, weight in weights.items()}
+        room = {code: cap - weight for code, weight in weights.items() if weight < cap - 1e-9}
+        if excess <= 1e-9 or not room:
+            break
+        room_total = sum(room.values())
+        for code, available in room.items():
+            weights[code] += excess * available / room_total
+    weights = {code: round(weight, 6) for code, weight in weights.items() if weight > 0}
+    missing = [item["asset_class"] for item in DEFENSIVE_ASSETS if not any(x["asset_class"] == item["asset_class"] for x in ready)]
+    allocated = round(sum(weights.values()), 6)
     return {
-        "status": "ready" if requested and not missing else "partial" if weights else "not_required" if not requested else "missing",
+        "status": "ready" if abs(allocated - defensive_target) <= .001 else "partial" if weights else "missing",
         "market_state": state,
         "as_of_date": str(as_of_date).replace("-", ""),
         "target_weights": weights,
-        "target_weight": round(sum(weights.values()), 4),
+        "target_weight": round(allocated, 6),
+        "equity_target_weight": round(equity_weight, 6),
+        "full_investment_target": round(equity_weight + allocated, 6),
         "missing_asset_classes": missing,
-        "reason": "S2/S3风险收缩期将非权益预算配置到计划书允许的防御ETF" if requested else "当前市场状态不强制启用防御袖套",
+        "reason": "股票预算之外的资金按市场状态与20日动量动态配置到防御ETF，正常运行不保留闲置现金",
     }
 
 

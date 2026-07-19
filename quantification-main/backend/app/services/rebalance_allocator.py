@@ -145,6 +145,7 @@ def allocate_buy_orders(
     high_risk_symbols: set[str] | None = None,
     max_high_risk_total_pct: float = 0.05,
     max_order_value_by_symbol: Dict[str, float] | None = None,
+    residual_sweep_symbol: str | None = None,
 ) -> tuple[List[PlannedBuyOrder], List[OrderResult], List[str]]:
     """
     等权 + 单票上限 + 二次分配剩余资金。
@@ -156,7 +157,7 @@ def allocate_buy_orders(
     existing_industry_value = dict(existing_industry_value or {})
     target_weights = {str(key): max(0.0, float(value or 0)) for key, value in (target_weights or {}).items()}
     symbol_position_limits = {
-        str(key): max(0.0, min(float(value or 0), float(max_single_position_pct)))
+        str(key): max(0.0, min(float(value or 0), 1.0))
         for key, value in (symbol_position_limits or {}).items()
     }
     high_risk_symbols = {str(symbol) for symbol in (high_risk_symbols or set())}
@@ -166,7 +167,7 @@ def allocate_buy_orders(
 
     tradable, blocked = _build_tradable_orders(candidates)
     pruned: List[str] = []
-    if tradable:
+    if tradable and not target_weights:
         tradable, pruned = _prune_candidates_for_budget(
             tradable,
             budget=budget,
@@ -188,6 +189,18 @@ def allocate_buy_orders(
     per_equal = budget / n
     weight_total = sum(target_weights.get(str(order.symbol), 0.0) for order in tradable)
     initial_fraction = max(0.0, min(1.0, float(initial_entry_fraction)))
+    target_gap_by_symbol: Dict[str, float] = {}
+    if weight_total > 0:
+        target_weight_scale = 1.0 if weight_total <= 1.000001 else 1.0 / weight_total
+        for order in tradable:
+            sym = str(order.symbol)
+            normalized_target = target_weights.get(sym, 0.0) * target_weight_scale
+            target_gap_by_symbol[sym] = max(
+                0.0,
+                total_equity * normalized_target - float(existing_position_value.get(sym, 0) or 0),
+            )
+    target_gap_total = sum(target_gap_by_symbol.values())
+    target_gap_scale = min(1.0, budget / target_gap_total) if target_gap_total > 0 else 0.0
 
     qty_map: Dict[str, int] = {}
     exec_price_map: Dict[str, float] = {}
@@ -221,12 +234,18 @@ def allocate_buy_orders(
         group = correlated_industry_group(industry)
         group_room = max(0.0, total_equity * max_correlated - float(existing_group_value.get(group, 0) or 0))
         high_risk_room = max(0.0, total_equity * high_risk_limit - existing_high_risk_value) if sym in high_risk_symbols else float("inf")
-        desired = budget * target_weights.get(sym, 0.0) / weight_total if weight_total > 0 else per_equal
-        if float(existing_position_value.get(sym, 0) or 0) <= 0:
+        existing_value = float(existing_position_value.get(sym, 0) or 0)
+        if weight_total > 0:
+            desired = target_gap_by_symbol.get(sym, 0.0) * target_gap_scale
+        else:
+            desired = per_equal
+        if existing_value <= 0:
             desired *= initial_fraction
         if sym in max_order_value_by_symbol:
             desired = min(desired, max_order_value_by_symbol[sym])
-        planned_symbol_caps[sym] = min(total_equity * symbol_limit, float(existing_position_value.get(sym, 0) or 0) + desired)
+        planned_symbol_caps[sym] = min(total_equity * symbol_limit, existing_value + desired)
+        if sym == str(residual_sweep_symbol or ""):
+            planned_symbol_caps[sym] = total_equity * symbol_limit
         high_risk_count = max(1, sum(1 for order in tradable if str(order.symbol) in high_risk_symbols))
         alloc = min(desired, cap_room, industry_room / max(1, industry_candidate_count.get(industry, 1)), group_room / max(1, group_candidate_count.get(group, 1)), high_risk_room / high_risk_count)
         qty = normalize_lot_quantity(int(alloc / exec_price))

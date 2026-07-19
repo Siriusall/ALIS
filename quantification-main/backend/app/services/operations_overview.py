@@ -255,7 +255,14 @@ def build_governance_overview() -> dict[str, Any]:
     tasks, tasks_error = _safe_overview_call("tasks", lambda: list_quant_run_tasks(limit=20), [])
     versions, versions_error = _safe_overview_call("versions", lambda: list_model_versions(limit=20), [])
     errors = [item for item in (health_error, readiness_error, observability_error, model_error, capabilities_error, tasks_error, versions_error) if item]
-    failed_tasks = [x for x in tasks if str(x.get("status") or "") in {"failed", "paused"}]
+    failed_tasks = [
+        x for x in tasks
+        if str(x.get("status") or "") == "failed"
+        or (
+            str(x.get("status") or "") == "paused"
+            and str(x.get("replay_status") or "") != "completed"
+        )
+    ]
     unresolved_data = [x for x in observability.get("logs", []) if str(x.get("status") or "") == "failed"]
     readiness_states = [str(x.get("status") or "unknown") for x in readiness.get("consumers", [])]
     readiness_status = "blocked" if "blocked" in readiness_states else "degraded" if "degraded" in readiness_states else "ready" if readiness_states else "unknown"

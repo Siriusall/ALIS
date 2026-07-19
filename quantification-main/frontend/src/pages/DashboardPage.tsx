@@ -5,7 +5,7 @@ import { useAuth } from "../context/AuthContext";
 import Layout from "../components/Layout";
 const StrategyPage = lazy(() => import("../components/StrategyPage"));
 const PositionPage = lazy(() => import("../components/PositionPage"));
-const QuantRunPanel = lazy(() => import("../components/QuantRunPanel"));
+const DecisionAnalysisPage = lazy(() => import("../components/DecisionAnalysisPage"));
 const DecisionPage = lazy(() => import("../components/DecisionPage"));
 const DataCenterPage = lazy(() => import("../components/DataCenterPage"));
 const ProductModulePage = lazy(() => import("../components/ProductModulePage"));
@@ -54,9 +54,9 @@ export default function DashboardPage() {
     thesis: <ThesisPage />,
     portfolio: <PositionPage onNavigate={setCurrentSection} />,
     executionLedger: <TradeHistory onNavigate={setCurrentSection} />,
-    positionRisk: <PositionRiskPage />,
+    positionRisk: <PositionRiskPage onNavigate={setCurrentSection} />,
     reviewWorkbench: <ReviewWorkbenchPage onNavigate={setCurrentSection} />,
-    validation: <QuantRunPanel />,
+    validation: <DecisionAnalysisPage onNavigate={setCurrentSection} />,
     decisionLogs: <DecisionAuditPage />,
     review: <ReviewPage />,
     governance: <GovernancePage />,

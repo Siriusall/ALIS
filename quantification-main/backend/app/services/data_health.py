@@ -13,6 +13,25 @@ from app.services.cache_consolidation import FACTOR_KEYS_FOR_COVERAGE
 _health_cache_lock = threading.Lock()
 _health_cache: dict[int, tuple[float, dict[str, Any]]] = {}
 _HEALTH_CACHE_TTL_SECONDS = 20.0
+_FACTOR_COVERAGE_THRESHOLDS = {
+    "close": 0.8,
+    "volume": 0.8,
+    "turnover": 0.8,
+    "float_mv": 0.8,
+    "total_mv": 0.8,
+    # pe_ttm is legitimately null for loss-making or otherwise
+    # non-comparable companies; treating it like a price field creates a
+    # permanent false alarm across the full A-share universe.
+    "pe_ttm": 0.65,
+    "pb": 0.8,
+}
+
+
+def _low_core_factor_coverage(coverage: dict[str, float]) -> dict[str, float]:
+    return {
+        key: value for key, value in coverage.items()
+        if value < _FACTOR_COVERAGE_THRESHOLDS.get(key, 0.8)
+    }
 
 
 def _summarize_dates(dates: list[str]) -> dict[str, Any]:
@@ -59,7 +78,7 @@ def _summarize_postgresql_market_snapshots(limit_days: int) -> dict[str, Any]:
                 labels.get(field, field): round(int(stat.get(f"{field}_count") or 0) / max(1, total), 4)
                 for field in fields
             }
-            low_core = {key: value for key, value in coverage.items() if value < 0.8}
+            low_core = _low_core_factor_coverage(coverage)
             item = {"date": ymd, "symbol_rows": total, "source_counts": {"postgresql_snapshot": total}, "core_factor_coverage": coverage}
             day_summaries.append(item)
             if total <= 0 or low_core:

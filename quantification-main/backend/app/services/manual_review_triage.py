@@ -5,6 +5,7 @@ import os
 import time
 from typing import Any
 
+from app.core.project_env import get_env_value
 from app.services.llm_review_assistant import generate_review_draft, triage_review_issue
 from app.services.manual_review_queue import (
     build_manual_review_queue,
@@ -17,6 +18,18 @@ from app.services.review_learning import decision_outcomes
 _lock = threading.Lock()
 _running = False
 _scheduler_started = False
+
+
+def _retryable_llm_configuration_failure(state: dict[str, Any]) -> bool:
+    """Retry persisted pre-triage failures after an API key is configured."""
+    if not get_env_value("DEEPSEEK_API_KEY").strip():
+        return False
+    text = " ".join(str(state.get(key) or "") for key in ("summary", "escalation_reason"))
+    return not str(state.get("model") or "").strip() and any(marker in text for marker in (
+        "deepseek_api_key_not_configured",
+        "LLM未配置",
+        "LLM服务不可用",
+    ))
 
 
 def run_manual_review_triage_once(limit: int = 100) -> dict[str, Any]:
@@ -42,7 +55,7 @@ def run_manual_review_triage_once(limit: int = 100) -> dict[str, Any]:
                 )
                 awaiting_outcome += 1
                 continue
-        if state.get("status") not in {"auto_resolved", "escalated"}:
+        if state.get("status") not in {"auto_resolved", "escalated"} or _retryable_llm_configuration_failure(state):
             candidates.append(item)
     for item in candidates[:cycle_limit]:
         key = str(item.get("key") or "")

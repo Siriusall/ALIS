@@ -33,6 +33,8 @@ def simulate_open_execution(
     max_correlated_industry_pct: float = 1.0,
     high_risk_symbols: set[str] | None = None,
     max_order_value_by_symbol: dict[str, float] | None = None,
+    initial_entry_fraction: float = 0.5,
+    residual_sweep_symbol: str | None = None,
 ) -> ExecutionState:
     """
     按真实 A 股规则模拟买入：1手=100股、滑点、佣金、过户费。
@@ -54,6 +56,8 @@ def simulate_open_execution(
         max_correlated_industry_pct=max_correlated_industry_pct,
         high_risk_symbols=high_risk_symbols,
         max_order_value_by_symbol=max_order_value_by_symbol,
+        initial_entry_fraction=initial_entry_fraction,
+        residual_sweep_symbol=residual_sweep_symbol,
     )
     orders = planned_to_order_results(planned) + blocked
     return ExecutionState(executed_at=executed_at or datetime.utcnow().isoformat(), orders=orders)

@@ -8,7 +8,12 @@ from pydantic import BaseModel, Field
 
 from app.db.store import get_active_model_version, get_model_version, set_active_model_version, update_model_version_validation
 from app.services.model_registry import compare_champion_challenger, evaluate_model_drift, get_model_constitution, get_model_status, get_train_run_status, model_artifact_status
-from app.services.model_governance_scheduler import auto_tune_models_once, request_model_training
+from app.services.model_governance_scheduler import (
+    auto_tune_models_once,
+    bootstrap_candidate_eligible,
+    mark_bootstrap_promotion,
+    request_model_training,
+)
 from app.services.quant_risk import bocpd_change_probability, constrained_cvar_weights, garch11_forecast, historical_cvar, hrp_fallback_weights, hsmm_regime, kalman_level, ledoit_wolf_covariance
 from app.services.market_context import (
     live_market_context,
@@ -321,10 +326,12 @@ def model_strategy_promote(model_version_id: int) -> dict:
         raise HTTPException(status_code=404, detail="模型版本不存在")
     validation = version.get("validation") or {}
     metrics = version.get("metrics") or {}
+    champion = get_active_model_version("main")
+    bootstrap = champion is None and str(version.get("model_key") or "") == "main"
     artifact = model_artifact_status(version)
     if not artifact.get("ok"):
         raise HTTPException(status_code=409, detail={"code": "model_artifact_unavailable", **artifact})
-    if not bool(validation.get("production_eligible")):
+    if not bool(validation.get("production_eligible")) and not (bootstrap and bootstrap_candidate_eligible(version)):
         raise HTTPException(
             status_code=409,
             detail={
@@ -336,10 +343,16 @@ def model_strategy_promote(model_version_id: int) -> dict:
         raise HTTPException(status_code=409, detail="模型未同时通过 holdout 与 walk-forward 晋升门槛")
     from app.services.review_learning import model_feedback_gate
     feedback = model_feedback_gate(str(version.get("version") or ""))
-    if not feedback.get("passed"):
+    if not bootstrap and not feedback.get("passed"):
         raise HTTPException(status_code=409, detail={"code": "review_feedback_gate_blocked", "review_feedback": feedback})
+    if bootstrap:
+        mark_bootstrap_promotion(version)
     set_active_model_version(model_version_id)
-    return {"ok": True, "model_version_id": model_version_id, "status": "active", "review_feedback": feedback}
+    return {
+        "ok": True, "model_version_id": model_version_id, "status": "active",
+        "review_feedback": feedback,
+        "promotion_policy": "bootstrap_offline_gates" if bootstrap else "challenger_full_gates",
+    }
 
 
 @router.post("/model-strategy/rollback/{model_version_id}")

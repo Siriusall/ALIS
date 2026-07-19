@@ -66,7 +66,10 @@ def _status(actual: int, expected: int | None, coverage: float | None, *, event_
         return "available" if actual > 0 else "missing"
     if actual <= 0:
         return "missing"
-    if coverage is not None and coverage >= 0.99:
+    # "complete" is an inventory fact, not an operational threshold.  A
+    # consumer may safely run at 99% coverage, but the remaining 1% must stay
+    # visible as a data gap and in the backfill plan.
+    if expected is not None and actual >= expected:
         return "complete"
     return "partial"
 
@@ -95,7 +98,7 @@ def _annual_periods(today: date | None = None) -> list[str]:
 
 def get_data_assets(*, force: bool = False) -> dict[str, Any]:
     if not force:
-        redis_cached = get_json("alis:data-platform:assets:v2")
+        redis_cached = get_json("alis:data-platform:assets:v3")
         if isinstance(redis_cached, dict):
             return redis_cached
     now = time.monotonic()
@@ -112,12 +115,13 @@ def get_data_assets(*, force: bool = False) -> dict[str, Any]:
     with _assets_cache_lock:
         _assets_cache["at"] = time.monotonic()
         _assets_cache["value"] = payload
-    set_json("alis:data-platform:assets:v2", payload, ttl=int(_ASSETS_CACHE_TTL_SEC))
+    set_json("alis:data-platform:assets:v3", payload, ttl=int(_ASSETS_CACHE_TTL_SEC))
     return payload
 
 
 def invalidate_data_assets_cache() -> None:
     redis_delete("alis:data-platform:assets:v2")
+    redis_delete("alis:data-platform:assets:v3")
     with _assets_cache_lock:
         _assets_cache["at"] = 0.0
         _assets_cache["value"] = None
@@ -134,6 +138,8 @@ def _compute_data_assets() -> dict[str, Any]:
     financial_periods = sorted(set(quarters + annuals))
     financial_start = min(financial_periods)
     financial_end = max(financial_periods)
+    from app.data_platform.services.data_center import get_vip_backfill_status
+    vip = get_vip_backfill_status(end_date=end_s)
 
     with _conn() as c:
         stocks = _i(c.execute("SELECT COUNT(*) n FROM dc_stock_master").fetchone())
@@ -431,6 +437,69 @@ def _compute_data_assets() -> dict[str, Any]:
     #   event_count     -> no fixed expected volume
     #   snapshot        -> latest master snapshot only
     specs: list[dict[str, Any]] = [
+        {
+            "key": "capital_structure_vip",
+            "name": "资金与席位接口汇总",
+            "domain": "资金与席位",
+            "consumer": "交易决策、量化分析、回测、模型训练",
+            "weight": 50,
+            "target_scope": "2020年至今精确接口切片",
+            "frequency": "daily",
+            "source": "Tushare moneyflow_hsgt/margin/margin_detail/margin_secs/top_list/top_inst/hk_hold",
+            "window_start": vip["scope"]["capital_start"],
+            "window_end": vip["scope"]["end_date"],
+            "window_depth": "至少6年",
+            "measurement": "coverage_records",
+            "actual": vip["capital"]["completed_slices"],
+            "expected": vip["capital"]["expected_slices"],
+            "symbols": 0,
+            "dates": vip["scope"]["trade_dates"],
+            "min_date": vip["scope"]["capital_start"],
+            "max_date": vip["scope"]["end_date"],
+            "rationale": "按完整请求参数终态水位验收，不以有若干原始行冒充完整",
+        },
+        {
+            "key": "etf_price_nav_vip",
+            "name": "ETF价格与净值接口汇总",
+            "domain": "基金与跨资产",
+            "consumer": "回测、跨资产轮动、模型训练",
+            "weight": 50,
+            "target_scope": "全部已上市ETF六年日线与NAV",
+            "frequency": "daily",
+            "source": "Tushare fund_basic/fund_daily/fund_nav",
+            "window_start": vip["scope"]["capital_start"],
+            "window_end": vip["scope"]["end_date"],
+            "window_depth": "至少6年",
+            "measurement": "coverage_records",
+            "actual": vip["etf_price_nav"]["completed_slices"],
+            "expected": vip["etf_price_nav"]["expected_slices"],
+            "symbols": vip["scope"]["etfs"],
+            "dates": 0,
+            "min_date": None,
+            "max_date": None,
+            "rationale": "每只ETF的fund_daily与fund_nav均达到终态才算完成",
+        },
+        {
+            "key": "major_news_vip",
+            "name": "九来源长篇新闻历史",
+            "domain": "事件与叙事",
+            "consumer": "量化分析、持仓风控、叙事模型训练",
+            "weight": 50,
+            "target_scope": "三年、九来源、逐自然日",
+            "frequency": "daily",
+            "source": "Tushare major_news",
+            "window_start": vip["scope"]["news_start"],
+            "window_end": vip["scope"]["end_date"],
+            "window_depth": "至少3年",
+            "measurement": "coverage_records",
+            "actual": vip["major_news"]["completed_slices"],
+            "expected": vip["major_news"]["expected_slices"],
+            "symbols": vip["scope"]["news_sources"],
+            "dates": 0,
+            "min_date": None,
+            "max_date": None,
+            "rationale": "按来源×自然日终态切片验收，空日也必须有valid_empty证据",
+        },
         {
             "key": "stock_master",
             "name": "股票基础与上市状态",
@@ -1120,6 +1189,49 @@ def _compute_data_assets() -> dict[str, Any]:
             "records_expected": expected_daily_records,
         },
     ]
+
+    # Expose every contracted VIP/high-entitlement dataset independently.
+    # Aggregate cards are useful operationally, but previously hid a missing
+    # API (notably ETF disclosed baskets) behind otherwise complete siblings.
+    dataset_meta = {
+        "moneyflow_hsgt": ("沪深港通流向", "资金", "市场状态、外资风险偏好"),
+        "hk_hold": ("沪深股通持股", "资金", "个股与行业外资持仓变化"),
+        "margin": ("两融汇总", "两融", "市场杠杆风险偏好"),
+        "margin_detail": ("两融明细", "两融", "个股资金持续与拥挤度"),
+        "margin_secs": ("两融标的", "两融", "历史可融资融券资格"),
+        "top_list": ("龙虎榜每日明细", "席位", "异动和游资强度"),
+        "top_inst": ("龙虎榜机构明细", "席位", "机构与营业部结构"),
+        "fund_basic": ("ETF基础信息", "基金与跨资产", "ETF资产池与上市状态"),
+        "fund_daily": ("ETF日线", "基金与跨资产", "ETF趋势与轮动"),
+        "fund_nav": ("ETF净值", "基金与跨资产", "折溢价、规模与流动性"),
+        "etf_sh_cons": ("沪市ETF每日持仓组合", "基金与跨资产", "ETF行业暴露和申赎结构"),
+        "etf_sz_cons": ("深市ETF每日持仓组合", "基金与跨资产", "ETF行业暴露和申赎结构"),
+    }
+    for api_name, (name, domain, consumer) in dataset_meta.items():
+        contract = vip.get("datasets", {}).get(api_name, {})
+        expected = int(contract.get("expected_slices") or 0)
+        actual = int(contract.get("completed_slices") or 0)
+        specs.append({
+            "key": f"vip_{api_name}",
+            "name": name,
+            "domain": domain,
+            "consumer": consumer,
+            "weight": 25,
+            "target_scope": "2020年至今，按完整请求参数切片验收",
+            "frequency": "monthly" if api_name == "fund_basic" else "daily",
+            "source": f"Tushare {api_name}",
+            "window_start": vip["scope"]["capital_start"],
+            "window_end": vip["scope"]["end_date"],
+            "window_depth": "至少6年",
+            "measurement": "coverage_records",
+            "actual": actual,
+            "expected": expected,
+            "symbols": vip["scope"]["etfs"] if api_name.startswith("fund_") else 0,
+            "dates": vip["scope"]["trade_dates"] if api_name != "fund_basic" else 0,
+            "min_date": vip["scope"]["capital_start"],
+            "max_date": vip["scope"]["end_date"],
+            "rationale": "独立接口终态水位；不能由同组其他接口的完成状态代替",
+        })
 
     items: list[dict[str, Any]] = []
     for spec in specs:

@@ -55,3 +55,17 @@ def test_decision_gate_and_worker_contract_block_rule_fallback_without_active_mo
 
     assert gate["tone"] == "hold"
     assert gate["reason_code"] == "paused_model_not_ready"
+
+
+def test_bootstrap_production_model_unblocks_selection_chain():
+    pause = decision.evaluate_model_readiness_gate({"active_version": {
+        "id": 5, "is_active": True,
+        "validation": {
+            "status": "passed", "production_eligible": False,
+            "bootstrap_production_eligible": True,
+            "promotion_policy": "bootstrap_offline_gates",
+            "production_eligibility": {"eligible": False, "history_sessions": 487},
+        },
+    }})
+
+    assert pause.should_pause is False

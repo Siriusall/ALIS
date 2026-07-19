@@ -21,6 +21,7 @@ from app.db.store import (
     get_latest_model_train_run,
     list_model_versions,
     set_active_model_version,
+    update_model_version_validation,
     update_model_version_status,
     update_model_train_run,
 )
@@ -32,6 +33,34 @@ logger = logging.getLogger("quant.model_governance")
 _lock = threading.Lock()
 _started = False
 _training_worker_running = False
+BOOTSTRAP_MINIMUM_HISTORY_SESSIONS = 252
+
+
+def bootstrap_candidate_eligible(version: dict[str, Any]) -> bool:
+    """Allow one auditable initial champion before full production evidence exists."""
+    validation = version.get("validation") or {}
+    eligibility = validation.get("production_eligibility") or {}
+    gates = eligibility.get("gates") or {}
+    metrics = version.get("metrics") or {}
+    sessions = int(eligibility.get("history_sessions", 0) or 0)
+    return (
+        str(validation.get("status") or "") == "passed"
+        and bool(gates.get("artifact_exists"))
+        and sessions >= BOOTSTRAP_MINIMUM_HISTORY_SESSIONS
+        and float(metrics.get("lift", 0) or 0) > 0
+        and float(metrics.get("walk_forward_lift", 0) or 0) > 0
+        and int(metrics.get("walk_forward_folds", 0) or 0) >= 3
+    )
+
+
+def mark_bootstrap_promotion(version: dict[str, Any]) -> None:
+    validation = dict(version.get("validation") or {})
+    validation.update({
+        "bootstrap_production_eligible": True,
+        "promotion_policy": "bootstrap_offline_gates",
+        "bootstrap_minimum_history_sessions": BOOTSTRAP_MINIMUM_HISTORY_SESSIONS,
+    })
+    update_model_version_validation(int(version["id"]), validation=validation)
 
 
 def _parse_utc(value: Any) -> datetime | None:
@@ -204,13 +233,20 @@ def auto_tune_models_once(*, allow_retrain: bool = True) -> dict[str, Any]:
             degraded_champion = {"id": champion.get("id"), "version": champion.get("version"), "review_feedback": champion_feedback}
             champion = None
     all_candidates = [x for x in list_model_versions("main", limit=50) if not x.get("is_active") and str(x.get("status")) in {"candidate", "watch"}]
-    candidates = [
+    technically_eligible = [
         x for x in all_candidates
         if bool((x.get("validation") or {}).get("production_eligible"))
         and str((x.get("validation") or {}).get("status")) == "passed"
         and float((x.get("metrics") or {}).get("lift", 0) or 0) > 0
         and float((x.get("metrics") or {}).get("walk_forward_lift", 0) or 0) > 0
-        and bool(model_feedback_gate(str(x.get("version") or "")).get("passed"))
+    ]
+    # The first production model cannot have production feedback yet. Requiring
+    # human reviews and mature 20-day outcomes here creates a bootstrap
+    # deadlock. The initial champion therefore uses the full offline technical
+    # gate; feedback remains mandatory for every later challenger promotion.
+    candidates = [x for x in all_candidates if bootstrap_candidate_eligible(x)] if not champion else [
+        x for x in technically_eligible
+        if bool(model_feedback_gate(str(x.get("version") or "")).get("passed"))
     ]
     if not champion and candidates:
         winner = max(
@@ -218,8 +254,13 @@ def auto_tune_models_once(*, allow_retrain: bool = True) -> dict[str, Any]:
             key=lambda item: float((item.get("metrics") or {}).get("lift", 0) or 0)
             + float((item.get("metrics") or {}).get("walk_forward_lift", 0) or 0),
         )
+        mark_bootstrap_promotion(winner)
         set_active_model_version(int(winner["id"]))
-        result = {"decision": "promoted_initial", "evaluated": len(candidates), "excluded": len(all_candidates) - len(candidates), "winner_id": winner.get("id")}
+        result = {
+            "decision": "promoted_initial", "evaluated": len(candidates),
+            "excluded": len(all_candidates) - len(candidates), "winner_id": winner.get("id"),
+            "promotion_policy": "bootstrap_offline_gates",
+        }
     elif not champion:
         result = {"decision": "no_champion", "evaluated": 0, "excluded": len(all_candidates)}
     else:

@@ -20,6 +20,8 @@ from app.services.research_engine import (
 )
 from app.services.thesis_store import create_thesis, generate_thesis_for_stock, generate_watch_pool_theses, get_thesis, list_theses, review_due_theses, review_thesis, update_hypothesis
 from app.services.industry_event_engine import industry_detail, list_event_followups, list_events, list_industries, materialize_event_followups, materialize_industry_state_history, materialize_industry_state_snapshots, review_linked_event_theses, score_event, score_industry, update_event_followup
+from app.services.industry_allocator import build_industry_allocation
+from app.services.market_context import live_market_context
 from app.services.decision_store import build_review_outcome_suggestion, create_decision_snapshot, create_review, diff_decision_snapshots, list_decision_snapshots, list_pool_members, list_position_state_history, list_position_states, list_reviews, remove_pool_member, transition_pool_member, transition_position, upsert_pool_member, verify_decision_snapshot
 from app.services.operations_overview import build_decision_audit, build_governance_overview, build_live_portfolio_risk
 from app.services.stock_pool_sync import stage_candidates_in_watch_pool
@@ -257,6 +259,23 @@ def research_thesis_review(thesis_id: int) -> dict[str, Any]:
 def research_industries(as_of_time: str = "") -> dict[str, Any]:
     """Read latest or an explicit point-in-time industry-state snapshot."""
     return list_industries(as_of_time=as_of_time or None)
+
+
+@router.get("/research/industries/allocation")
+def research_industry_allocation(
+    as_of_time: str = "",
+    market_state: str = "",
+    equity_budget: float = Query(default=-1, ge=-1, le=1),
+) -> dict[str, Any]:
+    """Expose the market -> industry budget layer used by daily selection."""
+    context = live_market_context()
+    state = market_state or str((context.get("market_state") or {}).get("state") or "unknown")
+    if equity_budget < 0:
+        defaults = {"S0": .85, "S1": .75, "S2": .70, "S3": .65, "S4": .50, "S5": .55, "S6": .50, "S7": .45, "S8": .35, "S9": .25, "S10": .10, "S11": .40}
+        equity_budget = defaults.get(state, .50)
+    return build_industry_allocation(
+        equity_budget=equity_budget, market_state=state, as_of_time=as_of_time or None,
+    )
 
 
 @router.get("/research/industries/{industry_code}")

@@ -102,16 +102,20 @@ def materialize_theme_snapshots(*, as_of_time: str | None = None, lookback: int 
             crowding = _clip(sum(company_turnover[:max(1, len(company_turnover) // 10)]) / max(sum(company_turnover), 1e-9))
             state = (states.get(industry) or {}).get("state") or {}
             fundamental = _clip(float(state.get("score") or 0) / 100.0) if state.get("status") == "ready" else 0.0
-            source_types = int(price_confirmation > 0) + int(fundamental > 0)
+            # A tradable short-term narrative is independently confirmed by
+            # price, breadth and capital persistence. Fundamentals are useful
+            # corroboration, but are not a prerequisite for a new story.
+            narrative_strength = _clip((price_confirmation + breadth + persistence + liquidity) / 4)
+            source_types = int(price_confirmation >= .55) + int(breadth >= .5) + int((persistence + liquidity) / 2 >= .5) + int(fundamental > 0)
             item = {
                 "theme": f"{industry}景气",
-                "narrative_strength": fundamental,
+                "narrative_strength": narrative_strength,
                 "price_confirmation": price_confirmation,
                 "breadth": breadth,
                 "capital_persistence": (persistence + liquidity) / 2,
                 "fundamental_verifiability": fundamental,
                 "catalyst_duration": persistence,
-                "source_policy_credibility": 1.0 if source_types >= 2 else .6,
+                "source_policy_credibility": 1.0 if source_types >= 3 else .75 if source_types >= 2 else .5,
                 "crowding": crowding,
                 "source_types": source_types,
                 "related_instruments": len(companies),
@@ -126,6 +130,10 @@ def materialize_theme_snapshots(*, as_of_time: str | None = None, lookback: int 
         for item in scored:
             raw = raw_by_name[item["theme"]]
             item["lifecycle"] = _lifecycle(score=float(item["score"]), momentum=raw["momentum"], breadth=raw["breadth"], crowding=raw["crowding"])
+            # A confirmed score is still not buyable once price has rolled
+            # over; this explicitly retires old stories such as a faded CPO.
+            item["promotable"] = bool(item["promotable"] and item["lifecycle"] not in {"退潮", "沉寂"})
+            item["state"] = "confirmed" if item["promotable"] else "fading" if item["lifecycle"] in {"退潮", "沉寂"} else "watch"
             item["knowledge_graph"] = {"theme": item["theme"], "industry": raw["industry"], "company_count": len(raw["companies"]), "evidence_types": ["price_volume"] + (["company_financial_aggregate"] if raw["state"].get("status") == "ready" else [])}
             theme_code = f"industry:{raw['industry']}"
             c.execute(

@@ -57,6 +57,29 @@ export interface DataCenterStatus {
   recent_runs: DataIngestionRun[];
 }
 
+export interface VipBackfillContractStatus {
+  completed_slices: number;
+  expected_slices: number;
+  missing_slices: number;
+  coverage: number;
+  complete: boolean;
+}
+
+export interface VipBackfillStatus {
+  ok: boolean;
+  capital: VipBackfillContractStatus;
+  etf_price_nav: VipBackfillContractStatus;
+  major_news: VipBackfillContractStatus;
+  scope: {
+    capital_start: string;
+    news_start: string;
+    end_date: string;
+    trade_dates: number;
+    etfs: number;
+    news_sources: number;
+  };
+}
+
 export interface DataCenterEstimate {
   ok: boolean;
   assumptions: Record<string, unknown>;
@@ -339,6 +362,7 @@ export interface BackfillStatus {
     resume_hint?: string;
   };
   plan_summary?: BackfillPlan["summary"];
+  plan?: BackfillPlan;
   max_steps?: number;
   activity?: {
     event: "request" | "retry" | "failed" | "response" | "saved" | string;
@@ -371,6 +395,13 @@ export async function startBackfill(maxSteps = 0, marketBatchDays = 30, financia
 
 export async function fetchBackfillStatus(): Promise<BackfillStatus> {
   const { data } = await api.get<BackfillStatus>("/api/data-center/backfill/status");
+  return data;
+}
+
+export async function fetchVipBackfillStatus(endDate: string): Promise<VipBackfillStatus> {
+  const { data } = await api.get<VipBackfillStatus>("/api/data-center/backfill/vip-status", {
+    params: { end_date: endDate },
+  });
   return data;
 }
 

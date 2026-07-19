@@ -1,8 +1,9 @@
 import { useEffect, useMemo, useState } from "react";
-import { fetchIndustries, type IndustryResearchItem } from "../api/research";
+import { fetchIndustries, fetchIndustryAllocation, type IndustryAllocation, type IndustryResearchItem } from "../api/research";
 
 export default function IndustryResearchPage() {
   const [items, setItems] = useState<IndustryResearchItem[]>([]);
+  const [allocation, setAllocation] = useState<IndustryAllocation | null>(null);
   const [error, setError] = useState("");
   const [asOfTime, setAsOfTime] = useState("");
   const [loading, setLoading] = useState(false);
@@ -12,7 +13,10 @@ export default function IndustryResearchPage() {
   async function load(value = asOfTime) {
     setLoading(true);
     try {
-      setItems(await fetchIndustries(value ? `${value}T23:59:59` : ""));
+      const pointInTime = value ? `${value}T23:59:59` : "";
+      const [research, budget] = await Promise.all([fetchIndustries(pointInTime), fetchIndustryAllocation(pointInTime)]);
+      setItems(research);
+      setAllocation(budget);
       setError("");
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
@@ -41,6 +45,17 @@ export default function IndustryResearchPage() {
         <button type="button" onClick={() => void load()} disabled={loading}>{loading ? "正在回放…" : asOfTime ? "读取历史时点" : "读取最新状态"}</button>
         {asOfTime && <button type="button" className="button ghost" onClick={() => { setAsOfTime(""); void load(""); }}>回到最新</button>}
       </div>
+      {allocation && <section className="industry-allocation-panel">
+        <div className="product-module-head"><div><span>MARKET → INDUSTRY → STOCK</span><h2>今日行业预算</h2><p>市场状态 {allocation.market_state} · 股票预算 {(allocation.requested_equity_budget * 100).toFixed(1)}% · 实际分配 {(allocation.allocated_equity_budget * 100).toFixed(1)}%，未分配部分进入防御资产。</p></div></div>
+        <div className="industry-budget-grid">
+          {allocation.items.filter((item) => item.target_weight > 0).map((item) => <article key={item.industry}>
+            <header><strong>{item.industry}</strong><em>{(item.target_weight * 100).toFixed(1)}%</em></header>
+            <p>叙事 {item.narrative_score.toFixed(1)} · {item.narrative_lifecycle} · 基本面景气 {item.raw_score.toFixed(1)}</p>
+            {!!item.candidates.length && <small>候选：{item.candidates.slice(0, 4).map((x) => `${x.name}(${x.symbol})`).join("、")}</small>}
+          </article>)}
+          {!allocation.items.some((item) => item.target_weight > 0) && <div className="research-empty"><strong>当前没有行业通过预算门</strong><span>股票预算将全部转入防御资产，不会留成现金。</span></div>}
+        </div>
+      </section>}
       <div className="decision-command-bar" aria-label="行业研究筛选">
         <div className="decision-command-intro"><span>INDUSTRY FOCUS</span><strong>默认先看可评价行业</strong></div>
         <input aria-label="搜索行业" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索行业名称或代码" />

@@ -3,7 +3,7 @@ from types import SimpleNamespace
 import app.services.quant_task_runner as runner
 
 
-def test_third_consecutive_cash_day_requires_defensive_asset_evaluation(monkeypatch):
+def test_cash_only_day_immediately_requires_defensive_asset_evaluation(monkeypatch):
     monkeypatch.setattr(runner, "list_quant_run_task_records", lambda task_id, limit=20: [
         {"detail": {"current_positions": []}},
         {"detail": {"current_positions": []}},
@@ -25,6 +25,7 @@ def test_third_consecutive_cash_day_requires_defensive_asset_evaluation(monkeypa
 
     policy = captured["detail"]["cash_only_policy"]
     assert policy["consecutive_cash_days"] == 3
-    assert policy["status"] == "explanation_required"
+    assert policy["status"] == "blocked"
     assert policy["defensive_asset_evaluation"]["status"] == "required"
+    assert "当日立即" in policy["defensive_asset_evaluation"]["decision"]
     assert captured["detail"]["daily_report"]["cash_only_policy"] == policy

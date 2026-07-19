@@ -1,14 +1,26 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from app.core.security import create_access_token, decode_access_token, hash_password, verify_password
+from app.core.config import settings
 from app.db.store import create_user, get_user_by_id, get_user_by_username
 from app.schemas.user import TokenResponse, UserLogin, UserRegister, UserResponse
 
 router = APIRouter(tags=["auth"])
 security = HTTPBearer(auto_error=False)
+
+_LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost", "testclient"}
+_DEBUG_USER = {"id": 0, "username": "本机调试", "created_at": None}
+
+
+def _can_bypass_auth(request: Request) -> bool:
+    """Allow password-free debugging only in non-production loopback sessions."""
+    if settings.env.lower() in {"prod", "production"} or not settings.local_debug_auth_bypass:
+        return False
+    client_host = request.client.host.lower() if request.client else ""
+    return client_host in _LOOPBACK_HOSTS
 
 
 def _current_user_id(credentials: HTTPAuthorizationCredentials | None = None) -> int | None:
@@ -24,9 +36,12 @@ def _current_user_id(credentials: HTTPAuthorizationCredentials | None = None) ->
 
 
 def require_current_user(
+    request: Request,
     credentials: HTTPAuthorizationCredentials | None = Depends(security),
 ) -> dict:
     """Resolve the bearer token and reject unauthenticated business calls."""
+    if _can_bypass_auth(request):
+        return _DEBUG_USER.copy()
     uid = _current_user_id(credentials)
     if not uid:
         raise HTTPException(status_code=401, detail="登录状态无效或已过期")

@@ -29,3 +29,23 @@ def test_market_batch_exposes_per_date_progress(monkeypatch):
     assert updates[0]["activity"]["date_total"] == 2
     assert updates[1]["activity"]["date_index"] == 2
     assert updates[1]["activity"]["apis"] == ["daily", "daily_basic", "stk_limit"]
+
+
+def test_blocked_only_plan_is_not_reported_as_fully_complete(monkeypatch):
+    monkeypatch.setattr(
+        backfill,
+        "build_backfill_plan",
+        lambda **_kwargs: {
+            "summary": {"steps_needed": 0, "steps_blocked": 1, "steps_done": 21},
+            "steps": [{"key": "etf_constituents_vip", "status": "blocked"}],
+        },
+    )
+    monkeypatch.setattr(backfill, "set_json", lambda *_args, **_kwargs: None)
+    backfill._state.clear()
+    backfill._state.update({"running": False, "phase": "idle"})
+
+    result = backfill.start_backfill(enqueue_stream=False)
+
+    assert result["reason"] == "blocked_only"
+    assert result["phase"] == "completed_with_gaps"
+    assert "1 个外部能力阻塞项" in result["message"]

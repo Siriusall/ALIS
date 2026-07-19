@@ -50,7 +50,7 @@ export default function BackfillStatusBar({ onOpenDataCenter, variant = "top" }:
   const progress = Math.max(0, Math.min(100, status?.progress ?? 0));
   const eta = running && status ? dynamicEta(status) : status ? "空闲" : "读取中";
   const meta = step?.id || status?.phase || (running ? "运行中" : "常驻计划");
-  const quantityText = need > 0 ? `${num(checked)} / ${num(need)}` : status?.plan_summary ? `${status.plan_summary.steps_done}/${status.plan_summary.steps_needed} 步` : "等待缺口统计";
+  const quantityText = need > 0 ? `${num(checked)} / ${num(need)}` : status?.plan_summary ? `${status.plan_summary.steps_done} 已完成 · ${status.plan_summary.steps_needed} 待补` : "等待缺口统计";
   const activityText = noGaps
     ? "无需补全"
     : status?.auto_resume
@@ -77,6 +77,8 @@ export default function BackfillStatusBar({ onOpenDataCenter, variant = "top" }:
 
 const num = (v: number) => new Intl.NumberFormat("zh-CN").format(v || 0);
 const dynamicEta = (s: BackfillStatus) => {
+  const planned = Number(s.plan_summary?.estimated_minutes ?? 0);
+  if (planned > 0) return planned >= 60 ? `${(planned / 60).toFixed(1)}h` : `${Math.max(1, Math.round(planned))}分钟`;
   const p = Math.max(1, Math.min(99, Number(s.progress ?? 0)));
   const elapsed = elapsedMinutesFromServerTime(s.started_at);
   if (elapsed <= 0) return "计算中";

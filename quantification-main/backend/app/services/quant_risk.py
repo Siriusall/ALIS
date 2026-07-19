@@ -242,7 +242,9 @@ def evaluate_model_readiness_gate(model_status: dict[str, Any] | None = None) ->
         )
     validation = dict(active.get("validation") or {})
     eligibility = dict(validation.get("production_eligibility") or {})
-    production_eligible = bool(validation.get("production_eligible")) and bool(eligibility.get("eligible", True))
+    fully_eligible = bool(validation.get("production_eligible")) and bool(eligibility.get("eligible", True))
+    bootstrap_eligible = bool(validation.get("bootstrap_production_eligible")) and validation.get("promotion_policy") == "bootstrap_offline_gates"
+    production_eligible = fully_eligible or bootstrap_eligible
     if not bool(active.get("is_active")) or str(validation.get("status") or "") != "passed" or not production_eligible:
         return pause_decision(
             code="paused_model_not_production_eligible",

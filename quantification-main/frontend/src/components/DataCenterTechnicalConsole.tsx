@@ -55,7 +55,7 @@ export default function TechnicalConsole({ section }: { section: SectionKey }) {
   }
   useEffect(() => { refresh(); }, []);
   useEffect(() => {
-    const intervalMs = update?.running ? 2000 : 5000;
+    const intervalMs = update?.running ? 2000 : section === "repair" ? 30000 : 5000;
     const timer = window.setInterval(() => refresh(true), intervalMs);
     return () => window.clearInterval(timer);
   }, [section, update?.running]);
@@ -111,13 +111,37 @@ function Overview(c: Ctx) {
 }
 
 function Readiness(c: Ctx) {
-  const assetIssues=(c.assets?.items??[]).filter((x:any)=>x.status==="partial"||x.status==="missing");
+  const [assetView,setAssetView]=useState<"all"|"issues"|"complete">("all");
+  const allAssets=c.assets?.items??[];
+  const assetItems=allAssets.filter((x:any)=>{
+    if(assetView==="issues") return x.status==="partial"||x.status==="missing";
+    if(assetView==="complete") return x.status==="complete"||x.status==="available";
+    return true;
+  });
+  const issueCount=allAssets.filter((x:any)=>x.status==="partial"||x.status==="missing").length;
+  const completeCount=allAssets.filter((x:any)=>x.status==="complete"||x.status==="available").length;
   return <div className="console-page"><PageHead eyebrow="FUNCTION READINESS" title="长线分析自检" description="按功能的数据契约判断是否能够安全运行" />
     <div className="readiness-tabs">{(c.readiness?.consumers ?? []).map((x: ConsumerReadiness)=><button className={c.selectedConsumer===x.key?"active":""} onClick={()=>c.setSelectedConsumer(x.key)} key={x.key}><span>{x.name}</span><Status status={x.status}/><em>{x.blocked_count} 阻断 · {x.degraded_count} 降级</em></button>)}</div>
     {c.selected && <Panel title={`${c.selected.name} · 必需数据`} sub={c.selected.description} right={<Status status={c.selected.status}/>}>
       <div className="contract-list">{c.selected.requirements.map((r:any,i:number)=><div className="contract-item" key={r.key}><span className="branch">{i===c.selected.requirements.length-1?"└":"├"}</span><div className="contract-name"><strong>{r.label}</strong><span>{r.evidence}</span></div><Bar value={r.coverage}/><strong>{pct(r.coverage)}</strong><Status status={r.status}/><em>阈值 ≥ {pct(r.threshold)}</em></div>)}</div>
     </Panel>}
-    <Panel title="全资产缺口" sub="业务合同之外也纳入检查；这些问题会同步进入补全计划"><Table heads={["数据集","数据域","状态","覆盖率","审计窗口","来源"]} rows={assetIssues.map((x:any)=>[x.name,x.domain,<AssetStatus status={x.status}/>,x.coverage==null?"—":pct(x.coverage),assetRange(x.window_start,x.window_end),x.source])}/></Panel>
+    <Panel title="全部数据资产验收" sub="补全成功的数据仍然展示；任务完成只代表任务结束，完整度由实际入库范围单独验收" right={<span>{completeCount} 项完整 · {issueCount} 项有缺口</span>}>
+      <div className="asset-filters">
+        <button className={assetView==="all"?"active":""} onClick={()=>setAssetView("all")}>全部（{allAssets.length}）</button>
+        <button className={assetView==="issues"?"active":""} onClick={()=>setAssetView("issues")}>仅看缺口（{issueCount}）</button>
+        <button className={assetView==="complete"?"active":""} onClick={()=>setAssetView("complete")}>已完整（{completeCount}）</button>
+      </div>
+      <Table heads={["数据集","数据域","状态","实际 / 应有","覆盖率","库内区间","主来源"]} rows={assetItems.map((x:any)=>[
+        <span><strong>{x.name}</strong><small style={{display:"block"}}>{x.target_scope}</small></span>,
+        x.domain,
+        <AssetStatus status={x.status}/>,
+        x.coverage_expected==null?`${num(x.coverage_basis??x.actual_records)}（事件数据）`:`${num(x.coverage_basis??x.actual_records)} / ${num(x.coverage_expected)}`,
+        x.coverage==null?"—":pct(x.coverage),
+        assetRange(x.min_date,x.max_date),
+        x.source,
+      ])}/>
+      {!assetItems.length&&<div className="empty">当前筛选下没有数据资产。</div>}
+    </Panel>
   </div>;
 }
 
@@ -215,7 +239,10 @@ function Repair(c: Ctx) {
 
   async function finishBackfill(status: BackfillStatus){
     setBackfill(status);
-    setMsg(`${status.message||"历史补全已结束"}；正在刷新审计与计划…`);
+    // Keep the terminal result visible while the relatively expensive plan
+    // audit refreshes in the background. A transient loading suffix looked
+    // like a stuck task even though ingestion had already stopped.
+    setMsg(status.message||"历史补全已结束");
     try{
       const next=await fetchBackfillPlan();
       setPlan(next);
@@ -246,10 +273,10 @@ function Repair(c: Ctx) {
 
   useEffect(()=>{
     let cancelled=false;
-    fetchBackfillPlan().then((next)=>{if(!cancelled)setPlan(next)}).catch(()=>{});
     fetchBackfillStatus().then((status)=>{
       if(cancelled) return;
       setBackfill(status);
+      if(status.plan) setPlan(status.plan);
       if(status.phase==="completed"||status.phase==="completed_with_gaps"||status.phase==="failed") setMsg(status.message||"");
     }).catch(()=>{});
     return ()=>{cancelled=true};
@@ -264,9 +291,9 @@ function Repair(c: Ctx) {
         const status=await fetchBackfillStatus();
         if(cancelled) return;
         setBackfill(status);
+        if(status.plan) setPlan(status.plan);
         if(status.running){
           if(msg.includes("历史补全失败") || msg.includes("自动续跑")) setMsg("");
-          void c.refresh(true);
         }else if(status.auto_resume){
           setMsg(status.message || `自动续跑中：${status.auto_resume_delay_seconds ?? "稍后"} 秒后继续`);
         }else if(status.phase==="completed" || status.phase==="completed_with_gaps" || status.phase==="failed" || status.phase==="interrupted"){
@@ -276,7 +303,11 @@ function Repair(c: Ctx) {
       }catch{/* ignore poll errors */}finally{backfillPollRunning.current=false}
     },2000);
     return ()=>{cancelled=true; window.clearInterval(timer);};
-  },[msg]);
+  // The polling lifecycle belongs to this page mount. Depending on `msg`
+  // recreated the interval whenever finishBackfill changed its text, so a
+  // terminal status was handled repeatedly and the UI stayed on
+  // “正在刷新审计与计划…”.
+  },[]);
 
   // 计划是常驻状态：页面打开立即加载，运行期间独立于任务状态轮询，
   // 避免只更新顶部进度而让“历史补全计划”停留在旧快照。
@@ -288,8 +319,12 @@ function Repair(c: Ctx) {
         if(!cancelled) setPlan(next);
       }catch{/* 保留上一次计划，避免短暂限流导致页面消失 */}
     };
+    if(backfill?.running) return ()=>{cancelled=true};
     void refreshPlan();
-    const timer=window.setInterval(refreshPlan, backfill?.running ? 5000 : 15000);
+    // Building the historical plan scans large coverage tables. Runtime
+    // progress comes from the cheap status endpoint, so do not continuously
+    // rescan the plan while ingestion is also writing those tables.
+    const timer=window.setInterval(refreshPlan, 60000);
     return ()=>{cancelled=true; window.clearInterval(timer);};
   },[backfill?.running]);
 
@@ -299,7 +334,7 @@ function Repair(c: Ctx) {
   return <div className="console-page"><PageHead eyebrow="INGESTION & REPAIR" title="数据补全" description="日常增量更新与历史缺口修复分开执行" />
     {msg&&<div className="inline-message">{msg}</div>}
     {c.update?.running&&<Progress update={c.update}/>}
-    {showProgress&&<div className={`task-progress ${(backfill?.phase==="failed"||backfill?.phase==="interrupted")&&!backfill?.auto_resume?"task-failed":""}`}><div><strong>{backfill?.message||"历史补全"}</strong><span>总进度 {backfill?.progress??0}%</span></div><div className="bar"><i style={{width:`${backfill?.progress??0}%`}}/></div>{backfill?.activity&&<div className={`live-activity activity-${backfill.activity.event}`}><i/><span>实时</span><strong>{backfill.activity.text}</strong><time>{timeText(backfill.activity.at)}</time></div>}{backfill?.auto_resume&&<div className="inline-message">自动续跑中：{backfill.auto_resume_delay_seconds ?? "稍后"} 秒后继续，第 {backfill.auto_resume_attempt ?? 1}{backfill.auto_resume_max_attempts?`/${backfill.auto_resume_max_attempts}`:" 次（不限次数）"}。无需人工点击。</div>}{(backfill?.phase==="failed"||backfill?.phase==="interrupted")&&!backfill?.auto_resume&&<FailureBox status={backfill} onResume={continueBackfill} disabled={!!backfill?.running||planning}/>}</div>}
+    {showProgress&&<div className={`task-progress ${(backfill?.phase==="failed"||backfill?.phase==="interrupted"||backfill?.phase==="completed_with_gaps")&&!backfill?.auto_resume?"task-failed":""}`}><div><strong>{backfill?.message||"历史补全"}</strong><span>总进度 {backfill?.progress??0}%</span></div><div className="bar"><i style={{width:`${backfill?.progress??0}%`}}/></div>{backfill?.activity&&<div className={`live-activity activity-${backfill.activity.event}`}><i/><span>实时</span><strong>{backfill.activity.text}</strong><time>{timeText(backfill.activity.at)}</time></div>}{backfill?.auto_resume&&<div className="inline-message">自动续跑中：{backfill.auto_resume_delay_seconds ?? "稍后"} 秒后继续，第 {backfill.auto_resume_attempt ?? 1}{backfill.auto_resume_max_attempts?`/${backfill.auto_resume_max_attempts}`:" 次"}。无需人工点击。</div>}{(backfill?.phase==="failed"||backfill?.phase==="interrupted"||backfill?.phase==="completed_with_gaps")&&!backfill?.auto_resume&&backfill?.failure_detail&&<FailureBox status={backfill} onResume={continueBackfill} disabled={!!backfill?.running||planning}/>}</div>}
     <div className="grid two">
       <Panel title="更新最新数据" sub="适合每日使用，只补最新交易日"><ul className="step-list"><li>确认最近交易日</li><li>更新行情、估值和涨跌停</li><li>更新最近公告</li><li>执行质量检查</li></ul><button className="button primary wide" onClick={c.latestUpdate}>开始日常更新</button></Panel>
       <Panel title="历史缺口概览" sub="按审计窗口识别缺口，并生成可执行计划">
@@ -448,7 +483,7 @@ const num=(v?:number)=>new Intl.NumberFormat("zh-CN").format(v??0); const pct=(v
 const dateText=(v?:string|null)=>formatGmt8Date(v); const timeText=(v?:string|null)=>formatGmt8Time(v);
 const elapsedMinutes=(v?:string|null)=>elapsedMinutesFromServerTime(v);
 const elapsedText=(v?:string|null)=>formatMinutes(elapsedMinutes(v));
-const dynamicEta=(s:BackfillStatus)=>{const p=Math.max(1,Math.min(99,Number(s.progress??0)));const elapsed=elapsedMinutes(s.started_at);if(elapsed<=0)return "计算中";return formatMinutes(elapsed*(100-p)/p)};
+const dynamicEta=(s:BackfillStatus)=>{const planned=Number(s.plan_summary?.estimated_minutes??0);if(planned>0)return formatMinutes(planned);const p=Math.max(1,Math.min(99,Number(s.progress??0)));const elapsed=elapsedMinutes(s.started_at);if(elapsed<=0)return "计算中";return formatMinutes(elapsed*(100-p)/p)};
 const formatMinutes=(m:number)=>m>=60?`${(m/60).toFixed(1)}h`:`${Math.max(1,Math.round(m))}分钟`;
 const sourceName=(v:string)=>({tushare:"Tushare",cninfo:"巨潮公告",web_fallback:"网页备用源",system:"系统任务",manual:"手工导入"} as any)[v]??v;
 const jobName=(v:string)=>v==="data_platform.daily_update"?"一键更新":v.includes("daily_basic")?"日度估值":v.includes("daily")?"日线行情":v.includes("announcement")?"公司公告":v.includes("quality")?"质量检查":v.includes("trade_cal")?"交易日历":v;

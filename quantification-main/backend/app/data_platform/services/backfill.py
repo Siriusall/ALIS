@@ -30,14 +30,21 @@ from app.data_platform.services.data_center import (
     sync_tushare_stock_batch,
     sync_index_bundle,
     set_tushare_activity_hook,
+    backfill_capital_structure_history,
+    backfill_etf_constituents_history,
+    backfill_etf_price_history,
+    backfill_major_news_history,
+    DEFER_EMPTY_AFTER_ATTEMPTS,
+    get_vip_backfill_status,
 )
 from app.data_platform.services.market_calendar import target_trade_day
 from app.data_platform.redis_store import ack_task, enqueue_task, get_json, set_json
 
 _lock = threading.Lock()
 _state: dict[str, Any] = {"running": False, "phase": "idle", "message": "尚未生成计划"}
-# Zero means recoverable failures retry indefinitely; delay remains capped.
-AUTO_RESUME_MAX_ATTEMPTS = 0
+# Recoverable process/rate-limit failures must be finite. Permanent upstream
+# failures are surfaced to the operator after this many automatic resumes.
+AUTO_RESUME_MAX_ATTEMPTS = 5
 AUTO_RESUME_DELAYS_SECONDS = (15, 30, 60, 120, 180)
 
 
@@ -265,22 +272,74 @@ def build_backfill_plan(*, market_batch_days: int = 30, financial_batch_size: in
 
     # 3. Adj factor — TuShare officially supports one full-market request per
     # trade date.  Backfill by date, never by 5,000+ individual stocks.
-    if open_days and len(have_adj) < len(open_days) * 0.995:
-        adj_checked_dates = _request_date_coverage("adj_factor", start_s, end_s)
+    if open_days and len(have_adj) < len(open_days):
+        missing_adj_dates = [trade_date for trade_date in open_days if trade_date not in have_adj]
         add(
             {
                 "priority": 2,
                 "key": "adj_factor",
                 "title": "补全复权因子",
-                "why": f"审计窗口内复权因子交易日覆盖 {len(have_adj)}/{max(len(open_days), FALLBACK_OPEN_DAYS)}",
+                "why": f"审计窗口内复权因子交易日覆盖 {len(have_adj)}/{len(open_days)}",
                 "action": "sync_date_api_batch",
-                "params": {"api_name": "adj_factor", "trade_dates": open_days, "limit": market_batch_days},
-                "estimated_calls": min(len(open_days), market_batch_days),
-                "estimated_minutes": round(min(len(open_days), market_batch_days) * 0.2, 1),
-                "status": "done" if open_days and adj_checked_dates >= len(open_days) else "needed",
-                "gap": {"have_dates": len(have_adj), "need_dates": max(len(open_days), FALLBACK_OPEN_DAYS)},
+                "params": {"api_name": "adj_factor", "trade_dates": missing_adj_dates, "limit": market_batch_days, "require_rows": True},
+                "estimated_calls": min(len(missing_adj_dates), market_batch_days),
+                "estimated_minutes": round(min(len(missing_adj_dates), market_batch_days) * 0.2, 1),
+                "status": "done" if open_days and len(have_adj) >= len(open_days) else "needed",
+                "gap": {"have_dates": len(have_adj), "need_dates": len(open_days), "missing_dates": missing_adj_dates},
             }
         )
+
+    # Strategy-specific VIP datasets are first-class assets. They must appear
+    # in the same plan used by the UI, not in a hidden side workflow.
+    vip = get_vip_backfill_status(end_date=end_s)
+    vip_steps = (
+        (
+            "capital_structure_vip", "补全北向、两融与龙虎榜历史", "sync_capital_history_batch",
+            vip["capital"],
+            {"start_date": vip["scope"]["capital_start"], "end_date": end_s, "cursor": vip["capital"].get("resume_cursor", ""), "limit_dates": min(60, market_batch_days)},
+        ),
+        (
+            "etf_price_nav_vip", "补全ETF日线与净值历史", "sync_etf_history_batch",
+            vip["etf_price_nav"],
+            {"start_date": vip["scope"]["capital_start"], "end_date": end_s, "cursor": vip["etf_price_nav"].get("resume_cursor", ""), "limit_funds": min(100, financial_batch_size)},
+        ),
+        (
+            "etf_constituents_vip", "补全沪深ETF每日持仓组合", "sync_etf_constituents_batch",
+            vip["etf_constituents"],
+            {"start_date": vip["scope"]["capital_start"], "end_date": end_s, "cursor": vip["etf_constituents"].get("resume_cursor", ""), "limit_dates": min(60, market_batch_days)},
+        ),
+        (
+            "major_news_vip", "补全九来源长篇新闻历史", "sync_major_news_history_batch",
+            vip["major_news"],
+            {"start_date": vip["scope"]["news_start"], "end_date": end_s, "cursor": vip["major_news"].get("resume_cursor", ""), "limit_days": min(31, market_batch_days)},
+        ),
+    )
+    for key, title, action, contract, params in vip_steps:
+        missing = int(contract.get("missing_slices") or 0)
+        unsupported = key == "etf_constituents_vip" and not bool(
+            vip.get("capabilities", {}).get("etf_constituents_supported", True)
+        )
+        add({
+            "priority": 2,
+            "key": key,
+            "title": title,
+            "why": (
+                "当前VIP网关未提供etf_sh_cons/etf_sz_cons；已完成官方接口接入，待网关透传后可直接续跑"
+                if unsupported else
+                f"精确终态切片覆盖 {int(contract.get('completed_slices') or 0)}/{int(contract.get('expected_slices') or 0)}，缺失 {missing}"
+            ),
+            "action": action,
+            "params": params,
+            "estimated_calls": missing,
+            "estimated_minutes": round(missing * 0.03, 1),
+            "status": "blocked" if unsupported else ("done" if contract.get("complete") else "needed"),
+            "gap": {
+                "have": int(contract.get("completed_slices") or 0),
+                "need": int(contract.get("expected_slices") or 0),
+                "missing": missing,
+                "coverage": float(contract.get("coverage") or 0),
+            },
+        })
 
     # 4. Core financial statements — VIP APIs fetch the whole report period.
     # Annual-only extras are deliberately separate: a successful VIP return
@@ -424,16 +483,24 @@ def build_backfill_plan(*, market_batch_days: int = 30, financial_batch_size: in
     )
 
     # 6. Quality check at the end.
-    prior_work_needed = any(
-        s.get("status") == "needed"
-        and s.get("action") in {"sync_trade_calendar", "sync_market_batch", "sync_financial_batch", "sync_announcements"}
-        for s in steps
-    )
     with _conn() as c:
-        quality_checked_today = bool(c.execute(
-            "SELECT 1 FROM dc_data_quality_checks WHERE checked_at >= ? LIMIT 1",
-            (today.isoformat(),),
-        ).fetchone())
+        quality_row = c.execute(
+            "SELECT MAX(checked_at) AS checked_at FROM dc_data_quality_checks"
+        ).fetchone()
+        coverage_row = c.execute(
+            "SELECT MAX(checked_at) AS checked_at FROM dc_tushare_request_coverage"
+        ).fetchone()
+    latest_quality_at = str(dict(quality_row).get("checked_at") or "") if quality_row else ""
+    latest_coverage_at = str(dict(coverage_row).get("checked_at") or "") if coverage_row else ""
+    # A quality pass remains valid while no ingestion attempt has happened
+    # after it.  Tying this only to `prior_work_needed` made quality appear
+    # perpetually pending whenever one upstream asset was deliberately
+    # deferred with a residual gap.
+    quality_is_current = bool(
+        latest_quality_at
+        and latest_quality_at[:10] >= today.isoformat()
+        and (not latest_coverage_at or latest_quality_at >= latest_coverage_at)
+    )
     add(
         {
             "priority": 5,
@@ -444,7 +511,7 @@ def build_backfill_plan(*, market_batch_days: int = 30, financial_batch_size: in
             "params": {"trade_date": sorted(have_daily)[-1] if have_daily else end_s},
             "estimated_calls": 0,
             "estimated_minutes": 0.2,
-            "status": "needed" if prior_work_needed or not quality_checked_today else "done",
+            "status": "done" if quality_is_current else "needed",
             "gap": {},
         }
     )
@@ -470,6 +537,10 @@ def build_backfill_plan(*, market_batch_days: int = 30, financial_batch_size: in
         "stk_holdernumber", "pledge_stat", "express", "industry_index", "index_weight",
         "income", "balancesheet", "cashflow", "financial_indicator", "fina_audit",
         "fina_mainbz", "announcements", "macro",
+        "capital_structure_vip", "etf_price_nav_vip", "major_news_vip",
+        "vip_moneyflow_hsgt", "vip_hk_hold", "vip_margin", "vip_margin_detail",
+        "vip_margin_secs", "vip_top_list", "vip_top_inst", "vip_fund_basic",
+        "vip_fund_daily", "vip_fund_nav", "vip_etf_sh_cons", "vip_etf_sz_cons",
     }
     fallback_supplements = {"income", "balancesheet", "cashflow", "financial_indicator", "valuation"}
     for item in asset_gaps:
@@ -542,6 +613,10 @@ def build_backfill_plan(*, market_batch_days: int = 30, financial_batch_size: in
                 "sync_date_api_batch",
                 "sync_index_core",
                 "sync_macro_core",
+                "sync_capital_history_batch",
+                "sync_etf_history_batch",
+                "sync_etf_constituents_batch",
+                "sync_major_news_history_batch",
                 "noop",
             ],
             "note": "可一键执行全部自动步骤；复权因子按交易日整批获取，核心财务按报告期 VIP 整批获取，失败接口再降级补偿。",
@@ -588,17 +663,18 @@ def _step_progress_units(step: dict[str, Any]) -> tuple[float, float]:
 
 
 def _plan_progress_percent(plan: dict[str, Any]) -> int:
-    done = 0.0
-    total = 0.0
+    ratios: list[float] = []
     for step in plan.get("steps") or []:
         if not isinstance(step, dict):
             continue
         step_done, step_total = _step_progress_units(step)
-        done += step_done
-        total += step_total
-    if total <= 0:
+        ratios.append(step_done / step_total if step_total > 0 else 1.0)
+    if not ratios:
         return 100
-    return max(0, min(100, int(round(done / total * 100))))
+    # Each declared plan step has equal weight. Weighting by raw request slices
+    # let a completed 9,855-slice news job hide an ETF job at only 66% and made
+    # the UI claim 99% far too early.
+    return max(0, min(100, int(round(sum(ratios) / len(ratios) * 100))))
 
 
 def get_backfill_status() -> dict[str, Any]:
@@ -792,7 +868,7 @@ def _schedule_auto_resume(
         auto_resume_max_attempts=AUTO_RESUME_MAX_ATTEMPTS or None,
         auto_resume_delay_seconds=delay,
         auto_resume_at=resume_at,
-        message=f"历史补全失败：{error}；{delay} 秒后自动继续（第 {attempt} 次，不限次数）",
+        message=f"历史补全失败：{error}；{delay} 秒后自动继续（第 {attempt}/{AUTO_RESUME_MAX_ATTEMPTS} 次）",
     )
 
     def _resume() -> None:
@@ -914,6 +990,35 @@ def _run_step(step: dict[str, Any]) -> dict[str, Any]:
         return sync_tushare_date_batch(
             str(params.get("api_name") or ""), trade_dates=list(params.get("trade_dates") or []),
             limit=int(params.get("limit") or 10),
+            require_rows=bool(params.get("require_rows")),
+        )
+    if action == "sync_capital_history_batch":
+        return backfill_capital_structure_history(
+            start_date=str(params.get("start_date") or "20200101"),
+            end_date=str(params.get("end_date") or ""),
+            cursor=str(params.get("cursor") or ""),
+            limit_dates=int(params.get("limit_dates") or 10),
+        )
+    if action == "sync_etf_history_batch":
+        return backfill_etf_price_history(
+            start_date=str(params.get("start_date") or "20200101"),
+            end_date=str(params.get("end_date") or ""),
+            cursor=str(params.get("cursor") or ""),
+            limit_funds=int(params.get("limit_funds") or 20),
+        )
+    if action == "sync_etf_constituents_batch":
+        return backfill_etf_constituents_history(
+            start_date=str(params.get("start_date") or "20200101"),
+            end_date=str(params.get("end_date") or ""),
+            cursor=str(params.get("cursor") or ""),
+            limit_dates=int(params.get("limit_dates") or 20),
+        )
+    if action == "sync_major_news_history_batch":
+        return backfill_major_news_history(
+            start_date=str(params.get("start_date") or ""),
+            end_date=str(params.get("end_date") or ""),
+            cursor=str(params.get("cursor") or ""),
+            limit_days=int(params.get("limit_days") or 7),
         )
     if action == "sync_index_core":
         return sync_index_bundle(
@@ -958,18 +1063,40 @@ def _worker(plan: dict[str, Any], *, max_steps: int, stream_id: str | None = Non
             s for s in plan.get("steps") or []
             if s.get("status") == "needed" and s.get("action") in {
                 "sync_trade_calendar", "sync_market_batch", "sync_financial_batch",
-                "sync_announcements", "run_quality", "sync_stock_api_batch", "sync_date_api_batch", "sync_index_core", "sync_macro_core",
+                "sync_announcements", "sync_stock_api_batch", "sync_date_api_batch", "sync_index_core", "sync_macro_core",
+                "sync_capital_history_batch", "sync_etf_history_batch", "sync_etf_constituents_batch", "sync_major_news_history_batch",
             }
         ]
+        if not runnable:
+            quality_step = next(
+                (
+                    s for s in plan.get("steps") or []
+                    if s.get("status") == "needed" and s.get("action") == "run_quality"
+                ),
+                None,
+            )
+            if quality_step is not None:
+                runnable = [quality_step]
         # max_steps <= 0 means run the full plan.
         if max_steps > 0:
             runnable = runnable[:max_steps]
+        elif runnable:
+            # Run one logical asset at a time. Each step is a quota-safe batch;
+            # after it persists coverage we rebuild and continue that asset
+            # before moving to the next one.
+            runnable = runnable[:1]
         total = len(runnable)
         index = 0
-        refresh_rounds = 0
+        previous_gap_signatures: dict[str, str] = {}
+        stagnant_batches: dict[str, int] = {}
         while index < len(runnable):
             step = runnable[index]
             index += 1
+            step_key = str(step.get("key") or step.get("id") or "")
+            previous_gap_signatures.setdefault(
+                step_key,
+                json.dumps(step.get("gap") or {}, ensure_ascii=False, sort_keys=True, default=str),
+            )
             _set(
                 phase=str(step.get("key") or step.get("id")),
                 message=f"正在执行：{step.get('title')}",
@@ -981,6 +1108,8 @@ def _worker(plan: dict[str, Any], *, max_steps: int, stream_id: str | None = Non
             )
             result = _run_step(step)
             executed.append({"step": {k: step.get(k) for k in ("id", "key", "title", "action")}, "result": _result_summary(result)})
+            if result.get("ok") or result.get("skipped"):
+                _set(failure_detail=None)
             if not result.get("ok") and not result.get("skipped"):
                 if result.get("cooldown"):
                     auto_resume_delay_override = max(1, int(result.get("cooldown_seconds") or 180))
@@ -995,36 +1124,44 @@ def _worker(plan: dict[str, Any], *, max_steps: int, stream_id: str | None = Non
                         if isinstance(sub, dict) and not sub.get("ok"):
                             detail = str(sub.get("error") or sub.get("api") or "子步骤失败")[:300]
                             break
-                # A global rate-limit cooldown pauses the worker. All other
-                # permanent/per-item failures are deferred so obtainable data
-                # can continue through the rest of the plan first.
+                # A global rate-limit cooldown pauses the worker. Other batch
+                # failures remain eligible for the bounded re-plan loop below:
+                # successful siblings may have advanced coverage, and the
+                # no-progress guard will defer the step after three unchanged
+                # rounds. Deferring immediately made the UI claim completion
+                # while the same executable gaps were still present.
                 if not result.get("cooldown"):
-                    step_key = str(step.get("key") or step.get("id") or "")
-                    deferred_keys.add(step_key)
-                    deferred.append({
-                        "step": {k: step.get(k) for k in ("id", "key", "title", "action")},
-                        "reason": (detail or "step failed")[:1000],
-                        "summary": _result_summary(result),
-                    })
+                    if step.get("action") == "run_quality":
+                        step_key = str(step.get("key") or step.get("id") or "")
+                        deferred_keys.add(step_key)
+                        deferred.append({
+                            "step": {k: step.get(k) for k in ("id", "key", "title", "action")},
+                            "reason": (detail or "质量检查失败")[:1000],
+                            "summary": _result_summary(result),
+                        })
                     _set(
-                        message=f"已延后：{step.get('title')}；继续获取其他可用数据",
+                        message=f"本批未完成：{step.get('title')}；完成其他步骤后按剩余缺口重试",
                         deferred=deferred,
                         deferred_count=len(deferred),
-                        failure_detail=None,
+                        failure_detail={
+                            "step": {k: step.get(k) for k in ("id", "key", "title", "action")},
+                            "summary": _result_summary(result),
+                            "resume_hint": f"系统会按剩余缺口有限重试；连续{DEFER_EMPTY_AFTER_ATTEMPTS}轮覆盖不增长后自动停止。",
+                        },
                     )
-                    continue
-                error = detail or "step failed"
-                error = error[:1000]
-                _set(
-                    failure_detail={
-                        "step": {k: step.get(k) for k in ("id", "key", "title", "action")},
-                        "summary": _result_summary(result),
-                        "resume_hint": "已写入的数据会保留；点击继续补全会重新生成缺口计划，从未完成/失败覆盖项继续。",
-                    },
-                    can_resume=True,
-                    resume_action="start_backfill",
-                )
-                break
+                else:
+                    error = detail or "step failed"
+                    error = error[:1000]
+                    _set(
+                        failure_detail={
+                            "step": {k: step.get(k) for k in ("id", "key", "title", "action")},
+                            "summary": _result_summary(result),
+                            "resume_hint": "已写入的数据会保留；点击继续补全会重新生成缺口计划，从未完成/失败覆盖项继续。",
+                        },
+                        can_resume=True,
+                        resume_action="start_backfill",
+                    )
+                    break
             # Calendar is a prerequisite. Rebuild the remaining plan after it
             # succeeds so market gaps discovered from the new calendar are
             # executed in this same run instead of requiring another click.
@@ -1037,7 +1174,7 @@ def _worker(plan: dict[str, Any], *, max_steps: int, stream_id: str | None = Non
                 remaining = [
                     s for s in refreshed.get("steps") or []
                     if s.get("status") == "needed"
-                    and s.get("action") in {"sync_market_batch", "sync_financial_batch", "sync_announcements", "run_quality", "sync_stock_api_batch", "sync_date_api_batch", "sync_index_core", "sync_macro_core"}
+                    and s.get("action") in {"sync_market_batch", "sync_financial_batch", "sync_announcements", "run_quality", "sync_stock_api_batch", "sync_date_api_batch", "sync_index_core", "sync_macro_core", "sync_capital_history_batch", "sync_etf_history_batch", "sync_etf_constituents_batch", "sync_major_news_history_batch"}
                     and str(s.get("key")) not in already
                     and str(s.get("key") or s.get("id") or "") not in deferred_keys
                 ]
@@ -1058,36 +1195,147 @@ def _worker(plan: dict[str, Any], *, max_steps: int, stream_id: str | None = Non
                 remaining = [
                     s for s in refreshed.get("steps") or []
                     if s.get("status") == "needed"
-                    and s.get("action") in {"sync_trade_calendar", "sync_market_batch", "sync_financial_batch", "sync_announcements", "run_quality", "sync_stock_api_batch", "sync_date_api_batch", "sync_index_core", "sync_macro_core"}
+                    # Quality is a terminal verification step. Re-adding it
+                    # together with every quota-safe data batch caused
+                    # "补全 -> 质量 -> 下一轮" to repeat indefinitely.
+                    and s.get("action") in {"sync_trade_calendar", "sync_market_batch", "sync_financial_batch", "sync_announcements", "sync_stock_api_batch", "sync_date_api_batch", "sync_index_core", "sync_macro_core", "sync_capital_history_batch", "sync_etf_history_batch", "sync_etf_constituents_batch", "sync_major_news_history_batch"}
                     and str(s.get("key") or s.get("id") or "") not in deferred_keys
                 ]
                 if remaining:
-                    refresh_rounds += 1
-                    runnable.extend(remaining)
-                    total = len(runnable)
-                    _set(
-                        message=f"仍有缺口，继续第 {refresh_rounds + 1} 轮补全",
-                        progress=_plan_progress_percent(refreshed),
-                        current_step=remaining[0],
+                    current_key = step_key
+                    current_remaining = next(
+                        (s for s in remaining if str(s.get("key") or s.get("id") or "") == current_key),
+                        None,
                     )
-        final = "failed" if error else ("completed_with_gaps" if deferred else "completed")
+                    gap_signature = json.dumps(
+                        (current_remaining or {}).get("gap") or {},
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        default=str,
+                    )
+                    if current_remaining is not None:
+                        previous = previous_gap_signatures.get(current_key)
+                        stagnant_batches[current_key] = stagnant_batches.get(current_key, 0) + 1 if previous == gap_signature else 0
+                        previous_gap_signatures[current_key] = gap_signature
+                    if current_remaining is not None and stagnant_batches.get(current_key, 0) >= DEFER_EMPTY_AFTER_ATTEMPTS:
+                        deferred_keys.add(current_key)
+                        deferred.append({
+                            "step": {k: current_remaining.get(k) for k in ("id", "key", "title", "action")},
+                            "reason": f"连续 {DEFER_EMPTY_AFTER_ATTEMPTS} 个批次执行后缺口没有变化，已停止该项自动补全",
+                            "summary": {"gap": current_remaining.get("gap") or {}},
+                        })
+                        _set(
+                            message=f"{current_remaining.get('title')} 连续 {DEFER_EMPTY_AFTER_ATTEMPTS} 个批次无进展，已转为待处理",
+                            deferred=deferred,
+                            deferred_count=len(deferred),
+                        )
+                        remaining = [
+                            pending for pending in remaining
+                            if str(pending.get("key") or pending.get("id") or "") not in deferred_keys
+                        ]
+                    # Prefer continuing the same asset until it is complete;
+                    # otherwise move to the next remaining asset.
+                    next_step = next(
+                        (pending for pending in remaining if str(pending.get("key") or pending.get("id") or "") == current_key),
+                        remaining[0] if remaining else None,
+                    )
+                    if next_step is not None:
+                        runnable.append(next_step)
+                    total = len(runnable)
+                    if next_step is not None:
+                        runtime_summary = dict(refreshed.get("summary") or {})
+                        runtime_summary["steps_needed"] = len(remaining) + 1  # terminal quality check
+                        runtime_summary["steps_blocked"] = len(deferred_keys)
+                        runtime_summary["next_action"] = str(next_step.get("title") or "继续补全")
+                        runtime_plan = {
+                            **refreshed,
+                            "summary": runtime_summary,
+                            "steps": [
+                                {
+                                    **pending,
+                                    "status": "blocked",
+                                    "why": f"本次运行连续{DEFER_EMPTY_AFTER_ATTEMPTS}个批次无进展，已停止自动请求",
+                                }
+                                if str(pending.get("key") or pending.get("id") or "") in deferred_keys
+                                else pending
+                                for pending in refreshed.get("steps") or []
+                            ],
+                        }
+                        _set(
+                            message=f"继续补全：{next_step.get('title')}",
+                            progress=_plan_progress_percent(refreshed),
+                            current_step=next_step,
+                            plan_summary=runtime_summary,
+                            plan=runtime_plan,
+                        )
+                    # `remaining` may have contained only the current asset
+                    # before the no-progress guard deferred it.  In that case
+                    # the list becomes empty inside this branch, so the outer
+                    # `elif not remaining` path is never reached.  Always add
+                    # the terminal quality check once the last executable data
+                    # step has disappeared.
+                    elif step.get("action") != "run_quality":
+                        quality_step = next(
+                            (
+                                pending for pending in refreshed.get("steps") or []
+                                if pending.get("status") == "needed" and pending.get("action") == "run_quality"
+                            ),
+                            None,
+                        )
+                        if quality_step is not None:
+                            runnable.append(quality_step)
+                            total = len(runnable)
+                elif step.get("action") != "run_quality":
+                    quality_step = next(
+                        (
+                            s for s in refreshed.get("steps") or []
+                            if s.get("status") == "needed" and s.get("action") == "run_quality"
+                        ),
+                        None,
+                    )
+                    if quality_step is not None:
+                        runnable.append(quality_step)
+                        total = len(runnable)
         invalidate_data_assets_cache()
         final_plan = build_backfill_plan(
             market_batch_days=int(plan.get("scope", {}).get("policy", {}).get("market_batch_days") or 10),
             financial_batch_size=int(plan.get("scope", {}).get("policy", {}).get("financial_batch_size") or 20),
         )
+        if deferred_keys:
+            final_plan = {
+                **final_plan,
+                "steps": [
+                    {
+                        **pending,
+                        "status": "blocked",
+                        "why": f"本次运行连续{DEFER_EMPTY_AFTER_ATTEMPTS}个批次无进展，已停止自动请求；可检查接口错误后手动重试",
+                    }
+                    if str(pending.get("key") or pending.get("id") or "") in deferred_keys
+                    else pending
+                    for pending in final_plan.get("steps") or []
+                ],
+            }
         final_summary = final_plan.get("summary") if isinstance(final_plan, dict) else {}
-        fully_done = not error and not deferred and int((final_summary or {}).get("steps_needed") or 0) <= 0
+        if deferred_keys and isinstance(final_summary, dict):
+            final_summary = {**final_summary, "steps_blocked": len(deferred_keys)}
+            final_plan = {**final_plan, "summary": final_summary}
+        remaining_steps = int((final_summary or {}).get("steps_needed") or 0)
+        blocked_steps = int((final_summary or {}).get("steps_blocked") or 0)
+        fully_done = not error and not deferred and remaining_steps <= 0 and blocked_steps <= 0
+        final = "failed" if error else ("completed" if fully_done else "completed_with_gaps")
         _set(
             running=False,
             phase=final,
             message=("历史补全失败：" + error) if error else (
-                f"可获取数据已补全；{len(deferred)} 个步骤已延后处理" if deferred
+                f"自动补全已停止；{len(deferred)} 个步骤无进展或失败，仍有缺口待处理" if deferred
                 else "历史补全已完成，当前无剩余缺口" if fully_done
-                else f"已执行 {len(executed)} 个补全步骤"
+                else f"可自动步骤已完成；仍有 {blocked_steps} 个外部能力阻塞项"
+                if blocked_steps > 0 and remaining_steps <= 0
+                else f"本次已执行 {len(executed)} 个步骤，仍有 {remaining_steps} 个待补步骤"
             ),
-            progress=100 if not error and not deferred else _plan_progress_percent(final_plan),
+            progress=100 if fully_done else _plan_progress_percent(final_plan),
             plan_summary=final_summary,
+            plan=final_plan,
             current_step=None,
             activity=None,
             finished_at=_now(),
@@ -1095,8 +1343,8 @@ def _worker(plan: dict[str, Any], *, max_steps: int, stream_id: str | None = Non
             deferred=deferred,
             deferred_count=len(deferred),
             error=error,
-            can_resume=bool(error),
-            resume_action="start_backfill" if error else "",
+            can_resume=bool(error or remaining_steps > 0),
+            resume_action="start_backfill" if error or remaining_steps > 0 else "",
             auto_resume=False,
             auto_resume_attempt=auto_resume_attempt,
             auto_resume_max_attempts=AUTO_RESUME_MAX_ATTEMPTS,
@@ -1138,7 +1386,7 @@ def _worker(plan: dict[str, Any], *, max_steps: int, stream_id: str | None = Non
             WHERE id=?
             """,
             (
-                "failed" if error else "completed",
+                str(_state.get("phase") or ("failed" if error else "completed")),
                 _now(),
                 len(executed),
                 len(executed),
@@ -1170,16 +1418,21 @@ def start_backfill(*, max_steps: int = 0, market_batch_days: int = 30, financial
         plan = build_backfill_plan(market_batch_days=market_batch_days, financial_batch_size=financial_batch_size)
         summary = plan.get("summary") if isinstance(plan, dict) else {}
         steps_needed = int((summary or {}).get("steps_needed") or 0)
+        steps_blocked = int((summary or {}).get("steps_blocked") or 0)
         if steps_needed <= 0:
             snapshot = {
                 "running": False,
                 "run_id": int(_state.get("run_id") or 0),
-                "phase": "completed",
-                "message": "历史补全已完成，当前无剩余缺口",
+                "phase": "completed_with_gaps" if steps_blocked > 0 else "completed",
+                "message": (
+                    f"可自动步骤已完成；仍有 {steps_blocked} 个外部能力阻塞项"
+                    if steps_blocked > 0 else "历史补全已完成，当前无剩余缺口"
+                ),
                 "progress": 100,
                 "started_at": _state.get("started_at") or _now(),
                 "finished_at": _now(),
                 "plan_summary": summary,
+                "plan": plan,
                 "current_step": None,
                 "activity": None,
                 "max_steps": max_steps,
@@ -1192,7 +1445,12 @@ def start_backfill(*, max_steps: int = 0, market_batch_days: int = 30, financial
             _state.clear()
             _state.update(snapshot)
             set_json("alis:data-platform:backfill:state", dict(_state), ttl=86400)
-            return {"ok": True, "reason": "no_gaps", **snapshot, "plan": plan}
+            return {
+                "ok": True,
+                "reason": "blocked_only" if steps_blocked > 0 else "no_gaps",
+                **snapshot,
+                "plan": plan,
+            }
         with _conn() as c:
             c.execute(
                 """
@@ -1213,6 +1471,7 @@ def start_backfill(*, max_steps: int = 0, market_batch_days: int = 30, financial
                 "progress": _plan_progress_percent(plan),
                 "started_at": _now(),
                 "plan_summary": plan.get("summary"),
+                "plan": plan,
                 "max_steps": max_steps,
                 "auto_resume": False,
                 "auto_resume_attempt": auto_resume_attempt,

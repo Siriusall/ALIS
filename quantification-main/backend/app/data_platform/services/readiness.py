@@ -70,7 +70,7 @@ def _metrics() -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
             FROM dc_stock_daily_snapshot WHERE trade_date=?""", (latest,),
         ).fetchone()
         raw_window = {}
-        for api in ("daily", "adj_factor", "suspend_d", "stk_limit"):
+        for api in ("daily", "adj_factor", "suspend_d", "stk_limit", "moneyflow"):
             raw_window[api] = dict(c.execute(
                 "SELECT COUNT(DISTINCT trade_date) dates FROM dc_tushare_raw_records WHERE api_name=? AND trade_date BETWEEN ? AND ?",
                 (api, window_start, history_end),
@@ -98,7 +98,7 @@ def _metrics() -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
             financial_pair_coverage[api] = (min(covered_symbols, stock_count) * len(report_periods), financial_expected)
         checked_symbols = {}
         checked_dates = {}
-        for api in ("suspend_d", "namechange", "adj_factor"):
+        for api in ("suspend_d", "namechange", "adj_factor", "moneyflow"):
             checked_symbols[api] = int(_value(c.execute(
                 "SELECT COUNT(DISTINCT ts_code) n FROM dc_tushare_request_coverage WHERE api_name=? AND result_status IN ('success','valid_empty','not_applicable','deferred_empty') AND ts_code<>''",
                 (api,),
@@ -142,6 +142,8 @@ def _metrics() -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
         ann_fresh = bool(latest_ann) and (datetime.now() - datetime.fromisoformat(latest_ann)).days <= 7
     except ValueError:
         pass
+    from app.data_platform.services.data_center import get_vip_backfill_status
+    vip = get_vip_backfill_status(end_date=history_end)
     values = {
         "trade_calendar": (ratio(calendar_rows, calendar_expected), calendar_rows, calendar_expected, f"自然日日历 {calendar_rows}/{calendar_expected}"),
         "latest_daily": (ratio(int(_value(snap, "daily_n")), stock_count), int(_value(snap, "daily_n")), stock_count, f"目标交易日 {latest}"),
@@ -155,10 +157,28 @@ def _metrics() -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
         "history_suspension": (ratio(checked_dates["suspend_d"], open_dates), checked_dates["suspend_d"], open_dates, "两年窗口停复牌请求日期覆盖（无停牌也算已检查）"),
         "history_limit": (ratio(int(raw_window.get("stk_limit", {}).get("dates") or 0), open_dates), int(raw_window.get("stk_limit", {}).get("dates") or 0), open_dates, "两年窗口涨跌停日期覆盖"),
         "stock_history": (ratio(checked_symbols["namechange"], stock_count), checked_symbols["namechange"], stock_count, "名称/ST 历史接口请求覆盖（无变更也算已检查）"),
+        "moneyflow": (
+            ratio(max(int(raw_window.get("moneyflow", {}).get("dates") or 0), checked_dates["moneyflow"]), open_dates),
+            max(int(raw_window.get("moneyflow", {}).get("dates") or 0), checked_dates["moneyflow"]),
+            open_dates,
+            "两年窗口个股资金流请求日期覆盖",
+        ),
         "financial": (ratio(financial_available, financial_expected), financial_available, financial_expected, "财务报表股票×报告期覆盖"),
         "financial_indicator": (ratio(indicator_available, indicator_expected), indicator_available, indicator_expected, "财务指标股票×报告期覆盖"),
         "announcements": (1.0 if ann_fresh and announcement_count else (0.5 if announcement_count else 0.0), announcement_count, announcement_count, f"最新公告 {latest_ann or '无'}"),
         "point_in_time": (1.0 if has_available_time else 0.0, 1 if has_available_time else 0, 1, "核心原始记录已保存 available_time；严格未来函数审计另列质量项"),
+        "capital_structure": (
+            float(vip["capital"]["coverage"]), int(vip["capital"]["completed_slices"]),
+            int(vip["capital"]["expected_slices"]), "北向、两融和龙虎榜精确请求切片覆盖",
+        ),
+        "etf_history": (
+            float(vip["etf_price_nav"]["coverage"]), int(vip["etf_price_nav"]["completed_slices"]),
+            int(vip["etf_price_nav"]["expected_slices"]), "已上市ETF日线与NAV精确请求切片覆盖",
+        ),
+        "major_news": (
+            float(vip["major_news"]["coverage"]), int(vip["major_news"]["completed_slices"]),
+            int(vip["major_news"]["expected_slices"]), "九来源长篇新闻按来源×自然日切片覆盖",
+        ),
     }
     return {key: {"coverage": round(v[0], 6), "available": v[1], "expected": v[2], "evidence": v[3]} for key, v in values.items()}, {
         "latest_trade_date": latest, "stock_count": stock_count, "known_open_dates": open_dates, "stored_history_dates": history_dates,

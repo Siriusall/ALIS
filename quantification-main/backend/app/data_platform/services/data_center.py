@@ -134,6 +134,9 @@ TUSHARE_CATALOG: list[TushareCatalogItem] = [
     TushareCatalogItem("daily", "行情", "A股日线", "价格、成交量、技术面和回测基础", "daily", "ts_code,trade_date,open,high,low,close,pre_close,change,pct_chg,vol,amount", {"trade_date": ""}),
     TushareCatalogItem("fund_basic", "基金", "场内基金基础信息", "防御ETF主数据与交易状态", "monthly", "ts_code,name,management,custodian,fund_type,found_date,due_date,list_date,issue_date,delist_date,market", {"market": "E"}),
     TushareCatalogItem("fund_daily", "基金", "场内基金日线", "货币、债券、黄金、低波和红利ETF模拟交易", "daily", "ts_code,trade_date,open,high,low,close,pre_close,change,pct_chg,vol,amount", {"ts_code": ""}),
+    TushareCatalogItem("fund_nav", "基金", "公募基金净值", "ETF折溢价、规模与复权净值", "daily", "ts_code,ann_date,nav_date,unit_nav,accum_nav,accum_div,net_asset,total_netasset,adj_nav", {"ts_code": ""}),
+    TushareCatalogItem("etf_sh_cons", "基金", "沪市ETF每日持仓组合", "ETF行业暴露、申赎与历史成分", "daily", "trade_date,ts_code,con_code,con_name,qty,sub_flag,cpr,rdr,sca,exchange", {"trade_date": ""}),
+    TushareCatalogItem("etf_sz_cons", "基金", "深市ETF每日持仓组合", "ETF行业暴露、申赎与历史成分", "daily", "trade_date,ts_code,con_code,con_name,qty,sub_flag,cpr,rdr,sub_cc,red_cc,exchange", {"trade_date": ""}),
     TushareCatalogItem("weekly", "行情", "周线", "长线趋势辅助", "weekly", "ts_code,trade_date,open,high,low,close,vol,amount", {"trade_date": ""}),
     TushareCatalogItem("monthly", "行情", "月线", "长线趋势辅助", "monthly", "ts_code,trade_date,open,high,low,close,vol,amount", {"trade_date": ""}),
     TushareCatalogItem("adj_factor", "行情", "复权因子", "历史价格复权和收益计算", "daily", "ts_code,trade_date,adj_factor", {"trade_date": ""}),
@@ -142,6 +145,13 @@ TUSHARE_CATALOG: list[TushareCatalogItem] = [
     TushareCatalogItem("stk_limit", "交易状态", "涨跌停价", "交易约束、涨跌停识别", "daily", "ts_code,trade_date,up_limit,down_limit", {"trade_date": ""}),
     TushareCatalogItem("moneyflow", "资金", "个股资金流", "资金确认项、短中期风险辅助", "daily", "ts_code,trade_date,buy_sm_vol,sell_sm_vol,buy_lg_vol,sell_lg_vol,net_mf_vol,net_mf_amount", {"trade_date": ""}),
     TushareCatalogItem("moneyflow_hsgt", "资金", "沪深港通资金流向", "北向资金净流入和南向资金观测", "daily", "trade_date,ggt_ss,ggt_sz,hgt,sgt,north_money,south_money", {"start_date": "", "end_date": ""}),
+    TushareCatalogItem("hk_hold", "资金", "沪深股通持股明细", "外资持仓变化、行业和龙头资金确认", "daily", "code,trade_date,ts_code,name,vol,ratio,exchange", {"trade_date": "", "exchange": "SH"}),
+    TushareCatalogItem("margin", "两融", "融资融券交易汇总", "市场杠杆风险偏好和拥挤度", "daily", "trade_date,exchange_id,rzye,rzmre,rzche,rqye,rqmcl,rqyl", {"trade_date": ""}),
+    TushareCatalogItem("margin_detail", "两融", "融资融券交易明细", "个股资金持续、杠杆拥挤和退潮信号", "daily", "trade_date,ts_code,rzye,rqye,rzmre,rqmcl,rzche,rqchl", {"trade_date": ""}),
+    TushareCatalogItem("margin_secs", "两融", "融资融券标的", "历史融资融券资格和可交易约束", "daily", "trade_date,ts_code,name,exchange", {"trade_date": "", "exchange": "SSE"}),
+    TushareCatalogItem("top_list", "席位", "龙虎榜每日明细", "异动强度、资金结构和事件响应", "daily", "trade_date,ts_code,name,close,pct_change,turnover_rate,amount,l_sell,l_buy,l_amount,net_amount,net_rate,amount_rate,float_values,reason", {"trade_date": ""}),
+    TushareCatalogItem("top_inst", "席位", "龙虎榜机构交易明细", "机构与营业部结构、龙头质量", "daily", "trade_date,ts_code,exalter,buy,sell,net_buy", {"trade_date": ""}),
+    TushareCatalogItem("major_news", "资讯", "长篇财经新闻", "主线叙事聚类、催化新鲜度与事件识别", "hourly", "title,content,pub_time,src", {"start_date": "", "end_date": ""}),
     TushareCatalogItem("income", "财务", "利润表", "营收、利润、成长能力", "quarterly", "ts_code,ann_date,f_ann_date,end_date,report_type,revenue,total_revenue,operate_profit,total_profit,n_income,n_income_attr_p,basic_eps,diluted_eps", {"ts_code": "", "period": ""}),
     TushareCatalogItem("balancesheet", "财务", "资产负债表", "资产质量、负债、安全性", "quarterly", "ts_code,ann_date,f_ann_date,end_date,total_assets,total_liab,total_hldr_eqy_exc_min_int,money_cap,accounts_receiv,inventories,goodwill,st_borr,lt_borr,bond_payable,non_cur_liab_due_1y", {"ts_code": "", "period": ""}),
     TushareCatalogItem("cashflow", "财务", "现金流量表", "经营现金流、自由现金流质量", "quarterly", "ts_code,ann_date,f_ann_date,end_date,n_cashflow_act,n_cash_flows_inv_act,n_cash_flows_fnc_act,c_pay_acq_const_fiolta", {"ts_code": "", "period": ""}),
@@ -169,7 +179,10 @@ TUSHARE_CATALOG: list[TushareCatalogItem] = [
 
 
 def _now() -> str:
-    return datetime.utcnow().isoformat(timespec="seconds")
+    # The rest of the data platform stores naive timestamps in the host
+    # timezone (Asia/Shanghai). UTC here made live activity appear eight hours
+    # behind and corrupted elapsed/ETA presentation in the frontend.
+    return datetime.now().isoformat(timespec="seconds")
 
 
 class EmptyTushareResult(RuntimeError):
@@ -704,6 +717,9 @@ VALID_EMPTY_TUSHARE_APIS = {
     # These APIs describe optional events/disclosures. No returned row is a
     # valid negative observation after a successful request.
     "express", "pledge_detail", "pledge_stat", "namechange", "suspend_d",
+    # Dragon-Tiger and long-form news are event datasets. A successful query
+    # with no rows is evidence that no event occurred in the requested window.
+    "top_list", "top_inst", "major_news",
 }
 
 PERIOD_FALLBACK_APIS = {
@@ -782,10 +798,12 @@ def sync_tushare_api_raw(api_name: str, params: dict[str, Any] | None = None, *,
                 if category == "rate_limit":
                     _activate_rate_limit_cooldown(api_name)
                     raise
-                # Empty responses can be transient upstream/indexing gaps too;
-                # retry them with the same bounded backoff before handing the
-                # request to the failure queue and fallback-source policy.
-                if category not in {"transient", "empty_pending"} or attempt >= len(retry_delays):
+                # Empty responses are audited across independent attempts in
+                # the persisted failure queue. Retrying the same empty slice
+                # four times with 1/3/8-second sleeps here multiplied that
+                # outer policy into 20 calls per slice. Only transport-level
+                # transient failures use immediate backoff.
+                if category != "transient" or attempt >= len(retry_delays):
                     raise
                 delay = retry_delays[attempt]
                 time.sleep(delay)
@@ -895,7 +913,7 @@ def _upsert_raw_records(api_name: str, df: pd.DataFrame) -> int:
                 payload["_returned_fields"] = returned_fields
                 payload["_field_contract_version"] = "financial_research_fields_v1"
             ts_code = str(payload.get("ts_code") or payload.get("con_code") or "").strip()
-            trade_date = str(payload.get("trade_date") or payload.get("date") or payload.get("month") or payload.get("MONTH") or payload.get("quarter") or "").strip()
+            trade_date = str(payload.get("trade_date") or payload.get("nav_date") or payload.get("date") or payload.get("month") or payload.get("MONTH") or payload.get("quarter") or "").strip()
             period = str(payload.get("period") or payload.get("end_date") or "").strip()
             ann_date = str(payload.get("ann_date") or "").strip()
             available_time = _point_in_time_available_time(api_name, payload, fallback=now)
@@ -910,7 +928,7 @@ def _upsert_raw_records(api_name: str, df: pd.DataFrame) -> int:
                         """INSERT INTO dc_data_quarantine(api_name,record_key,ts_code,period,payload_json,reason,quarantined_at)
                            VALUES(?,?,?,?,?,?,?) ON CONFLICT(api_name,record_key) DO UPDATE SET
                            payload_json=excluded.payload_json,reason=excluded.reason,quarantined_at=excluded.quarantined_at""",
-                        (api_name, record_key, ts_code, end_date, json.dumps(payload, ensure_ascii=False, sort_keys=True), reason, now),
+                        (api_name, record_key, ts_code, end_date, _strict_json(payload), reason, now),
                     )
                     continue
             values = (
@@ -920,7 +938,7 @@ def _upsert_raw_records(api_name: str, df: pd.DataFrame) -> int:
                 trade_date,
                 period,
                 ann_date,
-                json.dumps(payload, ensure_ascii=False, sort_keys=True),
+                _strict_json(payload),
                 SOURCE_TUSHARE,
                 available_time,
                 now,
@@ -998,6 +1016,12 @@ def _iso_available_on_date(value: Any, *, hour: int = 23, minute: int = 59, seco
 
 def _point_in_time_available_time(api_name: str, payload: dict[str, Any], *, fallback: str) -> str:
     """Separate economic availability from ingestion time for replay safety."""
+    if api_name == "major_news":
+        published = str(payload.get("pub_time") or "").strip().replace("Z", "+00:00")
+        try:
+            return datetime.fromisoformat(published).isoformat(timespec="seconds")
+        except ValueError:
+            return fallback
     if api_name in _DISCLOSURE_APIS:
         disclosed = payload.get("actual_date") or payload.get("f_ann_date") or payload.get("ann_date")
         return _iso_available_on_date(disclosed) or fallback
@@ -1020,7 +1044,15 @@ def _clean_payload(payload: dict[str, Any]) -> dict[str, Any]:
     return clean
 
 
+def _strict_json(payload: Any) -> str:
+    """Serialize standards-compliant JSON; raw storage must be JSONB-castable."""
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True, allow_nan=False)
+
+
 def _record_key(api_name: str, payload: dict[str, Any], idx: Any) -> str:
+    if api_name == "major_news":
+        raw = "|".join(str(payload.get(key) or "").strip() for key in ("src", "pub_time", "title", "content"))
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
     preferred = [
         "ts_code",
         "con_code",
@@ -1038,7 +1070,14 @@ def _record_key(api_name: str, payload: dict[str, Any], idx: Any) -> str:
         "pledge_amount",
         "cal_date",
         "exchange",
+        "exchange_id",
         "name",
+        "code",
+        "nav_date",
+        "reason",
+        "exalter",
+        "pub_time",
+        "src",
     ]
     parts = [str(payload.get(k) or "").strip() for k in preferred if str(payload.get(k) or "").strip()]
     if not parts:
@@ -1062,6 +1101,505 @@ def sync_market_bundle(trade_date: str, *, include_suspend: bool = False, apis: 
         results.append(_safe_sync_raw(api, {"trade_date": trade_date}))
     snapshot = build_stock_daily_snapshot(trade_date)
     return {"ok": all(bool(x.get("ok")) for x in results), "trade_date": trade_date, "apis": requested_apis, "results": results, "snapshot": snapshot}
+
+
+def sync_capital_structure_bundle(trade_date: str) -> dict[str, Any]:
+    """Sync the high-permission capital, leverage and leader-seat evidence for one date."""
+    requests: list[tuple[str, dict[str, Any]]] = [
+        ("moneyflow_hsgt", {"trade_date": trade_date}),
+        ("margin", {"trade_date": trade_date}),
+        ("margin_detail", {"trade_date": trade_date}),
+        ("top_list", {"trade_date": trade_date}),
+        ("top_inst", {"trade_date": trade_date}),
+        ("hk_hold", {"trade_date": trade_date, "exchange": "SH"}),
+        ("hk_hold", {"trade_date": trade_date, "exchange": "SZ"}),
+        ("margin_secs", {"trade_date": trade_date, "exchange": "SSE"}),
+        ("margin_secs", {"trade_date": trade_date, "exchange": "SZSE"}),
+        ("margin_secs", {"trade_date": trade_date, "exchange": "BSE"}),
+    ]
+    results = [
+        {"api_name": api_name, "request": params, **_safe_sync_raw(api_name, params)}
+        for api_name, params in requests
+    ]
+    return {
+        "ok": all(bool(item.get("ok")) for item in results),
+        "trade_date": trade_date,
+        "contract": "capital_structure_vip_account_v1",
+        "results": results,
+        "succeeded": sum(1 for item in results if item.get("ok")),
+        "failed": sum(1 for item in results if not item.get("ok")),
+    }
+
+
+def _request_is_complete(api_name: str, params: dict[str, Any]) -> bool:
+    """Return whether this exact parameter slice already reached a terminal state."""
+    request_key = _request_key(api_name, params, None)
+    with _conn() as c:
+        row = c.execute(
+            """SELECT 1 FROM dc_tushare_request_coverage
+               WHERE request_key=? AND result_status IN
+               ('success','not_applicable','valid_empty','deferred_empty')
+               LIMIT 1""",
+            (request_key,),
+        ).fetchone()
+    return row is not None
+
+
+def backfill_capital_structure_history(
+    *, start_date: str, end_date: str, cursor: str = "", limit_dates: int = 10
+) -> dict[str, Any]:
+    """Backfill a resumable slice of capital-structure history in ascending order.
+
+    ``hk_hold`` stopped publishing daily holdings after the disclosure change
+    effective 2024-08-19, so post-cutoff dates are intentionally not requested.
+    Exact request keys (including exchange) are used for resume safety.
+    """
+    if not (len(start_date) == len(end_date) == 8 and start_date.isdigit() and end_date.isdigit()):
+        raise ValueError("start_date/end_date must be YYYYMMDD")
+    if start_date > end_date:
+        raise ValueError("start_date must not be after end_date")
+    limit_dates = max(1, min(int(limit_dates), 60))
+    with _conn() as c:
+        rows = c.execute(
+            """SELECT cal_date FROM dc_trade_calendar
+               WHERE exchange='SSE' AND is_open=1 AND cal_date BETWEEN ? AND ?
+                 AND cal_date>?
+               ORDER BY cal_date ASC LIMIT ?""",
+            (start_date, end_date, cursor, limit_dates),
+        ).fetchall()
+    trade_dates = [str(dict(row).get("cal_date") or "") for row in rows]
+    pending_requests: list[tuple[str, dict[str, Any]]] = []
+    skipped = 0
+    for trade_date in trade_dates:
+        requests: list[tuple[str, dict[str, Any]]] = [
+            ("moneyflow_hsgt", {"trade_date": trade_date}),
+            ("margin", {"trade_date": trade_date}),
+            ("margin_detail", {"trade_date": trade_date}),
+            ("top_list", {"trade_date": trade_date}),
+            ("top_inst", {"trade_date": trade_date}),
+            ("margin_secs", {"trade_date": trade_date, "exchange": "SSE"}),
+            ("margin_secs", {"trade_date": trade_date, "exchange": "SZSE"}),
+        ]
+        # Beijing Stock Exchange margin trading launched on 2023-02-13;
+        # requesting BSE eligibility before that date only manufactures gaps.
+        if trade_date >= "20230213":
+            requests.append(("margin_secs", {"trade_date": trade_date, "exchange": "BSE"}))
+        if trade_date < "20240819":
+            requests.extend([
+                ("hk_hold", {"trade_date": trade_date, "exchange": "SH"}),
+                ("hk_hold", {"trade_date": trade_date, "exchange": "SZ"}),
+            ])
+        for api_name, params in requests:
+            if _request_is_complete(api_name, params):
+                skipped += 1
+                continue
+            pending_requests.append((api_name, params))
+    def fetch_one(item: tuple[str, dict[str, Any]]) -> dict[str, Any]:
+        api_name, params = item
+        return {"api_name": api_name, "request": params, **_safe_sync_raw(api_name, params)}
+
+    # This bundle contains several high-volume APIs. Keep the aggregate request
+    # rate below the VIP account's observed limit even if the global worker
+    # setting is tuned higher for lighter endpoints.
+    results = []
+    workers = 0
+    for offset in range(0, len(pending_requests), 4):
+        chunk_results, chunk_workers = _parallel_tushare_map(
+            pending_requests[offset : offset + 4],
+            fetch_one,
+            prefix="tushare-capital-history",
+        )
+        results.extend(chunk_results)
+        workers = max(workers, chunk_workers)
+    next_cursor = trade_dates[-1] if trade_dates else cursor
+    return {
+        "ok": all(bool(item.get("ok")) for item in results),
+        "start_date": start_date,
+        "end_date": end_date,
+        "cursor": next_cursor,
+        "dates_processed": len(trade_dates),
+        "has_more": bool(trade_dates) and next_cursor < end_date,
+        "requests_executed": len(results),
+        "requests_skipped": skipped,
+        "concurrency": workers,
+        "rows_written": sum(int(item.get("rows_written") or 0) for item in results),
+        "failed": sum(1 for item in results if not item.get("ok")),
+        "results": results,
+    }
+
+
+def backfill_etf_price_history(
+    *, start_date: str, end_date: str, cursor: str = "", limit_funds: int = 20
+) -> dict[str, Any]:
+    """Backfill listed ETF price and NAV histories with an exact fund cursor."""
+    if not (len(start_date) == len(end_date) == 8 and start_date.isdigit() and end_date.isdigit()):
+        raise ValueError("start_date/end_date must be YYYYMMDD")
+    limit_funds = max(1, min(int(limit_funds), 100))
+    with _conn() as c:
+        rows = c.execute(
+            """SELECT ts_code,payload_json FROM dc_tushare_raw_records
+               WHERE api_name='fund_basic' AND ts_code>? ORDER BY ts_code ASC""",
+            (cursor,),
+        ).fetchall()
+    funds: list[dict[str, str]] = []
+    for row in rows:
+        item = dict(row)
+        raw_payload = item.get("payload_json") or {}
+        if isinstance(raw_payload, dict):
+            payload = raw_payload
+        else:
+            try:
+                payload = json.loads(str(raw_payload))
+            except json.JSONDecodeError:
+                continue
+        name = str(payload.get("name") or "")
+        list_date = str(payload.get("list_date") or "")
+        delist_date = str(payload.get("delist_date") or "")
+        if "ETF" not in name.upper() or not list_date or list_date > end_date:
+            continue
+        if delist_date and delist_date < start_date:
+            continue
+        funds.append({
+            "ts_code": str(item.get("ts_code") or payload.get("ts_code") or ""),
+            "name": name,
+            "list_date": list_date,
+        })
+        if len(funds) >= limit_funds:
+            break
+    pending_requests: list[tuple[str, dict[str, Any]]] = []
+    skipped = 0
+    for fund in funds:
+        effective_start = max(start_date, fund["list_date"])
+        for api_name in ("fund_daily", "fund_nav"):
+            params = {"ts_code": fund["ts_code"], "start_date": effective_start, "end_date": end_date}
+            if _request_is_complete(api_name, params):
+                skipped += 1
+            else:
+                pending_requests.append((api_name, params))
+
+    def fetch_one(item: tuple[str, dict[str, Any]]) -> dict[str, Any]:
+        api_name, params = item
+        return {"api_name": api_name, "request": params, **_safe_sync_raw(api_name, params)}
+
+    results: list[dict[str, Any]] = []
+    workers = 0
+    for offset in range(0, len(pending_requests), 4):
+        chunk_results, chunk_workers = _parallel_tushare_map(
+            pending_requests[offset : offset + 4], fetch_one, prefix="tushare-etf-history"
+        )
+        results.extend(chunk_results)
+        workers = max(workers, chunk_workers)
+    next_cursor = funds[-1]["ts_code"] if funds else cursor
+    return {
+        "ok": all(bool(item.get("ok")) for item in results),
+        "start_date": start_date,
+        "end_date": end_date,
+        "cursor": next_cursor,
+        "funds_processed": len(funds),
+        "has_more": len(funds) == limit_funds,
+        "requests_executed": len(results),
+        "requests_skipped": skipped,
+        "concurrency": workers,
+        "rows_written": sum(int(item.get("rows_written") or 0) for item in results),
+        "failed": sum(1 for item in results if not item.get("ok")),
+        "funds": funds,
+        "results": results,
+    }
+
+
+def backfill_etf_constituents_history(
+    *, start_date: str, end_date: str, cursor: str = "", limit_dates: int = 20
+) -> dict[str, Any]:
+    """Backfill Shanghai/Shenzhen ETF disclosed baskets by trading date."""
+    if not (len(start_date) == len(end_date) == 8 and start_date.isdigit() and end_date.isdigit()):
+        raise ValueError("start_date/end_date must be YYYYMMDD")
+    if start_date > end_date:
+        raise ValueError("start_date must not be after end_date")
+    limit_dates = max(1, min(int(limit_dates), 60))
+    with _conn() as c:
+        rows = c.execute(
+            """SELECT cal_date FROM dc_trade_calendar
+               WHERE exchange='SSE' AND is_open=1 AND cal_date BETWEEN ? AND ? AND cal_date>?
+               ORDER BY cal_date ASC LIMIT ?""",
+            (start_date, end_date, cursor, limit_dates),
+        ).fetchall()
+    trade_dates = [str(dict(row).get("cal_date") or "") for row in rows]
+    requests = [
+        (api_name, {"trade_date": trade_date})
+        for trade_date in trade_dates
+        for api_name in ("etf_sh_cons", "etf_sz_cons")
+        if not _request_is_complete(api_name, {"trade_date": trade_date})
+    ]
+
+    def fetch_one(item: tuple[str, dict[str, Any]]) -> dict[str, Any]:
+        api_name, params = item
+        return {"api_name": api_name, "request": params, **_safe_sync_raw(api_name, params)}
+
+    results: list[dict[str, Any]] = []
+    workers = 0
+    for offset in range(0, len(requests), 4):
+        chunk, chunk_workers = _parallel_tushare_map(
+            requests[offset : offset + 4], fetch_one, prefix="tushare-etf-constituents"
+        )
+        results.extend(chunk)
+        workers = max(workers, chunk_workers)
+    next_cursor = trade_dates[-1] if trade_dates else cursor
+    return {
+        "ok": all(bool(item.get("ok")) for item in results),
+        "start_date": start_date,
+        "end_date": end_date,
+        "cursor": next_cursor,
+        "dates_processed": len(trade_dates),
+        "has_more": bool(trade_dates) and next_cursor < end_date,
+        "requests_executed": len(results),
+        "concurrency": workers,
+        "rows_written": sum(int(item.get("rows_written") or 0) for item in results),
+        "failed": sum(1 for item in results if not item.get("ok")),
+        "results": results,
+    }
+
+
+MAJOR_NEWS_SOURCES = (
+    "新华网", "凤凰财经", "同花顺", "新浪财经", "华尔街见闻",
+    "中证网", "财新网", "第一财经", "财联社",
+)
+
+
+def backfill_major_news_history(
+    *, start_date: str, end_date: str, cursor: str = "", limit_days: int = 7
+) -> dict[str, Any]:
+    """Backfill long-form news by source/day to stay below the 400-row cap."""
+    try:
+        start = datetime.strptime(start_date, "%Y%m%d").date()
+        end = datetime.strptime(end_date, "%Y%m%d").date()
+        after = datetime.strptime(cursor, "%Y%m%d").date() if cursor else start - timedelta(days=1)
+    except ValueError as exc:
+        raise ValueError("start_date/end_date/cursor must be YYYYMMDD") from exc
+    if start > end:
+        raise ValueError("start_date must not be after end_date")
+    limit_days = max(1, min(int(limit_days), 31))
+    first = max(start, after + timedelta(days=1))
+    days = [first + timedelta(days=i) for i in range(limit_days) if first + timedelta(days=i) <= end]
+    pending_requests: list[tuple[str, dict[str, Any]]] = []
+    skipped = 0
+    for day in days:
+        day_text = day.isoformat()
+        for source in MAJOR_NEWS_SOURCES:
+            params = {
+                "src": source,
+                "start_date": f"{day_text} 00:00:00",
+                "end_date": f"{day_text} 23:59:59",
+            }
+            if _request_is_complete("major_news", params):
+                skipped += 1
+            else:
+                pending_requests.append(("major_news", params))
+
+    def fetch_one(item: tuple[str, dict[str, Any]]) -> dict[str, Any]:
+        api_name, params = item
+        return {"api_name": api_name, "request": params, **_safe_sync_raw(api_name, params)}
+
+    results: list[dict[str, Any]] = []
+    workers = 0
+    for offset in range(0, len(pending_requests), 4):
+        chunk_results, chunk_workers = _parallel_tushare_map(
+            pending_requests[offset : offset + 4], fetch_one, prefix="tushare-major-news-history"
+        )
+        results.extend(chunk_results)
+        workers = max(workers, chunk_workers)
+    next_cursor = days[-1].strftime("%Y%m%d") if days else cursor
+    return {
+        "ok": all(bool(item.get("ok")) for item in results),
+        "start_date": start_date,
+        "end_date": end_date,
+        "cursor": next_cursor,
+        "days_processed": len(days),
+        "has_more": bool(days) and days[-1] < end,
+        "sources": list(MAJOR_NEWS_SOURCES),
+        "requests_executed": len(results),
+        "requests_skipped": skipped,
+        "concurrency": workers,
+        "rows_written": sum(int(item.get("rows_written") or 0) for item in results),
+        "failed": sum(1 for item in results if not item.get("ok")),
+        "results": results,
+    }
+
+
+def get_vip_backfill_status(
+    *, capital_start: str = "20200101", end_date: str, news_start: str = "20230719"
+) -> dict[str, Any]:
+    """Return request-slice coverage for the three VIP backfill contracts."""
+    terminal = {"success", "not_applicable", "valid_empty", "deferred_empty"}
+    with _conn() as c:
+        date_rows = c.execute(
+            """SELECT cal_date FROM dc_trade_calendar
+               WHERE exchange='SSE' AND is_open=1 AND cal_date BETWEEN ? AND ?
+               ORDER BY cal_date""",
+            (capital_start, end_date),
+        ).fetchall()
+        coverage_rows = c.execute(
+            """SELECT api_name,params_json,result_status,rows_read
+               FROM dc_tushare_request_coverage
+               WHERE api_name IN
+               ('moneyflow_hsgt','margin','margin_detail','top_list','top_inst','hk_hold','margin_secs',
+                'fund_daily','fund_nav','etf_sh_cons','etf_sz_cons','major_news')"""
+        ).fetchall()
+        fund_rows = c.execute(
+            """SELECT ts_code,payload_json FROM dc_tushare_raw_records
+               WHERE api_name='fund_basic' ORDER BY ts_code"""
+        ).fetchall()
+        constituent_probe_rows = c.execute(
+            """SELECT api_name,last_probe_status,last_probe_error,last_probe_at
+               FROM tushare_api_catalog
+               WHERE api_name IN ('etf_sh_cons','etf_sz_cons')"""
+        ).fetchall()
+    dates = [str(dict(row).get("cal_date") or "") for row in date_rows]
+    expected_capital: set[str] = set()
+    expected_by_api: dict[str, set[str]] = {}
+    def expect(api_name: str, params: dict[str, Any]) -> str:
+        key = _request_key(api_name, params, None)
+        expected_by_api.setdefault(api_name, set()).add(key)
+        return key
+    capital_keys_by_date: list[tuple[str, set[str]]] = []
+    for trade_date in dates:
+        requests: list[tuple[str, dict[str, Any]]] = [
+            (api, {"trade_date": trade_date})
+            for api in ("moneyflow_hsgt", "margin", "margin_detail", "top_list", "top_inst")
+        ] + [
+            ("margin_secs", {"trade_date": trade_date, "exchange": "SSE"}),
+            ("margin_secs", {"trade_date": trade_date, "exchange": "SZSE"}),
+        ]
+        if trade_date >= "20230213":
+            requests.append(("margin_secs", {"trade_date": trade_date, "exchange": "BSE"}))
+        if trade_date < "20240819":
+            requests.extend([
+                ("hk_hold", {"trade_date": trade_date, "exchange": "SH"}),
+                ("hk_hold", {"trade_date": trade_date, "exchange": "SZ"}),
+            ])
+        day_keys = {expect(api, params) for api, params in requests}
+        expected_capital.update(day_keys)
+        capital_keys_by_date.append((trade_date, day_keys))
+
+    completed_keys: set[str] = set()
+    for raw_row in coverage_rows:
+        row = dict(raw_row)
+        if str(row.get("result_status") or "") not in terminal:
+            continue
+        try:
+            params = json.loads(str(row.get("params_json") or "{}"))
+        except json.JSONDecodeError:
+            continue
+        api_name = str(row.get("api_name") or "")
+        key = _request_key(api_name, params, None)
+        completed_keys.add(key)
+
+    etf_funds: list[dict[str, str]] = []
+    for raw_row in fund_rows:
+        row = dict(raw_row)
+        raw_payload = row.get("payload_json") or {}
+        try:
+            payload = raw_payload if isinstance(raw_payload, dict) else json.loads(str(raw_payload))
+        except json.JSONDecodeError:
+            continue
+        name = str(payload.get("name") or "")
+        list_date = str(payload.get("list_date") or "")
+        delist_date = str(payload.get("delist_date") or "")
+        if "ETF" in name.upper() and list_date and list_date <= end_date and (not delist_date or delist_date >= capital_start):
+            etf_funds.append({"ts_code": str(row.get("ts_code") or payload.get("ts_code") or ""), "list_date": list_date})
+
+    expected_etf: set[str] = set()
+    etf_keys_by_code: list[tuple[str, set[str]]] = []
+    for fund in etf_funds:
+        params = {
+            "ts_code": fund["ts_code"],
+            "start_date": max(capital_start, fund["list_date"]),
+            "end_date": end_date,
+        }
+        fund_keys = {expect(api, params) for api in ("fund_daily", "fund_nav")}
+        expected_etf.update(fund_keys)
+        etf_keys_by_code.append((fund["ts_code"], fund_keys))
+
+    expected_etf_constituents: set[str] = set()
+    constituent_keys_by_date: list[tuple[str, set[str]]] = []
+    for trade_date in dates:
+        day_keys = {
+            expect(api_name, {"trade_date": trade_date})
+            for api_name in ("etf_sh_cons", "etf_sz_cons")
+        }
+        expected_etf_constituents.update(day_keys)
+        constituent_keys_by_date.append((trade_date, day_keys))
+
+    news_days = (datetime.strptime(end_date, "%Y%m%d").date() - datetime.strptime(news_start, "%Y%m%d").date()).days + 1
+
+    expected_news: set[str] = set()
+    news_keys_by_day: list[tuple[str, set[str]]] = []
+    news_start_day = datetime.strptime(news_start, "%Y%m%d").date()
+    for offset in range(max(0, news_days)):
+        day = news_start_day + timedelta(days=offset)
+        day_text = day.isoformat()
+        day_keys = {
+            expect("major_news", {
+                "src": source,
+                "start_date": f"{day_text} 00:00:00",
+                "end_date": f"{day_text} 23:59:59",
+            })
+            for source in MAJOR_NEWS_SOURCES
+        }
+        expected_news.update(day_keys)
+        news_keys_by_day.append((day.strftime("%Y%m%d"), day_keys))
+
+    def resume_cursor(groups: list[tuple[str, set[str]]]) -> str:
+        previous = ""
+        for value, keys in groups:
+            if not keys.issubset(completed_keys):
+                return previous
+            previous = value
+        return previous
+
+    def contract(done: int, expected: int, cursor: str) -> dict[str, Any]:
+        return {
+            "completed_slices": done,
+            "expected_slices": expected,
+            "missing_slices": max(0, expected - done),
+            "coverage": round(done / expected, 6) if expected else 1.0,
+            "complete": done >= expected,
+            "resume_cursor": cursor,
+        }
+
+    per_api = {
+        api_name: contract(len(keys & completed_keys), len(keys), "")
+        for api_name, keys in expected_by_api.items()
+    }
+    per_api["fund_basic"] = contract(1 if etf_funds else 0, 1, "")
+    constituent_probes = {str(dict(row).get("api_name") or ""): dict(row) for row in constituent_probe_rows}
+    constituent_supported = not any(
+        "接口" in str(row.get("last_probe_error") or "") and "不存在" in str(row.get("last_probe_error") or "")
+        for row in constituent_probes.values()
+    )
+    return {
+        "ok": True,
+        "capital": contract(len(expected_capital & completed_keys), len(expected_capital), resume_cursor(capital_keys_by_date)),
+        "etf_price_nav": contract(len(expected_etf & completed_keys), len(expected_etf), resume_cursor(etf_keys_by_code)),
+        "etf_constituents": contract(
+            len(expected_etf_constituents & completed_keys),
+            len(expected_etf_constituents),
+            resume_cursor(constituent_keys_by_date),
+        ),
+        "major_news": contract(len(expected_news & completed_keys), len(expected_news), resume_cursor(news_keys_by_day)),
+        "datasets": per_api,
+        "capabilities": {
+            "etf_constituents_supported": constituent_supported,
+            "etf_constituents_probes": constituent_probes,
+        },
+        "scope": {
+            "capital_start": capital_start,
+            "news_start": news_start,
+            "end_date": end_date,
+            "trade_dates": len(dates),
+            "etfs": len(etf_funds),
+            "news_sources": len(MAJOR_NEWS_SOURCES),
+        },
+    }
 
 
 def recover_orphaned_ingestion_runs() -> dict[str, Any]:
@@ -1583,17 +2121,26 @@ def sync_tushare_stock_batch(
     }
 
 
-def sync_tushare_date_batch(api_name: str, *, trade_dates: list[str], limit: int = 10) -> dict[str, Any]:
+def sync_tushare_date_batch(
+    api_name: str, *, trade_dates: list[str], limit: int = 10, require_rows: bool = False
+) -> dict[str, Any]:
     """Progress a date-based API without letting retryable empty rows block forever."""
     _catalog_item(api_name)
     wanted = list(dict.fromkeys(str(x) for x in trade_dates if str(x)))
     with _conn() as c:
-        checked = {str(dict(row).get("trade_date") or "") for row in c.execute(
-            f"""SELECT trade_date FROM dc_tushare_request_coverage
-                WHERE api_name=? AND trade_date IN ({','.join('?' for _ in wanted)})
-                  AND result_status IN ('success','not_applicable','valid_empty','deferred_empty')""",
-            (api_name, *wanted),
-        ).fetchall()} if wanted else set()
+        if require_rows:
+            checked = {str(dict(row).get("trade_date") or "") for row in c.execute(
+                f"""SELECT DISTINCT trade_date FROM dc_tushare_raw_records
+                    WHERE api_name=? AND trade_date IN ({','.join('?' for _ in wanted)})""",
+                (api_name, *wanted),
+            ).fetchall()} if wanted else set()
+        else:
+            checked = {str(dict(row).get("trade_date") or "") for row in c.execute(
+                f"""SELECT trade_date FROM dc_tushare_request_coverage
+                    WHERE api_name=? AND trade_date IN ({','.join('?' for _ in wanted)})
+                      AND result_status IN ('success','not_applicable','valid_empty','deferred_empty')""",
+                (api_name, *wanted),
+            ).fetchall()} if wanted else set()
     pending = [d for d in wanted if d not in checked][:max(1, min(int(limit), 60))]
     results, workers = _parallel_tushare_map(
         pending, lambda d: _safe_sync_raw(api_name, {"trade_date": d}), prefix=f"tushare-{api_name}"
@@ -1602,6 +2149,7 @@ def sync_tushare_date_batch(api_name: str, *, trade_dates: list[str], limit: int
     cooldown_seconds = max([int(x.get("cooldown_seconds") or 0) for x in results if x.get("cooldown")] or [0])
     return {
         "ok": all(bool(x.get("ok")) for x in results) and not cooldown, "api": api_name,
+        "require_rows": require_rows,
         "total": len(results), "success": sum(1 for x in results if x.get("ok") and not x.get("cooldown")),
         "failed": sum(1 for x in results if not x.get("ok")), "concurrency": workers,
         "cooldown": cooldown,

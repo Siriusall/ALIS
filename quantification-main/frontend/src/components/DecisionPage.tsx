@@ -4,6 +4,7 @@ import { fetchDecisionSummary, fetchDailyReport, type DecisionSummary, type Dail
 import type { QuantAnalyzeResponse } from "../types";
 import { useStockContext } from "../context/StockContext";
 import LoadingState from "./LoadingState";
+import SecurityLabel from "./SecurityLabel";
 
 const ANALYZE_RESULT_KEY = "quant_analyze_result_v1";
 
@@ -169,11 +170,16 @@ export default function DecisionPage({ onNavigate }: DecisionPageProps) {
   const buySuggestions = analyze?.rebalance_actions?.buy?.length ?? 0;
   const sellSuggestions = analyze?.rebalance_actions?.sell?.length ?? 0;
   const holdSuggestions = analyze?.rebalance_actions?.hold?.length ?? 0;
+  const recentBuyOps = (recentExec?.operations ?? []).filter((item) => item.side.toUpperCase() === "BUY");
+  const recentSellOps = (recentExec?.operations ?? []).filter((item) => item.side.toUpperCase() === "SELL");
+  const hasRecentExecution = Boolean(recentExec && recentExec.trade_date && recentExec.trade_date.replace(/-/g, "") === String(health?.trade_dates?.last || market?.trade_date || "").replace(/-/g, "").slice(0, 8));
+  const displayedBuyCount = buySuggestions || (hasRecentExecution ? recentBuyOps.length : 0);
+  const displayedSellCount = sellSuggestions || (hasRecentExecution ? recentSellOps.length : 0);
   const pendingAnalyze = Boolean(analyze?.ok && (buySuggestions > 0 || sellSuggestions > 0));
   const topSelections = (analyze?.selections ?? []).slice(0, 5);
   const stopIssues = (health?.issues ?? []).filter((item) => item.level === "error").slice(0, 4);
   const accountRisks = (ledger?.account_risks ?? []).slice(0, 4);
-  const actionCount = buySuggestions + sellSuggestions;
+  const actionCount = displayedBuyCount + displayedSellCount;
   const latestDataDate = health?.trade_dates?.last || market?.trade_date || "—";
   const noTradeReason = dataErrorCount > 0
     ? "系统有阻断项，今天先不进入执行。"
@@ -186,8 +192,10 @@ export default function DecisionPage({ onNavigate }: DecisionPageProps) {
       ? "先处理组合风险"
       : pendingAnalyze
         ? `今天有 ${actionCount} 条待确认调仓建议`
+        : hasRecentExecution
+          ? `今日已执行 ${displayedBuyCount} 笔买入、${displayedSellCount} 笔卖出`
         : "今天先观察，不急于调仓";
-  const reviewStatus = recentExec ? "有最近执行，待人工复核" : "暂无新执行记录";
+  const reviewStatus = recentExec ? "最近执行已入账，可按需复盘" : "暂无新执行记录";
 
   const modelReadyText = useMemo(() => {
     if (!displayedModel) return "待训练";
@@ -270,8 +278,8 @@ export default function DecisionPage({ onNavigate }: DecisionPageProps) {
               <strong>{primaryActionText}</strong>
             </div>
             <div className="decision-action-counts">
-              <button type="button" className="buy" onClick={() => onNavigate?.("validation")}><span>买入</span><strong>{buySuggestions}</strong></button>
-              <button type="button" className="sell" onClick={() => onNavigate?.("validation")}><span>卖出</span><strong>{sellSuggestions}</strong></button>
+              <button type="button" className="buy" onClick={() => onNavigate?.("validation")}><span>买入</span><strong>{displayedBuyCount}</strong></button>
+              <button type="button" className="sell" onClick={() => onNavigate?.("validation")}><span>卖出</span><strong>{displayedSellCount}</strong></button>
               <button type="button" className="hold" onClick={() => onNavigate?.("validation")}><span>持有</span><strong>{holdSuggestions}</strong></button>
             </div>
           </div>
@@ -294,7 +302,7 @@ export default function DecisionPage({ onNavigate }: DecisionPageProps) {
             <span>生产模型</span><strong>{activeModel ? "已就绪" : "未就绪"}</strong><em>{displayedModel?.version || modelReadyText}</em>
           </button>
           <button type="button" onClick={() => onNavigate?.("positionRisk")} className={Number(ledger?.drawdown || 0) <= -0.08 ? "danger" : "ready"}>
-            <span>组合回撤</span><strong>{fmtPct(ledger?.drawdown)}</strong><em>风险预算 {marketState ? `${Math.round(marketState.risk_budget_multiplier * 100)}%` : "—"}</em>
+            <span>组合回撤</span><strong>{fmtPct(ledger?.drawdown)}</strong><em>最终风险预算 {positionGate ? `${Math.round(positionGate.combined_risk_budget_multiplier * 100)}%` : marketState ? `${Math.round(marketState.risk_budget_multiplier * 100)}%` : "—"}</em>
           </button>
           <button type="button" onClick={() => onNavigate?.("portfolio")}>
             <span>账户权益</span><strong>{fmtMoney(ledger?.total_equity)}</strong><em>现金 {fmtPct(ledger?.cash_pct)} · {ledger?.position_count ?? 0} 只持仓</em>
@@ -304,17 +312,29 @@ export default function DecisionPage({ onNavigate }: DecisionPageProps) {
         <div className="decision-dashboard-main">
           <section className="decision-focus-card">
             <div className="decision-card-head">
-              <div><span>今日待办</span><h3>{actionCount ? `${actionCount} 条调仓建议待确认` : "今天没有必须执行的交易"}</h3></div>
+              <div><span>{hasRecentExecution && !pendingAnalyze ? "今日成交" : "今日待办"}</span><h3>{pendingAnalyze ? `${actionCount} 条调仓建议待确认` : hasRecentExecution ? `已完成 ${displayedBuyCount} 笔买入、${displayedSellCount} 笔卖出` : "今天没有必须执行的交易"}</h3></div>
               <button type="button" onClick={() => onNavigate?.("validation")}>量化分析 →</button>
             </div>
-            {!analyze ? (
+            {!analyze && hasRecentExecution ? (
+              <div className="decision-pick-list">
+                {[...recentBuyOps, ...recentSellOps].map((row, index) => (
+                  <article key={`${row.side}-${row.symbol}`}>
+                    <b>{String(index + 1).padStart(2, "0")}</b>
+                    <div><strong><SecurityLabel code={row.symbol} name={row.name} /></strong><span>{row.side.toUpperCase() === "BUY" ? "买入" : "卖出"} {row.quantity.toLocaleString("zh-CN")} 份</span></div>
+                    <em>¥{fmtMoney(row.amount ?? row.price * row.quantity)}</em>
+                    <button type="button" onClick={() => openResearch(row.symbol)}>研究</button>
+                    <button type="button" className="primary" onClick={() => onNavigate?.("executionLedger")}>成交 ¥{fmtMoney(row.price)}</button>
+                  </article>
+                ))}
+              </div>
+            ) : !analyze ? (
               <div className="decision-zero-state"><i>—</i><strong>尚未生成今日分析</strong><p>当前保持原仓位，不根据不完整信号交易。</p></div>
             ) : topSelections.length ? (
               <div className="decision-pick-list">
                 {topSelections.map((row, index) => (
                   <article key={row.symbol}>
                     <b>{String(index + 1).padStart(2, "0")}</b>
-                    <div><strong>{row.name || row.symbol}</strong><span>{row.symbol}</span></div>
+                    <div><strong><SecurityLabel code={row.symbol} name={row.name} /></strong></div>
                     <em>{row.score == null ? "待评分" : Number(row.score).toFixed(3)}</em>
                     <button type="button" onClick={() => openResearch(row.symbol)}>研究</button>
                     <button type="button" className="primary" onClick={() => openReview(row.symbol)}>复核</button>
@@ -335,7 +355,7 @@ export default function DecisionPage({ onNavigate }: DecisionPageProps) {
               <button type="button" onClick={() => onNavigate?.("dataCenter")} className={health?.ok ? "passed" : "blocked"}><i>{health?.ok ? "✓" : "!"}</i><div><strong>数据可信</strong><span>{health?.ok ? "核心数据满足决策要求" : "存在数据阻断"}</span></div><em>{health?.ok ? "通过" : "阻断"}</em></button>
               <button type="button" onClick={() => onNavigate?.("strategy")} className={activeModel ? "passed" : "blocked"}><i>{activeModel ? "✓" : "!"}</i><div><strong>模型可用</strong><span>{activeModel ? activeModel.version : modelReadyText}</span></div><em>{activeModel ? "通过" : "阻断"}</em></button>
               <button type="button" onClick={() => onNavigate?.("positionRisk")} className={Number(ledger?.drawdown || 0) > -0.08 ? "passed" : "blocked"}><i>{Number(ledger?.drawdown || 0) > -0.08 ? "✓" : "!"}</i><div><strong>风险预算</strong><span>{positionGate?.reason || "等待风险状态"}</span></div><em>{Number(ledger?.drawdown || 0) > -0.08 ? "通过" : "收缩"}</em></button>
-              <button type="button" onClick={() => onNavigate?.("review")} className="manual"><i>人</i><div><strong>人工确认</strong><span>{reviewStatus}</span></div><em>必需</em></button>
+              <button type="button" onClick={() => onNavigate?.("reviewWorkbench")} className="manual"><i>人</i><div><strong>执行复盘</strong><span>{reviewStatus}</span></div><em>{recentExec ? "可选" : "无待办"}</em></button>
             </div>
             {(stopIssues.length > 0 || accountRisks.length > 0) && <div className="decision-blocker-note">{[...stopIssues.map(issueText), ...accountRisks.map((risk) => risk.message)][0]}</div>}
           </aside>
@@ -349,7 +369,7 @@ export default function DecisionPage({ onNavigate }: DecisionPageProps) {
             <span>当前主线</span><strong>{market?.themes.items?.[0]?.theme || "暂无确认主题"}</strong><em>{market?.themes.reason || "尚未通过主题确认门"}</em>
           </button>
           <button type="button" onClick={() => onNavigate?.("portfolio")}>
-            <span>组合状态</span><strong>{ledger?.position_count ?? 0} 只持仓</strong><em>最大单票 {ledger?.max_position_symbol ? `${ledger.max_position_symbol} ${fmtPct(ledger.max_position_pct)}` : "—"}</em>
+            <span>组合状态</span><strong>{ledger?.position_count ?? 0} 只持仓</strong><em>最大单票 {ledger?.max_position_symbol ? <><SecurityLabel code={ledger.max_position_symbol} /> {fmtPct(ledger.max_position_pct)}</> : "—"}</em>
           </button>
           <button type="button" onClick={() => onNavigate?.("review")}>
             <span>最近执行</span><strong>{recentExec ? `${recentExec.buy_count} 买 / ${recentExec.sell_count} 卖` : "暂无执行"}</strong><em>{recentExec ? fmtDate(recentExec.executed_at) : "等待有效交易信号"}</em>

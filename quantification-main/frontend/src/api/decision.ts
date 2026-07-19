@@ -72,10 +72,13 @@ export interface DecisionExecutionOperation {
   quantity: number;
   at: string;
   remark?: string;
+  amount?: number;
 }
 
 export interface DecisionRecentExecution {
   execution_id: number;
+  execution_ids?: number[];
+  trade_date?: string;
   executed_at: string;
   strategy_id: number;
   budget: number;

@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { analyzeQuantMarket, executeQuantAnalyzeBuy, previewQuantAnalyzeRebalance, runQuantRunOnce } from "../api/quantRuns";
 import type { QuantAnalyzeResponse, QuantRebalancePreviewResponse } from "../types";
+import SecurityLabel from "./SecurityLabel";
 
 const ANALYZE_RESULT_KEY = "quant_analyze_result_v1";
 
@@ -320,7 +321,7 @@ export default function QuantRunPanel() {
                     <ul className="decision-explain-list">
                       {buyList.map((item) => (
                         <li key={`buy-${item.symbol}`}>
-                          {item.symbol}
+                          <SecurityLabel code={item.symbol} name={item.name} />
                           {item.name ? ` ${item.name}` : ""}
                           {item.price != null ? ` @ ${Number(item.price).toFixed(2)}` : ""}
                           {item.score != null ? `（得分 ${Number(item.score).toFixed(3)}）` : ""}
@@ -337,7 +338,7 @@ export default function QuantRunPanel() {
                     <ul className="decision-explain-list">
                       {sellList.map((item) => (
                         <li key={`sell-${item.symbol}`} className="decision-cell-stop">
-                          {item.symbol}
+                          <SecurityLabel code={item.symbol} name={item.name} />
                           {item.name ? ` ${item.name}` : ""}
                           {item.price != null ? ` @ ${Number(item.price).toFixed(2)}` : ""}
                           {item.quantity != null ? ` × ${item.quantity}` : ""}
@@ -406,7 +407,7 @@ export default function QuantRunPanel() {
                         previewRows.map((row, idx) => (
                           <tr key={`${row.symbol}-${row.side}-${idx}`}>
                             <td>{row.side === "SELL" ? "卖出" : "买入"}</td>
-                            <td>{row.symbol}{row.name ? ` ${row.name}` : ""}</td>
+                            <td><SecurityLabel code={row.symbol} name={row.name} /></td>
                             <td>{row.quantity ?? "—"}</td>
                             <td>{row.exec_price ?? row.price ?? row.request_price ?? "—"}</td>
                             <td>{row.total_cost != null ? fmtMoney(row.total_cost) : "—"}</td>
@@ -436,7 +437,7 @@ export default function QuantRunPanel() {
                     <tbody>
                       {(result.selections ?? []).map((row) => (
                         <tr key={row.symbol}>
-                          <td>{row.symbol}{row.name ? ` ${row.name}` : ""}</td>
+                          <td><SecurityLabel code={row.symbol} name={row.name} /></td>
                           <td>{row.score == null ? "—" : Number(row.score).toFixed(4)}</td>
                           <td>
                             {(row.factor_contributions ?? [])
@@ -467,7 +468,7 @@ export default function QuantRunPanel() {
                     <tbody>
                       {(result.current_positions ?? []).map((pos) => (
                         <tr key={pos.symbol}>
-                          <td>{pos.symbol}{pos.name ? ` ${pos.name}` : ""}</td>
+                          <td><SecurityLabel code={pos.symbol} name={pos.name} /></td>
                           <td>{pos.quantity ?? 0}</td>
                           <td>{pos.cost_price == null ? "—" : Number(pos.cost_price).toFixed(3)}</td>
                         </tr>

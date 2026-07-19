@@ -10,6 +10,7 @@ import {
 } from "../api/research";
 import { fetchPerformanceReports, type PerformanceReport } from "../api/modelStrategy";
 import { formatGmt8Time } from "../utils/time";
+import SecurityLabel from "./SecurityLabel";
 
 const ERROR_TYPES = ["无", "数据质量", "模型失效", "估值判断", "风险执行", "交易执行", "研究遗漏", "其他"];
 
@@ -240,7 +241,7 @@ export default function ReviewPage() {
                 onClick={() => setSelectedId(item.id)}
               >
                 <div>
-                  <strong>{item.ts_code}</strong>
+                  <strong><SecurityLabel code={item.ts_code} /></strong>
                   <span>{item.decision_type}</span>
                 </div>
                 <em>{formatGmt8Time(item.decision_time)}</em>
@@ -254,7 +255,7 @@ export default function ReviewPage() {
           <h3>当前复核对象</h3>
           {selectedOrFirstAwaiting ? (
             <div className="decision-issue warning review-focus-card">
-              <strong>{selectedOrFirstAwaiting.ts_code} · {selectedOrFirstAwaiting.decision_type}</strong>
+              <strong><SecurityLabel code={selectedOrFirstAwaiting.ts_code} /> · {selectedOrFirstAwaiting.decision_type}</strong>
               <br />
               决策时间：{formatGmt8Time(selectedOrFirstAwaiting.decision_time)} · 数据截至：{formatGmt8Time(selectedOrFirstAwaiting.data_as_of_time)}
               <br />
@@ -309,7 +310,7 @@ export default function ReviewPage() {
                 <option value="">选择待复盘决策</option>
                 {awaiting.map((item) => (
                   <option key={item.id} value={item.id}>
-                    {formatGmt8Time(item.decision_time)} · {item.ts_code} · {item.decision_type}
+                    {formatGmt8Time(item.decision_time)} · <SecurityLabel code={item.ts_code} /> · {item.decision_type}
                   </option>
                 ))}
               </select>
@@ -348,7 +349,7 @@ export default function ReviewPage() {
                 {decisions.map((item) => (
                   <tr key={item.id} className={reviewedIds.has(item.id) ? "" : "active"} onClick={() => setSelectedId(item.id)}>
                     <td>{formatGmt8Time(item.decision_time)}</td>
-                    <td>{item.ts_code}</td>
+                    <td><SecurityLabel code={item.ts_code} /></td>
                     <td>{item.decision_type}</td>
                     <td>{formatGmt8Time(item.data_as_of_time)}</td>
                     <td>{item.model_version}</td>

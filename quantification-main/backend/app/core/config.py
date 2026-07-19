@@ -9,7 +9,13 @@ load_project_env()
 
 class Settings(BaseModel):
     app_name: str = "Quantification Server"
-    env: str = "dev"
+    env: str = os.getenv("APP_ENV", "dev")
+    local_debug_auth_bypass: bool = os.getenv("LOCAL_DEBUG_AUTH_BYPASS", "true").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
     log_limit: int = 200
     jwt_secret: str = os.getenv("JWT_SECRET", "quant-dev-secret-change-before-production")
     jwt_algorithm: str = "HS256"

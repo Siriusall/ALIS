@@ -75,8 +75,8 @@ def test_governance_promotes_first_fully_eligible_model(monkeypatch):
         "id": 9,
         "status": "candidate",
         "is_active": False,
-        "metrics": {"lift": 0.01, "walk_forward_lift": 0.02},
-        "validation": {"status": "passed", "production_eligible": True},
+        "metrics": {"lift": 0.01, "walk_forward_lift": 0.02, "walk_forward_folds": 3},
+        "validation": {"status": "passed", "production_eligible": True, "production_eligibility": {"history_sessions": 1512, "gates": {"artifact_exists": True}}},
     }
     promoted = []
     monkeypatch.setattr(scheduler, "materialize_market_training_history", lambda: {"ok": True})
@@ -86,10 +86,41 @@ def test_governance_promotes_first_fully_eligible_model(monkeypatch):
         lambda model_key, limit=20: [candidate] if model_key == "main" else [{"version": "hsmm-shadow-202607-existing"}],
     )
     monkeypatch.setattr(scheduler, "set_active_model_version", lambda model_id: promoted.append(model_id))
+    monkeypatch.setattr(scheduler, "update_model_version_validation", lambda *args, **kwargs: None)
     monkeypatch.setattr(scheduler, "write_runtime_log", lambda *args, **kwargs: None)
+    monkeypatch.setattr("app.services.review_learning.materialize_decision_outcomes", lambda: {"ok": True})
 
     result = scheduler.auto_tune_models_once(allow_retrain=False)
 
     assert result["decision"] == "promoted_initial"
     assert promoted == [9]
+    assert result["promotion_policy"] == "bootstrap_offline_gates"
     assert result["retraining"]["reason"] == "post_training_evaluation"
+
+
+def test_governance_does_not_require_feedback_for_initial_model(monkeypatch):
+    candidate = {
+        "id": 10, "version": "bootstrap-v1", "status": "candidate", "is_active": False,
+        "metrics": {"lift": 0.01, "walk_forward_lift": 0.02, "walk_forward_folds": 3},
+        "validation": {"status": "passed", "production_eligible": False, "production_eligibility": {"history_sessions": 487, "gates": {"artifact_exists": True}}},
+    }
+    promoted = []
+    monkeypatch.setattr(scheduler, "materialize_market_training_history", lambda: {"ok": True})
+    monkeypatch.setattr(scheduler, "get_active_model_version", lambda *_: None)
+    monkeypatch.setattr(
+        scheduler, "list_model_versions",
+        lambda model_key, limit=20: [candidate] if model_key == "main" else [{"version": "hsmm-shadow-202607-existing"}],
+    )
+    monkeypatch.setattr(scheduler, "set_active_model_version", lambda model_id: promoted.append(model_id))
+    monkeypatch.setattr(scheduler, "update_model_version_validation", lambda *args, **kwargs: None)
+    monkeypatch.setattr(scheduler, "write_runtime_log", lambda *args, **kwargs: None)
+    monkeypatch.setattr("app.services.review_learning.materialize_decision_outcomes", lambda: {"ok": True})
+    monkeypatch.setattr(
+        "app.services.review_learning.model_feedback_gate",
+        lambda _version: {"passed": False, "blocked_reasons": ["minimum_20d_outcomes"]},
+    )
+
+    result = scheduler.auto_tune_models_once(allow_retrain=False)
+
+    assert result["decision"] == "promoted_initial"
+    assert promoted == [10]

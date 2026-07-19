@@ -9,6 +9,8 @@ CONTRACTS = {
             ("latest_valuation", "最新估值", 0.95, "degrade"),
             ("limit_price", "涨跌停价格", 0.99, "block"),
             ("suspension", "停复牌记录", 0.99, "block"),
+            ("capital_structure", "北向/两融/龙虎榜", 0.99, "degrade"),
+            ("moneyflow", "个股资金流", 0.99, "degrade"),
         ],
     },
     "quant_analysis": {
@@ -18,6 +20,9 @@ CONTRACTS = {
             ("latest_valuation", "最新估值", 0.90, "degrade"),
             ("financial", "财务指标", 0.90, "degrade"),
             ("stock_master", "股票主数据", 0.99, "block"),
+            ("capital_structure", "资金结构历史", 0.99, "degrade"),
+            ("moneyflow", "个股资金流历史", 0.99, "degrade"),
+            ("major_news", "叙事新闻历史", 0.99, "degrade"),
         ],
     },
     "backtest": {
@@ -29,6 +34,9 @@ CONTRACTS = {
             ("history_suspension", "停复牌记录", 0.99, "block"),
             ("history_limit", "涨跌停价格", 0.99, "block"),
             ("stock_history", "股票历史状态", 0.99, "block"),
+            ("capital_structure", "资金结构历史", 0.99, "block"),
+            ("moneyflow", "个股资金流历史", 0.99, "block"),
+            ("etf_history", "ETF价格与净值历史", 0.99, "block"),
         ],
     },
     "position_risk": {
@@ -38,6 +46,7 @@ CONTRACTS = {
             ("suspension", "停复牌记录", 1.0, "block"),
             ("limit_price", "涨跌停价格", 0.99, "block"),
             ("announcements", "最新公告", 0.90, "degrade"),
+            ("major_news", "新闻叙事历史", 0.99, "degrade"),
         ],
     },
     "model_training": {
@@ -47,6 +56,9 @@ CONTRACTS = {
             ("adj_factor", "复权因子", 0.995, "block"),
             ("financial", "财务特征", 0.90, "block"),
             ("point_in_time", "时点可用性", 1.0, "block"),
+            ("capital_structure", "资金结构训练样本", 0.99, "block"),
+            ("etf_history", "ETF轮动训练样本", 0.99, "block"),
+            ("major_news", "叙事训练语料", 0.99, "block"),
         ],
     },
     "financial_research": {

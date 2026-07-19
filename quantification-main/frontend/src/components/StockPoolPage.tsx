@@ -9,6 +9,7 @@ import {
   type StockPoolMember,
 } from "../api/research";
 import { useStockContext } from "../context/StockContext";
+import SecurityLabel from "./SecurityLabel";
 
 const TYPES = [
   { key: "watch", label: "研究观察池", rule: "机会发现后进入，允许证据尚不完整。" },
@@ -181,7 +182,7 @@ export default function StockPoolPage() {
           {eligibility ? (
             <div className="decision-two-col">
               <span>标的</span>
-              <strong>{eligibility.ts_code}</strong>
+              <strong><SecurityLabel code={eligibility.ts_code} /></strong>
               <span>核心候选资格</span>
               <strong>{eligibility.eligible_for_core ? "允许升级" : "禁止升级"}</strong>
               <span>投资逻辑数量</span>
@@ -279,7 +280,7 @@ export default function StockPoolPage() {
               {(grouped[group.key] ?? []).map((item) => (
                 <div className="pool-member" key={item.id}>
                   <div>
-                    <strong>{item.ts_code}</strong>
+                    <strong><SecurityLabel code={item.ts_code} /></strong>
                     <em>{item.reason}</em>
                     <time>{item.updated_at?.slice(0, 16)}</time>
                   </div>
