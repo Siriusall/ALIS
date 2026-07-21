@@ -246,9 +246,14 @@ def _market_change_signal(history: list[dict[str, Any]], current: dict[str, Any]
 
 def market_state_model_governance() -> dict[str, Any]:
     with _conn() as c:
-        row = c.execute(
-            "SELECT MIN(trade_date) first_date,MAX(trade_date) last_date,COUNT(DISTINCT trade_date) sessions FROM dc_tushare_raw_records WHERE api_name='daily'"
-        ).fetchone()
+        try:
+            row = c.execute(
+                "SELECT MIN(trade_date) first_date,MAX(trade_date) last_date,COUNT(*) sessions FROM dc_available_trade_dates"
+            ).fetchone()
+        except Exception:
+            row = c.execute(
+                "SELECT MIN(trade_date) first_date,MAX(trade_date) last_date,COUNT(*) sessions FROM (SELECT trade_date FROM dc_tushare_raw_records WHERE api_name='daily' GROUP BY trade_date LIMIT 5000)"
+            ).fetchone()
         training_row = c.execute(
             "SELECT MIN(feature_date) first_date,MAX(feature_date) last_date,COUNT(*) observations FROM model_training_history WHERE feature_set='market_regime_full_market_v2'"
         ).fetchone()

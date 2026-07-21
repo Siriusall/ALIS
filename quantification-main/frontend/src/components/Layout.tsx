@@ -9,7 +9,6 @@ import {
 } from "./dataCenterSections";
 import type { SectionKey as DataCenterSectionKey } from "./DataCenterTechnicalConsole";
 import {
-  GOVERNANCE_SECTIONS,
   GOVERNANCE_SECTION_EVENT,
   GOVERNANCE_SECTION_STORAGE_KEY,
   type GovernanceSectionKey,
@@ -42,13 +41,23 @@ export const ALL_SECTION_IDS = [
 ] as const;
 
 export const NAV_ITEMS = [
-  { id: "market", label: "今日调仓建议", icon: "decision" },
-  { id: "research", label: "研究中心", icon: "research" },
-  { id: "portfolioWorkbench", label: "组合与执行", icon: "portfolio" },
-  { id: "reviewWorkbench", label: "人工复核", icon: "review" },
-  { id: "dataCenter", label: "数据中台", icon: "data" },
-  { id: "governance", label: "系统治理", icon: "governance" },
-  { id: "backendLogs", label: "后端日志", icon: "logs" },
+  { id: "market", label: "决策主控", description: "行情识别、选股、配置", icon: "decision" },
+  { id: "governance", label: "模型工厂", description: "训练、验证、上线", icon: "governance" },
+  { id: "portfolioWorkbench", label: "组合配置", description: "五仓、风险、模拟落账", icon: "portfolio" },
+  { id: "reviewWorkbench", label: "复盘学习", description: "绩效、归因、人工确认", icon: "review" },
+  { id: "dataCenter", label: "数据工具", description: "数据资产与质量", icon: "data" },
+  { id: "research", label: "证据库", description: "研究证据明细", icon: "research" },
+] as const;
+
+const PRIMARY_NAV_ITEMS = NAV_ITEMS.slice(0, 4);
+const TOOL_NAV_ITEMS = NAV_ITEMS.slice(4);
+
+const SYSTEM_SECTIONS = [
+  { key: "models", label: "模型训练", hint: "计划书模型训练与上线", target: "governance" },
+  { key: "overview", label: "系统概况", hint: "生产链路是否可用", target: "governance" },
+  { key: "tasks", label: "自动任务", hint: "训练、补数、报表任务", target: "governance" },
+  { key: "services", label: "系统诊断", hint: "服务与数据健康", target: "governance" },
+  { key: "logs", label: "系统日志", hint: "后台异常排查", target: "backendLogs" },
 ] as const;
 
 export type SectionId = (typeof ALL_SECTION_IDS)[number];
@@ -70,6 +79,7 @@ const SECTION_PARENT: Partial<Record<SectionId, SectionId>> = {
   review: "reviewWorkbench",
   validation: "market",
   strategy: "governance",
+  backendLogs: "governance",
 };
 
 export function isSectionId(value: string | undefined): value is SectionId {
@@ -126,12 +136,12 @@ export default function Layout({
 }: LayoutProps) {
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [dataCenterOpen, setDataCenterOpen] = useState(currentSection === "dataCenter");
-  const [governanceOpen, setGovernanceOpen] = useState(currentSection === "governance" || currentSection === "strategy");
-  const [dataCenterSection, setDataCenterSection] = useState<DataCenterSectionKey>(() => {
-    return (window.localStorage.getItem(DATA_CENTER_SECTION_STORAGE_KEY) as DataCenterSectionKey | null) || "overview";
-  });
+  const [dataCenterSection, setDataCenterSection] = useState<DataCenterSectionKey>(() =>
+    (window.localStorage.getItem(DATA_CENTER_SECTION_STORAGE_KEY) as DataCenterSectionKey | null) || "overview"
+  );
+  const [governanceOpen, setGovernanceOpen] = useState(["governance", "strategy", "dataCenter", "backendLogs"].includes(currentSection));
   const [governanceSection, setGovernanceSection] = useState<GovernanceSectionKey>(() => {
-    return (window.localStorage.getItem(GOVERNANCE_SECTION_STORAGE_KEY) as GovernanceSectionKey | null) || "overview";
+    return (window.localStorage.getItem(GOVERNANCE_SECTION_STORAGE_KEY) as GovernanceSectionKey | null) || "models";
   });
   const currentChild = sections[currentSection] ?? sections.market;
   const navSection = getNavSection(currentSection);
@@ -158,8 +168,8 @@ export default function Layout({
 
   useEffect(() => {
     const onDataCenterSection = (event: Event) => {
-      const section = (event as CustomEvent<DataCenterSectionKey>).detail;
-      if (section) setDataCenterSection(section);
+      const next = (event as CustomEvent<DataCenterSectionKey>).detail;
+      if (next) setDataCenterSection(next);
     };
     window.addEventListener(DATA_CENTER_SECTION_EVENT, onDataCenterSection);
     return () => window.removeEventListener(DATA_CENTER_SECTION_EVENT, onDataCenterSection);
@@ -177,13 +187,13 @@ export default function Layout({
   function handleSectionChange(id: SectionId) {
     onSectionChange(id);
     if (id !== "dataCenter") setDataCenterOpen(false);
-    if (id !== "governance" && id !== "strategy") setGovernanceOpen(false);
+    if (getNavSection(id) !== "governance") setGovernanceOpen(false);
     if (window.innerWidth < 768) setSidebarOpen(false);
   }
 
   function handleGovernanceParent() {
     if (navSection !== "governance") {
-      onSectionChange("governance");
+      handleGovernanceSection("models");
       setGovernanceOpen(true);
       return;
     }
@@ -198,13 +208,22 @@ export default function Layout({
     if (window.innerWidth < 768) setSidebarOpen(false);
   }
 
+  function handleSystemSection(item: (typeof SYSTEM_SECTIONS)[number]) {
+    if (item.target === "governance") {
+      handleGovernanceSection(item.key as GovernanceSectionKey);
+      return;
+    }
+    onSectionChange(item.target);
+    if (window.innerWidth < 768) setSidebarOpen(false);
+  }
+
   function openDataCenter() {
     onSectionChange("dataCenter");
     if (window.innerWidth < 768) setSidebarOpen(false);
   }
 
   function handleDataCenterParent() {
-    if (navSection !== "dataCenter") {
+    if (currentSection !== "dataCenter") {
       onSectionChange("dataCenter");
       setDataCenterOpen(true);
       return;
@@ -214,6 +233,7 @@ export default function Layout({
 
   function handleDataCenterSection(section: DataCenterSectionKey) {
     setDataCenterSection(section);
+    setDataCenterOpen(true);
     window.localStorage.setItem(DATA_CENTER_SECTION_STORAGE_KEY, section);
     onSectionChange("dataCenter");
     window.dispatchEvent(new CustomEvent(DATA_CENTER_SECTION_EVENT, { detail: section }));
@@ -241,6 +261,7 @@ export default function Layout({
         <div className="dashboard-topbar-right">
           {user ? (
             <>
+              <span className="dashboard-mode-badge">研究与模拟</span>
               <span className="dashboard-topbar-username">{user.username}</span>
               <button type="button" className="dashboard-topbar-logout" onClick={onLogout}>
                 登出
@@ -267,33 +288,22 @@ export default function Layout({
       />
       <div className="dashboard-root-inner">
         <aside className="dashboard-sidebar" aria-label="主导航">
+          <div className="dashboard-sidebar-intro">
+            <span>主线</span>
+            <strong>训练模型 → 识别行情 → 选股配置 → 复盘学习</strong>
+          </div>
           <nav className="dashboard-nav">
-            {NAV_ITEMS.map(({ id, label, icon }) => id === "dataCenter" ? (
-              <div className={`dashboard-nav-group ${dataCenterOpen ? "open" : ""}`} key={id}>
-                <button type="button" className={`dashboard-nav-item dashboard-nav-parent ${navSection === id ? "active" : ""}`} onClick={handleDataCenterParent} aria-expanded={dataCenterOpen}>
-                  <NavIcon name={icon} />
-                  <span>{label}</span>
-                  <i className="dashboard-nav-caret" aria-hidden="true" />
-                </button>
-                <div className="dashboard-subnav" aria-label="数据中台子导航">
-                  {DATA_CENTER_SECTIONS.map((item) => (
-                    <button key={item.key} type="button" className={navSection === "dataCenter" && dataCenterSection === item.key ? "active" : ""} onClick={() => handleDataCenterSection(item.key)}>
-                      <span>{item.label}</span>
-                      <small>{item.hint}</small>
-                    </button>
-                  ))}
-                </div>
-              </div>
-            ) : id === "governance" ? (
+            {PRIMARY_NAV_ITEMS.map(({ id, label, description, icon }, index) => id === "governance" ? (
               <div className={`dashboard-nav-group ${governanceOpen ? "open" : ""}`} key={id}>
                 <button type="button" className={`dashboard-nav-item dashboard-nav-parent ${navSection === id ? "active" : ""}`} onClick={handleGovernanceParent} aria-expanded={governanceOpen}>
+                  <em>{String(index + 1).padStart(2, "0")}</em>
                   <NavIcon name={icon} />
-                  <span>{label}</span>
+                  <span className="dashboard-nav-copy"><strong>{label}</strong><small>{description}</small></span>
                   <i className="dashboard-nav-caret" aria-hidden="true" />
                 </button>
-                <div className="dashboard-subnav" aria-label="系统治理子导航">
-                  {GOVERNANCE_SECTIONS.map((item) => (
-                    <button key={item.key} type="button" className={navSection === "governance" && governanceSection === item.key ? "active" : ""} onClick={() => handleGovernanceSection(item.key)}>
+                <div className="dashboard-subnav" aria-label="模型工厂子导航">
+                  {SYSTEM_SECTIONS.map((item) => (
+                    <button key={item.key} type="button" className={currentSection === item.target && (item.target !== "governance" || governanceSection === item.key) ? "active" : ""} onClick={() => handleSystemSection(item)}>
                       <span>{item.label}</span>
                       <small>{item.hint}</small>
                     </button>
@@ -302,11 +312,40 @@ export default function Layout({
               </div>
             ) : (
               <button key={id} type="button" className={`dashboard-nav-item ${navSection === id ? "active" : ""}`} onClick={() => handleSectionChange(id)}>
+                <em>{String(index + 1).padStart(2, "0")}</em>
                 <NavIcon name={icon} />
-                <span>{label}</span>
+                <span className="dashboard-nav-copy"><strong>{label}</strong><small>{description}</small></span>
+              </button>
+            ))}
+            <div className="dashboard-nav-tools-label">工具区</div>
+            {TOOL_NAV_ITEMS.map(({ id, label, description, icon }) => id === "dataCenter" ? (
+              <div className={`dashboard-nav-group ${dataCenterOpen ? "open" : ""}`} key={id}>
+                <button type="button" className={`dashboard-nav-item dashboard-nav-parent ${navSection === id ? "active" : ""}`} onClick={handleDataCenterParent} aria-expanded={dataCenterOpen}>
+                  <em>·</em>
+                  <NavIcon name={icon} />
+                  <span className="dashboard-nav-copy"><strong>{label}</strong><small>{description}</small></span>
+                  <i className="dashboard-nav-caret" aria-hidden="true" />
+                </button>
+                <div className="dashboard-subnav" aria-label="数据中台子导航">
+                  {DATA_CENTER_SECTIONS.map((item) => (
+                    <button key={item.key} type="button" className={currentSection === "dataCenter" && dataCenterSection === item.key ? "active" : ""} onClick={() => handleDataCenterSection(item.key)}>
+                      <span>{item.label}</span><small>{item.hint}</small>
+                    </button>
+                  ))}
+                </div>
+              </div>
+            ) : (
+              <button key={id} type="button" className={`dashboard-nav-item ${navSection === id ? "active" : ""}`} onClick={() => handleSectionChange(id)}>
+                <em>·</em>
+                <NavIcon name={icon} />
+                <span className="dashboard-nav-copy"><strong>{label}</strong><small>{description}</small></span>
               </button>
             ))}
           </nav>
+          <div className="dashboard-sidebar-foot">
+            <i />
+            <div><strong>仅用于研究与模拟</strong><span>不会连接券商自动下单</span></div>
+          </div>
         </aside>
         <div className="dashboard-main">
           <header className="dashboard-header">{header}</header>

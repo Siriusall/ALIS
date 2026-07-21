@@ -160,6 +160,10 @@ def ack_task(message_id: str, *, stream: str = STREAM_KEY, group: str = STREAM_G
     value = client()
     if value is None:
         return False
+    try:
+        return bool(value.xack(stream, group, message_id))
+    except Exception:
+        return False
 
 
 def record_task_failure(message_id: str, fields: dict[str, str], *, stream: str = STREAM_KEY,
@@ -180,10 +184,6 @@ def record_task_failure(message_id: str, fields: dict[str, str], *, stream: str 
             value.xadd(STREAM_DEAD_LETTER, dead, maxlen=100000, approximate=True)
             value.xack(stream, group, message_id)
         return True
-    except Exception:
-        return False
-    try:
-        return bool(value.xack(stream, group, message_id))
     except Exception:
         return False
 

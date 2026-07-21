@@ -58,6 +58,31 @@ export async function createThesis(payload: Record<string, unknown>): Promise<In
   return (await response.json()).item;
 }
 
+export interface ThesisGenerationResponse {
+  ok: boolean;
+  ts_code: string;
+  status: string;
+  reason?: string;
+  created?: boolean;
+  ready_dimensions?: string[];
+  item?: InvestmentThesis;
+  blocked?: Array<Record<string, unknown>>;
+  generated_or_reviewed?: Array<Record<string, unknown>>;
+  candidates?: number;
+}
+
+export async function generateThesisForStock(tsCode: string, force = false): Promise<ThesisGenerationResponse> {
+  const response = await apiFetch(`/api/research/theses/generate/${encodeURIComponent(tsCode)}?force=${force ? "true" : "false"}`, { method: "POST" });
+  if (!response.ok) throw new Error(`投资逻辑生成失败（HTTP ${response.status}）`);
+  return response.json();
+}
+
+export async function generateWatchPoolTheses(limit = 100): Promise<ThesisGenerationResponse> {
+  const response = await apiFetch(`/api/research/theses/generate-watch-pool?limit=${limit}`, { method: "POST" });
+  if (!response.ok) throw new Error(`观察池投资逻辑生成失败（HTTP ${response.status}）`);
+  return response.json();
+}
+
 export async function updateHypothesis(id: number, status: string): Promise<InvestmentThesis> {
   const response = await apiFetch(`/api/research/hypotheses/${id}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ status, evidence: [{ source: "manual_review", checked_at: new Date().toISOString() }] }) });
   if (!response.ok) throw new Error(`假设状态更新失败（HTTP ${response.status}）`);
@@ -89,7 +114,8 @@ export async function fetchExpectation(code:string):Promise<ExpectationState>{co
 export interface ValuationState {ok:boolean;reason?:string;ts_code:string;status?:string;method?:string;trade_date?:string;current_price?:number;current_multiple?:number;history_percentile?:number;industry_percentile?:number;scenarios?:{bear:number;base:number;bull:number};dimension?:{score:number;coverage:number;status:string;missing:string[]};evidence?:{history_points:number;peer_count:number;available_time:string};limitations?:string[]}
 export async function fetchValuation(code:string):Promise<ValuationState>{const response=await apiFetch(`/api/research/valuations/${encodeURIComponent(code)}`);if(!response.ok)throw new Error(`估值数据读取失败（HTTP ${response.status}）`);return response.json()}
 
-export interface PortfolioRiskOverview {ok:boolean;status:string;as_of:string;account:{cash:number;market_value:number;equity:number;high_water_mark:number;drawdown:number};tail_risk:{confidence:number;var:number;cvar:number;observations:number};optimizer:string;target_weights:Record<string,number>;weight_explanations:Array<{symbol:string;current_weight:number;target_weight:number;delta:number;reason:string}>;industry_exposures:Array<{industry:string;weight:number;limit:number;status:string}>;exposures:Array<{symbol:string;name:string;industry?:string;market_value:number;weight:number;observations:number;thesis_status:string;thesis_confidence:number}>;breaches:Array<{code:string;symbol?:string;industry?:string;severity:string;message:string}>;stress_tests:Array<{code:string;name:string;pnl:number;equity_after:number;loss_pct:number;assumption:string;severity:string}>;deleveraging_actions:Array<{action:string;symbol?:string;industry?:string;priority:string;target_weight?:number;risk_budget_multiplier?:number;reason:string}>;position_state_recommendations:Array<{symbol:string;current_state:string;recommended_state:string;reason:string;evidence:{thesis_status:string;thesis_confidence:number;risk_breaches:string[]};requires_confirmation:boolean}>;limitations:string[]}
+export interface FiveBucketContract {schema_version:string;symbol:string;function_bucket:string;function_bucket_name:string;risk_group:string;bucket_target_weight:number;bucket_range:number[];target_weight:number;current_weight:number;delta:number;return_source:string;holding_period:string;narrative_lifecycle:string;funding_confirmation:string;exit_conditions:string[];data_status:string;evidence:Record<string,unknown>}
+export interface PortfolioRiskOverview {ok:boolean;status:string;as_of:string;account:{cash:number;market_value:number;equity:number;high_water_mark:number;drawdown:number};tail_risk:{confidence:number;var:number;cvar:number;observations:number};optimizer:string;target_weights:Record<string,number>;target_weight_contracts?:FiveBucketContract[];five_bucket_summary?:{buckets:Record<string,{name:string;target:number;actual:number;count:number;range:number[];status:string}>;risk_groups:{stable:number;offensive:number}};weight_explanations:Array<{symbol:string;current_weight:number;target_weight:number;delta:number;reason:string;target_weight_contract?:FiveBucketContract}>;industry_exposures:Array<{industry:string;weight:number;limit:number;status:string}>;exposures:Array<{symbol:string;name:string;industry?:string;market_value:number;weight:number;observations:number;thesis_status:string;thesis_confidence:number}>;breaches:Array<{code:string;symbol?:string;industry?:string;severity:string;message:string}>;stress_tests:Array<{code:string;name:string;pnl:number;equity_after:number;loss_pct:number;assumption:string;severity:string}>;deleveraging_actions:Array<{action:string;symbol?:string;industry?:string;priority:string;target_weight?:number;risk_budget_multiplier?:number;reason:string}>;position_state_recommendations:Array<{symbol:string;current_state:string;recommended_state:string;reason:string;evidence:{thesis_status:string;thesis_confidence:number;risk_breaches:string[]};requires_confirmation:boolean}>;limitations:string[]}
 export async function fetchPortfolioRisk():Promise<PortfolioRiskOverview>{const response=await apiFetch("/api/research/portfolio-risk/live");if(!response.ok)throw new Error(`持仓风险读取失败（HTTP ${response.status}）`);return response.json()}
 export async function confirmPositionState(payload:{ts_code:string;to_state:string;reason:string;evidence:Record<string,unknown>[];confirmed:true}):Promise<Record<string,unknown>>{const response=await apiFetch("/api/research/position-state/confirm",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)});if(!response.ok)throw new Error(`持仓状态确认失败（HTTP ${response.status}）`);return response.json()}
 

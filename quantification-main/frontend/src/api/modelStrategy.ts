@@ -37,6 +37,77 @@ export interface ModelStrategyStatus {
   latest_train_run?: ModelTrainRun | null;
   versions: ModelVersion[];
   has_active_model: boolean;
+  constitution?: Record<string, { model: string; status: string }>;
+}
+
+export interface PlanModelItem {
+  model_key: string;
+  name: string;
+  family: string;
+  role: string;
+  status: "production" | "candidate" | "trainable" | "proxy" | string;
+  required_data: string[];
+  coverage: Record<string, number | boolean | string>;
+  active_version?: ModelVersion | null;
+  latest_version?: ModelVersion | null;
+  latest_train_run?: ModelTrainRun | null;
+  blocked_reasons?: string[];
+  data_actions?: Array<{ label: string; api: string; reason: string }>;
+  training_contract?: Record<string, unknown>;
+  active_artifact?: Record<string, unknown>;
+  latest_artifact?: Record<string, unknown>;
+  versions?: ModelVersion[];
+}
+
+export interface PlanModelControl {
+  ok: boolean;
+  schema_version: string;
+  items: PlanModelItem[];
+  counts: Record<string, number>;
+  lightgbm_params: Record<string, unknown>;
+}
+
+export async function fetchPlanModels(): Promise<PlanModelControl> {
+  const { data } = await api.get<PlanModelControl>("/api/model-strategy/plan-models", { timeout: 60_000 });
+  return data;
+}
+
+export async function startPlanModelTraining(modelKey: string): Promise<{ ok: boolean; started: boolean; run_id?: number; model_key: string; status?: string; reason?: string }> {
+  const { data } = await api.post("/api/model-strategy/plan-models/train", { model_key: modelKey });
+  return data;
+}
+
+export async function startAllTrainablePlanModels(): Promise<{ ok: boolean; started_count: number; skipped_count: number }> {
+  const { data } = await api.post("/api/model-strategy/plan-models/train-all");
+  return data;
+}
+
+export async function reviewPlanModelVersion(
+  modelVersionId: number,
+  payload: { decision: "approved" | "rejected"; reviewer?: string; comment?: string; waive_live_observation?: boolean },
+): Promise<{ ok: boolean; model_version_id: number; production_eligible: boolean; production_eligibility: Record<string, unknown> }> {
+  const { data } = await api.post(`/api/model-strategy/plan-models/review/${modelVersionId}`, {
+    reviewer: payload.reviewer || "operator",
+    decision: payload.decision,
+    comment: payload.comment || "",
+    waive_live_observation: payload.waive_live_observation ?? true,
+  });
+  return data;
+}
+
+export async function reviewCandidatePlanModels(): Promise<{ ok: boolean; reviewed_count: number; skipped_count: number }> {
+  const { data } = await api.post("/api/model-strategy/plan-models/review-candidates", {
+    reviewer: "operator",
+    decision: "approved",
+    comment: "批量上线评审通过；模拟系统豁免真实20日观察",
+    waive_live_observation: true,
+  });
+  return data;
+}
+
+export async function materializeFormalPerformanceReports(): Promise<{ ok: boolean; updated: number; total: number }> {
+  const { data } = await api.post("/api/model-strategy/performance-reports/materialize-formal");
+  return data;
 }
 
 export interface ModelConstitution {

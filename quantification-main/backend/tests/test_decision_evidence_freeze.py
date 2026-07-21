@@ -18,24 +18,27 @@ def test_decision_evidence_hash_binds_resolved_execution_operation() -> None:
         "model_version": "strategy-v1", "market_state": {"state": "S1"},
         "research_state": {"confidence": .8}, "valuation": {"current_price": 10.2},
         "portfolio_context": {"cash": 1000}, "reason": "test", "invalidation_conditions": ["risk"],
+        "target_weight_contract": {"function_bucket": "leader", "target_weight": .08},
     }
     frozen = _decision_evidence_payload(base, decision_time="2026-07-17T09:30:00", operation_id=42)
 
     assert frozen["operation_id"] == 42
     assert _evidence_hash(frozen) != _evidence_hash({**frozen, "operation_id": None})
+    assert _evidence_hash(frozen) != _evidence_hash({**frozen, "target_weight_contract": {}})
 
 
 def test_snapshot_resolves_operation_before_writing_v2_hash(monkeypatch) -> None:
     payload = {
         "ts_code": "000001.SZ", "decision_type": "buy", "decision_time": "2026-07-17T09:30:00", "price": 10.2,
         "execution_id": 9, "data_as_of_time": "2026-07-16T23:59:59", "model_version": "strategy-v1",
-        "market_state": {}, "research_state": {}, "valuation": {}, "portfolio_context": {}, "reason": "test",
+        "market_state": {}, "research_state": {}, "valuation": {}, "portfolio_context": {}, "target_weight_contract": {"function_bucket": "leader"}, "reason": "test",
     }
     update_params = []
     returned = {
         "id": 1, **payload, "thesis_id": None, "operation_id": 42,
         "invalidation_conditions_json": "[]", "market_state_json": "{}", "research_state_json": "{}",
         "valuation_json": "{}", "portfolio_context_json": "{}", "created_at": "2026-07-17T09:30:00",
+        "target_weight_contract_json": "{\"function_bucket\":\"leader\"}",
         "evidence_hash": "", "evidence_schema_version": "",
     }
 

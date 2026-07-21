@@ -44,8 +44,8 @@ export default function ValuationPage() {
     <section className="valuation-page">
       <div className="product-module-head">
         <div>
-          <h1>估值与安全边际</h1>
-          <p>只回答一个问题：现在的价格还有没有安全边际。</p>
+          <h1>系统估值判断</h1>
+          <p>系统用当前价格、历史分位和同行证据判断安全边际。</p>
         </div>
         <button className="button ghost" onClick={() => void run()} disabled={loading}>
           {loading ? "计算中…" : "刷新估值"}
@@ -54,7 +54,7 @@ export default function ValuationPage() {
 
       <div className="stock-research-search">
         <input value={code} onChange={(event) => setCode(event.target.value.toUpperCase())} placeholder="输入股票代码" />
-        <button onClick={() => void run()} disabled={loading}>{loading ? "计算中…" : "计算估值"}</button>
+        <button onClick={() => void run()} disabled={loading}>{loading ? "计算中…" : "查看系统估值"}</button>
       </div>
 
       {error && <div className="alert">{error}</div>}

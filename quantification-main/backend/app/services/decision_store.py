@@ -39,6 +39,7 @@ def _decision_evidence_payload(payload: dict[str, Any], *, decision_time: str, o
         "data_as_of_time": payload["data_as_of_time"], "model_version": payload["model_version"],
         "market_state": payload.get("market_state") or {}, "research_state": payload.get("research_state") or {},
         "valuation": payload.get("valuation") or {}, "portfolio_context": payload.get("portfolio_context") or {},
+        "target_weight_contract": payload.get("target_weight_contract") or {},
         "reason": payload["reason"], "invalidation_conditions": payload.get("invalidation_conditions") or [],
     }
 
@@ -136,15 +137,16 @@ def create_decision_snapshot(payload: dict[str, Any]) -> dict[str, Any]:
         evidence_payload = _decision_evidence_payload(payload, decision_time=decision_time, operation_id=operation_id)
         evidence_hash = _evidence_hash(evidence_payload)
         row = c.execute("""INSERT INTO decision_snapshots(ts_code,decision_type,decision_time,price,thesis_id,execution_id,operation_id,data_as_of_time,model_version,
-                 market_state_json,research_state_json,valuation_json,portfolio_context_json,reason,invalidation_conditions_json,created_at)
-                 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) RETURNING *""", (
+                 market_state_json,research_state_json,valuation_json,portfolio_context_json,target_weight_contract_json,reason,invalidation_conditions_json,created_at)
+                 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) RETURNING *""", (
             payload["ts_code"], payload["decision_type"], decision_time, payload.get("price"), payload.get("thesis_id"), payload.get("execution_id"), operation_id, data_as_of,
             payload["model_version"], json.dumps(payload.get("market_state") or {}, ensure_ascii=False), json.dumps(payload.get("research_state") or {}, ensure_ascii=False),
-            json.dumps(payload.get("valuation") or {}, ensure_ascii=False), json.dumps(payload.get("portfolio_context") or {}, ensure_ascii=False), payload["reason"],
+            json.dumps(payload.get("valuation") or {}, ensure_ascii=False), json.dumps(payload.get("portfolio_context") or {}, ensure_ascii=False),
+            json.dumps(payload.get("target_weight_contract") or {}, ensure_ascii=False), payload["reason"],
             json.dumps(payload.get("invalidation_conditions") or [], ensure_ascii=False), now)).fetchone()
         c.execute("UPDATE decision_snapshots SET evidence_hash=?, evidence_schema_version=? WHERE id=?", (evidence_hash, "evidence_freeze_v2", dict(row)["id"]))
         row = c.execute("SELECT * FROM decision_snapshots WHERE id=?", (dict(row)["id"],)).fetchone()
-    return _decode(row, ("market_state_json", "research_state_json", "valuation_json", "portfolio_context_json", "invalidation_conditions_json"))
+    return _decode(row, ("market_state_json", "research_state_json", "valuation_json", "portfolio_context_json", "target_weight_contract_json", "invalidation_conditions_json"))
 
 
 def verify_decision_snapshot(decision_snapshot_id: int) -> dict[str, Any] | None:
@@ -153,7 +155,7 @@ def verify_decision_snapshot(decision_snapshot_id: int) -> dict[str, Any] | None
         row = c.execute("SELECT * FROM decision_snapshots WHERE id=?", (int(decision_snapshot_id),)).fetchone()
     if not row:
         return None
-    item = _decode(row, ("market_state_json", "research_state_json", "valuation_json", "portfolio_context_json", "invalidation_conditions_json"))
+    item = _decode(row, ("market_state_json", "research_state_json", "valuation_json", "portfolio_context_json", "target_weight_contract_json", "invalidation_conditions_json"))
     version = str(item.get("evidence_schema_version") or "")
     if version != "evidence_freeze_v2":
         return {
@@ -199,7 +201,7 @@ def diff_decision_snapshots(left_id: int, right_id: int) -> dict[str, Any] | Non
     with _conn() as c:
         rows = c.execute("SELECT * FROM decision_snapshots WHERE id IN (?,?)", (int(left_id), int(right_id))).fetchall()
     decoded = {
-        int(dict(row).get("id")): _decode(row, ("market_state_json", "research_state_json", "valuation_json", "portfolio_context_json", "invalidation_conditions_json"))
+        int(dict(row).get("id")): _decode(row, ("market_state_json", "research_state_json", "valuation_json", "portfolio_context_json", "target_weight_contract_json", "invalidation_conditions_json"))
         for row in rows
     }
     left, right = decoded.get(int(left_id)), decoded.get(int(right_id))
@@ -207,7 +209,7 @@ def diff_decision_snapshots(left_id: int, right_id: int) -> dict[str, Any] | Non
         return None
     fields = (
         "ts_code", "decision_type", "decision_time", "price", "data_as_of_time", "model_version",
-        "market_state", "research_state", "valuation", "portfolio_context", "reason", "invalidation_conditions",
+        "market_state", "research_state", "valuation", "portfolio_context", "target_weight_contract", "reason", "invalidation_conditions",
     )
     changes: list[dict[str, Any]] = []
     for field in fields:
@@ -225,7 +227,7 @@ def list_decision_snapshots(ts_code: str = "", limit: int = 100) -> list[dict[st
     with _conn() as c:
         if ts_code: rows = c.execute("SELECT * FROM decision_snapshots WHERE ts_code=? ORDER BY decision_time DESC LIMIT ?", (ts_code,limit)).fetchall()
         else: rows = c.execute("SELECT * FROM decision_snapshots ORDER BY decision_time DESC LIMIT ?", (limit,)).fetchall()
-    return [_decode(x,("market_state_json","research_state_json","valuation_json","portfolio_context_json","invalidation_conditions_json")) for x in rows]
+    return [_decode(x,("market_state_json","research_state_json","valuation_json","portfolio_context_json","target_weight_contract_json","invalidation_conditions_json")) for x in rows]
 
 
 def create_review(payload: dict[str, Any]) -> dict[str, Any]:
@@ -252,7 +254,7 @@ def build_review_outcome_suggestion(decision_snapshot_id: int) -> dict[str, Any]
         decision_row = c.execute("SELECT * FROM decision_snapshots WHERE id=?", (decision_snapshot_id,)).fetchone()
     if not decision_row:
         return None
-    decision = _decode(decision_row, ("market_state_json", "research_state_json", "valuation_json", "portfolio_context_json", "invalidation_conditions_json"))
+    decision = _decode(decision_row, ("market_state_json", "research_state_json", "valuation_json", "portfolio_context_json", "target_weight_contract_json", "invalidation_conditions_json"))
     execution_outcome = _matched_execution_outcome(decision)
     if execution_outcome:
         return {"ok": True, "decision": decision, "outcome": execution_outcome, "attribution": _execution_attribution(decision, execution_outcome)}

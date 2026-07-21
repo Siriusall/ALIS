@@ -14,6 +14,8 @@ from app.data_platform.services.assets import _report_periods
 _cache_lock = threading.Lock()
 _cache: dict[str, Any] = {"at": 0.0, "value": None}
 _CACHE_TTL = 30.0
+_refresh_lock = threading.Lock()
+_refresh_state: dict[str, Any] = {"running": False, "last_started_at": "", "last_finished_at": "", "last_error": "", "last_result": None}
 
 
 def _value(row: Any, key: str, default: Any = 0) -> Any:
@@ -175,6 +177,10 @@ def _metrics() -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
             float(vip["etf_price_nav"]["coverage"]), int(vip["etf_price_nav"]["completed_slices"]),
             int(vip["etf_price_nav"]["expected_slices"]), "已上市ETF日线与NAV精确请求切片覆盖",
         ),
+        "etf_constituents": (
+            float(vip["etf_constituents"]["coverage"]), int(vip["etf_constituents"]["completed_slices"]),
+            int(vip["etf_constituents"]["expected_slices"]), "ETF每日持仓组合精确请求切片覆盖（fund_portfolio）",
+        ),
         "major_news": (
             float(vip["major_news"]["coverage"]), int(vip["major_news"]["completed_slices"]),
             int(vip["major_news"]["expected_slices"]), "九来源长篇新闻按来源×自然日切片覆盖",
@@ -215,4 +221,39 @@ def readiness_overview() -> dict[str, Any]:
     with _cache_lock:
         _cache.update({"at": time.monotonic(), "value": payload})
     set_json("alis:data-platform:readiness:v2", payload, ttl=30)
+    _refresh_state.update({"last_result": payload, "last_finished_at": datetime.now().isoformat(timespec="seconds"), "last_error": ""})
     return payload
+
+
+def readiness_refresh_status() -> dict[str, Any]:
+    cached = get_json("alis:data-platform:readiness:v2")
+    return {
+        "ok": True,
+        "running": bool(_refresh_state.get("running")),
+        "last_started_at": _refresh_state.get("last_started_at") or "",
+        "last_finished_at": _refresh_state.get("last_finished_at") or "",
+        "last_error": _refresh_state.get("last_error") or "",
+        "has_cached_snapshot": isinstance(cached, dict) or isinstance(_refresh_state.get("last_result"), dict),
+        "cached_consumers": len((cached or _refresh_state.get("last_result") or {}).get("consumers") or []) if isinstance(cached or _refresh_state.get("last_result"), dict) else 0,
+    }
+
+
+def start_readiness_refresh() -> dict[str, Any]:
+    with _refresh_lock:
+        if _refresh_state.get("running"):
+            return {**readiness_refresh_status(), "started": False, "reason": "already_running"}
+        _refresh_state.update({"running": True, "last_started_at": datetime.now().isoformat(timespec="seconds"), "last_error": ""})
+
+    def worker() -> None:
+        try:
+            with _cache_lock:
+                _cache.update({"at": 0.0, "value": None})
+            result = readiness_overview()
+            _refresh_state.update({"last_result": result, "last_finished_at": datetime.now().isoformat(timespec="seconds"), "last_error": ""})
+        except Exception as exc:
+            _refresh_state.update({"last_error": str(exc)[:500], "last_finished_at": datetime.now().isoformat(timespec="seconds")})
+        finally:
+            _refresh_state["running"] = False
+
+    threading.Thread(target=worker, daemon=True, name="data-readiness-refresh").start()
+    return {**readiness_refresh_status(), "started": True}

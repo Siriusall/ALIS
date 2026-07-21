@@ -104,16 +104,16 @@ export default function StockResearchPage({ onNavigate }: StockResearchPageProps
     const thesis = data.theses[0];
     if (risk && !risk.eligible) return { tone: "stop", title: "禁止进入候选池", detail: risk.hard_reasons[0] || "风险硬门控未通过" };
     if (!valuation?.ok || !valuation.scenarios) return { tone: "hold", title: "继续研究，暂不进入核心候选", detail: "估值或安全边际证据不足" };
-    if (!thesis) return { tone: "hold", title: "等待投资逻辑", detail: "尚未建立可证伪的投资逻辑卡片" };
+    if (!thesis) return { tone: "hold", title: "等待系统生成投资逻辑", detail: "系统尚未生成可证伪逻辑卡片" };
     if (["warning", "invalidated"].includes(thesis.derived_status)) return { tone: "stop", title: "逻辑预警", detail: "必要条件异常，进入复核或退出流程" };
     const margin = valuation.current_price ? valuation.scenarios.base / valuation.current_price - 1 : 0;
     if (margin <= 0) return { tone: "hold", title: "质量与逻辑可研究，但价格不合适", detail: "基准情景尚无正安全边际" };
-    return { tone: "go", title: "具备候选研究条件", detail: "风险、逻辑与基础安全边际已形成，仍需通过组合约束" };
+    return { tone: "go", title: "系统建议进入候选", detail: "风险、逻辑与基础安全边际已形成，仍需通过组合约束" };
   }, [data]);
 
   return <section className="stock-workspace">
     <div className="product-module-head stock-workspace-head">
-      <div><span>COMPANY RESEARCH WORKSPACE</span><h1>单股研究工作台</h1><p>把一只股票该看的证据放在同一个地方看完。</p></div>
+      <div><span>COMPANY RESEARCH WORKSPACE</span><h1>系统单股判断</h1><p>系统汇总公司、行业、事件、预期和估值证据，你只看结论和反证。</p></div>
       {data && <div className={`workspace-decision workspace-decision-${decision?.tone ?? "hold"}`}><span>当前研究结论</span><strong>{decision?.title}</strong><em>{decision?.detail}</em></div>}
     </div>
     <div className="stock-research-search workspace-search">
@@ -137,7 +137,7 @@ export default function StockResearchPage({ onNavigate }: StockResearchPageProps
         </button>
         <button type="button" onClick={() => onNavigate?.("thesis")}>
           <span>02 · 投资逻辑</span>
-          <strong>{data.theses.length ? "已建立" : "待建立"}</strong>
+          <strong>{data.theses.length ? "已生成" : "待生成"}</strong>
         </button>
         <button type="button" onClick={() => onNavigate?.("valuation")}>
           <span>03 · 估值中心</span>
@@ -175,7 +175,7 @@ export default function StockResearchPage({ onNavigate }: StockResearchPageProps
       </section>
       <section id="workspace-thesis" className="workspace-section"><header><div><span>P3 · INVESTMENT THESIS</span><h2>投资逻辑与必要条件</h2></div></header>
         {data.theses.map(item => <article className="workspace-thesis" key={item.id}><div><span>{item.thesis_type} · {item.derived_status}</span><h3>{item.title}</h3><p>{item.core_thesis || "未填写核心逻辑"}</p></div><div className="workspace-kpi"><span>成立置信度</span><strong>{item.derived_confidence.toFixed(1)}</strong><em>下次复核 {item.next_review_at?.slice(0, 10) || "未设置"}</em></div><ul>{item.hypotheses.map(h => <li key={h.id}><strong>{h.necessary ? "必要条件" : "普通条件"}</strong><span>{h.statement}</span><em>{h.metric} · {h.status}</em></li>)}</ul></article>)}
-        {!data.theses.length && <div className="research-empty"><strong>尚未建立投资逻辑</strong><span>先去补逻辑卡片。</span></div>}
+        {!data.theses.length && <div className="research-empty"><strong>系统尚未生成投资逻辑</strong><span>可在投资逻辑中控里让系统自动生成。</span></div>}
       </section>
       <section className="workspace-section"><header><div><span>EVIDENCE & LIMITATIONS</span><h2>证据来源与限制</h2></div></header><div className="workspace-two-col"><article className="workspace-card">{data.research.evidence?.map(item => <div className="module-output" key={`${item.api}-${item.period}`}><i/>{item.api} · {item.period} · {item.available_time?.slice(0, 16)}</div>)}</article><article className="workspace-card">{data.research.limitations?.map(item => <div className="module-missing" key={item}>{item}</div>)}{data.valuation?.limitations?.map(item => <div className="module-missing" key={`valuation-${item}`}>{item}</div>)}{!data.research.limitations?.length && !data.valuation?.limitations?.length && <div className="workspace-clear">当前没有明显限制项</div>}</article></div></section>
     </>}

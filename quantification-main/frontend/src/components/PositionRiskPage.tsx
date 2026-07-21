@@ -85,8 +85,8 @@ export default function PositionRiskPage({ onNavigate }: { onNavigate?: (section
       <div className="product-module-head">
         <div>
           <span>POSITION RISK</span>
-          <h1>持仓风险与状态迁移</h1>
-          <p>组合尾部风险、投资逻辑状态、集中度和压力测试使用同一数据时点；状态迁移建议必须留痕确认后才写入。</p>
+          <h1>系统风险处置方案</h1>
+          <p>风险突破由系统识别并转成收缩、迁移和阻断建议；你只看最终方案是否允许落账。</p>
         </div>
         <button className="button ghost" onClick={() => void load()} disabled={loading}>
           {loading ? "刷新中…" : "刷新"}
@@ -97,6 +97,10 @@ export default function PositionRiskPage({ onNavigate }: { onNavigate?: (section
 
       {data && (
         <>
+          <div className="decision-issue warning">
+            风险突破不是交给你逐条处理的待办；系统已经根据突破生成下方的状态迁移、风险收缩和组合约束建议。
+          </div>
+
           <div className="product-module-grid">
             <article className="product-module-card">
               <h2>组合权益</h2>
@@ -120,21 +124,21 @@ export default function PositionRiskPage({ onNavigate }: { onNavigate?: (section
             </article>
           </div>
 
-          <div className="decision-command-bar" aria-label="风险处理顺序">
+          <div className="decision-command-bar" aria-label="系统风险处置顺序">
             <div className="decision-command-intro">
               <span>RISK ORDER</span>
-              <strong>风险处理优先于新增机会</strong>
+              <strong>系统先完成风险处置，再开放新增机会</strong>
             </div>
             <button type="button" className={breachCount > 0 ? "urgent" : ""}>
-              <span>01 · 风险突破</span>
+              <span>01 · 系统识别突破</span>
               <strong>{breachCount}</strong>
             </button>
             <button type="button" className={stateRecommendations.length > 0 ? "active" : ""}>
-              <span>02 · 状态迁移</span>
+              <span>02 · 系统迁移建议</span>
               <strong>{stateRecommendations.length}</strong>
             </button>
             <button type="button" className={deleveraging.length > 0 ? "urgent" : ""}>
-              <span>03 · 风险收缩</span>
+              <span>03 · 系统收缩建议</span>
               <strong>{deleveraging.length}</strong>
             </button>
             <button type="button">
@@ -143,27 +147,44 @@ export default function PositionRiskPage({ onNavigate }: { onNavigate?: (section
             </button>
           </div>
 
+          <div className="card decision-panel">
+            <h3>五功能仓目标合同</h3>
+            <div className="product-module-grid">
+              {Object.entries(data.five_bucket_summary?.buckets ?? {}).map(([key, item]) => (
+                <article className="product-module-card" key={key}>
+                  <h2>{item.name}</h2>
+                  <strong>{pct(item.actual)}</strong>
+                  <p>计划 {pct(item.target)} · 区间 {pct(item.range?.[0])}–{pct(item.range?.[1])} · {item.count} 个标的</p>
+                </article>
+              ))}
+            </div>
+            <div className="decision-two-col">
+              <span>稳定集团</span><strong>{pct(data.five_bucket_summary?.risk_groups?.stable)}</strong>
+              <span>进攻集团</span><strong>{pct(data.five_bucket_summary?.risk_groups?.offensive)}</strong>
+            </div>
+          </div>
+
           <div className="decision-grid">
             <div className="card decision-panel">
-              <h3>当前优先处理</h3>
+              <h3>系统处置队列</h3>
               <div className="review-queue">
                 <div className="review-queue-item">
                   <div>
-                    <strong>先处理风险突破</strong>
-                    <span>{breachCount} 个突破，优先于新增机会</span>
+                    <strong>系统识别风险突破</strong>
+                    <span>{breachCount} 个突破已进入自动风险收缩计算</span>
                   </div>
-                  <em>突破</em>
+                  <em>识别</em>
                 </div>
                 <div className="review-queue-item">
                   <div>
-                    <strong>确认状态迁移</strong>
-                    <span>{stateRecommendations.length} 个持仓建议变更状态</span>
+                    <strong>系统生成状态迁移</strong>
+                    <span>{stateRecommendations.length} 个持仓建议变更状态，确认后才写入</span>
                   </div>
                   <em>迁移</em>
                 </div>
                 <div className="review-queue-item">
                   <div>
-                    <strong>执行风险收缩</strong>
+                    <strong>系统生成风险收缩</strong>
                     <span>{deleveraging.length} 条减仓、降权或预算收缩建议</span>
                   </div>
                   <em>收缩</em>
@@ -172,7 +193,7 @@ export default function PositionRiskPage({ onNavigate }: { onNavigate?: (section
             </div>
 
             <div className="card decision-panel">
-              <h3>当前风险摘要</h3>
+              <h3>系统识别到的风险事实</h3>
               <div className="decision-issue-list">
                 {data.breaches.slice(0, 5).map((item, index) => (
                   <div className={`decision-issue ${item.severity}`} key={`${item.code}-${index}`}>
@@ -187,27 +208,27 @@ export default function PositionRiskPage({ onNavigate }: { onNavigate?: (section
           </div>
 
           <div className="card decision-panel">
-            <h3>投资逻辑驱动的状态迁移建议</h3>
+            <h3>系统状态迁移建议</h3>
             {stateRecommendations.length ? (
               stateRecommendations.map((item) => (
                 <div className="decision-issue warning" key={item.symbol}>
                   <strong><SecurityLabel code={item.symbol} name={data.exposures.find((value) => value.symbol === item.symbol)?.name} /></strong>：{stateText(item.current_state)} → {stateText(item.recommended_state)} · {reasonText(item.reason)}
                   <br />
                   <em>
-                    逻辑 {item.evidence.thesis_status} / 置信度 {item.evidence.thesis_confidence.toFixed(0)}% / 风险 {item.evidence.risk_breaches.join("、") || "—"}；需留痕确认。
+                    逻辑 {item.evidence.thesis_status} / 置信度 {item.evidence.thesis_confidence.toFixed(0)}% / 风险 {item.evidence.risk_breaches.join("、") || "—"}；系统建议，确认后写入。
                   </em>
                   {item.current_state !== "uninitialized" && (
                     <button className="button ghost" onClick={() => void confirm(item)} disabled={confirming === item.symbol}>
-                      {confirming === item.symbol ? "确认中…" : "确认迁移"}
+                      {confirming === item.symbol ? "确认中…" : "确认系统建议"}
                     </button>
                   )}
                   {item.current_state === "uninitialized" && (
-                    <button className="button ghost" onClick={() => onNavigate?.("thesis")}>先建立投资逻辑状态</button>
+                    <button className="button ghost" onClick={() => onNavigate?.("thesis")}>查看逻辑中控</button>
                   )}
                 </div>
               ))
             ) : (
-              <div className="empty">当前持仓没有由逻辑或单票风险触发的状态迁移建议</div>
+              <div className="empty">系统当前没有生成状态迁移建议</div>
             )}
           </div>
 
@@ -240,7 +261,25 @@ export default function PositionRiskPage({ onNavigate }: { onNavigate?: (section
           </div>
 
           <div className="card decision-panel">
-            <h3>风险收缩建议</h3>
+            <h3>逐标的目标权重合同</h3>
+            {(data.target_weight_contracts ?? []).length ? (
+              (data.target_weight_contracts ?? []).map((item) => (
+                <div className={`decision-issue ${item.data_status === "ready" ? "warning" : "error"}`} key={item.symbol}>
+                  <strong><SecurityLabel code={item.symbol} name={data.exposures.find((value) => value.symbol === item.symbol)?.name} /></strong>
+                  ：{item.function_bucket_name} · 目标 {pct(item.target_weight)} · 当前 {pct(item.current_weight)} · {item.return_source}
+                  <br />
+                  <em>周期 {item.holding_period} / 生命周期 {item.narrative_lifecycle} / 资金 {item.funding_confirmation} / 数据 {item.data_status}</em>
+                  <br />
+                  <em>退出：{item.exit_conditions.join("；")}</em>
+                </div>
+              ))
+            ) : (
+              <div className="empty">当前没有可落账的目标权重合同。</div>
+            )}
+          </div>
+
+          <div className="card decision-panel">
+            <h3>系统风险收缩建议</h3>
             {deleveraging.length ? (
               deleveraging.map((item, index) => (
                 <div className="decision-issue warning" key={`${item.action}-${index}`}>

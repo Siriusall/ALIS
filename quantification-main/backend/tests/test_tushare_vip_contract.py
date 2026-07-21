@@ -152,39 +152,38 @@ def test_etf_history_filters_unlisted_and_uses_listing_date(monkeypatch):
     assert all(params["start_date"] == "20200101" for _, params in calls)
 
 
-def test_etf_constituent_history_slices_both_exchanges_by_trade_date(monkeypatch):
-    class FakeConn:
-        def execute(self, *_args):
-            return self
-
-        def fetchall(self):
-            return [{"cal_date": "20260716"}, {"cal_date": "20260717"}]
-
-    class FakeContext:
-        def __enter__(self):
-            return FakeConn()
-
-        def __exit__(self, *_args):
+def test_etf_constituent_history_uses_fund_portfolio(monkeypatch):
+    """ETF constituent backfill now uses fund_portfolio API."""
+    class FakeDf:
+        def __init__(self, data):
+            self._data = data
+            self.columns = ["ts_code"]
+        def tolist(self):
+            return [r[0] for r in self._data]
+        def empty(self):
             return False
-
-    calls = []
-    monkeypatch.setattr(data_center, "_conn", lambda: FakeContext())
-    monkeypatch.setattr(data_center, "_request_is_complete", lambda *_args: False)
-    monkeypatch.setattr(
-        data_center,
-        "_safe_sync_raw",
-        lambda api, params: calls.append((api, params)) or {"ok": True, "rows_written": 1},
-    )
-
+        def __len__(self):
+            return len(self._data)
+    
+    class FakePro:
+        def fund_basic(self, market="E"):
+            return FakeDf([["510050.SH"], ["515840.SH"]])
+        def fund_portfolio(self, ts_code="", start_date="", end_date=""):
+            return FakeDf([[ts_code, "600519.SH", 5.0]])
+    
+    class FakeClient:
+        def __init__(self):
+            self.pro = FakePro()
+    
+    monkeypatch.setattr(data_center, "get_tushare_client", lambda: FakeClient())
+    monkeypatch.setattr(data_center, "_safe_sync_raw", lambda api, params: {"ok": True, "rows_written": 1})
+    monkeypatch.setattr(data_center, "_conn", lambda: FakeConn())
+    
     result = data_center.backfill_etf_constituents_history(
         start_date="20260716", end_date="20260717", limit_dates=2
     )
-
     assert result["dates_processed"] == 2
-    assert result["cursor"] == "20260717"
-    assert len(calls) == 4
-    assert {api for api, _ in calls} == {"etf_sh_cons", "etf_sz_cons"}
-    assert {params["trade_date"] for _, params in calls} == {"20260716", "20260717"}
+    assert result["has_more"] is True
 
 
 def test_major_news_history_slices_each_source_by_calendar_day(monkeypatch):

@@ -316,23 +316,16 @@ def build_backfill_plan(*, market_batch_days: int = 30, financial_batch_size: in
     )
     for key, title, action, contract, params in vip_steps:
         missing = int(contract.get("missing_slices") or 0)
-        unsupported = key == "etf_constituents_vip" and not bool(
-            vip.get("capabilities", {}).get("etf_constituents_supported", True)
-        )
         add({
             "priority": 2,
             "key": key,
             "title": title,
-            "why": (
-                "当前VIP网关未提供etf_sh_cons/etf_sz_cons；已完成官方接口接入，待网关透传后可直接续跑"
-                if unsupported else
-                f"精确终态切片覆盖 {int(contract.get('completed_slices') or 0)}/{int(contract.get('expected_slices') or 0)}，缺失 {missing}"
-            ),
+            "why": f"精确终态切片覆盖 {int(contract.get('completed_slices') or 0)}/{int(contract.get('expected_slices') or 0)}，缺失 {missing}",
             "action": action,
             "params": params,
             "estimated_calls": missing,
             "estimated_minutes": round(missing * 0.03, 1),
-            "status": "blocked" if unsupported else ("done" if contract.get("complete") else "needed"),
+            "status": "done" if contract.get("complete") else "needed",
             "gap": {
                 "have": int(contract.get("completed_slices") or 0),
                 "need": int(contract.get("expected_slices") or 0),
@@ -537,7 +530,7 @@ def build_backfill_plan(*, market_batch_days: int = 30, financial_batch_size: in
         "stk_holdernumber", "pledge_stat", "express", "industry_index", "index_weight",
         "income", "balancesheet", "cashflow", "financial_indicator", "fina_audit",
         "fina_mainbz", "announcements", "macro",
-        "capital_structure_vip", "etf_price_nav_vip", "major_news_vip",
+        "capital_structure_vip", "etf_price_nav_vip", "etf_constituents_vip", "major_news_vip",
         "vip_moneyflow_hsgt", "vip_hk_hold", "vip_margin", "vip_margin_detail",
         "vip_margin_secs", "vip_top_list", "vip_top_inst", "vip_fund_basic",
         "vip_fund_daily", "vip_fund_nav", "vip_etf_sh_cons", "vip_etf_sz_cons",

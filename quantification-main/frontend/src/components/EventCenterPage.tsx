@@ -69,11 +69,11 @@ export default function EventCenterPage() {
       <div className="product-module-head">
         <div>
           <span>EVENT ENGINE</span>
-          <h1>公告事件与逻辑复核</h1>
-          <p>先抓高影响事件，再看它是否真的改变投资逻辑。</p>
+          <h1>系统事件判断</h1>
+          <p>系统根据公告事件更新投资逻辑和风险判断，最终结论进入复核。</p>
         </div>
         <button className="button ghost" disabled={reviewing} onClick={() => void reviewLinked()}>
-          {reviewing ? "复核中…" : "复核关联逻辑"}
+          {reviewing ? "计算中…" : "重新计算事件影响"}
         </button>
       </div>
 
@@ -90,7 +90,7 @@ export default function EventCenterPage() {
       <div className="decision-command-bar" aria-label="事件处理顺序">
         <div className="decision-command-intro">
           <span>EVENT REVIEW</span>
-          <strong>事件只改变证据，不直接替你下结论</strong>
+          <strong>系统把事件影响同步到投资逻辑</strong>
         </div>
         <button type="button" className={urgentCount > 0 ? "urgent" : ""}>
           <span>01 · 紧急跟进</span>

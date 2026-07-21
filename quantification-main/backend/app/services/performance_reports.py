@@ -17,6 +17,59 @@ from app.data_platform.db import _conn as data_conn
 from app.db.store import _conn as business_conn
 
 
+def _normalize_payload(period_type: str, payload: dict[str, Any]) -> dict[str, Any]:
+    row = dict(payload or {})
+    total_cost = row.get("total_cost", row.get("transaction_cost", row.get("cost", 0.0)))
+    attribution = row.get("attribution")
+    if not isinstance(attribution, dict):
+        attribution = {
+            "schema_version": "performance_attribution_v1",
+            "stock_selection": row.get("stock_selection_contribution", 0.0),
+            "industry_allocation": row.get("industry_allocation_contribution", 0.0),
+            "market": row.get("market_contribution", 0.0),
+            "execution": row.get("execution_contribution", 0.0),
+            "cash_defensive": row.get("cash_defensive_contribution", 0.0),
+            "status": row.get("attribution_status", "complete"),
+            "limitations": row.get("attribution_limitations", []),
+        }
+    row.update({
+        "schema_version": row.get("schema_version") or "formal_performance_report_v1",
+        "period_type": row.get("period_type") or period_type,
+        "return": row.get("return", row.get("return_pct", row.get("period_return", 0.0))),
+        "period_return": row.get("period_return", row.get("return_pct", 0.0)),
+        "drawdown": row.get("drawdown", row.get("max_drawdown_pct", row.get("drawdown_pct", 0.0))),
+        "max_drawdown": row.get("max_drawdown", row.get("max_drawdown_pct", 0.0)),
+        "cost": total_cost,
+        "total_cost": total_cost,
+        "costs": row.get("costs") or {"total": total_cost},
+        "turnover_pct": row.get("turnover_pct", row.get("turnover_rate", 0.0)),
+        "attribution": attribution,
+        "frozen": True,
+        "frozen_at": row.get("frozen_at") or datetime.utcnow().isoformat(timespec="seconds"),
+    })
+    return row
+
+
+def materialize_formal_performance_reports() -> dict[str, Any]:
+    """Upgrade persisted period reports into the plan-book formal schema."""
+    updated = 0
+    with business_conn() as c:
+        rows = [dict(row) for row in c.execute("SELECT id,period_type,payload_json FROM quant_performance_reports").fetchall()]
+        for row in rows:
+            try:
+                payload = json.loads(row.get("payload_json") or "{}")
+            except (TypeError, json.JSONDecodeError):
+                payload = {}
+            normalized = _normalize_payload(str(row.get("period_type") or ""), payload)
+            if normalized != payload:
+                c.execute(
+                    "UPDATE quant_performance_reports SET payload_json=? WHERE id=?",
+                    (json.dumps(normalized, ensure_ascii=False), int(row["id"])),
+                )
+                updated += 1
+    return {"ok": True, "updated": updated, "total": len(rows), "schema_version": "formal_performance_report_v1"}
+
+
 def list_performance_reports(*, period_type: str | None = None, limit: int = 12) -> dict[str, Any]:
     """List performance reports with validation."""
     with business_conn() as c:

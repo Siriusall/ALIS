@@ -12,11 +12,11 @@ const MODULES: Array<{
   description: string;
   badge: string;
 }> = [
-  { id: "stockPool", title: "股票池", description: "先看候选范围。", badge: "入口" },
-  { id: "thesis", title: "投资逻辑", description: "确认逻辑是否还成立。", badge: "逻辑" },
-  { id: "portfolio", title: "组合管理", description: "查看当前持仓与权益。", badge: "持仓" },
-  { id: "positionRisk", title: "持仓风险", description: "先处理风险动作。", badge: "风险" },
-  { id: "executionLedger", title: "模拟执行账本", description: "核对建议是否执行。", badge: "执行" },
+  { id: "stockPool", title: "候选池明细", description: "查看模型输出的候选范围。", badge: "候选" },
+  { id: "thesis", title: "逻辑合同", description: "查看目标权重背后的证据。", badge: "证据" },
+  { id: "portfolio", title: "当前持仓", description: "查看权益、现金和持仓。", badge: "持仓" },
+  { id: "positionRisk", title: "风险方案", description: "查看系统处置建议。", badge: "风险" },
+  { id: "executionLedger", title: "模拟账本", description: "查看建议是否落账。", badge: "执行" },
 ];
 
 interface PortfolioWorkbenchPageProps {
@@ -74,6 +74,9 @@ export default function PortfolioWorkbenchPage({ onNavigate }: PortfolioWorkbenc
   const deleveraging = risk?.deleveraging_actions ?? [];
   const breaches = risk?.breaches ?? [];
   const recentOps = operations.slice(0, 5);
+  const bucketEntries = Object.entries(risk?.five_bucket_summary?.buckets ?? {});
+  const contracts = risk?.target_weight_contracts ?? [];
+  const allocationTotal = bucketEntries.reduce((sum, [, item]) => sum + Number(item.actual || 0), 0) || 1;
   const totalMarketValue = positions.reduce((sum, item) => sum + (item.current_value ?? item.price * item.quantity), 0);
   const largestPosition = useMemo(() => {
     if (!positions.length || totalMarketValue <= 0) return null;
@@ -93,9 +96,9 @@ export default function PortfolioWorkbenchPage({ onNavigate }: PortfolioWorkbenc
     <section className="product-module-page workbench-page">
       <div className="product-module-head">
         <div>
-          <span>PORTFOLIO HUB</span>
-          <h1>组合与执行</h1>
-          <p>这里把研究结论变成组合动作。</p>
+          <span>ALLOCATION</span>
+          <h1>组合配置</h1>
+          <p>只看系统给出的资金分布、风险方案和模拟落账状态。</p>
         </div>
       </div>
 
@@ -106,17 +109,90 @@ export default function PortfolioWorkbenchPage({ onNavigate }: PortfolioWorkbenc
           <span>当前主线</span>
           <strong>
             {breaches.length > 0
-              ? `先处理 ${breaches.length} 个风险突破，再看新增机会`
+              ? `系统已识别 ${breaches.length} 个风险突破，先看自动处置方案`
               : stateRecommendations.length > 0
-                ? `有 ${stateRecommendations.length} 个持仓建议做状态迁移`
+                ? `系统生成了 ${stateRecommendations.length} 个持仓状态迁移建议`
                 : coreCount > 0
-                  ? `当前有 ${coreCount} 个核心候选，可继续核查是否进入执行`
-                  : "先看股票池和持仓风险，再决定是否执行"}
+                  ? `当前有 ${coreCount} 个核心候选，可继续看系统执行建议`
+                  : "系统会先汇总股票池和持仓风险，再给出执行建议"}
           </strong>
         </div>
         <button type="button" className="button primary" onClick={() => onNavigate?.(breaches.length > 0 ? "positionRisk" : "portfolio")}>
-          {breaches.length > 0 ? "去处理持仓风险" : "打开组合管理"}
+          {breaches.length > 0 ? "查看系统风险方案" : "打开组合管理"}
         </button>
+      </div>
+
+      <section className="portfolio-allocation-board">
+        <header>
+          <div><span>FIVE BUCKET ALLOCATION</span><h2>资金现在放在哪里</h2><p>横条表示当前资金占比，右侧直接标出与目标的偏差。</p></div>
+          <button type="button" className="button ghost" onClick={() => onNavigate?.("positionRisk")}>完整风险分析</button>
+        </header>
+        <div className="portfolio-allocation-layout">
+          <div className="portfolio-allocation-main">
+            <div className="portfolio-stacked-bar" aria-label="五功能仓资金分布">
+              {bucketEntries.map(([key, item]) => <i key={key} className={`bucket-${key}`} style={{ width: `${Math.max(0, Number(item.actual || 0) / allocationTotal * 100)}%` }} title={`${item.name} ${pct(item.actual)}`} />)}
+            </div>
+            <div className="portfolio-bucket-list">
+              {bucketEntries.map(([key, item]) => {
+                const delta = Number(item.actual || 0) - Number(item.target || 0);
+                const outside = Number(item.actual || 0) < Number(item.range?.[0] || 0) || Number(item.actual || 0) > Number(item.range?.[1] || 1);
+                return <article key={key}>
+                  <i className={`bucket-${key}`} />
+                  <div><strong>{item.name}</strong><span>合理区间 {pct(item.range?.[0])}–{pct(item.range?.[1])}</span></div>
+                  <b>{pct(item.actual)}</b>
+                  <em className={outside ? "outside" : "inside"}>{delta > 0 ? "+" : ""}{pct(delta)}</em>
+                </article>;
+              })}
+              {!bucketEntries.length && <div className="empty">当前还没有可展示的五仓配置。</div>}
+            </div>
+          </div>
+          <aside className="portfolio-allocation-aside">
+            <span>组合当前取向</span>
+            <strong>{Number(risk?.five_bucket_summary?.risk_groups?.stable || 0) >= .7 ? "明显偏防守" : "攻守相对均衡"}</strong>
+            <p>稳定类 {pct(risk?.five_bucket_summary?.risk_groups?.stable)}，进攻类 {pct(risk?.five_bucket_summary?.risk_groups?.offensive)}。</p>
+            <div><span>风险突破</span><b>{breaches.length}</b></div>
+            <div><span>待确认合同</span><b>{contracts.filter((item) => item.data_status !== "ready").length}</b></div>
+            <button type="button" className="button primary" onClick={() => onNavigate?.("positionRisk")}>查看系统处置方案</button>
+          </aside>
+        </div>
+      </section>
+
+      <section className="portfolio-operator-board">
+        <button type="button" onClick={() => onNavigate?.("stockPool")}>
+          <span>候选来源</span><strong>{watchCount}/{coreCount}/{holdingCount}</strong><p>观察 / 核心 / 持仓</p>
+        </button>
+        <button type="button" onClick={() => onNavigate?.("positionRisk")} className={breaches.length ? "urgent" : ""}>
+          <span>系统风险方案</span><strong>{breaches.length}</strong><p>{deleveraging.length} 条收缩建议，{stateRecommendations.length} 条迁移建议</p>
+        </button>
+        <button type="button" onClick={() => onNavigate?.("executionLedger")}>
+          <span>模拟落账</span><strong>{recentOps.length}</strong><p>查看最近执行流水和建议是否落账</p>
+        </button>
+        <button type="button" onClick={() => onNavigate?.("thesis")}>
+          <span>逻辑合同</span><strong>{contracts.length}</strong><p>目标权重的收益来源、周期、退出条件</p>
+        </button>
+      </section>
+
+      <details className="module-detail-drawer">
+        <summary><span>展开组合合同、快照、流水和详情入口</span><em>目标权重合同、组合风险、执行账本、候选池明细</em></summary>
+
+      <div className="card decision-panel">
+        <div className="governance-section-head">
+          <div><h3>目标权重合同</h3><p>每笔目标仓位都必须说明收益来源、持有周期、资金确认和退出条件。</p></div>
+          <strong>{contracts.length}</strong>
+        </div>
+        <div className="decision-issue-list">
+          {contracts.slice(0, 6).map((item) => (
+            <div className={`decision-issue ${item.data_status === "ready" ? "warning" : "error"}`} key={item.symbol}>
+              <strong><SecurityLabel code={item.symbol} name={positions.find((position) => position.symbol === item.symbol)?.name} /></strong>
+              ：{item.function_bucket_name} · 当前 {pct(item.current_weight)} → 目标 {pct(item.target_weight)}
+              <br />
+              <em>{item.return_source} · 持有 {item.holding_period} · 资金 {item.funding_confirmation} · 数据 {item.data_status}</em>
+              <br />
+              <em>退出：{item.exit_conditions.join("；") || "尚未记录"}</em>
+            </div>
+          ))}
+          {!contracts.length && <div className="empty">当前没有可落账的目标权重合同。</div>}
+        </div>
       </div>
 
       <div className="product-module-grid">
@@ -144,33 +220,33 @@ export default function PortfolioWorkbenchPage({ onNavigate }: PortfolioWorkbenc
 
       <div className="decision-grid">
         <div className="card decision-panel">
-          <h3>当前待处理动作</h3>
+          <h3>系统下一步建议</h3>
           <div className="review-queue">
             <button type="button" className="review-queue-item" onClick={() => onNavigate?.("stockPool")}>
               <div>
-                <strong>先看股票池</strong>
+                <strong>系统候选池</strong>
                 <span>{watchCount} 个观察标的，{coreCount} 个核心候选</span>
               </div>
               <em>准入</em>
             </button>
             <button type="button" className="review-queue-item" onClick={() => onNavigate?.("positionRisk")}>
               <div>
-                <strong>处理持仓风险</strong>
-                <span>{breaches.length} 个风险突破，{stateRecommendations.length} 个状态迁移建议</span>
+                <strong>查看风险处置方案</strong>
+                <span>系统已把 {breaches.length} 个突破转成 {deleveraging.length} 条收缩建议、{stateRecommendations.length} 条迁移建议</span>
               </div>
               <em>风险</em>
             </button>
             <button type="button" className="review-queue-item" onClick={() => onNavigate?.("executionLedger")}>
               <div>
-                <strong>核对执行账本</strong>
-                <span>{recentOps.length} 条最近流水，确认建议是否被正确执行</span>
+                <strong>系统执行账本</strong>
+                <span>{recentOps.length} 条最近流水，用来验证系统建议是否落账</span>
               </div>
               <em>执行</em>
             </button>
             <button type="button" className="review-queue-item" onClick={() => onNavigate?.("thesis")}>
               <div>
-                <strong>复核投资逻辑</strong>
-                <span>把状态迁移和减仓动作回连到逻辑是否失效</span>
+                <strong>系统逻辑复核</strong>
+                <span>状态迁移和减仓动作会回连到逻辑是否失效</span>
               </div>
               <em>逻辑</em>
             </button>
@@ -241,6 +317,7 @@ export default function PortfolioWorkbenchPage({ onNavigate }: PortfolioWorkbenc
           </button>
         ))}
       </div>
+      </details>
     </section>
   );
 }

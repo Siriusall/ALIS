@@ -66,17 +66,17 @@ export default function ExpectationPage() {
       <div className="product-module-head">
         <div>
           <span>EXPECTATION CHANGE</span>
-          <h1>预期变化与业绩线索</h1>
-          <p>先看真实经营，再看预期有没有偏。</p>
+          <h1>系统预期判断</h1>
+          <p>系统汇总经营事实、预测基线和公司预告，判断预期是否发生变化。</p>
         </div>
         <button className="button ghost" onClick={() => void run()} disabled={loading}>
-          {loading ? "分析中…" : "刷新预期"}
+          {loading ? "刷新中…" : "刷新系统预期"}
         </button>
       </div>
 
       <div className="stock-research-search">
         <input value={code} onChange={(event) => setCode(event.target.value.toUpperCase())} placeholder="输入股票代码" />
-        <button onClick={() => void run()} disabled={loading}>{loading ? "分析中…" : "分析预期"}</button>
+        <button onClick={() => void run()} disabled={loading}>{loading ? "刷新中…" : "查看系统判断"}</button>
       </div>
 
       {error && <div className="alert">{error}</div>}

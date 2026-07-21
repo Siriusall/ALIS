@@ -40,9 +40,29 @@ def refresh_market_regime_training_history(*, years: int = 10) -> dict[str, Any]
     }
 
 
-# Backward-compatible import for older callers. The implementation now uses
-# the full-market aggregate feature layer rather than index-only observations.
-refresh_compact_training_history_from_api = refresh_market_regime_training_history
+def refresh_compact_training_history_from_api(*, years: int = 10) -> dict[str, Any]:
+    """Refresh the compact index anchors used by older HSMM callers."""
+    from datetime import date, timedelta
+    from app.data_platform.services.data_center import sync_tushare_api_raw
+    from app.services.market_context import materialize_market_training_history
+
+    end = date.today().strftime("%Y%m%d")
+    start = (date.today() - timedelta(days=max(1, min(int(years), 10)) * 366)).strftime("%Y%m%d")
+    results = [
+        {
+            "ts_code": code,
+            **sync_tushare_api_raw("index_daily", {"ts_code": code, "start_date": start, "end_date": end}),
+        }
+        for code in ("000300.SH", "000905.SH", "000852.SH")
+    ]
+    materialized = materialize_market_training_history()
+    return {
+        "ok": all(int(item.get("rows_written") or 0) > 0 for item in results) and bool(materialized.get("ok", True)),
+        "range": [start, end],
+        "sources": results,
+        "materialized": materialized,
+        "contract": "compact_index_anchors_v1",
+    }
 
 
 STATES = ("S0", "S1", "S2", "S3")

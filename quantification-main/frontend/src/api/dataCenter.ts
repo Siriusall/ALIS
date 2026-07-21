@@ -291,6 +291,16 @@ export async function fetchReadiness(): Promise<ReadinessOverview> {
   return data;
 }
 
+export interface ReadinessRefreshStatus { ok:boolean; running:boolean; started?:boolean; last_started_at:string; last_finished_at:string; last_error:string; has_cached_snapshot:boolean; cached_consumers:number }
+export async function fetchReadinessRefreshStatus(): Promise<ReadinessRefreshStatus> {
+  const { data } = await api.get<ReadinessRefreshStatus>("/api/data-center/readiness/refresh");
+  return data;
+}
+export async function startReadinessRefresh(): Promise<ReadinessRefreshStatus> {
+  const { data } = await api.post<ReadinessRefreshStatus>("/api/data-center/readiness/refresh");
+  return data;
+}
+
 export async function fetchDataAssets(): Promise<DataAssetsResponse> {
   // 资产目录会汇总各数据域的实际行数，查询可能超过通用15秒请求窗口。
   const { data } = await api.get<DataAssetsResponse>("/api/data-center/assets", { timeout: 60 * 1000 }); return data;

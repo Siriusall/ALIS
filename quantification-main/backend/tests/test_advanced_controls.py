@@ -27,7 +27,10 @@ def test_bayesian_review_and_attribution():
 
 def test_slo_and_oos_fail_closed():
     assert evaluate_slo([{"status": "ok", "latency_ms": 10, "freshness_seconds": 1}])["status"] == "ready"
-    assert multi_period_oos_report([{"period": "2024", "observations": 10, "holdout_lift": 1, "walk_forward_lift": -1}])["status"] == "failed"
+    blocked = multi_period_oos_report([{"period": "2024", "observations": 10, "holdout_lift": 1, "walk_forward_lift": -1}])
+    assert blocked["status"] == "blocked_by_data"
+    failed = multi_period_oos_report([{"period": "2024", "observations": 10, "market_state": "bull", "cost_after_return": .01, "holdout_lift": 1, "walk_forward_lift": -1}])
+    assert failed["status"] == "failed"
 
 
 def test_evidence_freeze_is_stable():

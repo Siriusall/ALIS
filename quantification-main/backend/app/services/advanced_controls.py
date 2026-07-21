@@ -97,9 +97,43 @@ def multi_period_oos_report(periods: list[dict[str, Any]]) -> dict[str, Any]:
     """Aggregate fixed-period out-of-sample reports without hiding failures."""
     normalized = []
     for item in periods:
-        normalized.append({"period": item.get("period"), "horizon": item.get("horizon"), "holdout_lift": float(item.get("holdout_lift", 0) or 0), "walk_forward_lift": float(item.get("walk_forward_lift", 0) or 0), "observations": int(item.get("observations", 0) or 0)})
-    passed = [x for x in normalized if x["observations"] > 0 and x["holdout_lift"] > 0 and x["walk_forward_lift"] > 0]
-    return {"periods": normalized, "period_count": len(normalized), "passed_count": len(passed), "status": "passed" if normalized and len(passed) == len(normalized) else "failed" if normalized else "insufficient_data", "method": "fixed_multi_period_oos_v1", "requires_all_periods_pass": True}
+        observations = int(item.get("observations", 0) or 0)
+        cost_after_return = item.get("cost_after_return")
+        market_state = str(item.get("market_state") or "")
+        blocked_reasons = []
+        if observations <= 0:
+            blocked_reasons.append("missing_observations")
+        if not market_state:
+            blocked_reasons.append("missing_market_state_slice")
+        if cost_after_return is None:
+            blocked_reasons.append("missing_cost_after_return")
+        normalized.append({
+            "period": item.get("period"),
+            "horizon": item.get("horizon"),
+            "market_state": market_state,
+            "holdout_lift": float(item.get("holdout_lift", 0) or 0),
+            "walk_forward_lift": float(item.get("walk_forward_lift", 0) or 0),
+            "cost_after_return": None if cost_after_return is None else float(cost_after_return),
+            "observations": observations,
+            "purge_gap_days": int(item.get("purge_gap_days", 0) or 0),
+            "status": "blocked_by_data" if blocked_reasons else "passed" if float(item.get("holdout_lift", 0) or 0) > 0 and float(item.get("walk_forward_lift", 0) or 0) > 0 and float(cost_after_return) > 0 else "failed",
+            "blocked_reasons": blocked_reasons,
+        })
+    passed = [x for x in normalized if x["status"] == "passed"]
+    blocked = [x for x in normalized if x["status"] == "blocked_by_data"]
+    failed = [x for x in normalized if x["status"] == "failed"]
+    status = "insufficient_data" if not normalized else "blocked_by_data" if blocked else "failed" if failed else "passed"
+    return {
+        "periods": normalized,
+        "period_count": len(normalized),
+        "passed_count": len(passed),
+        "blocked_by_data_count": len(blocked),
+        "failed_count": len(failed),
+        "status": status,
+        "method": "purged_walk_forward_market_state_oos_protocol_v1",
+        "requires_all_periods_pass": True,
+        "required_fields": ["observations", "market_state", "holdout_lift", "walk_forward_lift", "cost_after_return"],
+    }
 
 
 def freeze_evidence(payload: dict[str, Any], *, schema_version: str = "evidence_freeze_v1") -> dict[str, Any]:

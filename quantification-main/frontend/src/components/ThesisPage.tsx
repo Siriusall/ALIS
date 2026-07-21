@@ -1,11 +1,12 @@
 import { useEffect, useMemo, useState } from "react";
 import {
-  createThesis,
   fetchTheses,
+  generateThesisForStock,
+  generateWatchPoolTheses,
   reviewDueTheses,
   reviewThesis,
-  updateHypothesis,
   type InvestmentThesis,
+  type ThesisGenerationResponse,
 } from "../api/research";
 import { useStockContext } from "../context/StockContext";
 
@@ -20,31 +21,35 @@ const STATE_NAME: Record<string, string> = {
   failed: "失败",
 };
 
-const METRICS = [
-  { value: "revenue_growth", label: "收入同比" },
-  { value: "core_profit_growth", label: "净利润同比" },
-  { value: "cash_conversion", label: "经营现金/利润" },
-  { value: "debt_to_assets", label: "资产负债率" },
-];
+function statusTone(value: string) {
+  if (["valid", "verified"].includes(value)) return "ready";
+  if (["warning", "failed"].includes(value)) return "partial";
+  if (["invalidated"].includes(value)) return "blocked";
+  return "building";
+}
+
+function renderResult(result: ThesisGenerationResponse) {
+  if (!result.ok) return `${result.ts_code}：${result.reason || result.status}`;
+  if (result.created) return `${result.ts_code}：已生成并复核`;
+  if (result.status === "reviewed_existing") return `${result.ts_code}：已复核既有逻辑`;
+  return `${result.ts_code}：${result.status}`;
+}
 
 export default function ThesisPage() {
   const { activeStock, setActiveStock } = useStockContext();
   const [items, setItems] = useState<InvestmentThesis[]>([]);
   const [code, setCode] = useState(activeStock);
-  const [title, setTitle] = useState("");
-  const [core, setCore] = useState("");
-  const [hypothesis, setHypothesis] = useState("");
-  const [metric, setMetric] = useState("revenue_growth");
-  const [minValue, setMinValue] = useState("");
-  const [maxValue, setMaxValue] = useState("");
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
-  const [creating, setCreating] = useState(false);
+  const [busyId, setBusyId] = useState<number | null>(null);
+  const [generatingStock, setGeneratingStock] = useState(false);
+  const [generatingWatch, setGeneratingWatch] = useState(false);
   const [reviewingDue, setReviewingDue] = useState(false);
 
   async function refresh() {
     try {
-      setItems(await fetchTheses());
+      const data = await fetchTheses();
+      setItems(data);
       setError("");
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
@@ -55,55 +60,52 @@ export default function ThesisPage() {
     void refresh();
   }, []);
 
-  async function submit() {
+  async function generateOne() {
     const normalized = code.trim().toUpperCase();
-    if (!normalized || !title.trim() || !hypothesis.trim()) {
-      setError("股票代码、逻辑标题和至少一个必要条件不能为空");
+    if (!normalized) {
+      setError("请输入股票代码");
       return;
     }
-    setCreating(true);
+    setGeneratingStock(true);
     setError("");
     try {
-      const expected: Record<string, number> = {};
-      if (minValue !== "") expected.min = Number(minValue);
-      if (maxValue !== "") expected.max = Number(maxValue);
-      await createThesis({
-        ts_code: normalized,
-        title: title.trim(),
-        core_thesis: core.trim(),
-        hypotheses: [{ statement: hypothesis.trim(), metric, expected, necessary: true }],
-      });
+      const result = await generateThesisForStock(normalized);
       setActiveStock(normalized);
       setCode(normalized);
-      setTitle("");
-      setCore("");
-      setHypothesis("");
-      setMinValue("");
-      setMaxValue("");
-      setNotice("已建立投资逻辑卡片，后续事件和财务事实会触发复核。");
+      setNotice(renderResult(result));
       await refresh();
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
     } finally {
-      setCreating(false);
+      setGeneratingStock(false);
     }
   }
 
-  async function change(hypothesisId: number, status: string) {
+  async function generateWatchPool() {
+    setGeneratingWatch(true);
+    setError("");
     try {
-      const updated = await updateHypothesis(hypothesisId, status);
-      setItems((current) => current.map((item) => item.id === updated.id ? updated : item));
+      const result = await generateWatchPoolTheses(100);
+      const count = result.generated_or_reviewed?.length ?? 0;
+      setNotice(`观察池已处理 ${count}/${result.candidates ?? 0} 个候选`);
+      await refresh();
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setGeneratingWatch(false);
     }
   }
 
   async function autoReview(id: number) {
+    setBusyId(id);
+    setError("");
     try {
       const updated = await reviewThesis(id);
       setItems((current) => current.map((item) => item.id === updated.id ? updated : item));
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setBusyId(null);
     }
   }
 
@@ -128,66 +130,98 @@ export default function ThesisPage() {
     <section className="thesis-page">
       <div className="product-module-head">
         <div>
-          <span>INVESTMENT THESIS</span>
-          <h1>投资逻辑与可证伪条件</h1>
-          <p>逻辑必须能被验证，也必须能被推翻。</p>
+          <span>SYSTEM THESIS CONTROL</span>
+          <h1>投资逻辑中控台</h1>
+          <p>系统自动生成、自动复核和自动展示；你只在最终确认时介入。</p>
         </div>
-        <div>
+        <div className="thesis-toolbar">
+          <button className="button ghost" onClick={() => void generateWatchPool()} disabled={generatingWatch}>
+            {generatingWatch ? "生成观察池中…" : "批量生成观察池"}
+          </button>
           <button className="button ghost" onClick={() => void reviewDue()} disabled={reviewingDue}>
             {reviewingDue ? "到期复核中…" : "复核到期逻辑"}
           </button>
-          <span className="module-state module-state-building">事实层已启用</span>
+          <span className="module-state module-state-building">系统自动化已启用</span>
         </div>
       </div>
 
       {error && <div className="alert">{error}</div>}
       {notice && <div className="decision-issue warning">{notice}</div>}
 
-      <div className="decision-command-bar" aria-label="投资逻辑处理顺序">
+      <div className="decision-command-bar" aria-label="投资逻辑中控">
         <div className="decision-command-intro">
           <span>THESIS LOOP</span>
-          <strong>每个核心候选都要能被证伪</strong>
+          <strong>系统先生成证据，再做复核</strong>
         </div>
-        <button type="button">
-          <span>01 · 逻辑卡片</span>
-          <strong>{items.length}</strong>
-          <em>{activeCount} 条跟踪中</em>
+        <button type="button" onClick={() => void generateOne()} className={generatingStock ? "urgent" : ""}>
+          <span>01 · 单股生成</span>
+          <strong>{generatingStock ? "运行中" : code || "输入代码"}</strong>
+          <em>自动生成可证伪逻辑</em>
         </button>
         <button type="button" className={warningCount > 0 ? "urgent" : ""}>
           <span>02 · 预警/证伪</span>
           <strong>{warningCount}</strong>
         </button>
         <button type="button">
-          <span>03 · 当前标的</span>
-          <strong>{code || "未选择"}</strong>
+          <span>03 · 有效逻辑</span>
+          <strong>{activeCount}</strong>
         </button>
-        <button type="button">
-          <span>04 · 到期复核</span>
-          <strong>{reviewingDue ? "运行中" : "手动触发"}</strong>
+        <button type="button" onClick={() => void refresh()}>
+          <span>04 · 刷新状态</span>
+          <strong>{items.length}</strong>
+          <em>重新读取当前中控</em>
         </button>
       </div>
 
-      <div className="thesis-create">
-        <h2>建立逻辑卡片</h2>
-        <div className="thesis-form">
-          <input placeholder="股票代码 000001.SZ" value={code} onChange={(event) => setCode(event.target.value.toUpperCase())} />
-          <input placeholder="逻辑标题" value={title} onChange={(event) => setTitle(event.target.value)} />
-          <textarea placeholder="核心逻辑" value={core} onChange={(event) => setCore(event.target.value)} />
-          <textarea placeholder="必要条件：失败时置信度最高40分" value={hypothesis} onChange={(event) => setHypothesis(event.target.value)} />
-          <select value={metric} onChange={(event) => setMetric(event.target.value)}>
-            {METRICS.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}
-          </select>
-          <input type="number" placeholder="失效下限（可选）" value={minValue} onChange={(event) => setMinValue(event.target.value)} />
-          <input type="number" placeholder="失效上限（可选）" value={maxValue} onChange={(event) => setMaxValue(event.target.value)} />
-          <button onClick={() => void submit()} disabled={creating}>{creating ? "创建中…" : "创建逻辑"}</button>
-        </div>
+      <div className="thesis-shell">
+        <section className="thesis-summary">
+          <h2>系统生成与复核入口</h2>
+          <div className="thesis-actions">
+            <input
+              placeholder="股票代码 000001.SZ"
+              value={code}
+              onChange={(event) => setCode(event.target.value.toUpperCase())}
+              onKeyDown={(event) => event.key === "Enter" && void generateOne()}
+            />
+            <button onClick={() => void generateOne()} disabled={generatingStock}>
+              {generatingStock ? "生成中…" : "系统生成当前逻辑"}
+            </button>
+          </div>
+          <div className="thesis-metrics">
+            <article><span>逻辑总数</span><strong>{items.length}</strong></article>
+            <article><span>有效逻辑</span><strong>{activeCount}</strong></article>
+            <article><span>预警/证伪</span><strong>{warningCount}</strong></article>
+            <article><span>当前关注</span><strong>{code || "未选择"}</strong></article>
+          </div>
+          <p className="text-muted">逻辑卡只展示系统结论、证据、反证和下次复核时间，手工编辑已移出此页。</p>
+        </section>
+
+        <section className="thesis-summary">
+          <h2>字段合同</h2>
+          <div className="thesis-contract-grid">
+            {[
+              ["功能仓", "系统把逻辑绑定到对应收益角色和风险角色"],
+              ["收益来源", "说明主要靠什么兑现"],
+              ["持有周期", "说明判断兑现需要多久"],
+              ["叙事生命周期", "说明主线处在萌芽、扩散还是退潮"],
+              ["资金确认", "说明资金和价格是否支持"],
+              ["退出条件", "说明什么证据会触发退出"],
+              ["数据状态", "说明证据是完整、部分还是缺失"],
+            ].map(([name, detail]) => (
+              <article key={name}>
+                <span>{name}</span>
+                <strong>{detail}</strong>
+              </article>
+            ))}
+          </div>
+        </section>
       </div>
 
       <div className="thesis-list">
         {items.length === 0 && (
           <div className="research-empty">
-            <strong>还没有投资逻辑卡片</strong>
-            <span>建立后系统会持续跟踪必要条件。</span>
+            <strong>还没有系统逻辑卡</strong>
+            <span>先用上方入口生成一只股票或批量生成观察池。</span>
           </div>
         )}
         {items.map((item) => (
@@ -196,27 +230,27 @@ export default function ThesisPage() {
               <div>
                 <span>{item.ts_code} · {item.thesis_type}</span>
                 <h2>{item.title}</h2>
-                <p>{item.core_thesis || "未填写核心逻辑"}</p>
+                <p>{item.core_thesis || "未生成核心逻辑"}</p>
               </div>
               <div>
                 <strong>{STATE_NAME[item.derived_status] ?? item.derived_status}</strong>
                 <em>置信度 {item.derived_confidence.toFixed(1)}</em>
-                <button className="button ghost" onClick={() => void autoReview(item.id)}>自动复核</button>
+                <button className="button ghost" onClick={() => void autoReview(item.id)} disabled={busyId === item.id}>
+                  {busyId === item.id ? "复核中…" : "自动复核"}
+                </button>
               </div>
             </header>
+            <div className="thesis-meta">
+              <span>下次复核：{item.next_review_at?.slice(0, 10) || "未设置"}</span>
+              <span className={`module-state module-state-${statusTone(item.derived_status)}`}>系统判定：{STATE_NAME[item.derived_status] ?? item.derived_status}</span>
+            </div>
             <div className="thesis-hypotheses">
               {item.hypotheses.map((hypothesisItem) => (
                 <div key={hypothesisItem.id}>
                   <span className={hypothesisItem.necessary ? "necessary" : ""}>{hypothesisItem.necessary ? "必要" : "普通"}</span>
                   <strong>{hypothesisItem.statement}</strong>
                   <em>{hypothesisItem.metric || "未绑定指标"} · {STATE_NAME[hypothesisItem.status] ?? hypothesisItem.status}</em>
-                  <select value={hypothesisItem.status} onChange={(event) => void change(hypothesisItem.id, event.target.value)}>
-                    <option value="unverified">未验证</option>
-                    <option value="verified">已验证</option>
-                    <option value="warning">预警</option>
-                    <option value="failed">失败</option>
-                    <option value="invalidated">证伪</option>
-                  </select>
+                  <div>{hypothesisItem.evidence?.length ? `${hypothesisItem.evidence.length} 条证据` : "无历史证据"}</div>
                 </div>
               ))}
             </div>

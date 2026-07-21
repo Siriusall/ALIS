@@ -1,10 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { SectionId } from "./Layout";
 import { fetchDecisionSummary, fetchDailyReport, type DecisionSummary, type DailyRebalanceReport } from "../api/decision";
+import { fetchPlanModels, type PlanModelControl } from "../api/modelStrategy";
 import type { QuantAnalyzeResponse } from "../types";
 import { useStockContext } from "../context/StockContext";
 import LoadingState from "./LoadingState";
 import SecurityLabel from "./SecurityLabel";
+import { GOVERNANCE_SECTION_EVENT, GOVERNANCE_SECTION_STORAGE_KEY } from "./governanceSections";
 
 const ANALYZE_RESULT_KEY = "quant_analyze_result_v1";
 
@@ -37,9 +39,9 @@ const OBSERVATION_TEXT: Record<string, string> = {
 };
 
 const TONE_SUMMARY: Record<string, string> = {
-  go: "可以进入候选与执行确认",
-  hold: "先看门控，再决定是否动作",
-  stop: "先处理阻断，不进入执行",
+  go: "系统已给出可确认方案",
+  hold: "系统建议观察或等待证据",
+  stop: "系统阻断执行并给出原因",
 };
 
 function loadStoredAnalyzeResult(): QuantAnalyzeResponse | null {
@@ -104,6 +106,7 @@ export default function DecisionPage({ onNavigate }: DecisionPageProps) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [dailyReport, setDailyReport] = useState<DailyRebalanceReport | null>(null);
+  const [planModels, setPlanModels] = useState<PlanModelControl | null>(null);
   const [reportLoading, setReportLoading] = useState(false);
   const refreshRunning = useRef(false);
 
@@ -118,6 +121,7 @@ export default function DecisionPage({ onNavigate }: DecisionPageProps) {
       const data = await fetchDecisionSummary(30);
       setSummary(data);
       setAnalyze(loadStoredAnalyzeResult());
+      void fetchPlanModels().then(setPlanModels).catch(() => undefined);
     } catch (e: unknown) {
       const msg = (e as { response?: { data?: { detail?: string } } })?.response?.data?.detail;
       if (showLoading) {
@@ -189,9 +193,9 @@ export default function DecisionPage({ onNavigate }: DecisionPageProps) {
   const primaryActionText = dataErrorCount > 0
     ? `先修复 ${dataErrorCount} 个系统阻断`
     : Number(ledger?.drawdown || 0) <= -0.08
-      ? "先处理组合风险"
+      ? "先查看系统风险处置方案"
       : pendingAnalyze
-        ? `今天有 ${actionCount} 条待确认调仓建议`
+        ? `系统生成 ${actionCount} 条待确认调仓建议`
         : hasRecentExecution
           ? `今日已执行 ${displayedBuyCount} 笔买入、${displayedSellCount} 笔卖出`
         : "今天先观察，不急于调仓";
@@ -211,6 +215,12 @@ export default function DecisionPage({ onNavigate }: DecisionPageProps) {
   function openReview(symbol?: string) {
     if (symbol) setActiveStock(symbol);
     onNavigate?.("review");
+  }
+
+  function openModelConsole() {
+    window.localStorage.setItem(GOVERNANCE_SECTION_STORAGE_KEY, "models");
+    window.dispatchEvent(new CustomEvent(GOVERNANCE_SECTION_EVENT, { detail: "models" }));
+    onNavigate?.("governance");
   }
 
   async function loadDailyReport() {
@@ -298,7 +308,7 @@ export default function DecisionPage({ onNavigate }: DecisionPageProps) {
           <button type="button" onClick={() => onNavigate?.("governance")} className={dataErrorCount ? "danger" : "ready"}>
             <span>数据门控</span><strong>{health ? (health.ok ? "通过" : "阻断") : "检查中"}</strong><em>{dataErrorCount ? `${dataErrorCount} 个错误` : `${warningCount} 项提示`}</em>
           </button>
-          <button type="button" onClick={() => onNavigate?.("strategy")} className={activeModel ? "ready" : "warning"}>
+          <button type="button" onClick={openModelConsole} className={activeModel ? "ready" : "warning"}>
             <span>生产模型</span><strong>{activeModel ? "已就绪" : "未就绪"}</strong><em>{displayedModel?.version || modelReadyText}</em>
           </button>
           <button type="button" onClick={() => onNavigate?.("positionRisk")} className={Number(ledger?.drawdown || 0) <= -0.08 ? "danger" : "ready"}>
@@ -312,7 +322,7 @@ export default function DecisionPage({ onNavigate }: DecisionPageProps) {
         <div className="decision-dashboard-main">
           <section className="decision-focus-card">
             <div className="decision-card-head">
-              <div><span>{hasRecentExecution && !pendingAnalyze ? "今日成交" : "今日待办"}</span><h3>{pendingAnalyze ? `${actionCount} 条调仓建议待确认` : hasRecentExecution ? `已完成 ${displayedBuyCount} 笔买入、${displayedSellCount} 笔卖出` : "今天没有必须执行的交易"}</h3></div>
+              <div><span>{hasRecentExecution && !pendingAnalyze ? "今日成交" : "系统建议"}</span><h3>{pendingAnalyze ? `${actionCount} 条调仓建议等待确认` : hasRecentExecution ? `已完成 ${displayedBuyCount} 笔买入、${displayedSellCount} 笔卖出` : "今天没有必须执行的交易"}</h3></div>
               <button type="button" onClick={() => onNavigate?.("validation")}>量化分析 →</button>
             </div>
             {!analyze && hasRecentExecution ? (
@@ -336,8 +346,8 @@ export default function DecisionPage({ onNavigate }: DecisionPageProps) {
                     <b>{String(index + 1).padStart(2, "0")}</b>
                     <div><strong><SecurityLabel code={row.symbol} name={row.name} /></strong></div>
                     <em>{row.score == null ? "待评分" : Number(row.score).toFixed(3)}</em>
-                    <button type="button" onClick={() => openResearch(row.symbol)}>研究</button>
-                    <button type="button" className="primary" onClick={() => openReview(row.symbol)}>复核</button>
+                    <button type="button" onClick={() => openResearch(row.symbol)}>看证据</button>
+                    <button type="button" className="primary" onClick={() => openReview(row.symbol)}>确认</button>
                   </article>
                 ))}
               </div>
@@ -353,7 +363,7 @@ export default function DecisionPage({ onNavigate }: DecisionPageProps) {
             </div>
             <div className="decision-gate-list">
               <button type="button" onClick={() => onNavigate?.("dataCenter")} className={health?.ok ? "passed" : "blocked"}><i>{health?.ok ? "✓" : "!"}</i><div><strong>数据可信</strong><span>{health?.ok ? "核心数据满足决策要求" : "存在数据阻断"}</span></div><em>{health?.ok ? "通过" : "阻断"}</em></button>
-              <button type="button" onClick={() => onNavigate?.("strategy")} className={activeModel ? "passed" : "blocked"}><i>{activeModel ? "✓" : "!"}</i><div><strong>模型可用</strong><span>{activeModel ? activeModel.version : modelReadyText}</span></div><em>{activeModel ? "通过" : "阻断"}</em></button>
+              <button type="button" onClick={openModelConsole} className={activeModel ? "passed" : "blocked"}><i>{activeModel ? "✓" : "!"}</i><div><strong>模型可用</strong><span>{activeModel ? activeModel.version : modelReadyText}</span></div><em>{activeModel ? "通过" : "阻断"}</em></button>
               <button type="button" onClick={() => onNavigate?.("positionRisk")} className={Number(ledger?.drawdown || 0) > -0.08 ? "passed" : "blocked"}><i>{Number(ledger?.drawdown || 0) > -0.08 ? "✓" : "!"}</i><div><strong>风险预算</strong><span>{positionGate?.reason || "等待风险状态"}</span></div><em>{Number(ledger?.drawdown || 0) > -0.08 ? "通过" : "收缩"}</em></button>
               <button type="button" onClick={() => onNavigate?.("reviewWorkbench")} className="manual"><i>人</i><div><strong>执行复盘</strong><span>{reviewStatus}</span></div><em>{recentExec ? "可选" : "无待办"}</em></button>
             </div>

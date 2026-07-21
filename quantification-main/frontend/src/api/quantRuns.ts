@@ -34,6 +34,28 @@ export interface QuantTaskCreatePayload {
   replay_mode?: "pragmatic_recover" | "strict_replay";
 }
 
+export interface PerformancePeriod {
+  period: string;
+  start_date: string;
+  end_date: string;
+  return_pct: number;
+  benchmark_return_pct: number | null;
+  max_drawdown_pct: number;
+  transaction_cost: number;
+  stock_selection_contribution: number;
+  industry_allocation_contribution: number | null;
+  market_contribution: number | null;
+  execution_contribution: number;
+  attribution_status: string;
+}
+
+export interface QuantPerformanceOverview {
+  daily: PerformancePeriod[];
+  weekly: PerformancePeriod[];
+  monthly: PerformancePeriod[];
+  yearly: PerformancePeriod[];
+}
+
 export async function analyzeQuantMarket(payload?: {
   signal_date?: string;
   top_n?: number;
@@ -175,6 +197,11 @@ export async function getQuantTaskRunDetail(taskId: number, executeDate: string)
 
 export async function getQuantRunLedgerSummary(): Promise<QuantRunLedgerSummary> {
   const { data } = await api.get<QuantRunLedgerSummary>("/api/quant-runs/ledger-summary");
+  return data;
+}
+
+export async function getQuantPerformance(): Promise<QuantPerformanceOverview> {
+  const { data } = await api.get<QuantPerformanceOverview>("/api/quant-runs/performance");
   return data;
 }
 

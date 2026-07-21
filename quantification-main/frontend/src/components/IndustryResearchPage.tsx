@@ -39,7 +39,7 @@ export default function IndustryResearchPage() {
 
   return (
     <section className="industry-page">
-      <div className="product-module-head"><div><span>INDUSTRY RESEARCH</span><h1>行业研究中心</h1><p>只看证据够不够、结论稳不稳。</p></div></div>
+      <div className="product-module-head"><div><span>INDUSTRY RESEARCH</span><h1>系统行业判断</h1><p>这里展示系统已经算出的行业预算、景气和叙事生命周期。</p></div></div>
       <div className="stock-research-search workspace-search">
         <input aria-label="行业状态历史日期" type="date" value={asOfTime} onInput={(event) => setAsOfTime(event.currentTarget.value)} onChange={(event) => setAsOfTime(event.target.value)} />
         <button type="button" onClick={() => void load()} disabled={loading}>{loading ? "正在回放…" : asOfTime ? "读取历史时点" : "读取最新状态"}</button>

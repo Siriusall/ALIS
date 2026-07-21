@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { fetchManualReviewQueue, fetchReviewLearningOverview, generateLlmReviewDraft, materializeReviewOutcomes, submitManualReviewAction, type LlmReviewDraft, type ManualReviewQueue, type ManualReviewQueueItem, type ReviewLearningOverview } from "../api/research";
 import { formatGmt8Time } from "../utils/time";
+import { getQuantPerformance, type QuantPerformanceOverview } from "../api/quantRuns";
 import type { SectionId } from "./Layout";
 import LoadingState from "./LoadingState";
 
@@ -99,6 +100,7 @@ function systemConclusion(item: ManualReviewQueueItem) {
 export default function ReviewWorkbenchPage({ onNavigate }: Props) {
   const [queue, setQueue] = useState<ManualReviewQueue | null>(null);
   const [learning, setLearning] = useState<ReviewLearningOverview | null>(null);
+  const [performance, setPerformance] = useState<QuantPerformanceOverview | null>(null);
   const [selectedKey, setSelectedKey] = useState("");
   const [draft, setDraft] = useState<LlmReviewDraft | null>(null);
   const [errorType, setErrorType] = useState("模型失效");
@@ -112,9 +114,10 @@ export default function ReviewWorkbenchPage({ onNavigate }: Props) {
   async function load() {
     setLoading(true); setError("");
     try {
-      const [result, learningResult] = await Promise.all([fetchManualReviewQueue(), fetchReviewLearningOverview()]);
+      const [result, learningResult, performanceResult] = await Promise.all([fetchManualReviewQueue(), fetchReviewLearningOverview(), getQuantPerformance()]);
       setQueue(result);
       setLearning(learningResult);
+      setPerformance(performanceResult);
       setSelectedKey((current) => result.items.some((item) => item.key === current) ? current : result.items[0]?.key ?? "");
     } catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)); }
     finally { setLoading(false); }
@@ -190,12 +193,30 @@ export default function ReviewWorkbenchPage({ onNavigate }: Props) {
 
   if (loading && !queue) return <LoadingState variant="page" title="正在汇总人工复核队列" detail="正在检查决策、公告、模型与系统异常" rows={5} />;
 
+  const latestWeek = performance?.weekly[performance.weekly.length - 1];
+  const latestMonth = performance?.monthly[performance.monthly.length - 1];
+  const latestYear = performance?.yearly[performance.yearly.length - 1];
+
   return <section className="product-module-page manual-review-page">
-    <div className="product-module-head"><div><span>MANUAL REVIEW</span><h1>人工复核</h1><p>系统先发现问题并交给 LLM 预审；这里只保留 LLM 无法安全处理、必须由你决定的事项。</p></div><button className="button ghost" onClick={() => void load()} disabled={loading}>刷新队列</button></div>
+    <div className="product-module-head"><div><span>REVIEW CENTER</span><h1>复盘中心</h1><p>先看组合结果，再处理真正需要你确认的决策、模型和系统问题。</p></div><button className="button ghost" onClick={() => void load()} disabled={loading}>刷新复盘</button></div>
     {error && <div className="alert">{error}</div>}
+    <section className="review-scoreboard">
+      <div className="review-scoreboard-lead">
+        <span>本月组合结果</span>
+        <strong className={Number(latestMonth?.return_pct || 0) >= 0 ? "positive" : "negative"}>{latestMonth ? `${latestMonth.return_pct >= 0 ? "+" : ""}${latestMonth.return_pct.toFixed(2)}%` : "—"}</strong>
+        <p>相对基准 {latestMonth?.benchmark_return_pct == null ? "—" : `${(latestMonth.return_pct - latestMonth.benchmark_return_pct) >= 0 ? "+" : ""}${(latestMonth.return_pct - latestMonth.benchmark_return_pct).toFixed(2)}%`} · {latestMonth?.attribution_status === "complete" ? "收益归因完整" : "收益归因待补充"}</p>
+      </div>
+      <div className="review-scoreboard-metrics">
+        <article><span>本周收益</span><strong>{latestWeek ? `${latestWeek.return_pct.toFixed(2)}%` : "—"}</strong><small>成本 {latestWeek?.transaction_cost.toFixed(2) ?? "—"}</small></article>
+        <article><span>年度回撤</span><strong>{latestYear ? `${latestYear.max_drawdown_pct.toFixed(2)}%` : "—"}</strong><small>年度收益 {latestYear ? `${latestYear.return_pct.toFixed(2)}%` : "—"}</small></article>
+        <article className={(queue?.counts.high ?? 0) > 0 ? "urgent" : ""}><span>待我确认</span><strong>{queue?.counts.total ?? 0}</strong><small>{queue?.counts.high ?? 0} 条高优先级</small></article>
+      </div>
+    </section>
     <div className="manual-review-summary"><div><strong>{queue?.counts.total ?? 0}</strong><span>需人工处理</span></div><div className="danger"><strong>{queue?.counts.high ?? 0}</strong><span>高优先级</span></div><div><strong>{queue?.ai_triage?.auto_resolved ?? 0}</strong><span>AI已自动处理</span></div><div><strong>{queue?.ai_triage?.awaiting_outcome ?? 0}</strong><span>等待结果观察</span></div><p>{queue?.ai_triage?.running || (queue?.ai_triage?.pending ?? 0) > 0 ? `AI正在预审 ${queue?.ai_triage?.pending ?? 0} 条…` : "未成熟决策不会进入人工队列"}</p></div>
-    <section className={`llm-token-budget ${queue?.llm_budget?.status ?? "available"}`}><div><span>LLM Token 预算</span><strong>{(queue?.llm_budget?.used_tokens ?? 0).toLocaleString()} / {(queue?.llm_budget?.daily_budget ?? 0).toLocaleString()}</strong></div><div className="bar"><i style={{width:`${Math.min(100,((queue?.llm_budget?.used_tokens ?? 0)/Math.max(1,queue?.llm_budget?.daily_budget ?? 1))*100)}%`}} /></div><p>今日剩余 {(queue?.llm_budget?.remaining_tokens ?? 0).toLocaleString()} Token · 单次最多 {(queue?.llm_budget?.per_request_limit ?? 0).toLocaleString()} · 已调用 {queue?.llm_budget?.requests ?? 0} 次</p></section>
     <section className="manual-review-learning"><header><div><span>复盘学习闭环</span><strong>人工结论正在反馈给模型治理</strong></div><button className="button ghost" disabled={loading} onClick={() => void refreshOutcomes()}>更新收益归因</button></header><div><article><span>已归因决策</span><strong>{learning?.counts.decisions ?? 0}</strong></article><article><span>固定周期结果</span><strong>{learning?.counts.outcomes ?? 0}</strong></article><article><span>方向正确率</span><strong>{learning?.accuracy == null ? "待观察" : `${(learning.accuracy * 100).toFixed(0)}%`}</strong></article><article><span>训练反馈样本</span><strong>{learning?.counts.feedback_samples ?? 0}</strong></article></div><p>结果按 5、20、60 个交易日自动冻结；市场、行业、选股贡献进入归因，人工错误分类和成熟结果共同约束模型晋升。</p></section>
+    <details className="module-detail-drawer">
+      <summary><span>展开人工复核队列和 AI 预算</span><em>{queue?.items.length ?? 0} 条待确认，系统已先做预审</em></summary>
+    <section className={`llm-token-budget ${queue?.llm_budget?.status ?? "available"}`}><div><span>LLM Token 预算</span><strong>{(queue?.llm_budget?.used_tokens ?? 0).toLocaleString()} / {(queue?.llm_budget?.daily_budget ?? 0).toLocaleString()}</strong></div><div className="bar"><i style={{width:`${Math.min(100,((queue?.llm_budget?.used_tokens ?? 0)/Math.max(1,queue?.llm_budget?.daily_budget ?? 1))*100)}%`}} /></div><p>今日剩余 {(queue?.llm_budget?.remaining_tokens ?? 0).toLocaleString()} Token · 单次最多 {(queue?.llm_budget?.per_request_limit ?? 0).toLocaleString()} · 已调用 {queue?.llm_budget?.requests ?? 0} 次</p></section>
     <div className="manual-review-layout">
       <aside className="manual-review-list"><header><h2>复核队列</h2><span>{queue?.items.length ?? 0} 条</span></header>{queue?.items.map((item) => <button key={item.key} className={selected?.key === item.key ? "active" : ""} onClick={() => setSelectedKey(item.key)}><i className={item.priority} /><div><strong>{item.title}</strong><span>{KIND_LABEL[item.kind]} · {item.created_at ? formatGmt8Time(item.created_at) : "待处理"}</span></div></button>)}{!queue?.items.length && <div className="empty">队列已经处理完成。</div>}</aside>
       <main className="manual-review-detail">{selected ? <>
@@ -210,5 +231,6 @@ export default function ReviewWorkbenchPage({ onNavigate }: Props) {
         <button className="manual-review-context-link" onClick={() => onNavigate?.(selected.target_section as SectionId)}>查看完整上下文 →</button>
       </> : <div className="empty">当前没有需要人工复核的事项。</div>}</main>
     </div>
+    </details>
   </section>;
 }

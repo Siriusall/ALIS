@@ -26,6 +26,7 @@ from app.services.quant_risk import (
 from app.services.advanced_controls import black_litterman_weights
 from app.services.quant_run_engine import list_consolidated_trade_dates
 from app.services.rebalance_allocator import correlated_industry_group
+from app.services.five_bucket_contract import build_target_weight_contract, summarize_bucket_contracts
 from app.services.research_engine import capability_registry
 from app.services.thesis_store import list_theses
 
@@ -43,6 +44,30 @@ def _safe_overview_call(name: str, fn, fallback: Any) -> tuple[Any, dict[str, st
         return fn(), None
     except Exception as exc:  # noqa: BLE001
         return fallback, {"domain": name, "error": str(exc)[:200]}
+
+
+def _cached_readiness_overview() -> dict[str, Any]:
+    """Return a governance-safe readiness snapshot without scanning raw history."""
+    try:
+        from app.data_platform.redis_store import get_json
+
+        cached = get_json("alis:data-platform:readiness:v2")
+        if isinstance(cached, dict):
+            return cached
+    except Exception:
+        pass
+    return {
+        "ok": True,
+        "scope": {},
+        "consumers": [],
+        "summary_only": True,
+        "status_definition": {
+            "ready": "满足正式运行要求",
+            "degraded": "可运行但必须标注数据风险",
+            "blocked": "关键数据不足，应禁止正式运行",
+            "unknown": "尚无足够证据",
+        },
+    }
 
 
 def _stress_tests(exposures: list[dict[str, Any]], equity: float) -> list[dict[str, Any]]:
@@ -183,6 +208,7 @@ def build_live_portfolio_risk(lookback: int = 120) -> dict[str, Any]:
         if status == "breach":
             breaches.append({"code": "correlated_industry_limit", "group": group, "severity": "error", "limit": .35, "message": f"高度相关行业组权重 {weight:.1%} 超过 35% 上限"})
     weight_explanations = []
+    target_weight_contracts = []
     for item in exposures:
         target = _f(weights.get(item["symbol"]))
         reasons = []
@@ -194,7 +220,19 @@ def build_live_portfolio_risk(lookback: int = 120) -> dict[str, Any]:
             reasons.append("受单票上限裁剪")
         if any(x.get("industry") == item.get("industry") and x.get("status") == "breach" for x in industry_exposures):
             reasons.append("所在行业超过集中度上限，需整体降权")
-        weight_explanations.append({"symbol": item["symbol"], "current_weight": item["weight"], "target_weight": round(target, 6), "delta": round(target - _f(item["weight"]), 6), "reason": "；".join(reasons)})
+        contract = build_target_weight_contract(
+            symbol=str(item["symbol"]),
+            current_weight=_f(item.get("weight")),
+            target_weight=target,
+            score=_f(item.get("thesis_confidence")),
+            evidence={
+                "return_source": "基于收缩协方差与约束CVaR的目标权重",
+                "exit_conditions": ["单票/行业/CVaR约束触发", "投资逻辑失效", "组合回撤触发降风险"],
+            },
+            data_status="ready" if int(item.get("observations") or 0) > 0 else "insufficient",
+        )
+        target_weight_contracts.append(contract)
+        weight_explanations.append({"symbol": item["symbol"], "current_weight": item["weight"], "target_weight": round(target, 6), "delta": round(target - _f(item["weight"]), 6), "reason": "；".join(reasons), "target_weight_contract": contract})
     stress_tests = _stress_tests(exposures, equity)
     deleveraging_actions = _deleveraging_actions(exposures, breaches, stress_tests)
     states_by_symbol = {str(item.get("ts_code") or "").split(".")[0]: item for item in list_position_states()}
@@ -233,6 +271,8 @@ def build_live_portfolio_risk(lookback: int = 120) -> dict[str, Any]:
         "tail_risk": tail,
         "optimizer": optimizer if returns_by_symbol else "unavailable",
         "target_weights": weights,
+        "target_weight_contracts": target_weight_contracts,
+        "five_bucket_summary": summarize_bucket_contracts(target_weight_contracts),
         "weight_explanations": weight_explanations,
         "industry_exposures": industry_exposures,
         "correlated_industry_exposures": correlated_industry_exposures,
@@ -248,7 +288,7 @@ def build_live_portfolio_risk(lookback: int = 120) -> dict[str, Any]:
 
 def build_governance_overview() -> dict[str, Any]:
     health, health_error = _safe_overview_call("data_health", lambda: build_data_health_report(limit_days=30), {"ok": False, "issues": []})
-    readiness, readiness_error = _safe_overview_call("data_readiness", readiness_overview, {"consumers": []})
+    readiness, readiness_error = _safe_overview_call("data_readiness", _cached_readiness_overview, {"consumers": []})
     observability, observability_error = _safe_overview_call("observability", lambda: get_observability(limit_logs=20), {"logs": []})
     model, model_error = _safe_overview_call("model", get_model_status, {})
     capabilities, capabilities_error = _safe_overview_call("capabilities", capability_registry, [])
@@ -266,9 +306,12 @@ def build_governance_overview() -> dict[str, Any]:
     unresolved_data = [x for x in observability.get("logs", []) if str(x.get("status") or "") == "failed"]
     readiness_states = [str(x.get("status") or "unknown") for x in readiness.get("consumers", [])]
     readiness_status = "blocked" if "blocked" in readiness_states else "degraded" if "degraded" in readiness_states else "ready" if readiness_states else "unknown"
+    readiness_detail = "消费者数据就绪度"
+    if readiness.get("summary_only"):
+        readiness_detail = "深度就绪度后台计算中"
     gates = [
         {"key": "data_health", "status": "unknown" if health_error else "ready" if health.get("ok") else "blocked", "detail": f"{len(health.get('issues') or [])}项问题"},
-        {"key": "data_readiness", "status": "unknown" if readiness_error else readiness_status, "detail": "消费者数据就绪度"},
+        {"key": "data_readiness", "status": "unknown" if readiness_error else readiness_status, "detail": readiness_detail},
         {"key": "model", "status": "unknown" if model_error else "ready" if model.get("active_version") else "blocked", "detail": "生产模型版本"},
         {"key": "task_failures", "status": "unknown" if tasks_error else "ready" if not failed_tasks else "degraded", "detail": f"{len(failed_tasks)}个异常任务"},
     ]

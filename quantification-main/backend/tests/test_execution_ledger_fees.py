@@ -92,6 +92,28 @@ def test_quant_sell_can_update_cash_without_writing_manual_operation(monkeypatch
     assert not any("INSERT INTO operations" in sql for sql in statements)
 
 
+def test_list_operations_decodes_target_weight_contract(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _Conn:
+        def execute(self, *_args):
+            return _Cursor([{
+                "id": 1, "execution_id": 2, "symbol": "000001", "side": "BUY", "price": 10.0,
+                "quantity": 100, "at": "2026-01-02T09:30:00", "remark": "", "name": "平安银行",
+                "commission": 5.0, "transfer_fee": 0.01, "stamp_tax": 0.0, "slippage_bps": 10,
+                "fee_schedule_version": "cn_a_share_fee_v1", "operation_uid": "u1",
+                "target_weight_contract_json": "{\"function_bucket\":\"leader\",\"target_weight\":0.08}",
+            }])
+
+    @contextmanager
+    def fake_conn():
+        yield _Conn()
+
+    monkeypatch.setattr(store, "_conn", fake_conn)
+    rows = store.list_operations(limit=1)
+
+    assert rows[0]["target_weight_contract"]["function_bucket"] == "leader"
+    assert rows[0]["target_weight_contract"]["target_weight"] == .08
+
+
 def test_fifo_attribution_reconciles_market_industry_selection_and_execution(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(decision_store, "_market_and_industry_returns", lambda *_args: (.10, .15, "银行"))
     outcome = {

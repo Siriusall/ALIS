@@ -50,7 +50,7 @@ from app.data_platform.services.web_fallback import (
 from app.data_platform.services.daily_update import daily_update_status, simple_health, start_daily_update
 from app.data_platform.services.observability import get_observability
 from app.data_platform.services.runtime_logs import list_runtime_logs_since
-from app.data_platform.services.readiness import readiness_overview
+from app.data_platform.services.readiness import readiness_overview, readiness_refresh_status, start_readiness_refresh
 from app.data_platform.services.assets import get_data_assets
 from app.data_platform.services.backfill import build_backfill_plan, get_backfill_status, start_backfill
 from app.data_platform.services.cold_archive import archive_raw_records, cold_archive_status
@@ -92,6 +92,16 @@ def data_center_runtime_logs(
 @router.get("/data-center/readiness")
 def data_center_readiness() -> dict[str, Any]:
     return readiness_overview()
+
+
+@router.get("/data-center/readiness/refresh")
+def data_center_readiness_refresh_status() -> dict[str, Any]:
+    return readiness_refresh_status()
+
+
+@router.post("/data-center/readiness/refresh")
+def data_center_start_readiness_refresh() -> dict[str, Any]:
+    return start_readiness_refresh()
 
 
 @router.get("/data-center/assets")

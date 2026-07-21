@@ -280,6 +280,16 @@ def _migrate_operations_execution_id_nullable(c: _ConnWrapper) -> None:
     c.execute("ALTER TABLE operations_new RENAME TO operations")
 
 
+def _migrate_target_weight_contracts(c: _ConnWrapper) -> None:
+    for table in ("operations", "decision_snapshots"):
+        try:
+            columns = {str(row["name"]) for row in c.execute(f"PRAGMA table_info({table})").fetchall()}
+            if "target_weight_contract_json" not in columns:
+                c.execute(f"ALTER TABLE {table} ADD COLUMN target_weight_contract_json TEXT NOT NULL DEFAULT '{{}}'")
+        except Exception:
+            pass
+
+
 def _migrate_quant_run_task_detail_json(c: _ConnWrapper) -> None:
     """Add structured run explanation payload for decision review."""
     if c._is_mysql:
@@ -531,6 +541,7 @@ CREATE TABLE IF NOT EXISTS operations (
     slippage_bps REAL NOT NULL DEFAULT 0,
     fee_schedule_version TEXT NOT NULL DEFAULT '',
     operation_uid TEXT,
+    target_weight_contract_json TEXT NOT NULL DEFAULT '{}',
     FOREIGN KEY (execution_id) REFERENCES executions(id)
 );
 CREATE TABLE IF NOT EXISTS account (
@@ -935,6 +946,7 @@ def init_db() -> None:
                     data_as_of_time VARCHAR(64) NOT NULL, model_version VARCHAR(64) NOT NULL,
                     market_state_json TEXT NOT NULL, research_state_json TEXT NOT NULL,
                     valuation_json TEXT NOT NULL, portfolio_context_json TEXT NOT NULL,
+                    target_weight_contract_json TEXT NOT NULL DEFAULT '{}',
                     reason TEXT NOT NULL, invalidation_conditions_json TEXT NOT NULL,
                     evidence_hash VARCHAR(128) NOT NULL DEFAULT '', evidence_schema_version VARCHAR(64) NOT NULL DEFAULT 'evidence_freeze_v1',
                     created_at VARCHAR(64) NOT NULL
@@ -976,11 +988,14 @@ def init_db() -> None:
                 _migrate_quant_task_perf_schema(c)
                 _migrate_quant_task_status_semantics(c)
                 _migrate_quant_run_task_detail_json(c)
+                _migrate_target_weight_contracts(c)
             else:
                 c.execute("ALTER TABLE decision_snapshots ADD COLUMN IF NOT EXISTS evidence_hash VARCHAR(128) NOT NULL DEFAULT ''")
                 c.execute("ALTER TABLE decision_snapshots ADD COLUMN IF NOT EXISTS evidence_schema_version VARCHAR(64) NOT NULL DEFAULT 'evidence_freeze_v1'")
                 c.execute("ALTER TABLE decision_snapshots ADD COLUMN IF NOT EXISTS execution_id BIGINT")
                 c.execute("ALTER TABLE decision_snapshots ADD COLUMN IF NOT EXISTS operation_id BIGINT")
+                c.execute("ALTER TABLE decision_snapshots ADD COLUMN IF NOT EXISTS target_weight_contract_json TEXT NOT NULL DEFAULT '{}'")
+                c.execute("ALTER TABLE operations ADD COLUMN IF NOT EXISTS target_weight_contract_json TEXT NOT NULL DEFAULT '{}'")
                 c.execute("CREATE INDEX IF NOT EXISTS idx_decision_execution ON decision_snapshots(execution_id,operation_id)")
                 c.execute("ALTER TABLE position_state_history ADD COLUMN IF NOT EXISTS rule_version VARCHAR(64) NOT NULL DEFAULT ''")
                 c.execute("ALTER TABLE position_state_history ADD COLUMN IF NOT EXISTS model_version VARCHAR(64) NOT NULL DEFAULT ''")
@@ -1147,8 +1162,8 @@ def create_execution(strategy_id: int, executed_at: str, budget: float, top_n: i
             c.execute(
                 """INSERT INTO operations
                    (execution_id, symbol, side, price, quantity, at, remark, name,
-                    commission, transfer_fee, stamp_tax, slippage_bps, fee_schedule_version, operation_uid)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    commission, transfer_fee, stamp_tax, slippage_bps, fee_schedule_version, operation_uid, target_weight_contract_json)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     eid,
                     o.get("symbol", ""),
@@ -1164,6 +1179,7 @@ def create_execution(strategy_id: int, executed_at: str, budget: float, top_n: i
                     float(o.get("slippage_bps", 0) or 0),
                     str(o.get("fee_schedule_version") or FEE_SCHEDULE_VERSION),
                     operation_uid,
+                    json.dumps(o.get("target_weight_contract") or {}, ensure_ascii=False),
                 ),
             )
     return eid
@@ -1187,8 +1203,8 @@ def append_operations_to_execution(execution_id: int, executed_at: str, orders: 
             c.execute(
                 """INSERT INTO operations
                    (execution_id, symbol, side, price, quantity, at, remark, name,
-                    commission, transfer_fee, stamp_tax, slippage_bps, fee_schedule_version, operation_uid)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    commission, transfer_fee, stamp_tax, slippage_bps, fee_schedule_version, operation_uid, target_weight_contract_json)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     eid,
                     (o.get("symbol") or "").strip(),
@@ -1204,6 +1220,7 @@ def append_operations_to_execution(execution_id: int, executed_at: str, orders: 
                     float(o.get("slippage_bps", 0) or 0),
                     str(o.get("fee_schedule_version") or FEE_SCHEDULE_VERSION),
                     operation_uid,
+                    json.dumps(o.get("target_weight_contract") or {}, ensure_ascii=False),
                 ),
             )
             inserted += 1
@@ -1480,10 +1497,10 @@ def sell_position(
             c.execute(
                 """INSERT INTO operations
                    (execution_id, symbol, side, price, quantity, at, remark, name,
-                    commission, transfer_fee, stamp_tax, slippage_bps, fee_schedule_version, operation_uid)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    commission, transfer_fee, stamp_tax, slippage_bps, fee_schedule_version, operation_uid, target_weight_contract_json)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (None, sym, "SELL", sell_price, sell_qty, now, "手动出售", name,
-                 fee_comm, fee_trans, fee_tax, 0.0, FEE_SCHEDULE_VERSION, operation_uid),
+                 fee_comm, fee_trans, fee_tax, 0.0, FEE_SCHEDULE_VERSION, operation_uid, "{}"),
             )
     if sell_qty >= pos_qty:
         return None
@@ -1500,14 +1517,14 @@ def list_operations(execution_id: Optional[int] = None, limit: int = 500) -> Lis
         if execution_id is not None:
             cur = c.execute(
                 """SELECT id, execution_id, symbol, side, price, quantity, at, remark, name,
-                          commission, transfer_fee, stamp_tax, slippage_bps, fee_schedule_version, operation_uid
+                          commission, transfer_fee, stamp_tax, slippage_bps, fee_schedule_version, operation_uid, target_weight_contract_json
                    FROM operations WHERE execution_id = ? ORDER BY id DESC LIMIT ?""",
                 (execution_id, limit),
             )
         else:
             cur = c.execute(
                 """SELECT id, execution_id, symbol, side, price, quantity, at, remark, name,
-                          commission, transfer_fee, stamp_tax, slippage_bps, fee_schedule_version, operation_uid
+                          commission, transfer_fee, stamp_tax, slippage_bps, fee_schedule_version, operation_uid, target_weight_contract_json
                    FROM operations ORDER BY id DESC LIMIT ?""",
                 (limit,),
             )
@@ -1529,6 +1546,7 @@ def list_operations(execution_id: Optional[int] = None, limit: int = 500) -> Lis
             "slippage_bps": float(r["slippage_bps"] or 0),
             "fee_schedule_version": r["fee_schedule_version"] or "",
             "operation_uid": r["operation_uid"] or "",
+            "target_weight_contract": _json_load(r["target_weight_contract_json"] if "target_weight_contract_json" in r.keys() else "{}", {}),
         }
         for r in rows
     ]
@@ -2695,18 +2713,58 @@ def save_performance_reports(task_id: int | None, reports: dict[str, list[dict[s
     """Persist the latest period snapshots idempotently."""
     now = datetime.utcnow().isoformat()
     saved = 0
+
+    def normalize_report(kind: str, row: dict[str, Any]) -> dict[str, Any]:
+        payload = dict(row or {})
+        total_cost = payload.get("total_cost", payload.get("transaction_cost", payload.get("cost", 0.0)))
+        turnover = payload.get("turnover_pct", payload.get("turnover_rate", 0.0))
+        attribution = payload.get("attribution")
+        if not isinstance(attribution, dict):
+            attribution = {
+                "schema_version": "performance_attribution_v1",
+                "stock_selection": payload.get("stock_selection_contribution", 0.0),
+                "industry_allocation": payload.get("industry_allocation_contribution", 0.0),
+                "market": payload.get("market_contribution", 0.0),
+                "execution": payload.get("execution_contribution", 0.0),
+                "cash_defensive": payload.get("cash_defensive_contribution", 0.0),
+                "status": payload.get("attribution_status", "complete"),
+                "limitations": payload.get("attribution_limitations", []),
+            }
+        payload.update({
+            "schema_version": payload.get("schema_version") or "formal_performance_report_v1",
+            "period_type": payload.get("period_type") or kind,
+            "return": payload.get("return", payload.get("return_pct", payload.get("period_return", 0.0))),
+            "period_return": payload.get("period_return", payload.get("return_pct", 0.0)),
+            "drawdown": payload.get("drawdown", payload.get("max_drawdown_pct", payload.get("drawdown_pct", 0.0))),
+            "max_drawdown": payload.get("max_drawdown", payload.get("max_drawdown_pct", 0.0)),
+            "cost": total_cost,
+            "total_cost": total_cost,
+            "costs": payload.get("costs") or {
+                "total": total_cost,
+                "commission": payload.get("commission", 0.0),
+                "transfer_fee": payload.get("transfer_fee", 0.0),
+                "stamp_tax": payload.get("stamp_tax", 0.0),
+            },
+            "turnover_pct": turnover,
+            "attribution": attribution,
+            "frozen": True,
+            "frozen_at": payload.get("frozen_at") or now,
+        })
+        return payload
+
     with _conn() as c:
         for kind, rows in reports.items():
             for row in rows:
                 period = str(row.get("period") or "")
                 if not period:
                     continue
+                payload = normalize_report(str(kind), row)
                 c.execute("""INSERT INTO quant_performance_reports
                     (task_id, period_type, period, payload_json, created_at)
                     VALUES (?, ?, ?, ?, ?)
                     ON CONFLICT (task_id, period_type, period) DO UPDATE SET
                     payload_json=EXCLUDED.payload_json, created_at=EXCLUDED.created_at""",
-                    (task_id, kind, period, json.dumps(row, ensure_ascii=False), now))
+                    (task_id, kind, period, json.dumps(payload, ensure_ascii=False), now))
                 saved += 1
     return saved
 

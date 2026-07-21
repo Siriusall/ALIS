@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List
+from typing import Any, List
 
 
 @dataclass
@@ -27,6 +27,7 @@ class OrderResult:
     commission: float = 0.0
     transfer_fee: float = 0.0
     block_code: str = ""
+    target_weight_contract: dict[str, Any] | None = None
 
 
 class BrokerAdapter:

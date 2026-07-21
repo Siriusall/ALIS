@@ -6,6 +6,7 @@ from typing import Dict, List
 from app.core.a_share_fees import LOT_SIZE, apply_slippage_buy, cost_buy
 from app.core.trading_constraints import check_open_trade_constraints, normalize_lot_quantity
 from app.integrations.broker_adapter import OrderRequest, OrderResult
+from app.services.five_bucket_contract import build_target_weight_contract
 
 
 @dataclass
@@ -24,6 +25,7 @@ class PlannedBuyOrder:
     status: str
     message: str
     block_code: str
+    target_weight_contract: dict
 
 
 def _total_buy_cost(exec_price: float, quantity: int, symbol: str | None = None) -> float:
@@ -350,6 +352,18 @@ def allocate_buy_orders(
                 status="simulated",
                 message="模拟成交（次日开盘价口径）",
                 block_code="",
+                target_weight_contract=build_target_weight_contract(
+                    symbol=sym,
+                    current_weight=round(float(existing_position_value.get(sym, 0) or 0) / total_equity, 6) if total_equity > 0 else 0.0,
+                    target_weight=round((float(existing_position_value.get(sym, 0) or 0) + amount) / total_equity, 6) if total_equity > 0 else 0.0,
+                    score=score_map.get(sym, 0.0),
+                    evidence={
+                        "return_source": "调仓目标权重分配",
+                        "holding_period": "按功能仓合同执行",
+                        "exit_conditions": ["目标权重被新一轮组合优化降至0", "风险硬门触发", "交易成本后预期收益转负"],
+                    },
+                    data_status="ready",
+                ),
             )
         )
     return planned, blocked, pruned
@@ -367,6 +381,7 @@ def planned_to_order_results(planned: List[PlannedBuyOrder]) -> List[OrderResult
             commission=x.commission,
             transfer_fee=x.transfer_fee,
             block_code=x.block_code,
+            target_weight_contract=x.target_weight_contract,
         )
         for x in planned
     ]

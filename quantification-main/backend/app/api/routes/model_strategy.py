@@ -15,6 +15,9 @@ from app.services.model_governance_scheduler import (
     request_model_training,
 )
 from app.services.quant_risk import bocpd_change_probability, constrained_cvar_weights, garch11_forecast, historical_cvar, hrp_fallback_weights, hsmm_regime, kalman_level, ledoit_wolf_covariance
+from app.services.training_protocol import training_protocol_contract, validate_feature_frame_contract, validate_training_run_manifest
+from app.services.model_evidence_contract import evidence_binding_registry, model_output_contracts, normalize_model_output
+from app.services.two_group_optimizer import two_group_cvar_optimizer
 from app.services.market_context import (
     live_market_context,
     market_context_history,
@@ -26,14 +29,21 @@ from app.services.market_context import (
 )
 from app.services.strategy_gate import evaluate_strategy_gate
 from app.services.advanced_controls import black_litterman_weights, evaluate_slo, multi_period_oos_report
-from app.services.performance_reports import list_performance_reports, validate_performance_reports, build_multi_period_validation
+from app.services.performance_reports import list_performance_reports, validate_performance_reports, build_multi_period_validation, materialize_formal_performance_reports
 from app.services.news_theme_cluster import cluster_news_themes
 from app.services.analyst_consensus import build_analyst_consensus, batch_analyst_consensus
+from app.services.acceptance_evidence import (
+    evaluate_and_record_slo,
+    list_backend_acceptance_runs,
+    list_slo_evaluations,
+    run_and_record_backend_acceptance,
+)
 from app.services.auto_pipeline import run_daily_maintenance
 from app.services.defensive_assets import defensive_allocation_for_state, list_defensive_assets, materialize_defensive_asset_history
 from app.services.hsmm_shadow import train_hsmm_shadow
 from app.services.backend_acceptance import backend_acceptance_matrix
 from app.services.strategy_workbench import build_strategy_workbench
+from app.services.plan_model_control import model_family_status, request_plan_model_training, review_plan_model_version, train_all_trainable_plan_models, review_all_candidate_plan_models, score_plan_model_features
 
 router = APIRouter()
 
@@ -64,6 +74,11 @@ class MarketContextRequest(BaseModel):
 class PortfolioRiskRequest(BaseModel):
     returns_by_symbol: dict[str, list[float]] = Field(default_factory=dict)
     max_single: float = Field(0.25, gt=0, le=1)
+    expected_returns: dict[str, float] = Field(default_factory=dict)
+    buckets: dict[str, str] = Field(default_factory=dict)
+    current_weights: dict[str, float] = Field(default_factory=dict)
+    trading_costs: dict[str, float] = Field(default_factory=dict)
+    crowding: dict[str, float] = Field(default_factory=dict)
 
 
 class ModelDriftRequest(BaseModel):
@@ -96,6 +111,8 @@ class SLORequest(BaseModel):
     samples: list[dict[str, Any]] = Field(default_factory=list, max_length=10000)
     freshness_seconds: float = Field(86400, gt=0)
     success_target: float = Field(.99, gt=0, le=1)
+    scope: str = Field("model-strategy", max_length=128)
+    persist: bool = True
 
 
 class OOSReportRequest(BaseModel):
@@ -108,14 +125,138 @@ class HsmmReviewRequest(BaseModel):
     comment: str = Field("", max_length=2000)
 
 
+class PlanModelTrainRequest(BaseModel):
+    model_key: str = Field(..., min_length=3, max_length=128)
+
+
+class PlanModelReviewRequest(BaseModel):
+    reviewer: str = Field("operator", min_length=1, max_length=120)
+    decision: str = Field(..., pattern="^(approved|rejected)$")
+    comment: str = Field("", max_length=2000)
+    waive_live_observation: bool = False
+
+
+class PlanModelScoreRequest(BaseModel):
+    model_key: str = Field(..., min_length=3, max_length=128)
+    features: dict[str, Any] = Field(default_factory=dict)
+
+
+class FeatureFrameContractRequest(BaseModel):
+    rows: list[dict[str, Any]] = Field(default_factory=list, max_length=10000)
+    feature_names: list[str] = Field(default_factory=list, max_length=500)
+    require_source_time: bool = True
+
+
+class TrainingManifestRequest(BaseModel):
+    manifest: dict[str, Any] = Field(default_factory=dict)
+
+
+class NormalizeModelOutputRequest(BaseModel):
+    model_key: str = Field(..., min_length=3, max_length=128)
+    output: dict[str, Any] = Field(default_factory=dict)
+
+
 @router.get("/model-strategy/status")
 def model_strategy_status() -> dict:
     return get_model_status()
 
 
+@router.get("/model-strategy/plan-models")
+def model_strategy_plan_models() -> dict:
+    return model_family_status()
+
+
+@router.post("/model-strategy/plan-models/train")
+def model_strategy_train_plan_model(req: PlanModelTrainRequest) -> dict:
+    result = request_plan_model_training(req.model_key)
+    if not result.get("ok"):
+        raise HTTPException(status_code=404, detail=result)
+    return result
+
+
+@router.post("/model-strategy/plan-models/train-all")
+def model_strategy_train_all_plan_models() -> dict:
+    return train_all_trainable_plan_models()
+
+
+@router.post("/model-strategy/plan-models/review/{model_version_id}")
+def model_strategy_review_plan_model(model_version_id: int, req: PlanModelReviewRequest) -> dict:
+    result = review_plan_model_version(
+        model_version_id,
+        reviewer=req.reviewer,
+        decision=req.decision,
+        comment=req.comment,
+        waive_live_observation=req.waive_live_observation,
+    )
+    if not result.get("ok"):
+        raise HTTPException(status_code=404, detail=result)
+    return result
+
+
+@router.post("/model-strategy/plan-models/review-candidates")
+def model_strategy_review_candidate_plan_models(req: PlanModelReviewRequest) -> dict:
+    if req.decision != "approved":
+        raise HTTPException(status_code=400, detail="批量评审只支持approved；驳回请逐个处理")
+    return review_all_candidate_plan_models(reviewer=req.reviewer, comment=req.comment, waive_live_observation=req.waive_live_observation)
+
+
+@router.post("/model-strategy/plan-models/score")
+def model_strategy_score_plan_model(req: PlanModelScoreRequest) -> dict:
+    return score_plan_model_features(req.model_key, req.features)
+
+
+@router.get("/model-strategy/training-protocol")
+def model_strategy_training_protocol(model_key: str | None = None) -> dict:
+    return training_protocol_contract(model_key)
+
+
+@router.post("/model-strategy/training-protocol/validate-manifest")
+def model_strategy_validate_training_manifest(req: TrainingManifestRequest) -> dict:
+    return validate_training_run_manifest(req.manifest)
+
+
+@router.post("/model-strategy/training-protocol/validate-features")
+def model_strategy_validate_feature_contract(req: FeatureFrameContractRequest) -> dict:
+    return validate_feature_frame_contract(
+        req.rows,
+        feature_names=req.feature_names,
+        require_source_time=req.require_source_time,
+    )
+
+
+@router.get("/model-strategy/model-output-contracts")
+def model_strategy_model_output_contracts() -> dict:
+    return model_output_contracts()
+
+
+@router.post("/model-strategy/model-output-contracts/normalize")
+def model_strategy_normalize_model_output(req: NormalizeModelOutputRequest) -> dict:
+    return normalize_model_output(req.model_key, req.output)
+
+
+@router.get("/model-strategy/evidence-bindings")
+def model_strategy_evidence_bindings() -> dict:
+    return evidence_binding_registry()
+
+
 @router.get("/model-strategy/backend-acceptance")
 def model_strategy_backend_acceptance() -> dict:
     return backend_acceptance_matrix()
+
+
+@router.post("/model-strategy/performance-reports/materialize-formal")
+def model_strategy_materialize_formal_performance_reports() -> dict:
+    return materialize_formal_performance_reports()
+
+
+@router.post("/model-strategy/backend-acceptance/run")
+def model_strategy_backend_acceptance_run(suite: str = "plan-book-backend") -> dict:
+    return run_and_record_backend_acceptance(suite=suite)
+
+
+@router.get("/model-strategy/backend-acceptance/runs")
+def model_strategy_backend_acceptance_runs(suite: str | None = None, limit: int = 20) -> dict:
+    return list_backend_acceptance_runs(suite=suite, limit=limit)
 
 
 @router.get("/model-strategy/workbench")
@@ -251,13 +392,27 @@ def model_strategy_gate(req: StrategyGateRequest) -> dict:
 def model_strategy_portfolio_risk(req: PortfolioRiskRequest) -> dict:
     """Expose the exact portfolio optimizer and explicit fallback decision."""
     observations = {str(k): [float(x) for x in v] for k, v in req.returns_by_symbol.items()}
+    optimizer_result = two_group_cvar_optimizer(
+        observations,
+        expected_returns=req.expected_returns,
+        buckets=req.buckets,
+        current_weights=req.current_weights,
+        trading_costs=req.trading_costs,
+        crowding=req.crowding,
+    )
     covariance = ledoit_wolf_covariance(observations)
     weights = constrained_cvar_weights(observations, max_single=req.max_single)
     optimizer = "ledoit_wolf_shrinkage_plus_constrained_cvar_v1"
     if not weights:
         weights = hrp_fallback_weights(observations, max_single=req.max_single)
         optimizer = "hrp_inverse_volatility_fallback_v1"
-    return {"optimizer": optimizer, "weights": weights, "covariance": covariance, "weight_sum": round(sum(weights.values()), 8)}
+    return {
+        "optimizer": optimizer,
+        "weights": weights,
+        "covariance": covariance,
+        "weight_sum": round(sum(weights.values()), 8),
+        "two_group_optimizer": optimizer_result,
+    }
 
 
 @router.post("/model-strategy/black-litterman")
@@ -305,7 +460,19 @@ def model_strategy_black_litterman(req: BlackLittermanRequest) -> dict:
 
 @router.post("/model-strategy/slo/evaluate")
 def model_strategy_slo(req: SLORequest) -> dict:
+    if req.persist:
+        return evaluate_and_record_slo(
+            req.samples,
+            scope=req.scope,
+            freshness_seconds=req.freshness_seconds,
+            success_target=req.success_target,
+        )
     return evaluate_slo(req.samples, freshness_seconds=req.freshness_seconds, success_target=req.success_target)
+
+
+@router.get("/model-strategy/slo/history")
+def model_strategy_slo_history(scope: str | None = None, limit: int = 100) -> dict:
+    return list_slo_evaluations(scope=scope, limit=limit)
 
 
 @router.post("/model-strategy/oos/report")

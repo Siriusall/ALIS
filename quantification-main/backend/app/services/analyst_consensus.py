@@ -8,11 +8,18 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
-from collections import defaultdict
 
 from app.data_platform.db import _conn
+
+
+def _yyyymmdd(value: str | None) -> str:
+    return str(value or "")[:10].replace("-", "")
+
+
+def _shift_yyyymmdd(value: str, days: int) -> str:
+    return (datetime.strptime(value, "%Y%m%d").date() + timedelta(days=days)).strftime("%Y%m%d")
 
 
 def build_analyst_consensus(ts_code: str, *, as_of_time: str | None = None) -> dict[str, Any]:
@@ -20,7 +27,7 @@ def build_analyst_consensus(ts_code: str, *, as_of_time: str | None = None) -> d
 
     Returns consensus rating, target price, and estimate revisions.
     """
-    cutoff = str(as_of_time or "")[:10].replace("-", "")
+    cutoff = _yyyymmdd(as_of_time)
     cutoff_clause = " AND trade_date<=?" if cutoff else ""
     params: tuple[Any, ...] = (cutoff,) if cutoff else ()
 
@@ -87,9 +94,13 @@ def build_analyst_consensus(ts_code: str, *, as_of_time: str | None = None) -> d
             target_price_min = round(min(prices), 2)
             target_price_max = round(max(prices), 2)
 
-    # Recent trend (last 4 weeks vs prior 4 weeks)
-    recent = [r for r in valid_ratings if r["trade_date"] >= "20260701"]
-    prior = [r for r in valid_ratings if r["trade_date"] < "20260701" and r["trade_date"] >= "20260601"]
+    # Recent trend uses a rolling 4-week window anchored to as_of_time when
+    # provided, otherwise to the latest available report date for this stock.
+    anchor_date = cutoff or max((str(r.get("trade_date") or "") for r in valid_ratings), default="")
+    recent_start = _shift_yyyymmdd(anchor_date, -27) if anchor_date else ""
+    prior_start = _shift_yyyymmdd(anchor_date, -55) if anchor_date else ""
+    recent = [r for r in valid_ratings if recent_start and recent_start <= r["trade_date"] <= anchor_date]
+    prior = [r for r in valid_ratings if prior_start and prior_start <= r["trade_date"] < recent_start]
     recent_avg = sum(rating_scores[r["rating"]] for r in recent) / len(recent) if recent else None
     prior_avg = sum(rating_scores[r["rating"]] for r in prior) / len(prior) if prior else None
     revision = None
@@ -110,6 +121,14 @@ def build_analyst_consensus(ts_code: str, *, as_of_time: str | None = None) -> d
         "report_count": len(valid_ratings),
         "analyst_count": len(set(r["org_name"] for r in valid_ratings if r["org_name"])),
         "rating_revision": revision,
+        "revision_window": {
+            "anchor_date": anchor_date,
+            "recent_start": recent_start,
+            "prior_start": prior_start,
+            "recent_reports": len(recent),
+            "prior_reports": len(prior),
+            "method": "rolling_4w_vs_prior_4w",
+        },
         "confidence": round(confidence, 4),
         "latest_reports": [{"date": r["trade_date"], "rating": r["rating"], "org": r["org_name"], "title": r["report_title"]} for r in reports[:5]],
         "model_version": "analyst_consensus_v1",

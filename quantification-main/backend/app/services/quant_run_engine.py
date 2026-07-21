@@ -103,15 +103,7 @@ def _apply_research_admission(target_symbols: List[str], *, as_of_time: str | No
     for symbol in target_symbols:
         code = _ts_code(symbol)
         if code not in core_codes:
-            from app.services.theme_engine import best_theme_for_stock
-            from app.services.research_engine import build_stock_research
-            theme = best_theme_for_stock(code, as_of_time=as_of_time)
-            research = build_stock_research(code, persist=True, as_of_time=as_of_time)
-            tactical_ok = bool(theme and theme.get("promotable") and theme.get("lifecycle") not in {"退潮", "沉寂"} and (research.get("risk") or {}).get("eligible"))
-            if tactical_ok:
-                admitted.append(symbol)
-                continue
-            blocked.append({"symbol": symbol, "ts_code": code, "side": "BUY", "code": "not_in_core_or_narrative_pool", "message": "既不是长期核心资产，也未通过短期主线与风险准入"})
+            blocked.append({"symbol": symbol, "ts_code": code, "side": "BUY", "code": "not_in_core_pool", "message": "模型排名不能绕过核心研究池准入"})
             continue
         eligibility = evaluate_core_pool_eligibility(code, as_of_time=as_of_time)
         if not eligibility.get("eligible_for_core"):

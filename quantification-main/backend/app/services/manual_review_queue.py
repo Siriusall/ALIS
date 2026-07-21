@@ -92,6 +92,24 @@ def submit_manual_review_action(*, review_key: str, item_kind: str, action: str,
         })
         from app.services.review_learning import materialize_training_feedback
         materialize_training_feedback()
+    if item_kind == "model_release" and review_key.startswith("model:"):
+        try:
+            from app.services.plan_model_control import model_family_status, review_plan_model_version
+
+            target_version = review_key.split(":", 1)[1]
+            for item in model_family_status().get("items") or []:
+                latest = item.get("latest_version") or {}
+                if str(latest.get("version") or latest.get("id") or "") == target_version:
+                    review_plan_model_version(
+                        int(latest["id"]),
+                        reviewer=actor or "manual-review",
+                        decision="approved" if action in {"approved", "modified_approved", "ai_adopted"} else "rejected",
+                        comment=comment,
+                        waive_live_observation=True,
+                    )
+                    break
+        except Exception:
+            pass
     payload = dict(row)
     payload["llm_draft"] = json.loads(payload.pop("llm_draft_json") or "{}")
     return payload
@@ -144,6 +162,40 @@ def build_manual_review_queue(limit: int = 200, *, human_only: bool = True) -> d
             "evidence": {"validation": hsmm.get("validation"), "live_observation_weeks": hsmm.get("live_observation_weeks")},
             "target_section": "governance",
             })
+
+    try:
+        from app.services.plan_model_control import model_family_status
+
+        for plan_item in model_family_status().get("items") or []:
+            latest = plan_item.get("latest_version") or {}
+            if not latest or str(plan_item.get("status") or "") != "candidate":
+                continue
+            review = ((latest.get("validation") or {}).get("review") or {})
+            if review.get("status"):
+                continue
+            model_key = f"model:{latest.get('version') or latest.get('id')}"
+            if model_key in handled:
+                continue
+            items.append({
+                "key": model_key,
+                "kind": "model_release",
+                "priority": "high",
+                "title": f"计划书模型上线评审 · {plan_item.get('name')}",
+                "reason": "候选模型已完成滚动OOS与费用后回放，等待人工评审；模拟系统可豁免真实20日观察。",
+                "status": "pending",
+                "created_at": latest.get("updated_at"),
+                "subject": latest.get("version") or plan_item.get("model_key"),
+                "evidence": {
+                    "model_version_id": latest.get("id"),
+                    "model_key": plan_item.get("model_key"),
+                    "validation": latest.get("validation"),
+                    "coverage": plan_item.get("coverage"),
+                    "blocked_reasons": plan_item.get("blocked_reasons"),
+                },
+                "target_section": "governance",
+            })
+    except Exception:
+        pass
 
     system = build_governance_overview()
     for row in (system.get("tasks") or {}).get("failed_or_paused") or []:

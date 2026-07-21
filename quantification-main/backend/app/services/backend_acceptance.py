@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from app.data_platform.db import _conn as data_conn
@@ -26,7 +27,8 @@ def backend_acceptance_matrix() -> dict[str, Any]:
     with business_conn() as c:
         decisions = int(dict(c.execute("SELECT COUNT(*) count FROM decision_snapshots").fetchone()).get("count") or 0)
         operations = dict(c.execute("SELECT COUNT(*) count,COUNT(DISTINCT operation_uid) unique_count FROM operations").fetchone())
-        reports = int(dict(c.execute("SELECT COUNT(*) count FROM quant_performance_reports").fetchone()).get("count") or 0)
+        report_cursor = c.execute("SELECT period_type,payload_json FROM quant_performance_reports ORDER BY id DESC LIMIT 200")
+        report_rows = report_cursor.fetchall() if hasattr(report_cursor, "fetchall") else []
         theses = int(dict(c.execute("SELECT COUNT(*) count FROM investment_theses").fetchone()).get("count") or 0)
 
     raw_total = int(raw.get("total") or 0) + int(snapshots.get("total") or 0)
@@ -41,7 +43,23 @@ def backend_acceptance_matrix() -> dict[str, Any]:
     checks.append(_check("P3_DEFENSIVE", "防御资产数据", defensive == 5, {"ready_asset_count": defensive, "required": 5}, partial=defensive > 0, requirement="货币、债券、黄金、低波和红利ETF"))
     checks.append(_check("P3_DECISION", "决策证据快照", decisions > 0, {"snapshots": decisions}, requirement="决策具备证据、版本、置信度和可回放快照"))
     checks.append(_check("P3_LEDGER", "唯一模拟执行账本", int(operations.get("count") or 0) == int(operations.get("unique_count") or 0), {"operations": int(operations.get("count") or 0), "unique_operation_uid": int(operations.get("unique_count") or 0)}, requirement="逐笔成交不可重复且费用版本化"))
-    checks.append(_check("P3_REPORTS", "周期绩效报告", reports > 0, {"reports": reports}, requirement="周/月/年收益、回撤、成本和归因持久化"))
+    report_types = {str(dict(row).get("period_type") or "") for row in report_rows}
+    required_types = {"weekly", "monthly", "yearly"}
+    complete_reports = 0
+    for row in report_rows:
+        try:
+            payload = json.loads(dict(row).get("payload_json") or "{}")
+        except Exception:
+            payload = {}
+        keys = set(payload)
+        has_return = bool(keys & {"return", "return_pct", "total_return", "period_return"})
+        has_drawdown = bool(keys & {"drawdown", "drawdown_pct", "max_drawdown"})
+        has_cost = bool(keys & {"cost", "costs", "trading_cost", "total_cost"})
+        has_attribution = bool(keys & {"attribution", "return_attribution", "brinson_attribution"})
+        if has_return and has_drawdown and has_cost and has_attribution:
+            complete_reports += 1
+    reports_passed = required_types <= report_types and complete_reports >= 3
+    checks.append(_check("P3_REPORTS", "周期绩效报告", reports_passed, {"reports": len(report_rows), "period_types": sorted(report_types), "complete_reports": complete_reports, "required_types": sorted(required_types)}, partial=bool(report_rows), requirement="周/月/年收益、回撤、成本和归因持久化"))
     governance = market_state_model_governance()
     hsmm = governance.get("hsmm") or {}
     hsmm_status = str(hsmm.get("status") or "")
