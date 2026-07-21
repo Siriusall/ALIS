@@ -14,6 +14,7 @@ from app.services.quant_run_engine import list_consolidated_trade_dates
 from app.services.operations_overview import build_live_portfolio_risk
 from app.services.theme_engine import list_themes
 from app.services.daily_rebalance import build_daily_rebalance_report
+from app.services.decision_enhancement import build_decision_enhancement
 from app.services.quant_risk import evaluate_model_readiness_gate
 
 router = APIRouter()
@@ -346,10 +347,12 @@ def _build_gate_decision(
 
     position_gate = market_overview.get("position_gate") if isinstance(market_overview.get("position_gate"), dict) else {}
     if not bool(position_gate.get("allow_new_exposure", True)):
+        portfolio_risk = market_overview.get("portfolio_risk") if isinstance(market_overview.get("portfolio_risk"), dict) else {}
+        deleveraging_actions = portfolio_risk.get("deleveraging_actions") if isinstance(portfolio_risk.get("deleveraging_actions"), list) else []
         return {
             "tone": "hold",
-            "title": "组合风险门控限制新增仓位",
-            "detail": str(position_gate.get("reason") or "组合风险状态不允许扩张风险预算"),
+            "title": "不新增仓位，执行降风险计划" if deleveraging_actions else "组合风险门控限制新增仓位",
+            "detail": "风险门控只限制买入扩张；减仓、降权和防御调仓仍会继续执行。" if deleveraging_actions else str(position_gate.get("reason") or "组合风险状态不允许扩张风险预算"),
             "reason_code": "portfolio_risk_gate",
         }
 
@@ -410,6 +413,92 @@ def _build_gate_decision(
     }
 
 
+def _risk_gate_explanation(
+    *,
+    gate_decision: dict[str, Any],
+    latest_data_contract: dict[str, Any],
+    ledger: dict[str, Any],
+    model_status: dict[str, Any],
+    market_overview: dict[str, Any],
+    recent_execution: dict[str, Any] | None,
+) -> dict[str, Any]:
+    position_gate = market_overview.get("position_gate") if isinstance(market_overview.get("position_gate"), dict) else {}
+    portfolio_risk = market_overview.get("portfolio_risk") if isinstance(market_overview.get("portfolio_risk"), dict) else {}
+    market_state = market_overview.get("market_state") if isinstance(market_overview.get("market_state"), dict) else {}
+    cash = float(ledger.get("cash_balance") or 0)
+    drawdown = float(ledger.get("drawdown") or 0)
+    risk_budget = float(position_gate.get("combined_risk_budget_multiplier") or market_state.get("risk_budget_multiplier") or 0)
+    deleveraging_actions = portfolio_risk.get("deleveraging_actions") if isinstance(portfolio_risk.get("deleveraging_actions"), list) else []
+    requires_rebalance = bool(deleveraging_actions)
+    allow_new = bool(position_gate.get("allow_new_exposure", True)) and gate_decision.get("tone") == "go"
+    reasons: list[dict[str, Any]] = []
+    constraints: list[str] = []
+    plan: list[dict[str, str]] = []
+    release: list[str] = []
+
+    if not latest_data_contract.get("ok"):
+        reasons.append({"level": "block", "title": "当日数据未冻结", "detail": str(latest_data_contract.get("reason") or "最新交易日快照未完成")})
+        constraints.append("不根据不完整收盘数据新增仓位")
+        plan.append({"step": "等待数据", "detail": "日更任务会继续复核最新交易日行情、估值和涨跌停数据"})
+        release.append("最新交易日 daily/daily_basic/stk_limit 和快照全部入库")
+    if not model_status.get("active_version"):
+        reasons.append({"level": "block", "title": "生产模型未接管", "detail": "当前没有可用于正式决策的 active 模型版本"})
+        constraints.append("不允许生产模型缺位时自动新增风险敞口")
+        plan.append({"step": "模型治理", "detail": "等待候选模型完成验证并通过上线控制"})
+        release.append("模型治理页存在 active production 版本")
+    if not bool(position_gate.get("allow_new_exposure", True)):
+        breaches = [str(item.get("message") or item.get("code") or "") for item in (portfolio_risk.get("breaches") or []) if item]
+        reasons.append({
+            "level": "block",
+            "title": "组合风险硬约束",
+            "detail": "；".join(breaches[:3]) or str(position_gate.get("reason") or "组合风险状态不允许扩张风险预算"),
+        })
+        constraints.append("不新增股票风险敞口，只允许降风险或防御调整")
+        for action in deleveraging_actions[:3]:
+            symbol = str(action.get("symbol") or action.get("industry") or "组合")
+            target = action.get("target_weight")
+            target_text = f"目标 {float(target) * 100:.1f}%" if isinstance(target, (int, float)) else "降到约束内"
+            plan.append({"step": "自动降风险", "detail": f"{symbol} {target_text}，不被新增仓位门控拦截"})
+        if not deleveraging_actions:
+            plan.append({"step": "风险复核", "detail": "系统不新增仓位；若出现超配、逻辑失效或回撤约束，会优先生成减仓/防御调仓"})
+        release.append("组合风险状态恢复为 ready，且没有硬约束 breaches")
+    if risk_budget <= 0:
+        reasons.append({"level": "block", "title": "风险预算为 0", "detail": "组合/市场门控合成后的新增风险预算为 0"})
+        constraints.append("新增仓位目标权重被压到 0")
+        release.append("合成风险预算大于 0")
+    elif risk_budget < 0.8:
+        reasons.append({"level": "warn", "title": "风险预算收缩", "detail": f"当前最终风险预算约 {risk_budget * 100:.0f}%，不按常态扩张"})
+        constraints.append("新增仓位必须落在收缩后的风险预算内")
+    if cash < MIN_CASH_FOR_TRADE:
+        reasons.append({"level": "warn", "title": "可用现金不足", "detail": f"可用现金 {cash:,.2f} 元，低于最小交易门槛 {MIN_CASH_FOR_TRADE:,.0f} 元"})
+        constraints.append("可能无法完成最小一手调仓")
+        release.append(f"可用现金恢复到 {MIN_CASH_FOR_TRADE:,.0f} 元以上")
+    if drawdown <= -0.08:
+        reasons.append({"level": "warn", "title": "账户回撤接近风险线", "detail": f"当前回撤 {drawdown * 100:.2f}%，优先控制组合波动"})
+        constraints.append("优先处理减仓和风险复盘")
+        release.append("账户回撤回到 -8% 以内")
+    if recent_execution:
+        plan.append({"step": "复盘成交", "detail": "最近执行已入账，系统只在出现新信号或风险变化时再给交易"})
+    if not plan:
+        plan.append({"step": "生成分析", "detail": "数据、模型和风险门控通过后，系统生成量化分析与目标组合"})
+    if not release:
+        release.append("数据、模型、现金和组合风险门控全部通过")
+    return {
+        "allow_new_exposure": allow_new,
+        "allow_sell": True,
+        "allow_reduce": True,
+        "allow_defensive": True,
+        "requires_rebalance": requires_rebalance,
+        "risk_budget_multiplier": round(risk_budget, 4),
+        "reason_code": gate_decision.get("reason_code"),
+        "headline": "允许新增仓位" if allow_new else "不新增仓位，系统优先降风险" if requires_rebalance else "暂不新增仓位",
+        "reasons": reasons or [{"level": "ok", "title": "门控通过", "detail": "数据、模型、现金和组合风险均满足新增条件"}],
+        "constraints": constraints or ["允许按目标组合和交易约束新增仓位"],
+        "today_plan": plan,
+        "release_conditions": release,
+    }
+
+
 @router.get("/decision/daily-report")
 def decision_daily_report() -> dict[str, Any]:
     """P3-7 每日调仓报告"""
@@ -439,6 +528,21 @@ def decision_summary(limit_days: int = Query(30, ge=1, le=250)) -> dict[str, Any
             ),
             "reason_code": "daily_allocation_executed",
         }
+    risk_gate_explanation = _risk_gate_explanation(
+        gate_decision=gate_decision,
+        latest_data_contract=latest_data_contract,
+        ledger=ledger,
+        model_status=model_status,
+        market_overview=market_overview,
+        recent_execution=recent_execution,
+    )
+    decision_enhancement = build_decision_enhancement(
+        gate_decision=gate_decision,
+        risk_gate_explanation=risk_gate_explanation,
+        market_overview=market_overview,
+        ledger=ledger,
+        recent_execution=recent_execution,
+    )
     return {
         "data_health": data_health,
         "latest_data_contract": latest_data_contract,
@@ -446,6 +550,8 @@ def decision_summary(limit_days: int = Query(30, ge=1, le=250)) -> dict[str, Any
         "model_status": model_status,
         "market_overview": market_overview,
         "gate_decision": gate_decision,
+        "risk_gate_explanation": risk_gate_explanation,
+        "decision_enhancement": decision_enhancement,
         "recent_execution": recent_execution,
         "latest_model_validation": _latest_model_validation(model_status),
         "latest_analyze": None,

@@ -1307,6 +1307,114 @@ def backfill_etf_price_history(
     }
 
 
+def backfill_etf_daily_incremental(
+    *, start_date: str, end_date: str, cursor: str = "", limit_dates: int = 10, nav_limit_funds: int = 100
+) -> dict[str, Any]:
+    """Incrementally sync ETF prices by trade date instead of by fund code."""
+    if not (len(start_date) == len(end_date) == 8 and start_date.isdigit() and end_date.isdigit()):
+        raise ValueError("start_date/end_date must be YYYYMMDD")
+    if start_date > end_date:
+        raise ValueError("start_date must not be after end_date")
+    limit_dates = max(1, min(int(limit_dates), 60))
+    nav_limit_funds = max(0, min(int(nav_limit_funds), 300))
+    with _conn() as c:
+        date_rows = c.execute(
+            """SELECT cal_date FROM dc_trade_calendar
+               WHERE exchange='SSE' AND is_open=1 AND cal_date BETWEEN ? AND ?
+                 AND cal_date>?
+               ORDER BY cal_date ASC LIMIT ?""",
+            (start_date, end_date, cursor, limit_dates),
+        ).fetchall()
+        fund_rows = c.execute(
+            """SELECT ts_code,payload_json FROM dc_tushare_raw_records
+               WHERE api_name='fund_basic' ORDER BY ts_code ASC"""
+        ).fetchall()
+    trade_dates = [str(dict(row).get("cal_date") or "") for row in date_rows]
+    if not trade_dates:
+        return {
+            "ok": True,
+            "start_date": start_date,
+            "end_date": end_date,
+            "cursor": cursor,
+            "dates_processed": 0,
+            "has_more": False,
+            "requests_executed": 0,
+            "requests_skipped": 0,
+            "rows_written": 0,
+            "failed": 0,
+            "results": [],
+        }
+
+    funds: list[dict[str, str]] = []
+    if nav_limit_funds > 0:
+        for row in fund_rows:
+            item = dict(row)
+            raw_payload = item.get("payload_json") or {}
+            if isinstance(raw_payload, dict):
+                payload = raw_payload
+            else:
+                try:
+                    payload = json.loads(str(raw_payload))
+                except json.JSONDecodeError:
+                    continue
+            name = str(payload.get("name") or "")
+            list_date = str(payload.get("list_date") or "")
+            delist_date = str(payload.get("delist_date") or "")
+            if "ETF" not in name.upper() or not list_date or list_date > trade_dates[-1]:
+                continue
+            if delist_date and delist_date < trade_dates[0]:
+                continue
+            funds.append({"ts_code": str(item.get("ts_code") or payload.get("ts_code") or ""), "list_date": list_date})
+            if len(funds) >= nav_limit_funds:
+                break
+
+    pending_requests: list[tuple[str, dict[str, Any]]] = []
+    skipped = 0
+    for trade_date in trade_dates:
+        daily_params = {"trade_date": trade_date}
+        if _request_is_complete("fund_daily", daily_params):
+            skipped += 1
+        else:
+            pending_requests.append(("fund_daily", daily_params))
+        for fund in funds:
+            if fund["list_date"] > trade_date:
+                continue
+            nav_params = {"ts_code": fund["ts_code"], "start_date": trade_date, "end_date": trade_date}
+            if _request_is_complete("fund_nav", nav_params):
+                skipped += 1
+            else:
+                pending_requests.append(("fund_nav", nav_params))
+
+    def fetch_one(item: tuple[str, dict[str, Any]]) -> dict[str, Any]:
+        api_name, params = item
+        return {"api_name": api_name, "request": params, **_safe_sync_raw(api_name, params)}
+
+    results: list[dict[str, Any]] = []
+    workers = 0
+    for offset in range(0, len(pending_requests), 4):
+        chunk_results, chunk_workers = _parallel_tushare_map(
+            pending_requests[offset : offset + 4], fetch_one, prefix="tushare-etf-daily"
+        )
+        results.extend(chunk_results)
+        workers = max(workers, chunk_workers)
+    next_cursor = trade_dates[-1]
+    return {
+        "ok": all(bool(item.get("ok")) for item in results),
+        "start_date": start_date,
+        "end_date": end_date,
+        "cursor": next_cursor,
+        "dates_processed": len(trade_dates),
+        "funds_processed_for_nav": len(funds),
+        "has_more": next_cursor < end_date,
+        "requests_executed": len(results),
+        "requests_skipped": skipped,
+        "concurrency": workers,
+        "rows_written": sum(int(item.get("rows_written") or 0) for item in results),
+        "failed": sum(1 for item in results if not item.get("ok")),
+        "results": results,
+    }
+
+
 def backfill_etf_constituents_history(
     *, start_date: str, end_date: str, cursor: str = "", limit_dates: int = 20
 ) -> dict[str, Any]:
@@ -1651,6 +1759,10 @@ def get_vip_backfill_status(
 
     expected_etf: set[str] = set()
     etf_keys_by_code: list[tuple[str, set[str]]] = []
+    etf_daily_keys_by_date: list[tuple[str, set[str]]] = []
+    for trade_date in dates:
+        daily_keys = {expect("fund_daily", {"trade_date": trade_date})}
+        etf_daily_keys_by_date.append((trade_date, daily_keys))
     for fund in etf_funds:
         params = {
             "ts_code": fund["ts_code"],
@@ -1733,7 +1845,12 @@ def get_vip_backfill_status(
     return {
         "ok": True,
         "capital": contract(len(expected_capital & completed_keys), len(expected_capital), resume_cursor(capital_keys_by_date)),
-        "etf_price_nav": contract(len(expected_etf & completed_keys), len(expected_etf), resume_cursor(etf_keys_by_code)),
+        "etf_price_nav": {
+            **contract(len(expected_etf & completed_keys), len(expected_etf), resume_cursor(etf_keys_by_code)),
+            "resume_cursor": resume_cursor(etf_daily_keys_by_date),
+            "resume_cursor_mode": "trade_date",
+            "fund_code_resume_cursor": resume_cursor(etf_keys_by_code),
+        },
         "etf_constituents": contract(
             fund_portfolio_done,
             len(expected_etf_constituents),

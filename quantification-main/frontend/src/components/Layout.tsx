@@ -9,8 +9,10 @@ import {
 } from "./dataCenterSections";
 import type { SectionKey as DataCenterSectionKey } from "./DataCenterTechnicalConsole";
 import {
+  DEFAULT_GOVERNANCE_SECTION,
   GOVERNANCE_SECTION_EVENT,
   GOVERNANCE_SECTION_STORAGE_KEY,
+  normalizeGovernanceSection,
   type GovernanceSectionKey,
 } from "./governanceSections";
 
@@ -41,23 +43,24 @@ export const ALL_SECTION_IDS = [
 ] as const;
 
 export const NAV_ITEMS = [
-  { id: "market", label: "决策主控", description: "行情识别、选股、配置", icon: "decision" },
-  { id: "governance", label: "模型工厂", description: "训练、验证、上线", icon: "governance" },
-  { id: "portfolioWorkbench", label: "组合配置", description: "五仓、风险、模拟落账", icon: "portfolio" },
-  { id: "reviewWorkbench", label: "复盘学习", description: "绩效、归因、人工确认", icon: "review" },
-  { id: "dataCenter", label: "数据工具", description: "数据资产与质量", icon: "data" },
-  { id: "research", label: "证据库", description: "研究证据明细", icon: "research" },
+  { id: "market", label: "今日驾驶舱", description: "系统给出今日动作", icon: "decision" },
+  { id: "governance", label: "模型训练", description: "训练、评审、上线", icon: "governance" },
+  { id: "portfolioWorkbench", label: "组合与调仓", description: "持仓、风险、成交", icon: "portfolio" },
+  { id: "reviewWorkbench", label: "复盘学习", description: "绩效、归因、改进", icon: "review" },
+  { id: "dataCenter", label: "数据后台", description: "自动补数与质量", icon: "data" },
+  { id: "research", label: "证据后台", description: "系统研究明细", icon: "research" },
 ] as const;
 
 const PRIMARY_NAV_ITEMS = NAV_ITEMS.slice(0, 4);
 const TOOL_NAV_ITEMS = NAV_ITEMS.slice(4);
 
 const SYSTEM_SECTIONS = [
-  { key: "models", label: "模型训练", hint: "计划书模型训练与上线", target: "governance" },
-  { key: "overview", label: "系统概况", hint: "生产链路是否可用", target: "governance" },
-  { key: "tasks", label: "自动任务", hint: "训练、补数、报表任务", target: "governance" },
-  { key: "services", label: "系统诊断", hint: "服务与数据健康", target: "governance" },
-  { key: "logs", label: "系统日志", hint: "后台异常排查", target: "backendLogs" },
+  { key: "modelStatus", label: "模型状态", hint: "生产、候选、可训练", target: "governance" },
+  { key: "modelTraining", label: "模型训练过程", hint: "进度、阶段、队列", target: "governance" },
+  { key: "modelParameters", label: "模型参数", hint: "目标、标签、特征", target: "governance" },
+  { key: "modelAutoOptimization", label: "模型自优化", hint: "自动训练，人工闸门", target: "governance" },
+  { key: "modelPromotion", label: "模型晋升", hint: "批准、驳回、上线", target: "governance" },
+  { key: "modelVersions", label: "模型版本管理", hint: "历史版本与回退", target: "governance" },
 ] as const;
 
 export type SectionId = (typeof ALL_SECTION_IDS)[number];
@@ -141,7 +144,7 @@ export default function Layout({
   );
   const [governanceOpen, setGovernanceOpen] = useState(["governance", "strategy", "dataCenter", "backendLogs"].includes(currentSection));
   const [governanceSection, setGovernanceSection] = useState<GovernanceSectionKey>(() => {
-    return (window.localStorage.getItem(GOVERNANCE_SECTION_STORAGE_KEY) as GovernanceSectionKey | null) || "models";
+    return normalizeGovernanceSection(window.localStorage.getItem(GOVERNANCE_SECTION_STORAGE_KEY));
   });
   const currentChild = sections[currentSection] ?? sections.market;
   const navSection = getNavSection(currentSection);
@@ -177,7 +180,7 @@ export default function Layout({
 
   useEffect(() => {
     const onGovernanceSection = (event: Event) => {
-      const section = (event as CustomEvent<GovernanceSectionKey>).detail;
+      const section = normalizeGovernanceSection((event as CustomEvent<string>).detail);
       if (section) setGovernanceSection(section);
     };
     window.addEventListener(GOVERNANCE_SECTION_EVENT, onGovernanceSection);
@@ -193,7 +196,7 @@ export default function Layout({
 
   function handleGovernanceParent() {
     if (navSection !== "governance") {
-      handleGovernanceSection("models");
+      handleGovernanceSection(DEFAULT_GOVERNANCE_SECTION);
       setGovernanceOpen(true);
       return;
     }
@@ -289,8 +292,8 @@ export default function Layout({
       <div className="dashboard-root-inner">
         <aside className="dashboard-sidebar" aria-label="主导航">
           <div className="dashboard-sidebar-intro">
-            <span>主线</span>
-            <strong>训练模型 → 识别行情 → 选股配置 → 复盘学习</strong>
+            <span>怎么用</span>
+            <strong>先看今日驾驶舱；只有模型、数据异常时再进后台</strong>
           </div>
           <nav className="dashboard-nav">
             {PRIMARY_NAV_ITEMS.map(({ id, label, description, icon }, index) => id === "governance" ? (
@@ -317,7 +320,7 @@ export default function Layout({
                 <span className="dashboard-nav-copy"><strong>{label}</strong><small>{description}</small></span>
               </button>
             ))}
-            <div className="dashboard-nav-tools-label">工具区</div>
+            <div className="dashboard-nav-tools-label">系统后台 · 平时不用盯</div>
             {TOOL_NAV_ITEMS.map(({ id, label, description, icon }) => id === "dataCenter" ? (
               <div className={`dashboard-nav-group ${dataCenterOpen ? "open" : ""}`} key={id}>
                 <button type="button" className={`dashboard-nav-item dashboard-nav-parent ${navSection === id ? "active" : ""}`} onClick={handleDataCenterParent} aria-expanded={dataCenterOpen}>

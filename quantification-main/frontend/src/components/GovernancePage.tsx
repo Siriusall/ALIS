@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { fetchGovernanceOverview, fetchMarketContextGovernance, type GovernanceOverview, type MarketContextGovernance } from "../api/research";
 import {
   autoTuneModels,
+  fetchPlanModelAutoOptimization,
   fetchPlanModels,
   fetchModelStrategyStatus,
   materializeFormalPerformanceReports,
@@ -9,10 +10,13 @@ import {
   reviewCandidatePlanModels,
   reviewPlanModelVersion,
   rollbackModelVersion,
+  runPlanModelAutoOptimization,
   startAllTrainablePlanModels,
   startPlanModelTraining,
   startModelTraining,
   type ModelStrategyStatus,
+  type ModelTrainRun,
+  type PlanModelAutoOptimizationStatus,
   type PlanModelControl,
   type ModelVersion,
 } from "../api/modelStrategy";
@@ -37,6 +41,7 @@ import LoadingState from "./LoadingState";
 import {
   GOVERNANCE_SECTION_EVENT,
   GOVERNANCE_SECTION_STORAGE_KEY,
+  normalizeGovernanceSection,
   type GovernanceSectionKey,
 } from "./governanceSections";
 
@@ -46,6 +51,7 @@ function statusText(value: unknown) {
     ready: "正常", blocked: "阻塞", degraded: "降级", unknown: "待检查",
     running: "运行中", queued: "排队中", completed: "已完成", failed: "失败",
     paused: "已暂停", candidate: "候选", watch: "观察", active: "生产中",
+    production: "生产中", trainable: "可训练", proxy: "待数据",
     artifact_missing: "模型文件缺失", passed: "验证通过",
   };
   return map[key] || key;
@@ -61,12 +67,102 @@ function number(value: unknown, digits = 4) {
   return Number.isFinite(parsed) ? parsed.toFixed(digits) : "—";
 }
 
+function walkForwardText(metrics: Record<string, unknown> | undefined) {
+  if (!metrics) return "—";
+  const lift = Number(metrics.lift);
+  const walkForward = Number(metrics.walk_forward_lift);
+  const windows = Number(metrics.walk_forward_windows || metrics.walk_forward_folds || 0);
+  if (Number.isFinite(lift) && Number.isFinite(walkForward) && lift === walkForward && windows <= 0) {
+    return "旧版未分窗";
+  }
+  return number(metrics.walk_forward_lift);
+}
+
+function metricValue(metrics: Record<string, unknown> | undefined, key: string) {
+  const value = Number(metrics?.[key]);
+  return Number.isFinite(value) ? value : null;
+}
+
+function signedNumber(value: unknown, digits = 4) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return "—";
+  return `${parsed > 0 ? "+" : ""}${parsed.toFixed(digits)}`;
+}
+
+function approvalAdvice(candidate: Record<string, unknown> | undefined, production: Record<string, unknown> | undefined) {
+  const candidateLift = metricValue(candidate, "lift");
+  const productionLift = metricValue(production, "lift");
+  const candidateWf = metricValue(candidate, "walk_forward_lift");
+  const productionWf = metricValue(production, "walk_forward_lift");
+  if (candidateLift == null && candidateWf == null) return "缺少候选指标，先不批准";
+  if ((candidateLift ?? -Infinity) <= 0 || (candidateWf ?? candidateLift ?? -Infinity) <= 0) return "候选收益指标为负，建议驳回或继续观察";
+  if (productionWf != null && candidateWf != null && candidateWf < productionWf) return "弱于生产模型，谨慎批准";
+  if (productionLift != null && candidateLift != null && candidateLift < productionLift) return "Lift 弱于生产模型，谨慎批准";
+  return "候选不弱于生产模型，可进入人工批准";
+}
+
+function autoOptimizationVerdict(item: {
+  trigger?: string;
+  requires_human?: boolean;
+  running?: boolean;
+  shadow_ab?: { has_challenger?: boolean; status?: string; delta?: number; observation_sessions?: number; minimum_sessions?: number };
+}) {
+  const shadow = item.shadow_ab;
+  if (item.requires_human) return { tone: "action", title: "需要你批准", detail: "候选模型已过系统筛选，上线前保留人工闸门。" };
+  if (shadow?.status === "auto_rejected" || item.trigger === "auto_rejected") return { tone: "done", title: "系统已驳回", detail: "候选弱于现有生产模型，不进入人工审批。" };
+  if (item.running) return { tone: "watch", title: "正在训练", detail: "系统正在生成新候选，完成后自动比较。" };
+  if (item.trigger === "retrain_challenger") return { tone: "watch", title: "系统待重训", detail: "生产指标偏弱，下一轮生成候选对照。" };
+  if (shadow?.has_challenger) {
+    const delta = Number(shadow.delta);
+    const sessions = `${Number(shadow.observation_sessions || 0)}/${Number(shadow.minimum_sessions || 20)}`;
+    return { tone: delta >= 0 ? "watch" : "done", title: delta >= 0 ? "继续观察" : "系统会驳回", detail: `候选对比差值 ${signedNumber(delta)}，观察期 ${sessions}。` };
+  }
+  return { tone: "idle", title: "无需处理", detail: "当前生产模型可用，暂无新候选。" };
+}
+
 function compact(value: unknown) {
   if (value === null || value === undefined || value === "") return "—";
   if (typeof value === "boolean") return value ? "是" : "否";
   if (Array.isArray(value)) return value.length ? value.join("、") : "—";
   if (typeof value === "object") return JSON.stringify(value);
   return String(value);
+}
+
+function trainingTimeline(run: ModelTrainRun | null | undefined) {
+  const timeline = Array.isArray(run?.metrics?.timeline) ? run.metrics.timeline : [];
+  if (timeline.length) return timeline;
+  if (!run) return [];
+  return [{
+    at: run.updated_at || run.created_at,
+    phase: run.phase,
+    progress: run.progress,
+    message: run.message || statusText(run.status),
+  }];
+}
+
+const PARAM_LABELS: Record<string, string> = {
+  learning_rate: "学习率",
+  num_leaves: "叶子数",
+  max_depth: "最大深度",
+  n_estimators: "树数量",
+  min_child_samples: "叶子最小样本",
+  feature_fraction: "特征采样比例",
+  bagging_fraction: "样本采样比例",
+  bagging_freq: "采样频率",
+  reg_alpha: "L1 正则",
+  reg_lambda: "L2 正则",
+  max_bin: "最大分箱数",
+  random_state: "随机种子",
+  early_stopping_rounds: "早停轮数",
+};
+
+function parameterPairs(value: unknown) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return [];
+  return Object.entries(value as Record<string, unknown>).map(([key, raw]) => ({
+    key,
+    label: PARAM_LABELS[key] || key,
+    value: typeof raw === "number" ? (Number.isInteger(raw) ? String(raw) : String(raw)) : compact(raw),
+  }));
 }
 
 function statusClass(value: unknown) {
@@ -80,6 +176,40 @@ function statusClass(value: unknown) {
 function artifactValue(item: Record<string, unknown> | undefined, key: string) {
   return item && Object.prototype.hasOwnProperty.call(item, key) ? item[key] : undefined;
 }
+
+function firstContractValue(contract: Record<string, unknown>, keys: string[]) {
+  for (const key of keys) {
+    const value = contract[key];
+    if (value !== null && value !== undefined && value !== "") return value;
+  }
+  return "未配置";
+}
+
+const PLAN_MODEL_KEYS = [
+  "medium_horizon_lambdarank_v1",
+  "capital_persistence_multitask_v1",
+  "leader_lambdarank_v1",
+  "event_surprise_lgbm_v1",
+  "narrative_transition_multitask_v1",
+];
+
+const MODEL_SECTION_KEYS: GovernanceSectionKey[] = [
+  "modelStatus",
+  "modelTraining",
+  "modelParameters",
+  "modelAutoOptimization",
+  "modelPromotion",
+  "modelVersions",
+];
+
+const MODEL_SECTION_TITLES: Partial<Record<GovernanceSectionKey, string>> = {
+  modelStatus: "模型状态总览",
+  modelTraining: "模型训练过程",
+  modelParameters: "模型参数与证据合同",
+  modelAutoOptimization: "自优化检查与人工闸门",
+  modelPromotion: "候选模型晋升控制",
+  modelVersions: "模型版本与回退",
+};
 
 function eligibility(version: ModelVersion) {
   const validation = version.validation || {};
@@ -109,13 +239,14 @@ export default function GovernancePage() {
   const [overview, setOverview] = useState<GovernanceOverview | null>(null);
   const [models, setModels] = useState<ModelStrategyStatus | null>(null);
   const [planModels, setPlanModels] = useState<PlanModelControl | null>(null);
+  const [autoOptimization, setAutoOptimization] = useState<PlanModelAutoOptimizationStatus | null>(null);
   const [marketGovernance, setMarketGovernance] = useState<MarketContextGovernance | null>(null);
   const [loading, setLoading] = useState(false);
   const [busy, setBusy] = useState("");
   const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
   const [section, setSection] = useState<GovernanceSectionKey>(() =>
-    (window.localStorage.getItem(GOVERNANCE_SECTION_STORAGE_KEY) as GovernanceSectionKey | null) || "overview"
+    normalizeGovernanceSection(window.localStorage.getItem(GOVERNANCE_SECTION_STORAGE_KEY))
   );
   const [dataTasks, setDataTasks] = useState<DataObservability | null>(null);
   const [strategyTasks, setStrategyTasks] = useState<QuantTaskItem[]>([]);
@@ -151,7 +282,13 @@ export default function GovernancePage() {
     planModelsLoadingRef.current = true;
     if (!silent) setTaskLoading(true);
     try {
-      setPlanModels(await fetchPlanModels());
+      const plan = await fetchPlanModels();
+      setPlanModels(plan);
+      try {
+        setAutoOptimization(await fetchPlanModelAutoOptimization());
+      } catch {
+        setAutoOptimization(null);
+      }
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
     } finally {
@@ -194,7 +331,7 @@ export default function GovernancePage() {
   }, [section]);
 
   useEffect(() => {
-    if (section !== "models") return;
+    if (!MODEL_SECTION_KEYS.includes(section)) return;
     void loadPlanModels();
     const timer = window.setInterval(() => void loadPlanModels(true), 15000);
     return () => window.clearInterval(timer);
@@ -202,7 +339,7 @@ export default function GovernancePage() {
 
   useEffect(() => {
     const onSection = (event: Event) => {
-      const next = (event as CustomEvent<GovernanceSectionKey>).detail;
+      const next = normalizeGovernanceSection((event as CustomEvent<string>).detail);
       if (next) setSection(next);
     };
     window.addEventListener(GOVERNANCE_SECTION_EVENT, onSection);
@@ -217,6 +354,7 @@ export default function GovernancePage() {
       await run();
       setNotice(success);
       await load(true);
+      if (MODEL_SECTION_KEYS.includes(section)) await loadPlanModels(true);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
     } finally {
@@ -227,13 +365,30 @@ export default function GovernancePage() {
   const active = models?.active_version ?? null;
   const trainRun = models?.latest_train_run ?? null;
   const versions = models?.versions ?? [];
-  const candidates = versions.filter((item) => !item.is_active);
   const failedTasks = overview?.tasks.failed_or_paused ?? [];
   const blockers = overview?.gates.filter((item) => item.status === "blocked") ?? [];
   const healthGate = overview?.gates.find((item) => item.key === "data_health");
   const dataReadyGate = overview?.gates.find((item) => item.key === "data_readiness");
-  const systemReady = Boolean(active) && blockers.length === 0;
-  const eligibleCandidates = useMemo(() => candidates.filter((item) => eligibility(item).eligible), [candidates]);
+  const planBookModels = useMemo(() => {
+    const items = planModels?.items ?? [];
+    return PLAN_MODEL_KEYS.map((key) => items.find((item) => item.model_key === key)).filter(Boolean) as NonNullable<PlanModelControl["items"]>;
+  }, [planModels]);
+  const candidatePlanBookModels = planBookModels.filter((item) => {
+    const latest = item.latest_version;
+    const activeId = Number(item.active_version?.id || 0);
+    const latestId = Number(latest?.id || 0);
+    const reviewStatus = String((latest?.validation?.review as Record<string, unknown> | undefined)?.status || "");
+    return latestId > 0
+      && latestId !== activeId
+      && String(latest?.status || "") === "candidate"
+      && reviewStatus !== "rejected"
+      && approvalAdvice(latest?.metrics || {}, item.active_version?.metrics || {}) === "候选不弱于生产模型，可进入人工批准";
+  });
+  const runningPlanBookModels = planBookModels.filter((item) => item.latest_train_run?.status === "running");
+  const autoReviewQueue = autoOptimization?.review_queue ?? [];
+  const autoTrainableItems = (autoOptimization?.items ?? []).filter((item) => ["train_challenger", "retrain_challenger"].includes(item.trigger));
+  const autoRejectedItemCount = (autoOptimization?.items ?? []).filter((item) => item.trigger === "auto_rejected" || item.shadow_ab?.status === "auto_rejected").length;
+  const modelSection = MODEL_SECTION_KEYS.includes(section);
 
   if (loading && !overview && !models) {
     return <LoadingState variant="page" title="正在打开模型工厂" detail="正在读取生产模型、训练任务和系统健康状态" rows={5} />;
@@ -253,159 +408,359 @@ export default function GovernancePage() {
       {error && <div className="alert">{error}</div>}
       {notice && <div className="inline-message">{notice}</div>}
 
-      {section === "overview" && <>
-      <div className={`governance-command ${systemReady ? "ready" : "blocked"}`}>
-        <div>
-          <span>当前运行结论</span>
-          <h2>{systemReady ? "生产链路全部就绪" : active ? "每日决策已就绪，部分后台能力受限" : trainRun?.status === "running" ? "正在建立生产模型" : "生产运行仍被阻塞"}</h2>
-          <p>{active
-            ? `当前由 ${active.version} 提供生产评分。`
-            : trainRun?.status === "running"
-              ? `训练任务 #${trainRun.id} 正在执行，完成验证并满足门槛后可自动晋升。`
-              : "当前没有已晋升的生产模型，系统只能使用透明规则降级运行。"}</p>
-        </div>
-        <div className="governance-actions">
-          <button className="button primary" disabled={busy !== "" || trainRun?.status === "running"} onClick={() => void action("train", () => startModelTraining({ exchange_group: "HS" }), "训练任务已启动")}>{busy === "train" ? "启动中" : "启动新训练"}</button>
-          <button className="button ghost" disabled={busy !== "" || trainRun?.status === "running"} onClick={() => void action("tune", autoTuneModels, "自动调优和晋升检查已完成")}>{busy === "tune" ? "执行中" : "运行自动调优"}</button>
-          <button className="button ghost" disabled={busy !== "" || readinessRefresh?.running} onClick={() => void action("readiness-refresh", startReadinessRefresh, "深度数据 readiness 已转入后台刷新")}>{readinessRefresh?.running ? "自检中" : "刷新深度自检"}</button>
-        </div>
-      </div>
-
-      <div className="product-module-grid governance-summary-grid">
-        <article className="product-module-card"><h2>生产模型</h2><strong>{active?.version || "未设置"}</strong><p>{active ? "当前接管生产评分" : "透明规则降级运行"}</p></article>
-        <article className="product-module-card"><h2>当前训练</h2><strong>{trainRun ? `#${trainRun.id} ${statusText(trainRun.status)}` : "无任务"}</strong><p>{trainRun?.message || "等待下一次训练触发"}</p></article>
-        <article className="product-module-card"><h2>可晋升候选</h2><strong>{eligibleCandidates.length}</strong><p>共 {candidates.length} 个非生产版本</p></article>
-        <article className="product-module-card"><h2>系统健康</h2><strong>{statusText(healthGate?.status)}</strong><p>数据就绪：{readinessRefresh?.running ? "后台自检中" : statusText(dataReadyGate?.status)} · 缓存 {readinessRefresh?.cached_consumers ?? 0} 项</p></article>
-      </div>
-      </>}
-
-      {section === "models" && <>
+      {modelSection && <>
       <section className="model-training-console">
         <header>
           <div>
-            <span>模型训练</span>
-            <h2>{trainRun?.status === "running" ? "系统正在训练模型" : (planModels?.counts.candidate ?? 0) > 0 ? "有模型等待你审核上线" : "模型工厂正常待命"}</h2>
-            <p>已上线 {planModels?.counts.production ?? 0} 个，待审核 {planModels?.counts.candidate ?? 0} 个，待训练 {planModels?.counts.trainable ?? 0} 个。上线后才会参与行情识别、选股和配置。</p>
+            <span>模型中控台</span>
+            <h2>{MODEL_SECTION_TITLES[section] || "模型状态总览"}</h2>
+            <p>{section === "modelStatus"
+              ? "这里只回答：哪些模型在生产、哪些在候选、哪些还能训练。其他操作收进对应页。"
+              : "五个计划书模型按“状态、训练、参数、自优化、晋升、版本”拆开管理；系统负责判断，你只在上线/驳回时介入。"}</p>
           </div>
-          <div className="model-training-actions">
+          {section === "modelTraining" && <div className="model-training-actions">
             <button className="button primary" disabled={busy !== ""} onClick={() => void action("plan-train-all", startAllTrainablePlanModels, "已启动全部可训练计划书模型")}>{busy === "plan-train-all" ? "启动中" : "训练待训练模型"}</button>
-            <button className="button ghost" disabled={busy !== "" || (planModels?.counts.candidate ?? 0) <= 0} onClick={() => void action("plan-review-all", reviewCandidatePlanModels, "候选模型已批量评审")}>{busy === "plan-review-all" ? "评审中" : "审核候选上线"}</button>
-            <button className="button ghost" disabled={busy !== ""} onClick={() => void action("formal-reports", materializeFormalPerformanceReports, "周期绩效报告已正式物化")}>{busy === "formal-reports" ? "生成中" : "生成绩效报表"}</button>
-          </div>
+          </div>}
         </header>
-
-        <div className="model-training-status">
+        {section === "modelStatus" && <div className="model-training-status">
           <article><span>主决策模型</span><strong>{active?.version || "未上线"}</strong><p>{active ? "正在服务模拟决策" : "未上线前使用规则降级"}</p></article>
           <article><span>当前训练</span><strong>{trainRun ? `#${trainRun.id} ${statusText(trainRun.status)}` : "无任务"}</strong><p>{trainRun?.message || "可以启动新训练"}</p></article>
           <article><span>行情识别</span><strong>{marketGovernance?.hsmm?.production_eligible ? "可接管" : "观察中"}</strong><p>{marketGovernance?.hsmm ? `观察 ${marketGovernance.hsmm.live_observation_weeks.toFixed(2)} / ${marketGovernance.hsmm.minimum_live_observation_weeks} 周` : "等待状态"}</p></article>
-        </div>
+        </div>}
 
-        <div className="model-training-list">
-          <div className="model-training-list-head">
-            <span>模型</span><span>负责什么</span><span>状态</span><span>最新训练</span><span>下一步</span>
-          </div>
-          {(planModels?.items ?? []).filter((item) => ["production", "candidate", "trainable", "proxy"].includes(String(item.status))).slice(0, 6).map((item) => {
+        {section === "modelStatus" && <div className="model-status-list">
+          {!planModels && <LoadingState variant="section" title="正在读取模型状态" detail="正在汇总五个计划书模型的生产、候选和训练状态" rows={4} />}
+          {planBookModels.map((item) => {
             const running = item.latest_train_run?.status === "running";
             const trainable = item.status === "trainable" || item.status === "production" || item.status === "candidate";
-            const latestId = Number(item.latest_version?.id || 0);
             return <article key={item.model_key}>
-              <strong>{item.name}</strong>
-              <p>{item.role}</p>
-              <em className={`status-pill status-${statusClass(item.status)}`}>{statusText(item.status)}</em>
-              <span>{running ? "训练中" : item.latest_train_run ? `#${item.latest_train_run.id} ${statusText(item.latest_train_run.status)}` : "暂无记录"}</span>
               <div>
-                {item.status === "candidate"
-                  ? <button className="button ghost" disabled={busy !== "" || latestId <= 0} onClick={() => void action(`operator-review-${latestId}`, () => reviewPlanModelVersion(latestId, { decision: "approved", comment: "人工批准上线；模拟系统豁免真实20日观察", waive_live_observation: true }), `${item.name} 已批准上线`)}>批准上线</button>
-                  : <button className="button ghost" disabled={busy !== "" || running || !trainable} onClick={() => void action(`operator-train-${item.model_key}`, () => startPlanModelTraining(item.model_key), `${item.name} 训练已启动`)}>{running ? "训练中" : "训练"}</button>}
+                <strong>{item.name}</strong>
+                <span>{item.role}</span>
               </div>
+              <em className={`status-pill status-${statusClass(item.status)}`}>{statusText(item.status)}</em>
+              <p>{running ? "训练中" : item.latest_train_run ? `最近训练 #${item.latest_train_run.id} · ${statusText(item.latest_train_run.status)}` : "还没有训练记录"}</p>
+              <small>{item.status === "production" ? "已接入模拟决策链路" : item.status === "candidate" ? "等待人工在“模型晋升”里审核" : trainable ? "可在“模型训练过程”里训练" : "等待数据补齐"}</small>
             </article>;
           })}
-          {!planModels?.items.length && <div className="empty">模型状态读取中。</div>}
-        </div>
+          {planModels && !planBookModels.length && <div className="empty">暂无模型状态。</div>}
+        </div>}
+
+        {section === "modelTraining" && <div className="model-training-list">
+          <div className="model-training-list-head"><span>模型</span><span>训练阶段</span><span>状态</span><span>进度</span><span>操作</span></div>
+          {planBookModels.map((item) => {
+            const run = item.latest_train_run;
+            const running = run?.status === "running";
+            const trainable = item.status === "trainable" || item.status === "production" || item.status === "candidate";
+            const timeline = trainingTimeline(run);
+            const datasetSummary = run?.metrics?.dataset && typeof run.metrics.dataset === "object" ? run.metrics.dataset as Record<string, unknown> : null;
+            return <details key={item.model_key} className="model-training-run" open={running}>
+              <summary>
+                <strong>{item.name}</strong>
+                <p>{run?.message || "等待训练触发"}</p>
+                <em className={`status-pill status-${statusClass(run?.status || item.status)}`}>{statusText(run?.status || item.status)}</em>
+                <span>{run ? `${run.phase || "—"} · ${Math.round(Number(run.progress || 0) * 100)}%` : "未训练"}</span>
+                <div><button className="button ghost" disabled={busy !== "" || running || !trainable} onClick={(event) => { event.preventDefault(); void action(`training-${item.model_key}`, () => startPlanModelTraining(item.model_key), `${item.name} 训练已启动`); }}>{running ? "训练中" : "启动训练"}</button></div>
+              </summary>
+              <div className="model-training-log">
+                <div>
+                  <strong>训练日志</strong>
+                  <span>{run ? `任务 #${run.id} · ${run.updated_at ? formatGmt8Time(run.updated_at) : "等待更新"}` : "尚未启动训练"}</span>
+                </div>
+                {datasetSummary && (
+                  <div className="model-training-dataset">
+                    <span>样本 {compact(datasetSummary.sample_rows)}</span>
+                    <span>训练 {compact(datasetSummary.train_rows)}</span>
+                    <span>验证 {compact(datasetSummary.validation_rows)}</span>
+                    <span>特征 {compact(datasetSummary.feature_count)}</span>
+                    <span>周期 {compact(datasetSummary.horizon)} 天</span>
+                  </div>
+                )}
+                {timeline.length ? timeline.slice(-8).map((entry, index) => (
+                  <article key={`${entry.phase || "phase"}-${entry.at || index}`}>
+                    <i>{Math.round(Number(entry.progress || 0) * 100)}%</i>
+                    <div>
+                      <strong>{statusText(entry.phase || "running")}</strong>
+                      <span>{entry.message || "阶段更新"}</span>
+                    </div>
+                    <time>{entry.at ? formatGmt8Time(entry.at) : "—"}</time>
+                  </article>
+                )) : <p>暂无日志；启动训练后系统会自动写入覆盖检查、样本构造、训练、验证、产物生成等阶段。</p>}
+                {run?.error && <p className="model-training-error">错误：{run.error}</p>}
+              </div>
+            </details>;
+          })}
+        </div>}
+
+        {section === "modelAutoOptimization" && <details open className="model-auto-optimizer">
+          <summary>
+            <div>
+              <strong>模型自优化（人工闸门）</strong>
+              <span>{autoOptimization?.policy.summary || "系统自动训练 challenger、自动驳回弱候选；更优候选上线才需要人工批准。"}</span>
+            </div>
+            <em>{autoReviewQueue.length ? `${autoReviewQueue.length} 个可批准` : autoOptimization?.auto_rejected?.length ? `${autoOptimization.auto_rejected.length} 个已自动驳回` : autoTrainableItems.length ? `${autoTrainableItems.length} 个可自训练` : "无需介入"}</em>
+          </summary>
+          <div className="model-auto-optimizer-body">
+            <div className="model-auto-optimizer-command">
+              <div>
+                <strong>候选模型 A/B 影子运行</strong>
+                <p>新模型不上线也每天虚拟打分；弱于生产模型或核心指标为负时系统自动驳回，只有不弱于生产模型的候选才交给你批准。</p>
+              </div>
+              <button className="button primary" disabled={busy !== ""} onClick={() => void action("plan-auto-optimize", () => runPlanModelAutoOptimization(false), "模型自优化检查已执行，候选仍需人工上线")}>{busy === "plan-auto-optimize" ? "检查中" : "运行自优化检查"}</button>
+            </div>
+            {!!candidatePlanBookModels.length && (
+              <div className="model-review-now">
+                <div>
+                  <strong>{candidatePlanBookModels.length} 个候选模型等待人工批准</strong>
+                  <span>系统已自动过滤弱候选；这里只保留需要你最终上线确认的候选。</span>
+                </div>
+                <div>
+                  {candidatePlanBookModels.slice(0, 5).map((item) => {
+                    const latestId = Number(item.latest_version?.id || 0);
+                    const candidateMetrics = item.latest_version?.metrics || {};
+                    const productionMetrics = item.active_version?.metrics || {};
+                    const deltaWf = metricValue(candidateMetrics, "walk_forward_lift") != null && metricValue(productionMetrics, "walk_forward_lift") != null
+                      ? Number(candidateMetrics.walk_forward_lift) - Number(productionMetrics.walk_forward_lift)
+                      : null;
+                    return <article key={item.model_key}>
+                      <div>
+                        <strong>{item.name}</strong>
+                        <span>{approvalAdvice(candidateMetrics, productionMetrics)}</span>
+                        <small>候选 {item.latest_version?.version || "—"} · 生产 {item.active_version?.version || "—"}</small>
+                      </div>
+                      <div className="model-approval-metrics">
+                        <em><b>候选 Lift</b>{number(candidateMetrics.lift)}</em>
+                        <em><b>候选滚动验证</b>{walkForwardText(candidateMetrics)}</em>
+                        <em><b>生产滚动验证</b>{walkForwardText(productionMetrics)}</em>
+                        <em><b>滚动差值</b>{deltaWf == null ? "—" : signedNumber(deltaWf)}</em>
+                        <em><b>胜率</b>{percent(candidateMetrics.hit_rate)}</em>
+                        <em><b>IC/相关</b>{number(candidateMetrics.rank_return_corr)}</em>
+                        <em><b>样本</b>{compact(candidateMetrics.validation_rows || candidateMetrics.sample_rows)}</em>
+                        <em><b>窗口</b>{compact(candidateMetrics.walk_forward_windows || "旧版")}</em>
+                      </div>
+                      <div className="model-approval-actions">
+                        <button className="button primary" disabled={busy !== "" || latestId <= 0} onClick={() => void action(`auto-direct-approve-${latestId}`, () => reviewPlanModelVersion(latestId, { decision: "approved", comment: "自优化模块人工批准上线；模拟系统豁免真实20日观察", waive_live_observation: true }), `${item.name} 已批准上线`)}>批准上线</button>
+                        <button className="button ghost" disabled={busy !== "" || latestId <= 0} onClick={() => void action(`auto-direct-reject-${latestId}`, () => reviewPlanModelVersion(latestId, { decision: "rejected", comment: "自优化模块人工驳回", waive_live_observation: false }), `${item.name} 已驳回`)}>驳回</button>
+                      </div>
+                    </article>;
+                  })}
+                </div>
+              </div>
+            )}
+            {!!autoOptimization?.auto_rejected?.length && (
+              <div className="inline-message">
+                自优化已自动驳回：{autoOptimization.auto_rejected.map((item) => `${item.version || item.model_key}（${item.reason || "弱于生产模型"}）`).join("；")}
+              </div>
+            )}
+            <div className="model-auto-summary">
+              <article className={autoReviewQueue.length ? "needs-action" : ""}>
+                <span>你的待办</span>
+                <strong>{autoReviewQueue.length ? `${autoReviewQueue.length} 个需批准` : "暂无人工审批"}</strong>
+                <p>{autoReviewQueue.length ? "只在候选不弱于生产模型时出现。" : "弱候选、重训、观察都交给系统处理。"}</p>
+              </article>
+              <article>
+                <span>系统自动处理</span>
+                <strong>{autoRejectedItemCount} 个已驳回</strong>
+                <p>收益指标为负或弱于生产模型时自动剔除。</p>
+              </article>
+              <article>
+                <span>可自训练</span>
+                <strong>{autoTrainableItems.length} 个模型</strong>
+                <p>生产走弱时系统会训练 challenger 对照。</p>
+              </article>
+            </div>
+            <div className="model-auto-list">
+              {(autoOptimization?.items ?? []).map((item) => {
+                const latestId = Number(item.latest_version_id || 0);
+                const shadow = item.shadow_ab;
+                const candidateMetrics = item.candidate_metrics || {};
+                const productionMetrics = item.production_metrics || {};
+                const hasChallenger = Boolean(shadow?.has_challenger);
+                const verdict = autoOptimizationVerdict(item);
+                return <details key={item.model_key} className={`model-auto-row model-auto-row-${verdict.tone}`}>
+                  <summary>
+                    <i>{verdict.title}</i>
+                    <div>
+                      <strong>{item.name}</strong>
+                      <span>{verdict.detail}</span>
+                    </div>
+                    <b>{hasChallenger ? `候选对比 ${shadow ? signedNumber(shadow.delta) : "—"}` : item.trigger === "retrain_challenger" ? "等待新候选" : "无候选"}</b>
+                    <em className={`status-pill status-${statusClass(shadow?.status || item.status)}`}>{shadow?.status === "auto_rejected" ? "自动驳回" : shadow?.status === "review_ready" ? "可评审" : hasChallenger && shadow?.status === "shadow_running" ? "观察中" : item.trigger === "retrain_challenger" ? "待重训" : "稳定"}</em>
+                  </summary>
+                  <div className="model-auto-row-detail">
+                    <section>
+                      <h4>系统判断</h4>
+                      <p>{item.reason}</p>
+                      <small>{hasChallenger ? `生产 ${shadow?.champion_version || item.active_version || "—"} vs 候选 ${shadow?.challenger_version || item.latest_version || "—"}` : `当前生产 ${shadow?.champion_version || item.active_version || item.latest_version || "—"} · 暂无 challenger`}</small>
+                    </section>
+                    <div className="model-shadow-metrics">
+                      <em><b>观察期</b>{hasChallenger && shadow ? `${shadow.observation_sessions}/${shadow.minimum_sessions}` : "无候选"}</em>
+                      <em><b>{hasChallenger ? "候选收益提升" : "生产收益提升"}</b>{number((hasChallenger ? candidateMetrics : productionMetrics).lift)}</em>
+                      <em><b>{hasChallenger ? "候选滚动验证" : "生产滚动验证"}</b>{walkForwardText(hasChallenger ? candidateMetrics : productionMetrics)}</em>
+                      {hasChallenger && <em><b>生产滚动验证</b>{walkForwardText(productionMetrics)}</em>}
+                      {hasChallenger && <em><b>候选差值</b>{shadow ? signedNumber(shadow.delta) : "—"}</em>}
+                      <em><b>{hasChallenger ? "候选胜率" : "生产胜率"}</b>{percent((hasChallenger ? candidateMetrics : productionMetrics).hit_rate)}</em>
+                      <em><b>排序相关</b>{number((hasChallenger ? candidateMetrics : productionMetrics).rank_return_corr)}</em>
+                      <em><b>建议</b>{hasChallenger ? approvalAdvice(candidateMetrics, productionMetrics) : item.trigger === "retrain_challenger" ? "生产指标偏弱，系统应训练新 challenger" : "暂无新候选需要处理"}</em>
+                    </div>
+                    <div className="model-auto-row-actions">
+                      {item.requires_human && latestId > 0
+                        ? <>
+                          <button className="button primary" disabled={busy !== ""} onClick={() => void action(`auto-approve-${latestId}`, () => reviewPlanModelVersion(latestId, { decision: "approved", comment: "人工批准自优化候选上线；模拟系统豁免真实20日观察", waive_live_observation: true }), `${item.name} 已批准上线`)}>批准上线</button>
+                          <button className="button ghost" disabled={busy !== ""} onClick={() => void action(`auto-reject-${latestId}`, () => reviewPlanModelVersion(latestId, { decision: "rejected", comment: "人工驳回自优化候选", waive_live_observation: false }), `${item.name} 已驳回`)}>驳回</button>
+                        </>
+                        : <span>{item.trigger === "auto_rejected" ? "系统已处理，不需要你操作" : item.running ? "训练完成后自动比较" : item.trigger === "retrain_challenger" ? "等待系统重训" : item.trigger === "healthy" ? "系统自动观察" : "系统处理"}</span>}
+                    </div>
+                  </div>
+                </details>;
+              })}
+              {!autoOptimization?.items?.length && <div className="empty">自优化状态读取中。</div>}
+            </div>
+            <details className="model-auto-raw">
+              <summary>查看系统自动处理记录</summary>
+              <div className="model-auto-grid">
+                {(autoOptimization?.items ?? []).map((item) => {
+                  const latestId = Number(item.latest_version_id || 0);
+                  const shadow = item.shadow_ab;
+                  const candidateMetrics = item.candidate_metrics || {};
+                  const productionMetrics = item.production_metrics || {};
+                  const hasChallenger = Boolean(shadow?.has_challenger);
+                  return <article key={item.model_key}>
+                    <div>
+                    <strong>{item.name}</strong>
+                    <span>{item.reason}</span>
+                    <small>{hasChallenger ? `生产 ${shadow?.champion_version || item.active_version || "—"} vs 候选 ${shadow?.challenger_version || item.latest_version || "—"}` : `当前生产 ${shadow?.champion_version || item.active_version || item.latest_version || "—"} · 暂无 challenger`}</small>
+                    </div>
+                    <div className="model-shadow-metrics">
+                    <em><b>观察期</b>{hasChallenger && shadow ? `${shadow.observation_sessions}/${shadow.minimum_sessions}` : "无候选"}</em>
+                    <em><b>{hasChallenger ? "候选 Lift" : "生产 Lift"}</b>{number((hasChallenger ? candidateMetrics : productionMetrics).lift)}</em>
+                    <em><b>{hasChallenger ? "候选滚动验证" : "生产滚动验证"}</b>{walkForwardText(hasChallenger ? candidateMetrics : productionMetrics)}</em>
+                    {hasChallenger && <em><b>生产滚动验证</b>{walkForwardText(productionMetrics)}</em>}
+                    {hasChallenger && <em><b>滚动差值</b>{shadow ? signedNumber(shadow.delta) : "—"}</em>}
+                    <em><b>{hasChallenger ? "候选胜率" : "生产胜率"}</b>{percent((hasChallenger ? candidateMetrics : productionMetrics).hit_rate)}</em>
+                    <em><b>IC/相关</b>{number((hasChallenger ? candidateMetrics : productionMetrics).rank_return_corr)}</em>
+                    <em><b>系统建议</b>{hasChallenger ? approvalAdvice(candidateMetrics, productionMetrics) : item.trigger === "retrain_challenger" ? "生产指标偏弱，系统应训练新 challenger" : "暂无新候选需要处理"}</em>
+                    </div>
+                    <em className={`status-pill status-${statusClass(shadow?.status || item.status)}`}>{shadow?.status === "auto_rejected" ? "自动驳回" : shadow?.status === "review_ready" ? "可评审" : hasChallenger && shadow?.status === "shadow_running" ? "影子运行" : item.trigger === "retrain_challenger" ? "待重训" : "无候选"}</em>
+                    <div>
+                    {item.requires_human && latestId > 0
+                      ? <>
+                        <button className="button primary" disabled={busy !== ""} onClick={() => void action(`auto-approve-${latestId}`, () => reviewPlanModelVersion(latestId, { decision: "approved", comment: "人工批准自优化候选上线；模拟系统豁免真实20日观察", waive_live_observation: true }), `${item.name} 已批准上线`)}>批准</button>
+                        <button className="button ghost" disabled={busy !== ""} onClick={() => void action(`auto-reject-${latestId}`, () => reviewPlanModelVersion(latestId, { decision: "rejected", comment: "人工驳回自优化候选", waive_live_observation: false }), `${item.name} 已驳回`)}>驳回</button>
+                      </>
+                      : <span>{item.trigger === "auto_rejected" ? "系统已处理" : item.running ? "训练中" : item.trigger === "retrain_challenger" ? "等待重训" : item.trigger === "healthy" ? "自动观察" : "系统处理"}</span>}
+                    </div>
+                  </article>;
+                })}
+                {!autoOptimization?.items?.length && <div className="empty">自优化状态读取中。</div>}
+              </div>
+            </details>
+          </div>
+        </details>}
+
       </section>
 
-      <details className="module-detail-drawer">
-        <summary><span>查看训练参数和历史版本</span><em>高级信息，平时不用打开</em></summary>
-
-      <div className="card">
-        <div className="governance-section-head"><div><h3>模型族地图</h3><p>这里把“其他模型”也展开：LightGBM 只负责部分监督学习组件，风险/状态模型保持各自专门算法。</p></div></div>
-        <div className="governance-maintenance-grid">
-          {Object.entries(models?.constitution || {}).map(([key, item]) => <article key={key}>
-            <div><span>{key}</span><strong>{item.model}</strong><small>{item.status}</small></div>
-          </article>)}
-          <article><div><span>plan_book_supervised_models</span><strong>LightGBM / LambdaRank / Multitask</strong><small>计划书命名的五个功能模型，由下方逐个训练和上线</small></div></article>
-          {!Object.keys(models?.constitution || {}).length && <div className="empty">模型族地图读取中。</div>}
-        </div>
-      </div>
-
-      {marketGovernance?.hsmm && <div className="card governance-training-card">
-        <div className="governance-section-head"><div><h3>市场状态模型：HSMM + BOCPD</h3><p>这是市场状态/持有周期/门控证据，不归入 LightGBM 排序器。</p></div><span className={`status-pill status-${marketGovernance.hsmm.production_eligible ? "ready" : "watch"}`}>{marketGovernance.hsmm.production_eligible ? "可接管" : "影子观察"}</span></div>
-        <div className="decision-two-col">
-          <span>当前生产状态</span><strong>透明四状态机</strong>
-          <span>HSMM 角色</span><strong>影子状态模型，观察期满后再接管门控</strong>
-          <span>历史 OOS</span><strong>{marketGovernance.hsmm.validation?.status === "passed" ? "已通过" : "未通过"}</strong>
-          <span>真实影子观察</span><strong>{marketGovernance.hsmm.live_observation_weeks.toFixed(2)} / {marketGovernance.hsmm.minimum_live_observation_weeks} 周</strong>
-          <span>上线评审</span><strong>{marketGovernance.hsmm.review?.status ?? "未完成"}</strong>
-          <span>阻塞原因</span><strong>{marketGovernance.hsmm.blocking_reason}</strong>
-        </div>
-      </div>}
-
-      <div className="card">
+      {section === "modelParameters" && <section className="model-parameter-panel">
         <div className="governance-section-head">
-          <div><h3>计划书监督模型控制台</h3><p>逐个模型展示算法族、训练数据、固定参数、产物状态、训练进度、人工上线/驳回入口。</p></div>
-          <span>{planModels ? `${planModels.counts.production ?? 0} production / ${planModels.counts.proxy ?? 0} proxy` : "读取中"}</span>
+          <div><h3>生产模型参数</h3><p>这五个模型具体按什么目标、数据、窗口、指标和固定参数训练。</p></div>
+          <span>{planModels ? `${planModels.counts.production ?? 0} 个已上线` : "读取中"}</span>
         </div>
         <div className="governance-task-list">
-          {(planModels?.items ?? []).map((item) => {
+          {planBookModels.map((item) => {
             const coverage = item.coverage || {};
             const effective = Number(coverage.effective_sessions || 0);
             const minimum = Number(coverage.minimum_sessions || 0);
             const progress = minimum > 0 ? Math.min(100, Math.round((effective / minimum) * 100)) : 0;
             const running = item.latest_train_run?.status === "running";
             const trainable = item.status === "trainable" || item.status === "production" || item.status === "candidate";
-            const latestId = Number(item.latest_version?.id || 0);
             const review = (item.latest_version?.validation?.review || {}) as Record<string, unknown>;
             const latestArtifact = (item.latest_artifact || {}) as Record<string, unknown>;
             const contract = (item.training_contract || {}) as Record<string, unknown>;
+            const fixedParams = firstContractValue(contract, ["params", "hyperparams", "hyperparameters", "model_params"]);
+            const fixedParamPairs = parameterPairs(fixedParams);
             const metrics = item.latest_version?.metrics || {};
-            return <article key={item.model_key} className="governance-model-card">
-              <div>
-                <div className="governance-section-head compact-head">
-                  <div><strong>{item.name}</strong><span>{item.model_key}</span><small>{item.role}</small></div>
-                  <em className={`status-pill status-${statusClass(item.status)}`}>{item.status}</em>
-                </div>
+            return <article key={item.model_key} className="governance-model-card compact">
+              <details className="model-parameter-detail">
+                <summary>
+                  <div>
+                    <strong>{item.name}</strong>
+                    <span>{item.role}</span>
+                    <small>{item.latest_version?.version || item.model_key}</small>
+                  </div>
+                  <em className={`status-pill status-${statusClass(item.status)}`}>{statusText(item.status)}</em>
+                  <i>{minimum ? `${effective}/${minimum}` : "覆盖待配置"}</i>
+                </summary>
                 <div className="bar"><i style={{ width: `${progress}%` }} /></div>
                 <div className="decision-two-col">
                   <span>算法族</span><strong>{item.family}</strong>
-                  <span>训练目标</span><strong>{compact(contract.objective || contract.tasks || "—")}</strong>
-                  <span>评估指标</span><strong>{compact(contract.metric || contract.eval_at || "—")}</strong>
+                  <span>训练目标</span><strong>{compact(firstContractValue(contract, ["objective", "target", "training_target", "tasks"]))}</strong>
+                  <span>标签/任务</span><strong>{compact(firstContractValue(contract, ["labels", "label", "tasks", "task"]))}</strong>
+                  <span>特征输入</span><strong>{compact(firstContractValue(contract, ["features", "feature_sets", "inputs", "required_features"]))}</strong>
+                  <span>评估指标</span><strong>{compact(firstContractValue(contract, ["metric", "metrics", "eval_metric", "eval_at"]))}</strong>
                   <span>数据覆盖</span><strong>{minimum ? `${effective}/${minimum} sessions` : "—"}</strong>
                   <span>训练数据</span><strong>{item.required_data?.join("、") || "—"}</strong>
                   <span>产物类型</span><strong>{compact(artifactValue(latestArtifact, "model_type"))}</strong>
                   <span>模型文件</span><strong>{compact(artifactValue(latestArtifact, "model_path_exists"))}</strong>
-                  <span>训练窗口</span><strong>{compact(artifactValue(latestArtifact, "training_dataset"))}</strong>
-                  <span>LightGBM 参数</span><strong>{compact(contract.params)}</strong>
+                  <span>训练窗口</span><strong>{compact(firstContractValue(contract, ["train_window", "lookback_days", "history_window", "sample_window"]))}</strong>
+                  <span>OOS/回放</span><strong>{compact(firstContractValue(contract, ["oos", "rolling_oos", "walk_forward", "backtest"]))}</strong>
+                  <span>固定参数</span><strong>{fixedParamPairs.length ? <div className="model-param-tags">{fixedParamPairs.map((param) => <em key={param.key}><b>{param.label}</b>{param.value}</em>)}</div> : compact(fixedParams)}</strong>
                   <span>最新版本</span><strong>{item.latest_version?.version || "—"}</strong>
                   <span>最新训练</span><strong>{item.latest_train_run ? `#${item.latest_train_run.id} ${statusText(item.latest_train_run.status)} ${Math.round(Number(item.latest_train_run.progress || 0) * 100)}%` : "未训练"}</strong>
-                  <span>费用后 Lift</span><strong>{number(metrics.lift)} / WF {number(metrics.walk_forward_lift)}</strong>
+                  <span>费用后 Lift / 滚动验证</span><strong>{number(metrics.lift)} / {walkForwardText(metrics)}</strong>
                   <span>上线评审</span><strong>{review.status ? `${review.status} · ${review.reviewer || "operator"}` : item.status === "candidate" ? "待评审" : "—"}</strong>
                   <span>阻塞原因</span><strong>{(item.blocked_reasons ?? []).join("、") || "—"}</strong>
                 </div>
                 {!!item.data_actions?.length && <div className="inline-message">补数建议：{item.data_actions.map((action) => `${action.label}（${action.reason}）`).join("；")}</div>}
-              </div>
+              </details>
               <div className="governance-actions">
                 <button className="button ghost" disabled={busy !== "" || running || !trainable} onClick={() => void action(`plan-model-${item.model_key}`, () => startPlanModelTraining(item.model_key), `${item.name} 训练已启动`)}>{running ? "训练中" : item.status === "production" ? "重训" : "训练"}</button>
-                <button className="button ghost" disabled={busy !== "" || latestId <= 0 || item.status !== "candidate"} onClick={() => void action(`plan-review-${latestId}`, () => reviewPlanModelVersion(latestId, { decision: "approved", comment: "人工批准上线；模拟系统豁免真实20日观察", waive_live_observation: true }), `${item.name} 已批准上线`)}>批准上线</button>
-                <button className="button ghost" disabled={busy !== "" || latestId <= 0 || item.status !== "candidate"} onClick={() => void action(`plan-reject-${latestId}`, () => reviewPlanModelVersion(latestId, { decision: "rejected", comment: "人工驳回，继续观察", waive_live_observation: false }), `${item.name} 已驳回`)}>驳回</button>
               </div>
             </article>;
           })}
-          {!planModels?.items.length && <div className="empty">暂无模型族状态。</div>}
+          {!planBookModels.length && <div className="empty">模型参数读取中。</div>}
         </div>
-      </div>
+      </section>}
 
-      <div className="card governance-training-card">
-        <div className="governance-section-head"><div><h3>主线代理模型训练</h3><p>这是 legacy/main 综合代理模型，不等同于计划书五个专门模型；保留用于降级和对照。</p></div><strong>{trainRun ? `${Math.round(Number(trainRun.progress || 0) * 100)}%` : "—"}</strong></div>
+      {section === "modelPromotion" && <section className="model-release-panel">
+        <div className="governance-section-head">
+          <div><h3>上线控制</h3><p>只有候选模型会出现在这里；先看候选/生产指标，再逐个批准或驳回。</p></div>
+          <span>{candidatePlanBookModels.length ? `${candidatePlanBookModels.length} 个待评审` : "无待评审"}</span>
+        </div>
+        <div className="model-release-list">
+          {candidatePlanBookModels.map((item) => {
+            const latestId = Number(item.latest_version?.id || 0);
+            const candidateMetrics = item.latest_version?.metrics || {};
+            const productionMetrics = item.active_version?.metrics || {};
+            const deltaWf = metricValue(candidateMetrics, "walk_forward_lift") != null && metricValue(productionMetrics, "walk_forward_lift") != null
+              ? Number(candidateMetrics.walk_forward_lift) - Number(productionMetrics.walk_forward_lift)
+              : null;
+            return <article key={item.model_key}>
+              <div>
+                <strong>{item.name}</strong>
+                <span>{approvalAdvice(candidateMetrics, productionMetrics)}</span>
+                <small>候选 {item.latest_version?.version || "—"} · 生产 {item.active_version?.version || "—"}</small>
+              </div>
+              <div className="model-approval-metrics">
+                <em><b>候选 Lift</b>{number(candidateMetrics.lift)}</em>
+                <em><b>候选滚动验证</b>{walkForwardText(candidateMetrics)}</em>
+                <em><b>生产滚动验证</b>{walkForwardText(productionMetrics)}</em>
+                <em><b>滚动差值</b>{deltaWf == null ? "—" : signedNumber(deltaWf)}</em>
+                <em><b>胜率</b>{percent(candidateMetrics.hit_rate)}</em>
+                <em><b>IC/相关</b>{number(candidateMetrics.rank_return_corr)}</em>
+              </div>
+              <em className="status-pill status-watch">候选待审</em>
+              <div className="model-approval-actions">
+                <button className="button primary" disabled={busy !== "" || latestId <= 0} onClick={() => void action(`plan-review-${latestId}`, () => reviewPlanModelVersion(latestId, { decision: "approved", comment: "人工批准上线；模拟系统豁免真实20日观察", waive_live_observation: true }), `${item.name} 已批准上线`)}>批准上线</button>
+                <button className="button ghost" disabled={busy !== "" || latestId <= 0} onClick={() => void action(`plan-reject-${latestId}`, () => reviewPlanModelVersion(latestId, { decision: "rejected", comment: "人工驳回，继续观察", waive_live_observation: false }), `${item.name} 已驳回`)}>驳回</button>
+              </div>
+            </article>;
+          })}
+          {!candidatePlanBookModels.length && <div className="empty">暂无等待上线的候选模型。</div>}
+        </div>
+      </section>}
+
+      {section === "modelTraining" && <div className="card governance-training-card model-auxiliary-card">
+        <div className="governance-section-head"><div><h3>辅助：主线代理模型</h3><p>只用于降级和对照，不是五个正式生产模型的主入口。</p></div><strong>{trainRun ? `${Math.round(Number(trainRun.progress || 0) * 100)}%` : "—"}</strong></div>
         <div className="bar"><i style={{ width: `${Math.round(Number(trainRun?.progress || 0) * 100)}%` }} /></div>
         <div className="decision-two-col">
           <span>任务</span><strong>{trainRun ? `#${trainRun.id}` : "—"}</strong>
@@ -418,10 +773,45 @@ export default function GovernancePage() {
           <button className="button ghost" disabled={busy !== "" || trainRun?.status === "running"} onClick={() => void action("train", () => startModelTraining({ exchange_group: "HS" }), "主线代理训练任务已启动")}>训练主线代理</button>
           <button className="button ghost" disabled={busy !== "" || trainRun?.status === "running"} onClick={() => void action("tune", autoTuneModels, "主线代理自动调优和晋升检查已完成")}>自动调优</button>
         </div>
-      </div>
+      </div>}
 
-      <div className="card">
-        <div className="governance-section-head"><div><h3>主线代理版本控制</h3><p>只有通过验证且具备生产资格的版本才能晋升或回退。</p></div><span>{versions.length} 个版本</span></div>
+      {section === "modelVersions" && <>
+      <div className="card model-version-card">
+        <div className="governance-section-head"><div><h3>计划书五模型版本管理</h3><p>这里管理真正参与行情识别、选股、配置和退出的五个生产模型版本。</p></div><span>{planBookModels.reduce((sum, item) => sum + (item.versions?.length ?? 0), 0)} 个版本</span></div>
+        <div className="table-scroll">
+          <table>
+            <thead><tr><th>模型</th><th>版本</th><th>角色</th><th>验证/评审</th><th>Lift</th><th>Walk-forward</th><th>更新时间</th><th>操作</th></tr></thead>
+            <tbody>
+              {planBookModels.flatMap((model) => (model.versions ?? []).map((version) => {
+                const review = (version.validation?.review || {}) as Record<string, unknown>;
+                const eligible = Boolean(version.validation?.production_eligible);
+                const reviewStatus = String(review.status || "");
+                const rejected = reviewStatus === "rejected";
+                const candidate = !version.is_active && !rejected && String(version.status || "") === "candidate";
+                return <tr key={`${model.model_key}-${version.id}`}>
+                  <td><strong>{model.name}</strong><small>{model.role}</small></td>
+                  <td>{version.version}</td>
+                  <td>{version.is_active ? "生产模型" : statusText(version.status)}</td>
+                  <td>{reviewStatus ? `${reviewStatus === "rejected" ? "已驳回" : "已批准"} · ${review.reviewer || "operator"}` : eligible ? "生产资格通过" : statusText(version.validation?.status)}</td>
+                  <td>{number(version.metrics?.lift)}</td>
+                  <td>{walkForwardText(version.metrics)}</td>
+                  <td>{formatGmt8Time(version.updated_at)}</td>
+                  <td>{version.is_active
+                    ? <span className="status-pill status-ready">当前生产</span>
+                      : rejected
+                        ? <span className="status-pill status-blocked">已驳回</span>
+                        : candidate
+                      ? <div className="row-actions"><button disabled={busy !== ""} onClick={() => void action(`plan-version-approve-${version.id}`, () => reviewPlanModelVersion(version.id, { decision: "approved", comment: "版本管理页人工批准上线；模拟系统豁免真实20日观察", waive_live_observation: true }), `${model.name} 已批准上线`)}>批准</button><button className="danger" disabled={busy !== ""} onClick={() => void action(`plan-version-reject-${version.id}`, () => reviewPlanModelVersion(version.id, { decision: "rejected", comment: "版本管理页人工驳回", waive_live_observation: false }), `${model.name} 已驳回`)}>驳回</button></div>
+                      : <span className="muted">无操作</span>}</td>
+                </tr>;
+              }))}
+              {!planBookModels.some((item) => item.versions?.length) && <tr><td colSpan={8} className="empty">暂无计划书模型版本，先到“模型训练过程”启动训练。</td></tr>}
+            </tbody>
+          </table>
+        </div>
+      </div>
+      <div className="card model-version-card model-auxiliary-card">
+        <div className="governance-section-head"><div><h3>辅助：主线代理版本记录</h3><p>只用于降级、对照和排障，不是计划书五模型的主版本管理。</p></div><span>{versions.length} 个版本</span></div>
         <div className="table-scroll">
           <table>
             <thead><tr><th>版本</th><th>角色</th><th>验证</th><th>历史覆盖</th><th>Lift</th><th>Walk-forward</th><th>更新时间</th><th>操作</th></tr></thead>
@@ -447,7 +837,7 @@ export default function GovernancePage() {
           </table>
         </div>
       </div>
-      </details>
+      </>}
       </>}
 
       {section === "tasks" && <div className="governance-task-center">

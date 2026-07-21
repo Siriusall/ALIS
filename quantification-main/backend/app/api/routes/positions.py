@@ -26,6 +26,8 @@ from app.core.trade_calendar import get_last_trade_date
 from app.services.cache_consolidation import read_consolidated_cache
 from app.services.tushare_snapshot import get_daily_snapshot
 from app.services.strategy_config import parse_strategy_content
+from app.core.a_share_fees import is_exchange_etf
+from app.services.defensive_assets import defensive_asset_bar
 
 router = APIRouter()
 
@@ -151,6 +153,18 @@ def get_positions() -> PositionsListResponse:
 
     # 3) snapshot 不全时，缺失标的再回退到 spot
     missing_symbols = [s for s in symbols if s not in prices_by_symbol]
+    for s in list(missing_symbols):
+        if not is_exchange_etf(s):
+            continue
+        ts_code = s if str(s).upper().endswith((".SH", ".SZ")) else f"{s}.SH"
+        trade_date = (data_source_time or "")[:10].replace("-", "") or get_last_trade_date(for_data_availability=True).strftime("%Y%m%d")
+        bar = defensive_asset_bar(ts_code, trade_date)
+        if not bar:
+            continue
+        p = float(bar.get("close") or 0)
+        if p > 0:
+            prices_by_symbol[s] = p
+            missing_symbols.remove(s)
     if missing_symbols:
         try:
             spot_prices, spot_time = fetch_symbol_prices_with_time(missing_symbols)

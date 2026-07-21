@@ -30,6 +30,7 @@ from app.data_platform.services.data_center import (
     sync_market_bundle,
     sync_capital_structure_bundle,
     backfill_capital_structure_history,
+    backfill_etf_daily_incremental,
     backfill_etf_constituents_history,
     backfill_etf_price_history,
     backfill_major_news_history,
@@ -54,6 +55,7 @@ from app.data_platform.services.readiness import readiness_overview, readiness_r
 from app.data_platform.services.assets import get_data_assets
 from app.data_platform.services.backfill import build_backfill_plan, get_backfill_status, start_backfill
 from app.data_platform.services.cold_archive import archive_raw_records, cold_archive_status
+from app.data_platform.services.stream_admin import bulk_handle_stream_messages, handle_stream_message, stream_admin_status
 
 router = APIRouter(tags=["data-center"])
 
@@ -63,6 +65,16 @@ class ColdArchiveRequest(BaseModel):
     start_date: str = Field(min_length=8, max_length=10)
     end_date: str = Field(min_length=8, max_length=10)
     max_rows: int = Field(default=250_000, ge=1, le=1_000_000)
+
+
+class StreamMessageActionRequest(BaseModel):
+    action: str = Field(pattern="^(ack|delete|dead_letter|retry)$")
+
+
+class StreamBulkActionRequest(BaseModel):
+    action: str = Field(pattern="^(ack|delete|dead_letter)$")
+    task_type: str = "data_platform.backfill"
+    limit: int = Field(default=200, ge=1, le=1000)
 
 
 @router.get("/data-center/simple-health")
@@ -87,6 +99,30 @@ def data_center_runtime_logs(
         time.sleep(0.5)
         items = list_runtime_logs_since(after_id=after_id, limit=limit)
     return {"ok": True, "after_id": after_id, "total": len(items), "items": items}
+
+
+@router.get("/data-center/streams")
+def data_center_streams(
+    limit: int = Query(default=50, ge=1, le=200),
+    pending_limit: int = Query(default=50, ge=1, le=500),
+) -> dict[str, Any]:
+    return stream_admin_status(limit=limit, pending_limit=pending_limit)
+
+
+@router.post("/data-center/streams/messages/{message_id}")
+def data_center_stream_message_action(message_id: str, req: StreamMessageActionRequest) -> dict[str, Any]:
+    result = handle_stream_message(message_id, req.action)
+    if not result.get("ok"):
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=result)
+    return result
+
+
+@router.post("/data-center/streams/bulk")
+def data_center_stream_bulk_action(req: StreamBulkActionRequest) -> dict[str, Any]:
+    result = bulk_handle_stream_messages(req.action, task_type=req.task_type, limit=req.limit)
+    if not result.get("ok"):
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=result)
+    return result
 
 
 @router.get("/data-center/readiness")
@@ -377,8 +413,19 @@ def data_center_backfill_etf_history(
     end_date: str = Query(..., description="YYYYMMDD"),
     cursor: str = Query(default="", description="Last completed ETF ts_code"),
     limit_funds: int = Query(default=20, ge=1, le=100),
+    mode: str = Query(default="fund", pattern="^(fund|daily)$"),
+    limit_dates: int = Query(default=10, ge=1, le=60),
+    nav_limit_funds: int = Query(default=100, ge=0, le=300),
 ) -> dict[str, Any]:
     """Run one resumable ETF price/NAV history slice."""
+    if mode == "daily":
+        return backfill_etf_daily_incremental(
+            start_date=start_date,
+            end_date=end_date,
+            cursor=cursor,
+            limit_dates=limit_dates,
+            nav_limit_funds=nav_limit_funds,
+        )
     return backfill_etf_price_history(
         start_date=start_date, end_date=end_date, cursor=cursor, limit_funds=limit_funds
     )

@@ -38,6 +38,7 @@ from app.data_platform.redis_store import start_task_worker
 from app.data_platform.redis_store import health as redis_health
 from app.data_platform.routes.data_center import router as data_center_router
 from app.data_platform.services.backfill import process_stream_task, recover_interrupted_backfill
+from app.data_platform.services.stream_admin import auto_heal_stream
 from app.data_platform.services.data_center import recover_orphaned_ingestion_runs
 from app.data_platform.services.runtime_logs import write_runtime_log
 
@@ -74,11 +75,14 @@ def startup() -> None:
     try:
         recovery = recover_interrupted_backfill()
         orphaned = recover_orphaned_ingestion_runs()
+        cleaned = auto_heal_stream(limit=1000)
         start_task_worker(process_stream_task)
         if recovery.get("recovered"):
             write_runtime_log("WARNING", "backfill", "检测到服务重启中断的补数任务，已转换为可续跑状态", recovery)
         if orphaned.get("recovered"):
             write_runtime_log("WARNING", "data-platform", "检测到服务重启遗留采集任务，已转换为可续跑状态", orphaned)
+        if cleaned.get("cleanup", {}).get("acked") or cleaned.get("trim", {}).get("trimmed"):
+            write_runtime_log("INFO", "backfill", "已自动确认过期补全队列消息", cleaned)
         write_runtime_log("INFO", "data-platform", "统一后端中的数据中台已启动")
     except Exception as exc:  # noqa: BLE001
         logger.warning("Failed to initialize data-platform worker: %s", str(exc)[:200])

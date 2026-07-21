@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { fetchManualReviewQueue, fetchReviewLearningOverview, generateLlmReviewDraft, materializeReviewOutcomes, submitManualReviewAction, type LlmReviewDraft, type ManualReviewQueue, type ManualReviewQueueItem, type ReviewLearningOverview } from "../api/research";
+import { fetchManualReviewQueue, fetchProfitLoop, fetchReviewLearningOverview, generateLlmReviewDraft, materializeReviewOutcomes, submitManualReviewAction, type LlmReviewDraft, type ManualReviewQueue, type ManualReviewQueueItem, type ProfitLoopOverview, type ReviewLearningOverview } from "../api/research";
 import { formatGmt8Time } from "../utils/time";
 import { getQuantPerformance, type QuantPerformanceOverview } from "../api/quantRuns";
 import type { SectionId } from "./Layout";
@@ -97,9 +97,20 @@ function systemConclusion(item: ManualReviewQueueItem) {
   return { conclusion, action, confidence: Number.isFinite(confidence) ? confidence : null };
 }
 
+function pct(value: unknown, digits = 2) {
+  const number = Number(value);
+  return Number.isFinite(number) ? `${number >= 0 ? "+" : ""}${(number * 100).toFixed(digits)}%` : "—";
+}
+
+function rawPct(value: unknown, digits = 2) {
+  const number = Number(value);
+  return Number.isFinite(number) ? `${number >= 0 ? "+" : ""}${number.toFixed(digits)}%` : "—";
+}
+
 export default function ReviewWorkbenchPage({ onNavigate }: Props) {
   const [queue, setQueue] = useState<ManualReviewQueue | null>(null);
   const [learning, setLearning] = useState<ReviewLearningOverview | null>(null);
+  const [profitLoop, setProfitLoop] = useState<ProfitLoopOverview | null>(null);
   const [performance, setPerformance] = useState<QuantPerformanceOverview | null>(null);
   const [selectedKey, setSelectedKey] = useState("");
   const [draft, setDraft] = useState<LlmReviewDraft | null>(null);
@@ -114,10 +125,11 @@ export default function ReviewWorkbenchPage({ onNavigate }: Props) {
   async function load() {
     setLoading(true); setError("");
     try {
-      const [result, learningResult, performanceResult] = await Promise.all([fetchManualReviewQueue(), fetchReviewLearningOverview(), getQuantPerformance()]);
+      const [result, learningResult, performanceResult, profitResult] = await Promise.all([fetchManualReviewQueue(), fetchReviewLearningOverview(), getQuantPerformance(), fetchProfitLoop()]);
       setQueue(result);
       setLearning(learningResult);
       setPerformance(performanceResult);
+      setProfitLoop(profitResult);
       setSelectedKey((current) => result.items.some((item) => item.key === current) ? current : result.items[0]?.key ?? "");
     } catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)); }
     finally { setLoading(false); }
@@ -210,6 +222,39 @@ export default function ReviewWorkbenchPage({ onNavigate }: Props) {
         <article><span>本周收益</span><strong>{latestWeek ? `${latestWeek.return_pct.toFixed(2)}%` : "—"}</strong><small>成本 {latestWeek?.transaction_cost.toFixed(2) ?? "—"}</small></article>
         <article><span>年度回撤</span><strong>{latestYear ? `${latestYear.max_drawdown_pct.toFixed(2)}%` : "—"}</strong><small>年度收益 {latestYear ? `${latestYear.return_pct.toFixed(2)}%` : "—"}</small></article>
         <article className={(queue?.counts.high ?? 0) > 0 ? "urgent" : ""}><span>待我确认</span><strong>{queue?.counts.total ?? 0}</strong><small>{queue?.counts.high ?? 0} 条高优先级</small></article>
+      </div>
+    </section>
+    <section className="profit-loop-panel">
+      <header>
+        <div><span>收益闭环</span><strong>系统每天回答：谁赚钱、谁失效、要不要调仓、为什么卖、学到了什么</strong></div>
+        <button className="button ghost" disabled={loading} onClick={() => void refreshOutcomes()}>更新闭环</button>
+      </header>
+      <div className="profit-loop-grid">
+        <article>
+          <span>真实收益归因</span>
+          <strong>{rawPct(profitLoop?.attribution.latest_daily_return_pct)}</strong>
+          <small>模型 {pct(profitLoop?.attribution.components.model_selection)} · 行业 {pct(profitLoop?.attribution.components.industry_exposure)} · 成本 {profitLoop?.attribution.components.trading_cost?.toFixed?.(2) ?? "—"}</small>
+        </article>
+        <article className={(profitLoop?.model_monitor.degraded_count ?? 0) > 0 ? "warning" : ""}>
+          <span>模型上线后监控</span>
+          <strong>{profitLoop?.model_monitor.degraded_count ? `${profitLoop.model_monitor.degraded_count} 个降权` : "健康"}</strong>
+          <small>{profitLoop?.model_monitor.items?.[0] ? `${profitLoop.model_monitor.items[0].name} · ${profitLoop.model_monitor.items[0].reason}` : "live IC / hit rate / decay 已监控"}</small>
+        </article>
+        <article>
+          <span>组合层再优化</span>
+          <strong>{profitLoop?.portfolio_optimization.optimizer.ok ? "可执行" : "需约束"}</strong>
+          <small>目标函数 {profitLoop?.portfolio_optimization.optimizer.objective_value?.toFixed?.(4) ?? "—"} · 风险 {profitLoop?.portfolio_optimization.risk_budget.status || "—"}</small>
+        </article>
+        <article className={(profitLoop?.sell_rebalance.items ?? []).some((item) => item.action !== "hold") ? "warning" : ""}>
+          <span>卖出/调仓诊断</span>
+          <strong>{(profitLoop?.sell_rebalance.items ?? []).filter((item) => item.action !== "hold").length} 个需减仓</strong>
+          <small>{profitLoop?.sell_rebalance.items?.[0]?.reasons?.[0]?.detail || "未触发退出条件"}</small>
+        </article>
+        <article>
+          <span>复盘自动学习</span>
+          <strong>{profitLoop?.learning.overview.counts.feedback_samples ?? learning?.counts.feedback_samples ?? 0}</strong>
+          <small>反馈样本 · 卖出标签 {profitLoop?.sell_rebalance.learning_labels_written ?? 0} 条</small>
+        </article>
       </div>
     </section>
     <div className="manual-review-summary"><div><strong>{queue?.counts.total ?? 0}</strong><span>需人工处理</span></div><div className="danger"><strong>{queue?.counts.high ?? 0}</strong><span>高优先级</span></div><div><strong>{queue?.ai_triage?.auto_resolved ?? 0}</strong><span>AI已自动处理</span></div><div><strong>{queue?.ai_triage?.awaiting_outcome ?? 0}</strong><span>等待结果观察</span></div><p>{queue?.ai_triage?.running || (queue?.ai_triage?.pending ?? 0) > 0 ? `AI正在预审 ${queue?.ai_triage?.pending ?? 0} 条…` : "未成熟决策不会进入人工队列"}</p></div>

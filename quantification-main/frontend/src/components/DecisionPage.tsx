@@ -151,9 +151,14 @@ export default function DecisionPage({ onNavigate }: DecisionPageProps) {
   const health = summary?.data_health ?? null;
   const ledger = summary?.ledger ?? null;
   const gate = summary?.gate_decision;
+  const riskExplanation = summary?.risk_gate_explanation;
   const modelStatus = summary?.model_status ?? null;
   const activeModel = modelStatus?.active_version ?? null;
   const market = summary?.market_overview ?? null;
+  const enhancement = summary?.decision_enhancement ?? null;
+  const revenueDashboard = enhancement?.revenue_dashboard ?? null;
+  const protection = enhancement?.extreme_market_protection ?? null;
+  const positionPolicy = enhancement?.market_position_policy ?? revenueDashboard?.position_ceiling ?? null;
   const marketState = market?.market_state ?? null;
   const sentiment = market?.sentiment ?? null;
   const positionGate = market?.position_gate ?? null;
@@ -185,13 +190,18 @@ export default function DecisionPage({ onNavigate }: DecisionPageProps) {
   const accountRisks = (ledger?.account_risks ?? []).slice(0, 4);
   const actionCount = displayedBuyCount + displayedSellCount;
   const latestDataDate = health?.trade_dates?.last || market?.trade_date || "—";
+  const requiresRiskRebalance = Boolean(riskExplanation?.requires_rebalance);
   const noTradeReason = dataErrorCount > 0
     ? "系统有阻断项，今天先不进入执行。"
+    : requiresRiskRebalance
+      ? "风险预算收缩，系统应先卖出超配或切到防御资产。"
     : Number(ledger?.drawdown || 0) <= -0.08
       ? "组合风险较高，优先降风险。"
       : "当前没有新的买卖动作。";
   const primaryActionText = dataErrorCount > 0
     ? `先修复 ${dataErrorCount} 个系统阻断`
+    : requiresRiskRebalance
+      ? "系统执行降风险调仓，不新增股票仓位"
     : Number(ledger?.drawdown || 0) <= -0.08
       ? "先查看系统风险处置方案"
       : pendingAnalyze
@@ -200,6 +210,50 @@ export default function DecisionPage({ onNavigate }: DecisionPageProps) {
           ? `今日已执行 ${displayedBuyCount} 笔买入、${displayedSellCount} 笔卖出`
         : "今天先观察，不急于调仓";
   const reviewStatus = recentExec ? "最近执行已入账，可按需复盘" : "暂无新执行记录";
+  const riskGatePassed = Boolean(riskExplanation?.allow_new_exposure ?? positionGate?.allow_new_exposure ?? true);
+  const riskGateConstrained = !riskGatePassed || Number(riskExplanation?.risk_budget_multiplier ?? positionGate?.combined_risk_budget_multiplier ?? 1) < 0.8;
+  const riskGateLabel = !riskGatePassed ? (requiresRiskRebalance ? "禁买/降险" : "禁买") : riskGateConstrained ? "收缩" : "通过";
+  const riskGateIcon = !riskGatePassed ? (requiresRiskRebalance ? "↓" : "!") : riskGateConstrained ? "↓" : "✓";
+  const riskGateClass = !riskGatePassed ? (requiresRiskRebalance ? "warning" : "blocked") : riskGateConstrained ? "warning" : "passed";
+  const riskGateDetail = !riskGatePassed && (riskExplanation?.allow_reduce || riskExplanation?.allow_sell)
+    ? "不允许新增仓位；允许并优先执行减仓/防御调仓"
+    : riskExplanation?.reasons?.[0]?.detail || positionGate?.reason || "等待风险状态";
+  const modelPipelineReady = Boolean(activeModel);
+  const marketPipelineReady = Boolean(market?.ok);
+  const riskPipelineReady = Boolean(riskExplanation ? (riskExplanation.allow_new_exposure || riskExplanation.allow_reduce || riskExplanation.allow_defensive) : positionGate);
+  const actionPipelineReady = pendingAnalyze || hasRecentExecution || requiresRiskRebalance || gate?.tone === "go";
+  const pipelineItems = [
+    {
+      title: "数据已更新",
+      detail: health?.ok ? `最新交易日 ${latestDataDate}` : dataErrorCount ? `${dataErrorCount} 个数据阻断` : "等待数据中台确认",
+      status: health?.ok ? "done" : dataErrorCount ? "blocked" : "working",
+      target: "dataCenter" as SectionId,
+    },
+    {
+      title: "模型已接管",
+      detail: activeModel ? activeModel.version : displayedModel ? `${displayedModel.version} 待上线` : "等待训练",
+      status: modelPipelineReady ? "done" : "working",
+      target: "governance" as SectionId,
+    },
+    {
+      title: "行情已识别",
+      detail: marketState?.label || market?.reason || "等待市场观测",
+      status: marketPipelineReady ? "done" : "working",
+      target: "sentiment" as SectionId,
+    },
+    {
+      title: "风险已定界",
+      detail: riskGateLabel === "通过" ? "允许按目标组合调仓" : riskGateDetail,
+      status: riskGatePassed ? "done" : riskPipelineReady ? "warning" : "blocked",
+      target: "positionRisk" as SectionId,
+    },
+    {
+      title: "动作已生成",
+      detail: primaryActionText,
+      status: actionPipelineReady ? (requiresRiskRebalance ? "warning" : "done") : "working",
+      target: "validation" as SectionId,
+    },
+  ];
 
   const modelReadyText = useMemo(() => {
     if (!displayedModel) return "待训练";
@@ -277,6 +331,9 @@ export default function DecisionPage({ onNavigate }: DecisionPageProps) {
             <div className="decision-verdict-label"><i /> 今日建议</div>
             <h2>{gate?.title || "正在形成今日结论"}</h2>
             <p>{gate?.detail || "系统正在读取数据质量、市场环境、组合风险与生产模型。"}</p>
+            {riskExplanation && <div className="decision-reason-stack">
+              {riskExplanation.reasons.slice(0, 3).map((item) => <div className={`decision-reason-chip ${item.level}`} key={`${item.title}-${item.detail}`}><strong>{item.title}</strong><span>{item.detail}</span></div>)}
+            </div>}
             <div className="decision-verdict-footer">
               <span>{TONE_SUMMARY[gate?.tone || "hold"]}</span>
               <button type="button" onClick={() => onNavigate?.("validation")}>查看完整分析 <b>→</b></button>
@@ -295,6 +352,45 @@ export default function DecisionPage({ onNavigate }: DecisionPageProps) {
           </div>
         </div>
         {error && <div className="alert">{error}</div>}
+        {revenueDashboard && (
+          <section className="decision-revenue-dashboard" aria-label="收益目标仪表盘">
+            <header>
+              <div>
+                <span>收益目标仪表盘</span>
+                <strong>今天只看这四件事</strong>
+              </div>
+              <em>{positionPolicy?.label || marketState?.label || "市场状态待确认"}</em>
+            </header>
+            {protection?.active && (
+              <div className={`decision-protection-strip ${protection.severity}`}>
+                <strong>极端行情保护已启用</strong>
+                <span>{protection.triggers.map((item) => item.label).join(" / ")}</span>
+              </div>
+            )}
+            <div>
+              <article>
+                <span>今日是否调仓</span>
+                <strong>{revenueDashboard.today_action}</strong>
+                <small>{revenueDashboard.next_step}</small>
+              </article>
+              <article>
+                <span>预期收益来源</span>
+                <strong>{revenueDashboard.expected_return_source}</strong>
+                <small>排序模型选股，资金/叙事/事件只做确认和退出。</small>
+              </article>
+              <article>
+                <span>最大风险</span>
+                <strong>{revenueDashboard.max_risk}</strong>
+                <small>{revenueDashboard.why_not_move}</small>
+              </article>
+              <article>
+                <span>仓位上限</span>
+                <strong>{fmtPct(positionPolicy?.max_equity)} / 单票 {fmtPct(positionPolicy?.max_single_position)}</strong>
+                <small>当前股票仓位 {fmtPct(positionPolicy?.current_equity)} · {positionPolicy?.holding_period_bias || "正常轮动"}</small>
+              </article>
+            </div>
+          </section>
+        )}
         {!activeModel && latestCandidate && (
           <div className="decision-issue warning">
             训练已完成：{latestCandidate.version} 是候选版本，{displayedEligibility.validationStatus === "passed" ? "验证通过" : "验证尚未通过"}，但尚未允许接管交易。
@@ -303,6 +399,23 @@ export default function DecisionPage({ onNavigate }: DecisionPageProps) {
               : " 请在模型策略页查看上线门槛。"}
           </div>
         )}
+
+        <section className="decision-system-flow" aria-label="系统自动决策流程">
+          <header>
+            <span>系统自动闭环</span>
+            <strong>数据 → 模型 → 行情 → 风险 → 调仓</strong>
+            <p>你不需要逐个模块填空；这里显示系统自己已经判断到哪一步。</p>
+          </header>
+          <div>
+            {pipelineItems.map((item, index) => (
+              <button key={item.title} type="button" className={item.status} onClick={() => onNavigate?.(item.target)}>
+                <i>{index + 1}</i>
+                <span>{item.title}</span>
+                <strong>{item.detail}</strong>
+              </button>
+            ))}
+          </div>
+        </section>
 
         <div className="decision-glance-grid" aria-label="核心状态">
           <button type="button" onClick={() => onNavigate?.("governance")} className={dataErrorCount ? "danger" : "ready"}>
@@ -338,7 +451,7 @@ export default function DecisionPage({ onNavigate }: DecisionPageProps) {
                 ))}
               </div>
             ) : !analyze ? (
-              <div className="decision-zero-state"><i>—</i><strong>尚未生成今日分析</strong><p>当前保持原仓位，不根据不完整信号交易。</p></div>
+              <div className="decision-zero-state decision-plan-state"><i>—</i><strong>{riskExplanation?.headline || "尚未生成今日分析"}</strong><p>{riskExplanation?.constraints?.[0] || "当前保持原仓位，不根据不完整信号交易。"}</p>{riskExplanation?.today_plan?.length ? <div className="decision-plan-list">{riskExplanation.today_plan.slice(0, 4).map((item, index) => <div key={`${item.step}-${index}`}><b>{index + 1}</b><span>{item.step}</span><strong>{item.detail}</strong></div>)}</div> : null}</div>
             ) : topSelections.length ? (
               <div className="decision-pick-list">
                 {topSelections.map((row, index) => (
@@ -364,10 +477,10 @@ export default function DecisionPage({ onNavigate }: DecisionPageProps) {
             <div className="decision-gate-list">
               <button type="button" onClick={() => onNavigate?.("dataCenter")} className={health?.ok ? "passed" : "blocked"}><i>{health?.ok ? "✓" : "!"}</i><div><strong>数据可信</strong><span>{health?.ok ? "核心数据满足决策要求" : "存在数据阻断"}</span></div><em>{health?.ok ? "通过" : "阻断"}</em></button>
               <button type="button" onClick={openModelConsole} className={activeModel ? "passed" : "blocked"}><i>{activeModel ? "✓" : "!"}</i><div><strong>模型可用</strong><span>{activeModel ? activeModel.version : modelReadyText}</span></div><em>{activeModel ? "通过" : "阻断"}</em></button>
-              <button type="button" onClick={() => onNavigate?.("positionRisk")} className={Number(ledger?.drawdown || 0) > -0.08 ? "passed" : "blocked"}><i>{Number(ledger?.drawdown || 0) > -0.08 ? "✓" : "!"}</i><div><strong>风险预算</strong><span>{positionGate?.reason || "等待风险状态"}</span></div><em>{Number(ledger?.drawdown || 0) > -0.08 ? "通过" : "收缩"}</em></button>
-              <button type="button" onClick={() => onNavigate?.("reviewWorkbench")} className="manual"><i>人</i><div><strong>执行复盘</strong><span>{reviewStatus}</span></div><em>{recentExec ? "可选" : "无待办"}</em></button>
+              <button type="button" onClick={() => onNavigate?.("positionRisk")} className={riskGateClass}><i>{riskGateIcon}</i><div><strong>风险预算</strong><span>{riskGateDetail}</span></div><em>{riskGateLabel}</em></button>
+            <button type="button" onClick={() => onNavigate?.("reviewWorkbench")} className="manual"><i>人</i><div><strong>执行复盘</strong><span>{reviewStatus}</span></div><em>{recentExec ? "可选" : "无待办"}</em></button>
             </div>
-            {(stopIssues.length > 0 || accountRisks.length > 0) && <div className="decision-blocker-note">{[...stopIssues.map(issueText), ...accountRisks.map((risk) => risk.message)][0]}</div>}
+            {(riskExplanation?.release_conditions?.length || stopIssues.length > 0 || accountRisks.length > 0) && <div className="decision-blocker-note">{riskExplanation?.release_conditions?.[0] || [...stopIssues.map(issueText), ...accountRisks.map((risk) => risk.message)][0]}</div>}
           </aside>
         </div>
 
@@ -389,6 +502,22 @@ export default function DecisionPage({ onNavigate }: DecisionPageProps) {
         <details className="decision-detail-drawer">
           <summary><span>展开完整决策证据</span><em>市场观测、模型验证、数据问题与最近成交</em></summary>
           <div className="decision-detail-grid">
+            {enhancement?.model_role_contract && (
+              <section className="wide">
+                <div className="decision-card-head"><div><span>模型分工</span><h3>谁负责什么，谁不能越界</h3></div></div>
+                <p className="decision-detail-copy">{enhancement.model_role_contract.summary}</p>
+                <div className="decision-role-contract-grid">
+                  {enhancement.model_role_contract.items.map((item) => (
+                    <article key={item.model_key}>
+                      <strong>{item.name}</strong>
+                      <span>{item.decision_role}</span>
+                      <small>负责：{item.owns.slice(0, 3).join("、")}</small>
+                      <em>输出：{item.output}</em>
+                    </article>
+                  ))}
+                </div>
+              </section>
+            )}
             <section>
               <div className="decision-card-head"><div><span>市场证据</span><h3>{marketState?.label || "暂无结论"}</h3></div></div>
               <div className="market-observation-grid">

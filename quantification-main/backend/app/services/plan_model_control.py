@@ -5,7 +5,7 @@ import os
 import pickle
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +15,7 @@ from app.db.store import (
     create_model_train_run,
     create_model_version,
     get_active_model_version,
+    get_model_train_run,
     get_model_version,
     list_model_train_runs,
     list_model_versions,
@@ -183,11 +184,19 @@ def _plan_model_horizon(model_key: str) -> int:
     return 10
 
 
-def _build_plan_training_dataset(model_key: str, *, max_sessions: int = 760, max_rows: int = 120_000) -> dict[str, Any]:
+def _build_plan_training_dataset(
+    model_key: str,
+    *,
+    max_sessions: int = 760,
+    max_rows: int = 120_000,
+    on_progress: Any | None = None,
+) -> dict[str, Any]:
     from app.data_platform.db import _conn as data_conn
 
     horizon = _plan_model_horizon(model_key)
     date_limit = max_sessions + horizon + 5
+    if on_progress:
+        on_progress("dataset", 0.24, f"读取最近 {date_limit} 个交易日训练日历")
     with data_conn() as c:
         date_rows = c.execute(
             "SELECT trade_date FROM dc_stock_daily_snapshot GROUP BY trade_date ORDER BY trade_date DESC LIMIT ?",
@@ -197,6 +206,8 @@ def _build_plan_training_dataset(model_key: str, *, max_sessions: int = 760, max
         if len(dates) < max(80, horizon + 20):
             raise RuntimeError(f"训练日历不足：{len(dates)} sessions")
         start_date = min(dates)
+        if on_progress:
+            on_progress("dataset", 0.28, f"日历覆盖 {len(dates)} 天，起始 {start_date}，预测周期 {horizon} 天")
         raw_rows = c.execute(
             f"""
             WITH base AS (
@@ -227,6 +238,8 @@ def _build_plan_training_dataset(model_key: str, *, max_sessions: int = 760, max
             """,
             (horizon, start_date, max_rows),
         ).fetchall()
+    if on_progress:
+        on_progress("dataset", 0.31, f"取回候选训练截面 {len(raw_rows)} 行，开始构造特征")
     samples: list[dict[str, Any]] = []
     for row in raw_rows:
         item = dict(row)
@@ -249,10 +262,14 @@ def _build_plan_training_dataset(model_key: str, *, max_sessions: int = 760, max
         })
     if len(samples) < 500:
         raise RuntimeError(f"训练样本不足：{len(samples)} rows")
+    if on_progress:
+        on_progress("dataset", 0.34, f"有效样本 {len(samples)} 行，特征 {len(PLAN_MODEL_FEATURES)} 个")
     samples.sort(key=lambda x: x["trade_date"])
     returns = np.asarray([float(x["future_return"]) for x in samples], dtype=float)
     q20, q40, q60, q80 = np.quantile(returns, [0.2, 0.4, 0.6, 0.8])
     labels = np.digitize(returns, [q20, q40, q60, q80]).astype(int)
+    if on_progress:
+        on_progress("dataset", 0.37, f"收益标签完成：按 20/40/60/80 分位分成 5 档")
     x = np.asarray([x["features"] for x in samples], dtype=float)
     dates = [str(x["trade_date"]) for x in samples]
     unique_dates = sorted(set(dates))
@@ -261,6 +278,8 @@ def _build_plan_training_dataset(model_key: str, *, max_sessions: int = 760, max
     train_mask = np.asarray([date < split_date for date in dates], dtype=bool)
     if train_mask.sum() < 100 or (~train_mask).sum() < 50:
         train_mask = np.arange(len(samples)) < int(len(samples) * 0.8)
+    if on_progress:
+        on_progress("dataset", 0.40, f"训练/验证切分完成：训练 {int(train_mask.sum())} 行，验证 {int((~train_mask).sum())} 行")
     def _groups_for(mask: np.ndarray) -> list[int]:
         grouped: list[int] = []
         for date in unique_dates:
@@ -275,13 +294,18 @@ def _build_plan_training_dataset(model_key: str, *, max_sessions: int = 760, max
         "x_val": x[~train_mask],
         "y_val_rank": labels[~train_mask],
         "y_val_return": returns[~train_mask],
+        "val_dates": [date for date, in_split in zip(dates, ~train_mask) if bool(in_split)],
         "group_train": _groups_for(train_mask),
         "group_val": _groups_for(~train_mask),
         "sample_rows": len(samples),
+        "raw_rows": len(raw_rows),
         "train_rows": int(train_mask.sum()),
         "validation_rows": int((~train_mask).sum()),
         "dates": {"start": unique_dates[0], "split": split_date, "end": unique_dates[-1]},
         "horizon": horizon,
+        "label_quantiles": [float(q20), float(q40), float(q60), float(q80)],
+        "feature_count": len(PLAN_MODEL_FEATURES),
+        "trade_date_count": len(unique_dates),
     }
 
 
@@ -324,6 +348,23 @@ def _fit_lightgbm_plan_model(model_key: str, dataset: dict[str, Any]) -> dict[st
     lift = top_return - base_return
     hit_rate = float(np.mean(actual_return[order[:top_n]] > 0))
     corr = float(np.corrcoef(pred_score, actual_return)[0, 1]) if len(pred_score) > 1 and float(np.std(pred_score)) > 0 and float(np.std(actual_return)) > 0 else 0.0
+    val_dates = list(dataset.get("val_dates") or [])
+    window_lifts: list[float] = []
+    if len(val_dates) == len(actual_return):
+        unique_val_dates = sorted(set(str(date) for date in val_dates))
+        if len(unique_val_dates) >= 3:
+            chunks = np.array_split(np.asarray(unique_val_dates, dtype=object), min(3, len(unique_val_dates)))
+            for chunk in chunks:
+                date_set = {str(date) for date in chunk.tolist()}
+                mask = np.asarray([str(date) in date_set for date in val_dates], dtype=bool)
+                if int(mask.sum()) < 10:
+                    continue
+                window_pred = pred_score[mask]
+                window_return = actual_return[mask]
+                window_order = np.argsort(window_pred)[::-1]
+                window_top_n = max(1, min(50, len(window_order) // 10 or 1))
+                window_lifts.append(float(np.mean(window_return[window_order[:window_top_n]]) - np.mean(window_return)))
+    walk_forward_lift = float(np.mean(window_lifts)) if window_lifts else lift
     return {
         "model": model,
         "model_type": "plan_lightgbm_ranker" if model_key in {"medium_horizon_lambdarank_v1", "leader_lambdarank_v1"} else "plan_lightgbm_multitask",
@@ -335,7 +376,8 @@ def _fit_lightgbm_plan_model(model_key: str, dataset: dict[str, Any]) -> dict[st
             "cost_after_backplay": True,
             "baseline_compared": True,
             "lift": round(lift, 8),
-            "walk_forward_lift": round(lift, 8),
+            "walk_forward_lift": round(walk_forward_lift, 8),
+            "walk_forward_windows": len(window_lifts),
             "hit_rate": round(hit_rate, 6),
             "rank_return_corr": round(corr, 6),
             "horizon": dataset["horizon"],
@@ -413,6 +455,67 @@ def _latest_run_for_model(model_key: str, runs: list[dict[str, Any]] | None = No
     return None
 
 
+def _with_train_timeline(run: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not run:
+        return None
+    metrics = dict(run.get("metrics") or {})
+    if not isinstance(metrics.get("timeline"), list) or not metrics.get("timeline"):
+        metrics["timeline"] = [{
+            "at": run.get("updated_at") or run.get("created_at"),
+            "phase": run.get("phase") or run.get("status") or "queued",
+            "progress": run.get("progress") or 0,
+            "message": run.get("message") or "训练任务已创建，等待阶段更新",
+        }]
+    return {**run, "metrics": metrics}
+
+
+def _parse_dt(value: Any) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).replace(tzinfo=None)
+    except Exception:
+        return None
+
+
+def _mark_stale_train_run(run: dict[str, Any] | None, *, stale_minutes: int = 20) -> dict[str, Any] | None:
+    if not run or str(run.get("status") or "") not in {"running", "queued"}:
+        return run
+    updated_at = _parse_dt(run.get("updated_at") or run.get("created_at"))
+    if not updated_at or datetime.utcnow() - updated_at < timedelta(minutes=max(5, stale_minutes)):
+        return run
+    metrics = dict(run.get("metrics") or {})
+    timeline = list(metrics.get("timeline") or [])
+    timeline.append({
+        "at": datetime.utcnow().isoformat(),
+        "phase": "failed",
+        "progress": 1.0,
+        "message": "训练心跳超时：后端进程重启或训练线程中断，已标记为可重训",
+    })
+    metrics["timeline"] = timeline[-20:]
+    update_model_train_run(
+        int(run["id"]),
+        status="failed",
+        phase="failed",
+        progress=1.0,
+        message="训练心跳超时，已标记为可重训",
+        metrics=metrics,
+        error="stale_plan_model_training_run",
+        finished_at=datetime.utcnow().isoformat(),
+    )
+    refreshed = dict(run)
+    refreshed.update({
+        "status": "failed",
+        "phase": "failed",
+        "progress": 1.0,
+        "message": "训练心跳超时，已标记为可重训",
+        "metrics": metrics,
+        "error": "stale_plan_model_training_run",
+        "finished_at": datetime.utcnow().isoformat(),
+    })
+    return refreshed
+
+
 def model_family_status() -> dict[str, Any]:
     now = time.monotonic()
     cached = _status_cache.get("value")
@@ -426,7 +529,7 @@ def model_family_status() -> dict[str, Any]:
         active = get_active_model_version(key)
         latest = versions[0] if versions else None
         coverage = _coverage_snapshot(key, base_coverage)
-        run = _latest_run_for_model(key, train_runs)
+        run = _with_train_timeline(_mark_stale_train_run(_latest_run_for_model(key, train_runs)))
         trained = bool(latest)
         production_ready = bool(active and (active.get("validation") or {}).get("production_eligible"))
         if production_ready:
@@ -484,9 +587,19 @@ def model_family_status() -> dict[str, Any]:
 def _run_training_sync(model_key: str, run_id: int) -> dict[str, Any]:
     started_at = datetime.utcnow().isoformat()
     contract = PLAN_MODELS[model_key]
+    timeline: list[dict[str, Any]] = []
 
     def progress(phase: str, pct: float, message: str, metrics: dict[str, Any] | None = None) -> None:
-        payload = {"model_key": model_key, "contract": contract["family"], **(metrics or {})}
+        now = datetime.utcnow().isoformat()
+        timeline.append({"at": now, "phase": phase, "progress": pct, "message": message})
+        previous = (get_model_train_run(run_id) or {}).get("metrics") or {}
+        payload = {
+            **previous,
+            "model_key": model_key,
+            "contract": contract["family"],
+            **(metrics or {}),
+            "timeline": timeline[-20:],
+        }
         update_model_train_run(run_id, phase=phase, progress=pct, message=message, metrics=payload, started_at=started_at)
 
     try:
@@ -494,9 +607,25 @@ def _run_training_sync(model_key: str, run_id: int) -> dict[str, Any]:
         coverage = _coverage_snapshot(model_key)
         if not coverage["data_ready"]:
             raise RuntimeError(f"训练数据不足：{coverage['effective_sessions']}/{coverage['minimum_sessions']} sessions")
-        progress("dataset", 0.35, "构造点时训练样本与query标签", {"coverage": coverage})
-        dataset = _build_plan_training_dataset(model_key)
-        progress("training", 0.55, "训练真实LightGBM模型", {"coverage": coverage, "train_rows": dataset["train_rows"]})
+        progress("dataset", 0.22, "开始构造点时训练样本与query标签", {"coverage": coverage})
+        dataset = _build_plan_training_dataset(model_key, on_progress=progress)
+        progress(
+            "dataset",
+            0.43,
+            f"数据集就绪：{dataset['sample_rows']} 行，{dataset['trade_date_count']} 个交易日，{dataset['feature_count']} 个特征",
+            {"coverage": coverage, "dataset": {
+                "sample_rows": dataset["sample_rows"],
+                "raw_rows": dataset["raw_rows"],
+                "train_rows": dataset["train_rows"],
+                "validation_rows": dataset["validation_rows"],
+                "trade_date_count": dataset["trade_date_count"],
+                "feature_count": dataset["feature_count"],
+                "horizon": dataset["horizon"],
+                "dates": dataset["dates"],
+                "label_quantiles": dataset["label_quantiles"],
+            }},
+        )
+        progress("training", 0.55, f"训练真实LightGBM模型：训练 {dataset['train_rows']} 行，验证 {dataset['validation_rows']} 行", {"coverage": coverage, "train_rows": dataset["train_rows"], "validation_rows": dataset["validation_rows"]})
         trained = _fit_lightgbm_plan_model(model_key, dataset)
         progress("validation", 0.80, "执行滚动样本外与费用后回放")
         metrics = {
@@ -581,7 +710,15 @@ def _run_training_sync(model_key: str, run_id: int) -> dict[str, Any]:
             progress=1.0,
             message="计划书专门模型真实LightGBM训练完成，等待上线观察与评审",
             model_version_id=model_version_id,
-            metrics={"model_key": model_key, **metrics, "coverage": coverage},
+            metrics={
+                "model_key": model_key,
+                **metrics,
+                "coverage": coverage,
+                "timeline": [
+                    *timeline[-19:],
+                    {"at": datetime.utcnow().isoformat(), "phase": "completed", "progress": 1.0, "message": "训练完成，候选版本已生成"},
+                ],
+            },
             finished_at=datetime.utcnow().isoformat(),
         )
         return {"ok": True, "run_id": run_id, "model_version_id": model_version_id, "version": version}
@@ -592,7 +729,13 @@ def _run_training_sync(model_key: str, run_id: int) -> dict[str, Any]:
             phase="failed",
             progress=1.0,
             message="计划书专门模型训练失败",
-            metrics={"model_key": model_key},
+            metrics={
+                "model_key": model_key,
+                "timeline": [
+                    *timeline[-19:],
+                    {"at": datetime.utcnow().isoformat(), "phase": "failed", "progress": 1.0, "message": f"训练失败：{str(exc)[:160]}"},
+                ],
+            },
             error=str(exc)[:500],
             finished_at=datetime.utcnow().isoformat(),
         )

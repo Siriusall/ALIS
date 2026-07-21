@@ -23,11 +23,28 @@ from app.services.operations_overview import build_live_portfolio_risk
 from app.services.model_registry import get_model_status
 from app.services.thesis_store import list_theses
 from app.services.decision_store import list_pool_members
+from app.core.a_share_fees import is_exchange_etf
+from app.services.defensive_assets import defensive_asset_bar
 
 
-def _current_price(symbol: str) -> float | None:
+def _current_price(symbol: str, trade_date: str | None = None) -> float | None:
     """Get latest close price from snapshot."""
     code = symbol.strip().upper()
+    if is_exchange_etf(code):
+        ts_code = code if code.endswith((".SH", ".SZ")) else f"{code}.SH"
+        bar = defensive_asset_bar(ts_code, trade_date or datetime.now().strftime("%Y%m%d"))
+        if not bar and trade_date:
+            with data_conn() as c:
+                row = c.execute(
+                    """SELECT trade_date FROM dc_tushare_raw_records
+                       WHERE api_name='fund_daily' AND ts_code=? AND trade_date<=?
+                       ORDER BY trade_date DESC LIMIT 1""",
+                    (ts_code, str(trade_date).replace("-", "")),
+                ).fetchone()
+            if row:
+                bar = defensive_asset_bar(ts_code, str(dict(row).get("trade_date") or ""))
+        if bar:
+            return float(bar.get("close") or 0) or None
     if not code.endswith(".SH") and not code.endswith(".SZ"):
         for suffix in (".SH", ".SZ"):
             with data_conn() as c:
@@ -57,6 +74,7 @@ def build_daily_rebalance_report() -> dict[str, Any]:
     now = datetime.now().isoformat(timespec="seconds")
     market = live_market_context()
     portfolio_risk = build_live_portfolio_risk()
+    report_trade_date = str(portfolio_risk.get("as_of") or market.get("trade_date") or "").replace("-", "")
     model_status = get_model_status()
     positions_raw = get_positions()
     balance = get_account_balance()
@@ -66,7 +84,7 @@ def build_daily_rebalance_report() -> dict[str, Any]:
     positions = []
     for p in positions_raw:
         sym = str(p.get("symbol", ""))
-        price = _current_price(sym)
+        price = _current_price(sym, report_trade_date)
         qty = float(p.get("quantity", 0) or 0)
         avg_price = float(p.get("price", 0) or 0)
         current_value = price * qty if price else None
@@ -147,7 +165,7 @@ def build_daily_rebalance_report() -> dict[str, Any]:
             "current_value": round(current_value, 2) if current_value else 0,
             "target_value": round(target_value, 2),
             "difference": round(diff, 2),
-            "current_price": current_pos["current_price"] if current_pos else _current_price(sym),
+            "current_price": current_pos["current_price"] if current_pos else _current_price(sym, report_trade_date),
             "position_state": position_state.get("recommended_state", "normal") if position_state else "normal",
             "state_reason": position_state.get("reason", "") if position_state else "",
         })

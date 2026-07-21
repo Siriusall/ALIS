@@ -151,6 +151,17 @@ export async function fetchReviewLearningOverview():Promise<ReviewLearningOvervi
 export async function materializeReviewOutcomes():Promise<void>{const response=await apiFetch("/api/research/reviews/materialize-outcomes",{method:"POST"});if(!response.ok)throw new Error(`收益归因更新失败（HTTP ${response.status}）`)}
 export async function submitManualReviewAction(payload:{review_key:string;item_kind:string;action:"approved"|"rejected"|"modified_approved";error_type?:string;comment?:string;llm_draft?:Record<string,unknown>}):Promise<void>{const response=await apiFetch("/api/research/manual-review/action",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)});const data=await response.json().catch(()=>({}));if(!response.ok)throw new Error(data?.detail === "rejection_reason_required" ? "驳回时请选择错误类型；选择‘其他’时还需要填写原因" : `复核结果保存失败（HTTP ${response.status}）`)}
 
+export interface ProfitLoopOverview {
+  ok:boolean;
+  generated_at:string;
+  attribution:{latest_daily_return_pct:number;latest_monthly_return_pct:number;components:Record<string,number>;hit_rate:number};
+  model_monitor:{degraded_count:number;items:Array<{model_key:string;name:string;status:string;live_ic:number;hit_rate:number;turnover:number;drawdown_contribution:number;decay:number;weight_multiplier:number;reason:string}>};
+  portfolio_optimization:{optimizer:{ok:boolean;objective_value:number;objective_terms:Record<string,number>;weights:Record<string,number>;blocked_reasons:string[]};risk_budget:{status:string;breaches:Array<Record<string,unknown>>}};
+  sell_rebalance:{items:Array<{symbol:string;name:string;pnl_pct:number;current_weight:number;target_weight:number;action:string;reasons:Array<{code:string;label:string;detail:string}>}>;learning_labels_written:number};
+  learning:{overview:ReviewLearningOverview;sell_labels:Array<{label:string;count:number}>};
+}
+export async function fetchProfitLoop():Promise<ProfitLoopOverview>{const response=await apiFetch("/api/research/profit-loop");if(!response.ok)throw new Error(`收益闭环读取失败（HTTP ${response.status}）`);return response.json()}
+
 export interface StockPoolMember {id:number;ts_code:string;pool_type:string;reason:string;status:string;entered_at:string;updated_at:string}
 export interface PoolEligibility {ok:boolean;ts_code:string;eligible_for_core:boolean;gates:Array<{key:string;label:string;passed:boolean;detail:string}>;research_state?:Record<string,unknown>;valuation?:{status?:string;method?:string;scenarios?:Record<string,number>};thesis_count:number}
 export async function fetchPoolEligibility(tsCode:string):Promise<PoolEligibility>{const response=await apiFetch(`/api/research/pools/eligibility/${encodeURIComponent(tsCode)}`);if(!response.ok)throw new Error(`股票池门控读取失败（HTTP ${response.status}）`);return response.json()}

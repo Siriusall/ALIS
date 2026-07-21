@@ -21,12 +21,16 @@ from app.api.state import (
     update_quant_run_progress,
 )
 from app.core.exchange_groups import normalize_exchange_group
+from app.core.a_share_fees import sell_cost_breakdown
 from app.db.store import (
+    append_operations_to_execution,
+    create_execution,
     create_quant_run_task,
     delete_quant_run_task,
     get_account_balance,
     get_account_baseline,
     get_execution,
+    get_default_strategy_id,
     get_quant_run_task,
     get_positions,
     get_strategy,
@@ -38,10 +42,13 @@ from app.db.store import (
     list_performance_reports,
     upsert_quant_run_task_meta,
     update_quant_run_task,
+    sell_position,
 )
 from app.integrations.tushare_client import get_tushare_client
 from app.services.backtest_data_source import BacktestDataSource
 from app.services.cache_consolidation import trigger_backfill_merge_meta_async
+from app.services.defensive_assets import defensive_asset_bar
+from app.services.operations_overview import build_live_portfolio_risk
 from app.services.quant_run_engine import (
     HistoricalDataMissingError,
     ReplayRiskGateError,
@@ -71,6 +78,13 @@ class QuantRunStartRequest(BaseModel):
 class QuantRunCatchUpRequest(BaseModel):
     start_date: str | None = Field(None, description="可选，YYYY-MM-DD；不传则从 last_signal_date 后开始")
     max_steps: int = Field(5, ge=1, le=60, description="一次最多补跑多少个信号日")
+
+
+class QuantRiskRebalanceRequest(BaseModel):
+    strategy_id: int | None = Field(None, ge=1)
+    top_n: int = Field(10, ge=1, le=100)
+    budget_ratio: float = Field(1.0, ge=0.0, le=1.0)
+    exchange_group: str = Field("HS", description="ALL|HS|CYB|BJ")
 
 
 class QuantTaskCreateRequest(BaseModel):
@@ -1138,6 +1152,122 @@ def quant_run_once() -> dict:
         "bought_count": result.bought_count,
         "total_buy_cost": result.total_buy_cost,
         "message": result.message,
+    }
+
+
+@router.post("/quant-runs/execute-risk-rebalance")
+def quant_run_execute_risk_rebalance(req: QuantRiskRebalanceRequest | None = None) -> dict:
+    """按最近交易日直接执行一次纯卖出风险再平衡，主要用于风险收缩/超配降权。"""
+    body = req or QuantRiskRebalanceRequest()
+    try:
+        ensure_manual_trade_allowed("风险再平衡")
+    except RuntimeError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+    try:
+        dates = require_consolidated_trade_dates(min_count=2)
+    except HistoricalDataMissingError as e:
+        trigger_backfill_merge_meta_async(reason="quant_runs_risk_rebalance_508")
+        raise HTTPException(
+            status_code=508,
+            detail={
+                "code": "historical_data_missing_508",
+                "message": str(e),
+                "action": "backfill_triggered",
+            },
+        )
+    strategy_id = int(body.strategy_id or get_default_strategy_id() or 1)
+    signal_date = dates[-2]
+    execute_date = dates[-1]
+    portfolio_risk = build_live_portfolio_risk()
+    actions = [
+        item for item in (portfolio_risk.get("deleveraging_actions") or [])
+        if str(item.get("action") or "") == "reduce" and item.get("symbol")
+    ]
+    exposures = {str(item.get("symbol") or ""): item for item in (portfolio_risk.get("exposures") or [])}
+    positions = {str(item.get("symbol") or ""): item for item in get_positions()}
+    equity = float(((portfolio_risk.get("account") or {}).get("equity")) or 0)
+    if equity <= 0:
+        raise HTTPException(status_code=400, detail="账户权益不足，无法执行风险再平衡")
+    ds = BacktestDataSource()
+    executed_at = f"{execute_date}T09:30:00"
+    sell_orders: list[dict] = []
+    blocked: list[dict] = []
+
+    for action in actions:
+        symbol = str(action.get("symbol") or "")
+        pos = positions.get(symbol)
+        if not pos:
+            continue
+        quantity = int(pos.get("quantity") or 0)
+        if quantity <= 0:
+            continue
+        target_weight = float(action.get("target_weight") or 0)
+        if target_weight <= 0:
+            continue
+        px = float(ds.get_price_on_date(symbol, execute_date, field="open") or 0)
+        if px <= 0:
+            bar = defensive_asset_bar(f"{symbol}.SH", execute_date) or defensive_asset_bar(f"{symbol}.SZ", execute_date)
+            px = float((bar or {}).get("open") or (bar or {}).get("close") or 0)
+        if px <= 0:
+            blocked.append({"symbol": symbol, "side": "SELL", "code": "price_missing", "message": "执行日卖出价格缺失"})
+            continue
+        target_value = equity * target_weight
+        current_value = float((exposures.get(symbol) or {}).get("market_value") or 0) or px * quantity
+        excess_value = current_value - target_value
+        sell_qty = min(quantity, int(excess_value // (px * 100)) * 100)
+        if sell_qty <= 0 and current_value > target_value and quantity >= 100:
+            sell_qty = 100
+        if sell_qty <= 0:
+            continue
+        try:
+            fee = sell_cost_breakdown(px, sell_qty, symbol)
+            exec_price = float(fee["executed_price"])
+            sell_position(int(pos["id"]), quantity=sell_qty, price=exec_price, trade_date=execute_date, record_operation=False)
+        except ValueError as exc:
+            blocked.append({"symbol": symbol, "side": "SELL", "code": "sell_constraint", "message": str(exc)})
+            continue
+        sell_orders.append({
+            "symbol": symbol,
+            "side": "SELL",
+            "price": exec_price,
+            "quantity": sell_qty,
+            "at": executed_at,
+            "remark": "风险再平衡卖出（单票超限降权）",
+            "name": str(pos.get("name") or ""),
+            **{k: fee[k] for k in ("commission", "transfer_fee", "stamp_tax", "slippage_bps", "fee_schedule_version")},
+        })
+
+    execution_id = None
+    if sell_orders:
+        execution_id = create_execution(strategy_id=strategy_id, executed_at=executed_at, budget=0.0, top_n=int(body.top_n), orders=[])
+        append_operations_to_execution(execution_id, executed_at, sell_orders)
+    message = f"risk-only execute={execute_date} 卖出{len(sell_orders)} 笔，拦截{len(blocked)} 笔"
+    append_quant_run_record(
+        signal_date=signal_date,
+        execute_date=execute_date,
+        sold_count=len(sell_orders),
+        bought_count=0,
+        total_buy_cost=0.0,
+        message=message,
+    )
+    update_quant_run_progress(
+        last_signal_date=signal_date,
+        last_execute_date=execute_date,
+        message=message,
+    )
+    return {
+        "ok": True,
+        "mode": "risk_rebalance",
+        "strategy_id": strategy_id,
+        "signal_date": signal_date,
+        "execute_date": execute_date,
+        "sold_count": len(sell_orders),
+        "bought_count": 0,
+        "total_buy_cost": 0.0,
+        "execution_id": execution_id,
+        "orders": sell_orders,
+        "blocked_events": blocked,
+        "message": message,
     }
 
 

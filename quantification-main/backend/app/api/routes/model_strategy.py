@@ -44,6 +44,7 @@ from app.services.hsmm_shadow import train_hsmm_shadow
 from app.services.backend_acceptance import backend_acceptance_matrix
 from app.services.strategy_workbench import build_strategy_workbench
 from app.services.plan_model_control import model_family_status, request_plan_model_training, review_plan_model_version, train_all_trainable_plan_models, review_all_candidate_plan_models, score_plan_model_features
+from app.services.plan_model_auto_optimizer import build_auto_optimization_status, run_auto_optimization_once
 
 router = APIRouter()
 
@@ -156,6 +157,10 @@ class NormalizeModelOutputRequest(BaseModel):
     output: dict[str, Any] = Field(default_factory=dict)
 
 
+class PlanModelAutoOptimizationRequest(BaseModel):
+    force: bool = False
+
+
 @router.get("/model-strategy/status")
 def model_strategy_status() -> dict:
     return get_model_status()
@@ -177,6 +182,16 @@ def model_strategy_train_plan_model(req: PlanModelTrainRequest) -> dict:
 @router.post("/model-strategy/plan-models/train-all")
 def model_strategy_train_all_plan_models() -> dict:
     return train_all_trainable_plan_models()
+
+
+@router.get("/model-strategy/auto-optimization")
+def model_strategy_auto_optimization() -> dict:
+    return build_auto_optimization_status()
+
+
+@router.post("/model-strategy/auto-optimization/run")
+def model_strategy_run_auto_optimization(req: PlanModelAutoOptimizationRequest) -> dict:
+    return run_auto_optimization_once(force=req.force)
 
 
 @router.post("/model-strategy/plan-models/review/{model_version_id}")

@@ -32,6 +32,7 @@ from app.services.manual_review_queue import build_manual_review_queue, submit_m
 from app.services.llm_review_assistant import generate_review_draft, llm_token_budget_status
 from app.services.review_learning import materialize_decision_outcomes, review_learning_overview
 from app.services.manual_review_triage import run_manual_review_triage_once, start_manual_review_triage, triage_status
+from app.services.profit_loop import build_profit_loop
 
 router = APIRouter()
 
@@ -448,6 +449,11 @@ def research_review_learning_overview() -> dict[str, Any]:
 @router.post("/research/reviews/materialize-outcomes")
 def research_materialize_review_outcomes(limit: int = Query(default=1000, ge=1, le=5000)) -> dict[str, Any]:
     return materialize_decision_outcomes(limit=limit)
+
+
+@router.get("/research/profit-loop")
+def research_profit_loop() -> dict[str, Any]:
+    return build_profit_loop()
 
 
 @router.get("/research/manual-review/queue")

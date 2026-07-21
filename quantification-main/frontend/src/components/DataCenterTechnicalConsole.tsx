@@ -2,10 +2,10 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import {
   fetchDailyUpdateStatus, fetchDataCenterStatus, fetchDataObservability, fetchReadiness,
   fetchSimpleDataHealth, fetchDataAssets, fetchColdArchiveStatus, startColdArchive, startDailyUpdate, syncFinancialBatch, syncMarket, startWebFallbackCrawl,
-  fetchBackfillPlan, startBackfill, fetchBackfillStatus, fetchRuntimeLogsAfter,
+  fetchBackfillPlan, startBackfill, fetchBackfillStatus, fetchRuntimeLogsAfter, fetchStreamAdminStatus, handleStreamMessage, bulkHandleStreamMessages,
   type ConsumerReadiness, type DailyUpdateStatus, type DataCenterStatus, type DataObservability,
   type ReadinessOverview, type SimpleDataHealth, type DataAssetsResponse, type ColdArchiveStatus,
-  type BackfillPlan, type BackfillStatus, type BackfillStep,
+  type BackfillPlan, type BackfillStatus, type BackfillStep, type StreamAdminStatus, type StreamMessage,
 } from "../api/dataCenter";
 import { elapsedMinutesFromServerTime, formatGmt8Date, formatGmt8Time } from "../utils/time";
 import LoadingState from "./LoadingState";
@@ -218,6 +218,8 @@ function Repair(c: Ctx) {
   const [msg,setMsg]=useState("");
   const [plan,setPlan]=useState<BackfillPlan|null>(null);
   const [backfill,setBackfill]=useState<BackfillStatus|null>(null);
+  const [stream,setStream]=useState<StreamAdminStatus|null>(null);
+  const [streamOpen,setStreamOpen]=useState(false);
   const [planning,setPlanning]=useState(false);
   const backfillPollRunning=useRef(false);
 
@@ -271,6 +273,17 @@ function Repair(c: Ctx) {
     await runPlan();
   }
 
+  async function refreshStream(){
+    try{setStream(await fetchStreamAdminStatus(50,100));}
+    catch(e){setMsg(`读取队列失败：${e instanceof Error?e.message:String(e)}`)}
+  }
+
+  async function streamAction(label:string, fn:()=>Promise<any>){
+    setMsg(`${label}处理中…`);
+    try{await fn(); setMsg(`${label}完成`); await refreshStream(); await fetchBackfillStatus().then(setBackfill).catch(()=>{});}
+    catch(e){setMsg(`${label}失败：${e instanceof Error?e.message:String(e)}`)}
+  }
+
   useEffect(()=>{
     let cancelled=false;
     fetchBackfillStatus().then((status)=>{
@@ -279,6 +292,7 @@ function Repair(c: Ctx) {
       if(status.plan) setPlan(status.plan);
       if(status.phase==="completed"||status.phase==="completed_with_gaps"||status.phase==="failed") setMsg(status.message||"");
     }).catch(()=>{});
+    fetchStreamAdminStatus(50,100).then((status)=>{if(!cancelled) setStream(status)}).catch(()=>{});
     return ()=>{cancelled=true};
   },[]);
 
@@ -358,7 +372,49 @@ function Repair(c: Ctx) {
       </table></div>
     </Panel>}
     <Panel title="定向补数工具" sub="技术排障与小范围修复"><div className="repair-form"><label>交易日<input value={tradeDate} onChange={e=>setTradeDate(e.target.value)} placeholder="YYYYMMDD"/></label><button className="button ghost" onClick={()=>run("行情补数",()=>syncMarket(tradeDate))}>补指定行情</button><label>报告期<input value={period} onChange={e=>setPeriod(e.target.value)} placeholder="20260331"/></label><label>股票代码<input value={codes} onChange={e=>setCodes(e.target.value)}/></label><button className="button ghost" onClick={()=>run("财务补数",()=>syncFinancialBatch({period,codes,limit:20}))}>补财务数据</button><button className="button ghost" onClick={()=>run("网页备用源",()=>startWebFallbackCrawl(codes,20))}>运行备用源</button></div></Panel>
+    <StreamConsole stream={stream} open={streamOpen} onToggle={()=>setStreamOpen(!streamOpen)} onRefresh={refreshStream} onAction={streamAction}/>
   </div>;
+}
+
+function StreamConsole({stream,open,onToggle,onRefresh,onAction}:{stream:StreamAdminStatus|null;open:boolean;onToggle:()=>void;onRefresh:()=>void;onAction:(label:string,fn:()=>Promise<any>)=>void}) {
+  const pending=stream?.pending_messages??[];
+  const recent=stream?.recent_messages??[];
+  const dead=stream?.dead_letter?.recent_messages??[];
+  const rows=open ? pending : pending.slice(0,5);
+  const cleanup=(stream as any)?.auto_cleanup;
+  const acked=Number(cleanup?.cleanup?.acked??cleanup?.acked??0);
+  const trimmed=Number(cleanup?.trim?.trimmed??0);
+  const healthy=Boolean(stream?.available) && Number(stream?.pending??0)<=0 && Number(stream?.dead_letter?.length??0)<=0;
+  return <Panel title="任务自愈中心" sub="系统自动处理补全队列残留；正常情况下无需人工介入" right={<div className="stream-actions"><button className="button ghost" onClick={onRefresh}>刷新</button><button className="button ghost" onClick={onToggle}>{open?"收起高级":"高级"}</button></div>}>
+    <div className={`self-heal-card ${healthy?"healthy":"warning"}`}>
+      <div><span>{healthy?"队列正常":"需要关注"}</span><strong>{(stream as any)?.summary || (healthy?"没有待处理任务，历史残留会自动清理":"队列存在待处理项")}</strong><small>{acked||trimmed?`本次自动确认 ${acked} 条，裁剪历史 ${trimmed} 条`:"系统会在启动和刷新时自动巡检"}</small></div>
+      <Status status={healthy?"ready":"degraded"}/>
+    </div>
+    <div className="asset-summary">
+      <Metric label="待处理任务" value={num(stream?.pending)} hint="系统会自动确认旧任务"/>
+      <Metric label="异常隔离" value={num(stream?.dead_letter?.length)} hint="需要时才展开查看"/>
+      <Metric label="最近记录" value={num(stream?.length)} hint="自动保留最近50条"/>
+      <Metric label="自愈结果" value={acked||trimmed?"已处理":"正常"} hint={acked||trimmed?`ack ${acked} · trim ${trimmed}`:"无需操作"}/>
+    </div>
+    {open&&<>
+      {!!pending.length&&<div className="stream-bulk">
+        <button className="button ghost" onClick={()=>onAction("确认全部历史补全 pending",()=>bulkHandleStreamMessages("ack","data_platform.backfill",500))}>确认全部补全 pending</button>
+        <button className="button ghost" onClick={()=>onAction("转死信全部历史补全 pending",()=>bulkHandleStreamMessages("dead_letter","data_platform.backfill",500))}>全部转死信</button>
+        <button className="button ghost danger" onClick={()=>onAction("删除全部历史补全 pending",()=>bulkHandleStreamMessages("delete","data_platform.backfill",500))}>删除全部补全 pending</button>
+      </div>}
+      <StreamMessageTable title="Pending消息" items={rows} empty="没有 pending 消息。" onAction={onAction}/>
+      <StreamMessageTable title="最近消息" items={recent.slice(0,20)} empty="没有最近消息。" onAction={onAction} readonly/>
+      <StreamMessageTable title="Dead Letter" items={dead.slice(0,20)} empty="没有死信消息。" onAction={onAction} readonly/>
+      <Panel title="消费者" sub="pending 越多说明旧进程退出时没 ack"><Table heads={["消费者","Pending","空闲"]} rows={(stream?.consumers??[]).map(x=>[x.name,num(x.pending),msText(x.idle_ms)])}/></Panel>
+    </>}
+  </Panel>
+}
+
+function StreamMessageTable({title,items,empty,onAction,readonly=false}:{title:string;items:StreamMessage[];empty:string;onAction:(label:string,fn:()=>Promise<any>)=>void;readonly?:boolean}) {
+  return <div className="stream-table-block"><h3>{title}</h3>{items.length?<div className="table-wrap"><table><thead><tr><th>ID</th><th>任务</th><th>Run</th><th>尝试</th><th>消费者/空闲</th><th>参数</th><th>处理</th></tr></thead><tbody>{items.map(item=>{
+    const payload=(item.fields.payload??{}) as Record<string,unknown>;
+    return <tr key={item.id}><td><code>{item.id}</code></td><td>{String(item.fields.task_type||"—")}</td><td>{String(payload.run_id??"—")}</td><td>{String(payload.auto_resume_attempt??item.fields.attempt??"0")}</td><td>{item.consumer?`${item.consumer} · ${msText(item.idle_ms)}`:"—"}</td><td className="wrap-cell">{compactJson(payload)}</td><td>{readonly?<span className="muted">只读</span>:<div className="row-actions"><button onClick={()=>onAction("确认消息",()=>handleStreamMessage(item.id,"ack"))}>ack</button><button onClick={()=>onAction("重试消息",()=>handleStreamMessage(item.id,"retry"))}>重试</button><button onClick={()=>onAction("转死信",()=>handleStreamMessage(item.id,"dead_letter"))}>死信</button><button className="danger" onClick={()=>onAction("删除消息",()=>handleStreamMessage(item.id,"delete"))}>删除</button></div>}</td></tr>
+  })}</tbody></table></div>:<div className="empty">{empty}</div>}</div>
 }
 
 function RunningBackfillDetail({status}:{status:BackfillStatus}) {
@@ -485,6 +541,7 @@ const elapsedMinutes=(v?:string|null)=>elapsedMinutesFromServerTime(v);
 const elapsedText=(v?:string|null)=>formatMinutes(elapsedMinutes(v));
 const dynamicEta=(s:BackfillStatus)=>{const planned=Number(s.plan_summary?.estimated_minutes??0);if(planned>0)return formatMinutes(planned);const p=Math.max(1,Math.min(99,Number(s.progress??0)));const elapsed=elapsedMinutes(s.started_at);if(elapsed<=0)return "计算中";return formatMinutes(elapsed*(100-p)/p)};
 const formatMinutes=(m:number)=>m>=60?`${(m/60).toFixed(1)}h`:`${Math.max(1,Math.round(m))}分钟`;
+const msText=(v?:number)=>{const ms=Number(v||0);if(ms>=3600000)return `${(ms/3600000).toFixed(1)}h`;if(ms>=60000)return `${Math.round(ms/60000)}分钟`;return `${Math.round(ms/1000)}秒`};
 const sourceName=(v:string)=>({tushare:"Tushare",cninfo:"巨潮公告",web_fallback:"网页备用源",system:"系统任务",manual:"手工导入"} as any)[v]??v;
 const jobName=(v:string)=>v==="data_platform.daily_update"?"一键更新":v.includes("daily_basic")?"日度估值":v.includes("daily")?"日线行情":v.includes("announcement")?"公司公告":v.includes("quality")?"质量检查":v.includes("trade_cal")?"交易日历":v;
 const checkName=(v:string)=>({stock_master_coverage:"股票主数据覆盖",snapshot_coverage:"行情快照覆盖",snapshot_low_quality:"低质量记录"} as any)[v]??v;

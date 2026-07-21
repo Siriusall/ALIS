@@ -388,6 +388,40 @@ export interface BackfillStatus {
   };
 }
 
+export interface StreamMessage {
+  id: string;
+  consumer?: string;
+  idle_ms?: number;
+  deliveries?: number;
+  fields: {
+    task_type?: string;
+    payload_json?: string;
+    payload?: Record<string, unknown>;
+    enqueued_at?: string;
+    attempt?: string;
+    [key: string]: unknown;
+  };
+}
+
+export interface StreamAdminStatus {
+  ok: boolean;
+  available: boolean;
+  health?: "healthy" | "needs_attention" | string;
+  summary?: string;
+  stream: string;
+  group: string;
+  consumer: string;
+  length: number;
+  pending: number;
+  last_delivered_id: string;
+  lag: number;
+  consumers: Array<{ name: string; pending: number; idle_ms: number }>;
+  pending_messages: StreamMessage[];
+  recent_messages: StreamMessage[];
+  dead_letter: { stream: string; length: number; recent_messages: StreamMessage[] };
+  auto_cleanup?: Record<string, unknown>;
+}
+
 export async function fetchBackfillPlan(marketBatchDays = 30, financialBatchSize = 100): Promise<BackfillPlan> {
   const { data } = await api.get<BackfillPlan>("/api/data-center/backfill/plan", {
     params: { market_batch_days: marketBatchDays, financial_batch_size: financialBatchSize },
@@ -405,6 +439,23 @@ export async function startBackfill(maxSteps = 0, marketBatchDays = 30, financia
 
 export async function fetchBackfillStatus(): Promise<BackfillStatus> {
   const { data } = await api.get<BackfillStatus>("/api/data-center/backfill/status");
+  return data;
+}
+
+export async function fetchStreamAdminStatus(limit = 50, pendingLimit = 50): Promise<StreamAdminStatus> {
+  const { data } = await api.get<StreamAdminStatus>("/api/data-center/streams", {
+    params: { limit, pending_limit: pendingLimit },
+  });
+  return data;
+}
+
+export async function handleStreamMessage(messageId: string, action: "ack" | "delete" | "dead_letter" | "retry"): Promise<SyncResponse> {
+  const { data } = await api.post<SyncResponse>(`/api/data-center/streams/messages/${encodeURIComponent(messageId)}`, { action });
+  return data;
+}
+
+export async function bulkHandleStreamMessages(action: "ack" | "delete" | "dead_letter", taskType = "data_platform.backfill", limit = 200): Promise<SyncResponse> {
+  const { data } = await api.post<SyncResponse>("/api/data-center/streams/bulk", { action, task_type: taskType, limit });
   return data;
 }
 

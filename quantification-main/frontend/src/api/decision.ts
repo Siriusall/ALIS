@@ -9,6 +9,21 @@ export interface DecisionGate {
   reason_code: string;
 }
 
+export interface RiskGateExplanation {
+  allow_new_exposure: boolean;
+  allow_sell?: boolean;
+  allow_reduce?: boolean;
+  allow_defensive?: boolean;
+  requires_rebalance?: boolean;
+  risk_budget_multiplier: number;
+  reason_code: string;
+  headline: string;
+  reasons: Array<{ level: "ok" | "warn" | "block" | string; title: string; detail: string }>;
+  constraints: string[];
+  today_plan: Array<{ step: string; detail: string }>;
+  release_conditions: string[];
+}
+
 export interface DecisionLedger {
   cash_balance: number;
   position_market_value: number;
@@ -64,6 +79,70 @@ export interface DecisionMarketOverview {
   limitations: string[];
 }
 
+export interface DecisionEnhancement {
+  schema_version: string;
+  generated_at: string;
+  revenue_dashboard: {
+    today_action: string;
+    expected_return_source: string;
+    max_risk: string;
+    why_not_move: string;
+    risk_budget?: number;
+    next_step: string;
+    position_ceiling: {
+      state: string;
+      label: string;
+      max_equity: number;
+      current_equity: number;
+      cash_target: number;
+      risk_budget: number;
+      max_single_position: number;
+      concentration_limit: number;
+      holding_period_bias: string;
+      explanation: string;
+    };
+  };
+  market_position_policy: DecisionEnhancement["revenue_dashboard"]["position_ceiling"];
+  model_role_contract: {
+    summary: string;
+    items: Array<{
+      model_key: string;
+      name: string;
+      family: string;
+      plan_role?: string;
+      decision_role: string;
+      owns: string[];
+      must_not_own: string[];
+      output: string;
+    }>;
+  };
+  candidate_shadow_ab: {
+    ok: boolean;
+    policy?: string;
+    reason?: string;
+    items: Array<{
+      model_key: string;
+      name: string;
+      champion_version?: string;
+      challenger_version?: string;
+      observation_sessions: number;
+      minimum_sessions: number;
+      challenger_walk_forward_lift: number;
+      champion_walk_forward_lift: number;
+      delta: number;
+      recommendation: string;
+      status: string;
+    }>;
+  };
+  extreme_market_protection: {
+    active: boolean;
+    severity: string;
+    triggers: Array<{ code: string; label: string; detail: string }>;
+    auto_actions: string[];
+    release_conditions: string[];
+  };
+}
+
 export interface DecisionExecutionOperation {
   symbol: string;
   name?: string;
@@ -104,6 +183,8 @@ export interface DecisionSummary {
   model_status: ModelStrategyStatus;
   market_overview: DecisionMarketOverview;
   gate_decision: DecisionGate;
+  risk_gate_explanation?: RiskGateExplanation;
+  decision_enhancement?: DecisionEnhancement;
   recent_execution: DecisionRecentExecution | null;
   latest_model_validation: DecisionModelValidation | null;
   latest_analyze: null;

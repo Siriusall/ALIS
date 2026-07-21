@@ -9,6 +9,7 @@ from typing import Any
 
 from app.data_platform.db import _conn
 from app.data_platform.services.data_center import (
+    backfill_etf_daily_incremental,
     ensure_data_center_seeded,
     run_data_quality_checks,
     sync_cninfo_announcements,
@@ -115,6 +116,20 @@ def _worker(parent_run_id: int) -> None:
             ready_date = _latest_decision_ready_trade_date(c)
         if not bool(market_result.get("ok")) or ready_date != trade_date:
             raise RuntimeError(f"上游尚未发布 {trade_date} 完整收盘数据，自动日更将在下一轮重试")
+
+        _set_state(phase="etf_daily", message=f"正在按交易日更新 {trade_date} ETF 日线", progress=68)
+        try:
+            etf_daily = backfill_etf_daily_incremental(
+                start_date=trade_date,
+                end_date=trade_date,
+                cursor="",
+                limit_dates=1,
+                nav_limit_funds=0,
+            )
+            steps.append({"step": "etf_daily", "result": etf_daily})
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("daily ETF market update deferred: %s", str(exc)[:300])
+            steps.append({"step": "etf_daily", "result": {"ok": False, "deferred": True, "error": str(exc)[:300]}})
 
         _set_state(phase="announcements", message="正在更新最近公告", progress=75)
         ann_start = (date.today() - timedelta(days=3)).strftime("%Y%m%d")

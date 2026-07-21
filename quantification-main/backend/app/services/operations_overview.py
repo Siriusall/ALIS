@@ -139,6 +139,14 @@ def build_live_portfolio_risk(lookback: int = 120) -> dict[str, Any]:
             industry_by_symbol = {str(dict(row).get("ts_code") or "").split(".")[0]: str(dict(row).get("industry") or "unclassified") for row in rows}
         except Exception:  # noqa: BLE001
             industry_by_symbol = {}
+        try:
+            from app.services.defensive_assets import DEFENSIVE_ASSETS
+            industry_by_symbol.update({
+                str(item["ts_code"]).split(".")[0]: f"defensive_{item['asset_class']}"
+                for item in DEFENSIVE_ASSETS
+            })
+        except Exception:  # noqa: BLE001
+            pass
     for item in exposures:
         item["industry"] = industry_by_symbol.get(str(item["symbol"]), "unclassified")
     weights = constrained_cvar_weights(returns_by_symbol, max_single=.25)

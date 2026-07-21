@@ -21,7 +21,9 @@ export interface ModelTrainRun {
   progress: number;
   message: string;
   model_version_id?: number | null;
-  metrics: Record<string, number | string | unknown>;
+  metrics: Record<string, number | string | unknown> & {
+    timeline?: Array<{ at?: string; phase?: string; progress?: number; message?: string }>;
+  };
   error?: string;
   started_at?: string;
   finished_at?: string;
@@ -67,8 +69,62 @@ export interface PlanModelControl {
   lightgbm_params: Record<string, unknown>;
 }
 
+export interface PlanModelAutoOptimizationItem {
+  model_key: string;
+  name: string;
+  role: string;
+  status: string;
+  trigger: string;
+  reason: string;
+  requires_human: boolean;
+  latest_version_id?: number | null;
+  latest_version?: string | null;
+  active_version?: string | null;
+  candidate_metrics: Record<string, unknown>;
+  production_metrics: Record<string, unknown>;
+  blocked_reasons: string[];
+  running: boolean;
+  shadow_ab?: {
+    champion_version?: string | null;
+    challenger_version?: string | null;
+    has_challenger?: boolean;
+    observation_sessions: number;
+    minimum_sessions: number;
+    challenger_walk_forward_lift: number;
+    champion_walk_forward_lift: number;
+    delta: number;
+    status: string;
+    recommendation: string;
+  };
+}
+
+export interface PlanModelAutoOptimizationStatus {
+  ok: boolean;
+  schema_version: string;
+  policy: {
+    mode: string;
+    summary: string;
+    auto_allowed: string[];
+    human_required: string[];
+  };
+  auto_rejected?: Array<{ model_key?: string; version?: string; reason?: string; result?: Record<string, unknown> }>;
+  review_queue: PlanModelAutoOptimizationItem[];
+  items: PlanModelAutoOptimizationItem[];
+  generated_at: string;
+}
+
 export async function fetchPlanModels(): Promise<PlanModelControl> {
   const { data } = await api.get<PlanModelControl>("/api/model-strategy/plan-models", { timeout: 60_000 });
+  return data;
+}
+
+export async function fetchPlanModelAutoOptimization(): Promise<PlanModelAutoOptimizationStatus> {
+  const { data } = await api.get<PlanModelAutoOptimizationStatus>("/api/model-strategy/auto-optimization", { timeout: 60_000 });
+  return data;
+}
+
+export async function runPlanModelAutoOptimization(force = false): Promise<{ ok: boolean; auto_rejected_count?: number; auto_rejected?: unknown[]; started_count: number; skipped_count: number; status: PlanModelAutoOptimizationStatus }> {
+  const { data } = await api.post("/api/model-strategy/auto-optimization/run", { force }, { timeout: 60_000 });
   return data;
 }
 

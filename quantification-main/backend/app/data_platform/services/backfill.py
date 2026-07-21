@@ -31,6 +31,7 @@ from app.data_platform.services.data_center import (
     sync_index_bundle,
     set_tushare_activity_hook,
     backfill_capital_structure_history,
+    backfill_etf_daily_incremental,
     backfill_etf_constituents_history,
     backfill_etf_price_history,
     backfill_major_news_history,
@@ -301,7 +302,7 @@ def build_backfill_plan(*, market_batch_days: int = 30, financial_batch_size: in
         (
             "etf_price_nav_vip", "补全ETF日线与净值历史", "sync_etf_history_batch",
             vip["etf_price_nav"],
-            {"start_date": vip["scope"]["capital_start"], "end_date": end_s, "cursor": vip["etf_price_nav"].get("resume_cursor", ""), "limit_funds": min(100, financial_batch_size)},
+            {"start_date": vip["scope"]["capital_start"], "end_date": end_s, "cursor": vip["etf_price_nav"].get("resume_cursor", ""), "mode": "daily", "limit_dates": min(30, market_batch_days), "nav_limit_funds": min(100, financial_batch_size)},
         ),
         (
             "etf_constituents_vip", "补全沪深ETF每日持仓组合", "sync_etf_constituents_batch",
@@ -762,28 +763,16 @@ def recover_interrupted_backfill() -> dict[str, Any]:
             **(cached or {}), "running": False, "phase": "interrupted",
             "message": "服务重启导致任务中断；已写入数据保留，可点击继续补全",
             "finished_at": _now(), "error": "process_restarted",
+            "auto_resume": False,
+            "resume_action": "start_backfill",
         }
         with _lock:
             _state.clear()
             _state.update(snapshot)
         set_json("alis:data-platform:backfill:state", snapshot, ttl=86400)
-        _schedule_auto_resume(
-            error="process_restarted",
-            attempt=1,
-            max_steps=int(snapshot.get("max_steps") or 0),
-            market_batch_days=30,
-            financial_batch_size=100,
-        )
         return {"recovered": True, "run_id": run_id, "stale_runs": stale_ids}
-    if isinstance(cached, dict) and cached.get("phase") == "interrupted":
-        _schedule_auto_resume(
-            error=str(cached.get("error") or "process_restarted"),
-            attempt=int(cached.get("auto_resume_attempt") or 0) + 1,
-            max_steps=int(cached.get("max_steps") or 0),
-            market_batch_days=30,
-            financial_batch_size=100,
-        )
-        return {"recovered": True, "run_id": run_id, "stale_runs": [], "auto_resume": True}
+    if isinstance(cached, dict) and cached.get("phase") in {"interrupted", "cancelled"}:
+        return {"recovered": True, "run_id": run_id, "stale_runs": [], "auto_resume": False}
     if isinstance(cached, dict) and cached.get("auto_resume") and not cached.get("running"):
         _schedule_auto_resume(
             error=str(cached.get("error") or "process_restarted"),
@@ -993,6 +982,14 @@ def _run_step(step: dict[str, Any]) -> dict[str, Any]:
             limit_dates=int(params.get("limit_dates") or 10),
         )
     if action == "sync_etf_history_batch":
+        if str(params.get("mode") or "") == "daily":
+            return backfill_etf_daily_incremental(
+                start_date=str(params.get("start_date") or "20200101"),
+                end_date=str(params.get("end_date") or ""),
+                cursor=str(params.get("cursor") or ""),
+                limit_dates=int(params.get("limit_dates") or 10),
+                nav_limit_funds=int(params.get("nav_limit_funds") or 100),
+            )
         return backfill_etf_price_history(
             start_date=str(params.get("start_date") or "20200101"),
             end_date=str(params.get("end_date") or ""),

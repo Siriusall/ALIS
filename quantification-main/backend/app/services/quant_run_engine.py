@@ -280,9 +280,9 @@ def _parse_risk_budget(risk_budget: Dict[str, Any] | None) -> tuple[float, float
     except Exception:
         target_pct = 1.0
     try:
-        max_single = float(rb.get("max_single_position_pct", 1.0) or 1.0)
+        max_single = float(rb.get("max_single_position_pct", 0.15) or 0.15)
     except Exception:
-        max_single = 1.0
+        max_single = 0.15
     return max(0.0, min(1.0, target_pct)), max(0.0, min(1.0, max_single))
 
 
@@ -319,6 +319,73 @@ def _portfolio_state(ds: BacktestDataSource, valuation_date: str) -> Dict[str, A
         "positions": positions,
         "valuation_date": valuation_date,
     }
+
+
+def _sell_position_for_rebalance(
+    *,
+    pos: Dict[str, Any],
+    quantity: int,
+    price_row: Any,
+    execute_date: str,
+    executed_at: str,
+    reason: str,
+    detail: str,
+    turnover_remaining: float,
+    hard_risk_exit: bool,
+    blocked_events: List[Dict[str, Any]],
+    sell_triggers: List[Dict[str, Any]],
+    sold_ops_payload: List[Dict[str, Any]],
+) -> tuple[bool, float, str | None]:
+    sym = str(pos.get("symbol") or "").strip()
+    if not sym or quantity <= 0:
+        return False, turnover_remaining, None
+    px = _row_trade_price(price_row, prefer_open=True)
+    if px <= 0:
+        return False, turnover_remaining, "price_missing"
+    tradable = check_open_trade_constraints(
+        side="SELL",
+        symbol=sym,
+        name=str(pos.get("name") or ""),
+        open_price=px,
+        close_price=float(getattr(price_row, "close", 0) or 0) if price_row else 0.0,
+        change_pct=float(getattr(price_row, "change_pct", 0) or 0) if price_row else 0.0,
+        volume=float(getattr(price_row, "volume", 0) or 0) if price_row else 0.0,
+    )
+    if not tradable.ok:
+        blocked_events.append({"date": execute_date, "symbol": sym, "side": "SELL", "code": tradable.code, "message": tradable.message})
+        add_log("WARN", f"QuantRun 卖出被交易约束拦截: {tradable.message}")
+        return False, turnover_remaining, str(tradable.code or "trade_constraint")
+    proposed_turnover = px * quantity
+    if proposed_turnover > turnover_remaining + 1e-6 and not hard_risk_exit:
+        blocked_events.append({"date": execute_date, "symbol": sym, "side": "SELL", "code": "monthly_turnover_budget", "message": "月度双边换手预算30%已用尽，非硬风险退出延后"})
+        return False, turnover_remaining, "monthly_turnover_budget"
+    try:
+        fee = sell_cost_breakdown(px, quantity, sym)
+        exec_price = float(fee["executed_price"])
+        sell_position(int(pos["id"]), quantity=quantity, price=exec_price, trade_date=execute_date, record_operation=False)
+    except ValueError:
+        return False, turnover_remaining, "t_plus_one_or_position_constraint"
+    turnover_after = max(0.0, turnover_remaining - proposed_turnover)
+    sell_triggers.append({
+        "symbol": sym,
+        "name": str(pos.get("name") or ""),
+        "reason": reason,
+        "detail": detail,
+        "quantity": quantity,
+        "price": exec_price,
+        "requested_price": round(px, 4),
+    })
+    sold_ops_payload.append({
+        "symbol": sym,
+        "side": "SELL",
+        "price": exec_price,
+        "quantity": quantity,
+        "at": executed_at,
+        "remark": "量化任务卖出（关联执行）",
+        "name": str(pos.get("name") or "").strip(),
+        **{k: fee[k] for k in ("commission", "transfer_fee", "stamp_tax", "slippage_bps", "fee_schedule_version")},
+    })
+    return True, turnover_after, None
 
 
 def _industry_exposure_inputs(
@@ -709,71 +776,26 @@ def run_for_trade_date(
                         continue
                 except ValueError:
                     continue
-        px_row = exec_map.get(sym)
-        px = float(getattr(px_row, "open", 0) or 0) if px_row else 0.0
-        if px <= 0:
-            px = float(getattr(px_row, "close", 0) or 0) if px_row else 0.0
-        if px <= 0:
-            continue
-        tradable = check_open_trade_constraints(
-            side="SELL",
-            symbol=sym,
-            name=str(pos.get("name") or ""),
-            open_price=px,
-            close_price=float(getattr(px_row, "close", 0) or 0) if px_row else 0.0,
-            change_pct=float(getattr(px_row, "change_pct", 0) or 0) if px_row else 0.0,
-            volume=float(getattr(px_row, "volume", 0) or 0) if px_row else 0.0,
+        sold, turnover_remaining, block_code = _sell_position_for_rebalance(
+            pos=pos,
+            quantity=int(pos.get("quantity") or 0),
+            price_row=exec_map.get(sym),
+            execute_date=execute_date,
+            executed_at=executed_at,
+            reason="调仓卖出",
+            detail="不在目标池且满足持有期/T+1",
+            turnover_remaining=turnover_remaining,
+            hard_risk_exit=thesis_status_by_symbol.get(sym) in {"invalidated", "failed"},
+            blocked_events=blocked_events,
+            sell_triggers=sell_triggers,
+            sold_ops_payload=sold_ops_payload,
         )
-        if not tradable.ok:
+        if not sold:
             blocked_count += 1
-            event = {
-                "date": execute_date,
-                "symbol": sym,
-                "side": "SELL",
-                "code": tradable.code,
-                "message": tradable.message,
-            }
-            blocked_events.append(event)
-            add_log("WARN", f"QuantRun 卖出被交易约束拦截: {tradable.message}")
+            if block_code == "price_missing":
+                blocked_events.append({"date": execute_date, "symbol": sym, "side": "SELL", "code": "price_missing", "message": "执行日卖出价格缺失"})
             continue
-        proposed_turnover = px * int(pos.get("quantity") or 0)
-        hard_risk_exit = thesis_status_by_symbol.get(sym) in {"invalidated", "failed"}
-        if proposed_turnover > turnover_remaining + 1e-6 and not hard_risk_exit:
-            blocked_count += 1
-            blocked_events.append({"date": execute_date, "symbol": sym, "side": "SELL", "code": "monthly_turnover_budget", "message": "月度双边换手预算30%已用尽，非硬风险退出延后"})
-            continue
-        try:
-            fee = sell_cost_breakdown(px, int(pos["quantity"]), sym)
-            exec_price = float(fee["executed_price"])
-            sell_position(int(pos["id"]), quantity=int(pos["quantity"]), price=exec_price, trade_date=execute_date, record_operation=False)
-            sold_count += 1
-            turnover_remaining = max(0.0, turnover_remaining - proposed_turnover)
-            sell_triggers.append(
-                {
-                    "symbol": sym,
-                    "name": str(pos.get("name") or ""),
-                    "reason": "调仓卖出",
-                    "detail": "不在目标池且满足持有期/T+1",
-                    "quantity": int(pos["quantity"]),
-                    "price": exec_price,
-                    "requested_price": round(px, 4),
-                }
-            )
-            sold_ops_payload.append(
-                {
-                    "symbol": sym,
-                    "side": "SELL",
-                    "price": exec_price,
-                    "quantity": int(pos["quantity"]),
-                    "at": executed_at,
-                    "remark": "量化任务卖出（关联执行）",
-                    "name": str(pos.get("name") or "").strip(),
-                    **{k: fee[k] for k in ("commission", "transfer_fee", "stamp_tax", "slippage_bps", "fee_schedule_version")},
-                }
-            )
-        except ValueError:
-            # T+1 触发，跳过该仓位
-            continue
+        sold_count += 1
 
     # 再买入（等权资金，按总权益目标仓位与单票上限）
     held_after_sell = {str(p.get("symbol") or "").strip() for p in get_positions()}
@@ -898,6 +920,64 @@ def run_for_trade_date(
     weight_sum = sum(cvar_weights.values())
     if weight_sum > 0:
         cvar_weights = {symbol: weight / weight_sum * target_sleeve for symbol, weight in cvar_weights.items()}
+
+    # 风险收缩不是“禁止调仓”：目标池内的超配持仓也必须先降到目标权重。
+    reduced_to_target = False
+    for pos in list(get_positions()):
+        sym = str(pos.get("symbol") or "").strip()
+        if not sym or sym not in cvar_weights:
+            continue
+        px_row = exec_map.get(sym)
+        px = _row_trade_price(px_row, prefer_open=True)
+        quantity = int(pos.get("quantity") or 0)
+        if px <= 0 or quantity <= 0 or portfolio["total_equity"] <= 0:
+            continue
+        current_value = px * quantity
+        target_value = float(portfolio["total_equity"]) * float(cvar_weights.get(sym) or 0)
+        excess_value = current_value - target_value
+        if excess_value < max(100.0, px * 100):
+            continue
+        sell_qty = min(quantity, int(excess_value // (px * 100)) * 100)
+        if sell_qty <= 0:
+            continue
+        current_weight = current_value / max(float(portfolio["total_equity"]), 1.0)
+        hard_risk_exit = (
+            thesis_status_by_symbol.get(sym) in {"invalidated", "failed"}
+            or current_weight > max_single_position_pct + 1e-6
+            or current_weight > float(cvar_weights.get(sym) or 0) + 0.03
+        )
+        sold, turnover_remaining, block_code = _sell_position_for_rebalance(
+            pos=pos,
+            quantity=sell_qty,
+            price_row=px_row,
+            execute_date=execute_date,
+            executed_at=executed_at,
+            reason="目标权重降风险",
+            detail=f"当前约 {current_weight * 100:.1f}%，目标约 {float(cvar_weights.get(sym) or 0) * 100:.1f}%",
+            turnover_remaining=turnover_remaining,
+            hard_risk_exit=hard_risk_exit,
+            blocked_events=blocked_events,
+            sell_triggers=sell_triggers,
+            sold_ops_payload=sold_ops_payload,
+        )
+        if sold:
+            sold_count += 1
+            reduced_to_target = True
+        else:
+            blocked_count += 1
+            if block_code == "price_missing":
+                blocked_events.append({"date": execute_date, "symbol": sym, "side": "SELL", "code": "price_missing", "message": "执行日降权卖出价格缺失"})
+    if reduced_to_target:
+        portfolio = _portfolio_state(ds, execute_date)
+        available_balance = _compute_buy_budget(
+            total_equity=portfolio["total_equity"],
+            position_market_value=portfolio["position_market_value"],
+            cash_balance=portfolio["cash_balance"],
+            target_position_pct=target_position_pct,
+            budget_ratio=effective_budget_ratio,
+        )
+        turnover_capacity = max(turnover_remaining, full_investment_gap) if defensive_weights else turnover_remaining
+        available_balance = min(available_balance, turnover_capacity)
 
     _report("正在生成买卖单")
     industry_by_symbol, existing_industry_value = _industry_exposure_inputs(
