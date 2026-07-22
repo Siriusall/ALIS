@@ -6,7 +6,7 @@ import Layout from "../components/Layout";
 const StrategyPage = lazy(() => import("../components/StrategyPage"));
 const PositionPage = lazy(() => import("../components/PositionPage"));
 const DecisionAnalysisPage = lazy(() => import("../components/DecisionAnalysisPage"));
-const DecisionPage = lazy(() => import("../components/DecisionPage"));
+const InvestorDashboardPage = lazy(() => import("../components/InvestorDashboardPage"));
 const DataCenterPage = lazy(() => import("../components/DataCenterPage"));
 const ProductModulePage = lazy(() => import("../components/ProductModulePage"));
 const ResearchWorkbenchPage = lazy(() => import("../components/ResearchWorkbenchPage"));
@@ -26,6 +26,7 @@ const ReviewPage = lazy(() => import("../components/ReviewPage"));
 const ReviewWorkbenchPage = lazy(() => import("../components/ReviewWorkbenchPage"));
 const TradeHistory = lazy(() => import("../components/TradeHistory"));
 const BackendLogsPage = lazy(() => import("../components/BackendLogsPage"));
+const CandidatePoolPage = lazy(() => import("../components/CandidatePoolPage"));
 
 export default function DashboardPage() {
   const { user, logout } = useAuth();
@@ -39,7 +40,7 @@ export default function DashboardPage() {
 
   const setCurrentSection = useCallback((next: SectionId) => navigate(`/app/${next}`), [navigate]);
   const sections = useMemo(() => ({
-    market: <DecisionPage onNavigate={setCurrentSection} />,
+    market: <InvestorDashboardPage focus="returns" />,
     research: <ResearchWorkbenchPage onNavigate={setCurrentSection} />,
     dataCenter: <DataCenterPage />,
     stockResearch: <StockResearchPage onNavigate={setCurrentSection} />,
@@ -49,13 +50,14 @@ export default function DashboardPage() {
     themes: <ProductModulePage capabilityKey="themes" />,
     expectation: <ExpectationPage />,
     valuation: <ValuationPage />,
-    portfolioWorkbench: <PortfolioWorkbenchPage onNavigate={setCurrentSection} />,
+    portfolioWorkbench: <InvestorDashboardPage focus="rebalance" />,
     stockPool: <StockPoolPage />,
     thesis: <ThesisPage />,
     portfolio: <PositionPage onNavigate={setCurrentSection} />,
     executionLedger: <TradeHistory onNavigate={setCurrentSection} />,
     positionRisk: <PositionRiskPage onNavigate={setCurrentSection} />,
-    reviewWorkbench: <ReviewWorkbenchPage onNavigate={setCurrentSection} />,
+    reviewWorkbench: <InvestorDashboardPage focus="models" />,
+    candidatePool: <CandidatePoolPage />,
     validation: <DecisionAnalysisPage onNavigate={setCurrentSection} />,
     decisionLogs: <DecisionAuditPage />,
     review: <ReviewPage />,

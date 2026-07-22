@@ -1,7 +1,7 @@
 from app.services.decision_store import POOL_TYPES, POSITION_TRANSITIONS
 
 
-def test_three_stock_pools_are_fixed() -> None: assert POOL_TYPES=={"watch","core","holding"}
+def test_four_stock_pools_are_fixed() -> None: assert POOL_TYPES=={"watch","candidate","core","holding"}
 
 
 def test_position_state_cannot_jump_from_watch_to_conviction() -> None:

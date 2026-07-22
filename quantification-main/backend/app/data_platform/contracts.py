@@ -18,7 +18,8 @@ CONTRACTS = {
         "requirements": [
             ("latest_daily", "最新日线行情", 0.99, "block"),
             ("latest_valuation", "最新估值", 0.90, "degrade"),
-            ("financial", "财务指标", 0.90, "degrade"),
+            ("financial", "财报采集切片", 0.90, "degrade"),
+            ("candidate_financial_fields", "候选研究字段", 1.0, "degrade"),
             ("stock_master", "股票主数据", 0.99, "block"),
             ("capital_structure", "资金结构历史", 0.99, "degrade"),
             ("moneyflow", "个股资金流历史", 0.99, "degrade"),
@@ -77,8 +78,9 @@ CONTRACTS = {
     "financial_research": {
         "name": "财务研究", "description": "财报、财务指标和披露时间的数据条件",
         "requirements": [
-            ("financial", "财务报表", 0.90, "degrade"),
-            ("financial_indicator", "财务指标", 0.90, "degrade"),
+            ("financial", "财务报表采集切片", 0.90, "degrade"),
+            ("financial_indicator", "财务指标采集切片", 0.90, "degrade"),
+            ("candidate_financial_fields", "候选池研究字段", 1.0, "degrade"),
             ("announcements", "财报公告", 0.90, "degrade"),
             ("point_in_time", "披露时点", 1.0, "block"),
         ],

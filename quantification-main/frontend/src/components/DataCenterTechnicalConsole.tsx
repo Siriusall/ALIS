@@ -48,8 +48,13 @@ export default function TechnicalConsole({ section }: { section: SectionKey }) {
         fetchColdArchiveStatus().then(setArchive),
       ]);
       const failed = results.find((x) => x.status === "rejected");
-      if (failed?.status === "rejected") setMessage(failed.reason instanceof Error ? failed.reason.message : String(failed.reason));
-      else setMessage("");
+      // Polling is observational. A slow statistics query must not overwrite
+      // the message from an explicit repair/start action with a generic
+      // Axios timeout banner.
+      if (!quiet) {
+        if (failed?.status === "rejected") setMessage(failed.reason instanceof Error ? failed.reason.message : String(failed.reason));
+        else setMessage("");
+      }
     }
     finally { refreshRunning.current = false; setLoading(false); }
   }
@@ -230,7 +235,7 @@ function Repair(c: Ctx) {
   }
 
   async function generatePlan(){
-    setPlanning(true); setMsg("正在根据审计窗口生成历史补全计划…");
+    setPlanning(true); setMsg("正在扫描系统全部数据契约并生成补全计划…");
     try{
       const next=await fetchBackfillPlan();
       setPlan(next);
@@ -244,32 +249,32 @@ function Repair(c: Ctx) {
     // Keep the terminal result visible while the relatively expensive plan
     // audit refreshes in the background. A transient loading suffix looked
     // like a stuck task even though ingestion had already stopped.
-    setMsg(status.message||"历史补全已结束");
+    setMsg(status.message||"全部补全已结束");
     try{
       const next=await fetchBackfillPlan();
       setPlan(next);
-      setMsg(`${status.message||"历史补全已结束"}；计划已刷新，剩余 ${next.summary.steps_needed} 步`);
+      setMsg(`${status.message||"全部补全已结束"}；计划已刷新，剩余 ${next.summary.steps_needed} 步`);
       void c.refresh(true);
     }catch(e){
-      setMsg(`${status.message||"历史补全已结束"}；刷新计划失败：${e instanceof Error?e.message:String(e)}`);
+      setMsg(`${status.message||"全部补全已结束"}；刷新计划失败：${e instanceof Error?e.message:String(e)}`);
       void c.refresh(true);
     }
   }
 
   async function runPlan(){
-    setMsg("正在启动历史补全…");
+    setMsg("正在启动一键全部补全…");
     try{
       const result=await startBackfill(0);
       setBackfill(result);
       if(result.plan) setPlan(result.plan);
       const needed=result.plan?.summary?.steps_needed ?? result.plan_summary?.steps_needed;
-      setMsg(result.message||(needed!=null?`历史补全已启动，将执行 ${needed} 个可自动执行步骤`:"历史补全已启动，将执行可自动补全计划"));
+      setMsg(result.message||(needed!=null?`全部补全已启动，将执行 ${needed} 个步骤`:"全部补全已启动"));
       if(!result.running) await finishBackfill(result);
     }catch(e){setMsg(`启动补全失败：${e instanceof Error?e.message:String(e)}`)}
   }
 
   async function continueBackfill(){
-    setMsg("正在继续历史补全，会从剩余缺口重新生成计划…");
+    setMsg("正在继续全部补全，会从剩余缺口重新生成计划…");
     await runPlan();
   }
 
@@ -307,7 +312,7 @@ function Repair(c: Ctx) {
         setBackfill(status);
         if(status.plan) setPlan(status.plan);
         if(status.running){
-          if(msg.includes("历史补全失败") || msg.includes("自动续跑")) setMsg("");
+          if(msg.includes("全部补全失败") || msg.includes("自动续跑")) setMsg("");
         }else if(status.auto_resume){
           setMsg(status.message || `自动续跑中：${status.auto_resume_delay_seconds ?? "稍后"} 秒后继续`);
         }else if(status.phase==="completed" || status.phase==="completed_with_gaps" || status.phase==="failed" || status.phase==="interrupted"){
@@ -324,7 +329,7 @@ function Repair(c: Ctx) {
   },[]);
 
   // 计划是常驻状态：页面打开立即加载，运行期间独立于任务状态轮询，
-  // 避免只更新顶部进度而让“历史补全计划”停留在旧快照。
+  // 避免只更新顶部进度而让“系统数据补全计划”停留在旧快照。
   useEffect(()=>{
     let cancelled=false;
     const refreshPlan=async()=>{
@@ -348,18 +353,18 @@ function Repair(c: Ctx) {
   return <div className="console-page"><PageHead eyebrow="INGESTION & REPAIR" title="数据补全" description="日常增量更新与历史缺口修复分开执行" />
     {msg&&<div className="inline-message">{msg}</div>}
     {c.update?.running&&<Progress update={c.update}/>}
-    {showProgress&&<div className={`task-progress ${(backfill?.phase==="failed"||backfill?.phase==="interrupted"||backfill?.phase==="completed_with_gaps")&&!backfill?.auto_resume?"task-failed":""}`}><div><strong>{backfill?.message||"历史补全"}</strong><span>总进度 {backfill?.progress??0}%</span></div><div className="bar"><i style={{width:`${backfill?.progress??0}%`}}/></div>{backfill?.activity&&<div className={`live-activity activity-${backfill.activity.event}`}><i/><span>实时</span><strong>{backfill.activity.text}</strong><time>{timeText(backfill.activity.at)}</time></div>}{backfill?.auto_resume&&<div className="inline-message">自动续跑中：{backfill.auto_resume_delay_seconds ?? "稍后"} 秒后继续，第 {backfill.auto_resume_attempt ?? 1}{backfill.auto_resume_max_attempts?`/${backfill.auto_resume_max_attempts}`:" 次"}。无需人工点击。</div>}{(backfill?.phase==="failed"||backfill?.phase==="interrupted"||backfill?.phase==="completed_with_gaps")&&!backfill?.auto_resume&&backfill?.failure_detail&&<FailureBox status={backfill} onResume={continueBackfill} disabled={!!backfill?.running||planning}/>}</div>}
+    {showProgress&&<div className={`task-progress ${(backfill?.phase==="failed"||backfill?.phase==="interrupted"||backfill?.phase==="completed_with_gaps")&&!backfill?.auto_resume?"task-failed":""}`}><div><strong>{backfill?.message||"全部数据补全"}</strong><span>总进度 {backfill?.progress??0}%</span></div><div className="bar"><i style={{width:`${backfill?.progress??0}%`}}/></div>{backfill?.activity&&<div className={`live-activity activity-${backfill.activity.event}`}><i/><span>实时</span><strong>{backfill.activity.text}</strong><time>{timeText(backfill.activity.at)}</time></div>}{backfill?.auto_resume&&<div className="inline-message">自动续跑中：{backfill.auto_resume_delay_seconds ?? "稍后"} 秒后继续，第 {backfill.auto_resume_attempt ?? 1}{backfill.auto_resume_max_attempts?`/${backfill.auto_resume_max_attempts}`:" 次"}。无需人工点击。</div>}{(backfill?.phase==="failed"||backfill?.phase==="interrupted"||backfill?.phase==="completed_with_gaps")&&!backfill?.auto_resume&&backfill?.failure_detail&&<FailureBox status={backfill} onResume={continueBackfill} disabled={!!backfill?.running||planning}/>}</div>}
     <div className="grid two">
       <Panel title="更新最新数据" sub="适合每日使用，只补最新交易日"><ul className="step-list"><li>确认最近交易日</li><li>更新行情、估值和涨跌停</li><li>更新最近公告</li><li>执行质量检查</li></ul><button className="button primary wide" onClick={c.latestUpdate}>开始日常更新</button></Panel>
-      <Panel title="历史缺口概览" sub="按审计窗口识别缺口，并生成可执行计划">
+      <Panel title="系统数据缺口" sub="扫描所有数据资产、功能契约、研究字段和质量要求">
         <div className="gap-list">{(c.readiness?.consumers??[]).map((x:ConsumerReadiness)=><div key={x.key}><span>{x.name}</span><strong>{x.requirements.filter(r=>r.status!=="ready").length} 项缺口</strong><Status status={x.status}/></div>)}</div>
         <div style={{display:"grid",gap:8,marginTop:12}}>
-          <button className="button primary wide" disabled={planning} onClick={generatePlan}>{planning?"生成中…":backfill?.running?"刷新缺口统计（运行中）":"生成历史补全计划"}</button>
-          <button className="button ghost wide" disabled={!plan||!hasExecutableSteps||!!backfill?.running||planning} onClick={runPlan}>{hasExecutableSteps?"执行可自动步骤":"无可执行步骤"}</button>
+          <button className="button primary wide" disabled={planning} onClick={generatePlan}>{planning?"生成中…":backfill?.running?"刷新缺口统计（运行中）":"一键生成补全计划"}</button>
+          <button className="button ghost wide" disabled={!plan||!hasExecutableSteps||!!backfill?.running||planning} onClick={runPlan}>{hasExecutableSteps?"一键全部补全":"当前无需补全"}</button>
         </div>
       </Panel>
     </div>
-    {plan&&<Panel title="历史补全计划" sub={`生成于 ${plan.generated_at} · 待执行 ${plan.summary.steps_needed} 步 · 预计 ${plan.summary.estimated_hours} 小时 · 下一步：${plan.summary.next_action}`} right={<button className="button ghost" disabled={planning||!!backfill?.running} onClick={generatePlan}>刷新计划</button>}>
+    {plan&&<Panel title="系统数据补全计划" sub={`生成于 ${plan.generated_at} · 待执行 ${plan.summary.steps_needed} 步 · 预计 ${plan.summary.estimated_hours} 小时 · 下一步：${plan.summary.next_action}`} right={<button className="button ghost" disabled={planning||!!backfill?.running} onClick={generatePlan}>刷新计划</button>}>
       {backfill?.running&&<RunningBackfillDetail status={backfill}/>}
       <div className="asset-summary" style={{marginBottom:12}}>
         <Metric label="资产缺口" value={String(plan.summary.asset_gaps)} hint="partial/missing"/>
@@ -398,9 +403,9 @@ function StreamConsole({stream,open,onToggle,onRefresh,onAction}:{stream:StreamA
     </div>
     {open&&<>
       {!!pending.length&&<div className="stream-bulk">
-        <button className="button ghost" onClick={()=>onAction("确认全部历史补全 pending",()=>bulkHandleStreamMessages("ack","data_platform.backfill",500))}>确认全部补全 pending</button>
-        <button className="button ghost" onClick={()=>onAction("转死信全部历史补全 pending",()=>bulkHandleStreamMessages("dead_letter","data_platform.backfill",500))}>全部转死信</button>
-        <button className="button ghost danger" onClick={()=>onAction("删除全部历史补全 pending",()=>bulkHandleStreamMessages("delete","data_platform.backfill",500))}>删除全部补全 pending</button>
+        <button className="button ghost" onClick={()=>onAction("确认全部数据补全 pending",()=>bulkHandleStreamMessages("ack","data_platform.backfill",500))}>确认全部补全 pending</button>
+        <button className="button ghost" onClick={()=>onAction("转死信全部数据补全 pending",()=>bulkHandleStreamMessages("dead_letter","data_platform.backfill",500))}>全部转死信</button>
+        <button className="button ghost danger" onClick={()=>onAction("删除全部数据补全 pending",()=>bulkHandleStreamMessages("delete","data_platform.backfill",500))}>删除全部补全 pending</button>
       </div>}
       <StreamMessageTable title="Pending消息" items={rows} empty="没有 pending 消息。" onAction={onAction}/>
       <StreamMessageTable title="最近消息" items={recent.slice(0,20)} empty="没有最近消息。" onAction={onAction} readonly/>
@@ -427,7 +432,7 @@ function RunningBackfillDetail({status}:{status:BackfillStatus}) {
   const executed=Array.isArray(status.executed) ? status.executed.length : 0;
   return <div className="running-detail">
     <div className="running-head">
-      <div><span>全量补全总进度</span><strong>{status.message || step?.title || "历史补全运行中"}</strong></div>
+      <div><span>全部数据补全总进度</span><strong>{status.message || step?.title || "全部补全运行中"}</strong></div>
       <b>{status.progress ?? 0}%</b>
     </div>
     <div className="bar"><i style={{width:`${status.progress??0}%`}}/></div>

@@ -25,6 +25,7 @@ class Settings(BaseModel):
         "DATABASE_URL", "postgresql://sirius@127.0.0.1:5432/alis_sim"
     )
     database_connect_timeout_seconds: int = int(os.getenv("DATABASE_CONNECT_TIMEOUT_SECONDS", "5"))
+    database_statement_timeout_ms: int = int(os.getenv("DATABASE_STATEMENT_TIMEOUT_MS", "30000"))
     cors_origins: str = os.getenv(
         "CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173"
     )

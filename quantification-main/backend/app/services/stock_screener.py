@@ -14,7 +14,7 @@ from statistics import mean
 from app.data_platform.db import _conn as data_conn
 from app.db.store import _conn as business_conn, get_positions
 from app.services.research_engine import build_stock_research, score_dimension
-from app.services.decision_store import upsert_pool_member, list_pool_members, remove_pool_member
+from app.services.decision_store import upsert_pool_member, list_pool_members, transition_pool_member
 from app.services.thesis_store import generate_thesis_for_stock
 from app.services.operations_overview import build_live_portfolio_risk
 
@@ -156,7 +156,7 @@ def run_daily_screener(*, top_n: int = 300, research_limit: int = 100) -> dict[s
             # Check if already in candidate or core
             already = any(m2.get("ts_code") == code for m2 in list_pool_members("candidate") + list_pool_members("core"))
             if not already:
-                upsert_pool_member(ts_code=code, pool_type="candidate", reason=f"auto_promote_from_watch: {m.get('reason', '')}")
+                transition_pool_member(ts_code=code, from_pool="watch", to_pool="candidate", reason=f"auto_promote_from_watch: {m.get('reason', '')}")
                 promoted += 1
         except Exception:
             pass

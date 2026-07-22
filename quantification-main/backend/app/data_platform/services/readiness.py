@@ -88,24 +88,25 @@ def _metrics() -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
         report_periods = _recent_report_periods(date.today())
         financial_pair_coverage: dict[str, tuple[int, int]] = {}
         financial_expected = stock_count * len(report_periods)
+        period_placeholders = ",".join("?" for _ in report_periods)
         for api in ("income", "balancesheet", "cashflow", "fina_indicator"):
-            covered_symbols = int(_value(c.execute(
-                """
-                SELECT COUNT(DISTINCT ts_code) n
+            covered_pairs = int(_value(c.execute(
+                f"""
+                SELECT COUNT(DISTINCT ts_code || ':' || period) n
                 FROM (
-                    SELECT ts_code
+                    SELECT ts_code,period
                     FROM dc_tushare_raw_records
-                    WHERE api_name=? AND period<>'' AND ts_code<>''
+                    WHERE api_name=? AND period IN ({period_placeholders}) AND ts_code<>''
                     UNION
-                    SELECT ts_code
+                    SELECT ts_code,period
                     FROM dc_tushare_request_coverage
-                    WHERE api_name=? AND period<>'' AND ts_code<>''
+                    WHERE api_name=? AND period IN ({period_placeholders}) AND ts_code<>''
                       AND result_status IN ('success','not_applicable','valid_empty','deferred_empty')
                 ) done
                 """,
-                (api, api),
+                (api, *report_periods, api, *report_periods),
             ).fetchone(), "n"))
-            financial_pair_coverage[api] = (min(covered_symbols, stock_count) * len(report_periods), financial_expected)
+            financial_pair_coverage[api] = (min(covered_pairs, financial_expected), financial_expected)
         checked_symbols = {}
         checked_dates = {}
         for api in ("suspend_d", "namechange", "adj_factor", "moneyflow"):
@@ -172,6 +173,19 @@ def _metrics() -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
         pass
     from app.data_platform.services.data_center import get_vip_backfill_status
     vip = get_vip_backfill_status(end_date=history_end)
+    # Collection coverage and research-field readiness are separate contracts.
+    # Only active candidate/core names need the expensive field-level audit.
+    from app.db.store import _conn as business_conn
+    from app.data_platform.services.data_center import financial_research_completeness
+    with business_conn() as bc:
+        candidate_codes = [str(dict(row).get("ts_code") or "") for row in bc.execute(
+            """SELECT DISTINCT ts_code FROM stock_pool_memberships
+               WHERE pool_type IN ('candidate','core') AND status='active' ORDER BY ts_code"""
+        ).fetchall()]
+    candidate_field_states = [financial_research_completeness(code, period_limit=5) for code in candidate_codes]
+    candidate_field_expected = sum(int(item.get("field_checks") or 0) for item in candidate_field_states)
+    candidate_field_present = sum(int(item.get("present_field_checks") or 0) for item in candidate_field_states)
+    candidate_field_complete = sum(1 for item in candidate_field_states if item.get("status") == "complete")
     from app.data_platform.services.exchange_etf_pcf import tracked_etf_codes
     pcf_expected = len(tracked_etf_codes())
     values = {
@@ -193,8 +207,12 @@ def _metrics() -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
             open_dates,
             "两年窗口个股资金流请求日期覆盖",
         ),
-        "financial": (ratio(financial_available, financial_expected), financial_available, financial_expected, "财务报表股票×报告期覆盖"),
-        "financial_indicator": (ratio(indicator_available, indicator_expected), indicator_available, indicator_expected, "财务指标股票×报告期覆盖"),
+        "financial": (ratio(financial_available, financial_expected), financial_available, financial_expected, "财务报表实际股票×报告期采集切片覆盖"),
+        "financial_indicator": (ratio(indicator_available, indicator_expected), indicator_available, indicator_expected, "财务指标实际股票×报告期采集切片覆盖"),
+        "candidate_financial_fields": (
+            ratio(candidate_field_present, candidate_field_expected), candidate_field_present, candidate_field_expected,
+            f"候选池与核心池研究字段 {candidate_field_present}/{candidate_field_expected}；完全通过 {candidate_field_complete}/{len(candidate_field_states)} 只",
+        ),
         "announcements": (1.0 if ann_fresh and announcement_count else (0.5 if announcement_count else 0.0), announcement_count, announcement_count, f"最新公告 {latest_ann or '无'}"),
         "point_in_time": (1.0 if has_available_time else 0.0, 1 if has_available_time else 0, 1, "核心原始记录已保存 available_time；严格未来函数审计另列质量项"),
         "capital_structure": (

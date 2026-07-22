@@ -43,10 +43,10 @@ export default function BackfillStatusBar({ onOpenDataCenter, variant = "top" }:
   const title = failed
     ? status?.message || "补全状态读取失败"
     : running
-      ? status?.message || step?.title || "历史补全运行中"
+      ? status?.message || step?.title || "全部数据补全运行中"
       : status
-        ? noGaps ? "历史补全已完成" : status.message || status.plan_summary?.next_action || "历史补全计划待检查"
-        : "正在读取历史补全计划";
+        ? noGaps ? "全部数据补全已完成" : status.message || status.plan_summary?.next_action || "数据补全计划待检查"
+        : "正在读取数据补全计划";
   const progress = Math.max(0, Math.min(100, status?.progress ?? 0));
   const eta = running && status ? dynamicEta(status) : status ? "空闲" : "读取中";
   const meta = step?.id || status?.phase || (running ? "运行中" : "常驻计划");
@@ -55,7 +55,7 @@ export default function BackfillStatusBar({ onOpenDataCenter, variant = "top" }:
     ? "无需补全"
     : status?.auto_resume
     ? `${status.auto_resume_delay_seconds ?? "稍后"} 秒后自动继续 · 第 ${status.auto_resume_attempt ?? 1}/${status.auto_resume_max_attempts ?? 5} 次`
-    : status?.activity?.text || (error ? error : running ? "等待实时日志…" : "点击查看生成/继续历史补全计划");
+    : status?.activity?.text || (error ? error : running ? "等待实时日志…" : "点击查看或继续数据补全计划");
 
   const className = variant === "sidebar" ? "sidebar-backfill-card" : "global-backfill-bar";
 
@@ -66,7 +66,7 @@ export default function BackfillStatusBar({ onOpenDataCenter, variant = "top" }:
         <strong>{title}</strong>
         <span>{meta} · {quantityText} · {running ? "剩余" : "状态"} {eta}</span>
       </div>
-      <div className="global-backfill-progress" aria-label="历史补全进度">
+      <div className="global-backfill-progress" aria-label="全部数据补全进度">
         <i style={{ width: `${progress}%` }} />
       </div>
       <span className="global-backfill-activity">{activityText}</span>

@@ -464,6 +464,7 @@ export interface StreamAdminStatus {
 export async function fetchBackfillPlan(marketBatchDays = 30, financialBatchSize = 100): Promise<BackfillPlan> {
   const { data } = await api.get<BackfillPlan>("/api/data-center/backfill/plan", {
     params: { market_batch_days: marketBatchDays, financial_batch_size: financialBatchSize },
+    timeout: 120_000,
   });
   return data;
 }

@@ -96,7 +96,7 @@ def _refresh_research_cycle(task_id: int) -> None:
             from app.services.research_workflow import process_watch_pool
 
             pool_codes: list[str] = []
-            for pool_type in ("core", "watch"):
+            for pool_type in ("core", "candidate", "watch"):
                 for member in list_pool_members(pool_type):
                     code = str(member.get("ts_code") or "")
                     if code and code not in pool_codes:
@@ -249,6 +249,11 @@ def start_auto_simulation_scheduler() -> bool:
                         threading.Event().wait(_AUTO_SIMULATION_INTERVAL_SEC)
                         continue
                     if latest:
+                        try:
+                            from app.services.profit_loop import materialize_daily_rebalance_plan
+                            materialize_daily_rebalance_plan()
+                        except Exception as exc:
+                            logger.warning("每日正式调仓方案生成失败 trade_date=%s: %s", latest, str(exc)[:200])
                         for task in list_active_quant_run_tasks():
                             status = str(task.get("status") or "").lower()
                             if status not in {"pending", "paused"}:
@@ -473,6 +478,8 @@ def _execute_step_with_retry(
     progress_callback,
     scoring_timeout_sec: int,
 ):
+    from app.services.profit_loop import get_daily_rebalance_execution_input
+    authoritative_plan = get_daily_rebalance_execution_input(signal_date, execute_date)
     try:
         return run_for_trade_date(
             strategy_id=int(task_live.get("strategy_id") or 0),
@@ -484,6 +491,7 @@ def _execute_step_with_retry(
             progress_callback=progress_callback,
             strict_no_future=True,
             scoring_timeout_sec=scoring_timeout_sec,
+            authoritative_plan=authoritative_plan,
         )
     except Exception as e_step:  # noqa: BLE001
         if not _is_tushare_auth_error(e_step):
@@ -505,6 +513,7 @@ def _execute_step_with_retry(
             progress_callback=progress_callback,
             strict_no_future=True,
             scoring_timeout_sec=scoring_timeout_sec,
+            authoritative_plan=authoritative_plan,
         )
 
 
@@ -581,6 +590,12 @@ def _persist_step_result(
     )
     if rec_id == 0:
         logger.info("quant task replay idempotent skip task_id=%s signal_date=%s already_replayed", task_id, result.signal_date)
+    else:
+        try:
+            from app.services.profit_loop import mark_daily_rebalance_plan_executed
+            mark_daily_rebalance_plan_executed(result.signal_date, result.execute_date, result.execution_id)
+        except Exception as exc:
+            logger.warning("调仓方案执行状态回写失败 signal=%s: %s", result.signal_date, str(exc)[:160])
     upsert_quant_replay_waterline(
         strategy_id=strategy_id,
         exchange_group=exchange_group,

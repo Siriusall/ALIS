@@ -211,6 +211,23 @@ CREATE TABLE dc_cold_archive_manifest (
             created_at TEXT NOT NULL
         );
 CREATE INDEX idx_dc_cold_archive_dataset_created ON dc_cold_archive_manifest (dataset, created_at);
+CREATE TABLE dc_asset_watermark (
+            asset_key TEXT NOT NULL,
+            slice_key TEXT NOT NULL DEFAULT 'overall',
+            contract_tier TEXT NOT NULL DEFAULT 'core',
+            expected_count INTEGER NOT NULL DEFAULT 0,
+            available_count INTEGER NOT NULL DEFAULT 0,
+            missing_count INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'unknown',
+            terminal_reason TEXT NOT NULL DEFAULT '',
+            repair_priority INTEGER NOT NULL DEFAULT 50,
+            source_code TEXT NOT NULL DEFAULT '',
+            metadata_json TEXT NOT NULL DEFAULT '{}',
+            checked_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY(asset_key,slice_key)
+        );
+CREATE INDEX idx_dc_asset_watermark_status_priority ON dc_asset_watermark (status,repair_priority,asset_key);
 CREATE TABLE dc_tushare_failed_requests (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             request_key TEXT NOT NULL UNIQUE,
@@ -408,6 +425,10 @@ def _conn():
             connect_timeout=int(os.getenv("DATABASE_CONNECT_TIMEOUT_SECONDS", "5")),
         )
         try:
+            raw.execute(
+                "SELECT set_config('statement_timeout', %s, false)",
+                (os.getenv("DATABASE_STATEMENT_TIMEOUT_MS", "30000"),),
+            )
             conn = Connection(raw, is_postgres=True)
             yield conn
             raw.commit()
@@ -520,6 +541,15 @@ def init_db() -> None:
                 schema_json TEXT NOT NULL, status VARCHAR(32) NOT NULL DEFAULT 'completed',
                 created_at VARCHAR(64) NOT NULL)""")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_dc_cold_archive_dataset_created ON dc_cold_archive_manifest (dataset,created_at)")
+            conn.execute("""CREATE TABLE IF NOT EXISTS dc_asset_watermark (
+                asset_key VARCHAR(128) NOT NULL, slice_key VARCHAR(128) NOT NULL DEFAULT 'overall',
+                contract_tier VARCHAR(32) NOT NULL DEFAULT 'core', expected_count BIGINT NOT NULL DEFAULT 0,
+                available_count BIGINT NOT NULL DEFAULT 0, missing_count BIGINT NOT NULL DEFAULT 0,
+                status VARCHAR(32) NOT NULL DEFAULT 'unknown', terminal_reason TEXT NOT NULL DEFAULT '',
+                repair_priority INTEGER NOT NULL DEFAULT 50, source_code VARCHAR(128) NOT NULL DEFAULT '',
+                metadata_json TEXT NOT NULL DEFAULT '{}', checked_at VARCHAR(64) NOT NULL,
+                updated_at VARCHAR(64) NOT NULL, PRIMARY KEY(asset_key,slice_key))""")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_dc_asset_watermark_status_priority ON dc_asset_watermark(status,repair_priority,asset_key)")
             conn.execute("""CREATE TABLE IF NOT EXISTS dc_etf_pcf_header (
                 exchange VARCHAR(8) NOT NULL, etf_code VARCHAR(16) NOT NULL, trade_date VARCHAR(8) NOT NULL,
                 fund_name TEXT NOT NULL DEFAULT '', fund_manager TEXT NOT NULL DEFAULT '', index_code VARCHAR(32) NOT NULL DEFAULT '',

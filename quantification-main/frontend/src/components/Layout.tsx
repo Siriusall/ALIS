@@ -33,6 +33,7 @@ export const ALL_SECTION_IDS = [
   "executionLedger",
   "positionRisk",
   "reviewWorkbench",
+  "candidatePool",
   "decisionLogs",
   "review",
   "validation",
@@ -43,12 +44,12 @@ export const ALL_SECTION_IDS = [
 ] as const;
 
 export const NAV_ITEMS = [
-  { id: "market", label: "今日驾驶舱", description: "系统给出今日动作", icon: "decision" },
+  { id: "market", label: "我的收益", description: "资产与收益变化", icon: "decision" },
+  { id: "portfolioWorkbench", label: "调仓方案", description: "今天是否需要调整", icon: "portfolio" },
+  { id: "reviewWorkbench", label: "模型贡献", description: "模型收益与有效性", icon: "review" },
+  { id: "candidatePool", label: "候选池", description: "候选来源与晋升门控", icon: "research" },
+  { id: "dataCenter", label: "数据中台", description: "数据资产与质量", icon: "data" },
   { id: "governance", label: "模型训练", description: "训练、评审、上线", icon: "governance" },
-  { id: "portfolioWorkbench", label: "组合与调仓", description: "持仓、风险、成交", icon: "portfolio" },
-  { id: "reviewWorkbench", label: "复盘学习", description: "绩效、归因、改进", icon: "review" },
-  { id: "dataCenter", label: "数据后台", description: "自动补数与质量", icon: "data" },
-  { id: "research", label: "证据后台", description: "系统研究明细", icon: "research" },
 ] as const;
 
 const PRIMARY_NAV_ITEMS = NAV_ITEMS.slice(0, 4);
@@ -293,7 +294,7 @@ export default function Layout({
         <aside className="dashboard-sidebar" aria-label="主导航">
           <div className="dashboard-sidebar-intro">
             <span>怎么用</span>
-            <strong>先看今日驾驶舱；只有模型、数据异常时再进后台</strong>
+            <strong>先看收益，再决定调仓，最后验证模型</strong>
           </div>
           <nav className="dashboard-nav">
             {PRIMARY_NAV_ITEMS.map(({ id, label, description, icon }, index) => id === "governance" ? (
@@ -320,7 +321,7 @@ export default function Layout({
                 <span className="dashboard-nav-copy"><strong>{label}</strong><small>{description}</small></span>
               </button>
             ))}
-            <div className="dashboard-nav-tools-label">系统后台 · 平时不用盯</div>
+            <div className="dashboard-nav-tools-label">系统能力</div>
             {TOOL_NAV_ITEMS.map(({ id, label, description, icon }) => id === "dataCenter" ? (
               <div className={`dashboard-nav-group ${dataCenterOpen ? "open" : ""}`} key={id}>
                 <button type="button" className={`dashboard-nav-item dashboard-nav-parent ${navSection === id ? "active" : ""}`} onClick={handleDataCenterParent} aria-expanded={dataCenterOpen}>
@@ -337,6 +338,13 @@ export default function Layout({
                   ))}
                 </div>
               </div>
+            ) : id === "governance" ? (
+              <div className={`dashboard-nav-group ${governanceOpen ? "open" : ""}`} key={id}>
+                <button type="button" className={`dashboard-nav-item dashboard-nav-parent ${navSection === id ? "active" : ""}`} onClick={handleGovernanceParent} aria-expanded={governanceOpen}>
+                  <em>·</em><NavIcon name={icon} /><span className="dashboard-nav-copy"><strong>{label}</strong><small>{description}</small></span><i className="dashboard-nav-caret" aria-hidden="true" />
+                </button>
+                <div className="dashboard-subnav" aria-label="模型训练子导航">{SYSTEM_SECTIONS.map((item) => <button key={item.key} type="button" className={currentSection === item.target && governanceSection === item.key ? "active" : ""} onClick={() => handleSystemSection(item)}><span>{item.label}</span><small>{item.hint}</small></button>)}</div>
+              </div>
             ) : (
               <button key={id} type="button" className={`dashboard-nav-item ${navSection === id ? "active" : ""}`} onClick={() => handleSectionChange(id)}>
                 <em>·</em>
@@ -352,7 +360,7 @@ export default function Layout({
         </aside>
         <div className="dashboard-main">
           <header className="dashboard-header">{header}</header>
-          <BackfillStatusBar onOpenDataCenter={openDataCenter} />
+          {currentSection === "dataCenter" && <BackfillStatusBar onOpenDataCenter={openDataCenter} />}
           <div className="dashboard-content">
             <Suspense fallback={<LoadingState variant="page" title="正在打开模块" detail="正在准备页面结构和数据接口" rows={4} />}>
               {currentChild}

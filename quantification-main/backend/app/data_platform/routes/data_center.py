@@ -52,7 +52,8 @@ from app.data_platform.services.observability import get_observability
 from app.data_platform.services.runtime_logs import list_runtime_logs_since
 from app.data_platform.services.readiness import readiness_overview, readiness_refresh_status, start_readiness_refresh
 from app.data_platform.services.assets import get_data_assets
-from app.data_platform.services.backfill import build_backfill_plan, get_backfill_status, start_backfill
+from app.data_platform.services.asset_watermarks import asset_watermark_status, private_migration_manifest
+from app.data_platform.services.backfill import build_backfill_plan, get_backfill_status, start_backfill, terminate_orphaned_backfill
 from app.data_platform.services.cold_archive import archive_raw_records, cold_archive_status
 from app.data_platform.services.stream_admin import bulk_handle_stream_messages, handle_stream_message, stream_admin_status
 from app.services.theme_engine import materialize_theme_snapshot_history
@@ -146,6 +147,17 @@ def data_center_assets() -> dict[str, Any]:
     return get_data_assets()
 
 
+@router.get("/data-center/assets/watermarks")
+def data_center_asset_watermarks() -> dict[str, Any]:
+    return asset_watermark_status()
+
+
+@router.get("/data-center/migration-manifest")
+def data_center_migration_manifest() -> dict[str, Any]:
+    """Read-only migration reservation; does not export or copy data."""
+    return private_migration_manifest()
+
+
 @router.get("/data-center/cold-archive")
 def data_center_cold_archive_status(limit: int = Query(default=30, ge=1, le=200)) -> dict[str, Any]:
     return cold_archive_status(limit=limit)
@@ -208,6 +220,14 @@ def data_center_backfill_start(
 @router.get("/data-center/backfill/status")
 def data_center_backfill_status() -> dict[str, Any]:
     return get_backfill_status()
+
+
+@router.post("/data-center/backfill/terminate-orphan")
+def data_center_backfill_terminate_orphan() -> dict[str, Any]:
+    result = terminate_orphaned_backfill(reason="操作员终止无工作线程的补全任务")
+    if not result.get("ok"):
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=result)
+    return result
 
 
 @router.post("/data-center/web-fallback/import-legacy")

@@ -38,12 +38,6 @@ const OBSERVATION_TEXT: Record<string, string> = {
   crowding: "成交拥挤度",
 };
 
-const TONE_SUMMARY: Record<string, string> = {
-  go: "系统已给出可确认方案",
-  hold: "系统建议观察或等待证据",
-  stop: "系统阻断执行并给出原因",
-};
-
 function loadStoredAnalyzeResult(): QuantAnalyzeResponse | null {
   try {
     const raw = sessionStorage.getItem(ANALYZE_RESULT_KEY);
@@ -108,6 +102,7 @@ export default function DecisionPage({ onNavigate }: DecisionPageProps) {
   const [dailyReport, setDailyReport] = useState<DailyRebalanceReport | null>(null);
   const [planModels, setPlanModels] = useState<PlanModelControl | null>(null);
   const [reportLoading, setReportLoading] = useState(false);
+  const showDetails = useMemo(() => false, []);
   const refreshRunning = useRef(false);
 
   async function refresh(showLoading = true) {
@@ -331,11 +326,7 @@ export default function DecisionPage({ onNavigate }: DecisionPageProps) {
             <div className="decision-verdict-label"><i /> 今日建议</div>
             <h2>{gate?.title || "正在形成今日结论"}</h2>
             <p>{gate?.detail || "系统正在读取数据质量、市场环境、组合风险与生产模型。"}</p>
-            {riskExplanation && <div className="decision-reason-stack">
-              {riskExplanation.reasons.slice(0, 3).map((item) => <div className={`decision-reason-chip ${item.level}`} key={`${item.title}-${item.detail}`}><strong>{item.title}</strong><span>{item.detail}</span></div>)}
-            </div>}
             <div className="decision-verdict-footer">
-              <span>{TONE_SUMMARY[gate?.tone || "hold"]}</span>
               <button type="button" onClick={() => onNavigate?.("validation")}>查看完整分析 <b>→</b></button>
             </div>
           </div>
@@ -344,14 +335,27 @@ export default function DecisionPage({ onNavigate }: DecisionPageProps) {
               <span>现在应该做什么</span>
               <strong>{primaryActionText}</strong>
             </div>
-            <div className="decision-action-counts">
-              <button type="button" className="buy" onClick={() => onNavigate?.("validation")}><span>买入</span><strong>{displayedBuyCount}</strong></button>
-              <button type="button" className="sell" onClick={() => onNavigate?.("validation")}><span>卖出</span><strong>{displayedSellCount}</strong></button>
-              <button type="button" className="hold" onClick={() => onNavigate?.("validation")}><span>持有</span><strong>{holdSuggestions}</strong></button>
-            </div>
           </div>
         </div>
         {error && <div className="alert">{error}</div>}
+        <div className="decision-quick-glance" aria-label="今日关键数字">
+          <button type="button" onClick={() => onNavigate?.("positionRisk")}>
+            <span>股票仓位</span>
+            <strong>{fmtPct(positionPolicy?.current_equity)} <i>→</i> {fmtPct(positionPolicy?.max_equity)}</strong>
+            <em>{requiresRiskRebalance ? "需要降到上限内" : "处于预算内"}</em>
+          </button>
+          <button type="button" onClick={() => onNavigate?.("portfolio")}>
+            <span>账户现金</span>
+            <strong>{fmtPct(ledger?.cash_pct)}</strong>
+            <em>{ledger?.position_count ?? 0} 只持仓</em>
+          </button>
+          <button type="button" onClick={() => onNavigate?.("sentiment")}>
+            <span>市场状态</span>
+            <strong>{marketState?.label || "观测中"}</strong>
+            <em>风险预算 {positionGate ? `${Math.round(positionGate.combined_risk_budget_multiplier * 100)}%` : "—"}</em>
+          </button>
+        </div>
+        {showDetails && <>
         {revenueDashboard && (
           <section className="decision-revenue-dashboard" aria-label="收益目标仪表盘">
             <header>
@@ -549,6 +553,7 @@ export default function DecisionPage({ onNavigate }: DecisionPageProps) {
             </section>
           </div>
         </details>
+        </>}
       </div>
     </section>
   );

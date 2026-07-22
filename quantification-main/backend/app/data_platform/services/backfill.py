@@ -18,10 +18,13 @@ from app.data_platform.services.assets import (
     get_data_assets,
     invalidate_data_assets_cache,
 )
+from app.data_platform.services.asset_watermarks import mark_asset_terminal
 from app.data_platform.services.data_center import (
+    enrich_financial_research_batch,
     run_data_quality_checks,
     sync_cninfo_announcements,
     sync_financial_batch,
+    sync_financial_vip_period,
     sync_market_bundle,
     sync_pmi_industry_proxies,
     sync_trade_calendar,
@@ -84,10 +87,16 @@ def _raw_dates(api_name: str, start: str, end: str) -> set[str]:
     with _conn() as c:
         rows = c.execute(
             """
-            SELECT DISTINCT trade_date FROM dc_tushare_raw_records
-            WHERE api_name = ? AND trade_date <> '' AND trade_date BETWEEN ? AND ?
+            SELECT cal.cal_date AS trade_date
+            FROM dc_trade_calendar cal
+            WHERE cal.exchange = 'SSE' AND cal.is_open = 1
+              AND cal.cal_date BETWEEN ? AND ?
+              AND EXISTS (
+                  SELECT 1 FROM dc_tushare_raw_records raw
+                  WHERE raw.api_name = ? AND raw.trade_date = cal.cal_date
+              )
             """,
-            (api_name, start, end),
+            (start, end, api_name),
         ).fetchall()
     return {str(dict(r)["trade_date"]) for r in rows}
 
@@ -455,18 +464,78 @@ def build_backfill_plan(*, market_batch_days: int = 30, financial_batch_size: in
                 }
             )
 
+    # 4a. Field-level research readiness is repaired for the whole market by
+    # report period. One step calls four VIP endpoints, not thousands of
+    # per-stock endpoints. Rebuilding the plan verifies the persisted fields.
+    financial_field_asset = next(
+        (item for item in assets.get("items") or [] if item.get("key") == "financial_research_fields"),
+        {},
+    )
+    financial_field_states = {
+        str(item.get("period") or ""): item
+        for item in financial_field_asset.get("period_details") or []
+    }
+    for period in quarters:
+        field_state = financial_field_states.get(period, {})
+        if field_state.get("status") == "complete":
+            continue
+        if field_state.get("status") in {"upstream_unavailable", "not_applicable", "permission_denied"}:
+            add({
+                "priority": 3, "key": f"financial_research_terminal_{period}",
+                "title": f"财务字段终态缺口 {period}",
+                "why": str(field_state.get("terminal_reason") or "连续补偿无进展，等待上游能力变化或人工重置"),
+                "action": "upstream_residual_unavailable", "params": {"period": period},
+                "source_asset_key": "financial_research_fields", "source_slice_key": period,
+                "estimated_calls": 0, "estimated_minutes": 0, "status": "blocked",
+                "gap": {"have": int(field_state.get("complete_checks") or 0), "need": int(field_state.get("checks") or 0)},
+            })
+            continue
+        if field_state.get("batch_attempted"):
+            incomplete_symbols = int(field_state.get("incomplete_symbols") or 0)
+            add({
+                "priority": 3, "key": f"financial_research_residual_{period}",
+                "title": f"按报告期补偿财务字段残余 {period}",
+                "why": f"数据资产验收发现该报告期 VIP 整批后仍有字段残余；普通单股接口实测可补回，仅处理 {incomplete_symbols} 只缺口股票",
+                "action": "sync_financial_research_residual_batch", "params": {"period": period, "limit": financial_batch_size},
+                "source_asset_key": "financial_research_fields", "source_slice_key": period,
+                "estimated_calls": min(financial_batch_size, incomplete_symbols),
+                "estimated_minutes": round(min(financial_batch_size, incomplete_symbols) * 0.03, 1), "status": "needed",
+                "gap": {"have": int(field_state.get("complete_checks") or 0), "need": int(field_state.get("checks") or 0),
+                        "incomplete_symbols": incomplete_symbols,
+                        "missing_by_api": field_state.get("missing_by_api") or {}},
+            })
+            continue
+        add({
+            "priority": 3,
+            "key": f"financial_research_fields_{period}",
+            "title": f"按报告期补全全市场研究财务字段 {period}",
+            "why": f"全市场字段契约覆盖 {int(field_state.get('complete_checks') or 0)}/{int(field_state.get('checks') or 0)}；缺口 {field_state.get('missing_by_api')}",
+            "action": "sync_financial_research_period",
+            "source_asset_key": "financial_research_fields", "source_slice_key": period,
+            "params": {"period": period},
+            "estimated_calls": 4,
+            "estimated_minutes": 1.0,
+            "status": "needed",
+            "gap": {"have": int(field_state.get("complete_checks") or 0), "need": int(field_state.get("checks") or 0),
+                    "missing": int(field_state.get("checks") or 0) - int(field_state.get("complete_checks") or 0),
+                    "missing_by_api": field_state.get("missing_by_api") or {}},
+        })
+
     # 4b. Additional TuShare APIs verified by real small-sample calls.
     latest_period = quarters[0] if quarters else ""
     stock_routes = [
         ("namechange", "补全名称/ST历史", ""),
         ("forecast", "补全业绩预告", latest_period),
-        ("top10_holders", "补全十大股东", latest_period),
-        ("top10_floatholders", "补全十大流通股东", latest_period),
-        ("stk_holdernumber", "补全股东人数", latest_period),
         ("pledge_stat", "补全质押统计", ""),
         ("pledge_detail", "补全质押明细", ""),
         ("express", "补全业绩快报", latest_period),
     ]
+    for period in quarters:
+        stock_routes.extend([
+            ("top10_holders", f"补全十大股东 {period}", period),
+            ("top10_floatholders", f"补全十大流通股东 {period}", period),
+            ("stk_holdernumber", f"补全股东人数 {period}", period),
+        ])
     for period in annuals:
         stock_routes.append(("fina_mainbz", f"补全主营构成 {period}", period))
     for api_name, title, period in stock_routes:
@@ -478,7 +547,7 @@ def build_backfill_plan(*, market_batch_days: int = 30, financial_batch_size: in
         estimated_minutes = 0.0 if batch_checked else (1.0 if is_period_vip else round(remaining_symbols * 0.15, 1))
         add({
             "priority": 4,
-            "key": f"stock_api_{api_name}_{period}" if api_name == "fina_mainbz" else f"stock_api_{api_name}",
+            "key": f"stock_api_{api_name}_{period}" if period else f"stock_api_{api_name}",
             "title": title,
             "why": f"{api_name} 优先按报告期/日期窗批量获取，失败才逐股断点补偿；空结果也记录以避免重复请求",
             "action": "sync_stock_api_batch",
@@ -598,6 +667,10 @@ def build_backfill_plan(*, market_batch_days: int = 30, financial_batch_size: in
         if item["status"] in {"partial", "missing"} and item.get("weight", 0) > 0
     ]
 
+    # Data assets are the sole inventory source for repair planning. Consumer
+    # readiness remains a view over those assets, not a second hidden gap list.
+    contract_gaps: list[dict[str, Any]] = []
+
     # Surface every weighted asset gap, including those without a safe
     # automatic implementation. Hidden gaps are more dangerous than blocked
     # steps because they make the repair workflow look complete.
@@ -606,7 +679,7 @@ def build_backfill_plan(*, market_batch_days: int = 30, financial_batch_size: in
         "namechange", "suspension", "moneyflow", "top10_holders", "top10_floatholders",
         "stk_holdernumber", "pledge_stat", "express", "industry_index", "index_weight",
         "income", "balancesheet", "cashflow", "financial_indicator", "fina_audit",
-        "fina_mainbz", "announcements", "macro",
+        "fina_mainbz", "financial_research_fields", "announcements", "macro",
         "capital_structure_vip", "etf_price_nav_vip", "major_news_vip",
         "vip_moneyflow_hsgt", "vip_hk_hold", "vip_margin", "vip_margin_detail",
         "vip_margin_secs", "vip_top_list", "vip_top_inst", "vip_fund_basic",
@@ -639,6 +712,7 @@ def build_backfill_plan(*, market_batch_days: int = 30, financial_batch_size: in
 
     return {
         "ok": True,
+        "gap_source": "data_assets",
         "generated_at": _now(),
         "scope": {
             "market": "沪深A股",
@@ -671,12 +745,15 @@ def build_backfill_plan(*, market_batch_days: int = 30, financial_batch_size: in
             "next_action": needed[0]["title"] if needed else (blocked[0]["title"] if blocked else "无需补全"),
         },
         "asset_gaps": asset_gaps,
+        "contract_gaps": contract_gaps,
         "steps": steps,
         "execution": {
             "supported_actions": [
                 "sync_trade_calendar",
                 "sync_market_batch",
                 "sync_financial_batch",
+                "sync_financial_research_period",
+                "sync_financial_research_residual_batch",
                 "sync_announcements",
                 "run_quality",
                 "sync_stock_api_batch",
@@ -748,9 +825,26 @@ def _plan_progress_percent(plan: dict[str, Any]) -> int:
     return max(0, min(100, int(round(sum(ratios) / len(ratios) * 100))))
 
 
+def _completed_gap_message(plan: dict[str, Any], blocked_steps: int) -> str:
+    blocked = [step for step in plan.get("steps") or [] if step.get("status") == "blocked"]
+    residual_periods = [
+        str((step.get("params") or {}).get("period") or "")
+        for step in blocked
+        if step.get("action") == "upstream_residual_unavailable"
+    ]
+    if blocked and len(residual_periods) == len(blocked):
+        return f"自动补全已完成；{len(residual_periods)} 个报告期仍有上游未返回字段，系统已停止重复请求"
+    return f"自动补全已完成；仍有 {blocked_steps} 项无法自动处理的缺口"
+
+
 def get_backfill_status() -> dict[str, Any]:
     cached = get_json("alis:data-platform:backfill:state")
     if isinstance(cached, dict):
+        if str(cached.get("phase") or "") == "completed_with_gaps" and isinstance(cached.get("plan"), dict):
+            blocked_steps = int(((cached.get("plan") or {}).get("summary") or {}).get("steps_blocked") or 0)
+            cached["message"] = _completed_gap_message(cached["plan"], blocked_steps)
+        if not cached.get("running") and str(cached.get("phase") or "") == "interrupted":
+            cached = terminate_orphaned_backfill(reason="服务重启后原工作线程已不存在")
         _ensure_auto_resume_alive(cached)
         if not cached.get("running") and str(cached.get("phase") or "") in {"completed", "completed_with_gaps"}:
             # A completed state already persists the last plan summary.  The
@@ -768,7 +862,7 @@ def get_backfill_status() -> dict[str, Any]:
                         **cached,
                         "running": False,
                         "phase": "completed",
-                        "message": "历史补全已完成，当前无剩余缺口",
+                        "message": "全部数据补全已完成，当前无剩余缺口",
                         "progress": 100,
                         "plan_summary": summary,
                         "current_step": None,
@@ -818,8 +912,43 @@ def _ensure_auto_resume_alive(snapshot: dict[str, Any]) -> None:
     threading.Thread(target=_resume_now, daemon=True, name="backfill-auto-resume-heal").start()
 
 
+def terminate_orphaned_backfill(*, reason: str = "工作线程已不存在") -> dict[str, Any]:
+    """Terminate a persisted task only after its in-process worker is gone."""
+    cached = get_json("alis:data-platform:backfill:state")
+    snapshot = dict(cached) if isinstance(cached, dict) else dict(_state)
+    if snapshot.get("running"):
+        return {"ok": False, **snapshot, "reason": "worker_still_running"}
+    run_id = int(snapshot.get("run_id") or 0)
+    now = _now()
+    if run_id:
+        with _conn() as c:
+            c.execute(
+                """UPDATE data_ingestion_runs SET status='cancelled',finished_at=?,error=?
+                   WHERE id=? AND status IN ('running','interrupted')""",
+                (now, f"孤儿任务已终止：{reason}", run_id),
+            )
+    stream_id = str(snapshot.get("stream_id") or "")
+    if stream_id:
+        try:
+            ack_task(stream_id)
+        except Exception:
+            pass
+    normalized = {
+        **snapshot, "ok": True, "running": False, "phase": "cancelled",
+        "message": "旧补全任务已终止；已写入数据保留，可一键重新生成补全计划",
+        "finished_at": now, "error": "", "auto_resume": False,
+        "can_resume": False, "resume_action": "", "current_step": None,
+        "activity": None, "failure_detail": None, "stream_id": None,
+    }
+    with _lock:
+        _state.clear()
+        _state.update(normalized)
+    set_json("alis:data-platform:backfill:state", normalized, ttl=86400)
+    return normalized
+
+
 def recover_interrupted_backfill() -> dict[str, Any]:
-    """Turn a Redis/DB `running` snapshot left by a process restart into a resumable state."""
+    """Kill Redis/DB tasks whose worker disappeared during a process restart."""
     cached = get_json("alis:data-platform:backfill:state")
     run_id = int((cached or {}).get("run_id") or 0) if isinstance(cached, dict) else 0
     was_running = bool((cached or {}).get("running")) if isinstance(cached, dict) else False
@@ -832,25 +961,28 @@ def recover_interrupted_backfill() -> dict[str, Any]:
             now = _now()
             for stale_id in stale_ids:
                 c.execute(
-                    "UPDATE data_ingestion_runs SET status='interrupted',finished_at=?,error=? WHERE id=?",
-                    (now, "数据中台进程重启，任务已中断；已写入数据保留，可从缺口继续执行", stale_id),
+                    "UPDATE data_ingestion_runs SET status='cancelled',finished_at=?,error=? WHERE id=?",
+                    (now, "数据中台进程重启，原工作线程已不存在；孤儿任务自动终止", stale_id),
                 )
     if was_running or stale_ids:
         snapshot = {
-            **(cached or {}), "running": False, "phase": "interrupted",
-            "message": "服务重启导致任务中断；已写入数据保留；可重新生成并继续历史补全计划",
-            "finished_at": _now(), "error": "process_restarted",
+            **(cached or {}), "running": False, "phase": "cancelled",
+            "message": "服务重启后旧补全任务已自动终止；已写入数据保留，可一键重新生成补全计划",
+            "finished_at": _now(), "error": "",
             "auto_resume": False,
-            "resume_action": "start_backfill",
+            "can_resume": False, "resume_action": "",
             "current_step": None,
-            "activity": None,
+            "activity": None, "failure_detail": None, "stream_id": None,
         }
         with _lock:
             _state.clear()
             _state.update(snapshot)
         set_json("alis:data-platform:backfill:state", snapshot, ttl=86400)
         return {"recovered": True, "run_id": run_id, "stale_runs": stale_ids}
-    if isinstance(cached, dict) and cached.get("phase") in {"interrupted", "cancelled"}:
+    if isinstance(cached, dict) and cached.get("phase") == "interrupted":
+        terminated = terminate_orphaned_backfill(reason="启动检查发现历史中断状态")
+        return {"recovered": True, "terminated": True, "run_id": run_id, "stale_runs": [], "state": terminated}
+    if isinstance(cached, dict) and cached.get("phase") == "cancelled":
         return {"recovered": True, "run_id": run_id, "stale_runs": [], "auto_resume": False}
     if isinstance(cached, dict) and cached.get("auto_resume") and not cached.get("running"):
         _schedule_auto_resume(
@@ -911,14 +1043,14 @@ def _schedule_auto_resume(
         _set(
             auto_resume=False,
             auto_resume_reason="fatal_error",
-            message=f"历史补全失败：{error}；该错误不适合自动续跑，请手动处理",
+            message=f"全部数据补全失败：{error}；该错误不适合自动续跑，请手动处理",
         )
         return
     if AUTO_RESUME_MAX_ATTEMPTS > 0 and attempt > AUTO_RESUME_MAX_ATTEMPTS:
         _set(
             auto_resume=False,
             auto_resume_reason="max_attempts_reached",
-            message=f"历史补全失败：{error}；已自动续跑 {AUTO_RESUME_MAX_ATTEMPTS} 次，暂停等待人工处理",
+            message=f"全部数据补全失败：{error}；已自动续跑 {AUTO_RESUME_MAX_ATTEMPTS} 次，暂停等待人工处理",
         )
         return
     delay = max(1, int(delay_override_seconds or _auto_resume_delay(attempt)))
@@ -929,7 +1061,7 @@ def _schedule_auto_resume(
         auto_resume_max_attempts=AUTO_RESUME_MAX_ATTEMPTS or None,
         auto_resume_delay_seconds=delay,
         auto_resume_at=resume_at,
-        message=f"历史补全失败：{error}；{delay} 秒后自动继续（第 {attempt}/{AUTO_RESUME_MAX_ATTEMPTS} 次）",
+        message=f"全部数据补全失败：{error}；{delay} 秒后自动继续（第 {attempt}/{AUTO_RESUME_MAX_ATTEMPTS} 次）",
     )
 
     def _resume() -> None:
@@ -1041,6 +1173,12 @@ def _run_step(step: dict[str, Any]) -> dict[str, Any]:
         if not result.get("ok") and not result.get("cooldown") and int(result.get("success") or 0) > 0:
             result = {**result, "ok": True, "soft_failed": True}
         return result
+    if action == "sync_financial_research_period":
+        return sync_financial_vip_period(str(params.get("period") or ""), contract_mode="research_fields_v2")
+    if action == "sync_financial_research_residual_batch":
+        return enrich_financial_research_batch(
+            str(params.get("period") or ""), limit=int(params.get("limit") or 100),
+        )
     if action == "sync_stock_api_batch":
         return sync_tushare_stock_batch(
             str(params.get("api_name") or ""), period=str(params.get("period") or ""),
@@ -1136,7 +1274,7 @@ def _worker(plan: dict[str, Any], *, max_steps: int, stream_id: str | None = Non
         runnable = [
             s for s in plan.get("steps") or []
             if s.get("status") == "needed" and s.get("action") in {
-                "sync_trade_calendar", "sync_market_batch", "sync_financial_batch",
+                "sync_trade_calendar", "sync_market_batch", "sync_financial_batch", "sync_financial_research_period", "sync_financial_research_residual_batch",
                 "sync_announcements", "sync_stock_api_batch", "sync_date_api_batch", "sync_index_core", "sync_macro_core",
                 "sync_capital_history_batch", "sync_etf_history_batch", "sync_major_news_history_batch",
                 "sync_exchange_etf_pcf_batch",
@@ -1250,7 +1388,7 @@ def _worker(plan: dict[str, Any], *, max_steps: int, stream_id: str | None = Non
                 remaining = [
                     s for s in refreshed.get("steps") or []
                     if s.get("status") == "needed"
-                    and s.get("action") in {"sync_market_batch", "sync_financial_batch", "sync_announcements", "run_quality", "sync_stock_api_batch", "sync_date_api_batch", "sync_index_core", "sync_macro_core", "sync_capital_history_batch", "sync_etf_history_batch", "sync_major_news_history_batch", "sync_exchange_etf_pcf_batch", "materialize_theme_snapshots_batch"}
+                    and s.get("action") in {"sync_market_batch", "sync_financial_batch", "sync_financial_research_period", "sync_financial_research_residual_batch", "sync_announcements", "run_quality", "sync_stock_api_batch", "sync_date_api_batch", "sync_index_core", "sync_macro_core", "sync_capital_history_batch", "sync_etf_history_batch", "sync_major_news_history_batch", "sync_exchange_etf_pcf_batch", "materialize_theme_snapshots_batch"}
                     and str(s.get("key")) not in already
                     and str(s.get("key") or s.get("id") or "") not in deferred_keys
                 ]
@@ -1274,7 +1412,7 @@ def _worker(plan: dict[str, Any], *, max_steps: int, stream_id: str | None = Non
                     # Quality is a terminal verification step. Re-adding it
                     # together with every quota-safe data batch caused
                     # "补全 -> 质量 -> 下一轮" to repeat indefinitely.
-                    and s.get("action") in {"sync_trade_calendar", "sync_market_batch", "sync_financial_batch", "sync_announcements", "sync_stock_api_batch", "sync_date_api_batch", "sync_index_core", "sync_macro_core", "sync_capital_history_batch", "sync_etf_history_batch", "sync_major_news_history_batch", "sync_exchange_etf_pcf_batch", "materialize_theme_snapshots_batch"}
+                    and s.get("action") in {"sync_trade_calendar", "sync_market_batch", "sync_financial_batch", "sync_financial_research_period", "sync_financial_research_residual_batch", "sync_announcements", "sync_stock_api_batch", "sync_date_api_batch", "sync_index_core", "sync_macro_core", "sync_capital_history_batch", "sync_etf_history_batch", "sync_major_news_history_batch", "sync_exchange_etf_pcf_batch", "materialize_theme_snapshots_batch"}
                     and str(s.get("key") or s.get("id") or "") not in deferred_keys
                 ]
                 if remaining:
@@ -1294,6 +1432,13 @@ def _worker(plan: dict[str, Any], *, max_steps: int, stream_id: str | None = Non
                         stagnant_batches[current_key] = stagnant_batches.get(current_key, 0) + 1 if previous == gap_signature else 0
                         previous_gap_signatures[current_key] = gap_signature
                     if current_remaining is not None and stagnant_batches.get(current_key, 0) >= DEFER_EMPTY_AFTER_ATTEMPTS:
+                        asset_key = str(current_remaining.get("source_asset_key") or "")
+                        slice_key = str(current_remaining.get("source_slice_key") or "overall")
+                        if asset_key:
+                            mark_asset_terminal(
+                                asset_key, slice_key, "upstream_unavailable",
+                                f"连续 {DEFER_EMPTY_AFTER_ATTEMPTS} 个批次执行后缺口没有变化",
+                            )
                         deferred_keys.add(current_key)
                         deferred.append({
                             "step": {k: current_remaining.get(k) for k in ("id", "key", "title", "action")},
@@ -1402,10 +1547,10 @@ def _worker(plan: dict[str, Any], *, max_steps: int, stream_id: str | None = Non
         _set(
             running=False,
             phase=final,
-            message=("历史补全失败：" + error) if error else (
+            message=("全部数据补全失败：" + error) if error else (
                 f"自动补全已停止；{len(deferred)} 个步骤无进展或失败，仍有缺口待处理" if deferred
-                else "历史补全已完成，当前无剩余缺口" if fully_done
-                else f"可自动步骤已完成；仍有 {blocked_steps} 个外部能力阻塞项"
+                else "全部数据补全已完成，当前无剩余缺口" if fully_done
+                else _completed_gap_message(final_plan, blocked_steps)
                 if blocked_steps > 0 and remaining_steps <= 0
                 else f"本次已执行 {len(executed)} 个步骤，仍有 {remaining_steps} 个待补步骤"
             ),
@@ -1425,14 +1570,16 @@ def _worker(plan: dict[str, Any], *, max_steps: int, stream_id: str | None = Non
             auto_resume_attempt=auto_resume_attempt,
             auto_resume_max_attempts=AUTO_RESUME_MAX_ATTEMPTS,
         )
-        should_auto_resume = bool(error)
+        # A failed worker is terminal. Rebuilding/restarting it from a timer
+        # made an explicitly stopped job appear to start forever.
+        should_auto_resume = False
     except Exception as exc:  # noqa: BLE001
         error = str(exc)[:1000]
         invalidate_data_assets_cache()
         _set(
             running=False,
             phase="failed",
-            message=f"历史补全失败：{error}",
+            message=f"全部数据补全失败：{error}",
             finished_at=_now(),
             executed=executed,
             error=error,
@@ -1447,7 +1594,7 @@ def _worker(plan: dict[str, Any], *, max_steps: int, stream_id: str | None = Non
             auto_resume_attempt=auto_resume_attempt,
             auto_resume_max_attempts=AUTO_RESUME_MAX_ATTEMPTS,
         )
-        should_auto_resume = True
+        should_auto_resume = False
     finally:
         set_tushare_activity_hook(None)
         if stream_id:
@@ -1501,8 +1648,8 @@ def start_backfill(*, max_steps: int = 0, market_batch_days: int = 30, financial
                 "run_id": int(_state.get("run_id") or 0),
                 "phase": "completed_with_gaps" if steps_blocked > 0 else "completed",
                 "message": (
-                    f"可自动步骤已完成；仍有 {steps_blocked} 个外部能力阻塞项"
-                    if steps_blocked > 0 else "历史补全已完成，当前无剩余缺口"
+                    _completed_gap_message(plan, steps_blocked)
+                    if steps_blocked > 0 else "全部数据补全已完成，当前无剩余缺口"
                 ),
                 "progress": 100,
                 "started_at": _state.get("started_at") or _now(),
@@ -1543,7 +1690,7 @@ def start_backfill(*, max_steps: int = 0, market_batch_days: int = 30, financial
                 "running": True,
                 "run_id": run_id,
                 "phase": "starting",
-                "message": "正在启动历史补全",
+                "message": "正在启动全部数据补全",
                 "progress": _plan_progress_percent(plan),
                 "started_at": _now(),
                 "plan_summary": plan.get("summary"),

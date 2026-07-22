@@ -649,6 +649,7 @@ def run_for_trade_date(
     progress_callback: Optional[Callable[[str], None]] = None,
     strict_no_future: bool = True,
     scoring_timeout_sec: Optional[int] = None,
+    authoritative_plan: Dict[str, Any] | None = None,
 ) -> QuantRunExecResult:
     def _report(phase: str) -> None:
         if progress_callback is not None:
@@ -665,15 +666,37 @@ def run_for_trade_date(
             code="future_guard_date_order",
         )
     _report("正在加载快照")
-    target_symbols, selection_detail = _build_target_symbols(
-        ds=ds,
-        strategy_id=int(strategy_id),
-        signal_date=signal_date,
-        top_n=int(top_n),
-        exchange_group=exchange_group,
-        progress_callback=_report,
-        scoring_timeout_sec=scoring_timeout_sec,
-    )
+    if authoritative_plan:
+        target_symbols = [str(x).strip() for x in authoritative_plan.get("target_symbols") or [] if str(x).strip()]
+        selection_detail = {
+            "signal_date": signal_date,
+            "exchange_group": exchange_group,
+            "strategy_template": {"id": "authoritative_daily_plan", "name": "统一日调仓计划"},
+            "risk_budget": authoritative_plan.get("risk_budget") or {},
+            "selections": [
+                {"symbol": str(item.get("symbol") or ""), "name": str(item.get("name") or ""),
+                 "score": float(item.get("expected_20d_return") or 0) * 100}
+                for item in authoritative_plan.get("proposal") or []
+                if str(item.get("symbol") or "") in target_symbols
+            ],
+            "blocked_events": [], "sell_triggers": [],
+            "plan_provenance": {
+                "source": "daily_rebalance_plans",
+                "plan_id": authoritative_plan.get("plan_id"),
+                "plan_version": authoritative_plan.get("plan_version"),
+                "input_hash": authoritative_plan.get("input_hash"),
+            },
+        }
+    else:
+        target_symbols, selection_detail = _build_target_symbols(
+            ds=ds,
+            strategy_id=int(strategy_id),
+            signal_date=signal_date,
+            top_n=int(top_n),
+            exchange_group=exchange_group,
+            progress_callback=_report,
+            scoring_timeout_sec=scoring_timeout_sec,
+        )
     target_symbols, research_blocks = _apply_research_admission(target_symbols, as_of_time=f"{signal_date}T23:59:59")
     target_symbols, dynamic_blocks, dynamic_gate = _apply_dynamic_strategy_gate(
         target_symbols, as_of_time=f"{signal_date}T23:59:59"
@@ -905,6 +928,14 @@ def run_for_trade_date(
         else:
             available_balance = 0.0
         blocked_events.append({"date": execute_date, "side": "BUY", "code": "marginal_cvar_infeasible", "message": marginal_cvar.get("reason") or "单股边际CVaR贡献12%硬约束不可行"})
+    if authoritative_plan:
+        planned_weights = {
+            str(symbol): max(0.0, float(weight or 0))
+            for symbol, weight in (authoritative_plan.get("target_weights") or {}).items()
+            if str(symbol) in target_symbols and float(weight or 0) > 0
+        }
+        cvar_weights = planned_weights
+        optimizer_name = "authoritative_daily_plan_weights_v1"
     if cvar_weights:
         scale = max(1, len(cvar_weights))
         for sym, weight in cvar_weights.items():
@@ -919,7 +950,7 @@ def run_for_trade_date(
     )
     target_sleeve = max(0.0, 1.0 - non_target_value / max(float(portfolio["total_equity"]), 1.0))
     weight_sum = sum(cvar_weights.values())
-    if weight_sum > 0:
+    if weight_sum > 0 and not authoritative_plan:
         cvar_weights = {symbol: weight / weight_sum * target_sleeve for symbol, weight in cvar_weights.items()}
 
     # 风险收缩不是“禁止调仓”：目标池内的超配持仓也必须先降到目标权重。

@@ -40,8 +40,8 @@ def evaluate_core_pool_eligibility(ts_code: str, *, as_of_time: str | None = Non
 
 
 def process_watch_pool(*, limit: int = 100) -> dict[str, Any]:
-    """Run the unattended research-to-core workflow required by the plan."""
-    members = list_pool_members("watch")[:max(1, min(int(limit), 500))]
+    """Evaluate staged candidates for core admission; retained name kept for API compatibility."""
+    members = list_pool_members("candidate")[:max(1, min(int(limit), 500))]
     promoted: list[dict[str, Any]] = []
     blocked: list[dict[str, Any]] = []
     failed: list[dict[str, Any]] = []
@@ -52,10 +52,34 @@ def process_watch_pool(*, limit: int = 100) -> dict[str, Any]:
             eligibility = evaluate_core_pool_eligibility(code)
             evidence_reason = "; ".join(f"{gate['key']}={'pass' if gate['passed'] else 'blocked'}" for gate in eligibility["gates"])
             if eligibility["eligible_for_core"]:
-                pool_item = transition_pool_member(ts_code=code, from_pool="watch", to_pool="core", reason=f"automatic_research_workflow_v1; {evidence_reason}")
+                pool_item = transition_pool_member(ts_code=code, from_pool="candidate", to_pool="core", reason=f"automatic_research_workflow_v2; {evidence_reason}")
                 promoted.append({"ts_code": code, "pool_item": pool_item, "thesis": thesis, "eligibility": eligibility})
             else:
                 blocked.append({"ts_code": code, "thesis": thesis, "eligibility": eligibility})
         except Exception as exc:  # noqa: BLE001 - each candidate must be isolated
             failed.append({"ts_code": code, "error": str(exc)[:300]})
-    return {"ok": not failed, "candidates": len(members), "promoted": promoted, "blocked": blocked, "failed": failed}
+    return {"ok": not failed, "schema_version": "candidate_to_core_v2", "candidates": len(members), "promoted": promoted, "blocked": blocked, "failed": failed}
+
+
+def stage_watch_pool_candidates(*, limit: int = 50) -> dict[str, Any]:
+    """Repair/stage the highest research-scored watch names into the candidate tier."""
+    members = list_pool_members("watch")
+    def score(item: dict[str, Any]) -> float:
+        reason = str(item.get("reason") or "")
+        try:
+            return float(reason.split("score=", 1)[1].split()[0])
+        except (IndexError, ValueError):
+            return 0.0
+    staged = []
+    failed = []
+    for member in sorted(members, key=score, reverse=True)[:max(1, min(int(limit), 100))]:
+        code = str(member.get("ts_code") or "")
+        try:
+            item = transition_pool_member(
+                ts_code=code, from_pool="watch", to_pool="candidate",
+                reason=f"candidate_stage_v2; research_score={score(member):.2f}; source={member.get('reason') or ''}",
+            )
+            staged.append(item)
+        except Exception as exc:
+            failed.append({"ts_code": code, "error": str(exc)[:200]})
+    return {"ok": not failed, "staged": len(staged), "items": staged, "failed": failed}

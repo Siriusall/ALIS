@@ -48,4 +48,4 @@ def test_blocked_only_plan_is_not_reported_as_fully_complete(monkeypatch):
 
     assert result["reason"] == "blocked_only"
     assert result["phase"] == "completed_with_gaps"
-    assert "1 个外部能力阻塞项" in result["message"]
+    assert "1 项无法自动处理的缺口" in result["message"]

@@ -98,7 +98,7 @@ def _annual_periods(today: date | None = None) -> list[str]:
 
 def get_data_assets(*, force: bool = False) -> dict[str, Any]:
     if not force:
-        redis_cached = get_json("alis:data-platform:assets:v3")
+        redis_cached = get_json("alis:data-platform:assets:v4")
         if isinstance(redis_cached, dict):
             return redis_cached
     now = time.monotonic()
@@ -112,16 +112,20 @@ def get_data_assets(*, force: bool = False) -> dict[str, Any]:
             return cached
 
     payload = _compute_data_assets()
+    from app.data_platform.services.asset_watermarks import apply_terminal_states, persist_asset_watermarks
+    payload = apply_terminal_states(payload)
+    persist_asset_watermarks(payload)
     with _assets_cache_lock:
         _assets_cache["at"] = time.monotonic()
         _assets_cache["value"] = payload
-    set_json("alis:data-platform:assets:v3", payload, ttl=int(_ASSETS_CACHE_TTL_SEC))
+    set_json("alis:data-platform:assets:v4", payload, ttl=int(_ASSETS_CACHE_TTL_SEC))
     return payload
 
 
 def invalidate_data_assets_cache() -> None:
     redis_delete("alis:data-platform:assets:v2")
     redis_delete("alis:data-platform:assets:v3")
+    redis_delete("alis:data-platform:assets:v4")
     with _assets_cache_lock:
         _assets_cache["at"] = 0.0
         _assets_cache["value"] = None
@@ -138,9 +142,26 @@ def _compute_data_assets() -> dict[str, Any]:
     financial_periods = sorted(set(quarters + annuals))
     financial_start = min(financial_periods)
     financial_end = max(financial_periods)
-    from app.data_platform.services.data_center import get_vip_backfill_status
+    from app.data_platform.services.data_center import get_vip_backfill_status, financial_research_periods_completeness
     from app.data_platform.services.exchange_etf_pcf import tracked_etf_codes
     vip = get_vip_backfill_status(end_date=end_s)
+    financial_field_states = financial_research_periods_completeness(quarters)
+    financial_field_periods = [
+        {
+            "period": period,
+            "status": state.get("status"),
+            "checks": int(state.get("checks") or 0),
+            "complete_checks": int(state.get("complete_checks") or 0),
+            "coverage": float(state.get("coverage") or 0),
+            "missing_by_api": state.get("missing_by_api") or {},
+            "batch_attempted": bool(state.get("batch_attempted")),
+            "incomplete_symbols": len(state.get("incomplete_symbols") or []),
+        }
+        for period in quarters
+        for state in [financial_field_states.get(period, {})]
+    ]
+    financial_field_checks = sum(item["checks"] for item in financial_field_periods)
+    financial_field_complete = sum(item["complete_checks"] for item in financial_field_periods)
 
     with _conn() as c:
         stocks = _i(c.execute("SELECT COUNT(*) n FROM dc_stock_master").fetchone())
@@ -326,6 +347,7 @@ def _compute_data_assets() -> dict[str, Any]:
         # coverage, so pre-listing and deferred-empty cases do not remain as
         # permanent false gaps.
         financial_symbol_counts: dict[str, int] = {}
+        financial_period_symbol_counts: dict[str, dict[str, int]] = {}
         for api in period_apis:
             row = c.execute(
                 """
@@ -344,6 +366,32 @@ def _compute_data_assets() -> dict[str, Any]:
                 (api, financial_start, financial_end, api, financial_start, financial_end),
             ).fetchone()
             financial_symbol_counts[api] = int((dict(row) if row else {}).get("n") or 0)
+            grouped = c.execute(
+                """
+                SELECT period,COUNT(DISTINCT ts_code) n
+                FROM (
+                    SELECT ts_code,period FROM dc_tushare_raw_records
+                    WHERE api_name=? AND period<>'' AND period BETWEEN ? AND ? AND ts_code<>''
+                    UNION
+                    SELECT ts_code,period FROM dc_tushare_request_coverage
+                    WHERE api_name=? AND period<>'' AND period BETWEEN ? AND ? AND ts_code<>''
+                      AND result_status IN ('success','not_applicable','valid_empty','deferred_empty')
+                ) done
+                GROUP BY period
+                """,
+                (api, financial_start, financial_end, api, financial_start, financial_end),
+            ).fetchall()
+            financial_period_symbol_counts[api] = {
+                str(dict(item).get("period") or ""): int(dict(item).get("n") or 0)
+                for item in grouped
+            }
+
+        applicable_stocks_by_period = {
+            period: _i(c.execute(
+                "SELECT COUNT(*) n FROM dc_stock_master WHERE list_date='' OR list_date<=?", (period,)
+            ).fetchone())
+            for period in financial_periods
+        }
 
         # Period coverage for financial statements.
         financial_period_counts = {
@@ -441,6 +489,15 @@ def _compute_data_assets() -> dict[str, Any]:
     expected_financial_periods = len(financial_periods)
     expected_quarter_periods = len(quarters)
     expected_annual_periods = len(annuals)
+
+    def financial_pair_actual(api: str, periods: list[str]) -> int:
+        return sum(
+            min(financial_period_symbol_counts.get(api, {}).get(period, 0), applicable_stocks_by_period.get(period, stocks))
+            for period in periods
+        )
+
+    def financial_pair_expected(periods: list[str]) -> int:
+        return sum(applicable_stocks_by_period.get(period, stocks) for period in periods)
 
     # Build asset definitions: each has an explicit audit window.
     # measurement:
@@ -779,14 +836,14 @@ def _compute_data_assets() -> dict[str, Any]:
             "window_start": financial_start,
             "window_end": financial_end,
             "window_depth": f"{FINANCIAL_QUARTERS}季度+{FINANCIAL_ANNUAL_YEARS}年度",
-            "measurement": "coverage_stocks",
-            "actual": financial_symbol_counts.get("income", 0),
-            "expected": expected_financial_stocks,
+            "measurement": "coverage_records",
+            "actual": financial_pair_actual("income", financial_periods),
+            "expected": financial_pair_expected(financial_periods),
             "symbols": financial_symbol_counts.get("income", 0),
             "dates": financial_period_counts.get("income", 0),
             "min_date": period_raw("income").get("min_date"),
             "max_date": period_raw("income").get("max_date"),
-            "rationale": "按股票覆盖度计；报告期窗口 " + ",".join(quarters[:4]) + "...",
+            "rationale": "按股票×应适用报告期覆盖度计；报告期窗口 " + ",".join(quarters[:4]) + "...",
             "periods_actual": financial_period_counts.get("income", 0),
             "periods_expected": expected_financial_periods,
         },
@@ -802,9 +859,9 @@ def _compute_data_assets() -> dict[str, Any]:
             "window_start": financial_start,
             "window_end": financial_end,
             "window_depth": f"{FINANCIAL_QUARTERS}季度+{FINANCIAL_ANNUAL_YEARS}年度",
-            "measurement": "coverage_stocks",
-            "actual": financial_symbol_counts.get("balancesheet", 0),
-            "expected": expected_financial_stocks,
+            "measurement": "coverage_records",
+            "actual": financial_pair_actual("balancesheet", financial_periods),
+            "expected": financial_pair_expected(financial_periods),
             "symbols": financial_symbol_counts.get("balancesheet", 0),
             "dates": financial_period_counts.get("balancesheet", 0),
             "min_date": period_raw("balancesheet").get("min_date"),
@@ -825,9 +882,9 @@ def _compute_data_assets() -> dict[str, Any]:
             "window_start": financial_start,
             "window_end": financial_end,
             "window_depth": f"{FINANCIAL_QUARTERS}季度+{FINANCIAL_ANNUAL_YEARS}年度",
-            "measurement": "coverage_stocks",
-            "actual": financial_symbol_counts.get("cashflow", 0),
-            "expected": expected_financial_stocks,
+            "measurement": "coverage_records",
+            "actual": financial_pair_actual("cashflow", financial_periods),
+            "expected": financial_pair_expected(financial_periods),
             "symbols": financial_symbol_counts.get("cashflow", 0),
             "dates": financial_period_counts.get("cashflow", 0),
             "min_date": period_raw("cashflow").get("min_date"),
@@ -848,16 +905,38 @@ def _compute_data_assets() -> dict[str, Any]:
             "window_start": financial_start,
             "window_end": financial_end,
             "window_depth": f"{FINANCIAL_QUARTERS}季度",
-            "measurement": "coverage_stocks",
-            "actual": financial_symbol_counts.get("fina_indicator", 0),
-            "expected": expected_financial_stocks,
+            "measurement": "coverage_records",
+            "actual": financial_pair_actual("fina_indicator", quarters),
+            "expected": financial_pair_expected(quarters),
             "symbols": financial_symbol_counts.get("fina_indicator", 0),
             "dates": financial_period_counts.get("fina_indicator", 0),
             "min_date": period_raw("fina_indicator").get("min_date"),
             "max_date": period_raw("fina_indicator").get("max_date"),
-            "rationale": "按股票覆盖度计",
+            "rationale": "按股票×应适用季度覆盖度计",
             "periods_actual": financial_period_counts.get("fina_indicator", 0),
             "periods_expected": expected_quarter_periods,
+        },
+        {
+            "key": "financial_research_fields",
+            "name": "研究财务字段契约",
+            "domain": "财务数据",
+            "consumer": "候选池、长线研究、量化分析、模型训练",
+            "weight": 100,
+            "target_scope": f"全市场最近{FINANCIAL_QUARTERS}季度；按行业适用字段逐项验收",
+            "frequency": "quarterly",
+            "source": "Tushare VIP整批 + 普通单股残余补偿",
+            "window_start": min(quarters) if quarters else financial_start,
+            "window_end": max(quarters) if quarters else financial_end,
+            "window_depth": f"{FINANCIAL_QUARTERS}季度字段级",
+            "measurement": "coverage_records",
+            "actual": financial_field_complete,
+            "expected": financial_field_checks,
+            "symbols": stocks,
+            "dates": len(quarters),
+            "min_date": min(quarters) if quarters else None,
+            "max_date": max(quarters) if quarters else None,
+            "rationale": "每只适用股票的利润表、资产负债表、现金流和财务指标必需字段均存在才算完整",
+            "period_details": financial_field_periods,
         },
         {
             "key": "fina_audit",
@@ -871,9 +950,9 @@ def _compute_data_assets() -> dict[str, Any]:
             "window_start": min(annuals) if annuals else financial_start,
             "window_end": max(annuals) if annuals else financial_end,
             "window_depth": f"{FINANCIAL_ANNUAL_YEARS}年度",
-            "measurement": "coverage_stocks",
-            "actual": financial_symbol_counts.get("fina_audit", 0),
-            "expected": expected_financial_stocks,
+            "measurement": "coverage_records",
+            "actual": financial_pair_actual("fina_audit", annuals),
+            "expected": financial_pair_expected(annuals),
             "symbols": financial_symbol_counts.get("fina_audit", 0),
             "dates": financial_period_counts.get("fina_audit", 0),
             "min_date": period_raw("fina_audit").get("min_date"),
@@ -894,9 +973,9 @@ def _compute_data_assets() -> dict[str, Any]:
             "window_start": min(annuals) if annuals else financial_start,
             "window_end": max(annuals) if annuals else financial_end,
             "window_depth": f"{FINANCIAL_ANNUAL_YEARS}年度",
-            "measurement": "coverage_stocks",
-            "actual": financial_symbol_counts.get("fina_mainbz", 0),
-            "expected": expected_financial_stocks,
+            "measurement": "coverage_records",
+            "actual": financial_pair_actual("fina_mainbz", annuals),
+            "expected": financial_pair_expected(annuals),
             "symbols": financial_symbol_counts.get("fina_mainbz", 0),
             "dates": financial_period_counts.get("fina_mainbz", 0),
             "min_date": period_raw("fina_mainbz").get("min_date"),
@@ -938,14 +1017,14 @@ def _compute_data_assets() -> dict[str, Any]:
             "window_start": financial_start,
             "window_end": financial_end,
             "window_depth": f"{FINANCIAL_QUARTERS}季度",
-            "measurement": "coverage_stocks",
-            "actual": financial_symbol_counts.get("top10_holders", 0),
-            "expected": expected_financial_stocks,
+            "measurement": "coverage_records",
+            "actual": financial_pair_actual("top10_holders", quarters),
+            "expected": financial_pair_expected(quarters),
             "symbols": financial_symbol_counts.get("top10_holders", 0),
             "dates": int(period_raw("top10_holders").get("periods") or 0),
             "min_date": period_raw("top10_holders").get("min_date"),
             "max_date": period_raw("top10_holders").get("max_date"),
-            "rationale": "按股票覆盖度计",
+            "rationale": "按股票×应适用季度终态覆盖度计",
         },
         {
             "key": "top10_floatholders",
@@ -959,14 +1038,14 @@ def _compute_data_assets() -> dict[str, Any]:
             "window_start": financial_start,
             "window_end": financial_end,
             "window_depth": f"{FINANCIAL_QUARTERS}季度",
-            "measurement": "coverage_stocks",
-            "actual": financial_symbol_counts.get("top10_floatholders", 0),
-            "expected": expected_financial_stocks,
+            "measurement": "coverage_records",
+            "actual": financial_pair_actual("top10_floatholders", quarters),
+            "expected": financial_pair_expected(quarters),
             "symbols": financial_symbol_counts.get("top10_floatholders", 0),
             "dates": int(period_raw("top10_floatholders").get("periods") or 0),
             "min_date": period_raw("top10_floatholders").get("min_date"),
             "max_date": period_raw("top10_floatholders").get("max_date"),
-            "rationale": "按股票覆盖度计",
+            "rationale": "按股票×应适用季度终态覆盖度计",
         },
         {
             "key": "stk_holdernumber",
@@ -980,14 +1059,14 @@ def _compute_data_assets() -> dict[str, Any]:
             "window_start": financial_start,
             "window_end": financial_end,
             "window_depth": f"{FINANCIAL_QUARTERS}季度",
-            "measurement": "coverage_stocks",
-            "actual": financial_symbol_counts.get("stk_holdernumber", 0),
-            "expected": expected_financial_stocks,
+            "measurement": "coverage_records",
+            "actual": financial_pair_actual("stk_holdernumber", quarters),
+            "expected": financial_pair_expected(quarters),
             "symbols": financial_symbol_counts.get("stk_holdernumber", 0),
             "dates": int(period_raw("stk_holdernumber").get("periods") or 0),
             "min_date": period_raw("stk_holdernumber").get("min_date"),
             "max_date": period_raw("stk_holdernumber").get("max_date"),
-            "rationale": "按股票覆盖度计",
+            "rationale": "按股票×应适用季度终态覆盖度计",
         },
         {
             "key": "pledge_stat",
@@ -1310,6 +1389,7 @@ def _compute_data_assets() -> dict[str, Any]:
                 "max_date": spec.get("max_date"),
                 "status": state,
                 "measurement": spec["measurement"],
+                "period_details": spec.get("period_details"),
             }
         )
 

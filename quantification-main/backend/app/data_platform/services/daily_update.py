@@ -156,12 +156,24 @@ def _worker(parent_run_id: int) -> None:
         _set_state(phase="research", message="正在更新候选池和核心池研究", progress=95)
         try:
             from app.services.stock_screener import run_daily_screener
-            from app.services.research_workflow import process_watch_pool
+            from app.services.research_workflow import process_watch_pool, stage_watch_pool_candidates
 
             research_limit = max(1, min(int(os.getenv("ALIS_DAILY_RESEARCH_LIMIT", "100")), 500))
             screen = run_daily_screener(top_n=max(100, research_limit * 3), research_limit=research_limit)
+            staged = stage_watch_pool_candidates(limit=min(50, research_limit))
+            candidate_enrichment = []
+            enrichment_limit = max(1, min(int(os.getenv("ALIS_DAILY_CANDIDATE_ENRICH_LIMIT", "5")), 20))
+            from app.services.decision_store import list_pool_members
+            for member in list_pool_members("candidate"):
+                if len(candidate_enrichment) >= enrichment_limit:
+                    break
+                code = str(member.get("ts_code") or "")
+                before = financial_research_completeness(code, period_limit=5)
+                if before.get("status") != "complete":
+                    enriched = enrich_financial_research_fields(code, period_limit=5, request_limit=20)
+                    candidate_enrichment.append({"ts_code": code, "before": before.get("status"), "after": (enriched.get("after") or {}).get("status"), "requested": enriched.get("requested")})
             promote = process_watch_pool(limit=research_limit)
-            steps.append({"step": "research_pool", "result": {"screen": screen, "promote": promote}})
+            steps.append({"step": "research_pool", "result": {"screen": screen, "stage": staged, "candidate_enrichment": candidate_enrichment, "promote": promote}})
         except Exception as exc:  # noqa: BLE001
             logger.warning("daily research maintenance deferred: %s", str(exc)[:300])
             steps.append({"step": "research_pool", "result": {"ok": False, "deferred": True, "error": str(exc)[:300]}})

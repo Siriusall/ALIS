@@ -8,7 +8,7 @@ from typing import Any
 from app.db.store import _conn
 
 
-POOL_TYPES = {"watch", "core", "holding"}
+POOL_TYPES = {"watch", "candidate", "core", "holding"}
 POSITION_TRANSITIONS = {
     "excluded": {"watch"}, "watch": {"waiting_valuation", "excluded"},
     "waiting_valuation": {"trial", "watch"}, "trial": {"holding", "warning", "exit"},

@@ -157,6 +157,7 @@ def _conn():
             connect_timeout=settings.database_connect_timeout_seconds,
         )
         try:
+            raw.execute("SELECT set_config('statement_timeout', %s, false)", (str(settings.database_statement_timeout_ms),))
             w = _ConnWrapper(raw, is_mysql=False, is_postgres=True)
             yield w
             w.commit()

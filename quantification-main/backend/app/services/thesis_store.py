@@ -73,10 +73,24 @@ def get_thesis(thesis_id: int) -> dict[str, Any] | None:
 def list_theses(ts_code: str = "", limit: int = 100) -> list[dict[str, Any]]:
     with _conn() as c:
         if ts_code:
-            rows = c.execute("SELECT id FROM investment_theses WHERE ts_code=? ORDER BY updated_at DESC LIMIT ?", (ts_code, limit)).fetchall()
+            rows = c.execute("SELECT * FROM investment_theses WHERE ts_code=? ORDER BY updated_at DESC LIMIT ?", (ts_code, limit)).fetchall()
         else:
-            rows = c.execute("SELECT id FROM investment_theses ORDER BY updated_at DESC LIMIT ?", (limit,)).fetchall()
-    return [value for row in rows if (value := get_thesis(int(dict(row)["id"]))) is not None]
+            rows = c.execute("SELECT * FROM investment_theses ORDER BY updated_at DESC LIMIT ?", (limit,)).fetchall()
+        values = [dict(row) for row in rows]
+        ids = [int(row["id"]) for row in values]
+        hypotheses = [] if not ids else [dict(row) for row in c.execute(
+            f"SELECT * FROM thesis_hypotheses WHERE thesis_id IN ({','.join('?' for _ in ids)}) ORDER BY thesis_id,id",
+            tuple(ids),
+        ).fetchall()]
+    by_thesis: dict[int, list[dict[str, Any]]] = {thesis_id: [] for thesis_id in ids}
+    for item in hypotheses:
+        item["expected"] = _loads(item.pop("expected_json", "{}"), {})
+        item["evidence"] = _loads(item.pop("evidence_json", "[]"), [])
+        by_thesis.setdefault(int(item["thesis_id"]), []).append(item)
+    for value in values:
+        value["hypotheses"] = by_thesis.get(int(value["id"]), [])
+        value["derived_status"], value["derived_confidence"] = _derive_thesis_state(value["hypotheses"])
+    return values
 
 
 def update_hypothesis(hypothesis_id: int, *, status: str, evidence: list[dict[str, Any]]) -> dict[str, Any] | None:
@@ -226,10 +240,10 @@ def generate_thesis_for_stock(ts_code: str, *, force: bool = False) -> dict[str,
 
 
 def generate_watch_pool_theses(*, limit: int = 100) -> dict[str, Any]:
-    """Generate managed theses for watch candidates without promoting their pool tier."""
+    """Generate managed theses for staged candidates without promoting their pool tier."""
     from app.services.decision_store import list_pool_members
 
-    members = list_pool_members("watch")[:max(1, min(int(limit), 500))]
+    members = list_pool_members("candidate")[:max(1, min(int(limit), 500))]
     generated: list[dict[str, Any]] = []
     blocked: list[dict[str, Any]] = []
     for member in members:

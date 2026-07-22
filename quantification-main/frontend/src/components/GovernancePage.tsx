@@ -905,10 +905,10 @@ export default function GovernancePage() {
         </div>
 
         <div className="card">
-          <div className="governance-section-head"><div><h3>系统维护任务</h3><p>日常数据更新、历史补全和后台维护事件。</p></div></div>
+          <div className="governance-section-head"><div><h3>系统维护任务</h3><p>日常数据更新、全部数据补全和后台维护事件。</p></div></div>
           <div className="governance-maintenance-grid">
             <article><div><span>日常数据更新</span><strong>{dailyUpdate?.running ? "运行中" : statusText(dailyUpdate?.phase)}</strong><small>{dailyUpdate?.message || "等待调度"}</small></div><button className="button ghost" disabled={Boolean(dailyUpdate?.running) || busy !== ""} onClick={() => void action("daily-update", startDailyUpdate, "日常更新已启动")}>执行日更</button></article>
-            <article><div><span>历史数据补全</span><strong>{backfill?.running ? "运行中" : statusText(backfill?.phase)}</strong><small>{backfill?.message || "等待补全计划"}</small></div><button className="button ghost" disabled={Boolean(backfill?.running) || busy !== ""} onClick={() => void action("backfill", () => startBackfill(0), "历史补全已启动")}>执行补全</button></article>
+            <article><div><span>全部数据补全</span><strong>{backfill?.running ? "运行中" : statusText(backfill?.phase)}</strong><small>{backfill?.message || "等待补全计划"}</small></div><button className="button ghost" disabled={Boolean(backfill?.running) || busy !== ""} onClick={() => void action("backfill", () => startBackfill(0), "全部补全已启动")}>一键全部补全</button></article>
           </div>
           <div className="governance-runtime-events">
             {(dataTasks?.runtime_logs ?? []).filter((item) => item.logger !== "model-governance").slice(0, 12).map((item) => <div key={item.id}><time>{formatGmt8Time(item.created_at)}</time><strong>{item.logger}</strong><span>{item.message}</span></div>)}

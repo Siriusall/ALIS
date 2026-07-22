@@ -646,7 +646,15 @@ def get_data_center_status(limit_runs: int = 10) -> dict[str, Any]:
         ).fetchall()
         stock_count = c.execute("SELECT COUNT(*) AS cnt FROM dc_stock_master").fetchone()
         cal_count = c.execute("SELECT COUNT(*) AS cnt FROM dc_trade_calendar").fetchone()
-        raw_count = c.execute("SELECT COUNT(*) AS cnt FROM dc_tushare_raw_records").fetchone()
+        # This table has tens of millions of rows. PostgreSQL's exact COUNT(*)
+        # scans the whole table and used to make the status poll hit the 30s
+        # statement timeout. The catalog estimate is sufficient for a status
+        # card; SQLite tests retain the exact count.
+        raw_count = (
+            c.execute("SELECT COALESCE(reltuples, 0)::BIGINT AS cnt FROM pg_class WHERE relname='dc_tushare_raw_records'").fetchone()
+            if c._is_postgres
+            else c.execute("SELECT COUNT(*) AS cnt FROM dc_tushare_raw_records").fetchone()
+        )
         snapshot_count = c.execute("SELECT COUNT(*) AS cnt FROM dc_stock_daily_snapshot").fetchone()
         quality_count = c.execute("SELECT COUNT(*) AS cnt FROM dc_data_quality_checks").fetchone()
         announcement_count = c.execute("SELECT COUNT(*) AS cnt FROM dc_announcement_raw").fetchone()
@@ -740,7 +748,7 @@ PERIOD_FALLBACK_APIS = {
 FINANCIAL_RESEARCH_REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
     "income": ("total_revenue", "n_income", "n_income_attr_p"),
     "balancesheet": ("total_assets", "total_liab", "money_cap"),
-    "cashflow": ("n_cashflow_act", "c_pay_acq_const_fiolta"),
+    "cashflow": ("n_cashflow_act",),
     "fina_indicator": ("roe", "grossprofit_margin", "netprofit_margin", "debt_to_assets"),
 }
 FINANCIAL_SECTOR_RESEARCH_REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
@@ -1808,21 +1816,111 @@ def financial_research_completeness(
                     any_of_fields = ["accounts_receiv", "inventories", "goodwill"]
                     if not any(merged.get(field) is not None or field in returned_fields for field in any_of_fields):
                         missing.append("accounts_receiv|inventories|goodwill")
+                elif required_contract is FINANCIAL_RESEARCH_REQUIRED_FIELDS and api_name == "cashflow":
+                    any_of_fields = ["free_cashflow", "c_pay_acq_const_fiolta"]
+                    if not any(merged.get(field) is not None or field in returned_fields for field in any_of_fields):
+                        missing.append("free_cashflow|c_pay_acq_const_fiolta")
                 details.append({
                     "period": period, "api": api_name, "required_fields": list(required),
+                    "any_of_fields": any_of_fields,
                     "present_fields": [field for field in required if merged.get(field) is not None or field in returned_fields]
                                       + ([next((field for field in any_of_fields if merged.get(field) is not None or field in returned_fields), "")] if any_of_fields and any(merged.get(field) is not None or field in returned_fields for field in any_of_fields) else []),
                     "missing_fields": missing, "complete": not missing,
                 })
     checks = len(details)
     complete = sum(1 for item in details if item["complete"])
+    required_field_checks = sum(len(item["required_fields"]) + (1 if item.get("any_of_fields") else 0) for item in details)
+    present_field_checks = sum(
+        sum(1 for field in item["required_fields"] if field in item["present_fields"])
+        + (1 if item.get("any_of_fields") and any(field in item["present_fields"] for field in item["any_of_fields"]) else 0)
+        for item in details
+    )
     return {
         "ok": True, "ts_code": code, "industry": industry, "as_of_time": as_of_time, "periods": target_periods,
         "checks": checks, "complete_checks": complete,
-        "coverage": round(complete / checks, 4) if checks else 0.0,
+        "coverage": round(present_field_checks / required_field_checks, 4) if required_field_checks else 0.0,
+        "field_checks": required_field_checks, "present_field_checks": present_field_checks,
+        "complete_check_coverage": round(complete / checks, 4) if checks else 0.0,
         "status": "complete" if checks and complete == checks else "partial" if complete else "missing",
         "details": details,
     }
+
+
+def financial_research_periods_completeness(periods: list[str]) -> dict[str, dict[str, Any]]:
+    """Audit multiple report periods in one raw-data pass."""
+    targets = list(dict.fromkeys(str(period or "").strip() for period in periods if str(period or "").strip()))
+    if not targets:
+        return {}
+    apis = tuple(FINANCIAL_RESEARCH_REQUIRED_FIELDS)
+    with _conn() as c:
+        masters = [dict(row) for row in c.execute(
+            "SELECT ts_code,industry,list_date FROM dc_stock_master WHERE ts_code<>''"
+        ).fetchall()]
+        api_placeholders = ",".join("?" for _ in apis)
+        period_placeholders = ",".join("?" for _ in targets)
+        rows = c.execute(
+            f"""SELECT period,api_name,ts_code,payload_json FROM dc_tushare_raw_records
+                WHERE period IN ({period_placeholders}) AND api_name IN ({api_placeholders}) AND ts_code<>''""",
+            (*targets, *apis),
+        ).fetchall()
+        attempted_by_period: dict[str, set[str]] = {target: set() for target in targets}
+        for row in c.execute(
+            f"""SELECT DISTINCT period,api_name FROM dc_tushare_request_coverage
+                WHERE period IN ({period_placeholders}) AND params_json LIKE '%%research_fields_v2%%'
+                  AND result_status='success'""",
+            tuple(targets),
+        ).fetchall():
+            item = dict(row)
+            attempted_by_period.setdefault(str(item.get("period") or ""), set()).add(str(item.get("api_name") or ""))
+    present: dict[tuple[str, str, str], set[str]] = {}
+    for raw in rows:
+        item = dict(raw)
+        try:
+            payload = json.loads(item.get("payload_json") or "{}")
+        except (TypeError, json.JSONDecodeError):
+            payload = {}
+        fields = {str(key) for key, value in payload.items() if value is not None}
+        fields.update(str(value) for value in payload.get("_returned_fields") or [])
+        present.setdefault((str(item.get("period") or ""), str(item.get("ts_code") or ""), str(item.get("api_name") or "")), set()).update(fields)
+    results: dict[str, dict[str, Any]] = {}
+    for target in targets:
+        missing_by_api = {api: 0 for api in apis}
+        incomplete_symbols: set[str] = set()
+        complete_checks = checks = applicable = 0
+        for master in masters:
+            listed = str(master.get("list_date") or "")
+            if listed and listed.isdigit() and listed > target:
+                continue
+            applicable += 1
+            industry = str(master.get("industry") or "")
+            contract = FINANCIAL_SECTOR_RESEARCH_REQUIRED_FIELDS if any(label in industry for label in ("银行", "保险", "证券", "多元金融")) else FINANCIAL_RESEARCH_REQUIRED_FIELDS
+            code = str(master.get("ts_code") or "")
+            for api_name, required in contract.items():
+                checks += 1
+                available = present.get((target, code, api_name), set())
+                complete = all(field in available for field in required)
+                if contract is FINANCIAL_RESEARCH_REQUIRED_FIELDS and api_name == "balancesheet":
+                    complete = complete and bool(available.intersection({"accounts_receiv", "inventories", "goodwill"}))
+                if contract is FINANCIAL_RESEARCH_REQUIRED_FIELDS and api_name == "cashflow":
+                    complete = complete and bool(available.intersection({"free_cashflow", "c_pay_acq_const_fiolta"}))
+                if complete:
+                    complete_checks += 1
+                else:
+                    missing_by_api[api_name] += 1
+                    incomplete_symbols.add(code)
+        attempted_apis = attempted_by_period.get(target, set())
+        results[target] = {"ok": True, "period": target, "applicable_stocks": applicable, "checks": checks,
+                           "complete_checks": complete_checks, "coverage": round(complete_checks / checks, 6) if checks else 0.0,
+                           "status": "complete" if checks and complete_checks == checks else "partial" if complete_checks else "missing",
+                           "missing_by_api": missing_by_api, "batch_attempted": all(api in attempted_apis for api in apis),
+                           "attempted_apis": sorted(attempted_apis), "incomplete_symbols": sorted(incomplete_symbols)}
+    return results
+
+
+def financial_research_period_completeness(period: str) -> dict[str, Any]:
+    """Audit field contracts for every stock applicable to one report period."""
+    target = str(period or "").strip()
+    return financial_research_periods_completeness([target]).get(target, {})
 
 
 def enrich_financial_research_fields(
@@ -1848,19 +1946,24 @@ def enrich_financial_research_batch(period: str, *, limit: int = 5) -> dict[str,
     target_period = str(period or "").strip()
     if len(target_period) != 8 or not target_period.isdigit():
         raise ValueError("period must be YYYYMMDD")
-    with _conn() as c:
-        codes = [str(dict(row).get("ts_code") or "") for row in c.execute(
-            "SELECT ts_code FROM dc_stock_master WHERE ts_code<>'' ORDER BY ts_code"
-        ).fetchall()]
-    targets: list[str] = []
-    checked = 0
-    for code in codes:
-        checked += 1
-        state = financial_research_completeness(code, periods=[target_period])
-        if state["status"] != "complete":
-            targets.append(code)
-        if len(targets) >= max(1, min(int(limit), 50)):
-            break
+    period_state = financial_research_period_completeness(target_period)
+    all_targets = list(period_state.get("incomplete_symbols") or [])
+    # Preserve the full-market completion goal while repairing the highest
+    # value private data first: holdings, then candidate/core pools, then the
+    # remaining market. API availability may disappear before the long tail.
+    try:
+        from app.db.store import get_positions
+        from app.services.decision_store import list_pool_members
+        held_bases = {str(item.get("symbol") or "").split(".")[0] for item in get_positions()}
+        pool_codes = {
+            str(item.get("ts_code") or "")
+            for item in list_pool_members("candidate") + list_pool_members("core")
+        }
+    except Exception:
+        held_bases, pool_codes = set(), set()
+    all_targets.sort(key=lambda code: (0 if code.split(".")[0] in held_bases else 1 if code in pool_codes else 2, code))
+    targets = all_targets[:max(1, min(int(limit), 100))]
+    checked = int(period_state.get("applicable_stocks") or 0)
 
     def enrich(code: str) -> dict[str, Any]:
         try:
@@ -1878,7 +1981,7 @@ def enrich_financial_research_batch(period: str, *, limit: int = 5) -> dict[str,
     }
 
 
-def sync_financial_vip_period(period: str) -> dict[str, Any]:
+def sync_financial_vip_period(period: str, *, contract_mode: str = "core") -> dict[str, Any]:
     """Load a whole report period through TuShare's 5000-point VIP APIs.
 
     The normal statement endpoints are explicitly single-stock only.  VIP
@@ -1906,6 +2009,8 @@ def sync_financial_vip_period(period: str) -> dict[str, Any]:
             finish_ingestion_run(run_id, status="completed", rows_read=len(frame), rows_written=written,
                                  meta={"api": vip_api, "period": period, "mode": "vip_batch"})
             _record_probe(vip_api, "ok", len(frame))
+            if contract_mode == "research_fields_v2":
+                _record_request_coverage(api, {"period": period, "mode": contract_mode}, None, len(frame))
             _invalidate_asset_views()
             results.append({"api": api, "vip_api": vip_api, "ok": True, "rows": len(frame), "written": written})
         except Exception as exc:  # noqa: BLE001
@@ -1914,7 +2019,7 @@ def sync_financial_vip_period(period: str) -> dict[str, Any]:
             _record_probe(vip_api, "failed", 0, str(exc))
             results.append({"api": api, "vip_api": vip_api, "ok": False, "rows": 0, "error": str(exc)[:300]})
     succeeded = sum(1 for item in results if item.get("ok"))
-    return {"ok": succeeded > 0, "period": period, "mode": "vip_batch", "results": results,
+    return {"ok": succeeded == len(results), "period": period, "mode": "vip_batch", "contract_mode": contract_mode, "results": results,
             "succeeded": succeeded, "total": len(results)}
 
 

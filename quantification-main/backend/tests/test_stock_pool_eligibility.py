@@ -75,7 +75,7 @@ def test_core_pool_blocks_row_complete_but_field_incomplete_financials(monkeypat
     assert result["eligible_for_core"] is False
 
 
-def test_watch_pool_workflow_promotes_only_eligible_candidates(monkeypatch):
+def test_candidate_workflow_promotes_only_eligible_candidates(monkeypatch):
     transitions = []
     monkeypatch.setattr(research_workflow, "list_pool_members", lambda _pool: [{"ts_code": "000001.SZ"}, {"ts_code": "000002.SZ"}])
     monkeypatch.setattr(research_workflow, "generate_thesis_for_stock", lambda code: {"ok": True, "ts_code": code})
@@ -90,6 +90,6 @@ def test_watch_pool_workflow_promotes_only_eligible_candidates(monkeypatch):
     assert result["candidates"] == 2
     assert [item["ts_code"] for item in result["promoted"]] == ["000001.SZ"]
     assert [item["ts_code"] for item in result["blocked"]] == ["000002.SZ"]
-    assert transitions[0]["from_pool"] == "watch"
+    assert transitions[0]["from_pool"] == "candidate"
     assert transitions[0]["to_pool"] == "core"
-    assert "automatic_research_workflow_v1" in transitions[0]["reason"]
+    assert "automatic_research_workflow_v2" in transitions[0]["reason"]
