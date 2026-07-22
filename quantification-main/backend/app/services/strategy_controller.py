@@ -288,7 +288,7 @@ def build_strategy_action_contracts(
     return {
         "schema_version": STRATEGY_CONTROLLER_VERSION,
         "strategy_policy": {"schema_version": policy.get("schema_version"), "version": ctx.get("strategy_policy_version") or "production_or_default"},
-        "generated_at": datetime.utcnow().isoformat(),
+        "generated_at": datetime.now().isoformat(),
         "action_counts": action_counts,
         "contracts": [asdict(item) for item in contracts],
         "blocked": blocked,
@@ -466,7 +466,7 @@ def ensure_default_strategy_policy_version() -> dict[str, Any]:
     active = get_active_model_version(STRATEGY_MODEL_KEY)
     if active:
         return active
-    version = f"strategy_controller_default-{datetime.utcnow().strftime('%Y%m%d%H%M%S%f')}"
+    version = f"strategy_controller_default-{datetime.now().strftime('%Y%m%d%H%M%S%f')}"
     version_id = create_model_version(
         model_key=STRATEGY_MODEL_KEY,
         version=version,
@@ -492,7 +492,7 @@ def strategy_controller_status() -> dict[str, Any]:
         "policy": active_strategy_policy(),
         "versions": visible_versions,
         "version_count": len(versions),
-        "generated_at": datetime.utcnow().isoformat(),
+        "generated_at": datetime.now().isoformat(),
     }
 
 
@@ -513,7 +513,7 @@ def _recent_strategy_patches(limit: int = 50) -> set[str]:
 def create_strategy_policy_candidate(policy_patch: dict[str, Any], *, comment: str = "") -> dict[str, Any]:
     base = active_strategy_policy()
     policy = _deep_merge(base, policy_patch or {})
-    version = f"strategy_controller_candidate-{datetime.utcnow().strftime('%Y%m%d%H%M%S%f')}"
+    version = f"strategy_controller_candidate-{datetime.now().strftime('%Y%m%d%H%M%S%f')}"
     validation = {
         "status": "candidate",
         "production_eligible": False,
@@ -598,7 +598,7 @@ def run_strategy_policy_auto_optimization(*, force: bool = False) -> dict[str, A
         "created": created,
         "skipped": skipped,
         "note": "只生成候选并自动评估；弱于生产、样本不足或越界会自动拦截，不自动上线。",
-        "generated_at": datetime.utcnow().isoformat(),
+        "generated_at": datetime.now().isoformat(),
     }
 
 
@@ -621,7 +621,7 @@ def rollback_strategy_policy_version(version_id: int, *, reviewer: str = "operat
         "status": "rollback_activated",
         "reviewer": reviewer,
         "comment": comment,
-        "reviewed_at": datetime.utcnow().isoformat(),
+        "reviewed_at": datetime.now().isoformat(),
     }
     validation["production_eligible"] = True
     validation["status"] = "passed"
@@ -767,14 +767,14 @@ def evaluate_strategy_policy_version(version_id: int) -> dict[str, Any]:
         "blocked_reasons": sorted(set(blocked)),
         "bounds": bounds,
         "method": "strategy_policy_cost_after_decision_outcome_proxy_v1",
-        "review": {"status": "pending" if status == "passed" else "waiting_for_data" if status == "blocked_by_data" else "auto_rejected", "reviewed_at": datetime.utcnow().isoformat()},
+        "review": {"status": "pending" if status == "passed" else "waiting_for_data" if status == "blocked_by_data" else "auto_rejected", "reviewed_at": datetime.now().isoformat()},
     }
     update_model_version_validation(int(version_id), validation=validation)
     update_model_version_status(int(version_id), status="candidate" if status in {"passed", "blocked_by_data"} else "rejected", is_active=False)
     with business_conn() as c:
         c.execute(
             "UPDATE model_versions SET metrics_json = ?, updated_at = ? WHERE id = ?",
-            (json.dumps(metrics, ensure_ascii=False), datetime.utcnow().isoformat(), int(version_id)),
+            (json.dumps(metrics, ensure_ascii=False), datetime.now().isoformat(), int(version_id)),
         )
     return {"ok": True, "version_id": int(version_id), "status": status, "metrics": metrics, "validation": validation}
 
@@ -898,7 +898,7 @@ def strategy_policy_replay_preview(
             "why": "这是基于已冻结决策快照的回放预览，用于发现候选方向；完整逐日重建与影子观察需要时间序列积累。",
         },
         "actions": actions[-max(1, min(int(limit or 120), 200)):],
-        "generated_at": datetime.utcnow().isoformat(),
+        "generated_at": datetime.now().isoformat(),
     }
 
 
@@ -914,7 +914,7 @@ def review_strategy_policy_version(version_id: int, *, decision: str, reviewer: 
             return {"ok": False, "error": "strategy_policy_validation_failed", "evaluation": evaluation}
         version = get_model_version(int(version_id)) or version
     validation = dict(version.get("validation") or {})
-    validation["review"] = {"status": decision, "reviewer": reviewer, "comment": comment, "reviewed_at": datetime.utcnow().isoformat()}
+    validation["review"] = {"status": decision, "reviewer": reviewer, "comment": comment, "reviewed_at": datetime.now().isoformat()}
     validation["production_eligible"] = decision == "approved"
     validation["blocked_reasons"] = [] if decision == "approved" else ["operator_rejected"]
     validation["status"] = "passed" if decision == "approved" else "rejected"

@@ -14,7 +14,7 @@ from app.services.model_governance_scheduler import (
     mark_bootstrap_promotion,
     request_model_training,
 )
-from app.services.quant_risk import bocpd_change_probability, constrained_cvar_weights, garch11_forecast, historical_cvar, hrp_fallback_weights, hsmm_regime, kalman_level, ledoit_wolf_covariance
+from app.services.quant_risk import bocpd_change_probability, garch11_forecast, historical_cvar, hsmm_regime, kalman_level, ledoit_wolf_covariance
 from app.services.training_protocol import training_protocol_contract, validate_feature_frame_contract, validate_training_run_manifest
 from app.services.model_evidence_contract import evidence_binding_registry, model_output_contracts, normalize_model_output
 from app.services.two_group_optimizer import two_group_cvar_optimizer
@@ -475,7 +475,7 @@ def model_strategy_review_hsmm_shadow(model_version_id: int, req: HsmmReviewRequ
         "status": req.decision,
         "reviewer": req.reviewer.strip(),
         "comment": req.comment.strip(),
-        "reviewed_at": datetime.utcnow().isoformat(timespec="seconds"),
+        "reviewed_at": datetime.now().isoformat(timespec="seconds"),
     }
     validation["review"] = review_payload
     validation["production_eligible"] = req.decision == "approved"
@@ -513,17 +513,16 @@ def model_strategy_portfolio_risk(req: PortfolioRiskRequest) -> dict:
         crowding=req.crowding,
     )
     covariance = ledoit_wolf_covariance(observations)
-    weights = constrained_cvar_weights(observations, max_single=req.max_single)
-    optimizer = "ledoit_wolf_shrinkage_plus_constrained_cvar_v1"
-    if not weights:
-        weights = hrp_fallback_weights(observations, max_single=req.max_single)
-        optimizer = "hrp_inverse_volatility_fallback_v1"
+    weights = optimizer_result.get("weights") or {}
+    optimizer = str(optimizer_result.get("optimizer") or "unavailable")
     return {
         "optimizer": optimizer,
         "weights": weights,
         "covariance": covariance,
         "weight_sum": round(sum(weights.values()), 8),
+        "portfolio_optimizer": optimizer_result,
         "two_group_optimizer": optimizer_result,
+        "deprecated_inputs": {"max_single": "策略桶固定上限已取消；账户与订单安全约束由执行层处理"},
     }
 
 

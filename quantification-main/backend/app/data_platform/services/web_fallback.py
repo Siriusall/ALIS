@@ -25,7 +25,7 @@ _active_crawl: dict[str, Any] = {}
 
 
 def _now() -> str:
-    return datetime.utcnow().isoformat(timespec="seconds")
+    return datetime.now().isoformat(timespec="seconds")
 
 
 def _ts_code(symbol: str, market: str = "") -> str:

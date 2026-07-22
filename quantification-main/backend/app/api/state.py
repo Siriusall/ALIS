@@ -14,7 +14,7 @@ _logs: List[LogEntryResponse] = []
 
 def add_log(level: str, message: str) -> None:
     entry = LogEntryResponse(
-        timestamp=datetime.utcnow().isoformat(),
+        timestamp=datetime.now().isoformat(),
         level=level,
         message=message,
     )
@@ -66,7 +66,7 @@ _quant_records: list[QuantRunRecord] = []
 
 
 def _now_iso() -> str:
-    return datetime.utcnow().isoformat()
+    return datetime.now().isoformat()
 
 
 def get_quant_run_state() -> QuantRunState:

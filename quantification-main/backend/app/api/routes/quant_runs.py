@@ -194,7 +194,7 @@ def _compute_drawdown(equity: list[float]) -> list[float]:
 
 
 def _utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now().astimezone().isoformat()
 
 
 def _default_task_risk_config() -> dict:
@@ -772,7 +772,7 @@ def quant_run_ledger_summary() -> dict:
     baseline = float(get_account_baseline() or 0)
     positions = get_positions()
     latest_trade_dates = list_consolidated_trade_dates()
-    latest_date = latest_trade_dates[-1] if latest_trade_dates else datetime.now(timezone.utc).date().isoformat()
+    latest_date = latest_trade_dates[-1] if latest_trade_dates else datetime.now().astimezone().date().isoformat()
     ds = BacktestDataSource()
     market_value = 0.0
     for p in positions:

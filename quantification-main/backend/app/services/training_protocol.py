@@ -126,7 +126,7 @@ def training_protocol_contract(model_key: str | None = None) -> dict[str, Any]:
     return {
         **TRAINING_PROTOCOL_V1,
         "model_key": model_key,
-        "generated_at": datetime.utcnow().isoformat(timespec="seconds"),
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
     }
 
 

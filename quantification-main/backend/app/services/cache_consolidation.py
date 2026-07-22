@@ -28,7 +28,7 @@ MAX_SYMBOL_ROWS_PER_REQUEST = 50000
 # all-in-one 合并实现版本（人工维护，便于线上快速识别是否为新逻辑产物）
 MERGE_IMPL_VERSION = "2026-03-04.1"
 
-# 参与覆盖率统计的因子键（与 FACTOR_LIST / 合并行字段一致）
+# 参与覆盖率统计的因子键（与 AGENTS.md 因子合同及合并行字段一致）
 FACTOR_KEYS_FOR_COVERAGE = (
     "volume", "turnover", "change_pct", "momentum_5", "momentum_20", "volatility_20", "volume_ratio_5",
     "float_mv", "total_mv", "pe_ttm", "pb",

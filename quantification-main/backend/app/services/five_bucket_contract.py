@@ -103,7 +103,7 @@ def build_target_weight_contract(
         "evidence_bindings": evidence_bindings,
         "requires_model_upgrade": evidence_quality != "model_backed",
         "evidence": payload,
-        "created_at": datetime.utcnow().isoformat(timespec="seconds"),
+        "created_at": datetime.now().isoformat(timespec="seconds"),
     }
 
 

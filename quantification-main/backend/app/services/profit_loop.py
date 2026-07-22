@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import json
 import hashlib
-from datetime import datetime
+import os
+from datetime import datetime, time as dtime
 from statistics import mean
 from typing import Any
 
@@ -19,7 +20,7 @@ from app.services.two_group_optimizer import two_group_cvar_optimizer
 
 
 def _now() -> str:
-    return datetime.utcnow().isoformat(timespec="seconds")
+    return datetime.now().isoformat(timespec="seconds")
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -72,6 +73,44 @@ def _ensure_tables() -> None:
             UNIQUE(trade_date,input_hash)
         )""")
         c.execute("ALTER TABLE daily_rebalance_plans ADD COLUMN IF NOT EXISTS planned_execute_date VARCHAR(16) NOT NULL DEFAULT ''")
+        c.execute("ALTER TABLE daily_rebalance_plans ADD COLUMN IF NOT EXISTS planned_execute_at VARCHAR(40) NOT NULL DEFAULT ''")
+
+
+def _fallback_execution_clock() -> dtime:
+    hour = max(0, min(int(os.getenv("QUANT_AUTO_SIMULATION_CLOSE_HOUR", "16")), 23))
+    minute = max(0, min(int(os.getenv("QUANT_AUTO_SIMULATION_CLOSE_MINUTE", "5")), 59))
+    return dtime(hour, minute)
+
+
+def remembered_first_rebalance_clock() -> dtime | None:
+    """Return the first formal rebalance's actual local clock, if recorded."""
+    try:
+        with business_conn() as c:
+            row = c.execute(
+                """SELECT executed_at FROM daily_rebalance_plans
+                   WHERE status='executed' AND COALESCE(executed_at,'')<>''
+                   ORDER BY executed_at ASC,id ASC LIMIT 1"""
+            ).fetchone()
+        value = str(dict(row).get("executed_at") or "") if row else ""
+        parsed = datetime.fromisoformat(value)
+        return dtime(parsed.hour, parsed.minute)
+    except Exception:
+        # Startup and schema bootstrap must keep the configured 16:05 fallback
+        # even when the plan table is not available yet.
+        return None
+
+
+def effective_rebalance_clock() -> dtime:
+    """Use 16:05 bootstrap time until the first formal execution fixes the clock."""
+    return remembered_first_rebalance_clock() or _fallback_execution_clock()
+
+
+def _planned_execute_at(execute_date: str) -> str:
+    clock = effective_rebalance_clock()
+    date_value = str(execute_date or "")[:10]
+    if len(date_value) == 8 and date_value.isdigit():
+        date_value = f"{date_value[:4]}-{date_value[4:6]}-{date_value[6:8]}"
+    return f"{date_value}T{clock.hour:02d}:{clock.minute:02d}:00+08:00" if date_value else ""
 
 
 def _latest_report(period_type: str = "daily") -> dict[str, Any]:
@@ -233,11 +272,18 @@ def build_portfolio_reoptimization() -> dict[str, Any]:
     candidate_members = list_pool_members("candidate")
     watch_members = list_pool_members("watch")
     core_symbols = [str(item.get("ts_code") or "").split(".")[0] for item in core_members if str(item.get("status") or "active") == "active"]
+    candidate_symbols = [
+        str(item.get("ts_code") or "").split(".")[0]
+        for item in candidate_members[:20]
+        if str(item.get("status") or "active") == "active"
+    ]
     core_member_by_symbol = {
         str(item.get("ts_code") or "").split(".")[0]: item
         for item in core_members if str(item.get("status") or "active") == "active"
     }
-    symbols = list(dict.fromkeys(holding_symbols + core_symbols))
+    # Optimisation needs a real choice set.  Recently researched candidates
+    # may compete for weight, while execution safety remains downstream.
+    symbols = list(dict.fromkeys(holding_symbols + core_symbols + candidate_symbols))
     missing_names = [symbol for symbol in symbols if not names.get(symbol)]
     if missing_names:
         with data_conn() as c:
@@ -260,14 +306,6 @@ def build_portfolio_reoptimization() -> dict[str, Any]:
     exposures = {str(item.get("symbol") or ""): item for item in (risk.get("exposures") or [])}
     position_map = {str(item.get("symbol") or ""): item for item in positions}
     trading_costs = {symbol: 0.0015 for symbol in symbols}
-    optimizer = two_group_cvar_optimizer(
-        returns,
-        expected_returns=expected,
-        buckets=buckets,
-        current_weights=current_weights,
-        trading_costs=trading_costs,
-        crowding={symbol: 0.0 for symbol in symbols},
-    )
     try:
         context = live_market_context()
     except Exception:
@@ -278,7 +316,6 @@ def build_portfolio_reoptimization() -> dict[str, Any]:
     risk_status = str(risk.get("status") or "unknown")
     portfolio_budget = 0.0 if risk_status == "blocked" else 0.75 if risk_status == "warning" else 1.0 if risk_status == "ready" else 0.5
     equity_budget = round(market_budget * profile_budget * portfolio_budget, 6)
-    raw_weights = optimizer.get("weights") or {}
     equity_candidates = [symbol for symbol in symbols if symbol not in {"510880", "511010", "511880", "512890", "518880"}]
     industry_allocation = build_industry_allocation(
         symbols=equity_candidates,
@@ -289,11 +326,23 @@ def build_portfolio_reoptimization() -> dict[str, Any]:
     admitted_industries = set((industry_allocation.get("industry_targets") or {}).keys())
     symbol_industries = industry_allocation.get("symbol_industries") or {}
     candidate_blocks = []
-    for symbol in core_symbols:
+    for symbol in list(dict.fromkeys(core_symbols + candidate_symbols)):
         industry = str(symbol_industries.get(symbol) or "未分类")
         if industry not in admitted_industries:
-            raw_weights[symbol] = 0.0
-            candidate_blocks.append({"symbol": symbol, "name": names.get(symbol, ""), "industry": industry, "code": "industry_budget_gate_failed", "reason": "所属行业未获得当日风险预算"})
+            candidate_blocks.append({"symbol": symbol, "name": names.get(symbol, ""), "industry": industry, "code": "industry_soft_penalty", "reason": "所属行业未获得优先预算，已施加软惩罚但未禁止入选"})
+    industry_penalty = {
+        symbol: (0.002 if symbol in equity_candidates and str(symbol_industries.get(symbol) or "未分类") not in admitted_industries else 0.0)
+        for symbol in symbols
+    }
+    optimizer = two_group_cvar_optimizer(
+        returns,
+        expected_returns=expected,
+        buckets=buckets,
+        current_weights=current_weights,
+        trading_costs=trading_costs,
+        crowding=industry_penalty,
+    )
+    raw_weights = dict(optimizer.get("weights") or {})
     scaled_weights = {symbol: round(_safe_float(weight) * equity_budget, 8) for symbol, weight in raw_weights.items()}
     block_by_symbol = {str(item.get("symbol") or ""): item for item in candidate_blocks}
     # A negative trend estimate may justify holding a diversifier, but never an automatic increase.
@@ -308,6 +357,26 @@ def build_portfolio_reoptimization() -> dict[str, Any]:
         pnl_pct = live_price / cost - 1.0 if cost > 0 else 0.0
         if pnl_pct <= -0.06 and _safe_float(expected.get(symbol)) <= -0.05:
             scaled_weights[symbol] = 0.0
+    error_breaches = [item for item in risk.get("breaches") or [] if str(item.get("severity") or "") == "error"]
+    preliminary_improvement = sum(
+        (_safe_float(scaled_weights.get(symbol)) - _safe_float(current_weights.get(symbol))) * _safe_float(expected.get(symbol))
+        for symbol in set(current_weights) | set(scaled_weights)
+    )
+    preliminary_cost = sum(
+        abs(_safe_float(scaled_weights.get(symbol)) - _safe_float(current_weights.get(symbol))) * _safe_float(trading_costs.get(symbol))
+        for symbol in set(current_weights) | set(scaled_weights)
+    )
+    if not error_breaches and preliminary_improvement <= preliminary_cost:
+        scaled_weights = {symbol: round(weight, 8) for symbol, weight in current_weights.items()}
+        optimizer["status"] = "hold_current_cost_gate"
+        optimizer["cost_gate"] = {
+            "triggered": True,
+            "expected_improvement": round(preliminary_improvement, 8),
+            "estimated_one_way_cost": round(preliminary_cost, 8),
+            "reason": "目标组合的预期改善不能覆盖交易成本，保持当前持仓",
+        }
+    else:
+        optimizer["cost_gate"] = {"triggered": False}
     optimizer["unscaled_weights"] = raw_weights
     optimizer["weights"] = scaled_weights
     optimizer["equity_budget"] = equity_budget
@@ -330,7 +399,7 @@ def build_portfolio_reoptimization() -> dict[str, Any]:
         live_price = market_value / quantity if quantity > 0 and market_value > 0 else cost_basis
         pnl_pct = live_price / cost_basis - 1.0 if cost_basis > 0 else 0.0
         full_exit = current_weight > 0.002 and target_weight <= 0.002
-        new_candidate = current_weight <= 0.002 and symbol in core_symbols
+        new_candidate = current_weight <= 0.002 and symbol in set(core_symbols + candidate_symbols)
         proposal.append({
             "symbol": symbol,
             "name": names.get(symbol, ""),
@@ -354,23 +423,31 @@ def build_portfolio_reoptimization() -> dict[str, Any]:
                 else "目标组合提高该资产配置" if delta > 0.002
                 else "风险预算或组合相关性要求降低配置" if delta < -0.002
                 else "权重偏差不足以覆盖调仓成本",
-            "candidate_source": "core_pool" if symbol in core_symbols and symbol not in holding_symbols else "holding",
+            "candidate_source": "core_pool" if symbol in core_symbols and symbol not in holding_symbols else "candidate_pool" if symbol in candidate_symbols and symbol not in holding_symbols else "holding",
             "candidate_lineage": ({
                 "entry_pool": "core",
                 "entered_at": str((core_member_by_symbol.get(symbol) or {}).get("entered_at") or ""),
                 "source_reason": str((core_member_by_symbol.get(symbol) or {}).get("reason") or ""),
                 "path": ["全市场", "基础过滤", "候选池", "财务研究", "行业预算", "核心池", "组合优化"],
-            } if symbol in core_symbols and symbol not in holding_symbols else None),
+            } if symbol in core_symbols and symbol not in holding_symbols else ({
+                "entry_pool": "candidate",
+                "entered_at": "",
+                "source_reason": "active_candidate_pool",
+                "path": ["全市场", "基础过滤", "候选池", "组合优化"],
+            } if symbol in candidate_symbols and symbol not in holding_symbols else None)),
         })
     current_expected = sum(_safe_float(item["expected_return_contribution_before"]) for item in proposal)
     target_expected = sum(_safe_float(item["expected_return_contribution_after"]) for item in proposal)
     estimated_cost = sum(_safe_float(item["estimated_one_way_cost"]) for item in proposal)
     turnover = sum(abs(_safe_float(item["weight_change"])) for item in proposal)
     expected_improvement = target_expected - current_expected
-    error_breaches = [item for item in risk.get("breaches") or [] if str(item.get("severity") or "") == "error"]
     execution_checks = [
         {"key": "market_data", "label": "收盘数据已锁定", "status": "pass" if _latest_trade_date() else "block", "detail": _latest_trade_date() or "缺少完整收盘日"},
-        {"key": "optimizer", "label": "组合优化已完成", "status": "pass" if optimizer.get("ok") else "block", "detail": "目标权重已生成" if optimizer.get("ok") else "优化器没有有效解"},
+        {"key": "optimizer", "label": "组合优化已完成", "status": "pass" if optimizer.get("ok") else "block", "detail": (
+            "目标组合改善不足以覆盖成本，保持当前持仓" if (optimizer.get("cost_gate") or {}).get("triggered")
+            else f"已生成目标权重（{optimizer.get('status') or 'optimal'}）" if optimizer.get("ok")
+            else "；".join(optimizer.get("blocked_reasons") or ["优化器没有有效解"])
+        )},
         {"key": "risk_gate", "label": "风险门控", "status": "block" if error_breaches else "warn" if risk.get("breaches") else "pass", "detail": f"{len(error_breaches)} 项阻断，{len(risk.get('breaches') or []) - len(error_breaches)} 项提醒"},
         {"key": "cost_benefit", "label": "收益改善覆盖成本", "status": "pass" if expected_improvement > estimated_cost else "warn", "detail": f"预期改善 {expected_improvement:.2%}，单边成本 {estimated_cost:.2%}"},
     ]
@@ -394,10 +471,11 @@ def build_portfolio_reoptimization() -> dict[str, Any]:
             "watch_count": len(watch_members),
             "candidate_count": len(candidate_members),
             "core_count": len(core_symbols),
+            "optimization_count": len(returns),
             "new_core_symbols": [symbol for symbol in core_symbols if symbol not in holding_symbols],
             "industry_allocation": industry_allocation,
             "blocked_candidates": candidate_blocks,
-            "admission_policy": "观察池初筛，候选池补研究与估值，核心池通过行业预算后才允许新购入",
+            "admission_policy": "当前持仓、核心池及最近20只有效候选共同优化；行业偏好作为软惩罚，账户与交易安全由执行层硬门控",
         },
         "risk_budget": {
             "status": risk.get("status"),
@@ -554,6 +632,7 @@ def materialize_daily_rebalance_plan(portfolio: dict[str, Any] | None = None) ->
             "SELECT MIN(cal_date) value FROM dc_trade_calendar WHERE is_open=1 AND cal_date>?", (trade_date,)
         ).fetchone() if trade_date else None
     planned_execute_date = str(dict(next_row or {}).get("value") or "")
+    planned_execute_at = _planned_execute_at(planned_execute_date)
     portfolio = portfolio or build_portfolio_reoptimization()
     proposal = portfolio.get("rebalance_proposal") or []
     contract = {
@@ -579,9 +658,9 @@ def materialize_daily_rebalance_plan(portfolio: dict[str, Any] | None = None) ->
             if version > 1:
                 c.execute("UPDATE daily_rebalance_plans SET status='superseded' WHERE trade_date=? AND status='planned'", (trade_date,))
             c.execute("""INSERT INTO daily_rebalance_plans
-                (trade_date,planned_execute_date,version,input_hash,status,proposal_json,generated_at)
-                VALUES(?,?,?,?,'planned',?,?)""",
-                (trade_date, planned_execute_date, version, input_hash, canonical, _now()))
+                (trade_date,planned_execute_date,planned_execute_at,version,input_hash,status,proposal_json,generated_at)
+                VALUES(?,?,?,?,?,'planned',?,?)""",
+                (trade_date, planned_execute_date, planned_execute_at, version, input_hash, canonical, _now()))
             row = dict(c.execute(
                 "SELECT * FROM daily_rebalance_plans WHERE trade_date=? AND version=?", (trade_date, version)
             ).fetchone())
@@ -590,6 +669,7 @@ def materialize_daily_rebalance_plan(portfolio: dict[str, Any] | None = None) ->
         "trade_date": trade_date,
         "data_as_of_date": trade_date,
         "planned_execute_date": str(row.get("planned_execute_date") or planned_execute_date),
+        "planned_execute_at": str(row.get("planned_execute_at") or planned_execute_at),
         "valid_until_date": str(row.get("planned_execute_date") or planned_execute_date),
         "version": int(row["version"]),
         "plan_version": f"{trade_date}-v{int(row['version'])}",
@@ -600,7 +680,10 @@ def materialize_daily_rebalance_plan(portfolio: dict[str, Any] | None = None) ->
         "executed_at": row.get("executed_at"),
         "input_hash": input_hash,
         "generation_policy": "以最近完整收盘数据生成；输入未变化则复用，变化才升版本",
-        "execution_policy": "每个交易日最多执行一次；打开页面只读取或补建方案，不触发交易",
+        "execution_policy": (
+            f"执行日{effective_rebalance_clock().strftime('%H:%M')}后检查；"
+            "首次正式调仓后沿用其实际执行时分；收盘数据完整时自动执行，每个交易日最多一次"
+        ),
     }
 
 
@@ -653,7 +736,7 @@ def get_daily_rebalance_execution_input(signal_date: str, execute_date: str) -> 
 def mark_daily_rebalance_plan_executed(signal_date: str, execute_date: str, execution_id: int | None) -> None:
     """Bind execution to the immutable plan built from the prior close signal."""
     signal = str(signal_date or "").replace("-", "")[:8]
-    executed_at = f"{str(execute_date or '')[:10]}T09:30:00"
+    executed_at = datetime.now().astimezone().isoformat(timespec="seconds")
     with business_conn() as c:
         c.execute("""UPDATE daily_rebalance_plans SET status='executed',execution_id=?,executed_at=?
             WHERE id=(SELECT id FROM daily_rebalance_plans

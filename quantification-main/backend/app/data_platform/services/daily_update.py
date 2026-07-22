@@ -25,7 +25,7 @@ _state: dict[str, Any] = {"running": False, "phase": "idle", "message": "等待�
 _scheduler_lock = threading.Lock()
 _scheduler_started = False
 _DAILY_UPDATE_ENABLED = str(os.getenv("ALIS_DAILY_UPDATE_ENABLED", "1")).strip().lower() in {"1", "true", "yes", "on"}
-_DAILY_UPDATE_INTERVAL_SEC = max(60, min(int(os.getenv("ALIS_DAILY_UPDATE_INTERVAL_SEC", "300")), 3600))
+_DAILY_UPDATE_INTERVAL_SEC = max(60, min(int(os.getenv("ALIS_DAILY_UPDATE_INTERVAL_SEC", "60")), 3600))
 _DAILY_UPDATE_START_TIME = dtime(
     max(0, min(int(os.getenv("ALIS_DAILY_UPDATE_HOUR", "16")), 23)),
     max(0, min(int(os.getenv("ALIS_DAILY_UPDATE_MINUTE", "5")), 59)),

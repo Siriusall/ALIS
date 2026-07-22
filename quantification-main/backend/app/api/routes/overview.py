@@ -25,7 +25,7 @@ def get_overview() -> OverviewResponse:
             total_candidates=len(scores),
             avg_confidence=avg_confidence,
             top_signal=top_signal,
-            last_run=datetime.utcnow().isoformat(),
+            last_run=datetime.now().isoformat(),
         )
     except Exception as e:
         add_log("ERROR", str(e))
@@ -33,5 +33,5 @@ def get_overview() -> OverviewResponse:
             total_candidates=0,
             avg_confidence=0.0,
             top_signal="",
-            last_run=datetime.utcnow().isoformat(),
+            last_run=datetime.now().isoformat(),
         )

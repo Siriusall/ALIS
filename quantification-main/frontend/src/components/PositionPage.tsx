@@ -10,7 +10,7 @@ import {
   Legend,
 } from "recharts";
 import type { Position, Operation } from "../types";
-import { formatGmt8Time } from "../utils/time";
+import { formatGmt8Time, toGmt8ISOString } from "../utils/time";
 import type { SectionId } from "./Layout";
 import LoadingState from "./LoadingState";
 import {
@@ -213,7 +213,7 @@ export default function PositionPage({ onNavigate }: PositionPageProps) {
           </button>
         </div>
         <div className="text-muted" style={{ marginBottom: "0.75rem", fontSize: "14px" }}>
-          <span>当前时间：{formatTime(currentTime.toISOString())}</span>
+          <span>当前时间：{formatTime(toGmt8ISOString(currentTime))}</span>
           <span style={{ marginLeft: "1rem" }}>行情/数据源时间：{formatTime(dataSourceTime ?? undefined)}</span>
         </div>
         <div className="product-module-grid">

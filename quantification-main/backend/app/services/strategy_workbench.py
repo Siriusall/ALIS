@@ -111,7 +111,7 @@ def build_strategy_workbench(limit: int = 10, *, include_details: bool = False) 
     return {
         "ok": True,
         "schema_version": "strategy_workbench_v1",
-        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "generated_at": datetime.now().astimezone().isoformat(),
         "status": status,
         "current_analysis": {
             "mode": "post_close_t_plus_1_simulation",

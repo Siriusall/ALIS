@@ -1506,7 +1506,7 @@ def analyze_market_plan(
         "execute_date": execute_date,
         "execution_note": execution_note,
         "same_day_fallback": same_day_fallback,
-        "analyzed_at": datetime.now(timezone.utc).isoformat(),
+        "analyzed_at": datetime.now().astimezone().isoformat(),
         "strategy_id": sid,
         "exchange_group": exchange_group,
         "target_symbols": targets,

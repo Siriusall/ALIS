@@ -46,7 +46,7 @@ _DEFAULT_MIN_ACCOUNT_BALANCE = max(0.0, float(os.getenv("QUANT_MIN_ACCOUNT_BALAN
 _DEFAULT_MAX_CONSECUTIVE_LOSSES = max(0, min(int(os.getenv("QUANT_MAX_CONSECUTIVE_LOSSES", "3")), 30))
 _DEFAULT_ENABLE_DATA_HEALTH_GATE = str(os.getenv("QUANT_ENABLE_DATA_HEALTH_GATE", "1")).strip().lower() in {"1", "true", "yes", "on"}
 _AUTO_SIMULATION_ENABLED = str(os.getenv("QUANT_AUTO_SIMULATION", "1")).strip().lower() in {"1", "true", "yes", "on"}
-_AUTO_SIMULATION_INTERVAL_SEC = max(60, min(int(os.getenv("QUANT_AUTO_SIMULATION_INTERVAL_SEC", "300")), 3600))
+_AUTO_SIMULATION_INTERVAL_SEC = max(60, min(int(os.getenv("QUANT_AUTO_SIMULATION_INTERVAL_SEC", "60")), 3600))
 _AUTO_SIMULATION_CLOSE_TIME = dtime(
     max(0, min(int(os.getenv("QUANT_AUTO_SIMULATION_CLOSE_HOUR", "16")), 23)),
     max(0, min(int(os.getenv("QUANT_AUTO_SIMULATION_CLOSE_MINUTE", "5")), 59)),
@@ -145,7 +145,7 @@ def _refresh_research_cycle(task_id: int) -> None:
 
 
 def _utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now().astimezone().isoformat()
 
 
 def _is_running(task_id: int) -> bool:
@@ -235,7 +235,9 @@ def start_auto_simulation_scheduler() -> bool:
         while True:
             try:
                 now = datetime.now()
-                if now.weekday() < 5 and now.time() >= _AUTO_SIMULATION_CLOSE_TIME:
+                from app.services.profit_loop import effective_rebalance_clock
+                close_time = effective_rebalance_clock()
+                if now.weekday() < 5 and now.time() >= close_time:
                     target, data_ready = _ensure_close_data_ready()
                     if not data_ready:
                         # Do not execute against the latest *old* slice while
@@ -266,7 +268,11 @@ def start_auto_simulation_scheduler() -> bool:
             threading.Event().wait(_AUTO_SIMULATION_INTERVAL_SEC)
 
     threading.Thread(target=_loop, name="quant-auto-simulation", daemon=True).start()
-    logger.info("自动模拟调度已启动，%s 后每 %ss 检查日更与执行条件", _AUTO_SIMULATION_CLOSE_TIME.strftime("%H:%M"), _AUTO_SIMULATION_INTERVAL_SEC)
+    logger.info(
+        "自动模拟调度已启动；首次以 %s 检查，首次正式调仓后沿用实际执行时分；每 %ss 检查日更与执行条件",
+        _AUTO_SIMULATION_CLOSE_TIME.strftime("%H:%M"),
+        _AUTO_SIMULATION_INTERVAL_SEC,
+    )
     return True
 
 

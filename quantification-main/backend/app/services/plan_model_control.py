@@ -593,12 +593,12 @@ def _mark_stale_train_run(run: dict[str, Any] | None, *, stale_minutes: int = 20
     if not run or str(run.get("status") or "") not in {"running", "queued"}:
         return run
     updated_at = _parse_dt(run.get("updated_at") or run.get("created_at"))
-    if not updated_at or datetime.utcnow() - updated_at < timedelta(minutes=max(5, stale_minutes)):
+    if not updated_at or datetime.now() - updated_at < timedelta(minutes=max(5, stale_minutes)):
         return run
     metrics = dict(run.get("metrics") or {})
     timeline = list(metrics.get("timeline") or [])
     timeline.append({
-        "at": datetime.utcnow().isoformat(),
+        "at": datetime.now().isoformat(),
         "phase": "failed",
         "progress": 1.0,
         "message": "训练心跳超时：后端进程重启或训练线程中断，已标记为可重训",
@@ -612,7 +612,7 @@ def _mark_stale_train_run(run: dict[str, Any] | None, *, stale_minutes: int = 20
         message="训练心跳超时，已标记为可重训",
         metrics=metrics,
         error="stale_plan_model_training_run",
-        finished_at=datetime.utcnow().isoformat(),
+        finished_at=datetime.now().isoformat(),
     )
     refreshed = dict(run)
     refreshed.update({
@@ -622,7 +622,7 @@ def _mark_stale_train_run(run: dict[str, Any] | None, *, stale_minutes: int = 20
         "message": "训练心跳超时，已标记为可重训",
         "metrics": metrics,
         "error": "stale_plan_model_training_run",
-        "finished_at": datetime.utcnow().isoformat(),
+        "finished_at": datetime.now().isoformat(),
     })
     return refreshed
 
@@ -696,12 +696,12 @@ def model_family_status() -> dict[str, Any]:
 
 
 def _run_training_sync(model_key: str, run_id: int) -> dict[str, Any]:
-    started_at = datetime.utcnow().isoformat()
+    started_at = datetime.now().isoformat()
     contract = PLAN_MODELS[model_key]
     timeline: list[dict[str, Any]] = []
 
     def progress(phase: str, pct: float, message: str, metrics: dict[str, Any] | None = None) -> None:
-        now = datetime.utcnow().isoformat()
+        now = datetime.now().isoformat()
         timeline.append({"at": now, "phase": phase, "progress": pct, "message": message})
         previous = (get_model_train_run(run_id) or {}).get("metrics") or {}
         payload = {
@@ -769,10 +769,10 @@ def _run_training_sync(model_key: str, run_id: int) -> dict[str, Any]:
                     "duplicate_of_version_id": duplicate_id,
                     "timeline": [
                         *timeline[-19:],
-                        {"at": datetime.utcnow().isoformat(), "phase": "skipped_duplicate_dataset", "progress": 1.0, "message": f"数据指纹未变化，复用 {duplicate_name}，不生成新版本"},
+                        {"at": datetime.now().isoformat(), "phase": "skipped_duplicate_dataset", "progress": 1.0, "message": f"数据指纹未变化，复用 {duplicate_name}，不生成新版本"},
                     ],
                 },
-                finished_at=datetime.utcnow().isoformat(),
+                finished_at=datetime.now().isoformat(),
             )
             return {"ok": True, "run_id": run_id, "skipped": True, "reason": "duplicate_training_dataset", "duplicate_of_version_id": duplicate_id}
         progress("training", 0.55, f"训练真实LightGBM模型：训练 {dataset['train_rows']} 行，验证 {dataset['validation_rows']} 行", {"coverage": coverage, "train_rows": dataset["train_rows"], "validation_rows": dataset["validation_rows"]})
@@ -820,7 +820,7 @@ def _run_training_sync(model_key: str, run_id: int) -> dict[str, Any]:
             },
         }
         validation["training_protocol"] = protocol_validation
-        version = f"{model_key}-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
+        version = f"{model_key}-{datetime.now().strftime('%Y%m%d%H%M%S')}"
         root = models_root() / model_key / version
         root.mkdir(parents=True, exist_ok=True)
         model_path = root / "model.pkl"
@@ -845,7 +845,7 @@ def _run_training_sync(model_key: str, run_id: int) -> dict[str, Any]:
             "training_runtime_protocol": TRAINING_PROTOCOL,
             "coverage": coverage,
             "metrics": metrics,
-            "created_at": datetime.utcnow().isoformat(),
+            "created_at": datetime.now().isoformat(),
             "artifact_type": "plan_model_lightgbm_artifact",
             "training_dataset": {"horizon": dataset["horizon"], "rows": dataset["sample_rows"], "test_rows": dataset["test_rows"], **dataset["dates"]},
         }
@@ -874,10 +874,10 @@ def _run_training_sync(model_key: str, run_id: int) -> dict[str, Any]:
                 "coverage": coverage,
                 "timeline": [
                     *timeline[-19:],
-                    {"at": datetime.utcnow().isoformat(), "phase": "completed", "progress": 1.0, "message": "训练完成，候选版本已生成"},
+                    {"at": datetime.now().isoformat(), "phase": "completed", "progress": 1.0, "message": "训练完成，候选版本已生成"},
                 ],
             },
-            finished_at=datetime.utcnow().isoformat(),
+            finished_at=datetime.now().isoformat(),
         )
         return {"ok": True, "run_id": run_id, "model_version_id": model_version_id, "version": version}
     except Exception as exc:
@@ -891,11 +891,11 @@ def _run_training_sync(model_key: str, run_id: int) -> dict[str, Any]:
                 "model_key": model_key,
                 "timeline": [
                     *timeline[-19:],
-                    {"at": datetime.utcnow().isoformat(), "phase": "failed", "progress": 1.0, "message": f"训练失败：{str(exc)[:160]}"},
+                    {"at": datetime.now().isoformat(), "phase": "failed", "progress": 1.0, "message": f"训练失败：{str(exc)[:160]}"},
                 ],
             },
             error=str(exc)[:500],
-            finished_at=datetime.utcnow().isoformat(),
+            finished_at=datetime.now().isoformat(),
         )
         return {"ok": False, "run_id": run_id, "error": str(exc)}
     finally:
@@ -974,7 +974,7 @@ def review_plan_model_version(
         "reviewer": reviewer.strip() or "operator",
         "comment": comment.strip(),
         "waive_live_observation": bool(waive_live_observation),
-        "reviewed_at": datetime.utcnow().isoformat(timespec="seconds"),
+        "reviewed_at": datetime.now().isoformat(timespec="seconds"),
         "policy": "plan_model_release_review_v1",
     }
     blocked = []

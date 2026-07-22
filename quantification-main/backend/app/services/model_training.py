@@ -374,7 +374,7 @@ def run_model_training(
     exchange_group: str = "HS",
 ) -> dict[str, Any]:
     rid = run_id or create_model_train_run("开始模型训练")
-    started_at = datetime.utcnow().isoformat()
+    started_at = datetime.now().isoformat()
 
     def progress(phase: str, pct: float, msg: str) -> None:
         update_model_train_run(
@@ -497,7 +497,7 @@ def run_model_training(
                 "exchange_group": exchange_group,
                 "train_rows": len(x_train),
                 "validation_rows": len(x_val),
-                "created_at": datetime.utcnow().isoformat(),
+                "created_at": datetime.now().isoformat(),
                 "tuning_grid": grid,
                 "selected_params": model_params,
                 "review_feedback_rows": feedback_added,
@@ -531,7 +531,7 @@ def run_model_training(
         if best is None:
             raise ValueError("训练样本不足，无法生成模型版本")
 
-        version = datetime.utcnow().strftime("v%Y%m%d%H%M%S")
+        version = datetime.now().strftime("v%Y%m%d%H%M%S")
         root = models_root() / version
         root.mkdir(parents=True, exist_ok=True)
         artifact = dict(best["artifact"])
@@ -579,7 +579,7 @@ def run_model_training(
             message=f"训练完成，生成模型版本 {version}",
             model_version_id=model_version_id,
             metrics=best["metrics"],
-            finished_at=datetime.utcnow().isoformat(),
+            finished_at=datetime.now().isoformat(),
         )
         return {"ok": True, "run_id": rid, "model_version_id": model_version_id, "version": version, "metrics": best["metrics"], "training_input": training_input}
     except Exception as e:
@@ -590,6 +590,6 @@ def run_model_training(
             progress=1.0,
             message="训练失败",
             error=str(e),
-            finished_at=datetime.utcnow().isoformat(),
+            finished_at=datetime.now().isoformat(),
         )
         raise

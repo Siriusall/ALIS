@@ -25,7 +25,7 @@ def get_positions_equity_curve() -> dict:
     ]
     executed_at = min((p.get("updated_at") or "") for p in positions) or None
     if not executed_at:
-        executed_at = datetime.utcnow().isoformat()[:10]
+        executed_at = datetime.now().isoformat()[:10]
     curve = compute_equity_curve(orders, executed_at)
     add_log("INFO", f"持仓收益曲线：{len(positions)} 只股票，{len(curve)} 个点")
     return {"execution_id": None, "series": curve}

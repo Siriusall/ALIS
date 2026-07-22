@@ -1,30 +1,89 @@
 from __future__ import annotations
 
-import math
 from typing import Any
 
-from app.services.quant_risk import constrained_cvar_weights, historical_cvar, hrp_fallback_weights
+import numpy as np
+from scipy.cluster.hierarchy import leaves_list, linkage
+from scipy.spatial.distance import squareform
+from scipy.optimize import minimize
+
+from app.services.quant_risk import historical_cvar
 
 
 STABLE_BUCKETS = {"medium", "defensive", "liquidity"}
 OFFENSIVE_BUCKETS = {"narrative", "leader", "event"}
 
 
-def _clip(value: float, low: float, high: float) -> float:
-    return max(low, min(high, value))
-
-
 def _normalize(weights: dict[str, float]) -> dict[str, float]:
-    total = sum(max(0.0, float(v)) for v in weights.values()) or 1.0
-    return {key: round(max(0.0, float(value)) / total, 8) for key, value in weights.items()}
+    total = sum(max(0.0, float(value)) for value in weights.values())
+    if total <= 0:
+        return {}
+    return {symbol: max(0.0, float(value)) / total for symbol, value in weights.items()}
 
 
-def _scale_group(base: dict[str, float], symbols: list[str], target: float) -> dict[str, float]:
-    subtotal = sum(base.get(symbol, 0.0) for symbol in symbols)
-    if subtotal <= 0:
-        equal = target / max(1, len(symbols))
-        return {symbol: equal for symbol in symbols}
-    return {symbol: base.get(symbol, 0.0) / subtotal * target for symbol in symbols}
+def _aligned_return_matrix(observations: dict[str, list[float]], symbols: list[str]) -> np.ndarray:
+    """Align on the most recent common window without inventing observations."""
+    common = min((len(observations[symbol]) for symbol in symbols), default=0)
+    if common <= 0:
+        return np.empty((0, len(symbols)))
+    return np.asarray([observations[symbol][-common:] for symbol in symbols], dtype=float).T
+
+
+def _empirical_cvar_loss(matrix: np.ndarray, weights: np.ndarray, beta: float = 0.95) -> float:
+    losses = -(matrix @ weights)
+    if losses.size == 0:
+        return 0.0
+    var = float(np.quantile(losses, beta))
+    tail = losses[losses >= var - 1e-12]
+    return float(np.mean(tail)) if tail.size else var
+
+
+def _inverse_volatility_fallback(matrix: np.ndarray, symbols: list[str]) -> dict[str, float]:
+    if matrix.size == 0 or not symbols:
+        return {}
+    volatility = np.sqrt(np.mean(np.square(matrix), axis=0))
+    inverse = 1.0 / np.maximum(volatility, 1e-6)
+    inverse /= float(np.sum(inverse)) or 1.0
+    return {symbol: float(inverse[index]) for index, symbol in enumerate(symbols)}
+
+
+def _hrp_fallback(matrix: np.ndarray, symbols: list[str]) -> dict[str, float]:
+    """Hierarchical risk parity with correlation clustering and recursive bisection."""
+    if matrix.size == 0 or not symbols:
+        return {}
+    if len(symbols) < 2:
+        return {symbols[0]: 1.0}
+    covariance = np.atleast_2d(np.cov(matrix, rowvar=False))
+    diagonal = np.maximum(np.diag(covariance), 1e-12)
+    scale = np.sqrt(np.outer(diagonal, diagonal))
+    correlation = np.clip(covariance / np.maximum(scale, 1e-12), -1.0, 1.0)
+    np.fill_diagonal(correlation, 1.0)
+    distance = np.sqrt(np.maximum(0.0, (1.0 - correlation) / 2.0))
+    order = list(leaves_list(linkage(squareform(distance, checks=False), method="single")))
+    weights = np.ones(len(symbols), dtype=float)
+
+    def cluster_variance(indices: list[int]) -> float:
+        sub_covariance = covariance[np.ix_(indices, indices)]
+        inverse_variance = 1.0 / np.maximum(np.diag(sub_covariance), 1e-12)
+        allocation = inverse_variance / (float(np.sum(inverse_variance)) or 1.0)
+        return float(allocation @ sub_covariance @ allocation)
+
+    clusters = [order]
+    while clusters:
+        next_clusters: list[list[int]] = []
+        for cluster in clusters:
+            if len(cluster) <= 1:
+                continue
+            midpoint = len(cluster) // 2
+            left, right = cluster[:midpoint], cluster[midpoint:]
+            left_variance, right_variance = cluster_variance(left), cluster_variance(right)
+            left_fraction = right_variance / max(left_variance + right_variance, 1e-12)
+            weights[left] *= left_fraction
+            weights[right] *= 1.0 - left_fraction
+            next_clusters.extend([left, right])
+        clusters = next_clusters
+    weights /= float(np.sum(weights)) or 1.0
+    return {symbol: float(weights[index]) for index, symbol in enumerate(symbols)}
 
 
 def two_group_cvar_optimizer(
@@ -35,85 +94,132 @@ def two_group_cvar_optimizer(
     current_weights: dict[str, float] | None = None,
     trading_costs: dict[str, float] | None = None,
     crowding: dict[str, float] | None = None,
-    max_single_mid: float = 0.10,
-    max_single_offensive: float = 0.08,
+    risk_aversion: float = 2.0,
+    concentration_penalty: float = 0.50,
 ) -> dict[str, Any]:
-    observations = {str(k): [float(x) for x in v] for k, v in returns_by_symbol.items() if v}
+    """Optimize expected return against empirical CVaR and implementation costs.
+
+    Bucket labels are deliberately descriptive only.  They no longer impose
+    fixed stable/offensive allocations or bucket-specific single-name caps.
+    Account and order safety constraints remain in the execution layer.
+    """
+    observations = {
+        str(symbol): [float(value) for value in values]
+        for symbol, values in returns_by_symbol.items()
+        if values
+    }
     if not observations:
         return {
             "ok": False,
-            "schema_version": "two_group_cvar_optimizer_v1",
-            "optimizer": "five_bucket_center_weight_risk_parity_fallback_v1",
+            "status": "insufficient_data",
+            "schema_version": "portfolio_cvar_optimizer_v2",
+            "optimizer": "empirical_cvar_slsqp_v2",
             "weights": {},
             "blocked_reasons": ["missing_returns"],
+            "fallback_used": False,
         }
-    bucket_map = {symbol: str((buckets or {}).get(symbol) or "narrative") for symbol in observations}
-    stable_symbols = [symbol for symbol, bucket in bucket_map.items() if bucket in STABLE_BUCKETS]
-    offensive_symbols = [symbol for symbol, bucket in bucket_map.items() if bucket in OFFENSIVE_BUCKETS]
-    if not stable_symbols:
-        stable_symbols = [symbol for symbol in observations if bucket_map[symbol] == "defensive"]
-    if not offensive_symbols:
-        offensive_symbols = [symbol for symbol in observations if symbol not in stable_symbols]
-    base = constrained_cvar_weights(observations, max_single=0.25) or hrp_fallback_weights(observations, max_single=0.25)
-    weights: dict[str, float] = {}
-    weights.update(_scale_group(base, stable_symbols, 0.50 if stable_symbols else 0.0))
-    weights.update(_scale_group(base, offensive_symbols, 0.50 if offensive_symbols else 0.0))
-    max_caps = {
-        symbol: max_single_mid if bucket_map.get(symbol) in {"medium", "defensive", "liquidity"} else max_single_offensive
-        for symbol in weights
-    }
-    capped = {symbol: min(value, max_caps[symbol]) for symbol, value in weights.items()}
-    weights = _normalize(capped)
-    stable_weight = sum(value for symbol, value in weights.items() if bucket_map.get(symbol) in STABLE_BUCKETS)
-    offensive_weight = sum(value for symbol, value in weights.items() if bucket_map.get(symbol) in OFFENSIVE_BUCKETS)
-    risk_by_symbol = {symbol: abs(float(historical_cvar(observations[symbol]).get("cvar") or 0.0)) for symbol in weights}
-    total_risk = sum(weights[symbol] * risk_by_symbol[symbol] for symbol in weights) or 1.0
-    explanations = {}
-    objective_terms = {"expected_net_return": 0.0, "cvar95": 0.0, "turnover_cost": 0.0, "crowding_penalty": 0.0}
-    for symbol, weight in weights.items():
-        exp = float((expected_returns or {}).get(symbol) or 0.0)
-        cost = abs(weight - float((current_weights or {}).get(symbol) or 0.0)) * float((trading_costs or {}).get(symbol) or 0.0)
-        crowd = weight * float((crowding or {}).get(symbol) or 0.0)
-        cvar_contribution = weight * risk_by_symbol[symbol] / total_risk
-        objective_terms["expected_net_return"] += weight * exp
-        objective_terms["turnover_cost"] += cost
-        objective_terms["crowding_penalty"] += crowd
-        explanations[symbol] = {
-            "weight": round(weight, 8),
-            "function_bucket": bucket_map.get(symbol),
-            "expected_return_contribution": round(weight * exp, 8),
-            "cvar_contribution": round(cvar_contribution, 8),
-            "trading_cost": round(cost, 8),
-            "crowding_penalty": round(crowd, 8),
-            "constraint_shadow_price": round(max(0.0, base.get(symbol, 0.0) - max_caps[symbol]), 8),
+
+    symbols = list(observations)
+    matrix = _aligned_return_matrix(observations, symbols)
+    if matrix.shape[0] < 2:
+        return {
+            "ok": False,
+            "status": "insufficient_data",
+            "schema_version": "portfolio_cvar_optimizer_v2",
+            "optimizer": "empirical_cvar_slsqp_v2",
+            "weights": {},
+            "blocked_reasons": ["insufficient_common_observations"],
+            "fallback_used": False,
         }
-    objective_terms["cvar95"] = sum(weights[symbol] * risk_by_symbol[symbol] for symbol in weights)
-    objective = (
-        objective_terms["expected_net_return"]
-        - 2.0 * objective_terms["cvar95"]
-        - 0.5 * objective_terms["turnover_cost"]
-        - 0.5 * objective_terms["crowding_penalty"]
+
+    expected_vector = np.asarray([float((expected_returns or {}).get(symbol) or 0.0) for symbol in symbols])
+    current = _normalize({symbol: float((current_weights or {}).get(symbol) or 0.0) for symbol in symbols})
+    current_vector = np.asarray([current.get(symbol, 0.0) for symbol in symbols])
+    if float(np.sum(current_vector)) <= 0:
+        current_vector = np.asarray(list(_inverse_volatility_fallback(matrix, symbols).values()))
+    cost_vector = np.asarray([max(0.0, float((trading_costs or {}).get(symbol) or 0.0)) for symbol in symbols])
+    crowding_vector = np.asarray([max(0.0, float((crowding or {}).get(symbol) or 0.0)) for symbol in symbols])
+
+    def objective(weight_vector: np.ndarray) -> float:
+        expected = float(expected_vector @ weight_vector)
+        cvar = _empirical_cvar_loss(matrix, weight_vector)
+        turnover_cost = float(cost_vector @ np.abs(weight_vector - current_vector))
+        crowding_cost = float(crowding_vector @ weight_vector)
+        concentration = float(np.sum(np.square(weight_vector)))
+        return -expected + float(risk_aversion) * cvar + turnover_cost + crowding_cost + float(concentration_penalty) * concentration
+
+    result = minimize(
+        objective,
+        current_vector,
+        method="SLSQP",
+        bounds=[(0.0, 1.0) for _ in symbols],
+        constraints=[{"type": "eq", "fun": lambda weights: float(np.sum(weights) - 1.0)}],
+        options={"maxiter": 500, "ftol": 1e-10},
     )
-    gates = {
-        "stable_group_45_55": 0.45 <= stable_weight <= 0.55 or not stable_symbols or not offensive_symbols,
-        "offensive_group_45_55": 0.45 <= offensive_weight <= 0.55 or not stable_symbols or not offensive_symbols,
-        "weight_sum_100": math.isclose(sum(weights.values()), 1.0, abs_tol=1e-6),
-        "long_only": all(value >= -1e-12 for value in weights.values()),
-        "single_name_caps": all(weights[symbol] <= max_caps[symbol] + 1e-8 for symbol in weights),
+    fallback_used = not bool(result.success) or result.x is None or not np.all(np.isfinite(result.x))
+    if fallback_used:
+        weight_map = _hrp_fallback(matrix, symbols) or _inverse_volatility_fallback(matrix, symbols)
+        status = "fallback"
+        solver_message = str(result.message)
+    else:
+        solved = np.maximum(np.asarray(result.x, dtype=float), 0.0)
+        solved /= float(np.sum(solved)) or 1.0
+        weight_map = {symbol: float(solved[index]) for index, symbol in enumerate(symbols)}
+        status = "optimal"
+        solver_message = str(result.message)
+
+    weights = {symbol: round(weight, 8) for symbol, weight in weight_map.items()}
+    # Remove rounding drift while preserving a fully invested continuous solution.
+    largest = max(weights, key=weights.get)
+    weights[largest] = round(weights[largest] + (1.0 - sum(weights.values())), 8)
+    bucket_map = {symbol: str((buckets or {}).get(symbol) or "unclassified") for symbol in symbols}
+    stable_weight = sum(weights[symbol] for symbol in symbols if bucket_map[symbol] in STABLE_BUCKETS)
+    offensive_weight = sum(weights[symbol] for symbol in symbols if bucket_map[symbol] in OFFENSIVE_BUCKETS)
+    cvar95 = _empirical_cvar_loss(matrix, np.asarray([weights[symbol] for symbol in symbols]))
+    expected_net_return = sum(weights[symbol] * expected_vector[index] for index, symbol in enumerate(symbols))
+    turnover_cost = sum(abs(weights[symbol] - current_vector[index]) * cost_vector[index] for index, symbol in enumerate(symbols))
+    crowding_penalty_value = sum(weights[symbol] * crowding_vector[index] for index, symbol in enumerate(symbols))
+    concentration_value = sum(weight * weight for weight in weights.values())
+    objective_terms = {
+        "expected_net_return": float(expected_net_return),
+        "cvar95": float(cvar95),
+        "turnover_cost": float(turnover_cost),
+        "crowding_penalty": float(crowding_penalty_value),
+        "concentration_penalty": float(concentration_penalty) * concentration_value,
     }
-    blocked = [key for key, passed in gates.items() if not passed]
+    explanations: dict[str, dict[str, Any]] = {}
+    total_standalone_risk = sum(
+        weights[symbol] * abs(float(historical_cvar(observations[symbol]).get("cvar") or 0.0))
+        for symbol in symbols
+    ) or 1.0
+    for index, symbol in enumerate(symbols):
+        standalone_risk = abs(float(historical_cvar(observations[symbol]).get("cvar") or 0.0))
+        explanations[symbol] = {
+            "weight": weights[symbol],
+            "function_bucket": bucket_map[symbol],
+            "expected_return_contribution": round(weights[symbol] * expected_vector[index], 8),
+            "cvar_contribution": round(weights[symbol] * standalone_risk / total_standalone_risk, 8),
+            "trading_cost": round(abs(weights[symbol] - current_vector[index]) * cost_vector[index], 8),
+            "crowding_penalty": round(weights[symbol] * crowding_vector[index], 8),
+            "constraint_shadow_price": 0.0,
+        }
+
     return {
-        "ok": not blocked,
-        "schema_version": "two_group_cvar_optimizer_v1",
-        "optimizer": "rockafellar_uryasev_cvar95_contract_v1",
-        "objective": "max_expected_net_return_minus_2_cvar95_minus_0_5_turnover_minus_0_5_crowding",
-        "objective_value": round(objective, 8),
+        "ok": True,
+        "status": status,
+        "schema_version": "portfolio_cvar_optimizer_v2",
+        "optimizer": "empirical_cvar_slsqp_v2" if not fallback_used else "hierarchical_risk_parity_fallback_v2",
+        "objective": "max_expected_return_minus_cvar_cost_turnover_crowding_and_concentration",
+        "objective_value": round(-objective(np.asarray([weights[symbol] for symbol in symbols])), 8),
         "objective_terms": {key: round(value, 8) for key, value in objective_terms.items()},
         "weights": weights,
         "weight_sum": round(sum(weights.values()), 8),
         "risk_groups": {"stable": round(stable_weight, 8), "offensive": round(offensive_weight, 8)},
-        "gates": gates,
-        "blocked_reasons": blocked,
+        "gates": {"weight_sum_100": abs(sum(weights.values()) - 1.0) <= 1e-6, "long_only": all(value >= 0 for value in weights.values())},
+        "blocked_reasons": [],
+        "soft_constraints": ["concentration", "turnover", "crowding", "bucket_exposure_descriptive_only"],
+        "solver": {"success": bool(result.success), "message": solver_message, "iterations": int(getattr(result, "nit", 0) or 0)},
+        "fallback_used": fallback_used,
         "explanations": explanations,
-        "fallback_policy": "if_unavailable_use_five_bucket_center_weight_plus_in_bucket_risk_parity_never_all_cash",
+        "fallback_policy": "hierarchical_risk_parity_then_inverse_volatility_then_keep_current_positions_at_execution_gate",
     }

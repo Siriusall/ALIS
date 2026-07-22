@@ -132,7 +132,7 @@ def build_simulation_ledger(*, limit: int = 20, execution_id: int | None = None)
     return {
         "ok": True,
         "schema_version": "simulation_ledger_v1",
-        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "generated_at": datetime.now().astimezone().isoformat(),
         "items": items,
         "limitations": [
             "mark_to_market_pnl is an execution-day estimate; formal FIFO realized attribution is exposed through decision review outcomes.",

@@ -120,7 +120,7 @@ def archive_raw_records(
     temporary = target.with_suffix(".parquet.tmp")
     frame.to_parquet(temporary, engine="pyarrow", compression="zstd", index=False)
     temporary.replace(target)
-    created_at = datetime.now(timezone.utc).isoformat()
+    created_at = datetime.now().astimezone().isoformat()
     schema = {name: str(dtype) for name, dtype in frame.dtypes.items()}
     checksum = _sha256(target)
     with _conn() as conn:

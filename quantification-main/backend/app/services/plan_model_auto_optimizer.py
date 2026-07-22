@@ -205,7 +205,7 @@ def build_auto_optimization_status(*, apply_auto_reject: bool = True) -> dict[st
         "auto_rejected": auto_rejected,
         "review_queue": [item for item in items if item["requires_human"]],
         "items": items,
-        "generated_at": datetime.utcnow().isoformat(),
+        "generated_at": datetime.now().isoformat(),
     }
 
 

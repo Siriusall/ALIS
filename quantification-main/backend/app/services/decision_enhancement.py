@@ -227,7 +227,7 @@ def build_decision_enhancement(
     protection = extreme_market_protection(market_overview, ledger)
     return {
         "schema_version": "decision_enhancement_v1",
-        "generated_at": datetime.utcnow().isoformat(),
+        "generated_at": datetime.now().isoformat(),
         "revenue_dashboard": revenue_target_dashboard(
             gate_decision=gate_decision,
             risk_gate_explanation=risk_gate_explanation,

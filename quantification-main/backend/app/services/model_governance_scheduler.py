@@ -105,7 +105,7 @@ def automatic_retraining_decision(
     stale_running_hours: int = 12,
 ) -> dict[str, Any]:
     """Decide whether a new challenger is useful, without retraining identical data."""
-    current = now or datetime.utcnow()
+    current = now or datetime.now()
     status = str((latest_run or {}).get("status") or "")
     updated = _parse_utc((latest_run or {}).get("updated_at"))
     age = current - updated if updated else None
@@ -177,7 +177,7 @@ def request_model_training(
             update_model_train_run(
                 int(latest_run["id"]), status="failed", phase="failed",
                 message="训练进程超时，已由自动治理标记失败", error="stale_training_run",
-                finished_at=datetime.utcnow().isoformat(),
+                finished_at=datetime.now().isoformat(),
             )
         run_id = create_model_train_run("自动持续训练任务已创建" if not force else "训练任务已创建")
         _training_worker_running = True

@@ -65,7 +65,11 @@ def test_two_group_optimizer_returns_explainable_weights():
     buckets = {"511880.SH": "defensive", **{symbol: "narrative" for symbol in returns if symbol != "511880.SH"}}
     result = two_group_cvar_optimizer(returns, buckets=buckets)
 
-    assert result["schema_version"] == "two_group_cvar_optimizer_v1"
+    assert result["schema_version"] == "portfolio_cvar_optimizer_v2"
+    assert result["ok"] is True
+    assert result["status"] in {"optimal", "fallback"}
     assert abs(result["weight_sum"] - 1.0) < 1e-6
     assert result["explanations"]["511880.SH"]["function_bucket"] == "defensive"
     assert "constraint_shadow_price" in result["explanations"]["000001.SZ"]
+    assert "stable_group_45_55" not in result["gates"]
+    assert "offensive_group_45_55" not in result["gates"]

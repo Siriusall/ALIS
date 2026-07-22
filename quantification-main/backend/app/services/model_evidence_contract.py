@@ -114,7 +114,7 @@ def model_output_contracts() -> dict[str, Any]:
         "ok": True,
         "schema_version": "plan_book_model_output_contracts_v1",
         "contracts": MODEL_OUTPUT_CONTRACTS,
-        "generated_at": datetime.utcnow().isoformat(timespec="seconds"),
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
     }
 
 
@@ -123,7 +123,7 @@ def evidence_binding_registry() -> dict[str, Any]:
         "ok": True,
         "schema_version": "target_weight_evidence_binding_registry_v1",
         "bindings": EVIDENCE_BINDINGS,
-        "generated_at": datetime.utcnow().isoformat(timespec="seconds"),
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
     }
 
 

@@ -45,7 +45,7 @@ def _normalize_payload(period_type: str, payload: dict[str, Any]) -> dict[str, A
         "turnover_pct": row.get("turnover_pct", row.get("turnover_rate", 0.0)),
         "attribution": attribution,
         "frozen": True,
-        "frozen_at": row.get("frozen_at") or datetime.utcnow().isoformat(timespec="seconds"),
+        "frozen_at": row.get("frozen_at") or datetime.now().isoformat(timespec="seconds"),
     })
     return row
 

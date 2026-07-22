@@ -276,7 +276,7 @@ def train_hsmm_shadow(*, refresh_api: bool = True) -> dict[str, Any]:
         "drawdown_improvement": round(gated_dd - baseline_dd, 6), "stress_recall": round(stress_recall, 4),
         "stable_distinguishing_dimensions": differentiation,
     }
-    version = f"hsmm-shadow-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
+    version = f"hsmm-shadow-{datetime.now().strftime('%Y%m%d%H%M%S')}"
     artifact_dir = Path(__file__).resolve().parents[2] / ".cache" / "models" / "market_regime"
     artifact_dir.mkdir(parents=True, exist_ok=True)
     artifact_path = artifact_dir / f"{version}.json"

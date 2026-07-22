@@ -242,8 +242,8 @@ export default function ReviewWorkbenchPage({ onNavigate }: Props) {
         </article>
         <article>
           <span>组合层再优化</span>
-          <strong>{profitLoop?.portfolio_optimization.optimizer.ok ? "可执行" : "需约束"}</strong>
-          <small>目标函数 {profitLoop?.portfolio_optimization.optimizer.objective_value?.toFixed?.(4) ?? "—"} · 风险 {profitLoop?.portfolio_optimization.risk_budget.status || "—"}</small>
+          <strong>{profitLoop?.portfolio_optimization.optimizer.cost_gate?.triggered ? "保持当前持仓" : profitLoop?.portfolio_optimization.optimizer.ok ? "可执行" : "需处理"}</strong>
+          <small>{profitLoop?.portfolio_optimization.optimizer.cost_gate?.reason || `状态 ${profitLoop?.portfolio_optimization.optimizer.status || "—"} · 优化标的 ${profitLoop?.portfolio_optimization.candidate_universe.optimization_count ?? "—"} 只 · 风险 ${profitLoop?.portfolio_optimization.risk_budget.status || "—"}`}</small>
         </article>
         <article className={(profitLoop?.sell_rebalance.items ?? []).some((item) => item.action !== "hold") ? "warning" : ""}>
           <span>卖出/调仓诊断</span>

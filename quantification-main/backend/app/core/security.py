@@ -37,7 +37,7 @@ def verify_password(plain: str, hashed: str) -> bool:
 
 
 def create_access_token(subject: str | int, extra: Optional[dict[str, Any]] = None) -> str:
-    now = datetime.utcnow()
+    now = datetime.now()
     expire = now + timedelta(minutes=settings.jwt_expire_minutes)
     payload = {"sub": str(subject), "exp": expire, "iat": now}
     if extra:

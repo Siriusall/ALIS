@@ -1,5 +1,10 @@
 const SHANGHAI_TZ = "Asia/Shanghai";
 
+export function toGmt8ISOString(value = new Date()): string {
+  const shifted = new Date(value.getTime() + 8 * 60 * 60 * 1000);
+  return shifted.toISOString().replace(/Z$/, "+08:00");
+}
+
 function parseServerTime(value?: string | null): Date | null {
   if (!value) return null;
   const text = String(value).trim();

@@ -491,7 +491,7 @@ def _migrate_quant_task_status_semantics(c: _ConnWrapper) -> None:
     - 历史 completed 统一转为 paused
     - 仅手动停止使用 stopped
     """
-    now = datetime.utcnow().isoformat()
+    now = datetime.now().isoformat()
     c.execute(
         """
         UPDATE quant_run_tasks
@@ -1007,7 +1007,7 @@ def init_db() -> None:
                 "SELECT id FROM strategies WHERE name = ?", (_DEFAULT_STRATEGY_NAME,)
             )
             if cur.fetchone() is None:
-                now = datetime.utcnow().isoformat()
+                now = datetime.now().isoformat()
                 c.execute(
                     """INSERT INTO strategies (name, type, content, created_at, updated_at)
                        VALUES (?, 'formula', ?, ?, ?)""",
@@ -1100,7 +1100,7 @@ def get_strategy(strategy_id: int) -> Optional[Dict[str, Any]]:
 
 def create_strategy(name: str, type_: str, content: Any) -> Dict[str, Any]:
     """Insert strategy; content will be JSON-serialized if dict/list."""
-    now = datetime.utcnow().isoformat()
+    now = datetime.now().isoformat()
     payload = json.dumps(content) if isinstance(content, (dict, list)) else str(content)
     with _conn() as c:
         c.execute(
@@ -1117,7 +1117,7 @@ def update_strategy(strategy_id: int, name: Optional[str], type_: Optional[str],
     current = get_strategy(strategy_id)
     if not current:
         return None
-    now = datetime.utcnow().isoformat()
+    now = datetime.now().isoformat()
     name = name if name is not None else current["name"]
     type_ = type_ if type_ is not None else current["type"]
     if content is not None:
@@ -1295,7 +1295,7 @@ def create_backtest_result(result: Dict[str, Any]) -> int:
             (
                 int(result.get("strategy_id") or 0),
                 str(result.get("strategy_name") or ""),
-                datetime.utcnow().isoformat(),
+                datetime.now().isoformat(),
                 str(result.get("start_date") or ""),
                 str(result.get("end_date") or ""),
                 float(result.get("initial_cash") or 0),
@@ -1470,7 +1470,7 @@ def sell_position(
     if sell_qty <= 0:
         return None
     sell_price = max(0.0, round(float(price), 2))
-    now = datetime.utcnow().isoformat()[:19]
+    now = datetime.now().isoformat()[:19]
     with _conn() as c:
         if sell_qty >= pos_qty:
             c.execute("DELETE FROM positions WHERE id = ?", (position_id,))
@@ -1614,7 +1614,7 @@ def merge_execution_into_positions(
     """将一次执行的买入订单合并进 positions 表（同 symbol 累加数量、加权成本）。可选传入 name_by_symbol 写入名称（来自选股，无需再调行情源）。"""
     if not orders:
         return
-    now = executed_at[:19] if executed_at else datetime.utcnow().isoformat()[:19]
+    now = executed_at[:19] if executed_at else datetime.now().isoformat()[:19]
     name_by_symbol = name_by_symbol or {}
     with _conn() as c:
         for o in orders:
@@ -1638,7 +1638,7 @@ def add_position(symbol: str, quantity: int, price: float) -> Dict[str, Any]:
     price = max(0.0, round(float(price), 2))
     if not symbol:
         return {}
-    now = datetime.utcnow().isoformat()[:19]
+    now = datetime.now().isoformat()[:19]
     bought_date = now[:10]
     with _conn() as c:
         pid = _merge_position_row(
@@ -1661,7 +1661,7 @@ def update_position(position_id: int, quantity: Optional[int] = None, price: Opt
             return None
         q = int(row["quantity"]) if quantity is None else max(0, int(quantity))
         p = float(row["price"]) if price is None else max(0.0, round(float(price), 2))
-        now = datetime.utcnow().isoformat()[:19]
+        now = datetime.now().isoformat()[:19]
         if q <= 0:
             c.execute("DELETE FROM positions WHERE id = ?", (position_id,))
             return None
@@ -1685,7 +1685,7 @@ def delete_position(position_id: int) -> bool:
 
 def create_user(username: str, password_hash: str) -> Dict[str, Any]:
     """创建用户，返回 { id, username, created_at }。用户名已存在则抛错由调用方处理。"""
-    now = datetime.utcnow().isoformat()
+    now = datetime.now().isoformat()
     with _conn() as c:
         c.execute(
             "INSERT INTO users (username, password_hash, created_at) VALUES (?, ?, ?)",
@@ -1787,7 +1787,7 @@ def create_quant_run_task(
     max_steps: int = 5,
     replay_mode: str = "pragmatic_recover",
 ) -> int:
-    now = datetime.utcnow().isoformat()
+    now = datetime.now().isoformat()
     norm_exchange_group = str(exchange_group or "HS")
     norm_start_date = str(start_date) if start_date else None
     norm_replay_mode = str(replay_mode or "pragmatic_recover")
@@ -1861,7 +1861,7 @@ def upsert_quant_run_task_meta(
     strategy_snapshot: Dict[str, Any],
     risk_config: Dict[str, Any],
 ) -> None:
-    now = datetime.utcnow().isoformat()
+    now = datetime.now().isoformat()
     strategy_payload = json.dumps(strategy_snapshot or {}, ensure_ascii=False)
     risk_payload = json.dumps(risk_config or {}, ensure_ascii=False)
     try:
@@ -1928,7 +1928,7 @@ def get_quant_run_task_meta(task_id: int) -> Dict[str, Any]:
 
 
 def upsert_quant_run_task_health(task_id: int, **fields: Any) -> None:
-    now = datetime.utcnow().isoformat()
+    now = datetime.now().isoformat()
     payload = {
         "heartbeat_at": fields.get("heartbeat_at"),
         "last_step_latency_ms": int(fields.get("last_step_latency_ms") or 0),
@@ -2225,7 +2225,7 @@ def update_quant_run_task(task_id: int, **fields: Any) -> bool:
     data = {k: v for k, v in fields.items() if k in allowed}
     if not data:
         return False
-    data["updated_at"] = datetime.utcnow().isoformat()
+    data["updated_at"] = datetime.now().isoformat()
     cols = ", ".join([f"{k} = ?" for k in data.keys()])
     params = tuple(data.values()) + (int(task_id),)
     with _conn() as c:
@@ -2289,7 +2289,7 @@ def create_quant_run_task_record(
     message: str,
     detail: Optional[Dict[str, Any]] = None,
 ) -> int:
-    now = datetime.utcnow().isoformat()
+    now = datetime.now().isoformat()
     detail_json = json.dumps(detail, ensure_ascii=False) if detail else None
     with _conn() as c:
         # 幂等防重：同一 task_id + signal_date 只允许一条执行记录。
@@ -2353,7 +2353,7 @@ def upsert_quant_replay_waterline(
     last_run_mode: str = "pragmatic_recover",
     last_run_status: str = "",
 ) -> None:
-    now = datetime.utcnow().isoformat()
+    now = datetime.now().isoformat()
     with _conn() as c:
         if c._is_mysql and not c._is_postgres:
             c.execute(
@@ -2483,7 +2483,7 @@ def delete_quant_run_task(task_id: int) -> bool:
 
 
 def create_model_train_run(message: str = "等待训练") -> int:
-    now = datetime.utcnow().isoformat()
+    now = datetime.now().isoformat()
     with _conn() as c:
         c.execute(
             """INSERT INTO model_train_runs (
@@ -2507,7 +2507,7 @@ def update_model_train_run(
     started_at: str | None = None,
     finished_at: str | None = None,
 ) -> None:
-    now = datetime.utcnow().isoformat()
+    now = datetime.now().isoformat()
     fields: list[str] = ["updated_at = ?"]
     params: list[Any] = [now]
     if status is not None:
@@ -2553,7 +2553,7 @@ def create_model_version(
     validation: dict | None = None,
     is_active: bool = False,
 ) -> int:
-    now = datetime.utcnow().isoformat()
+    now = datetime.now().isoformat()
     with _conn() as c:
         if c._is_postgres:
             # Databases migrated from SQLite may contain explicit ids while
@@ -2594,7 +2594,7 @@ def set_active_model_version(model_version_id: int) -> None:
         c.execute("UPDATE model_versions SET is_active = 0 WHERE model_key = ?", (row["model_key"],))
         c.execute(
             "UPDATE model_versions SET is_active = 1, status = ?, updated_at = ? WHERE id = ?",
-            ("active", datetime.utcnow().isoformat(), int(model_version_id)),
+            ("active", datetime.now().isoformat(), int(model_version_id)),
         )
 
 
@@ -2612,14 +2612,14 @@ def update_model_version_status(
     if not fields:
         return
     fields.append("updated_at = ?")
-    params.append(datetime.utcnow().isoformat())
+    params.append(datetime.now().isoformat())
     params.append(int(model_version_id))
     with _conn() as c:
         c.execute(f"UPDATE model_versions SET {', '.join(fields)} WHERE id = ?", tuple(params))
 
 
 def update_model_version_validation(model_version_id: int, *, validation: dict[str, Any]) -> None:
-    now = datetime.utcnow().isoformat()
+    now = datetime.now().isoformat()
     with _conn() as c:
         c.execute(
             "UPDATE model_versions SET validation_json = ?, updated_at = ? WHERE id = ?",
@@ -2712,7 +2712,7 @@ def list_model_train_runs(limit: int = 20) -> List[Dict[str, Any]]:
 
 def save_performance_reports(task_id: int | None, reports: dict[str, list[dict[str, Any]]]) -> int:
     """Persist the latest period snapshots idempotently."""
-    now = datetime.utcnow().isoformat()
+    now = datetime.now().isoformat()
     saved = 0
 
     def normalize_report(kind: str, row: dict[str, Any]) -> dict[str, Any]:

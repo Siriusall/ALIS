@@ -60,7 +60,7 @@ def simulate_open_execution(
         residual_sweep_symbol=residual_sweep_symbol,
     )
     orders = planned_to_order_results(planned) + blocked
-    return ExecutionState(executed_at=executed_at or datetime.utcnow().isoformat(), orders=orders)
+    return ExecutionState(executed_at=executed_at or datetime.now().isoformat(), orders=orders)
 
 
 # 保留旧版简单实现供测试对照（内部不再默认使用）
@@ -71,7 +71,7 @@ def simulate_open_execution_legacy(
 ) -> ExecutionState:
     orders: List[OrderResult] = []
     if not candidates:
-        return ExecutionState(executed_at=executed_at or datetime.utcnow().isoformat(), orders=orders)
+        return ExecutionState(executed_at=executed_at or datetime.now().isoformat(), orders=orders)
 
     per_order_budget = budget / len(candidates)
     for order in candidates:
@@ -127,4 +127,4 @@ def simulate_open_execution_legacy(
             )
         )
 
-    return ExecutionState(executed_at=executed_at or datetime.utcnow().isoformat(), orders=orders)
+    return ExecutionState(executed_at=executed_at or datetime.now().isoformat(), orders=orders)
