@@ -276,8 +276,8 @@ export default function PortfolioWorkbenchPage({ onNavigate }: PortfolioWorkbenc
         <div className="card decision-panel">
           <h3>风险与状态迁移摘要</h3>
           <div className="decision-issue-list">
-            {breaches.slice(0, 5).map((item) => (
-              <div key={`${item.code}-${item.message}`} className="decision-issue error">
+            {breaches.slice(0, 5).map((item, index) => (
+              <div key={`${item.code}-${item.message}-${index}`} className="decision-issue error">
                 {item.message}
               </div>
             ))}

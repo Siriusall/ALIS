@@ -14,6 +14,33 @@ def _metric(metrics: dict[str, Any] | None, key: str) -> float | None:
         return None
 
 
+def _cost_after_lift(metrics: dict[str, Any] | None) -> float | None:
+    return _metric(metrics, "net_lift") if _metric(metrics, "net_lift") is not None else _metric(metrics, "lift")
+
+
+def _cost_after_walk_forward(metrics: dict[str, Any] | None) -> float | None:
+    return _metric(metrics, "walk_forward_lift") or _cost_after_lift(metrics)
+
+
+def _cost_after_worst_window(metrics: dict[str, Any] | None) -> float | None:
+    return _metric(metrics, "worst_window_net_lift") or _cost_after_walk_forward(metrics)
+
+
+def _candidate_cost_after_passed(metrics: dict[str, Any] | None) -> tuple[bool, str]:
+    net_lift = _cost_after_lift(metrics)
+    walk_forward = _cost_after_walk_forward(metrics)
+    worst_window = _cost_after_worst_window(metrics)
+    if net_lift is None or walk_forward is None or worst_window is None:
+        return False, "missing_cost_after_metrics"
+    if net_lift <= 0:
+        return False, f"candidate_net_lift_non_positive:{net_lift:.6f}"
+    if walk_forward <= 0:
+        return False, f"candidate_walk_forward_non_positive:{walk_forward:.6f}"
+    if worst_window <= 0:
+        return False, f"candidate_worst_window_non_positive:{worst_window:.6f}"
+    return True, ""
+
+
 def _recommendation(item: dict[str, Any]) -> dict[str, Any]:
     status = str(item.get("status") or "unknown")
     active = item.get("active_version") or {}
@@ -21,14 +48,17 @@ def _recommendation(item: dict[str, Any]) -> dict[str, Any]:
     blocked = list(item.get("blocked_reasons") or [])
     latest_metrics = latest.get("metrics") or {}
     active_metrics = active.get("metrics") or {}
-    latest_lift = _metric(latest_metrics, "walk_forward_lift") or _metric(latest_metrics, "lift")
-    active_lift = _metric(active_metrics, "walk_forward_lift") or _metric(active_metrics, "lift")
+    latest_lift = _cost_after_walk_forward(latest_metrics)
+    active_lift = _cost_after_walk_forward(active_metrics)
     latest_is_challenger = bool(latest.get("id")) and int(latest.get("id") or 0) != int(active.get("id") or 0) and str(latest.get("status") or "") == "candidate"
     latest_review = ((latest.get("validation") or {}).get("review") or {}) if isinstance(latest.get("validation"), dict) else {}
 
     if latest_is_challenger:
+        passed, reason_code = _candidate_cost_after_passed(latest_metrics)
         if str(latest_review.get("status") or "") == "rejected":
             return {"action": "auto_rejected", "reason": "弱候选未进入批准队列。", "requires_human": False}
+        if not passed:
+            return {"action": "reject_recommended", "reason": f"候选模型费用后核心指标未通过，系统应自动驳回（{reason_code}）。", "requires_human": False}
         if blocked and any("requires_review" not in reason and "live_observation" not in reason for reason in blocked):
             action = "observe"
             reason = "候选模型还有非人工评审类阻塞，先观察。"
@@ -63,20 +93,23 @@ def _auto_reject_reason(item: dict[str, Any]) -> str:
         return ""
     candidate = latest.get("metrics") or {}
     production = active.get("metrics") or {}
-    candidate_lift = _metric(candidate, "lift")
-    candidate_wf = _metric(candidate, "walk_forward_lift")
-    production_lift = _metric(production, "lift")
-    production_wf = _metric(production, "walk_forward_lift")
+    candidate_lift = _cost_after_lift(candidate)
+    candidate_wf = _cost_after_walk_forward(candidate)
+    candidate_worst = _cost_after_worst_window(candidate)
+    production_lift = _cost_after_lift(production)
+    production_wf = _cost_after_walk_forward(production)
+    production_worst = _cost_after_worst_window(production)
     candidate_hit_rate = _metric(candidate, "hit_rate")
     production_hit_rate = _metric(production, "hit_rate")
-    if candidate_lift is not None and candidate_lift <= 0:
-        return f"auto_reject_candidate_lift_non_positive:{candidate_lift:.6f}"
-    if candidate_wf is not None and candidate_wf <= 0:
-        return f"auto_reject_candidate_walk_forward_non_positive:{candidate_wf:.6f}"
+    passed, reason = _candidate_cost_after_passed(candidate)
+    if not passed:
+        return f"auto_reject_{reason}"
     if candidate_wf is not None and production_wf is not None and candidate_wf < production_wf:
         return f"auto_reject_walk_forward_delta_negative:{candidate_wf - production_wf:.6f}"
     if candidate_lift is not None and production_lift is not None and candidate_lift < production_lift:
-        return f"auto_reject_lift_delta_negative:{candidate_lift - production_lift:.6f}"
+        return f"auto_reject_net_lift_delta_negative:{candidate_lift - production_lift:.6f}"
+    if candidate_worst is not None and production_worst is not None and candidate_worst < production_worst:
+        return f"auto_reject_worst_window_delta_negative:{candidate_worst - production_worst:.6f}"
     if candidate_hit_rate is not None and production_hit_rate is not None and candidate_hit_rate < production_hit_rate:
         return f"auto_reject_hit_rate_delta_negative:{candidate_hit_rate - production_hit_rate:.6f}"
     return ""
@@ -114,8 +147,8 @@ def _shadow_ab(item: dict[str, Any]) -> dict[str, Any]:
         or _metric(latest_validation, "oos_sessions")
         or 0
     )
-    challenger_wf = _metric(latest_metrics, "walk_forward_lift") or _metric(latest_metrics, "lift") or 0.0
-    champion_wf = _metric(active_metrics, "walk_forward_lift") or _metric(active_metrics, "lift") or 0.0
+    challenger_wf = _cost_after_walk_forward(latest_metrics) or 0.0
+    champion_wf = _cost_after_walk_forward(active_metrics) or 0.0
     delta = round(challenger_wf - champion_wf, 6)
     ready = sessions >= 20
     status = "no_challenger" if same_version else "auto_rejected" if str(latest_review.get("status") or "") == "rejected" else "review_ready" if ready else "shadow_running"
@@ -125,8 +158,8 @@ def _shadow_ab(item: dict[str, Any]) -> dict[str, Any]:
         "has_challenger": bool(latest.get("id")) and not same_version and str(latest.get("status") or "") == "candidate",
         "observation_sessions": sessions,
         "minimum_sessions": 20,
-        "challenger_walk_forward_lift": challenger_wf,
-        "champion_walk_forward_lift": champion_wf,
+        "challenger_cost_after_walk_forward_lift": challenger_wf,
+        "champion_cost_after_walk_forward_lift": champion_wf,
         "delta": delta,
         "status": status,
         "recommendation": "no_action" if same_version else "rejected" if status == "auto_rejected" else "approve_review" if ready and delta >= 0 else "reject_or_retrain" if ready else "observe",

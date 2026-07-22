@@ -22,8 +22,8 @@ CONTRACTS = {
             ("stock_master", "股票主数据", 0.99, "block"),
             ("capital_structure", "资金结构历史", 0.99, "degrade"),
             ("moneyflow", "个股资金流历史", 0.99, "degrade"),
-            ("etf_constituents", "ETF持仓行业暴露", 0.99, "degrade"),
             ("major_news", "叙事新闻历史", 0.99, "degrade"),
+            ("theme_snapshots", "主题快照历史", 0.99, "degrade"),
         ],
     },
     "backtest": {
@@ -38,7 +38,7 @@ CONTRACTS = {
             ("capital_structure", "资金结构历史", 0.99, "block"),
             ("moneyflow", "个股资金流历史", 0.99, "block"),
             ("etf_history", "ETF价格与净值历史", 0.99, "block"),
-            ("etf_constituents", "ETF每日持仓组合", 0.99, "degrade"),
+            ("etf_pcf", "ETF每日申购赎回篮子", 0.80, "degrade"),
         ],
     },
     "position_risk": {
@@ -60,8 +60,18 @@ CONTRACTS = {
             ("point_in_time", "时点可用性", 1.0, "block"),
             ("capital_structure", "资金结构训练样本", 0.99, "block"),
             ("etf_history", "ETF轮动训练样本", 0.99, "block"),
-            ("etf_constituents", "ETF持仓训练样本", 0.99, "degrade"),
+            ("etf_pcf", "ETF真实篮子核验", 0.80, "degrade"),
             ("major_news", "叙事训练语料", 0.99, "block"),
+            ("theme_snapshots", "叙事状态快照", 1.0, "block"),
+        ],
+    },
+    "narrative_model": {
+        "name": "叙事状态模型", "description": "训练叙事生命周期、退潮和退出信号的数据条件",
+        "requirements": [
+            ("history_daily", "历史行情特征", 0.995, "block"),
+            ("moneyflow", "资金斜率历史", 0.99, "degrade"),
+            ("major_news", "叙事新闻历史", 0.99, "degrade"),
+            ("theme_snapshots", "250日主题快照", 1.0, "block"),
         ],
     },
     "financial_research": {

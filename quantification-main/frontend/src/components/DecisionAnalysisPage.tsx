@@ -57,6 +57,8 @@ export default function DecisionAnalysisPage({ onNavigate }: { onNavigate?: (sec
   const risks = ledger.account_risks ?? [];
   const contraction = gate.reason_code === "market_risk_contraction";
   const effectiveRiskBudget = market.position_gate?.combined_risk_budget_multiplier ?? state?.risk_budget_multiplier;
+  const strategyTrace = analysis?.rebalance_decision_trace ?? analysis?.strategy_controller?.trace ?? [];
+  const strategyContracts = analysis?.strategy_action_contracts ?? analysis?.strategy_controller?.contracts ?? [];
 
   return (
     <section className="decision-analysis-page">
@@ -101,7 +103,13 @@ export default function DecisionAnalysisPage({ onNavigate }: { onNavigate?: (sec
         </section>
 
         <section className="decision-analysis-card wide">
-          <header><span>04</span><div><h2>逐股调仓明细</h2><p>展示本次已经形成的建议，不在此页重新计算</p></div></header>
+          <header><span>04</span><div><h2>策略总控</h2><p>模型识别信号，策略决定动作，组合层只负责权重</p></div></header>
+          {strategyTrace.length ? <div className="decision-strategy-trace">{strategyTrace.map((item, index) => <article key={`${item.step}-${index}`}><b>{index + 1}</b><span>{item.step}</span><strong>{item.detail}</strong></article>)}</div> : <p className="decision-analysis-ok">旧分析结果暂未包含策略总控追踪，重新生成今日分析后可查看。</p>}
+          {strategyContracts.length ? <div className="decision-strategy-contracts">{strategyContracts.slice(0, 6).map((item) => <article key={`${item.side}-${item.symbol}-${item.priority}`}><div><strong><SecurityLabel code={item.symbol} name={item.name} /></strong><span>{item.action} · {item.expected_return_source}</span></div><em>{item.trigger_models?.slice(0, 3).join(" / ") || "策略控制器"}</em><small>退出：{item.exit_conditions?.[0] || "按策略合同复核"}</small></article>)}</div> : null}
+        </section>
+
+        <section className="decision-analysis-card wide">
+          <header><span>05</span><div><h2>逐股调仓明细</h2><p>展示本次已经形成的建议，不在此页重新计算</p></div></header>
           {actions.length ? <div className="decision-analysis-table-wrap"><table><thead><tr><th>动作</th><th>标的</th><th>评分</th><th>理由</th></tr></thead><tbody>{actions.map((row, index) => <tr key={`${row.side}-${row.symbol}-${index}`}><td><b className={`action-${row.side}`}>{row.side}</b></td><td><SecurityLabel code={row.symbol} name={row.name} /></td><td>{row.score ?? "—"}</td><td>{row.reason || "遵循本次组合目标"}</td></tr>)}</tbody></table></div> : <div className="decision-analysis-empty"><strong>{gate.tone === "hold" || gate.tone === "stop" ? "本次结论无需生成交易动作" : "本次没有逐股调仓动作"}</strong><p>{gate.tone === "hold" || gate.tone === "stop" ? "系统已经完成分析，并决定保持当前组合；因此没有买卖计划需要展示或重新生成。" : "当前建议未产生买入或卖出标的。"}</p></div>}
         </section>
       </div>

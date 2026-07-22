@@ -32,7 +32,6 @@ from app.data_platform.services.data_center import (
     set_tushare_activity_hook,
     backfill_capital_structure_history,
     backfill_etf_daily_incremental,
-    backfill_etf_constituents_history,
     backfill_etf_price_history,
     backfill_major_news_history,
     DEFER_EMPTY_AFTER_ATTEMPTS,
@@ -40,6 +39,8 @@ from app.data_platform.services.data_center import (
 )
 from app.data_platform.services.market_calendar import target_trade_day
 from app.data_platform.redis_store import ack_task, enqueue_task, get_json, set_json
+from app.services.theme_engine import materialize_theme_snapshot_history
+from app.data_platform.services.exchange_etf_pcf import backfill_exchange_etf_pcf
 
 _lock = threading.Lock()
 _state: dict[str, Any] = {"running": False, "phase": "idle", "message": "尚未生成计划"}
@@ -151,6 +152,35 @@ def _request_date_coverage(api_name: str, start: str, end: str) -> int:
             (api_name, start, end),
         ).fetchone()
     return int(dict(row).get("n") or 0)
+
+
+def _theme_snapshot_dates(dates: list[str]) -> set[str]:
+    if not dates:
+        return set()
+    placeholders = ",".join("?" for _ in dates)
+    with _conn() as c:
+        rows = c.execute(
+            f"SELECT DISTINCT as_of_date FROM dc_theme_snapshot WHERE as_of_date IN ({placeholders})",
+            tuple(dates),
+        ).fetchall()
+    return {str(dict(row).get("as_of_date") or "") for row in rows}
+
+
+def _latest_snapshot_date_on_or_before(end: str) -> str:
+    with _conn() as c:
+        row = c.execute(
+            """
+            SELECT trade_date value
+            FROM dc_stock_daily_snapshot
+            WHERE trade_date<=?
+            GROUP BY trade_date
+            HAVING SUM(CASE WHEN close IS NOT NULL THEN 1 ELSE 0 END) > 0
+            ORDER BY trade_date DESC
+            LIMIT 1
+            """,
+            (end,),
+        ).fetchone()
+    return str(dict(row).get("value") or end) if row else end
 
 
 def build_backfill_plan(*, market_batch_days: int = 30, financial_batch_size: int = 100) -> dict[str, Any]:
@@ -305,11 +335,6 @@ def build_backfill_plan(*, market_batch_days: int = 30, financial_batch_size: in
             {"start_date": vip["scope"]["capital_start"], "end_date": end_s, "cursor": vip["etf_price_nav"].get("resume_cursor", ""), "mode": "daily", "limit_dates": min(30, market_batch_days), "nav_limit_funds": min(100, financial_batch_size)},
         ),
         (
-            "etf_constituents_vip", "补全沪深ETF每日持仓组合", "sync_etf_constituents_batch",
-            vip["etf_constituents"],
-            {"start_date": vip["scope"]["capital_start"], "end_date": end_s, "cursor": vip["etf_constituents"].get("resume_cursor", ""), "limit_dates": min(60, market_batch_days)},
-        ),
-        (
             "major_news_vip", "补全九来源长篇新闻历史", "sync_major_news_history_batch",
             vip["major_news"],
             {"start_date": vip["scope"]["news_start"], "end_date": end_s, "cursor": vip["major_news"].get("resume_cursor", ""), "limit_days": min(31, market_batch_days)},
@@ -334,6 +359,57 @@ def build_backfill_plan(*, market_batch_days: int = 30, financial_batch_size: in
                 "coverage": float(contract.get("coverage") or 0),
             },
         })
+
+    # Official exchange PCF is independent from TuShare. SZSE exposes dated
+    # files; SSE public data only guarantees the latest basket, so unavailable
+    # old SSE dates remain explicit rather than being marked as valid-empty.
+    pcf_asset = next((item for item in assets.get("items") or [] if item.get("key") == "exchange_etf_pcf"), {})
+    pcf_open_dates = _open_dates(end_s, _ymd(today))
+    pcf_end = max([end_s, *pcf_open_dates])
+    pcf_start = max(start_s, _ymd(today - timedelta(days=365)))
+    pcf_done = str(pcf_asset.get("status") or "") == "complete" and str(pcf_asset.get("max_date") or "") >= pcf_end
+    # Incomplete latest coverage must retry that exact day; advancing a date
+    # cursor merely because one ETF succeeded would strand the remaining ETFs.
+    pcf_params_start = pcf_start if pcf_done else pcf_end
+    pcf_cursor = str(pcf_asset.get("max_date") or "") if pcf_done else ""
+    add({
+        "priority": 2,
+        "key": "exchange_etf_pcf",
+        "title": "补全交易所ETF申购赎回篮子",
+        "why": "深交所按公开日期回补最近一年；上交所补最新并从接入日起每日归档，不伪造不可得历史",
+        "action": "sync_exchange_etf_pcf_batch",
+        "params": {"start_date": pcf_params_start, "end_date": pcf_end, "cursor": pcf_cursor, "limit_dates": 1},
+        "estimated_calls": 1,
+        "estimated_minutes": 10,
+        "status": "done" if pcf_done else "needed",
+        "gap": {"have": int(pcf_asset.get("actual_records") or 0), "max_date": pcf_asset.get("max_date"), "need_date": pcf_end},
+    })
+
+    # 3b. Derived theme snapshots for the narrative lifecycle model.  This is
+    # generated from already-stored market/industry data, so it belongs in the
+    # data platform plan rather than hidden inside model training.
+    theme_end_s = _latest_snapshot_date_on_or_before(end_s)
+    theme_open_days = [day for day in open_days if day <= theme_end_s]
+    target_theme_dates = list(reversed(theme_open_days[-250:])) if theme_open_days else []
+    have_theme_dates = _theme_snapshot_dates(target_theme_dates)
+    missing_theme_dates = [trade_date for trade_date in reversed(target_theme_dates) if trade_date not in have_theme_dates]
+    add({
+        "priority": 2,
+        "key": "theme_snapshots_250",
+        "title": "补全250日主题快照",
+        "why": f"叙事状态转移模型需要最近250个可用行情交易日主题快照，当前 {len(have_theme_dates)}/{len(target_theme_dates) or 250}，截止 {theme_end_s}",
+        "action": "materialize_theme_snapshots_batch",
+        "params": {"end_date": theme_end_s, "target_sessions": 250, "limit_dates": min(30, market_batch_days)},
+        "estimated_calls": max(0, len(missing_theme_dates)),
+        "estimated_minutes": round(max(0, len(missing_theme_dates)) * 0.05, 1),
+        "status": "done" if target_theme_dates and len(have_theme_dates) >= min(250, len(target_theme_dates)) else "needed",
+        "gap": {
+            "have_dates": len(have_theme_dates),
+            "need_dates": min(250, len(target_theme_dates) or 250),
+            "missing_dates": missing_theme_dates[:60],
+            "batch": min(30, market_batch_days),
+        },
+    })
 
     # 4. Core financial statements — VIP APIs fetch the whole report period.
     # Annual-only extras are deliberately separate: a successful VIP return
@@ -531,10 +607,10 @@ def build_backfill_plan(*, market_batch_days: int = 30, financial_batch_size: in
         "stk_holdernumber", "pledge_stat", "express", "industry_index", "index_weight",
         "income", "balancesheet", "cashflow", "financial_indicator", "fina_audit",
         "fina_mainbz", "announcements", "macro",
-        "capital_structure_vip", "etf_price_nav_vip", "etf_constituents_vip", "major_news_vip",
+        "capital_structure_vip", "etf_price_nav_vip", "major_news_vip",
         "vip_moneyflow_hsgt", "vip_hk_hold", "vip_margin", "vip_margin_detail",
         "vip_margin_secs", "vip_top_list", "vip_top_inst", "vip_fund_basic",
-        "vip_fund_daily", "vip_fund_nav", "vip_etf_sh_cons", "vip_etf_sz_cons",
+        "vip_fund_daily", "vip_fund_nav",
     }
     fallback_supplements = {"income", "balancesheet", "cashflow", "financial_indicator", "valuation"}
     for item in asset_gaps:
@@ -609,8 +685,9 @@ def build_backfill_plan(*, market_batch_days: int = 30, financial_batch_size: in
                 "sync_macro_core",
                 "sync_capital_history_batch",
                 "sync_etf_history_batch",
-                "sync_etf_constituents_batch",
                 "sync_major_news_history_batch",
+                "sync_exchange_etf_pcf_batch",
+                "materialize_theme_snapshots_batch",
                 "noop",
             ],
             "note": "可一键执行全部自动步骤；复权因子按交易日整批获取，核心财务按报告期 VIP 整批获取，失败接口再降级补偿。",
@@ -761,10 +838,12 @@ def recover_interrupted_backfill() -> dict[str, Any]:
     if was_running or stale_ids:
         snapshot = {
             **(cached or {}), "running": False, "phase": "interrupted",
-            "message": "服务重启导致任务中断；已写入数据保留，可点击继续补全",
+            "message": "服务重启导致任务中断；已写入数据保留；可重新生成并继续历史补全计划",
             "finished_at": _now(), "error": "process_restarted",
             "auto_resume": False,
             "resume_action": "start_backfill",
+            "current_step": None,
+            "activity": None,
         }
         with _lock:
             _state.clear()
@@ -996,19 +1075,24 @@ def _run_step(step: dict[str, Any]) -> dict[str, Any]:
             cursor=str(params.get("cursor") or ""),
             limit_funds=int(params.get("limit_funds") or 20),
         )
-    if action == "sync_etf_constituents_batch":
-        return backfill_etf_constituents_history(
-            start_date=str(params.get("start_date") or "20200101"),
-            end_date=str(params.get("end_date") or ""),
-            cursor=str(params.get("cursor") or ""),
-            limit_dates=int(params.get("limit_dates") or 20),
-        )
     if action == "sync_major_news_history_batch":
         return backfill_major_news_history(
             start_date=str(params.get("start_date") or ""),
             end_date=str(params.get("end_date") or ""),
             cursor=str(params.get("cursor") or ""),
             limit_days=int(params.get("limit_days") or 7),
+        )
+    if action == "sync_exchange_etf_pcf_batch":
+        return backfill_exchange_etf_pcf(
+            start_date=str(params.get("start_date") or ""), end_date=str(params.get("end_date") or ""),
+            cursor=str(params.get("cursor") or ""), limit_dates=int(params.get("limit_dates") or 1),
+            limit_funds=int(params.get("limit_funds") or 0),
+        )
+    if action == "materialize_theme_snapshots_batch":
+        return materialize_theme_snapshot_history(
+            end_date=str(params.get("end_date") or ""),
+            target_sessions=int(params.get("target_sessions") or 250),
+            limit_dates=int(params.get("limit_dates") or 20),
         )
     if action == "sync_index_core":
         return sync_index_bundle(
@@ -1054,7 +1138,9 @@ def _worker(plan: dict[str, Any], *, max_steps: int, stream_id: str | None = Non
             if s.get("status") == "needed" and s.get("action") in {
                 "sync_trade_calendar", "sync_market_batch", "sync_financial_batch",
                 "sync_announcements", "sync_stock_api_batch", "sync_date_api_batch", "sync_index_core", "sync_macro_core",
-                "sync_capital_history_batch", "sync_etf_history_batch", "sync_etf_constituents_batch", "sync_major_news_history_batch",
+                "sync_capital_history_batch", "sync_etf_history_batch", "sync_major_news_history_batch",
+                "sync_exchange_etf_pcf_batch",
+                "materialize_theme_snapshots_batch",
             }
         ]
         if not runnable:
@@ -1164,7 +1250,7 @@ def _worker(plan: dict[str, Any], *, max_steps: int, stream_id: str | None = Non
                 remaining = [
                     s for s in refreshed.get("steps") or []
                     if s.get("status") == "needed"
-                    and s.get("action") in {"sync_market_batch", "sync_financial_batch", "sync_announcements", "run_quality", "sync_stock_api_batch", "sync_date_api_batch", "sync_index_core", "sync_macro_core", "sync_capital_history_batch", "sync_etf_history_batch", "sync_etf_constituents_batch", "sync_major_news_history_batch"}
+                    and s.get("action") in {"sync_market_batch", "sync_financial_batch", "sync_announcements", "run_quality", "sync_stock_api_batch", "sync_date_api_batch", "sync_index_core", "sync_macro_core", "sync_capital_history_batch", "sync_etf_history_batch", "sync_major_news_history_batch", "sync_exchange_etf_pcf_batch", "materialize_theme_snapshots_batch"}
                     and str(s.get("key")) not in already
                     and str(s.get("key") or s.get("id") or "") not in deferred_keys
                 ]
@@ -1188,7 +1274,7 @@ def _worker(plan: dict[str, Any], *, max_steps: int, stream_id: str | None = Non
                     # Quality is a terminal verification step. Re-adding it
                     # together with every quota-safe data batch caused
                     # "补全 -> 质量 -> 下一轮" to repeat indefinitely.
-                    and s.get("action") in {"sync_trade_calendar", "sync_market_batch", "sync_financial_batch", "sync_announcements", "sync_stock_api_batch", "sync_date_api_batch", "sync_index_core", "sync_macro_core", "sync_capital_history_batch", "sync_etf_history_batch", "sync_etf_constituents_batch", "sync_major_news_history_batch"}
+                    and s.get("action") in {"sync_trade_calendar", "sync_market_batch", "sync_financial_batch", "sync_announcements", "sync_stock_api_batch", "sync_date_api_batch", "sync_index_core", "sync_macro_core", "sync_capital_history_batch", "sync_etf_history_batch", "sync_major_news_history_batch", "sync_exchange_etf_pcf_batch", "materialize_theme_snapshots_batch"}
                     and str(s.get("key") or s.get("id") or "") not in deferred_keys
                 ]
                 if remaining:

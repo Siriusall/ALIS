@@ -31,7 +31,6 @@ from app.data_platform.services.data_center import (
     sync_capital_structure_bundle,
     backfill_capital_structure_history,
     backfill_etf_daily_incremental,
-    backfill_etf_constituents_history,
     backfill_etf_price_history,
     backfill_major_news_history,
     get_vip_backfill_status,
@@ -56,6 +55,8 @@ from app.data_platform.services.assets import get_data_assets
 from app.data_platform.services.backfill import build_backfill_plan, get_backfill_status, start_backfill
 from app.data_platform.services.cold_archive import archive_raw_records, cold_archive_status
 from app.data_platform.services.stream_admin import bulk_handle_stream_messages, handle_stream_message, stream_admin_status
+from app.services.theme_engine import materialize_theme_snapshot_history
+from app.data_platform.services.exchange_etf_pcf import backfill_exchange_etf_pcf, sync_exchange_etf_pcf
 
 router = APIRouter(tags=["data-center"])
 
@@ -431,16 +432,27 @@ def data_center_backfill_etf_history(
     )
 
 
-@router.post("/data-center/backfill/etf-constituents")
-def data_center_backfill_etf_constituents(
-    start_date: str = Query(..., description="YYYYMMDD"),
-    end_date: str = Query(..., description="YYYYMMDD"),
-    cursor: str = Query(default="", description="Last completed YYYYMMDD"),
-    limit_dates: int = Query(default=20, ge=1, le=60),
+@router.post("/data-center/sync/exchange-etf-pcf")
+def data_center_sync_exchange_etf_pcf(
+    trade_date: str = Query(..., min_length=8, max_length=8, description="YYYYMMDD"),
+    limit_funds: int = Query(default=0, ge=0, le=2000),
 ) -> dict[str, Any]:
-    """Run one resumable Shanghai/Shenzhen ETF basket history slice."""
-    return backfill_etf_constituents_history(
-        start_date=start_date, end_date=end_date, cursor=cursor, limit_dates=limit_dates
+    """Collect official SSE/SZSE ETF creation-redemption baskets for one day."""
+    return sync_exchange_etf_pcf(trade_date, limit_funds=limit_funds)
+
+
+@router.post("/data-center/backfill/exchange-etf-pcf")
+def data_center_backfill_exchange_etf_pcf(
+    start_date: str = Query(..., min_length=8, max_length=8),
+    end_date: str = Query(..., min_length=8, max_length=8),
+    cursor: str = Query(default=""),
+    limit_dates: int = Query(default=1, ge=1, le=20),
+    limit_funds: int = Query(default=0, ge=0, le=2000),
+) -> dict[str, Any]:
+    """Run one resumable official-exchange PCF history slice."""
+    return backfill_exchange_etf_pcf(
+        start_date=start_date, end_date=end_date, cursor=cursor,
+        limit_dates=limit_dates, limit_funds=limit_funds,
     )
 
 
@@ -454,6 +466,20 @@ def data_center_backfill_major_news(
     """Run one resumable source-by-day long-form news slice."""
     return backfill_major_news_history(
         start_date=start_date, end_date=end_date, cursor=cursor, limit_days=limit_days
+    )
+
+
+@router.post("/data-center/backfill/theme-snapshots")
+def data_center_backfill_theme_snapshots(
+    end_date: str = Query(default="", description="YYYYMMDD；默认最新交易日"),
+    target_sessions: int = Query(default=250, ge=3, le=760),
+    limit_dates: int = Query(default=30, ge=1, le=80),
+) -> dict[str, Any]:
+    """Materialize derived theme snapshots for narrative lifecycle training."""
+    return materialize_theme_snapshot_history(
+        end_date=end_date,
+        target_sessions=target_sessions,
+        limit_dates=limit_dates,
     )
 
 

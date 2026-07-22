@@ -69,3 +69,33 @@ def test_bootstrap_production_model_unblocks_selection_chain():
     }})
 
     assert pause.should_pause is False
+
+
+def test_decision_gate_blocks_new_exposure_when_equity_exceeds_effective_budget():
+    ledger = {"cash_balance": 30_000, "position_market_value": 70_000, "total_equity": 100_000}
+    market = {
+        "ok": True,
+        "position_gate": {"allow_new_exposure": True, "combined_risk_budget_multiplier": 0.525},
+        "market_state": {"state": "S3", "risk_budget_multiplier": 0.7},
+        "portfolio_risk": {"breaches": [], "deleveraging_actions": []},
+    }
+
+    gate = decision._build_gate_decision(
+        data_health={"issues": []},
+        latest_data_contract={"ok": True, "latest_trade_date": "20260721", "missing_apis": [], "snapshot_ready": True},
+        ledger=ledger,
+        model_status={"active_version": {"is_active": True}},
+        market_overview=market,
+    )
+    explanation = decision._risk_gate_explanation(
+        gate_decision=gate,
+        latest_data_contract={"ok": True},
+        ledger=ledger,
+        model_status={"active_version": {"is_active": True}},
+        market_overview=market,
+        recent_execution=None,
+    )
+
+    assert gate["reason_code"] == "equity_budget_exceeded"
+    assert explanation["allow_new_exposure"] is False
+    assert explanation["requires_rebalance"] is True

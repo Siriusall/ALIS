@@ -5,7 +5,7 @@ import pytest
 from app.data_platform.services import data_center
 
 
-def test_vip_missing_data_catalog_is_complete():
+def test_supported_vip_data_catalog_is_complete():
     names = {item.api_name for item in data_center.TUSHARE_CATALOG}
     assert {
         "moneyflow_hsgt",
@@ -17,8 +17,6 @@ def test_vip_missing_data_catalog_is_complete():
         "top_inst",
         "major_news",
         "fund_nav",
-        "etf_sh_cons",
-        "etf_sz_cons",
     } <= names
 
 
@@ -150,40 +148,6 @@ def test_etf_history_filters_unlisted_and_uses_listing_date(monkeypatch):
     assert result["funds_processed"] == 1
     assert {api for api, _ in calls} == {"fund_daily", "fund_nav"}
     assert all(params["start_date"] == "20200101" for _, params in calls)
-
-
-def test_etf_constituent_history_uses_fund_portfolio(monkeypatch):
-    """ETF constituent backfill now uses fund_portfolio API."""
-    class FakeDf:
-        def __init__(self, data):
-            self._data = data
-            self.columns = ["ts_code"]
-        def tolist(self):
-            return [r[0] for r in self._data]
-        def empty(self):
-            return False
-        def __len__(self):
-            return len(self._data)
-    
-    class FakePro:
-        def fund_basic(self, market="E"):
-            return FakeDf([["510050.SH"], ["515840.SH"]])
-        def fund_portfolio(self, ts_code="", start_date="", end_date=""):
-            return FakeDf([[ts_code, "600519.SH", 5.0]])
-    
-    class FakeClient:
-        def __init__(self):
-            self.pro = FakePro()
-    
-    monkeypatch.setattr(data_center, "get_tushare_client", lambda: FakeClient())
-    monkeypatch.setattr(data_center, "_safe_sync_raw", lambda api, params: {"ok": True, "rows_written": 1})
-    monkeypatch.setattr(data_center, "_conn", lambda: FakeConn())
-    
-    result = data_center.backfill_etf_constituents_history(
-        start_date="20260716", end_date="20260717", limit_dates=2
-    )
-    assert result["dates_processed"] == 2
-    assert result["has_more"] is True
 
 
 def test_major_news_history_slices_each_source_by_calendar_day(monkeypatch):

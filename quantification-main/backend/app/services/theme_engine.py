@@ -162,6 +162,66 @@ def materialize_theme_snapshots(*, as_of_time: str | None = None, lookback: int 
     return {"ok": True, "as_of_date": dates[-1], "themes_written": written, "company_mappings_written": mappings, "promotable": sum(1 for item in scored if item["promotable"]), "model_version": "industry_price_fundamental_theme_v1"}
 
 
+def materialize_theme_snapshot_history(*, end_date: str = "", target_sessions: int = 250, limit_dates: int = 20) -> dict[str, Any]:
+    target = max(1, min(int(target_sessions or 250), 760))
+    limit = max(1, min(int(limit_dates or 20), 80))
+    cutoff = str(end_date or "").replace("-", "")[:8]
+    with _conn() as c:
+        if not cutoff:
+            row = c.execute("SELECT MAX(trade_date) value FROM dc_stock_daily_snapshot").fetchone()
+            cutoff = str(dict(row).get("value") or "") if row else ""
+        usable_row = c.execute(
+            """
+            SELECT trade_date value
+            FROM dc_stock_daily_snapshot
+            WHERE trade_date<=?
+            GROUP BY trade_date
+            HAVING SUM(CASE WHEN close IS NOT NULL THEN 1 ELSE 0 END) > 0
+            ORDER BY trade_date DESC
+            LIMIT 1
+            """,
+            (cutoff,),
+        ).fetchone()
+        usable_cutoff = str(dict(usable_row).get("value") or cutoff) if usable_row else cutoff
+        rows = c.execute(
+            """
+            SELECT cal_date FROM dc_trade_calendar
+            WHERE is_open=1 AND cal_date<=?
+            ORDER BY cal_date DESC LIMIT ?
+            """,
+            (usable_cutoff, target),
+        ).fetchall()
+        target_dates = [str(dict(row).get("cal_date") or "") for row in rows if dict(row).get("cal_date")]
+        placeholders = ",".join("?" for _ in target_dates)
+        existing_rows = c.execute(
+            f"SELECT DISTINCT as_of_date FROM dc_theme_snapshot WHERE as_of_date IN ({placeholders})",
+            tuple(target_dates),
+        ).fetchall() if target_dates else []
+        existing = {str(dict(row).get("as_of_date") or "") for row in existing_rows}
+    missing = sorted([trade_date for trade_date in target_dates if trade_date not in existing])
+    batch = missing[:limit]
+    results = []
+    for trade_date in batch:
+        try:
+            results.append(materialize_theme_snapshots(as_of_time=f"{trade_date[:4]}-{trade_date[4:6]}-{trade_date[6:8]}T23:59:59", lookback=60))
+        except Exception as exc:
+            results.append({"ok": False, "as_of_date": trade_date, "error": str(exc)[:300]})
+    written_dates = [str(item.get("as_of_date") or "") for item in results if item.get("ok")]
+    return {
+        "ok": all(bool(item.get("ok")) for item in results) if results else True,
+        "target_sessions": target,
+        "requested_end_date": cutoff,
+        "effective_end_date": usable_cutoff,
+        "existing_sessions": len(existing),
+        "missing_sessions": len(missing),
+        "processed_sessions": len(batch),
+        "written_sessions": len(written_dates),
+        "written_dates": written_dates,
+        "remaining_sessions": max(0, len(missing) - len(written_dates)),
+        "results": results[:10],
+    }
+
+
 def list_themes(*, as_of_time: str | None = None, promotable_only: bool = False, limit: int = 100) -> dict[str, Any]:
     cutoff = str(as_of_time or "")[:10].replace("-", "")
     with _conn() as c:

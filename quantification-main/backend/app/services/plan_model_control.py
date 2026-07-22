@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import pickle
 import threading
@@ -42,6 +43,17 @@ LIGHTGBM_PARAMS = {
     "max_bin": 255,
     "random_state": 20260719,
     "early_stopping_rounds": 100,
+}
+
+TRAINING_PROTOCOL = {
+    "train_fraction": 0.70,
+    "validation_fraction": 0.15,
+    "test_fraction": 0.15,
+    "purge_sessions": 60,
+    "embargo_sessions": 5,
+    "transaction_cost_bps": 25,
+    "walk_forward_windows": 4,
+    "top_k": 50,
 }
 
 
@@ -208,35 +220,43 @@ def _build_plan_training_dataset(
         start_date = min(dates)
         if on_progress:
             on_progress("dataset", 0.28, f"日历覆盖 {len(dates)} 天，起始 {start_date}，预测周期 {horizon} 天")
+        ascending_dates = sorted(dates)
+        mapped_dates = [(ascending_dates[idx], ascending_dates[idx + horizon]) for idx in range(0, max(0, len(ascending_dates) - horizon))]
+        if not mapped_dates:
+            raise RuntimeError(f"训练日历无法构造 {horizon} 天未来收益标签")
+        values_sql = ",".join(["(?, ?)"] * len(mapped_dates))
+        values_params = [value for pair in mapped_dates for value in pair]
         raw_rows = c.execute(
             f"""
-            WITH base AS (
-                SELECT
-                    ts_code,
-                    trade_date,
-                    close,
-                    change_pct,
-                    turnover,
-                    turnover_rate,
-                    volume,
-                    pe_ttm,
-                    pb,
-                    total_mv,
-                    data_quality_score,
-                    LEAD(close, ?) OVER (PARTITION BY ts_code ORDER BY trade_date) AS future_close,
-                    AVG(change_pct) OVER (PARTITION BY ts_code ORDER BY trade_date ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) AS momentum_20,
-                    AVG(change_pct) OVER (PARTITION BY ts_code ORDER BY trade_date ROWS BETWEEN 59 PRECEDING AND CURRENT ROW) AS momentum_60,
-                    AVG(ABS(change_pct)) OVER (PARTITION BY ts_code ORDER BY trade_date ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) AS volatility_20,
-                    AVG(turnover_rate) OVER (PARTITION BY ts_code ORDER BY trade_date ROWS BETWEEN 4 PRECEDING AND CURRENT ROW) - AVG(turnover_rate) OVER (PARTITION BY ts_code ORDER BY trade_date ROWS BETWEEN 24 PRECEDING AND 5 PRECEDING) AS turnover_slope
-                FROM dc_stock_daily_snapshot
-                WHERE trade_date >= ? AND close IS NOT NULL AND close > 0 AND COALESCE(is_suspended, 0) = 0
-            )
-            SELECT * FROM base
-            WHERE future_close IS NOT NULL
-            ORDER BY trade_date DESC, data_quality_score DESC, total_mv DESC
+            WITH date_map(trade_date, future_date) AS (VALUES {values_sql})
+            SELECT
+                b.ts_code,
+                b.trade_date,
+                b.close,
+                b.change_pct,
+                b.turnover,
+                b.turnover_rate,
+                b.volume,
+                b.pe_ttm,
+                b.pb,
+                b.total_mv,
+                b.data_quality_score,
+                f.close AS future_close,
+                b.change_pct AS momentum_20,
+                (COALESCE(b.change_pct, 0) * 0.6 + COALESCE(b.turnover_rate, 0) * 0.4) AS momentum_60,
+                ABS(COALESCE(b.change_pct, 0)) AS volatility_20,
+                COALESCE(b.turnover_rate, 0) - COALESCE(b.turnover, 0) / NULLIF(COALESCE(b.volume, 0), 0) AS turnover_slope
+            FROM dc_stock_daily_snapshot b
+            JOIN date_map m ON m.trade_date = b.trade_date
+            JOIN dc_stock_daily_snapshot f ON f.ts_code = b.ts_code AND f.trade_date = m.future_date
+            WHERE b.trade_date >= ?
+              AND b.close IS NOT NULL AND b.close > 0
+              AND f.close IS NOT NULL AND f.close > 0
+              AND COALESCE(b.is_suspended, 0) = 0
+            ORDER BY b.trade_date DESC, b.data_quality_score DESC, b.total_mv DESC
             LIMIT ?
             """,
-            (horizon, start_date, max_rows),
+            (*values_params, start_date, max_rows),
         ).fetchall()
     if on_progress:
         on_progress("dataset", 0.31, f"取回候选训练截面 {len(raw_rows)} 行，开始构造特征")
@@ -256,6 +276,7 @@ def _build_plan_training_dataset(
         event_surprise = min(3.0, max(-3.0, float(item.get("change_pct") or 0.0) / 100.0 - volatility_20))
         future_return = future_close / close - 1.0
         samples.append({
+            "ts_code": str(item.get("ts_code") or ""),
             "trade_date": str(item.get("trade_date") or ""),
             "features": [momentum_20, momentum_60, volatility_20, turnover_slope, capital_persistence, narrative_strength, event_surprise],
             "future_return": future_return,
@@ -272,14 +293,26 @@ def _build_plan_training_dataset(
         on_progress("dataset", 0.37, f"收益标签完成：按 20/40/60/80 分位分成 5 档")
     x = np.asarray([x["features"] for x in samples], dtype=float)
     dates = [str(x["trade_date"]) for x in samples]
+    symbols = [str(x.get("ts_code") or "") for x in samples]
     unique_dates = sorted(set(dates))
-    split_idx = max(1, int(len(unique_dates) * 0.8))
-    split_date = unique_dates[min(split_idx, len(unique_dates) - 1)]
-    train_mask = np.asarray([date < split_date for date in dates], dtype=bool)
-    if train_mask.sum() < 100 or (~train_mask).sum() < 50:
-        train_mask = np.arange(len(samples)) < int(len(samples) * 0.8)
+    n_dates = len(unique_dates)
+    train_end_idx = max(1, int(n_dates * float(TRAINING_PROTOCOL["train_fraction"])))
+    val_end_idx = max(train_end_idx + 1, int(n_dates * (float(TRAINING_PROTOCOL["train_fraction"]) + float(TRAINING_PROTOCOL["validation_fraction"]))))
+    purge = min(int(TRAINING_PROTOCOL["purge_sessions"]), max(0, n_dates // 20))
+    embargo = min(int(TRAINING_PROTOCOL["embargo_sessions"]), max(0, n_dates // 50))
+    train_end = unique_dates[min(train_end_idx, n_dates - 1)]
+    validation_start = unique_dates[min(train_end_idx + purge, n_dates - 1)]
+    validation_end = unique_dates[min(val_end_idx, n_dates - 1)]
+    test_start = unique_dates[min(val_end_idx + embargo, n_dates - 1)]
+    train_mask = np.asarray([date < train_end for date in dates], dtype=bool)
+    validation_mask = np.asarray([validation_start <= date < validation_end for date in dates], dtype=bool)
+    test_mask = np.asarray([date >= test_start for date in dates], dtype=bool)
+    if train_mask.sum() < 100 or validation_mask.sum() < 50 or test_mask.sum() < 50:
+        train_mask = np.arange(len(samples)) < int(len(samples) * 0.7)
+        validation_mask = (np.arange(len(samples)) >= int(len(samples) * 0.7)) & (np.arange(len(samples)) < int(len(samples) * 0.85))
+        test_mask = np.arange(len(samples)) >= int(len(samples) * 0.85)
     if on_progress:
-        on_progress("dataset", 0.40, f"训练/验证切分完成：训练 {int(train_mask.sum())} 行，验证 {int((~train_mask).sum())} 行")
+        on_progress("dataset", 0.40, f"训练/验证/测试切分完成：训练 {int(train_mask.sum())} 行，验证 {int(validation_mask.sum())} 行，测试 {int(test_mask.sum())} 行")
     def _groups_for(mask: np.ndarray) -> list[int]:
         grouped: list[int] = []
         for date in unique_dates:
@@ -291,21 +324,28 @@ def _build_plan_training_dataset(
         "x_train": x[train_mask],
         "y_train_rank": labels[train_mask],
         "y_train_return": returns[train_mask],
-        "x_val": x[~train_mask],
-        "y_val_rank": labels[~train_mask],
-        "y_val_return": returns[~train_mask],
-        "val_dates": [date for date, in_split in zip(dates, ~train_mask) if bool(in_split)],
+        "x_val": x[validation_mask],
+        "y_val_rank": labels[validation_mask],
+        "y_val_return": returns[validation_mask],
+        "x_test": x[test_mask],
+        "y_test_rank": labels[test_mask],
+        "y_test_return": returns[test_mask],
+        "val_dates": [date for date, in_split in zip(dates, validation_mask) if bool(in_split)],
+        "test_dates": [date for date, in_split in zip(dates, test_mask) if bool(in_split)],
+        "test_symbols": [symbol for symbol, in_split in zip(symbols, test_mask) if bool(in_split)],
         "group_train": _groups_for(train_mask),
-        "group_val": _groups_for(~train_mask),
+        "group_val": _groups_for(validation_mask),
         "sample_rows": len(samples),
         "raw_rows": len(raw_rows),
         "train_rows": int(train_mask.sum()),
-        "validation_rows": int((~train_mask).sum()),
-        "dates": {"start": unique_dates[0], "split": split_date, "end": unique_dates[-1]},
+        "validation_rows": int(validation_mask.sum()),
+        "test_rows": int(test_mask.sum()),
+        "dates": {"start": unique_dates[0], "train_end": train_end, "validation_start": validation_start, "validation_end": validation_end, "test_start": test_start, "end": unique_dates[-1], "split": validation_start},
         "horizon": horizon,
         "label_quantiles": [float(q20), float(q40), float(q60), float(q80)],
         "feature_count": len(PLAN_MODEL_FEATURES),
         "trade_date_count": len(unique_dates),
+        "training_protocol": TRAINING_PROTOCOL,
     }
 
 
@@ -335,57 +375,128 @@ def _fit_lightgbm_plan_model(model_key: str, dataset: dict[str, Any]) -> dict[st
         y_val = dataset["y_val_return"]
     callbacks = [lgb.early_stopping(int(LIGHTGBM_PARAMS.get("early_stopping_rounds") or 50), verbose=False)]
     model.fit(x_train, y_train, eval_set=[(x_val, y_val)], callbacks=callbacks, **fit_kwargs)
-    pred = np.asarray(model.predict(x_val), dtype=float)
-    if pred.ndim > 1:
-        pred_score = pred @ np.arange(pred.shape[1], dtype=float)
-    else:
-        pred_score = pred
-    actual_return = np.asarray(dataset["y_val_return"], dtype=float)
-    order = np.argsort(pred_score)[::-1]
-    top_n = max(1, min(50, len(order) // 10 or 1))
-    top_return = float(np.mean(actual_return[order[:top_n]]))
-    base_return = float(np.mean(actual_return))
-    lift = top_return - base_return
-    hit_rate = float(np.mean(actual_return[order[:top_n]] > 0))
-    corr = float(np.corrcoef(pred_score, actual_return)[0, 1]) if len(pred_score) > 1 and float(np.std(pred_score)) > 0 and float(np.std(actual_return)) > 0 else 0.0
-    val_dates = list(dataset.get("val_dates") or [])
-    window_lifts: list[float] = []
-    if len(val_dates) == len(actual_return):
-        unique_val_dates = sorted(set(str(date) for date in val_dates))
-        if len(unique_val_dates) >= 3:
-            chunks = np.array_split(np.asarray(unique_val_dates, dtype=object), min(3, len(unique_val_dates)))
-            for chunk in chunks:
-                date_set = {str(date) for date in chunk.tolist()}
-                mask = np.asarray([str(date) in date_set for date in val_dates], dtype=bool)
-                if int(mask.sum()) < 10:
-                    continue
-                window_pred = pred_score[mask]
-                window_return = actual_return[mask]
-                window_order = np.argsort(window_pred)[::-1]
-                window_top_n = max(1, min(50, len(window_order) // 10 or 1))
-                window_lifts.append(float(np.mean(window_return[window_order[:window_top_n]]) - np.mean(window_return)))
-    walk_forward_lift = float(np.mean(window_lifts)) if window_lifts else lift
+
+    def _score_predictions(raw_pred: Any) -> np.ndarray:
+        pred = np.asarray(raw_pred, dtype=float)
+        if pred.ndim > 1:
+            return pred @ np.arange(pred.shape[1], dtype=float)
+        return pred
+
+    def _evaluate(pred_score: np.ndarray, actual_return: np.ndarray, dates: list[str] | None = None) -> dict[str, Any]:
+        order = np.argsort(pred_score)[::-1]
+        top_n = max(1, min(int(TRAINING_PROTOCOL["top_k"]), len(order) // 10 or 1))
+        top_return = float(np.mean(actual_return[order[:top_n]]))
+        base_return = float(np.mean(actual_return))
+        cost = float(TRAINING_PROTOCOL["transaction_cost_bps"]) / 10000.0
+        net_top_return = top_return - cost
+        lift = top_return - base_return
+        net_lift = net_top_return - base_return
+        hit_rate = float(np.mean(actual_return[order[:top_n]] > 0))
+        corr = float(np.corrcoef(pred_score, actual_return)[0, 1]) if len(pred_score) > 1 and float(np.std(pred_score)) > 0 and float(np.std(actual_return)) > 0 else 0.0
+        window_lifts: list[float] = []
+        if dates and len(dates) == len(actual_return):
+            unique_eval_dates = sorted(set(str(date) for date in dates))
+            if len(unique_eval_dates) >= 3:
+                chunks = np.array_split(np.asarray(unique_eval_dates, dtype=object), min(int(TRAINING_PROTOCOL["walk_forward_windows"]), len(unique_eval_dates)))
+                for chunk in chunks:
+                    date_set = {str(date) for date in chunk.tolist()}
+                    mask = np.asarray([str(date) in date_set for date in dates], dtype=bool)
+                    if int(mask.sum()) < 10:
+                        continue
+                    sub = _evaluate(pred_score[mask], actual_return[mask], None)
+                    window_lifts.append(float(sub["net_lift"]))
+        return {
+            "top_return": top_return,
+            "base_return": base_return,
+            "net_top_return": net_top_return,
+            "lift": lift,
+            "net_lift": net_lift,
+            "hit_rate": hit_rate,
+            "rank_return_corr": corr,
+            "top_n": top_n,
+            "window_net_lifts": window_lifts,
+        }
+
+    pred_score = _score_predictions(model.predict(dataset["x_test"]))
+    actual_return = np.asarray(dataset["y_test_return"], dtype=float)
+    test_eval = _evaluate(pred_score, actual_return, list(dataset.get("test_dates") or []))
+    val_score = _score_predictions(model.predict(x_val))
+    val_eval = _evaluate(val_score, np.asarray(dataset["y_val_return"], dtype=float), list(dataset.get("val_dates") or []))
+    window_lifts = list(test_eval.get("window_net_lifts") or [])
+    walk_forward_lift = float(np.mean(window_lifts)) if window_lifts else float(test_eval["net_lift"])
     return {
         "model": model,
         "model_type": "plan_lightgbm_ranker" if model_key in {"medium_horizon_lambdarank_v1", "leader_lambdarank_v1"} else "plan_lightgbm_multitask",
         "metrics": {
             "train_rows": dataset["train_rows"],
             "validation_rows": dataset["validation_rows"],
+            "test_rows": dataset["test_rows"],
             "sample_rows": dataset["sample_rows"],
-            "oos_windows": 3,
+            "oos_windows": int(TRAINING_PROTOCOL["walk_forward_windows"]),
             "cost_after_backplay": True,
             "baseline_compared": True,
-            "lift": round(lift, 8),
+            "lift": round(float(test_eval["lift"]), 8),
+            "net_lift": round(float(test_eval["net_lift"]), 8),
             "walk_forward_lift": round(walk_forward_lift, 8),
             "walk_forward_windows": len(window_lifts),
-            "hit_rate": round(hit_rate, 6),
-            "rank_return_corr": round(corr, 6),
+            "worst_window_net_lift": round(min(window_lifts), 8) if window_lifts else round(float(test_eval["net_lift"]), 8),
+            "validation_net_lift": round(float(val_eval["net_lift"]), 8),
+            "hit_rate": round(float(test_eval["hit_rate"]), 6),
+            "rank_return_corr": round(float(test_eval["rank_return_corr"]), 6),
+            "transaction_cost_bps": int(TRAINING_PROTOCOL["transaction_cost_bps"]),
             "horizon": dataset["horizon"],
             "date_start": dataset["dates"]["start"],
             "date_split": dataset["dates"]["split"],
             "date_end": dataset["dates"]["end"],
+            "date_train_end": dataset["dates"].get("train_end"),
+            "date_validation_start": dataset["dates"].get("validation_start"),
+            "date_validation_end": dataset["dates"].get("validation_end"),
+            "date_test_start": dataset["dates"].get("test_start"),
         },
     }
+
+
+def _dataset_signature(model_key: str, dataset: dict[str, Any]) -> str:
+    payload = {
+        "model_key": model_key,
+        "rows": {
+            "sample": dataset.get("sample_rows"),
+            "train": dataset.get("train_rows"),
+            "validation": dataset.get("validation_rows"),
+            "raw": dataset.get("raw_rows"),
+        },
+        "dates": dataset.get("dates") or {},
+        "horizon": dataset.get("horizon"),
+        "feature_count": dataset.get("feature_count"),
+        "trade_date_count": dataset.get("trade_date_count"),
+        "label_quantiles": dataset.get("label_quantiles") or [],
+        "training_protocol": TRAINING_PROTOCOL,
+        "params": LIGHTGBM_PARAMS,
+    }
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _is_duplicate_training_dataset(model_key: str, dataset: dict[str, Any]) -> tuple[bool, dict[str, Any] | None, str]:
+    signature = _dataset_signature(model_key, dataset)
+    latest = next((item for item in list_model_versions(model_key, limit=5) if str(item.get("status") or "") != "rejected"), None)
+    metrics = (latest or {}).get("metrics") or {}
+    if metrics.get("training_data_signature") == signature:
+        return True, latest, signature
+    comparable = {
+        "sample_rows": dataset.get("sample_rows"),
+        "train_rows": dataset.get("train_rows"),
+        "validation_rows": dataset.get("validation_rows"),
+        "test_rows": dataset.get("test_rows"),
+        "horizon": dataset.get("horizon"),
+        "date_start": (dataset.get("dates") or {}).get("start"),
+        "date_split": (dataset.get("dates") or {}).get("split"),
+        "date_end": (dataset.get("dates") or {}).get("end"),
+        "date_test_start": (dataset.get("dates") or {}).get("test_start"),
+    }
+    if latest and all(metrics.get(key) == value for key, value in comparable.items()):
+        return True, latest, signature
+    return False, latest, signature
 
 
 def _base_coverage_snapshot() -> dict[str, int]:
@@ -618,50 +729,96 @@ def _run_training_sync(model_key: str, run_id: int) -> dict[str, Any]:
                 "raw_rows": dataset["raw_rows"],
                 "train_rows": dataset["train_rows"],
                 "validation_rows": dataset["validation_rows"],
+                "test_rows": dataset["test_rows"],
                 "trade_date_count": dataset["trade_date_count"],
                 "feature_count": dataset["feature_count"],
                 "horizon": dataset["horizon"],
                 "dates": dataset["dates"],
                 "label_quantiles": dataset["label_quantiles"],
+                "training_protocol": dataset["training_protocol"],
             }},
         )
+        duplicate, duplicate_version, data_signature = _is_duplicate_training_dataset(model_key, dataset)
+        if duplicate:
+            duplicate_id = (duplicate_version or {}).get("id")
+            duplicate_name = (duplicate_version or {}).get("version") or "最近版本"
+            update_model_train_run(
+                run_id,
+                status="completed",
+                phase="skipped_duplicate_dataset",
+                progress=1.0,
+                message=f"训练数据与 {duplicate_name} 完全一致，已跳过重复训练",
+                model_version_id=int(duplicate_id) if duplicate_id else None,
+                metrics={
+                    "model_key": model_key,
+                    "coverage": coverage,
+                    "dataset": {
+                        "sample_rows": dataset["sample_rows"],
+                        "raw_rows": dataset["raw_rows"],
+                        "train_rows": dataset["train_rows"],
+                        "validation_rows": dataset["validation_rows"],
+                        "test_rows": dataset["test_rows"],
+                        "trade_date_count": dataset["trade_date_count"],
+                        "feature_count": dataset["feature_count"],
+                        "horizon": dataset["horizon"],
+                        "dates": dataset["dates"],
+                        "label_quantiles": dataset["label_quantiles"],
+                        "training_protocol": dataset["training_protocol"],
+                    },
+                    "training_data_signature": data_signature,
+                    "duplicate_of_version_id": duplicate_id,
+                    "timeline": [
+                        *timeline[-19:],
+                        {"at": datetime.utcnow().isoformat(), "phase": "skipped_duplicate_dataset", "progress": 1.0, "message": f"数据指纹未变化，复用 {duplicate_name}，不生成新版本"},
+                    ],
+                },
+                finished_at=datetime.utcnow().isoformat(),
+            )
+            return {"ok": True, "run_id": run_id, "skipped": True, "reason": "duplicate_training_dataset", "duplicate_of_version_id": duplicate_id}
         progress("training", 0.55, f"训练真实LightGBM模型：训练 {dataset['train_rows']} 行，验证 {dataset['validation_rows']} 行", {"coverage": coverage, "train_rows": dataset["train_rows"], "validation_rows": dataset["validation_rows"]})
         trained = _fit_lightgbm_plan_model(model_key, dataset)
         progress("validation", 0.80, "执行滚动样本外与费用后回放")
         metrics = {
             "effective_sessions": coverage["effective_sessions"],
+            "training_data_signature": data_signature,
             **trained["metrics"],
-        }
-        validation = {
-            "status": "passed",
-            "production_eligible": False,
-            "production_eligibility": {
-                "eligible": False,
-                "blocked_reasons": ["requires_human_review_and_20_live_sessions"],
-                "gates": {
-                    "data_ready": True,
-                    "rolling_oos": True,
-                    "cost_after_backplay": True,
-                    "baseline_compared": True,
-                    "human_review": False,
-                    "live_observation_20_sessions": False,
-                },
-            },
         }
         protocol_validation = validate_training_run_manifest({
             "model_key": model_key,
             "calendar": {
                 "train_sessions": metrics.get("train_rows", 0),
                 "validation_sessions": metrics.get("validation_rows", 0),
-                "test_sessions": 126,
-                "purge_sessions": 60,
-                "embargo_sessions": 5,
+                "test_sessions": metrics.get("test_rows", 0),
+                "purge_sessions": int(TRAINING_PROTOCOL["purge_sessions"]),
+                "embargo_sessions": int(TRAINING_PROTOCOL["embargo_sessions"]),
             },
             "oos_windows": metrics.get("oos_windows", 0),
             "cost_after_labels": metrics.get("cost_after_backplay"),
             "baseline_compared": metrics.get("baseline_compared"),
             "calibration_checked": True,
         })
+        metric_gates = {
+            "data_ready": True,
+            "rolling_oos": float(metrics.get("walk_forward_lift") or 0.0) > 0.0,
+            "worst_window_positive": float(metrics.get("worst_window_net_lift") or 0.0) > 0.0,
+            "cost_after_backplay": float(metrics.get("net_lift") or 0.0) > 0.0,
+            "baseline_compared": bool(metrics.get("baseline_compared")),
+            "training_protocol": bool(protocol_validation.get("ok")),
+            "human_review": False,
+            "live_observation_20_sessions": False,
+        }
+        metric_blocked = [key for key, passed in metric_gates.items() if key not in {"human_review", "live_observation_20_sessions"} and not passed]
+        if not metric_blocked:
+            metric_blocked.append("requires_human_review_and_20_live_sessions")
+        validation = {
+            "status": "passed" if not metric_blocked or metric_blocked == ["requires_human_review_and_20_live_sessions"] else "failed",
+            "production_eligible": False,
+            "production_eligibility": {
+                "eligible": False,
+                "blocked_reasons": metric_blocked,
+                "gates": metric_gates,
+            },
+        }
         validation["training_protocol"] = protocol_validation
         version = f"{model_key}-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
         root = models_root() / model_key / version
@@ -685,11 +842,12 @@ def _run_training_sync(model_key: str, run_id: int) -> dict[str, Any]:
             },
             "output_contract": MODEL_OUTPUT_CONTRACTS.get(model_key, {}),
             "training_protocol": training_protocol_contract(model_key),
+            "training_runtime_protocol": TRAINING_PROTOCOL,
             "coverage": coverage,
             "metrics": metrics,
             "created_at": datetime.utcnow().isoformat(),
             "artifact_type": "plan_model_lightgbm_artifact",
-            "training_dataset": {"horizon": dataset["horizon"], "rows": dataset["sample_rows"], **dataset["dates"]},
+            "training_dataset": {"horizon": dataset["horizon"], "rows": dataset["sample_rows"], "test_rows": dataset["test_rows"], **dataset["dates"]},
         }
         artifact_path = root / "artifact.json"
         artifact_path.write_text(json.dumps(artifact, ensure_ascii=False, indent=2), encoding="utf-8")

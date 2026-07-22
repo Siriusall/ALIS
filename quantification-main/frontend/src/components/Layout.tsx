@@ -142,7 +142,7 @@ export default function Layout({
   const [dataCenterSection, setDataCenterSection] = useState<DataCenterSectionKey>(() =>
     (window.localStorage.getItem(DATA_CENTER_SECTION_STORAGE_KEY) as DataCenterSectionKey | null) || "overview"
   );
-  const [governanceOpen, setGovernanceOpen] = useState(["governance", "strategy", "dataCenter", "backendLogs"].includes(currentSection));
+  const [governanceOpen, setGovernanceOpen] = useState(["governance", "strategy", "backendLogs"].includes(currentSection));
   const [governanceSection, setGovernanceSection] = useState<GovernanceSectionKey>(() => {
     return normalizeGovernanceSection(window.localStorage.getItem(GOVERNANCE_SECTION_STORAGE_KEY));
   });

@@ -45,6 +45,15 @@ from app.services.backend_acceptance import backend_acceptance_matrix
 from app.services.strategy_workbench import build_strategy_workbench
 from app.services.plan_model_control import model_family_status, request_plan_model_training, review_plan_model_version, train_all_trainable_plan_models, review_all_candidate_plan_models, score_plan_model_features
 from app.services.plan_model_auto_optimizer import build_auto_optimization_status, run_auto_optimization_once
+from app.services.strategy_controller import (
+    create_strategy_policy_candidate,
+    evaluate_strategy_policy_version,
+    review_strategy_policy_version,
+    rollback_strategy_policy_version,
+    run_strategy_policy_auto_optimization,
+    strategy_policy_replay_preview,
+    strategy_controller_status,
+)
 
 router = APIRouter()
 
@@ -161,6 +170,36 @@ class PlanModelAutoOptimizationRequest(BaseModel):
     force: bool = False
 
 
+class StrategyPolicyCandidateRequest(BaseModel):
+    policy_patch: dict[str, Any] = Field(default_factory=dict)
+    comment: str = Field("", max_length=2000)
+
+
+class StrategyPolicyReviewRequest(BaseModel):
+    reviewer: str = Field("operator", min_length=1, max_length=120)
+    decision: str = Field(..., pattern="^(approved|rejected)$")
+    comment: str = Field("", max_length=2000)
+
+
+class StrategyPolicyRollbackRequest(BaseModel):
+    reviewer: str = Field("operator", min_length=1, max_length=120)
+    comment: str = Field("", max_length=2000)
+
+
+class StrategyPolicyReplayRequest(BaseModel):
+    version_id: int | None = None
+    start_date: str | None = None
+    end_date: str | None = None
+    limit: int = Field(120, ge=1, le=1000)
+
+
+def _passed_cost_after_metrics(metrics: dict[str, Any]) -> bool:
+    net_lift = float(metrics.get("net_lift", metrics.get("lift", 0)) or 0)
+    walk_forward = float(metrics.get("walk_forward_lift", metrics.get("net_lift", metrics.get("lift", 0))) or 0)
+    worst_window = float(metrics.get("worst_window_net_lift", walk_forward) or 0)
+    return net_lift > 0 and walk_forward > 0 and worst_window > 0
+
+
 @router.get("/model-strategy/status")
 def model_strategy_status() -> dict:
     return get_model_status()
@@ -192,6 +231,64 @@ def model_strategy_auto_optimization() -> dict:
 @router.post("/model-strategy/auto-optimization/run")
 def model_strategy_run_auto_optimization(req: PlanModelAutoOptimizationRequest) -> dict:
     return run_auto_optimization_once(force=req.force)
+
+
+@router.get("/model-strategy/strategy-controller")
+def model_strategy_strategy_controller() -> dict:
+    return strategy_controller_status()
+
+
+@router.post("/model-strategy/strategy-controller/candidates")
+def model_strategy_create_strategy_policy_candidate(req: StrategyPolicyCandidateRequest) -> dict:
+    return create_strategy_policy_candidate(req.policy_patch, comment=req.comment)
+
+
+@router.post("/model-strategy/strategy-controller/auto-optimize")
+def model_strategy_auto_optimize_strategy_policy(req: PlanModelAutoOptimizationRequest) -> dict:
+    return run_strategy_policy_auto_optimization(force=req.force)
+
+
+@router.post("/model-strategy/strategy-controller/replay-preview")
+def model_strategy_replay_strategy_policy(req: StrategyPolicyReplayRequest) -> dict:
+    result = strategy_policy_replay_preview(
+        version_id=req.version_id,
+        start_date=req.start_date,
+        end_date=req.end_date,
+        limit=req.limit,
+    )
+    if not result.get("ok"):
+        raise HTTPException(status_code=404, detail=result)
+    return result
+
+
+@router.post("/model-strategy/strategy-controller/review/{version_id}")
+def model_strategy_review_strategy_policy(version_id: int, req: StrategyPolicyReviewRequest) -> dict:
+    result = review_strategy_policy_version(
+        version_id,
+        decision=req.decision,
+        reviewer=req.reviewer,
+        comment=req.comment,
+    )
+    if not result.get("ok"):
+        status_code = 409 if result.get("error") == "strategy_policy_validation_failed" else 404
+        raise HTTPException(status_code=status_code, detail=result)
+    return result
+
+
+@router.post("/model-strategy/strategy-controller/rollback/{version_id}")
+def model_strategy_rollback_strategy_policy(version_id: int, req: StrategyPolicyRollbackRequest) -> dict:
+    result = rollback_strategy_policy_version(version_id, reviewer=req.reviewer, comment=req.comment)
+    if not result.get("ok"):
+        raise HTTPException(status_code=409 if result.get("error") == "strategy_policy_not_rollback_eligible" else 404, detail=result)
+    return result
+
+
+@router.post("/model-strategy/strategy-controller/validate/{version_id}")
+def model_strategy_validate_strategy_policy(version_id: int) -> dict:
+    result = evaluate_strategy_policy_version(version_id)
+    if not result.get("ok"):
+        raise HTTPException(status_code=404, detail=result)
+    return result
 
 
 @router.post("/model-strategy/plan-models/review/{model_version_id}")
@@ -521,8 +618,8 @@ def model_strategy_promote(model_version_id: int) -> dict:
                 "production_eligibility": validation.get("production_eligibility") or {},
             },
         )
-    if str(validation.get("status")) != "passed" or float(metrics.get("lift", 0) or 0) <= 0 or float(metrics.get("walk_forward_lift", 0) or 0) <= 0:
-        raise HTTPException(status_code=409, detail="模型未同时通过 holdout 与 walk-forward 晋升门槛")
+    if str(validation.get("status")) != "passed" or not _passed_cost_after_metrics(metrics):
+        raise HTTPException(status_code=409, detail="模型未同时通过费用后测试集、walk-forward 与最差窗口晋升门槛")
     from app.services.review_learning import model_feedback_gate
     feedback = model_feedback_gate(str(version.get("version") or ""))
     if not bootstrap and not feedback.get("passed"):
@@ -556,9 +653,9 @@ def model_strategy_rollback(model_version_id: int) -> dict:
                 "production_eligibility": validation.get("production_eligibility") or {},
             },
         )
-    if str(validation.get("status")) != "passed" or float(metrics.get("lift", 0) or 0) <= 0 or float(metrics.get("walk_forward_lift", 0) or 0) <= 0:
-        raise HTTPException(status_code=409, detail="只能回退到已通过验证的模型版本")
-    previous = get_active_model_version("main")
+    if str(validation.get("status")) != "passed" or not _passed_cost_after_metrics(metrics):
+        raise HTTPException(status_code=409, detail="只能回退到费用后测试集、walk-forward 与最差窗口均通过的模型版本")
+    previous = get_active_model_version(str(target.get("model_key") or "main"))
     set_active_model_version(model_version_id)
     return {"ok": True, "status": "rolled_back", "previous_model_version_id": previous.get("id") if previous else None, "model_version_id": model_version_id}
 

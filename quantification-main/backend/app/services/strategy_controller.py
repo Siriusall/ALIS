@@ -1,0 +1,926 @@
+from __future__ import annotations
+
+import json
+from dataclasses import asdict, dataclass
+from datetime import datetime
+from typing import Any
+
+from app.db.store import _conn as business_conn, create_model_version, get_active_model_version, get_model_version, list_model_versions, set_active_model_version, update_model_version_status, update_model_version_validation
+from app.services.review_learning import materialize_decision_outcomes
+
+STRATEGY_CONTROLLER_VERSION = "strategy_controller_v1"
+STRATEGY_MODEL_KEY = "strategy_controller"
+
+DEFAULT_STRATEGY_POLICY = {
+    "schema_version": "strategy_policy_v1",
+    "market_state_policy": {
+        "risk_expansion": {"max_equity": 0.90, "max_single": 0.15},
+        "sideways": {"max_equity": 0.65, "max_single": 0.10},
+        "risk_contraction": {"max_equity": 0.40, "max_single": 0.06},
+        "stress": {"max_equity": 0.25, "max_single": 0.04},
+    },
+    "signal_thresholds": {
+        "add_position_score": 80.0,
+        "loss_review_threshold": -0.06,
+        "profit_trim_threshold": 0.25,
+        "risk_weight_gap": 0.01,
+    },
+    "rebalance_rules": {
+        "min_weight_change": 0.01,
+        "max_monthly_turnover": 0.30,
+        "out_of_pool_action": "sell_exit",
+    },
+}
+
+
+@dataclass
+class StrategyActionContract:
+    symbol: str
+    name: str
+    action: str
+    side: str
+    priority: int
+    score: float | None
+    trigger_models: list[str]
+    expected_return_source: str
+    holding_period: str
+    narrative_lifecycle: str
+    capital_confirmation: str
+    risk_budget: dict[str, Any]
+    exit_conditions: list[str]
+    forbidden_conditions: list[str]
+    data_status: str
+    reason: str
+    source: str
+
+
+def _safe_float(value: Any) -> float | None:
+    try:
+        number = float(value)
+        return number if number == number else None
+    except Exception:
+        return None
+
+
+def _deep_merge(base: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:
+    result = dict(base)
+    for key, value in (patch or {}).items():
+        if isinstance(value, dict) and isinstance(result.get(key), dict):
+            result[key] = _deep_merge(result[key], value)
+        else:
+            result[key] = value
+    return result
+
+
+def active_strategy_policy() -> dict[str, Any]:
+    version = get_active_model_version(STRATEGY_MODEL_KEY)
+    config = version.get("config") if version else {}
+    policy = config.get("policy") if isinstance(config, dict) else {}
+    return _deep_merge(DEFAULT_STRATEGY_POLICY, policy if isinstance(policy, dict) else {})
+
+
+def active_strategy_policy_context() -> dict[str, Any]:
+    active = ensure_default_strategy_policy_version()
+    return {
+        "strategy_policy": active_strategy_policy(),
+        "strategy_policy_version": active.get("version") or "default",
+        "strategy_policy_version_id": active.get("id"),
+    }
+
+
+def _threshold(policy: dict[str, Any], key: str, default: float) -> float:
+    thresholds = policy.get("signal_thresholds") if isinstance(policy.get("signal_thresholds"), dict) else {}
+    return _safe_float(thresholds.get(key)) or default
+
+
+def _action_for_buy(score: float | None, policy: dict[str, Any] | None = None) -> str:
+    add_score = _threshold(policy or DEFAULT_STRATEGY_POLICY, "add_position_score", 80.0)
+    if score is not None and score >= add_score:
+        return "add_position"
+    return "buy_candidate"
+
+
+def _return_source(action: str, row: dict[str, Any], context: dict[str, Any]) -> str:
+    if action == "defensive_switch":
+        return "风险预算收缩 + 防御资产补位"
+    if action in {"sell_exit", "reduce_position"}:
+        return "风险改善：释放无效或超配风险预算"
+    strategy_template = context.get("strategy_template") if isinstance(context.get("strategy_template"), dict) else {}
+    template_name = str(strategy_template.get("name") or strategy_template.get("id") or "").strip()
+    if template_name:
+        return f"{template_name} + 中期景气排序确认"
+    score = _safe_float(row.get("score"))
+    if score is not None:
+        return "模型排序相对优势 + 组合优化确认"
+    return "目标池入选 + 风险预算允许"
+
+
+def _trigger_models(action: str, row: dict[str, Any]) -> list[str]:
+    if action == "defensive_switch":
+        return ["portfolio_risk_engine_v1", "market_state_policy_v1", "defensive_asset_policy_v1"]
+    if action in {"sell_exit", "reduce_position"}:
+        return ["portfolio_risk_engine_v1", "narrative_transition_multitask_v1", "capital_persistence_multitask_v1"]
+    models = ["medium_horizon_lambdarank_v1", "portfolio_risk_engine_v1"]
+    if _safe_float(row.get("score")) is not None:
+        models.append("capital_persistence_multitask_v1")
+    return models
+
+
+def _risk_budget_for(symbol: str, context: dict[str, Any]) -> dict[str, Any]:
+    risk_budget = context.get("risk_budget") if isinstance(context.get("risk_budget"), dict) else {}
+    target_weights = context.get("target_weights") if isinstance(context.get("target_weights"), dict) else {}
+    return {
+        "target_position_pct": risk_budget.get("target_position_pct"),
+        "max_single_position_pct": risk_budget.get("max_single_position_pct"),
+        "target_weight": target_weights.get(symbol),
+        "optimizer": context.get("optimizer"),
+    }
+
+
+def _position_cost(position: dict[str, Any]) -> float:
+    return _safe_float(position.get("price")) or _safe_float(position.get("cost_price")) or 0.0
+
+
+def diagnose_position_exit(
+    *,
+    symbol: str,
+    position: dict[str, Any],
+    current_price: float,
+    current_weight: float | None,
+    target_weight: float | None,
+    in_target_pool: bool,
+    thesis_status: str = "",
+    model_degraded: bool = False,
+    policy: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    reasons: list[dict[str, str]] = []
+    policy = policy or DEFAULT_STRATEGY_POLICY
+    cost = _position_cost(position)
+    pnl_pct = current_price / cost - 1.0 if cost > 0 and current_price > 0 else 0.0
+    current = current_weight if current_weight is not None else 0.0
+    target = 0.0 if not in_target_pool else target_weight if target_weight is not None else current
+    if not in_target_pool:
+        reasons.append({"code": "out_of_target_pool", "label": "不在目标池", "detail": "策略目标池已移除，优先退出或降风险"})
+    if str(thesis_status or "") in {"invalidated", "failed"}:
+        reasons.append({"code": "thesis_invalidated", "label": "投资逻辑失效", "detail": "叙事/投资逻辑状态已失效"})
+    if target + _threshold(policy, "risk_weight_gap", 0.01) < current:
+        reasons.append({"code": "risk_budget_shrink", "label": "风险预算收缩", "detail": f"目标权重 {target:.2%} 低于当前 {current:.2%}"})
+    if pnl_pct < _threshold(policy, "loss_review_threshold", -0.06):
+        reasons.append({"code": "loss_exceeds_expected", "label": "亏损超预期", "detail": f"浮亏 {pnl_pct:.2%}，需要复核买入假设"})
+    if model_degraded:
+        reasons.append({"code": "model_decay", "label": "模型失效降权", "detail": "生产模型健康监控触发降权"})
+    if pnl_pct > _threshold(policy, "profit_trim_threshold", 0.25) and target < current:
+        reasons.append({"code": "valuation_overextension", "label": "涨幅/估值透支", "detail": "已有较大盈利且组合目标降权"})
+    action = "sell_exit" if any(item["code"] in {"out_of_target_pool", "thesis_invalidated", "model_decay"} for item in reasons) else "reduce_position" if reasons else "hold"
+    return {
+        "symbol": symbol,
+        "action": action,
+        "pnl_pct": round(pnl_pct, 6),
+        "current_weight": round(current, 6),
+        "target_weight": round(target, 6),
+        "reasons": reasons or [{"code": "hold_contract_intact", "label": "继续持有", "detail": "目标池、风险预算和退出条件未触发"}],
+    }
+
+
+def _contract(
+    *,
+    row: dict[str, Any],
+    action: str,
+    side: str,
+    priority: int,
+    context: dict[str, Any],
+    source: str,
+) -> StrategyActionContract:
+    symbol = str(row.get("symbol") or "").strip()
+    score = _safe_float(row.get("score"))
+    holding_period = (
+        "风险状态解除前持有或再平衡"
+        if action == "defensive_switch"
+        else "5-20 sessions" if action == "buy_candidate"
+        else "20-60 sessions" if action == "add_position"
+        else "继续持有并等待下一次复核" if action == "hold"
+        else "立即降风险或退出"
+    )
+    return StrategyActionContract(
+        symbol=symbol,
+        name=str(row.get("name") or ""),
+        action=action,
+        side=side,
+        priority=priority,
+        score=score,
+        trigger_models=_trigger_models(action, row),
+        expected_return_source=_return_source(action, row, context),
+        holding_period=holding_period,
+        narrative_lifecycle=str(row.get("narrative_lifecycle") or ("risk_hedge" if action == "defensive_switch" else "risk_exit" if side == "SELL" else "confirmed_or_watch")),
+        capital_confirmation=str(row.get("capital_confirmation") or ("defensive_budget_confirmed" if action == "defensive_switch" else "reduce_required" if side == "SELL" else "model_or_proxy_confirmed")),
+        risk_budget=_risk_budget_for(symbol, context),
+        exit_conditions=[
+            "资金持续性转弱",
+            "叙事生命周期进入衰退/失效",
+            "模型排序跌出阈值",
+            "组合风险预算收缩",
+            "交易成本后优势消失",
+        ],
+        forbidden_conditions=[
+            "数据未冻结",
+            "无生产模型",
+            "停牌/涨跌停不可交易",
+            "单票/行业/相关行业超限",
+            "流动性容量不足",
+        ],
+        data_status=str(context.get("data_status") or "frozen"),
+        reason=str(row.get("reason") or row.get("detail") or row.get("message") or "遵循策略控制器合成动作"),
+        source=source,
+    )
+
+
+def build_strategy_action_contracts(
+    *,
+    buy_actions: list[dict[str, Any]] | None = None,
+    sell_actions: list[dict[str, Any]] | None = None,
+    hold_symbols: list[str] | None = None,
+    blocked_actions: list[dict[str, Any]] | None = None,
+    context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    ctx = dict(context or {})
+    policy = ctx.get("strategy_policy") if isinstance(ctx.get("strategy_policy"), dict) else active_strategy_policy()
+    defensive_weights = {
+        str(key): float(value or 0.0)
+        for key, value in (ctx.get("defensive_weights") or {}).items()
+    } if isinstance(ctx.get("defensive_weights"), dict) else {}
+    contracts: list[StrategyActionContract] = []
+    priority = 1
+    for row in sell_actions or []:
+        quantity = int(row.get("quantity") or 0)
+        action = "sell_exit" if quantity > 0 else "reduce_position"
+        contracts.append(_contract(row=row, action=action, side="SELL", priority=priority, context=ctx, source="sell_rebalance"))
+        priority += 1
+    for row in buy_actions or []:
+        action = str(row.get("action") or "") or _action_for_buy(_safe_float(row.get("score")), policy)
+        contracts.append(_contract(row=row, action=action, side="BUY", priority=priority, context=ctx, source="buy_rebalance"))
+        priority += 1
+    for symbol in hold_symbols or []:
+        contracts.append(_contract(row={"symbol": symbol, "reason": "仍在目标组合内，继续持有"}, action="hold", side="HOLD", priority=priority, context=ctx, source="target_hold"))
+        priority += 1
+
+    blocked = []
+    for row in blocked_actions or []:
+        blocked.append({
+            "symbol": str(row.get("symbol") or ""),
+            "side": str(row.get("side") or ""),
+            "code": str(row.get("code") or row.get("block_code") or "blocked"),
+            "message": str(row.get("message") or row.get("reason") or "策略/交易约束拦截"),
+        })
+
+    action_counts = {
+        "buy": sum(1 for item in contracts if item.side == "BUY"),
+        "sell": sum(1 for item in contracts if item.side == "SELL"),
+        "hold": sum(1 for item in contracts if item.side == "HOLD"),
+        "blocked": len(blocked),
+    }
+    trace = [
+        {"step": "数据", "status": ctx.get("data_status") or "frozen", "detail": f"信号日 {ctx.get('signal_date') or '—'}，执行日 {ctx.get('execute_date') or '—'}"},
+        {"step": "模型", "status": "attached", "detail": "排序、资金、龙头、事件、叙事模型作为策略输入；组合风险模型负责仓位约束"},
+        {"step": "策略", "status": "ready", "detail": f"生成买入 {action_counts['buy']}、卖出 {action_counts['sell']}、持有 {action_counts['hold']}、拦截 {action_counts['blocked']}"},
+        {"step": "组合", "status": "ready", "detail": f"优化器 {ctx.get('optimizer') or 'pending'}，目标仓位 {ctx.get('target_position_pct') or '—'}"},
+        {"step": "执行", "status": "simulation_only", "detail": "仅生成模拟订单与决策快照，不连接券商"},
+    ]
+    return {
+        "schema_version": STRATEGY_CONTROLLER_VERSION,
+        "strategy_policy": {"schema_version": policy.get("schema_version"), "version": ctx.get("strategy_policy_version") or "production_or_default"},
+        "generated_at": datetime.utcnow().isoformat(),
+        "action_counts": action_counts,
+        "contracts": [asdict(item) for item in contracts],
+        "blocked": blocked,
+        "trace": trace,
+        "summary": f"策略控制器生成 {len(contracts)} 个动作合同；弱约束与交易拦截 {len(blocked)} 条。",
+    }
+
+
+def build_target_weight_explanations(
+    *,
+    target_weights: dict[str, float],
+    current_weights: dict[str, float] | None = None,
+    score_map: dict[str, float] | None = None,
+    returns_by_symbol: dict[str, list[float]] | None = None,
+    liquidity_caps: dict[str, float] | None = None,
+    defensive_weights: dict[str, float] | None = None,
+    optimizer: str = "",
+    risk_budget: dict[str, Any] | None = None,
+    constraints: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    current = {str(k): float(v or 0.0) for k, v in (current_weights or {}).items()}
+    scores = {str(k): float(v or 0.0) for k, v in (score_map or {}).items()}
+    returns = returns_by_symbol or {}
+    liquidity = {str(k): float(v or 0.0) for k, v in (liquidity_caps or {}).items()}
+    defensive = {str(k): float(v or 0.0) for k, v in (defensive_weights or {}).items()}
+    max_single = _safe_float((risk_budget or {}).get("max_single_position_pct")) or _safe_float((constraints or {}).get("max_single_position_pct"))
+    items: list[dict[str, Any]] = []
+    for symbol, raw_weight in sorted((target_weights or {}).items(), key=lambda kv: (-float(kv[1] or 0.0), str(kv[0]))):
+        target = max(0.0, float(raw_weight or 0.0))
+        current_weight = max(0.0, current.get(str(symbol), 0.0))
+        delta = target - current_weight
+        is_defensive = str(symbol) in defensive
+        sample_count = len(returns.get(str(symbol)) or [])
+        reasons = []
+        reasons.append("防御资产固定袖套" if is_defensive else "策略目标池入选")
+        reasons.append("组合优化器分配目标权重")
+        if max_single is not None and target >= max_single - 1e-6:
+            reasons.append("受单票上限约束")
+        if sample_count < 20:
+            reasons.append("历史收益样本偏少，置信度降级")
+        if liquidity.get(str(symbol), 0.0) > 0:
+            reasons.append("流动性容量参与订单上限")
+        items.append({
+            "symbol": str(symbol),
+            "target_weight": round(target, 6),
+            "current_weight": round(current_weight, 6),
+            "weight_delta": round(delta, 6),
+            "action_hint": "increase" if delta > 0.002 else "decrease" if delta < -0.002 else "hold",
+            "asset_role": "defensive" if is_defensive else "equity",
+            "score": round(scores.get(str(symbol), 0.0), 6) if str(symbol) in scores else None,
+            "return_sample_count": sample_count,
+            "liquidity_capacity": round(liquidity.get(str(symbol), 0.0), 2) if str(symbol) in liquidity else None,
+            "optimizer": optimizer,
+            "why_this_weight": "；".join(reasons),
+            "components": {
+                "strategy_signal": "defensive_switch" if is_defensive else "selected_by_ranking_or_target_pool",
+                "risk_budget": risk_budget or {},
+                "constraints": constraints or {},
+                "cost_liquidity": {"liquidity_cap": liquidity.get(str(symbol))},
+            },
+        })
+    return {
+        "schema_version": "target_weight_explanation_v1",
+        "optimizer": optimizer,
+        "count": len(items),
+        "items": items,
+    }
+
+
+def build_strategy_rebalance_actions(
+    *,
+    target_symbols: list[str],
+    held_positions: dict[str, dict[str, Any]],
+    selection_map: dict[str, dict[str, Any]] | None = None,
+    market_rows: dict[str, Any] | None = None,
+    same_day_fallback: bool = False,
+    mode: str = "full_rebalance",
+    blocked_actions: list[dict[str, Any]] | None = None,
+    current_weights: dict[str, float] | None = None,
+    target_weights: dict[str, float] | None = None,
+    thesis_status_by_symbol: dict[str, str] | None = None,
+    model_degraded: bool = False,
+    context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    ctx = dict(context or {})
+    policy = ctx.get("strategy_policy") if isinstance(ctx.get("strategy_policy"), dict) else active_strategy_policy()
+    selections = dict(selection_map or {})
+    rows = dict(market_rows or {})
+    targets = [str(symbol).strip() for symbol in target_symbols if str(symbol).strip()]
+    target_set = set(targets)
+    held = {str(symbol).strip(): dict(pos or {}) for symbol, pos in held_positions.items() if str(symbol).strip()}
+    current_weight_map = {str(key): float(value or 0.0) for key, value in (current_weights or {}).items()}
+    target_weight_map = {str(key): float(value or 0.0) for key, value in (target_weights or {}).items()}
+    thesis_map = {str(key): str(value or "") for key, value in (thesis_status_by_symbol or {}).items()}
+    buy_actions: list[dict[str, Any]] = []
+    sell_actions: list[dict[str, Any]] = []
+
+    for symbol in targets:
+        if symbol in held:
+            continue
+        selection = selections.get(symbol) or {}
+        row = rows.get(symbol)
+        buy_actions.append({
+            "symbol": symbol,
+            "name": selection.get("name") or str(getattr(row, "name", "") or ""),
+            "action": "defensive_switch" if symbol in defensive_weights else None,
+            "score": selection.get("score"),
+            "reason": "策略总控：防御资产补位，等待组合层分配权重" if symbol in defensive_weights else "策略总控：入选目标池，等待组合层分配权重",
+            "price": ctx.get("price_by_symbol", {}).get(symbol) if isinstance(ctx.get("price_by_symbol"), dict) else None,
+            "close": round(float(getattr(row, "close", 0) or 0), 4) if row else None,
+            "change_pct": float(getattr(row, "change_pct", 0) or 0) if row else 0.0,
+            "volume": float(getattr(row, "volume", 0) or 0) if row else 0.0,
+            "capital_confirmation": "defensive_budget_confirmed" if symbol in defensive_weights else "model_or_proxy_confirmed",
+            "narrative_lifecycle": "risk_hedge" if symbol in defensive_weights else "confirmed_or_watch",
+        })
+
+    if str(mode or "full_rebalance").lower() == "full_rebalance":
+        for symbol, position in sorted(held.items()):
+            row = rows.get(symbol)
+            current_price = 0.0
+            if isinstance(ctx.get("price_by_symbol"), dict):
+                current_price = _safe_float(ctx["price_by_symbol"].get(symbol)) or 0.0
+            if current_price <= 0 and row:
+                current_price = _safe_float(getattr(row, "close", 0)) or 0.0
+            diagnosis = diagnose_position_exit(
+                symbol=symbol,
+                position=position,
+                current_price=current_price,
+                current_weight=current_weight_map.get(symbol),
+                target_weight=target_weight_map.get(symbol),
+                in_target_pool=symbol in target_set,
+                thesis_status=thesis_map.get(symbol, ""),
+                model_degraded=model_degraded,
+                policy=policy,
+            )
+            if diagnosis["action"] == "hold":
+                continue
+            primary_reason = (diagnosis.get("reasons") or [{}])[0]
+            sell_actions.append({
+                "symbol": symbol,
+                "name": str(position.get("name") or ""),
+                "quantity": int(position.get("quantity") or 0),
+                "reason": f"策略总控：{primary_reason.get('label') or '触发退出条件'}",
+                "detail": primary_reason.get("detail") or "",
+                "price": ctx.get("price_by_symbol", {}).get(symbol) if isinstance(ctx.get("price_by_symbol"), dict) else None,
+                "close": round(float(getattr(row, "close", 0) or 0), 4) if row else None,
+                "pnl_pct": diagnosis.get("pnl_pct"),
+                "current_weight": diagnosis.get("current_weight"),
+                "target_weight": diagnosis.get("target_weight"),
+                "exit_diagnostics": diagnosis.get("reasons") or [],
+                "capital_confirmation": "reduce_required",
+                "narrative_lifecycle": "risk_exit" if symbol not in target_set else "deleveraging",
+            })
+
+    hold_symbols = sorted(symbol for symbol in held if symbol in target_set)
+    strategy_controller = build_strategy_action_contracts(
+        buy_actions=buy_actions,
+        sell_actions=sell_actions,
+        hold_symbols=hold_symbols,
+        blocked_actions=blocked_actions or [],
+        context=ctx,
+    )
+    return {
+        "buy": buy_actions,
+        "sell": sell_actions,
+        "hold": hold_symbols,
+        "blocked": list(blocked_actions or []),
+        "strategy_controller": strategy_controller,
+        "strategy_action_contracts": strategy_controller["contracts"],
+        "rebalance_decision_trace": strategy_controller["trace"],
+    }
+
+
+def ensure_default_strategy_policy_version() -> dict[str, Any]:
+    active = get_active_model_version(STRATEGY_MODEL_KEY)
+    if active:
+        return active
+    version = f"strategy_controller_default-{datetime.utcnow().strftime('%Y%m%d%H%M%S%f')}"
+    version_id = create_model_version(
+        model_key=STRATEGY_MODEL_KEY,
+        version=version,
+        status="active",
+        artifact_path="builtin://strategy_controller/default_policy",
+        config={"policy": DEFAULT_STRATEGY_POLICY},
+        metrics={"source": "default_policy", "cost_after_backplay": None},
+        validation={"status": "passed", "production_eligible": True, "review": {"status": "system_bootstrap"}},
+        is_active=True,
+    )
+    return get_model_version(version_id) or {"id": version_id, "version": version, "config": {"policy": DEFAULT_STRATEGY_POLICY}, "is_active": True}
+
+
+def strategy_controller_status() -> dict[str, Any]:
+    active = ensure_default_strategy_policy_version()
+    versions = list_model_versions(STRATEGY_MODEL_KEY, limit=20)
+    visible_versions = [item for item in versions if item.get("is_active")][:1] + [item for item in versions if not item.get("is_active")][:2]
+    return {
+        "ok": True,
+        "schema_version": "strategy_controller_status_v1",
+        "model_key": STRATEGY_MODEL_KEY,
+        "active_version": active,
+        "policy": active_strategy_policy(),
+        "versions": visible_versions,
+        "version_count": len(versions),
+        "generated_at": datetime.utcnow().isoformat(),
+    }
+
+
+def _canonical_json(value: Any) -> str:
+    return json.dumps(value or {}, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _recent_strategy_patches(limit: int = 50) -> set[str]:
+    patches: set[str] = set()
+    for version in list_model_versions(STRATEGY_MODEL_KEY, limit=limit):
+        config = version.get("config") if isinstance(version.get("config"), dict) else {}
+        patch = config.get("patch") if isinstance(config, dict) else None
+        if isinstance(patch, dict) and patch:
+            patches.add(_canonical_json(patch))
+    return patches
+
+
+def create_strategy_policy_candidate(policy_patch: dict[str, Any], *, comment: str = "") -> dict[str, Any]:
+    base = active_strategy_policy()
+    policy = _deep_merge(base, policy_patch or {})
+    version = f"strategy_controller_candidate-{datetime.utcnow().strftime('%Y%m%d%H%M%S%f')}"
+    validation = {
+        "status": "candidate",
+        "production_eligible": False,
+        "blocked_reasons": ["requires_backtest_and_human_review"],
+        "review": {"status": "pending", "comment": comment},
+    }
+    version_id = create_model_version(
+        model_key=STRATEGY_MODEL_KEY,
+        version=version,
+        status="candidate",
+        artifact_path="builtin://strategy_controller/policy_candidate",
+        config={"policy": policy, "patch": policy_patch or {}, "comment": comment},
+        metrics={"requires_backtest": True},
+        validation=validation,
+        is_active=False,
+    )
+    evaluation = evaluate_strategy_policy_version(version_id)
+    return {"ok": True, "version": get_model_version(version_id), "evaluation": evaluation}
+
+
+def run_strategy_policy_auto_optimization(*, force: bool = False) -> dict[str, Any]:
+    active = ensure_default_strategy_policy_version()
+    policy = active_strategy_policy()
+    values = _policy_bounds(policy)["values"]
+    suggestions = [
+        {
+            "name": "提高买入确认门槛",
+            "reason": "减少弱信号新仓，降低无效换手",
+            "patch": {"signal_thresholds": {"add_position_score": min(95.0, float(values["add_position_score"]) + 2.0)}},
+        },
+        {
+            "name": "亏损复核更敏感",
+            "reason": "更早识别买入假设失效",
+            "patch": {"signal_thresholds": {"loss_review_threshold": max(-0.15, float(values["loss_review_threshold"]) + 0.005)}},
+        },
+        {
+            "name": "降权触发更及时",
+            "reason": "风险预算收缩时更快调整持仓",
+            "patch": {"signal_thresholds": {"risk_weight_gap": max(0.002, float(values["risk_weight_gap"]) - 0.002)}},
+        },
+        {
+            "name": "止盈再平衡更主动",
+            "reason": "盈利且目标降权时更快释放估值透支风险",
+            "patch": {"signal_thresholds": {"profit_trim_threshold": max(0.08, float(values["profit_trim_threshold"]) - 0.02)}},
+        },
+        {
+            "name": "月度换手上限收紧",
+            "reason": "费用后回放优先控制交易成本",
+            "patch": {"rebalance_rules": {"max_monthly_turnover": max(0.05, float(values["max_monthly_turnover"]) - 0.03)}},
+        },
+    ]
+    existing = _recent_strategy_patches()
+    created: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    for suggestion in suggestions:
+        patch_key = _canonical_json(suggestion["patch"])
+        if not force and patch_key in existing:
+            skipped.append({"name": suggestion["name"], "reason": "recent_duplicate_patch", "patch": suggestion["patch"]})
+            continue
+        result = create_strategy_policy_candidate(
+            suggestion["patch"],
+            comment=f"auto_optimization: {suggestion['name']}；{suggestion['reason']}",
+        )
+        version = result.get("version") or {}
+        evaluation = result.get("evaluation") or {}
+        created.append({
+            "name": suggestion["name"],
+            "reason": suggestion["reason"],
+            "patch": suggestion["patch"],
+            "version_id": version.get("id"),
+            "version": version.get("version"),
+            "status": evaluation.get("status") or version.get("status"),
+            "metrics": evaluation.get("metrics") or version.get("metrics"),
+            "validation": evaluation.get("validation") or version.get("validation"),
+        })
+    return {
+        "ok": True,
+        "schema_version": "strategy_policy_auto_optimization_v1",
+        "active_version_id": active.get("id"),
+        "created_count": len(created),
+        "skipped_count": len(skipped),
+        "created": created,
+        "skipped": skipped,
+        "note": "只生成候选并自动评估；弱于生产、样本不足或越界会自动拦截，不自动上线。",
+        "generated_at": datetime.utcnow().isoformat(),
+    }
+
+
+def rollback_strategy_policy_version(version_id: int, *, reviewer: str = "operator", comment: str = "") -> dict[str, Any]:
+    version = get_model_version(int(version_id))
+    if not version or version.get("model_key") != STRATEGY_MODEL_KEY:
+        return {"ok": False, "error": "strategy_policy_version_not_found", "version_id": version_id}
+    validation = dict(version.get("validation") or {})
+    validation_status = str(validation.get("status") or "")
+    review_status = str((validation.get("review") or {}).get("status") or "")
+    if validation_status != "passed" and review_status not in {"approved", "system_bootstrap"}:
+        return {
+            "ok": False,
+            "error": "strategy_policy_not_rollback_eligible",
+            "version_id": int(version_id),
+            "validation_status": validation_status,
+            "review_status": review_status,
+        }
+    validation["review"] = {
+        "status": "rollback_activated",
+        "reviewer": reviewer,
+        "comment": comment,
+        "reviewed_at": datetime.utcnow().isoformat(),
+    }
+    validation["production_eligible"] = True
+    validation["status"] = "passed"
+    update_model_version_validation(int(version_id), validation=validation)
+    set_active_model_version(int(version_id))
+    return {"ok": True, "version": get_model_version(int(version_id))}
+
+
+def _policy_bounds(policy: dict[str, Any]) -> dict[str, Any]:
+    thresholds = policy.get("signal_thresholds") if isinstance(policy.get("signal_thresholds"), dict) else {}
+    rebalance = policy.get("rebalance_rules") if isinstance(policy.get("rebalance_rules"), dict) else {}
+    market = policy.get("market_state_policy") if isinstance(policy.get("market_state_policy"), dict) else {}
+    add_score = _threshold(policy, "add_position_score", 80.0)
+    loss = _threshold(policy, "loss_review_threshold", -0.06)
+    profit = _threshold(policy, "profit_trim_threshold", 0.25)
+    gap = _threshold(policy, "risk_weight_gap", 0.01)
+    max_turnover = _safe_float(rebalance.get("max_monthly_turnover")) or 0.30
+    max_equity_values = [
+        _safe_float((item or {}).get("max_equity")) or 0.0
+        for item in market.values()
+        if isinstance(item, dict)
+    ]
+    gates = {
+        "add_position_score_range": 50.0 <= add_score <= 95.0,
+        "loss_review_threshold_range": -0.15 <= loss <= -0.02,
+        "profit_trim_threshold_range": 0.08 <= profit <= 0.60,
+        "risk_weight_gap_range": 0.002 <= gap <= 0.05,
+        "max_monthly_turnover_range": 0.05 <= max_turnover <= 0.60,
+        "max_equity_range": all(0.05 <= value <= 1.0 for value in max_equity_values) if max_equity_values else True,
+    }
+    return {
+        "ok": all(gates.values()),
+        "gates": gates,
+        "blocked_reasons": [key for key, passed in gates.items() if not passed],
+        "values": {
+            "add_position_score": add_score,
+            "loss_review_threshold": loss,
+            "profit_trim_threshold": profit,
+            "risk_weight_gap": gap,
+            "max_monthly_turnover": max_turnover,
+            "max_equity_max": max(max_equity_values) if max_equity_values else None,
+        },
+    }
+
+
+def _policy_aggressiveness_penalty(policy: dict[str, Any], champion_policy: dict[str, Any]) -> float:
+    values = _policy_bounds(policy)["values"]
+    champion = _policy_bounds(champion_policy)["values"]
+    penalty = 0.0
+    penalty += max(0.0, float(champion["add_position_score"]) - float(values["add_position_score"])) * 0.00025
+    penalty += max(0.0, abs(float(values["loss_review_threshold"])) - abs(float(champion["loss_review_threshold"]))) * 0.04
+    penalty += max(0.0, float(values["profit_trim_threshold"]) - float(champion["profit_trim_threshold"])) * 0.01
+    penalty += max(0.0, float(values["risk_weight_gap"]) - float(champion["risk_weight_gap"])) * 0.08
+    penalty += max(0.0, float(values["max_monthly_turnover"]) - float(champion["max_monthly_turnover"])) * 0.01
+    return round(penalty, 8)
+
+
+def _historical_policy_replay_metrics(policy: dict[str, Any], champion_policy: dict[str, Any]) -> dict[str, Any]:
+    materialize_decision_outcomes(limit=1000)
+    with business_conn() as c:
+        rows = [dict(row) for row in c.execute(
+            """SELECT horizon_sessions,directional_return,correct,entry_date
+               FROM decision_outcome_attributions
+               WHERE horizon_sessions IN (5,20,60)
+               ORDER BY entry_date,id"""
+        ).fetchall()]
+    mature = [row for row in rows if int(row.get("horizon_sessions") or 0) == 20]
+    if not mature:
+        return {
+            "sample_rows": 0,
+            "net_lift": 0.0,
+            "walk_forward_lift": 0.0,
+            "worst_window_net_lift": 0.0,
+            "hit_rate": 0.0,
+            "blocked_reasons": ["missing_mature_decision_outcomes"],
+        }
+    cost = 0.0025
+    penalty = _policy_aggressiveness_penalty(policy, champion_policy)
+    net_returns = [float(row.get("directional_return") or 0.0) - cost - penalty for row in mature]
+    hit_rate = sum(1 for value in net_returns if value > 0) / len(net_returns)
+    windows: list[float] = []
+    window_count = min(4, len(net_returns))
+    if window_count:
+        size = max(1, len(net_returns) // window_count)
+        for index in range(0, len(net_returns), size):
+            chunk = net_returns[index:index + size]
+            if chunk:
+                windows.append(sum(chunk) / len(chunk))
+    return {
+        "sample_rows": len(mature),
+        "net_lift": round(sum(net_returns) / len(net_returns), 8),
+        "walk_forward_lift": round(sum(windows) / len(windows), 8) if windows else 0.0,
+        "worst_window_net_lift": round(min(windows), 8) if windows else 0.0,
+        "hit_rate": round(hit_rate, 6),
+        "transaction_cost_bps": 25,
+        "aggressiveness_penalty": penalty,
+        "window_net_lifts": [round(value, 8) for value in windows],
+        "blocked_reasons": [],
+    }
+
+
+def evaluate_strategy_policy_version(version_id: int) -> dict[str, Any]:
+    version = get_model_version(int(version_id))
+    if not version or version.get("model_key") != STRATEGY_MODEL_KEY:
+        return {"ok": False, "error": "strategy_policy_version_not_found", "version_id": version_id}
+    active = get_active_model_version(STRATEGY_MODEL_KEY)
+    policy = ((version.get("config") or {}).get("policy") or DEFAULT_STRATEGY_POLICY)
+    champion_policy = ((active or {}).get("config") or {}).get("policy") or DEFAULT_STRATEGY_POLICY
+    bounds = _policy_bounds(policy)
+    metrics = _historical_policy_replay_metrics(policy, champion_policy) if bounds["ok"] else {
+        "sample_rows": 0,
+        "net_lift": 0.0,
+        "walk_forward_lift": 0.0,
+        "worst_window_net_lift": 0.0,
+        "hit_rate": 0.0,
+        "transaction_cost_bps": 25,
+        "aggressiveness_penalty": 0.0,
+        "blocked_reasons": bounds["blocked_reasons"],
+    }
+    passed_metrics = (
+        float(metrics.get("net_lift") or 0.0) > 0.0
+        and float(metrics.get("walk_forward_lift") or 0.0) > 0.0
+        and float(metrics.get("worst_window_net_lift") or 0.0) > 0.0
+        and int(metrics.get("sample_rows") or 0) >= 5
+    )
+    blocked = list(bounds["blocked_reasons"]) + list(metrics.get("blocked_reasons") or [])
+    if not passed_metrics:
+        for reason in ("net_lift_positive", "walk_forward_positive", "worst_window_positive", "minimum_samples"):
+            if reason == "net_lift_positive" and float(metrics.get("net_lift") or 0.0) > 0.0:
+                continue
+            if reason == "walk_forward_positive" and float(metrics.get("walk_forward_lift") or 0.0) > 0.0:
+                continue
+            if reason == "worst_window_positive" and float(metrics.get("worst_window_net_lift") or 0.0) > 0.0:
+                continue
+            if reason == "minimum_samples" and int(metrics.get("sample_rows") or 0) >= 5:
+                continue
+            blocked.append(reason)
+    insufficient_data = int(metrics.get("sample_rows") or 0) < 5 or "missing_mature_decision_outcomes" in list(metrics.get("blocked_reasons") or [])
+    status = "passed" if bounds["ok"] and passed_metrics else "blocked_by_data" if bounds["ok"] and insufficient_data else "rejected"
+    validation = {
+        "status": status,
+        "production_eligible": status == "passed",
+        "blocked_reasons": sorted(set(blocked)),
+        "bounds": bounds,
+        "method": "strategy_policy_cost_after_decision_outcome_proxy_v1",
+        "review": {"status": "pending" if status == "passed" else "waiting_for_data" if status == "blocked_by_data" else "auto_rejected", "reviewed_at": datetime.utcnow().isoformat()},
+    }
+    update_model_version_validation(int(version_id), validation=validation)
+    update_model_version_status(int(version_id), status="candidate" if status in {"passed", "blocked_by_data"} else "rejected", is_active=False)
+    with business_conn() as c:
+        c.execute(
+            "UPDATE model_versions SET metrics_json = ?, updated_at = ? WHERE id = ?",
+            (json.dumps(metrics, ensure_ascii=False), datetime.utcnow().isoformat(), int(version_id)),
+        )
+    return {"ok": True, "version_id": int(version_id), "status": status, "metrics": metrics, "validation": validation}
+
+
+def strategy_policy_replay_preview(
+    *,
+    version_id: int | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    limit: int = 120,
+) -> dict[str, Any]:
+    version = get_model_version(int(version_id)) if version_id else get_active_model_version(STRATEGY_MODEL_KEY)
+    if not version or version.get("model_key") != STRATEGY_MODEL_KEY:
+        return {"ok": False, "error": "strategy_policy_version_not_found", "version_id": version_id}
+    policy = ((version.get("config") or {}).get("policy") or DEFAULT_STRATEGY_POLICY)
+    add_score = _threshold(policy, "add_position_score", 80.0)
+    loss_threshold = _threshold(policy, "loss_review_threshold", -0.06)
+    profit_threshold = _threshold(policy, "profit_trim_threshold", 0.25)
+    materialize_decision_outcomes(limit=2000)
+    where = ["1=1"]
+    params: list[Any] = []
+    if start_date:
+        where.append("substr(d.decision_time,1,10) >= ?")
+        params.append(str(start_date))
+    if end_date:
+        where.append("substr(d.decision_time,1,10) <= ?")
+        params.append(str(end_date))
+    params.append(max(1, min(int(limit or 120), 1000)))
+    with business_conn() as c:
+        rows = [dict(row) for row in c.execute(
+            f"""SELECT d.id,d.ts_code,d.decision_type,d.decision_time,d.price,d.reason,
+                      d.research_state_json,d.portfolio_context_json,d.target_weight_contract_json,
+                      a.horizon_sessions,a.directional_return,a.correct,a.exit_date
+               FROM decision_snapshots d
+               LEFT JOIN decision_outcome_attributions a
+                 ON a.decision_snapshot_id=d.id AND a.horizon_sessions=20
+               WHERE {' AND '.join(where)}
+               ORDER BY d.decision_time DESC,d.id DESC
+               LIMIT ?""",
+            tuple(params),
+        ).fetchall()]
+    actions: list[dict[str, Any]] = []
+    pending_outcomes = 0
+    passed_returns: list[float] = []
+    blocked_returns: list[float] = []
+    for row in reversed(rows):
+        research = {}
+        contract = {}
+        try:
+            research = json.loads(row.get("research_state_json") or "{}")
+            contract = json.loads(row.get("target_weight_contract_json") or "{}")
+        except Exception:
+            research = {}
+            contract = {}
+        score = _safe_float(research.get("score") or contract.get("score"))
+        directional_return = _safe_float(row.get("directional_return"))
+        decision_type = str(row.get("decision_type") or "").upper()
+        action = "hold"
+        would_trade = False
+        reasons: list[str] = []
+        if decision_type in {"BUY", "ADD"}:
+            if score is None:
+                action = "buy_candidate"
+                would_trade = False
+                reasons.append("缺少冻结分数，回放只观察不交易")
+            elif score >= add_score:
+                action = "add_position"
+                would_trade = True
+                reasons.append(f"分数 {score:.2f} >= 买入阈值 {add_score:.2f}")
+            else:
+                action = "buy_candidate"
+                reasons.append(f"分数 {score:.2f} < 买入阈值 {add_score:.2f}")
+        elif decision_type in {"SELL", "REDUCE"}:
+            action = "sell_exit" if directional_return is not None and directional_return <= loss_threshold else "reduce_position"
+            would_trade = True
+            reasons.append("历史决策为卖出/减仓")
+        if directional_return is None:
+            pending_outcomes += 1
+        elif would_trade:
+            passed_returns.append(float(directional_return))
+        else:
+            blocked_returns.append(float(directional_return))
+        if directional_return is not None and directional_return >= profit_threshold:
+            reasons.append(f"收益达到止盈复核阈值 {profit_threshold:.2%}")
+        actions.append({
+            "decision_snapshot_id": int(row.get("id") or 0),
+            "symbol": str(row.get("ts_code") or "").split(".")[0],
+            "decision_time": str(row.get("decision_time") or ""),
+            "historical_decision_type": decision_type,
+            "replayed_action": action,
+            "would_trade": would_trade,
+            "score": score,
+            "horizon_sessions": int(row.get("horizon_sessions") or 20),
+            "directional_return": directional_return,
+            "reason": "；".join(reasons) if reasons else "策略参数回放观察",
+        })
+    avg_trade_return = sum(passed_returns) / len(passed_returns) if passed_returns else 0.0
+    avg_blocked_return = sum(blocked_returns) / len(blocked_returns) if blocked_returns else 0.0
+    return {
+        "ok": True,
+        "schema_version": "strategy_policy_replay_preview_v1",
+        "method": "decision_snapshot_replay_preview_v1",
+        "maturity": "preview_not_shadow_observation",
+        "version_id": version.get("id"),
+        "version": version.get("version"),
+        "date_range": {"start_date": start_date, "end_date": end_date},
+        "metrics": {
+            "sample_rows": len(actions),
+            "trade_rows": len(passed_returns),
+            "blocked_rows": len(blocked_returns),
+            "pending_outcomes": pending_outcomes,
+            "avg_trade_directional_return": round(avg_trade_return, 8),
+            "avg_blocked_directional_return": round(avg_blocked_return, 8),
+            "spread_vs_blocked": round(avg_trade_return - avg_blocked_return, 8),
+            "transaction_cost_bps": 25,
+        },
+        "protocol": {
+            "purge_embargo": "declared_not_enforced_until_full_daily_replay",
+            "shadow_observation_sessions_required": 20,
+            "can_auto_promote": False,
+            "why": "这是基于已冻结决策快照的回放预览，用于发现候选方向；完整逐日重建与影子观察需要时间序列积累。",
+        },
+        "actions": actions[-max(1, min(int(limit or 120), 200)):],
+        "generated_at": datetime.utcnow().isoformat(),
+    }
+
+
+def review_strategy_policy_version(version_id: int, *, decision: str, reviewer: str = "operator", comment: str = "") -> dict[str, Any]:
+    version = get_model_version(int(version_id))
+    if not version or version.get("model_key") != STRATEGY_MODEL_KEY:
+        return {"ok": False, "error": "strategy_policy_version_not_found", "version_id": version_id}
+    if decision not in {"approved", "rejected"}:
+        return {"ok": False, "error": "invalid_decision"}
+    if decision == "approved":
+        evaluation = evaluate_strategy_policy_version(int(version_id))
+        if not evaluation.get("ok") or str(evaluation.get("status")) != "passed":
+            return {"ok": False, "error": "strategy_policy_validation_failed", "evaluation": evaluation}
+        version = get_model_version(int(version_id)) or version
+    validation = dict(version.get("validation") or {})
+    validation["review"] = {"status": decision, "reviewer": reviewer, "comment": comment, "reviewed_at": datetime.utcnow().isoformat()}
+    validation["production_eligible"] = decision == "approved"
+    validation["blocked_reasons"] = [] if decision == "approved" else ["operator_rejected"]
+    validation["status"] = "passed" if decision == "approved" else "rejected"
+    update_model_version_validation(int(version_id), validation=validation)
+    if decision == "approved":
+        set_active_model_version(int(version_id))
+    else:
+        update_model_version_status(int(version_id), status="rejected", is_active=False)
+    return {"ok": True, "version": get_model_version(int(version_id))}

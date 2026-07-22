@@ -21,6 +21,7 @@ export interface TushareCatalogItem {
   last_probe_rows: number;
   last_probe_error?: string;
   last_probe_at?: string | null;
+  source_code?: string;
 }
 
 export interface DataIngestionRun {
@@ -47,6 +48,8 @@ export interface DataCenterCoverage {
   industry_metric_definitions: number;
   industry_metric_values: number;
   web_factor_rows: number;
+  etf_pcf_header_rows: number;
+  etf_pcf_component_rows: number;
 }
 
 export interface DataCenterStatus {
@@ -298,6 +301,42 @@ export async function fetchReadinessRefreshStatus(): Promise<ReadinessRefreshSta
 }
 export async function startReadinessRefresh(): Promise<ReadinessRefreshStatus> {
   const { data } = await api.post<ReadinessRefreshStatus>("/api/data-center/readiness/refresh");
+  return data;
+}
+
+export async function backfillThemeSnapshots(payload: { endDate?: string; targetSessions?: number; limitDates?: number } = {}): Promise<Record<string, unknown>> {
+  const { data } = await api.post<Record<string, unknown>>("/api/data-center/backfill/theme-snapshots", null, {
+    params: {
+      end_date: payload.endDate || "",
+      target_sessions: payload.targetSessions ?? 250,
+      limit_dates: payload.limitDates ?? 30,
+    },
+    timeout: 120_000,
+  });
+  return data;
+}
+
+export async function syncExchangeEtfPcf(tradeDate: string, limitFunds = 0): Promise<Record<string, unknown>> {
+  const { data } = await api.post<Record<string, unknown>>("/api/data-center/sync/exchange-etf-pcf", null, {
+    params: { trade_date: tradeDate, limit_funds: limitFunds },
+    timeout: 10 * 60 * 1000,
+  });
+  return data;
+}
+
+export async function backfillExchangeEtfPcf(payload: {
+  startDate: string; endDate: string; cursor?: string; limitDates?: number; limitFunds?: number;
+}): Promise<Record<string, unknown>> {
+  const { data } = await api.post<Record<string, unknown>>("/api/data-center/backfill/exchange-etf-pcf", null, {
+    params: {
+      start_date: payload.startDate,
+      end_date: payload.endDate,
+      cursor: payload.cursor || "",
+      limit_dates: payload.limitDates ?? 1,
+      limit_funds: payload.limitFunds ?? 0,
+    },
+    timeout: 10 * 60 * 1000,
+  });
   return data;
 }
 

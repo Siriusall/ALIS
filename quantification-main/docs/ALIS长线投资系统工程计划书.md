@@ -199,7 +199,7 @@
 | 主题叙事 | 120个主题，主题快照仅覆盖2026-07-15至07-17；3167只股票有映射 | **只能在线评分，历史长度不足，暂不能训练可靠叙事生命周期模型** |
 | 公告与事件 | 公告878条、覆盖324只股票，仅2026-07-10至07-17；结构化事件171条、9类 | **不足训练事件预期差模型，只能规则评分和持续积累标签** |
 | ETF基础、日线与净值 | 1621只已上市ETF的`fund_daily/fund_nav`请求切片均已达到终态 | **价格与净值合同已补齐；是否存在真实NAV需同时看原始行数与`valid_empty/deferred_empty`分类** |
-| ETF申赎持仓组合 | `etf_sh_cons/etf_sz_cons`各需1584个交易日切片，当前接入前为0/1584 | **已列入数据中台独立资产和P1历史补全，补齐前不得训练ETF行业暴露模型** |
+| ETF申赎持仓组合 | TuShare网关不可用，改用沪深交易所官方PCF | **作为独立`exchange_etf_pcf`长线数据资产；默认跟踪5个防御ETF及沪深宽基校验样本，可通过`ALIS_ETF_PCF_CODES`扩展；日更盘前采集** |
 | 北向/融资/龙虎榜 | 14096/14164个请求切片达到终态（99.52%）；剩余68个精确缺口 | **可用于大多数历史窗口，但模型必须按接口独立覆盖率裁剪样本，不得把汇总覆盖率当成各接口全量** |
 
 因此，数据库对“价格＋资金驱动的主线和龙头第一版”基本够用，对完整的文本叙事、事件预期差、行业专属景气和跨资产轮动训练还不够。上线时必须区分：`trained`、`rule/proxy`、`missing`，代理信号不得冒充训练模型。
@@ -273,8 +273,6 @@
 | ETF基础 | `fund_basic` | `market=E,status=L` | `ts_code,name,management,fund_type,list_date,market`等 | `ts_code` | 月 | 防御、宽基、行业ETF池 |
 | ETF日线 | `fund_daily` | `ts_code,start_date,end_date` | `ts_code,trade_date,open,high,low,close,pre_close,pct_chg,vol,amount` | `ts_code,trade_date` | 日；至少6年 | 防御和进攻ETF轮动 |
 | ETF净值 | `fund_nav` | `ts_code,start_date,end_date` | `ts_code,ann_date,nav_date,unit_nav,accum_nav,net_asset,total_netasset,adj_nav` | `ts_code,nav_date` | 日 | 折溢价、规模、流动性 |
-| 沪市ETF持仓 | `etf_sh_cons` | `ts_code/trade_date/start_date,end_date` | `trade_date,ts_code,con_code,con_name,qty,sub_flag,cpr,rdr,sca,exchange` | `trade_date,ts_code,con_code` | 日 | ETF行业暴露、申赎结构 |
-| 深市ETF持仓 | `etf_sz_cons` | 同上 | `trade_date,ts_code,con_code,con_name,qty,sub_flag,cpr,rdr,sub_cc,red_cc,exchange` | `trade_date,ts_code,con_code` | 日 | ETF行业暴露、申赎结构 |
 | 宽基/行业指数 | `index_basic/index_daily/index_weight` | 指数代码或日期范围 | 现有指数字段集 | 指数代码＋日期＋成分 | 日/月；至少10年 | 行业超额、历史成分、基准 |
 
 ### 13.3 标准化与落库
@@ -291,7 +289,7 @@
 
 1. P0：`moneyflow_hsgt`、`margin`、`margin_detail`、`margin_secs`、`top_list`、`top_inst`。
 2. P1：`fund_basic`、宽基/行业ETF的`fund_daily/fund_nav`、指数日线与历史权重。
-   `etf_sh_cons/etf_sz_cons`必须作为两个独立数据资产展示，并按交易日水位补全；不得由`fund_daily/fund_nav`完成状态代替。
+   ETF申赎持仓组合使用交易所官方PCF独立展示和验收；不得用`fund_daily/fund_nav`、`fund_portfolio`或指数权重冒充真实PCF。
 3. P2：`major_news`三年历史、公告事件历史、主题实体映射。
 4. P3：六年财务VIP、主营构成VIP、行业产品价格/库存/产能等非Tushare专属序列。
 
@@ -321,7 +319,7 @@
 - `margin_secs(BSE)`从北交所融资融券正式启动日2023-02-13开始构造预期切片。
 - `major_news`按来源、按日回补，空日记`valid_empty`。
 - 部分接口失败时成功接口仍提交，失败项进入精确参数重试清单。
-- 2026-07-19实调确认：官方文档已发布`etf_sh_cons/etf_sz_cons`，但当前固定VIP网关`lianghua.nanyangqiankun.top`返回“接口不存在”；同一网关token不能用于官方TuShare主站。数据中台必须将两类资产显示为`missing/blocked`，禁止循环请求或记作空结果；网关透传接口后沿现有交易日水位直接续跑。
+- 2026-07-22决定：不再等待固定VIP网关透传`etf_sh_cons/etf_sz_cons`，改为直接采集上交所查询接口与深交所官方PCF文件。上交所公开通道只保证最新篮子，不可得的旧日期保持缺失；深交所按公开日期回补。
 
 | 业务日期 | 接口 | 实调结果 |
 | --- | --- | --- |

@@ -139,6 +139,7 @@ def _compute_data_assets() -> dict[str, Any]:
     financial_start = min(financial_periods)
     financial_end = max(financial_periods)
     from app.data_platform.services.data_center import get_vip_backfill_status
+    from app.data_platform.services.exchange_etf_pcf import tracked_etf_codes
     vip = get_vip_backfill_status(end_date=end_s)
 
     with _conn() as c:
@@ -412,6 +413,18 @@ def _compute_data_assets() -> dict[str, Any]:
                 """
             ).fetchone()
         )
+        etf_pcf = _d(
+            c.execute(
+                """SELECT COUNT(*) records, COUNT(DISTINCT etf_code) symbols,
+                          COUNT(DISTINCT trade_date) dates, MIN(trade_date) min_date, MAX(trade_date) max_date
+                   FROM dc_etf_pcf_header WHERE trade_date>=?""",
+                (start_s,),
+            ).fetchone()
+        )
+        pcf_latest_date = str(etf_pcf.get("max_date") or end_s)
+        etf_pcf_latest = _i(c.execute(
+            "SELECT COUNT(DISTINCT etf_code) n FROM dc_etf_pcf_header WHERE trade_date=?", (pcf_latest_date,)
+        ).fetchone())
 
     def daily_raw(api: str) -> dict[str, Any]:
         return raw_daily.get(api, {})
@@ -437,6 +450,28 @@ def _compute_data_assets() -> dict[str, Any]:
     #   event_count     -> no fixed expected volume
     #   snapshot        -> latest master snapshot only
     specs: list[dict[str, Any]] = [
+        {
+            "key": "exchange_etf_pcf",
+            "name": "ETF每日申购赎回篮子（PCF）",
+            "domain": "基金与跨资产",
+            "consumer": "长线资产暴露、ETF轮动、申赎结构与偏离核验",
+            "weight": 25,
+            "target_scope": "ALIS长线ETF清单；默认5个防御资产加沪深宽基校验样本，可配置扩展",
+            "frequency": "daily_premarket",
+            "source": "上海证券交易所 / 深圳证券交易所官方PCF",
+            "window_start": start_s,
+            "window_end": pcf_latest_date,
+            "window_depth": "深市按公开历史回补；沪市从接入日起归档",
+            "measurement": "coverage_records",
+            "actual": etf_pcf_latest,
+            "expected": len(tracked_etf_codes()),
+            "symbols": int(etf_pcf.get("symbols") or 0),
+            "dates": int(etf_pcf.get("dates") or 0),
+            "min_date": etf_pcf.get("min_date"),
+            "max_date": etf_pcf.get("max_date"),
+            "records_actual": int(etf_pcf.get("records") or 0),
+            "rationale": "PCF是每日真实申赎篮子；fund_portfolio与指数权重不得冒充。上交所历史不可得日期保持缺失。",
+        },
         {
             "key": "capital_structure_vip",
             "name": "资金与席位接口汇总",
@@ -478,27 +513,6 @@ def _compute_data_assets() -> dict[str, Any]:
             "min_date": None,
             "max_date": None,
             "rationale": "每只ETF的fund_daily与fund_nav均达到终态才算完成",
-        },
-        {
-            "key": "etf_constituents_vip",
-            "name": "ETF持仓组合接口汇总",
-            "domain": "基金与跨资产",
-            "consumer": "回测、跨资产轮动、模型训练、量化分析",
-            "weight": 50,
-            "target_scope": "全部已上市ETF六年每日持仓",
-            "frequency": "daily",
-            "source": "Tushare fund_portfolio（etf_sh_cons/etf_sz_cons VIP网关不可用时降级）",
-            "window_start": vip["scope"]["capital_start"],
-            "window_end": vip["scope"]["end_date"],
-            "window_depth": "至少6年",
-            "measurement": "coverage_records",
-            "actual": vip["etf_constituents"]["completed_slices"],
-            "expected": vip["etf_constituents"]["expected_slices"],
-            "symbols": vip["scope"]["etfs"],
-            "dates": 0,
-            "min_date": None,
-            "max_date": None,
-            "rationale": "每只ETF的fund_portfolio请求切片均达到终态才算完成；etf_sh_cons/etf_sz_cons VIP不可用时以此为准",
         },
         {
             "key": "major_news_vip",
@@ -1225,8 +1239,6 @@ def _compute_data_assets() -> dict[str, Any]:
         "fund_basic": ("ETF基础信息", "基金与跨资产", "ETF资产池与上市状态"),
         "fund_daily": ("ETF日线", "基金与跨资产", "ETF趋势与轮动"),
         "fund_nav": ("ETF净值", "基金与跨资产", "折溢价、规模与流动性"),
-        "etf_sh_cons": ("沪市ETF每日持仓组合", "基金与跨资产", "ETF行业暴露和申赎结构"),
-        "etf_sz_cons": ("深市ETF每日持仓组合", "基金与跨资产", "ETF行业暴露和申赎结构"),
     }
     for api_name, (name, domain, consumer) in dataset_meta.items():
         contract = vip.get("datasets", {}).get(api_name, {})

@@ -7,7 +7,7 @@ from typing import Any
 
 from app.data_platform.contracts import CONTRACTS
 from app.data_platform.db import _conn
-from app.data_platform.redis_store import get_json, set_json
+from app.data_platform.redis_store import delete as redis_delete, get_json, set_json
 from app.data_platform.services.market_calendar import target_trade_date
 from app.data_platform.services.assets import _report_periods
 
@@ -16,6 +16,13 @@ _cache: dict[str, Any] = {"at": 0.0, "value": None}
 _CACHE_TTL = 30.0
 _refresh_lock = threading.Lock()
 _refresh_state: dict[str, Any] = {"running": False, "last_started_at": "", "last_finished_at": "", "last_error": "", "last_result": None}
+
+
+def invalidate_readiness_cache() -> None:
+    redis_delete("alis:data-platform:readiness:v2")
+    with _cache_lock:
+        _cache["at"] = 0.0
+        _cache["value"] = None
 
 
 def _value(row: Any, key: str, default: Any = 0) -> Any:
@@ -64,6 +71,7 @@ def _metrics() -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
     with _conn() as c:
         stock_count = int(_value(c.execute("SELECT COUNT(*) n FROM dc_stock_master").fetchone(), "n"))
         latest = target
+        usable_latest = _latest_usable_snapshot_date(c, stock_count)
         snap = c.execute(
             """SELECT COUNT(*) n,
             SUM(CASE WHEN close IS NOT NULL THEN 1 ELSE 0 END) daily_n,
@@ -123,6 +131,18 @@ def _metrics() -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
         history_dates = int(_value(c.execute(
             "SELECT COUNT(DISTINCT trade_date) n FROM dc_stock_daily_snapshot WHERE trade_date BETWEEN ? AND ?", (window_start, history_end)
         ).fetchone(), "n"))
+        theme_snapshot_dates = int(_value(c.execute(
+            """
+            SELECT COUNT(DISTINCT as_of_date) n
+            FROM dc_theme_snapshot
+            WHERE as_of_date IN (
+                SELECT cal_date FROM dc_trade_calendar
+                WHERE is_open=1 AND cal_date<=?
+                ORDER BY cal_date DESC LIMIT 250
+            )
+            """,
+            (usable_latest or history_end,),
+        ).fetchone(), "n"))
         announcement_count = int(_value(c.execute("SELECT COUNT(*) n FROM dc_announcement_raw").fetchone(), "n"))
         latest_ann = str(_value(c.execute("SELECT MAX(publish_time) value FROM dc_announcement_raw").fetchone(), "value", ""))
         has_available_time = c.execute(
@@ -134,6 +154,12 @@ def _metrics() -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
             LIMIT 1
             """
         ).fetchone() is not None
+        pcf_latest_date = str(_value(c.execute(
+            "SELECT MAX(trade_date) value FROM dc_etf_pcf_header WHERE trade_date<=?", (today,)
+        ).fetchone(), "value", ""))
+        pcf_latest = int(_value(c.execute(
+            "SELECT COUNT(DISTINCT etf_code) n FROM dc_etf_pcf_header WHERE trade_date=?", (pcf_latest_date,)
+        ).fetchone(), "n")) if pcf_latest_date else 0
 
     n = int(_value(snap, "n"))
     ratio = lambda count, total: min(1.0, count / total) if total else 0.0
@@ -146,6 +172,8 @@ def _metrics() -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
         pass
     from app.data_platform.services.data_center import get_vip_backfill_status
     vip = get_vip_backfill_status(end_date=history_end)
+    from app.data_platform.services.exchange_etf_pcf import tracked_etf_codes
+    pcf_expected = len(tracked_etf_codes())
     values = {
         "trade_calendar": (ratio(calendar_rows, calendar_expected), calendar_rows, calendar_expected, f"自然日日历 {calendar_rows}/{calendar_expected}"),
         "latest_daily": (ratio(int(_value(snap, "daily_n")), stock_count), int(_value(snap, "daily_n")), stock_count, f"目标交易日 {latest}"),
@@ -177,13 +205,18 @@ def _metrics() -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
             float(vip["etf_price_nav"]["coverage"]), int(vip["etf_price_nav"]["completed_slices"]),
             int(vip["etf_price_nav"]["expected_slices"]), "已上市ETF日线与NAV精确请求切片覆盖",
         ),
-        "etf_constituents": (
-            float(vip["etf_constituents"]["coverage"]), int(vip["etf_constituents"]["completed_slices"]),
-            int(vip["etf_constituents"]["expected_slices"]), "ETF每日持仓组合精确请求切片覆盖（fund_portfolio）",
+        "etf_pcf": (
+            ratio(pcf_latest, pcf_expected) if pcf_latest_date >= history_end else 0.0,
+            pcf_latest if pcf_latest_date >= history_end else 0, pcf_expected,
+            f"当前已发布PCF {pcf_latest_date or '无'} 覆盖 {pcf_latest}/{pcf_expected}；行情目标日 {history_end}，盘前PCF可领先收盘行情一个交易日",
         ),
         "major_news": (
             float(vip["major_news"]["coverage"]), int(vip["major_news"]["completed_slices"]),
             int(vip["major_news"]["expected_slices"]), "九来源长篇新闻按来源×自然日切片覆盖",
+        ),
+        "theme_snapshots": (
+            ratio(theme_snapshot_dates, 250), theme_snapshot_dates, 250,
+            f"叙事状态转移模型要求最近250个可用行情交易日主题快照，当前 {theme_snapshot_dates}/250，截止 {usable_latest or history_end}",
         ),
     }
     return {key: {"coverage": round(v[0], 6), "available": v[1], "expected": v[2], "evidence": v[3]} for key, v in values.items()}, {

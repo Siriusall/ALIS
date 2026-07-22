@@ -187,10 +187,10 @@ def revenue_target_dashboard(
     protection: dict[str, Any],
 ) -> dict[str, Any]:
     needs_reduce = bool(risk_gate_explanation.get("requires_rebalance") or protection.get("active"))
-    if recent_execution:
-        action = "已调仓，等待新信号"
-    elif needs_reduce:
+    if needs_reduce:
         action = "先降风险，不新增"
+    elif recent_execution:
+        action = "已调仓，等待新信号"
     elif gate_decision.get("tone") == "go":
         action = "可生成/执行目标组合"
     else:

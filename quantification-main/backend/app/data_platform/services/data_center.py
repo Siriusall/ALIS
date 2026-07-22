@@ -22,6 +22,7 @@ from app.data_platform.redis_store import set_add as redis_set_add, set_remove a
 SOURCE_TUSHARE = "tushare"
 SOURCE_CNINFO = "cninfo"
 SOURCE_MANUAL = "manual"
+SOURCE_EXCHANGE_PCF = "exchange_etf_pcf"
 
 _tushare_activity_local = threading.local()
 _tushare_cooldown_lock = threading.Lock()
@@ -135,8 +136,6 @@ TUSHARE_CATALOG: list[TushareCatalogItem] = [
     TushareCatalogItem("fund_basic", "基金", "场内基金基础信息", "防御ETF主数据与交易状态", "monthly", "ts_code,name,management,custodian,fund_type,found_date,due_date,list_date,issue_date,delist_date,market", {"market": "E"}),
     TushareCatalogItem("fund_daily", "基金", "场内基金日线", "货币、债券、黄金、低波和红利ETF模拟交易", "daily", "ts_code,trade_date,open,high,low,close,pre_close,change,pct_chg,vol,amount", {"ts_code": ""}),
     TushareCatalogItem("fund_nav", "基金", "公募基金净值", "ETF折溢价、规模与复权净值", "daily", "ts_code,ann_date,nav_date,unit_nav,accum_nav,accum_div,net_asset,total_netasset,adj_nav", {"ts_code": ""}),
-    TushareCatalogItem("etf_sh_cons", "基金", "沪市ETF每日持仓组合", "ETF行业暴露、申赎与历史成分", "daily", "trade_date,ts_code,con_code,con_name,qty,sub_flag,cpr,rdr,sca,exchange", {"trade_date": ""}),
-    TushareCatalogItem("etf_sz_cons", "基金", "深市ETF每日持仓组合", "ETF行业暴露、申赎与历史成分", "daily", "trade_date,ts_code,con_code,con_name,qty,sub_flag,cpr,rdr,sub_cc,red_cc,exchange", {"trade_date": ""}),
     TushareCatalogItem("weekly", "行情", "周线", "长线趋势辅助", "weekly", "ts_code,trade_date,open,high,low,close,vol,amount", {"trade_date": ""}),
     TushareCatalogItem("monthly", "行情", "月线", "长线趋势辅助", "monthly", "ts_code,trade_date,open,high,low,close,vol,amount", {"trade_date": ""}),
     TushareCatalogItem("adj_factor", "行情", "复权因子", "历史价格复权和收益计算", "daily", "ts_code,trade_date,adj_factor", {"trade_date": ""}),
@@ -322,6 +321,7 @@ def ensure_data_center_seeded() -> dict[str, Any]:
         for values in (
             (SOURCE_TUSHARE, "TuShare Pro", "api", 10, "active", "A股行情、财务、股东、分红、指数等结构化数据主通道", now, now),
             (SOURCE_CNINFO, "巨潮资讯", "crawler", 20, "active", "A股公告元数据、公告正文和附件主通道", now, now),
+            (SOURCE_EXCHANGE_PCF, "沪深交易所 ETF PCF", "exchange_api", 15, "active", "上交所与深交所每日申购赎回篮子官方数据", now, now),
             (SOURCE_MANUAL, "手工/公开行业指标", "manual", 30, "active", "行业景气指标定义和值的人工维护或脚本导入通道", now, now),
         ):
             if c._is_mysql:
@@ -654,6 +654,8 @@ def get_data_center_status(limit_runs: int = 10) -> dict[str, Any]:
         industry_metric_count = c.execute("SELECT COUNT(*) AS cnt FROM dc_industry_metric_definition").fetchone()
         industry_value_count = c.execute("SELECT COUNT(*) AS cnt FROM dc_industry_metric_value").fetchone()
         web_factor_count = c.execute("SELECT COUNT(*) AS cnt FROM dc_web_factor_snapshot").fetchone()
+        etf_pcf_header_count = c.execute("SELECT COUNT(*) AS cnt FROM dc_etf_pcf_header").fetchone()
+        etf_pcf_component_count = c.execute("SELECT COUNT(*) AS cnt FROM dc_etf_pcf_component").fetchone()
         runs = c.execute(
             """
             SELECT id, job_name, source_code, status, started_at, finished_at,
@@ -667,7 +669,14 @@ def get_data_center_status(limit_runs: int = 10) -> dict[str, Any]:
     return {
         "ok": True,
         "sources": [_row_to_dict(row) for row in source_rows],
-        "catalog": [_row_to_dict(row) for row in catalog_rows],
+        "catalog": [_row_to_dict(row) for row in catalog_rows] + [
+            {"api_name": "sse_etf_pcf", "category": "交易所ETF", "display_name": "上交所ETF每日申赎篮子",
+             "recommended_frequency": "daily_premarket", "enabled": 1, "source_code": SOURCE_EXCHANGE_PCF,
+             "last_probe_status": "official_public", "last_probe_rows": 0, "last_probe_error": None, "last_probe_at": None},
+            {"api_name": "szse_etf_pcf", "category": "交易所ETF", "display_name": "深交所ETF每日申赎篮子",
+             "recommended_frequency": "daily_premarket", "enabled": 1, "source_code": SOURCE_EXCHANGE_PCF,
+             "last_probe_status": "official_public", "last_probe_rows": 0, "last_probe_error": None, "last_probe_at": None},
+        ],
         "coverage": {
             "stock_master_rows": _row_count(stock_count),
             "trade_calendar_rows": _row_count(cal_count),
@@ -679,6 +688,8 @@ def get_data_center_status(limit_runs: int = 10) -> dict[str, Any]:
             "industry_metric_definitions": _row_count(industry_metric_count),
             "industry_metric_values": _row_count(industry_value_count),
             "web_factor_rows": _row_count(web_factor_count),
+            "etf_pcf_header_rows": _row_count(etf_pcf_header_count),
+            "etf_pcf_component_rows": _row_count(etf_pcf_component_count),
         },
         "recent_runs": [_row_to_dict(row) for row in runs],
     }
@@ -1145,6 +1156,24 @@ def _request_is_complete(api_name: str, params: dict[str, Any]) -> bool:
     return row is not None
 
 
+def _etf_nav_publish_cutoff(end_date: str, *, lag_open_sessions: int = 2) -> str:
+    """Latest trade date whose ETF NAV is expected to be published."""
+    if not (len(str(end_date)) == 8 and str(end_date).isdigit()):
+        return ""
+    with _conn() as c:
+        rows = c.execute(
+            """SELECT cal_date FROM dc_trade_calendar
+               WHERE exchange='SSE' AND is_open=1 AND cal_date<=?
+               ORDER BY cal_date DESC LIMIT ?""",
+            (str(end_date), max(1, int(lag_open_sessions) + 1)),
+        ).fetchall()
+    dates = [str(dict(row).get("cal_date") or "") for row in rows]
+    if not dates:
+        return ""
+    index = min(max(0, int(lag_open_sessions)), len(dates) - 1)
+    return dates[index]
+
+
 def backfill_capital_structure_history(
     *, start_date: str, end_date: str, cursor: str = "", limit_dates: int = 10
 ) -> dict[str, Any]:
@@ -1330,6 +1359,7 @@ def backfill_etf_daily_incremental(
                WHERE api_name='fund_basic' ORDER BY ts_code ASC"""
         ).fetchall()
     trade_dates = [str(dict(row).get("cal_date") or "") for row in date_rows]
+    nav_end_date = _etf_nav_publish_cutoff(end_date)
     if not trade_dates:
         return {
             "ok": True,
@@ -1342,6 +1372,7 @@ def backfill_etf_daily_incremental(
             "requests_skipped": 0,
             "rows_written": 0,
             "failed": 0,
+            "nav_publish_cutoff": nav_end_date,
             "results": [],
         }
 
@@ -1360,11 +1391,15 @@ def backfill_etf_daily_incremental(
             name = str(payload.get("name") or "")
             list_date = str(payload.get("list_date") or "")
             delist_date = str(payload.get("delist_date") or "")
-            if "ETF" not in name.upper() or not list_date or list_date > trade_dates[-1]:
+            if "ETF" not in name.upper() or not list_date or list_date > (nav_end_date or trade_dates[-1]):
                 continue
             if delist_date and delist_date < trade_dates[0]:
                 continue
-            funds.append({"ts_code": str(item.get("ts_code") or payload.get("ts_code") or ""), "list_date": list_date})
+            ts_code = str(item.get("ts_code") or payload.get("ts_code") or "")
+            nav_params = {"ts_code": ts_code, "start_date": max(start_date, list_date), "end_date": nav_end_date}
+            if not nav_end_date or nav_params["start_date"] > nav_end_date or _request_is_complete("fund_nav", nav_params):
+                continue
+            funds.append({"ts_code": ts_code, "list_date": list_date})
             if len(funds) >= nav_limit_funds:
                 break
 
@@ -1376,14 +1411,12 @@ def backfill_etf_daily_incremental(
             skipped += 1
         else:
             pending_requests.append(("fund_daily", daily_params))
-        for fund in funds:
-            if fund["list_date"] > trade_date:
-                continue
-            nav_params = {"ts_code": fund["ts_code"], "start_date": trade_date, "end_date": trade_date}
-            if _request_is_complete("fund_nav", nav_params):
-                skipped += 1
-            else:
-                pending_requests.append(("fund_nav", nav_params))
+    for fund in funds:
+        nav_params = {"ts_code": fund["ts_code"], "start_date": max(start_date, fund["list_date"]), "end_date": nav_end_date}
+        if _request_is_complete("fund_nav", nav_params):
+            skipped += 1
+        else:
+            pending_requests.append(("fund_nav", nav_params))
 
     def fetch_one(item: tuple[str, dict[str, Any]]) -> dict[str, Any]:
         api_name, params = item
@@ -1405,206 +1438,14 @@ def backfill_etf_daily_incremental(
         "cursor": next_cursor,
         "dates_processed": len(trade_dates),
         "funds_processed_for_nav": len(funds),
+        "nav_publish_cutoff": nav_end_date,
+        "nav_deferred_unpublished_dates": [date for date in trade_dates if nav_end_date and date > nav_end_date],
         "has_more": next_cursor < end_date,
         "requests_executed": len(results),
         "requests_skipped": skipped,
         "concurrency": workers,
         "rows_written": sum(int(item.get("rows_written") or 0) for item in results),
         "failed": sum(1 for item in results if not item.get("ok")),
-        "results": results,
-    }
-
-
-def backfill_etf_constituents_history(
-    *, start_date: str, end_date: str, cursor: str = "", limit_dates: int = 20
-) -> dict[str, Any]:
-    """Backfill ETF constituent holdings using fund_portfolio API."""
-    if not start_date.isdigit() or len(start_date) != 8:
-        start_date = "20200101"
-    if not end_date.isdigit() or len(end_date) != 8:
-        end_date = datetime.now().strftime("%Y%m%d")
-    limit_dates = max(1, min(int(limit_dates), 60))
-    
-    # Get Tushare client for API calls.
-    from app.data_platform.tushare_client import get_tushare_client
-    client = get_tushare_client()
-
-    def _load_etf_codes_from_local_fund_basic() -> tuple[list[str], dict[str, str]]:
-        """Read ETF universe from cached fund_basic rows."""
-        etf_codes: list[str] = []
-        list_date_map: dict[str, str] = {}
-        try:
-            with _conn() as _c:
-                rows = _c.execute(
-                    """SELECT ts_code,payload_json FROM dc_tushare_raw_records
-                       WHERE api_name='fund_basic' ORDER BY ts_code ASC"""
-                ).fetchall()
-            for _row in rows:
-                _item = dict(_row)
-                _code = str(_item.get('ts_code') or '')
-                if not _code.endswith(('.SH', '.SZ')):
-                    continue
-                _payload = _item.get('payload_json') or {}
-                if isinstance(_payload, str):
-                    try:
-                        _payload = _json.loads(_payload)
-                    except Exception:
-                        _payload = {}
-                _name = str(_payload.get('name') or '')
-                _ld = str(_payload.get('list_date') or '')
-                _dd = str(_payload.get('delist_date') or '')
-                # Only include listed ETFs that are still active (or delisted after window start).
-                if 'ETF' not in _name.upper():
-                    continue
-                if not _ld or _ld > end_date:
-                    continue
-                if _dd and _dd < start_date:
-                    continue
-                etf_codes.append(_code)
-                if _ld.isdigit() and len(_ld) == 8:
-                    list_date_map[_code] = _ld
-        except Exception:
-            return [], {}
-        return etf_codes, list_date_map
-
-    # Read ETF codes from the database (fund_basic raw records) so ordering
-    # matches get_vip_backfill_status exactly.  A live fund_basic call may
-    # return a different sort order, which breaks the per-ETF resume cursor.
-    import json as _json
-    etf_codes, list_date_map = _load_etf_codes_from_local_fund_basic()
-
-    if not etf_codes:
-        # The local ETF universe is incomplete or not yet seeded. Pull fund_basic
-        # once so the ETF constituent walk can continue instead of getting stuck
-        # on an empty cached universe.
-        try:
-            _safe_sync_raw("fund_basic", {"market": "E"})
-        except Exception:
-            pass
-        etf_codes, list_date_map = _load_etf_codes_from_local_fund_basic()
-
-    if not etf_codes:
-        try:
-            df = client.pro.fund_basic(market="E")
-            if df is not None:
-                raw_codes = []
-                if hasattr(df, "__getitem__") and "ts_code" in getattr(df, "columns", []):
-                    raw_codes = [str(code) for code in df["ts_code"].tolist()]
-                elif hasattr(df, "tolist"):
-                    raw_codes = [str(code) for code in df.tolist()]
-                etf_codes = sorted(
-                    code for code in raw_codes
-                    if code.endswith((".SH", ".SZ")) and code > (cursor or "")
-                )
-        except Exception:
-            etf_codes = []
-    
-    if not etf_codes:
-        return {"ok": False, "error": "no_etf_codes", "start_date": start_date, "end_date": end_date}
-    
-    resume = cursor or ""
-    # Apply the cursor before batching.  The old logic sliced the first page
-    # and then skipped already-processed ETFs inside that slice, which meant
-    # the second and later calls could keep looking at the same front page and
-    # never advance to the remaining ETF universe.
-    pending_codes = [ts_code for ts_code in etf_codes if ts_code > resume]
-    batch = pending_codes[:min(limit_dates, len(pending_codes))]
-    results = []
-    written = 0
-    failed = 0
-    
-    for ts_code in batch:
-        if ts_code <= resume:
-            continue
-        try:
-            _emit_tushare_activity(
-                "request",
-                "fund_portfolio",
-                {"ts_code": ts_code, "start_date": start_date, "end_date": end_date},
-                step="etf_constituents",
-                cursor=cursor,
-                batch_limit=limit_dates,
-            )
-            df = client.pro.fund_portfolio(ts_code=ts_code, start_date=start_date, end_date=end_date)
-            rows = 0
-            empty_attr = getattr(df, "empty", True)
-            is_empty = empty_attr() if callable(empty_attr) else bool(empty_attr)
-            if df is not None and not is_empty:
-                # Store each row in raw records
-                import json
-                now = datetime.now().isoformat(timespec="seconds")
-                if hasattr(df, "iterrows"):
-                    record_iter = (row.to_dict() for _, row in df.iterrows())
-                else:
-                    columns = list(getattr(df, "columns", []))
-                    record_iter = (
-                        dict(zip(columns, values if isinstance(values, (list, tuple)) else [values]))
-                        for values in getattr(df, "_data", [])
-                    )
-                for record in record_iter:
-                    record_key = f"fund_portfolio_{ts_code}_{record.get('end_date','')}_{record.get('symbol','')}"
-                    try:
-                        with _conn() as c:
-                            c.execute(
-                                """INSERT INTO dc_tushare_raw_records 
-                                   (api_name, record_key, ts_code, trade_date, period, payload_json, source_code, available_time, updated_at)
-                                   VALUES(?,?,?,?,?,?,?,?,?)
-                                   ON CONFLICT(api_name, record_key) DO NOTHING""",
-                                ("fund_portfolio", record_key, ts_code,
-                                 str(record.get("ann_date", ""))[:10], str(record.get("end_date", ""))[:10],
-                                 json.dumps(record, ensure_ascii=False, default=str),
-                                 "tushare", now, now)
-                            )
-                        rows += 1
-                    except Exception:
-                        pass
-                written += rows
-                results.append({"ts_code": ts_code, "rows": rows, "ok": True})
-            else:
-                results.append({"ts_code": ts_code, "rows": 0, "ok": True})
-            # Record request coverage so get_vip_backfill_status can track per-ETF completion
-            # Use effective_start_date matching get_vip_backfill_status key
-            effective_start = max(start_date, list_date_map.get(ts_code, start_date))
-            _record_request_coverage(
-                "fund_portfolio",
-                {"ts_code": ts_code, "start_date": effective_start, "end_date": end_date},
-                None,
-                rows,
-                result_status="success" if rows > 0 else "valid_empty",
-            )
-            _emit_tushare_activity(
-                "saved",
-                "fund_portfolio",
-                {"ts_code": ts_code, "start_date": start_date, "end_date": end_date},
-                step="etf_constituents",
-                rows=rows,
-                written=rows,
-                result_status="success" if rows > 0 else "valid_empty",
-            )
-        except Exception as e:
-            failed += 1
-            results.append({"ts_code": ts_code, "rows": 0, "ok": False, "error": str(e)[:80]})
-            _emit_tushare_activity(
-                "failed",
-                "fund_portfolio",
-                {"ts_code": ts_code, "start_date": start_date, "end_date": end_date},
-                step="etf_constituents",
-                error=str(e)[:300],
-            )
-    
-    next_cursor = batch[-1] if batch else resume
-    has_more = len(etf_codes) > len(batch)
-    return {
-        "ok": failed == 0,
-        "start_date": start_date,
-        "end_date": end_date,
-        "cursor": next_cursor,
-        "dates_processed": len(batch),
-        "has_more": has_more,
-        "requests_executed": len(results),
-        "concurrency": 1,
-        "rows_written": written,
-        "failed": failed,
         "results": results,
     }
 
@@ -1692,18 +1533,14 @@ def get_vip_backfill_status(
                FROM dc_tushare_request_coverage
                WHERE api_name IN
                ('moneyflow_hsgt','margin','margin_detail','top_list','top_inst','hk_hold','margin_secs',
-                'fund_daily','fund_nav','etf_sh_cons','etf_sz_cons','major_news','fund_portfolio')"""
+                'fund_daily','fund_nav','major_news')"""
         ).fetchall()
         fund_rows = c.execute(
             """SELECT ts_code,payload_json FROM dc_tushare_raw_records
                WHERE api_name='fund_basic' ORDER BY ts_code"""
         ).fetchall()
-        constituent_probe_rows = c.execute(
-            """SELECT api_name,last_probe_status,last_probe_error,last_probe_at
-               FROM tushare_api_catalog
-               WHERE api_name IN ('fund_portfolio','etf_sh_cons','etf_sz_cons')"""
-        ).fetchall()
     dates = [str(dict(row).get("cal_date") or "") for row in date_rows]
+    nav_end_date = _etf_nav_publish_cutoff(end_date)
     expected_capital: set[str] = set()
     expected_by_api: dict[str, set[str]] = {}
     def expect(api_name: str, params: dict[str, Any]) -> str:
@@ -1762,34 +1599,21 @@ def get_vip_backfill_status(
     etf_daily_keys_by_date: list[tuple[str, set[str]]] = []
     for trade_date in dates:
         daily_keys = {expect("fund_daily", {"trade_date": trade_date})}
+        expected_etf.update(daily_keys)
         etf_daily_keys_by_date.append((trade_date, daily_keys))
     for fund in etf_funds:
-        params = {
-            "ts_code": fund["ts_code"],
-            "start_date": max(capital_start, fund["list_date"]),
-            "end_date": end_date,
-        }
-        fund_keys = {expect(api, params) for api in ("fund_daily", "fund_nav")}
-        expected_etf.update(fund_keys)
-        etf_keys_by_code.append((fund["ts_code"], fund_keys))
-
-    expected_etf_constituents: set[str] = set()
-    constituent_keys_by_date: list[tuple[str, set[str]]] = []
-    for fund in etf_funds:
-        day_keys = {
-            expect("fund_portfolio", {
+        fund_keys = set()
+        if nav_end_date and fund["list_date"] <= nav_end_date:
+            fund_keys.add(expect("fund_nav", {
                 "ts_code": fund["ts_code"],
                 "start_date": max(capital_start, fund["list_date"]),
-                "end_date": end_date,
-            })
-        }
-        expected_etf_constituents.update(day_keys)
-        constituent_keys_by_date.append((fund["ts_code"], day_keys))
+                "end_date": nav_end_date,
+            }))
+        etf_keys_by_code.append((fund["ts_code"], fund_keys))
+        expected_etf.update(fund_keys)
 
-    # Count completed solely from coverage table (fund_portfolio was added to the
-    # coverage query above).  Raw-records existence is not a substitute for
-    # verified request-slice completion.
-    fund_portfolio_done = len(expected_etf_constituents & completed_keys)
+    # Count completed solely from coverage table.  Raw-records existence is not
+    # a substitute for verified request-slice completion.
 
     news_days = (datetime.strptime(end_date, "%Y%m%d").date() - datetime.strptime(news_start, "%Y%m%d").date()).days + 1
 
@@ -1833,15 +1657,6 @@ def get_vip_backfill_status(
         for api_name, keys in expected_by_api.items()
     }
     per_api["fund_basic"] = contract(1 if etf_funds else 0, 1, "")
-    constituent_probes = {str(dict(row).get("api_name") or ""): dict(row) for row in constituent_probe_rows}
-    # fund_portfolio is the working alternative to etf_sh_cons/etf_sz_cons
-    constituent_supported = True
-    for row in constituent_probes.values():
-        api = str(row.get("api_name") or "")
-        err = str(row.get("last_probe_error") or "")
-        if api == "fund_portfolio" and err and "不存在" in err:
-            constituent_supported = False
-            break
     return {
         "ok": True,
         "capital": contract(len(expected_capital & completed_keys), len(expected_capital), resume_cursor(capital_keys_by_date)),
@@ -1850,18 +1665,12 @@ def get_vip_backfill_status(
             "resume_cursor": resume_cursor(etf_daily_keys_by_date),
             "resume_cursor_mode": "trade_date",
             "fund_code_resume_cursor": resume_cursor(etf_keys_by_code),
+            "nav_publish_cutoff": nav_end_date,
+            "deferred_unpublished_nav_dates": [date for date in dates if nav_end_date and date > nav_end_date],
         },
-        "etf_constituents": contract(
-            fund_portfolio_done,
-            len(expected_etf_constituents),
-            resume_cursor(constituent_keys_by_date),
-        ),
         "major_news": contract(len(expected_news & completed_keys), len(expected_news), resume_cursor(news_keys_by_day)),
         "datasets": per_api,
-        "capabilities": {
-            "etf_constituents_supported": constituent_supported,
-            "etf_constituents_probes": constituent_probes,
-        },
+        "capabilities": {},
         "scope": {
             "capital_start": capital_start,
             "news_start": news_start,
@@ -2815,6 +2624,28 @@ def run_data_quality_checks(trade_date: str | None = None) -> dict[str, Any]:
             bad_count = _row_count(c.execute("SELECT COUNT(*) AS cnt FROM dc_stock_daily_snapshot WHERE trade_date = ? AND data_quality_score < 75", (trade_date,)).fetchone())
             checks.append(_quality_item("snapshot_coverage", f"snapshot:{trade_date}", "ok" if snap_count >= 5000 else "warning", "high", f"snapshot rows={snap_count}", snap_count))
             checks.append(_quality_item("snapshot_low_quality", f"snapshot:{trade_date}", "ok" if bad_count == 0 else "warning", "medium", f"low quality rows={bad_count}", bad_count))
+            pcf_headers = _row_count(c.execute(
+                "SELECT COUNT(*) AS cnt FROM dc_etf_pcf_header WHERE trade_date=?", (trade_date,)
+            ).fetchone())
+            pcf_components = _row_count(c.execute(
+                "SELECT COUNT(*) AS cnt FROM dc_etf_pcf_component WHERE trade_date=?", (trade_date,)
+            ).fetchone())
+            pcf_mismatch = _row_count(c.execute(
+                """SELECT COUNT(*) AS cnt FROM dc_etf_pcf_header h
+                   WHERE h.trade_date=? AND h.component_count<>(SELECT COUNT(*) FROM dc_etf_pcf_component c
+                   WHERE c.exchange=h.exchange AND c.etf_code=h.etf_code AND c.trade_date=h.trade_date)""",
+                (trade_date,),
+            ).fetchone())
+            checks.append(_quality_item(
+                "etf_pcf_coverage", f"exchange_etf_pcf:{trade_date}",
+                "ok" if pcf_headers > 0 and pcf_components > 0 else "warning", "medium",
+                f"ETF PCF headers={pcf_headers}, components={pcf_components}", 0 if pcf_headers else 1,
+            ))
+            checks.append(_quality_item(
+                "etf_pcf_component_count", f"exchange_etf_pcf:{trade_date}",
+                "ok" if pcf_mismatch == 0 else "warning", "high",
+                f"ETF PCF component count mismatches={pcf_mismatch}", pcf_mismatch,
+            ))
         now = _now()
         for item in checks:
             c.execute(

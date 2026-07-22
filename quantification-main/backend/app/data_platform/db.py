@@ -162,6 +162,41 @@ CREATE TABLE dc_tushare_raw_records (
             updated_at TEXT NOT NULL,
             UNIQUE (api_name, record_key)
         );
+CREATE TABLE dc_etf_pcf_header (
+            exchange TEXT NOT NULL,
+            etf_code TEXT NOT NULL,
+            trade_date TEXT NOT NULL,
+            fund_name TEXT NOT NULL DEFAULT '',
+            fund_manager TEXT NOT NULL DEFAULT '',
+            index_code TEXT NOT NULL DEFAULT '',
+            creation_redemption_unit REAL,
+            component_count INTEGER NOT NULL DEFAULT 0,
+            publish_iopv INTEGER NOT NULL DEFAULT 0,
+            source_url TEXT NOT NULL,
+            source_code TEXT NOT NULL,
+            raw_text TEXT NOT NULL DEFAULT '',
+            available_time TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (exchange, etf_code, trade_date)
+        );
+CREATE TABLE dc_etf_pcf_component (
+            exchange TEXT NOT NULL,
+            etf_code TEXT NOT NULL,
+            trade_date TEXT NOT NULL,
+            component_code TEXT NOT NULL,
+            component_name TEXT NOT NULL DEFAULT '',
+            quantity REAL,
+            substitution_flag TEXT NOT NULL DEFAULT '',
+            creation_premium_rate REAL,
+            redemption_discount_rate REAL,
+            substitution_cash_amount REAL,
+            listing_market TEXT NOT NULL DEFAULT '',
+            payload_json TEXT NOT NULL,
+            source_code TEXT NOT NULL,
+            available_time TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (exchange, etf_code, trade_date, component_code)
+        );
 CREATE TABLE dc_cold_archive_manifest (
             archive_id TEXT PRIMARY KEY,
             dataset TEXT NOT NULL,
@@ -282,6 +317,8 @@ CREATE INDEX idx_dc_raw_trade_date ON dc_tushare_raw_records (trade_date);
 CREATE INDEX idx_dc_raw_api_period_ts ON dc_tushare_raw_records (api_name, period, ts_code);
 CREATE INDEX idx_dc_raw_api_date_ts ON dc_tushare_raw_records (api_name, trade_date, ts_code);
 CREATE INDEX idx_dc_raw_api_available ON dc_tushare_raw_records (api_name, available_time, id);
+CREATE INDEX idx_dc_etf_pcf_date ON dc_etf_pcf_header (trade_date, exchange);
+CREATE INDEX idx_dc_etf_pcf_component_date ON dc_etf_pcf_component (trade_date, etf_code);
 CREATE INDEX idx_dc_raw_api_ts_available ON dc_tushare_raw_records (api_name, ts_code, available_time, id);
 CREATE INDEX idx_dc_tushare_failed_status ON dc_tushare_failed_requests (status, last_failed_at);
 CREATE INDEX idx_dc_request_coverage_api_symbol ON dc_tushare_request_coverage (api_name,ts_code,period);
@@ -483,6 +520,23 @@ def init_db() -> None:
                 schema_json TEXT NOT NULL, status VARCHAR(32) NOT NULL DEFAULT 'completed',
                 created_at VARCHAR(64) NOT NULL)""")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_dc_cold_archive_dataset_created ON dc_cold_archive_manifest (dataset,created_at)")
+            conn.execute("""CREATE TABLE IF NOT EXISTS dc_etf_pcf_header (
+                exchange VARCHAR(8) NOT NULL, etf_code VARCHAR(16) NOT NULL, trade_date VARCHAR(8) NOT NULL,
+                fund_name TEXT NOT NULL DEFAULT '', fund_manager TEXT NOT NULL DEFAULT '', index_code VARCHAR(32) NOT NULL DEFAULT '',
+                creation_redemption_unit DOUBLE PRECISION, component_count INTEGER NOT NULL DEFAULT 0,
+                publish_iopv INTEGER NOT NULL DEFAULT 0, source_url TEXT NOT NULL, source_code VARCHAR(64) NOT NULL,
+                raw_text TEXT NOT NULL DEFAULT '', available_time VARCHAR(64) NOT NULL, updated_at VARCHAR(64) NOT NULL,
+                PRIMARY KEY(exchange,etf_code,trade_date))""")
+            conn.execute("""CREATE TABLE IF NOT EXISTS dc_etf_pcf_component (
+                exchange VARCHAR(8) NOT NULL, etf_code VARCHAR(16) NOT NULL, trade_date VARCHAR(8) NOT NULL,
+                component_code VARCHAR(32) NOT NULL, component_name TEXT NOT NULL DEFAULT '', quantity DOUBLE PRECISION,
+                substitution_flag VARCHAR(32) NOT NULL DEFAULT '', creation_premium_rate DOUBLE PRECISION,
+                redemption_discount_rate DOUBLE PRECISION, substitution_cash_amount DOUBLE PRECISION,
+                listing_market VARCHAR(32) NOT NULL DEFAULT '', payload_json TEXT NOT NULL,
+                source_code VARCHAR(64) NOT NULL, available_time VARCHAR(64) NOT NULL, updated_at VARCHAR(64) NOT NULL,
+                PRIMARY KEY(exchange,etf_code,trade_date,component_code))""")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_dc_etf_pcf_date ON dc_etf_pcf_header(trade_date,exchange)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_dc_etf_pcf_component_date ON dc_etf_pcf_component(trade_date,etf_code)")
             return
         schema = SCHEMA_SQL.replace("CREATE TABLE ", "CREATE TABLE IF NOT EXISTS ")
         schema = schema.replace("CREATE INDEX ", "CREATE INDEX IF NOT EXISTS ")

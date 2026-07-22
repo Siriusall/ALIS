@@ -18,6 +18,7 @@ from app.data_platform.services.data_center import (
     sync_trade_calendar,
 )
 from app.data_platform.services.market_calendar import target_trade_date
+from app.data_platform.services.exchange_etf_pcf import sync_exchange_etf_pcf
 
 _lock = threading.Lock()
 _state: dict[str, Any] = {"running": False, "phase": "idle", "message": "等待更新"}
@@ -130,6 +131,14 @@ def _worker(parent_run_id: int) -> None:
         except Exception as exc:  # noqa: BLE001
             logger.warning("daily ETF market update deferred: %s", str(exc)[:300])
             steps.append({"step": "etf_daily", "result": {"ok": False, "deferred": True, "error": str(exc)[:300]}})
+
+        _set_state(phase="etf_pcf", message=f"正在更新 {trade_date} ETF 申购赎回篮子", progress=72)
+        try:
+            pcf = sync_exchange_etf_pcf(trade_date)
+            steps.append({"step": "etf_pcf", "result": pcf})
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("daily exchange ETF PCF update deferred: %s", str(exc)[:300])
+            steps.append({"step": "etf_pcf", "result": {"ok": False, "deferred": True, "error": str(exc)[:300]}})
 
         _set_state(phase="announcements", message="正在更新最近公告", progress=75)
         ann_start = (date.today() - timedelta(days=3)).strftime("%Y%m%d")

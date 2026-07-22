@@ -10,6 +10,7 @@ ALIS 是面向 A 股长线投资的研究型平台，连接行情、财务、公
 - PostgreSQL：主业务库 `alis_sim`、数据中台库 `alis_data`
 - Redis：任务队列、运行日志和缓存协调
 - TuShare：行情、财务和其他数据来源
+- 沪深交易所官方 PCF：ETF 每日申购赎回篮子，独立于 TuShare 采集和验收
 - `docs/`：计划书、设计、契约、实现矩阵、审计和对话记录
 
 生产运行只使用 PostgreSQL，不回退 SQLite。

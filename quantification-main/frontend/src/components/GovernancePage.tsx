@@ -78,6 +78,14 @@ function walkForwardText(metrics: Record<string, unknown> | undefined) {
   return number(metrics.walk_forward_lift);
 }
 
+function costAfterLift(metrics: Record<string, unknown> | undefined) {
+  return metricValue(metrics, "net_lift") ?? metricValue(metrics, "lift");
+}
+
+function worstWindowLift(metrics: Record<string, unknown> | undefined) {
+  return metricValue(metrics, "worst_window_net_lift") ?? metricValue(metrics, "walk_forward_lift") ?? costAfterLift(metrics);
+}
+
 function metricValue(metrics: Record<string, unknown> | undefined, key: string) {
   const value = Number(metrics?.[key]);
   return Number.isFinite(value) ? value : null;
@@ -90,14 +98,17 @@ function signedNumber(value: unknown, digits = 4) {
 }
 
 function approvalAdvice(candidate: Record<string, unknown> | undefined, production: Record<string, unknown> | undefined) {
-  const candidateLift = metricValue(candidate, "lift");
-  const productionLift = metricValue(production, "lift");
+  const candidateLift = costAfterLift(candidate);
+  const productionLift = costAfterLift(production);
   const candidateWf = metricValue(candidate, "walk_forward_lift");
   const productionWf = metricValue(production, "walk_forward_lift");
-  if (candidateLift == null && candidateWf == null) return "缺少候选指标，先不批准";
-  if ((candidateLift ?? -Infinity) <= 0 || (candidateWf ?? candidateLift ?? -Infinity) <= 0) return "候选收益指标为负，建议驳回或继续观察";
+  const candidateWorst = worstWindowLift(candidate);
+  const productionWorst = worstWindowLift(production);
+  if (candidateLift == null || candidateWf == null || candidateWorst == null) return "缺少费用后验证指标，先不批准";
+  if (candidateLift <= 0 || candidateWf <= 0 || candidateWorst <= 0) return "候选费用后指标为负，系统应自动驳回";
   if (productionWf != null && candidateWf != null && candidateWf < productionWf) return "弱于生产模型，谨慎批准";
-  if (productionLift != null && candidateLift != null && candidateLift < productionLift) return "Lift 弱于生产模型，谨慎批准";
+  if (productionLift != null && candidateLift < productionLift) return "费用后收益弱于生产模型，谨慎批准";
+  if (productionWorst != null && candidateWorst < productionWorst) return "最差窗口弱于生产模型，谨慎批准";
   return "候选不弱于生产模型，可进入人工批准";
 }
 
@@ -138,6 +149,17 @@ function trainingTimeline(run: ModelTrainRun | null | undefined) {
     progress: run.progress,
     message: run.message || statusText(run.status),
   }];
+}
+
+function visibleVersionHistory(versions: ModelVersion[] | undefined, limitPrevious = 2) {
+  const list = [...(versions ?? [])].sort((left, right) => {
+    const leftTime = Date.parse(left.updated_at || left.created_at || "");
+    const rightTime = Date.parse(right.updated_at || right.created_at || "");
+    return (Number.isFinite(rightTime) ? rightTime : right.id) - (Number.isFinite(leftTime) ? leftTime : left.id);
+  });
+  const active = list.find((item) => item.is_active);
+  const previous = list.filter((item) => !item.is_active).slice(0, limitPrevious);
+  return active ? [active, ...previous] : previous;
 }
 
 const PARAM_LABELS: Record<string, string> = {
@@ -529,8 +551,9 @@ export default function GovernancePage() {
                         <small>候选 {item.latest_version?.version || "—"} · 生产 {item.active_version?.version || "—"}</small>
                       </div>
                       <div className="model-approval-metrics">
-                        <em><b>候选 Lift</b>{number(candidateMetrics.lift)}</em>
+                        <em><b>候选费用后</b>{number(costAfterLift(candidateMetrics))}</em>
                         <em><b>候选滚动验证</b>{walkForwardText(candidateMetrics)}</em>
+                        <em><b>候选最差窗口</b>{number(worstWindowLift(candidateMetrics))}</em>
                         <em><b>生产滚动验证</b>{walkForwardText(productionMetrics)}</em>
                         <em><b>滚动差值</b>{deltaWf == null ? "—" : signedNumber(deltaWf)}</em>
                         <em><b>胜率</b>{percent(candidateMetrics.hit_rate)}</em>
@@ -595,8 +618,9 @@ export default function GovernancePage() {
                     </section>
                     <div className="model-shadow-metrics">
                       <em><b>观察期</b>{hasChallenger && shadow ? `${shadow.observation_sessions}/${shadow.minimum_sessions}` : "无候选"}</em>
-                      <em><b>{hasChallenger ? "候选收益提升" : "生产收益提升"}</b>{number((hasChallenger ? candidateMetrics : productionMetrics).lift)}</em>
+                      <em><b>{hasChallenger ? "候选费用后" : "生产费用后"}</b>{number(costAfterLift(hasChallenger ? candidateMetrics : productionMetrics))}</em>
                       <em><b>{hasChallenger ? "候选滚动验证" : "生产滚动验证"}</b>{walkForwardText(hasChallenger ? candidateMetrics : productionMetrics)}</em>
+                      <em><b>{hasChallenger ? "候选最差窗口" : "生产最差窗口"}</b>{number(worstWindowLift(hasChallenger ? candidateMetrics : productionMetrics))}</em>
                       {hasChallenger && <em><b>生产滚动验证</b>{walkForwardText(productionMetrics)}</em>}
                       {hasChallenger && <em><b>候选差值</b>{shadow ? signedNumber(shadow.delta) : "—"}</em>}
                       <em><b>{hasChallenger ? "候选胜率" : "生产胜率"}</b>{percent((hasChallenger ? candidateMetrics : productionMetrics).hit_rate)}</em>
@@ -633,8 +657,9 @@ export default function GovernancePage() {
                     </div>
                     <div className="model-shadow-metrics">
                     <em><b>观察期</b>{hasChallenger && shadow ? `${shadow.observation_sessions}/${shadow.minimum_sessions}` : "无候选"}</em>
-                    <em><b>{hasChallenger ? "候选 Lift" : "生产 Lift"}</b>{number((hasChallenger ? candidateMetrics : productionMetrics).lift)}</em>
+                    <em><b>{hasChallenger ? "候选费用后" : "生产费用后"}</b>{number(costAfterLift(hasChallenger ? candidateMetrics : productionMetrics))}</em>
                     <em><b>{hasChallenger ? "候选滚动验证" : "生产滚动验证"}</b>{walkForwardText(hasChallenger ? candidateMetrics : productionMetrics)}</em>
+                    <em><b>{hasChallenger ? "候选最差窗口" : "生产最差窗口"}</b>{number(worstWindowLift(hasChallenger ? candidateMetrics : productionMetrics))}</em>
                     {hasChallenger && <em><b>生产滚动验证</b>{walkForwardText(productionMetrics)}</em>}
                     {hasChallenger && <em><b>滚动差值</b>{shadow ? signedNumber(shadow.delta) : "—"}</em>}
                     <em><b>{hasChallenger ? "候选胜率" : "生产胜率"}</b>{percent((hasChallenger ? candidateMetrics : productionMetrics).hit_rate)}</em>
@@ -706,7 +731,7 @@ export default function GovernancePage() {
                   <span>固定参数</span><strong>{fixedParamPairs.length ? <div className="model-param-tags">{fixedParamPairs.map((param) => <em key={param.key}><b>{param.label}</b>{param.value}</em>)}</div> : compact(fixedParams)}</strong>
                   <span>最新版本</span><strong>{item.latest_version?.version || "—"}</strong>
                   <span>最新训练</span><strong>{item.latest_train_run ? `#${item.latest_train_run.id} ${statusText(item.latest_train_run.status)} ${Math.round(Number(item.latest_train_run.progress || 0) * 100)}%` : "未训练"}</strong>
-                  <span>费用后 Lift / 滚动验证</span><strong>{number(metrics.lift)} / {walkForwardText(metrics)}</strong>
+                  <span>费用后 / 滚动 / 最差</span><strong>{number(costAfterLift(metrics))} / {walkForwardText(metrics)} / {number(worstWindowLift(metrics))}</strong>
                   <span>上线评审</span><strong>{review.status ? `${review.status} · ${review.reviewer || "operator"}` : item.status === "candidate" ? "待评审" : "—"}</strong>
                   <span>阻塞原因</span><strong>{(item.blocked_reasons ?? []).join("、") || "—"}</strong>
                 </div>
@@ -741,8 +766,9 @@ export default function GovernancePage() {
                 <small>候选 {item.latest_version?.version || "—"} · 生产 {item.active_version?.version || "—"}</small>
               </div>
               <div className="model-approval-metrics">
-                <em><b>候选 Lift</b>{number(candidateMetrics.lift)}</em>
+                <em><b>候选费用后</b>{number(costAfterLift(candidateMetrics))}</em>
                 <em><b>候选滚动验证</b>{walkForwardText(candidateMetrics)}</em>
+                <em><b>候选最差窗口</b>{number(worstWindowLift(candidateMetrics))}</em>
                 <em><b>生产滚动验证</b>{walkForwardText(productionMetrics)}</em>
                 <em><b>滚动差值</b>{deltaWf == null ? "—" : signedNumber(deltaWf)}</em>
                 <em><b>胜率</b>{percent(candidateMetrics.hit_rate)}</em>
@@ -777,24 +803,25 @@ export default function GovernancePage() {
 
       {section === "modelVersions" && <>
       <div className="card model-version-card">
-        <div className="governance-section-head"><div><h3>计划书五模型版本管理</h3><p>这里管理真正参与行情识别、选股、配置和退出的五个生产模型版本。</p></div><span>{planBookModels.reduce((sum, item) => sum + (item.versions?.length ?? 0), 0)} 个版本</span></div>
+        <div className="governance-section-head"><div><h3>计划书五模型版本管理</h3><p>每个模型只展示当前生产版和最近两个历史版本；完整历史保留在数据库，页面不堆料。</p></div><span>{planBookModels.reduce((sum, item) => sum + visibleVersionHistory(item.versions).length, 0)} 个展示版本</span></div>
         <div className="table-scroll">
           <table>
-            <thead><tr><th>模型</th><th>版本</th><th>角色</th><th>验证/评审</th><th>Lift</th><th>Walk-forward</th><th>更新时间</th><th>操作</th></tr></thead>
+            <thead><tr><th>模型</th><th>版本</th><th>角色</th><th>验证/评审</th><th>费用后</th><th>滚动/最差窗口</th><th>更新时间</th><th>操作</th></tr></thead>
             <tbody>
-              {planBookModels.flatMap((model) => (model.versions ?? []).map((version) => {
+              {planBookModels.flatMap((model) => visibleVersionHistory(model.versions).map((version) => {
                 const review = (version.validation?.review || {}) as Record<string, unknown>;
                 const eligible = Boolean(version.validation?.production_eligible);
                 const reviewStatus = String(review.status || "");
                 const rejected = reviewStatus === "rejected";
                 const candidate = !version.is_active && !rejected && String(version.status || "") === "candidate";
+                const canRollback = !version.is_active && eligible && String(version.validation?.status || "") === "passed" && Number(costAfterLift(version.metrics) || 0) > 0 && Number(version.metrics?.walk_forward_lift || 0) > 0 && Number(worstWindowLift(version.metrics) || 0) > 0;
                 return <tr key={`${model.model_key}-${version.id}`}>
                   <td><strong>{model.name}</strong><small>{model.role}</small></td>
                   <td>{version.version}</td>
                   <td>{version.is_active ? "生产模型" : statusText(version.status)}</td>
                   <td>{reviewStatus ? `${reviewStatus === "rejected" ? "已驳回" : "已批准"} · ${review.reviewer || "operator"}` : eligible ? "生产资格通过" : statusText(version.validation?.status)}</td>
-                  <td>{number(version.metrics?.lift)}</td>
-                  <td>{walkForwardText(version.metrics)}</td>
+                  <td>{number(costAfterLift(version.metrics))}</td>
+                  <td>{walkForwardText(version.metrics)} / {number(worstWindowLift(version.metrics))}</td>
                   <td>{formatGmt8Time(version.updated_at)}</td>
                   <td>{version.is_active
                     ? <span className="status-pill status-ready">当前生产</span>
@@ -802,6 +829,8 @@ export default function GovernancePage() {
                         ? <span className="status-pill status-blocked">已驳回</span>
                         : candidate
                       ? <div className="row-actions"><button disabled={busy !== ""} onClick={() => void action(`plan-version-approve-${version.id}`, () => reviewPlanModelVersion(version.id, { decision: "approved", comment: "版本管理页人工批准上线；模拟系统豁免真实20日观察", waive_live_observation: true }), `${model.name} 已批准上线`)}>批准</button><button className="danger" disabled={busy !== ""} onClick={() => void action(`plan-version-reject-${version.id}`, () => reviewPlanModelVersion(version.id, { decision: "rejected", comment: "版本管理页人工驳回", waive_live_observation: false }), `${model.name} 已驳回`)}>驳回</button></div>
+                      : canRollback
+                        ? <button className="button ghost" disabled={busy !== ""} onClick={() => void action(`plan-version-rollback-${version.id}`, () => rollbackModelVersion(version.id), `${model.name} 已回退至 ${version.version}`)}>回退至此</button>
                       : <span className="muted">无操作</span>}</td>
                 </tr>;
               }))}
@@ -811,12 +840,12 @@ export default function GovernancePage() {
         </div>
       </div>
       <div className="card model-version-card model-auxiliary-card">
-        <div className="governance-section-head"><div><h3>辅助：主线代理版本记录</h3><p>只用于降级、对照和排障，不是计划书五模型的主版本管理。</p></div><span>{versions.length} 个版本</span></div>
+        <div className="governance-section-head"><div><h3>辅助：主线代理版本记录</h3><p>只展示当前和前两个版本；用于降级、对照和排障。</p></div><span>{visibleVersionHistory(versions).length} 个展示版本</span></div>
         <div className="table-scroll">
           <table>
-            <thead><tr><th>版本</th><th>角色</th><th>验证</th><th>历史覆盖</th><th>Lift</th><th>Walk-forward</th><th>更新时间</th><th>操作</th></tr></thead>
+            <thead><tr><th>版本</th><th>角色</th><th>验证</th><th>历史覆盖</th><th>费用后</th><th>滚动/最差窗口</th><th>更新时间</th><th>操作</th></tr></thead>
             <tbody>
-              {versions.map((item) => {
+              {visibleVersionHistory(versions).map((item) => {
                 const gate = eligibility(item);
                 const canControl = gate.eligible && String(item.validation?.status || "") === "passed";
                 return <tr key={item.id}>
@@ -824,8 +853,8 @@ export default function GovernancePage() {
                   <td>{item.is_active ? "生产模型" : statusText(item.status)}</td>
                   <td>{gate.eligible ? "生产资格通过" : gate.reasons.join("、") || statusText(item.validation?.status)}</td>
                   <td>{gate.minimum ? `${gate.history}/${gate.minimum}` : "—"}</td>
-                  <td>{number(item.metrics?.lift)}</td>
-                  <td>{number(item.metrics?.walk_forward_lift)}</td>
+                  <td>{number(costAfterLift(item.metrics))}</td>
+                  <td>{number(item.metrics?.walk_forward_lift)} / {number(worstWindowLift(item.metrics))}</td>
                   <td>{formatGmt8Time(item.updated_at)}</td>
                   <td>{item.is_active
                     ? <span className="status-pill status-ready">当前生产</span>

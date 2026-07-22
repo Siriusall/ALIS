@@ -279,6 +279,15 @@ export interface QuantTaskRunDetailResponse {
     hold?: string[];
     blocked?: Array<Record<string, unknown>>;
   };
+  strategy_controller?: {
+    schema_version?: string;
+    summary?: string;
+    action_counts?: Record<string, number>;
+    trace?: Array<{ step?: string; status?: string; detail?: string }>;
+    contracts?: StrategyActionContract[];
+  };
+  strategy_action_contracts?: StrategyActionContract[];
+  rebalance_decision_trace?: Array<{ step?: string; status?: string; detail?: string }>;
   current_positions?: Array<{
     symbol: string;
     name?: string;
@@ -315,6 +324,26 @@ export interface QuantTaskRunDetailResponse {
   buy_summary?: Record<string, unknown>;
 }
 
+export interface StrategyActionContract {
+  symbol: string;
+  name?: string;
+  action: string;
+  side: string;
+  priority?: number;
+  score?: number | null;
+  trigger_models?: string[];
+  expected_return_source?: string;
+  holding_period?: string;
+  narrative_lifecycle?: string;
+  capital_confirmation?: string;
+  risk_budget?: Record<string, unknown>;
+  exit_conditions?: string[];
+  forbidden_conditions?: string[];
+  data_status?: string;
+  reason?: string;
+  source?: string;
+}
+
 export interface QuantAnalyzeResponse {
   ok: boolean;
   signal_date: string;
@@ -332,6 +361,9 @@ export interface QuantAnalyzeResponse {
   target_symbols?: string[];
   selections?: QuantTaskRunDetailResponse["selections"];
   rebalance_actions?: QuantTaskRunDetailResponse["rebalance_actions"];
+  strategy_controller?: QuantTaskRunDetailResponse["strategy_controller"];
+  strategy_action_contracts?: QuantTaskRunDetailResponse["strategy_action_contracts"];
+  rebalance_decision_trace?: QuantTaskRunDetailResponse["rebalance_decision_trace"];
   current_positions?: QuantTaskRunDetailResponse["current_positions"];
   filter_summary?: Record<string, unknown>;
 }
@@ -380,6 +412,9 @@ export interface QuantRebalancePreviewResponse {
   sell_orders: QuantRebalanceOrderPreview[];
   buy_orders: QuantRebalanceOrderPreview[];
   blocked_events?: QuantRebalanceOrderPreview[];
+  strategy_controller?: QuantTaskRunDetailResponse["strategy_controller"];
+  strategy_action_contracts?: QuantTaskRunDetailResponse["strategy_action_contracts"];
+  rebalance_decision_trace?: QuantTaskRunDetailResponse["rebalance_decision_trace"];
 }
 
 export interface QuantExecuteBuyResponse {

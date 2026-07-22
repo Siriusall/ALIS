@@ -42,6 +42,16 @@ MARKET_RISK_BUDGETS = {
 }
 
 
+def _equity_budget_breach(ledger: dict[str, Any], position_gate: dict[str, Any]) -> tuple[bool, float, float]:
+    """Return whether the live equity allocation is already above the effective risk budget."""
+    total_equity = float(ledger.get("total_equity") or 0)
+    if total_equity <= 0:
+        return False, 0.0, 0.0
+    current_equity = float(ledger.get("position_market_value") or 0) / total_equity
+    risk_budget = float(position_gate.get("combined_risk_budget_multiplier") or 0)
+    return risk_budget > 0 and current_equity > risk_budget + 0.005, current_equity, risk_budget
+
+
 def _ledger_summary() -> dict[str, Any]:
     cash_balance = float(get_account_balance() or 0)
     baseline = float(get_account_baseline() or 0)
@@ -346,6 +356,14 @@ def _build_gate_decision(
         }
 
     position_gate = market_overview.get("position_gate") if isinstance(market_overview.get("position_gate"), dict) else {}
+    budget_breached, current_equity, risk_budget = _equity_budget_breach(ledger, position_gate)
+    if budget_breached:
+        return {
+            "tone": "hold",
+            "title": "当前仓位超过风险预算，暂停新增仓位",
+            "detail": f"当前股票仓位约 {current_equity * 100:.1f}%，高于风险预算 {risk_budget * 100:.1f}%；先通过减仓或防御调仓回到约束内。",
+            "reason_code": "equity_budget_exceeded",
+        }
     if not bool(position_gate.get("allow_new_exposure", True)):
         portfolio_risk = market_overview.get("portfolio_risk") if isinstance(market_overview.get("portfolio_risk"), dict) else {}
         deleveraging_actions = portfolio_risk.get("deleveraging_actions") if isinstance(portfolio_risk.get("deleveraging_actions"), list) else []
@@ -429,8 +447,9 @@ def _risk_gate_explanation(
     drawdown = float(ledger.get("drawdown") or 0)
     risk_budget = float(position_gate.get("combined_risk_budget_multiplier") or market_state.get("risk_budget_multiplier") or 0)
     deleveraging_actions = portfolio_risk.get("deleveraging_actions") if isinstance(portfolio_risk.get("deleveraging_actions"), list) else []
-    requires_rebalance = bool(deleveraging_actions)
-    allow_new = bool(position_gate.get("allow_new_exposure", True)) and gate_decision.get("tone") == "go"
+    budget_breached, current_equity, equity_budget = _equity_budget_breach(ledger, position_gate)
+    requires_rebalance = bool(deleveraging_actions) or budget_breached
+    allow_new = bool(position_gate.get("allow_new_exposure", True)) and not budget_breached and gate_decision.get("tone") == "go"
     reasons: list[dict[str, Any]] = []
     constraints: list[str] = []
     plan: list[dict[str, str]] = []
@@ -462,13 +481,25 @@ def _risk_gate_explanation(
         if not deleveraging_actions:
             plan.append({"step": "风险复核", "detail": "系统不新增仓位；若出现超配、逻辑失效或回撤约束，会优先生成减仓/防御调仓"})
         release.append("组合风险状态恢复为 ready，且没有硬约束 breaches")
+    if budget_breached:
+        reasons.append({
+            "level": "block",
+            "title": "股票仓位超过风险预算",
+            "detail": f"当前股票仓位约 {current_equity * 100:.1f}%，高于当前风险预算 {equity_budget * 100:.1f}%",
+        })
+        constraints.append("暂停新增股票仓位，优先减仓或迁移到防御资产")
+        plan.append({"step": "回到风险预算", "detail": f"将股票仓位从 {current_equity * 100:.1f}% 降至 {equity_budget * 100:.1f}% 以内"})
+        release.append(f"股票仓位回到 {equity_budget * 100:.1f}% 风险预算以内")
     if risk_budget <= 0:
         reasons.append({"level": "block", "title": "风险预算为 0", "detail": "组合/市场门控合成后的新增风险预算为 0"})
         constraints.append("新增仓位目标权重被压到 0")
         release.append("合成风险预算大于 0")
     elif risk_budget < 0.8:
         reasons.append({"level": "warn", "title": "风险预算收缩", "detail": f"当前最终风险预算约 {risk_budget * 100:.0f}%，不按常态扩张"})
-        constraints.append("新增仓位必须落在收缩后的风险预算内")
+        if allow_new:
+            constraints.append("新增仓位必须落在收缩后的风险预算内")
+        else:
+            constraints.append("减仓或防御迁移后，股票仓位必须落在收缩后的风险预算内")
     if cash < MIN_CASH_FOR_TRADE:
         reasons.append({"level": "warn", "title": "可用现金不足", "detail": f"可用现金 {cash:,.2f} 元，低于最小交易门槛 {MIN_CASH_FOR_TRADE:,.0f} 元"})
         constraints.append("可能无法完成最小一手调仓")

@@ -39,6 +39,7 @@ from app.services.strategy_config import parse_strategy_content
 from app.services.trend_model import analyze_trend
 from app.services.quant_risk import cvar_position_multiplier, constrained_cvar_weights, enforce_marginal_cvar_limit, hrp_fallback_weights, ledoit_wolf_covariance
 from app.services.industry_allocator import apply_industry_targets, build_industry_allocation
+from app.services.strategy_controller import active_strategy_policy_context, build_strategy_action_contracts, build_strategy_rebalance_actions, build_target_weight_explanations
 
 _SCORING_HEARTBEAT_EVERY = max(100, min(int(os.getenv("QUANT_SCORING_HEARTBEAT_EVERY", "300")), 2000))
 _SCORING_TIMEOUT_SEC = max(10, min(int(os.getenv("QUANT_SCORING_TIMEOUT_SEC", "90")), 1800))
@@ -1140,6 +1141,63 @@ def run_for_trade_date(
             asset_function_by_symbol[symbol] = "core"
         else:
             asset_function_by_symbol[symbol] = "tactical" if symbol in high_risk_symbols else "core"
+    current_weights_for_strategy = {
+        symbol: float(value or 0.0) / max(float(portfolio["total_equity"] or 0.0), 1.0)
+        for symbol, value in portfolio["position_value_by_symbol"].items()
+    }
+    price_by_symbol_for_strategy = {
+        symbol: round(_row_trade_price(row, prefer_open=True), 4)
+        for symbol, row in exec_map.items()
+        if _row_trade_price(row, prefer_open=True) > 0
+    }
+    selection_map_for_strategy = {
+        str(item.get("symbol") or ""): item
+        for item in (selection_detail.get("selections") or [])
+        if str(item.get("symbol") or "")
+    }
+    target_weight_explanations = build_target_weight_explanations(
+        target_weights=cvar_weights,
+        current_weights=current_weights_for_strategy,
+        score_map=score_map,
+        returns_by_symbol=returns_by_symbol,
+        liquidity_caps=liquidity_caps,
+        defensive_weights=defensive_weights,
+        optimizer=optimizer_name,
+        risk_budget=risk_budget,
+        constraints={
+            "max_single_position_pct": max_single_position_pct,
+            "max_industry_position_pct": .25,
+            "max_correlated_industry_pct": .35,
+            "max_marginal_cvar_contribution": round(adaptive_marginal_limit, 4),
+            "monthly_turnover_remaining": round(turnover_remaining, 2),
+        },
+    )
+    final_strategy_decision = build_strategy_rebalance_actions(
+        target_symbols=target_symbols,
+        held_positions={str(pos.get("symbol") or ""): pos for pos in get_positions() if str(pos.get("symbol") or "")},
+        selection_map=selection_map_for_strategy,
+        market_rows=exec_map,
+        same_day_fallback=same_day_fallback,
+        mode="full_rebalance",
+        blocked_actions=blocked_events,
+        current_weights=current_weights_for_strategy,
+        target_weights=cvar_weights,
+        thesis_status_by_symbol=thesis_status_by_symbol,
+        context={
+            **active_strategy_policy_context(),
+            "signal_date": signal_date,
+            "execute_date": execute_date,
+            "data_status": "frozen",
+            "strategy_template": strategy_template,
+            "risk_budget": risk_budget,
+            "target_position_pct": target_position_pct,
+            "target_weights": cvar_weights,
+            "defensive_weights": defensive_weights,
+            "optimizer": optimizer_name,
+            "price_by_symbol": price_by_symbol_for_strategy,
+        },
+    )
+    strategy_controller = final_strategy_decision["strategy_controller"]
     detail = {
         **selection_detail,
         "execute_date": execute_date,
@@ -1159,6 +1217,16 @@ def run_for_trade_date(
             "hold": sorted(list(held_after_sell.intersection(set(target_symbols)))),
             "blocked": blocked_events,
         },
+        "strategy_controller": strategy_controller,
+        "strategy_action_contracts": final_strategy_decision["strategy_action_contracts"],
+        "rebalance_decision_trace": final_strategy_decision["rebalance_decision_trace"],
+        "strategy_rebalance_actions": {
+            "buy": final_strategy_decision["buy"],
+            "sell": final_strategy_decision["sell"],
+            "hold": final_strategy_decision["hold"],
+            "blocked": final_strategy_decision["blocked"],
+        },
+        "target_weight_explanations": target_weight_explanations,
         "current_positions": current_positions,
         "summary": (
             f"今日趋势判断为 {trend_text}，采用{template_name}；"
@@ -1173,7 +1241,13 @@ def run_for_trade_date(
         },
         "portfolio_risk": {
             "optimizer": optimizer_name,
+            "role_contract": {
+                "strategy_controller": "负责买入/卖出/持有动作、退出诊断、策略参数版本与人工上线门",
+                "portfolio_optimizer": "负责在策略动作约束下分配目标权重、控制单票/行业/相关性/换手/尾部风险",
+                "execution_layer": "负责模拟订单、价格可得性、T+1/持有期/费用约束；不连接券商",
+            },
             "weights": cvar_weights,
+            "weight_explanations": target_weight_explanations,
             "black_litterman": bl_result,
             "covariance": covariance_snapshot,
             "hard_constraints": {"max_single_position_pct": max_single_position_pct, "max_industry_position_pct": .25, "max_correlated_industry_pct": .35, "max_marginal_cvar_contribution": round(adaptive_marginal_limit, 4)},
@@ -1211,6 +1285,7 @@ def run_for_trade_date(
         "trade_reasons": {
             "new_facts_and_scores": selection_detail.get("selections") or [],
             "valuation_and_risk": selection_detail.get("filter_summary") or {},
+            "strategy_action_contracts": strategy_controller["contracts"],
         },
         "unchanged_holdings": [
             {"symbol": symbol, "reason": "仍在目标组合且未触发逻辑/风险退出条件", "next_trigger": "目标池、逻辑或风险状态变化"}
@@ -1343,43 +1418,34 @@ def analyze_market_plan(
         if str(getattr(r, "symbol", "") or "").strip()
     }
 
-    buy_actions: List[Dict[str, Any]] = []
-    for sym in targets:
-        if sym in held:
-            continue
-        sel = selection_map.get(sym) or {}
-        row = exec_map.get(sym)
-        trade_px = _row_trade_price(row, prefer_open=True)
-        buy_actions.append(
-            {
-                "symbol": sym,
-                "name": sel.get("name") or (str(getattr(row, "name", "") or "") if row else ""),
-                "score": sel.get("score"),
-                "reason": "入选目标池，建议次日开盘买入" if not same_day_fallback else "入选目标池，建议按执行日开盘价买入",
-                "price": round(trade_px, 4) if trade_px > 0 else None,
-                "close": round(float(getattr(row, "close", 0) or 0), 4) if row else None,
-                "change_pct": float(getattr(row, "change_pct", 0) or 0) if row else 0.0,
-                "volume": float(getattr(row, "volume", 0) or 0) if row else 0.0,
-            }
-        )
-
-    sell_actions: List[Dict[str, Any]] = []
-    for sym, pos in held.items():
-        if sym in target_set:
-            continue
-        row = exec_map.get(sym)
-        trade_px = _row_trade_price(row, prefer_open=True)
-        sell_actions.append(
-            {
-                "symbol": sym,
-                "name": str(pos.get("name") or ""),
-                "quantity": int(pos.get("quantity") or 0),
-                "price": round(trade_px, 4) if trade_px > 0 else None,
-                "reason": "不在目标池，建议次日开盘卖出" if not same_day_fallback else "不在目标池，建议按执行日开盘价卖出",
-            }
-        )
-
-    hold_symbols = sorted([sym for sym in held if sym in target_set])
+    price_by_symbol = {
+        sym: round(_row_trade_price(row, prefer_open=True), 4)
+        for sym, row in exec_map.items()
+        if _row_trade_price(row, prefer_open=True) > 0
+    }
+    strategy_decision = build_strategy_rebalance_actions(
+        target_symbols=targets,
+        held_positions=held,
+        selection_map=selection_map,
+        market_rows=exec_map,
+        same_day_fallback=same_day_fallback,
+        mode="full_rebalance",
+        blocked_actions=research_blocks + dynamic_blocks,
+        context={
+            **active_strategy_policy_context(),
+            "signal_date": sig,
+            "execute_date": execute_date,
+            "data_status": "frozen",
+            "strategy_template": detail.get("strategy_template") or {},
+            "risk_budget": detail.get("risk_budget") or {},
+            "target_position_pct": (detail.get("risk_budget") or {}).get("target_position_pct") if isinstance(detail.get("risk_budget"), dict) else None,
+            "optimizer": "analysis_target_pool_v1",
+            "price_by_symbol": price_by_symbol,
+        },
+    )
+    buy_actions = strategy_decision["buy"]
+    sell_actions = strategy_decision["sell"]
+    hold_symbols = strategy_decision["hold"]
     trend = (detail.get("trend_analysis") or {}).get("trend")
     template_name = (detail.get("strategy_template") or {}).get("name") or (detail.get("strategy_template") or {}).get("id")
     summary = (
@@ -1391,6 +1457,7 @@ def analyze_market_plan(
         if not same_day_fallback
         else "当前为最新交易日，暂用当日开盘价口径执行"
     )
+    strategy_controller = strategy_decision["strategy_controller"]
 
     current_positions = [
         {
@@ -1419,6 +1486,9 @@ def analyze_market_plan(
             "hold": hold_symbols,
             "blocked": research_blocks + dynamic_blocks,
         },
+        "strategy_controller": strategy_controller,
+        "strategy_action_contracts": strategy_decision["strategy_action_contracts"],
+        "rebalance_decision_trace": strategy_decision["rebalance_decision_trace"],
         "current_positions": current_positions,
         "summary": summary,
     }
@@ -1474,6 +1544,43 @@ def plan_analyze_rebalance(
     scores = dict(selection_scores or {})
     for sym in buy_symbols:
         scores.setdefault(sym, 0.0)
+    held_before_strategy: Dict[str, Dict[str, Any]] = {}
+    for pos in get_positions():
+        sym = str(pos.get("symbol") or "").strip()
+        if sym:
+            held_before_strategy[sym] = pos
+    selection_map_for_strategy = {
+        sym: {"symbol": sym, "score": scores.get(sym)}
+        for sym in buy_symbols
+    }
+    price_by_symbol_for_strategy = {
+        sym: round(_row_trade_price(row, prefer_open=True), 4)
+        for sym, row in exec_map.items()
+        if _row_trade_price(row, prefer_open=True) > 0
+    }
+    initial_strategy_decision = build_strategy_rebalance_actions(
+        target_symbols=buy_symbols,
+        held_positions=held_before_strategy,
+        selection_map=selection_map_for_strategy,
+        market_rows=exec_map,
+        same_day_fallback=same_day_fallback,
+        mode=mode,
+        blocked_actions=research_blocks + dynamic_blocks,
+        context={
+            **active_strategy_policy_context(),
+            "signal_date": sig,
+            "execute_date": execute_date,
+            "data_status": "frozen",
+            "risk_budget": {
+                "target_position_pct": target_position_pct if target_position_pct is not None else dynamic_gate.get("risk_budget_multiplier"),
+                "max_single_position_pct": max_single_position_pct if max_single_position_pct is not None else .25,
+            },
+            "target_position_pct": target_position_pct if target_position_pct is not None else dynamic_gate.get("risk_budget_multiplier"),
+            "optimizer": "strategy_controller_pretrade_v1",
+            "price_by_symbol": price_by_symbol_for_strategy,
+        },
+    )
+    buy_symbols = [str(item.get("symbol") or "") for item in initial_strategy_decision["buy"] if str(item.get("symbol") or "")]
 
     rebalance_mode = str(mode or "full_rebalance").strip().lower()
     sell_preview: List[Dict[str, Any]] = []
@@ -1689,6 +1796,49 @@ def plan_analyze_rebalance(
         }
         for o in buy_blocked
     ]
+    current_weights_for_strategy = {
+        symbol: float(value or 0.0) / max(float(portfolio["total_equity"] or 0.0), 1.0)
+        for symbol, value in portfolio["position_value_by_symbol"].items()
+    }
+    target_weight_explanations = build_target_weight_explanations(
+        target_weights=target_weights,
+        current_weights=current_weights_for_strategy,
+        score_map=scores,
+        returns_by_symbol=plan_returns,
+        liquidity_caps=plan_liquidity_caps,
+        defensive_weights={},
+        optimizer=plan_optimizer,
+        risk_budget=risk_budget,
+        constraints={
+            "max_single_position_pct": max_single,
+            "max_industry_position_pct": .25,
+            "max_correlated_industry_pct": .35,
+            "buy_budget": round(buy_budget, 2),
+        },
+    )
+    final_strategy_decision = build_strategy_rebalance_actions(
+        target_symbols=buy_symbols,
+        held_positions={str(pos.get("symbol") or ""): pos for pos in get_positions() if str(pos.get("symbol") or "")},
+        selection_map={symbol: {"symbol": symbol, "score": scores.get(symbol), "name": name_by_symbol.get(symbol, "")} for symbol in buy_symbols},
+        market_rows=exec_map,
+        same_day_fallback=same_day_fallback,
+        mode=rebalance_mode,
+        blocked_actions=sell_blocked + blocked_buy_orders,
+        current_weights=current_weights_for_strategy,
+        target_weights=target_weights,
+        context={
+            **active_strategy_policy_context(),
+            "signal_date": sig,
+            "execute_date": execute_date,
+            "data_status": "frozen",
+            "risk_budget": risk_budget,
+            "target_position_pct": target_pct,
+            "target_weights": target_weights,
+            "optimizer": plan_optimizer,
+            "price_by_symbol": price_by_symbol_for_strategy,
+        },
+    )
+    strategy_controller = final_strategy_decision["strategy_controller"]
     total_buy_cost = round(sum(float(x.get("total_cost") or 0) for x in buy_preview), 2)
     estimated_cash_after = round(cash_balance - total_buy_cost, 2)
     if not dry_run and total_buy_cost > cash_balance:
@@ -1841,12 +1991,28 @@ def plan_analyze_rebalance(
         "buy_orders": buy_preview,
         "blocked_events": sell_blocked + blocked_buy_orders,
         "orders": buy_preview + blocked_buy_orders,
+        "strategy_controller": strategy_controller,
+        "strategy_action_contracts": final_strategy_decision["strategy_action_contracts"],
+        "rebalance_decision_trace": final_strategy_decision["rebalance_decision_trace"],
+        "strategy_rebalance_actions": {
+            "buy": final_strategy_decision["buy"],
+            "sell": final_strategy_decision["sell"],
+            "hold": final_strategy_decision["hold"],
+            "blocked": final_strategy_decision["blocked"],
+        },
+        "target_weight_explanations": target_weight_explanations,
         "decision_snapshot_ids": decision_snapshot_ids,
         "decision_snapshot_error": decision_snapshot_error or None,
         "pool_sync": pool_sync,
         "research_admission": {"admitted": research_targets, "blocked": research_blocks},
         "dynamic_strategy_gate": dynamic_gate,
-        "portfolio_optimizer": {"method": plan_optimizer, "weights": target_weights, "black_litterman": plan_bl, "hard_constraints": {"max_single_position_pct": max_single, "max_industry_position_pct": .25, "max_correlated_industry_pct": .35}},
+        "portfolio_optimizer": {
+            "method": plan_optimizer,
+            "weights": target_weights,
+            "weight_explanations": target_weight_explanations,
+            "black_litterman": plan_bl,
+            "hard_constraints": {"max_single_position_pct": max_single, "max_industry_position_pct": .25, "max_correlated_industry_pct": .35},
+        },
     }
 
 
