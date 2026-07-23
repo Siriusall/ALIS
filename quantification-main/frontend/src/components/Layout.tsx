@@ -17,6 +17,7 @@ import {
 } from "./governanceSections";
 
 export const ALL_SECTION_IDS = [
+  "autonomy",
   "market",
   "research",
   "stockResearch",
@@ -46,6 +47,7 @@ export const ALL_SECTION_IDS = [
 ] as const;
 
 export const NAV_ITEMS = [
+  { id: "autonomy", label: "自治中心", description: "系统运行与研究深度", icon: "governance" },
   { id: "market", label: "我的收益", description: "资产与收益变化", icon: "decision" },
   { id: "portfolioWorkbench", label: "调仓方案", description: "今天是否需要调整", icon: "portfolio" },
   { id: "reviewWorkbench", label: "模型贡献", description: "模型收益与有效性", icon: "review" },
@@ -53,18 +55,18 @@ export const NAV_ITEMS = [
   { id: "strategyLab", label: "策略实验室", description: "Champion 与候选表现", icon: "review" },
   { id: "factorLab", label: "因子实验室", description: "版本、物化与自动评价", icon: "data" },
   { id: "dataCenter", label: "数据中台", description: "数据资产与质量", icon: "data" },
-  { id: "governance", label: "模型训练", description: "训练、评审、上线", icon: "governance" },
+  { id: "governance", label: "模型演化", description: "训练、观察、自动晋升", icon: "governance" },
 ] as const;
 
-const PRIMARY_NAV_ITEMS = NAV_ITEMS.slice(0, 4);
-const TOOL_NAV_ITEMS = NAV_ITEMS.slice(4);
+const PRIMARY_NAV_ITEMS = NAV_ITEMS.slice(0, 5);
+const TOOL_NAV_ITEMS = NAV_ITEMS.slice(5);
 
 const SYSTEM_SECTIONS = [
   { key: "modelStatus", label: "模型状态", hint: "生产、候选、可训练", target: "governance" },
   { key: "modelTraining", label: "模型训练过程", hint: "进度、阶段、队列", target: "governance" },
   { key: "modelParameters", label: "模型参数", hint: "目标、标签、特征", target: "governance" },
-  { key: "modelAutoOptimization", label: "模型自优化", hint: "自动训练，人工闸门", target: "governance" },
-  { key: "modelPromotion", label: "模型晋升", hint: "批准、驳回、上线", target: "governance" },
+  { key: "modelAutoOptimization", label: "模型自优化", hint: "自动训练，确定性硬门", target: "governance" },
+  { key: "modelPromotion", label: "模型晋升", hint: "影子观察与自动晋升", target: "governance" },
   { key: "modelVersions", label: "模型版本管理", hint: "历史版本与回退", target: "governance" },
 ] as const;
 
@@ -347,7 +349,7 @@ export default function Layout({
                 <button type="button" className={`dashboard-nav-item dashboard-nav-parent ${navSection === id ? "active" : ""}`} onClick={handleGovernanceParent} aria-expanded={governanceOpen}>
                   <em>·</em><NavIcon name={icon} /><span className="dashboard-nav-copy"><strong>{label}</strong><small>{description}</small></span><i className="dashboard-nav-caret" aria-hidden="true" />
                 </button>
-                <div className="dashboard-subnav" aria-label="模型训练子导航">{SYSTEM_SECTIONS.map((item) => <button key={item.key} type="button" className={currentSection === item.target && governanceSection === item.key ? "active" : ""} onClick={() => handleSystemSection(item)}><span>{item.label}</span><small>{item.hint}</small></button>)}</div>
+                <div className="dashboard-subnav" aria-label="模型演化子导航">{SYSTEM_SECTIONS.map((item) => <button key={item.key} type="button" className={currentSection === item.target && governanceSection === item.key ? "active" : ""} onClick={() => handleSystemSection(item)}><span>{item.label}</span><small>{item.hint}</small></button>)}</div>
               </div>
             ) : (
               <button key={id} type="button" className={`dashboard-nav-item ${navSection === id ? "active" : ""}`} onClick={() => handleSectionChange(id)}>

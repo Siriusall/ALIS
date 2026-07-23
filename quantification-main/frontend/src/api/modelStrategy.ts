@@ -156,7 +156,12 @@ export interface OwnerDailySummaryResponse {
         model_auto_promoted: number;
         model_auto_rejected: number;
         model_training_started: number;
+        model_degraded_count?: number;
+        degraded_models?: Array<{ model_key: string; weight_multiplier?: number | null; reason?: string }>;
         strategy_candidates_created?: number;
+        strategy_learning_candidate_count?: number;
+        strategy_candidates_re_evaluated?: number;
+        strategy_candidates_ready_for_review?: number;
         portfolio_method?: string | null;
         execution_cost_version?: string | null;
         execution_cost_status?: string | null;
@@ -170,6 +175,12 @@ export interface OwnerDailySummaryResponse {
         performance_review_status?: string | null;
         performance_learning_signal_count?: number;
         performance_learning_signals?: Array<{ code: string; severity: string; target: string; value: number }>;
+        data_quality_governance_status?: string | null;
+        data_quality_repair_count?: number;
+        llm_research_status?: string | null;
+        llm_research_proposal_count?: number;
+        llm_research_assessed_count?: number;
+        llm_research_routed_count?: number;
       };
       anomalies: Array<{ module: string; message: string }>;
     };
@@ -178,6 +189,23 @@ export interface OwnerDailySummaryResponse {
 
 export async function fetchOwnerDailySummary(): Promise<OwnerDailySummaryResponse> {
   const { data } = await api.get<OwnerDailySummaryResponse>("/api/model-strategy/evolution/owner-summary");
+  return data;
+}
+
+export interface ResearchDataAssets {
+  ok: boolean;
+  schema_version: string;
+  status: "ready" | "partial" | string;
+  industry_components: Record<string, { status: string; metric_count: number; value_count: number; latest_available_time: string; sources?: string[] }>;
+  analyst_consensus_pit: { status: string; records: number; symbols: number; latest_available_time: string; missing_point_in_time_records: number };
+  theme_exposure: { status: string; revenue_exposures: number; revenue_companies: number; revenue_themes: number; revenue_latest_date: string; limitation: string };
+  announcement_extraction: { status: string; raw_records: number; events: number; avg_rule_confidence: number; limitation: string };
+  gaps: string[];
+  policy: string;
+}
+
+export async function fetchResearchDataAssets(): Promise<ResearchDataAssets> {
+  const { data } = await api.get<ResearchDataAssets>("/api/model-strategy/evolution/research-data-assets");
   return data;
 }
 
@@ -342,6 +370,13 @@ export interface StrategyLabChallenger {
     worst_window_drawdown: number | null;
     total_fees: number | null;
     windows: Array<{ window: number; return: number | null }>;
+    failure_attribution: {
+      status: string;
+      primary_cause: string;
+      confidence: string;
+      evidence: Record<string, number | string | null>;
+      limitations: string[];
+    };
   };
   passed_gates: string[];
   blocking_reasons: string[];
@@ -418,6 +453,7 @@ export interface EvolutionTask {
   heartbeat_at?: string | null;
   created_at: string;
   updated_at: string;
+  finished_at?: string | null;
 }
 
 export interface EvolutionSchedule {

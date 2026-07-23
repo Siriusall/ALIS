@@ -121,6 +121,15 @@ def advance_formal_candidate_lifecycle(
                 blocking_reasons=gate["blocking_reasons"],
             )
             update_model_version_status(model_version_id, status="rejected", is_active=False)
+            from app.services.experiment_memory import record_model_experiment_outcome
+
+            version = get_model_version(model_version_id) or {}
+            record_model_experiment_outcome(
+                version,
+                stage="formal_oos",
+                rejected=True,
+                evidence={"formal_comparison": gate, "blocking_reasons": gate["blocking_reasons"]},
+            )
             status = "formal_oos_rejected"
         outcomes.append({"model_version_id": model_version_id, "status": status, **gate})
     return outcomes
@@ -434,6 +443,14 @@ def run_strategy_shadow_cycle(
                     next_gate="automatic_candidate_regeneration",
                 )
                 update_model_version_status(int(candidate["id"]), status="rejected", is_active=False)
+                from app.services.experiment_memory import record_model_experiment_outcome
+
+                record_model_experiment_outcome(
+                    candidate,
+                    stage="shadow",
+                    rejected=True,
+                    evidence={"shadow_gate": gate, "blocking_reasons": gate["blocking_reasons"]},
+                )
                 result_status = "shadow_rejected"
             else:
                 _merge_validation(
@@ -458,6 +475,14 @@ def run_strategy_shadow_cycle(
                     next_gate="automatic_candidate_regeneration",
                 )
                 update_model_version_status(int(candidate["id"]), status="rolled_back", is_active=False)
+                from app.services.experiment_memory import record_model_experiment_outcome
+
+                record_model_experiment_outcome(
+                    candidate,
+                    stage="cooling",
+                    rejected=True,
+                    evidence={"cooling_gate": cooling, "blocking_reasons": cooling["reasons"]},
+                )
                 _record_promotion_event(
                     "rolled_back",
                     from_id=rollback["from_champion_version_id"],

@@ -1,8 +1,12 @@
+from contextlib import contextmanager
+
 from app.services.backtest_data_source import HistBar, SnapshotRow
+from app.services import factor_platform
 from app.services.factor_platform import (
     CORE_ACTIVE_KEYS,
     SPEC_BY_KEY,
     compute_registered_factor,
+    is_factor_governance_eligible,
 )
 from app.services.factor_engine import FACTOR_REGISTRY
 
@@ -85,8 +89,84 @@ def test_new_factor_candidates_are_registered_but_not_bootstrap_active():
     assert "momentum_20" in CORE_ACTIVE_KEYS
     assert "momentum_60" in SPEC_BY_KEY
     assert "momentum_60" not in CORE_ACTIVE_KEYS
+
+
+def test_industry_candidate_factor_uses_only_supplied_point_in_time_value():
+    row = _row()
+    assert compute_registered_factor(
+        "industry_ppi_yoy_proxy", row, [], {}, industry_inputs={"industry_ppi_yoy_proxy": 5.5},
+    ) == 5.5
+    assert compute_registered_factor("industry_ppi_yoy_proxy", row, [], {}) == 0.0
+    assert "industry_demand_proxy" in SPEC_BY_KEY
+    assert "industry_inventory_proxy" in SPEC_BY_KEY
     assert "beta_60" in SPEC_BY_KEY
 
 
 def test_daily_selection_registry_covers_every_versioned_factor():
     assert set(SPEC_BY_KEY).issubset(FACTOR_REGISTRY)
+
+
+def test_trade_constraint_factors_cannot_be_governed_as_alpha_signals():
+    assert is_factor_governance_eligible(SPEC_BY_KEY["momentum_60"]) is True
+    assert is_factor_governance_eligible(SPEC_BY_KEY["is_st"]) is False
+    assert is_factor_governance_eligible(SPEC_BY_KEY["is_limit_up"]) is False
+
+
+def test_factor_evaluation_replaces_same_future_window_and_skips_constraints(monkeypatch):
+    definitions = [
+        {"id": 1, "factor_key": "momentum_60", "category": "动量"},
+        {"id": 2, "factor_key": "is_st", "category": "交易约束"},
+    ]
+    rows = [_row() for _ in range(5)]
+    for index, row in enumerate(rows):
+        row.symbol = f"00000{index + 1}"
+        row.close = 10.0
+    forward_rows = [_row() for _ in range(5)]
+    for index, row in enumerate(forward_rows):
+        row.symbol = f"00000{index + 1}"
+        row.close = 10.0 + index
+
+    class DataSource:
+        def load_snapshot(self, trade_date):
+            return rows if trade_date == "20260722" else forward_rows
+
+    class Cursor:
+        def __init__(self, values=None):
+            self.values = values or []
+
+        def fetchall(self):
+            return self.values
+
+    calls = []
+
+    class Connection:
+        def execute(self, sql, params=None):
+            calls.append((" ".join(sql.split()), params))
+            if "SELECT ts_code,standardized_value" in sql:
+                return Cursor([
+                    {"ts_code": f"00000{index + 1}", "standardized_value": float(index)}
+                    for index in range(5)
+                ])
+            return Cursor()
+
+    @contextmanager
+    def fake_conn():
+        yield Connection()
+
+    monkeypatch.setattr(factor_platform, "ensure_factor_registry", lambda: definitions)
+    monkeypatch.setattr(factor_platform, "_conn", fake_conn)
+    result = factor_platform.evaluate_materialized_factors(
+        trade_date="20260722",
+        forward_date="20260723",
+        data_source=DataSource(),
+    )
+
+    assert result["results"][1] == {
+        "factor_key": "is_st",
+        "definition_id": 2,
+        "status": "not_applicable_constraint",
+    }
+    delete_index = next(index for index, (sql, _) in enumerate(calls) if sql.startswith("DELETE FROM factor_evaluations"))
+    insert_index = next(index for index, (sql, _) in enumerate(calls) if sql.startswith("INSERT INTO factor_evaluations"))
+    assert delete_index < insert_index
+    assert calls[delete_index][1] == (1, "20260722", "20260723")

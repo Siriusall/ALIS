@@ -8,13 +8,16 @@ import socket
 import threading
 import time
 import uuid
+from copy import deepcopy
 from typing import Any, Callable
 
 from app.data_platform.services.oos_hard_data import audit_oos_hard_data
 from app.db.store import (
     _conn,
+    get_model_version,
     list_model_versions,
     update_model_version_metrics,
+    update_model_version_status,
     update_model_version_validation,
 )
 from app.services.production_strategy import resolve_production_strategy_champion
@@ -276,11 +279,92 @@ def _ensure_task_active(task_id: int) -> None:
             pass
 
 
-def _strategy_targets() -> list[dict[str, Any]]:
-    champion = resolve_production_strategy_champion()
-    from app.services.strategy_candidate_generator import ensure_dynamic_exposure_challenger
+def _experiment_data_gate() -> dict[str, Any]:
+    """One current-data contract for every asynchronous research entry point."""
+    from app.services.data_health import assess_latest_decision_data_health
 
-    generated = ensure_dynamic_exposure_challenger()
+    return assess_latest_decision_data_health()
+
+
+def _blocked_by_decision_data(task: dict[str, Any], gate: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "ok": True,
+        "schema_version": "alis_evolution_data_gate_v1",
+        "status": "blocked_by_decision_data",
+        "task_type": str(task.get("task_type") or ""),
+        "reason": "latest_decision_data_not_safe_for_research",
+        "data_gate": gate,
+        "policy": "no_factor_evaluation_shadow_or_formal_oos_until_experiment_ready",
+    }
+
+
+def _latest_challenger_failure_attribution() -> dict[str, Any]:
+    """Return only persisted formal-OOS evidence suitable for candidate routing."""
+    for version in list_model_versions("alis_strategy_challenger", limit=20):
+        formal = (version.get("metrics") or {}).get("formal_oos")
+        attribution = formal.get("failure_attribution") if isinstance(formal, dict) else None
+        if not isinstance(attribution, dict):
+            continue
+        primary_cause = str(attribution.get("primary_cause") or "unknown")
+        confidence = str(attribution.get("confidence") or "low")
+        if primary_cause != "unknown" and confidence in {"medium", "high"}:
+            routed = deepcopy(attribution)
+            routed["_routing_source"] = {
+                "model_version_id": int(version["id"]),
+                "strategy_id": int((version.get("config") or {}).get("strategy_id") or 0),
+                "model_version": str(version.get("version") or ""),
+            }
+            return routed
+    return {}
+
+
+def reconcile_failed_controller_oos_candidates(*, limit: int = 50) -> dict[str, Any]:
+    """Close stale controller candidates that a pre-fix worker left at the shadow gate."""
+    reconciled: list[int] = []
+    for version in list_model_versions("strategy_controller", limit=max(1, min(int(limit), 200))):
+        validation = version.get("validation") if isinstance(version.get("validation"), dict) else {}
+        formal = ((version.get("metrics") or {}).get("formal_oos") or {})
+        formal = formal if isinstance(formal, dict) else {}
+        failed = (
+            str(validation.get("status") or "") == "formal_oos_failed"
+            or str(formal.get("status") or "") == "failed"
+        )
+        if not failed:
+            continue
+        if (
+            str(version.get("status") or "") == "rejected"
+            and str(validation.get("next_gate") or "") == "formal_oos_rejected"
+        ):
+            continue
+        next_validation = dict(validation)
+        next_validation.update({
+            "status": "formal_oos_failed",
+            "production_eligible": False,
+            "next_gate": "formal_oos_rejected",
+            "blocking_reasons": list(validation.get("blocking_reasons") or formal.get("blocking_reasons") or []),
+        })
+        update_model_version_validation(int(version["id"]), validation=next_validation)
+        update_model_version_status(int(version["id"]), status="rejected", is_active=False)
+        reconciled.append(int(version["id"]))
+    return {"schema_version": "strategy_controller_formal_oos_reconciliation_v1", "reconciled_version_ids": reconciled}
+
+
+def _strategy_targets() -> list[dict[str, Any]]:
+    reconcile_failed_controller_oos_candidates()
+    champion = resolve_production_strategy_champion()
+    attribution = _latest_challenger_failure_attribution()
+    generated: dict[str, Any] | None = None
+    if attribution.get("primary_cause") == "market_exposure":
+        from app.services.strategy_candidate_generator import ensure_dynamic_exposure_challenger
+
+        generated = ensure_dynamic_exposure_challenger()
+    elif attribution.get("primary_cause") == "selection_or_allocation_residual":
+        from app.services.strategy_candidate_generator import ensure_selection_allocation_challenger
+
+        generated = ensure_selection_allocation_challenger(
+            failure_attribution=attribution,
+            source_model_version_id=int(((attribution.get("_routing_source") or {}).get("model_version_id") or 0)),
+        )
     targets = [{
         "role": "champion",
         "strategy_id": int(champion["strategy_id"]),
@@ -308,9 +392,33 @@ def _strategy_targets() -> list[dict[str, Any]]:
                     "validation_status": validation_status,
                 })
     for item in targets:
-        if int(item["strategy_id"]) == int(generated["strategy_id"]):
+        if generated and int(item["strategy_id"]) == int(generated["strategy_id"]):
             item["name"] = generated["name"]
     return targets
+
+
+def create_strategy_controller_oos_task(
+    strategy_controller_version_id: int, *, max_windows: int = 5, force: bool = False,
+) -> dict[str, Any]:
+    """Queue formal OOS for one controller candidate without rebinding production."""
+    version = get_model_version(int(strategy_controller_version_id))
+    if not version or version.get("model_key") != "strategy_controller" or version.get("status") != "candidate":
+        raise ValueError("strategy_controller_version_id 不存在或不是待验证候选")
+    champion = resolve_production_strategy_champion()
+    target = {
+        "role": "strategy_controller_candidate",
+        "strategy_id": int(champion["strategy_id"]),
+        "model_version_id": int(version["id"]),
+        "controller_version_id": int(version["id"]),
+        "name": str(version.get("version") or f"策略控制器候选 {version['id']}"),
+    }
+    return create_evolution_task(
+        task_type="strategy_controller_oos",
+        payload={"targets": [target], "max_windows": max(1, min(int(max_windows), MAX_WINDOWS_PER_CANDIDATE)), "trigger": "api"},
+        dedupe_key=f"strategy_controller_oos:{version['id']}:{champion['champion_id']}",
+        priority=50,
+        force=force,
+    )
 
 
 def _run_quick_gate(target: dict[str, Any], audit: dict[str, Any]) -> dict[str, Any]:
@@ -374,6 +482,7 @@ def _formal_metrics(result: dict[str, Any]) -> dict[str, Any]:
         "aggregate_excess_return": summary.get("aggregate_excess_return"),
         "worst_window_drawdown": summary.get("worst_window_drawdown"),
         "total_fees": summary.get("total_fees"),
+        "failure_attribution": result.get("failure_attribution") or {},
         "window_returns": [float((window.get("metrics") or {}).get("total_return") or 0.0) for window in windows],
     }
 
@@ -381,15 +490,54 @@ def _formal_metrics(result: dict[str, Any]) -> dict[str, Any]:
 def _persist_candidate_result(target: dict[str, Any], result: dict[str, Any]) -> None:
     if target["role"] == "champion":
         return
-    update_model_version_metrics(target["model_version_id"], metrics={"formal_oos": _formal_metrics(result)})
-    update_model_version_validation(target["model_version_id"], validation={
-        "status": f"formal_oos_{result.get('status')}",
-        "production_eligible": False,
+    version = get_model_version(int(target["model_version_id"])) or {}
+    metrics = dict(version.get("metrics") or {})
+    metrics["formal_oos"] = _formal_metrics(result)
+    update_model_version_metrics(target["model_version_id"], metrics=metrics)
+    validation = dict(version.get("validation") or {})
+    is_controller_candidate = target["role"] == "strategy_controller_candidate"
+    controller_shadow_ready = (
+        is_controller_candidate
+        and str(metrics.get("evaluation_scope") or "") == "candidate_specific_shadow_20d"
+        and int(metrics.get("shadow_sessions") or 0) >= 20
+        and float(metrics.get("net_lift") or 0.0) > 0.0
+        and float(metrics.get("walk_forward_lift") or 0.0) > 0.0
+        and float(metrics.get("worst_window_net_lift") or 0.0) > 0.0
+    )
+    promotion_gates = result.get("promotion_gates") or {}
+    formal_oos_ready = str(result.get("status") or "") == "passed" and bool(promotion_gates) and all(
+        bool(value) for value in promotion_gates.values()
+    )
+    automatically_promoted = controller_shadow_ready and formal_oos_ready
+    next_gate = "activated_and_champion_rebound" if automatically_promoted else "automatic_evolution_diagnosis"
+    if is_controller_candidate:
+        next_gate = "candidate_specific_shadow_observation" if formal_oos_ready else "formal_oos_rejected"
+    validation.update({
+        "status": "passed" if automatically_promoted else f"formal_oos_{result.get('status')}",
+        "production_eligible": automatically_promoted,
         "passed_gates": [key for key, value in (result.get("promotion_gates") or {}).items() if value],
         "blocking_reasons": result.get("blocking_reasons") or [],
-        "comparison_role": "diagnostic_baseline_not_promotable" if target["role"] == "baseline" else "challenger",
-        "next_gate": "automatic_evolution_diagnosis",
+        "comparison_role": "strategy_controller_candidate" if is_controller_candidate else ("diagnostic_baseline_not_promotable" if target["role"] == "baseline" else "challenger"),
+        "next_gate": next_gate,
     })
+    update_model_version_validation(target["model_version_id"], validation=validation)
+    if str(result.get("status") or "") == "failed":
+        from app.services.experiment_memory import record_model_experiment_outcome
+
+        record_model_experiment_outcome(
+            version,
+            stage="formal_oos",
+            rejected=True,
+            evidence={"formal_oos": _formal_metrics(result), "blocking_reasons": result.get("blocking_reasons") or []},
+        )
+    if is_controller_candidate and not formal_oos_ready:
+        update_model_version_status(int(target["model_version_id"]), status="rejected", is_active=False)
+    if automatically_promoted:
+        from app.db.store import set_active_model_version
+        from app.services.production_strategy import ensure_production_strategy_champion
+
+        set_active_model_version(int(target["model_version_id"]))
+        ensure_production_strategy_champion(force_rebind=True)
 
 
 def _execute_strategy_cycle(
@@ -406,14 +554,19 @@ def _execute_strategy_cycle(
     max_windows = max(1, min(int(payload.get("max_windows") or MAX_WINDOWS_PER_CANDIDATE), MAX_WINDOWS_PER_CANDIDATE))
     checkpoint = task.get("checkpoint") if isinstance(task.get("checkpoint"), dict) else {}
     completed = checkpoint.get("completed") if isinstance(checkpoint.get("completed"), list) else []
-    completed_ids = {int(item.get("strategy_id") or 0) for item in completed}
+    def target_identity(item: dict[str, Any]) -> str:
+        controller_id = int(item.get("controller_version_id") or 0)
+        return f"controller:{controller_id}" if controller_id else f"strategy:{int(item.get('strategy_id') or 0)}"
+
+    completed_ids = {target_identity(item) for item in completed}
     current = checkpoint.get("current") if isinstance(checkpoint.get("current"), dict) else {}
     total_units = max(1, len(targets) * max_windows)
 
     for target_index, target in enumerate(targets):
         _ensure_task_active(int(task["id"]))
         strategy_id = int(target["strategy_id"])
-        if strategy_id in completed_ids:
+        identity = target_identity(target)
+        if identity in completed_ids:
             continue
         if (
             target.get("role") == "challenger"
@@ -437,7 +590,7 @@ def _execute_strategy_cycle(
                     "summary": quick.get("metrics") or {},
                     "blocking_reasons": quick.get("blocking_reasons") or [],
                 })
-                completed_ids.add(strategy_id)
+                completed_ids.add(identity)
                 _heartbeat(
                     int(task["id"]), phase="quick_diagnostic",
                     progress=(target_index + 1) / max(1, len(targets)),
@@ -446,7 +599,10 @@ def _execute_strategy_cycle(
                 )
                 continue
         prior_windows = (
-            current.get("windows") if int(current.get("strategy_id") or 0) == strategy_id
+            current.get("windows") if (
+                str(current.get("target_identity") or "") == identity
+                or (not current.get("target_identity") and int(current.get("strategy_id") or 0) == strategy_id)
+            )
             and isinstance(current.get("windows"), list) else []
         )
 
@@ -455,7 +611,7 @@ def _execute_strategy_cycle(
             overall_units = target_index * max_windows + len(windows)
             next_checkpoint = {
                 "completed": completed,
-                "current": {"strategy_id": strategy_id, "windows": windows},
+                "current": {"target_identity": identity, "strategy_id": strategy_id, "controller_version_id": target.get("controller_version_id"), "windows": windows},
                 "hard_data_window": {"start": audit["window_start"], "end": audit["window_end"]},
             }
             _heartbeat(
@@ -471,6 +627,7 @@ def _execute_strategy_cycle(
             start_date=str(audit["window_start"]),
             end_date=str(audit["window_end"]),
             max_windows=max_windows,
+            strategy_controller_version_id=target.get("controller_version_id"),
             execute=True,
             progress_callback=progress,
             checkpoint_results=prior_windows,
@@ -479,13 +636,15 @@ def _execute_strategy_cycle(
         completed.append({
             "strategy_id": strategy_id,
             "model_version_id": int(target.get("model_version_id") or 0),
+            "controller_version_id": target.get("controller_version_id"),
             "role": target.get("role"),
             "name": target.get("name"),
             "status": result.get("status"),
             "summary": result.get("summary"),
+            "failure_attribution": result.get("failure_attribution") or {},
             "blocking_reasons": result.get("blocking_reasons"),
         })
-        completed_ids.add(strategy_id)
+        completed_ids.add(identity)
         current = {}
         _heartbeat(
             int(task["id"]),
@@ -494,10 +653,8 @@ def _execute_strategy_cycle(
             message=f"{target.get('name')} 正式验证完成",
             checkpoint={"completed": completed, "current": {}, "hard_data_window": {"start": audit["window_start"], "end": audit["window_end"]}},
         )
-    lifecycle = advance_formal_candidate_lifecycle(
-        completed,
-        shadow_start_date=str(audit["window_end"]),
-    )
+    lifecycle_targets = [item for item in completed if item.get("role") != "strategy_controller_candidate"]
+    lifecycle = advance_formal_candidate_lifecycle(lifecycle_targets, shadow_start_date=str(audit["window_end"])) if lifecycle_targets else []
     return {
         "schema_version": "alis_evolution_cycle_v1",
         "status": "completed",
@@ -520,13 +677,23 @@ def diagnose_strategy_results(items: list[dict[str, Any]]) -> dict[str, Any]:
     )
     baseline_return = float((best_baseline.get("summary") or {}).get("aggregate_cost_after_return") or 0.0)
     benchmark_return = float((challenger.get("summary") or {}).get("aggregate_benchmark_return") or 0.0)
+    attribution = challenger.get("failure_attribution") if isinstance(challenger.get("failure_attribution"), dict) else {}
+    primary_gap = str(attribution.get("primary_cause") or "unknown")
+    recommendations = {
+        "market_exposure": "dynamic_market_exposure_with_etf_fallback_v1",
+        "transaction_costs": "cost_and_turnover_constrained_candidate_required",
+        "execution_constraints": "execution_constraint_replay_and_capacity_candidate_required",
+        "selection_or_allocation_residual": "bounded_top_n_selection_candidate_v1",
+        "unknown": "no_automatic_candidate_without_replay_evidence",
+    }
     return {
-        "primary_gap": "market_exposure" if benchmark_return - max(challenger_return, baseline_return) > 0.10 else "selection_or_allocation",
-        "recommended_next_candidate": "dynamic_market_exposure_with_etf_fallback_v1",
+        "primary_gap": primary_gap,
+        "recommended_next_candidate": recommendations.get(primary_gap, recommendations["unknown"]),
         "evidence": {
             "challenger_return": challenger_return,
             "best_baseline_return": baseline_return,
             "benchmark_return": benchmark_return,
+            "failure_attribution": attribution,
         },
     }
 
@@ -536,9 +703,16 @@ def execute_evolution_task(
     *,
     validation_runner: Callable[..., dict[str, Any]] = run_purged_walk_forward_validation,
 ) -> dict[str, Any]:
-    if task.get("task_type") == "strategy_evolution_cycle":
+    task_type = str(task.get("task_type") or "")
+    if task_type in {"strategy_evolution_cycle", "strategy_controller_oos", "strategy_shadow_cycle", "factor_daily_cycle"}:
+        gate = _experiment_data_gate()
+        if not bool(gate.get("experiment_ready")):
+            return _blocked_by_decision_data(task, gate)
+    if task_type == "strategy_evolution_cycle":
         return _execute_strategy_cycle(task, validation_runner=validation_runner)
-    if task.get("task_type") == "strategy_shadow_cycle":
+    if task_type == "strategy_controller_oos":
+        return _execute_strategy_cycle(task, validation_runner=validation_runner)
+    if task_type == "strategy_shadow_cycle":
         from app.services.strategy_lifecycle import run_strategy_shadow_cycle
 
         _heartbeat(
@@ -551,7 +725,7 @@ def execute_evolution_task(
                 1, min(int((task.get("payload") or {}).get("max_new_sessions") or 5), 20)
             ),
         )
-    if task.get("task_type") == "factor_daily_cycle":
+    if task_type == "factor_daily_cycle":
         from app.services.factor_platform import run_factor_daily_cycle
 
         _heartbeat(
@@ -560,7 +734,7 @@ def execute_evolution_task(
             checkpoint=task.get("checkpoint") if isinstance(task.get("checkpoint"), dict) else {},
         )
         return run_factor_daily_cycle()
-    if task.get("task_type") == "system_autonomy_cycle":
+    if task_type == "system_autonomy_cycle":
         from app.services.system_autonomy import run_system_autonomy_cycle
 
         _heartbeat(

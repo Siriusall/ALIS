@@ -10,6 +10,7 @@ from app.services.review_learning import materialize_decision_outcomes
 
 STRATEGY_CONTROLLER_VERSION = "strategy_controller_v1"
 STRATEGY_MODEL_KEY = "strategy_controller"
+MINIMUM_CANDIDATE_SHADOW_SESSIONS = 20
 
 DEFAULT_STRATEGY_POLICY = {
     "schema_version": "strategy_policy_v1",
@@ -540,7 +541,9 @@ def _recent_strategy_patches(limit: int = 50) -> set[str]:
     return patches
 
 
-def create_strategy_policy_candidate(policy_patch: dict[str, Any], *, comment: str = "") -> dict[str, Any]:
+def create_strategy_policy_candidate(
+    policy_patch: dict[str, Any], *, comment: str = "", learning_evidence: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     base = active_strategy_policy()
     policy = _deep_merge(base, policy_patch or {})
     version = f"strategy_controller_candidate-{datetime.now().strftime('%Y%m%d%H%M%S%f')}"
@@ -555,7 +558,12 @@ def create_strategy_policy_candidate(policy_patch: dict[str, Any], *, comment: s
         version=version,
         status="candidate",
         artifact_path="builtin://strategy_controller/policy_candidate",
-        config={"policy": policy, "patch": policy_patch or {}, "comment": comment},
+        config={
+            "policy": policy,
+            "patch": policy_patch or {},
+            "comment": comment,
+            "learning_evidence": learning_evidence or {},
+        },
         metrics={"requires_backtest": True},
         validation=validation,
         is_active=False,
@@ -564,11 +572,74 @@ def create_strategy_policy_candidate(policy_patch: dict[str, Any], *, comment: s
     return {"ok": True, "version": get_model_version(version_id), "evaluation": evaluation}
 
 
+def _learning_signal_suggestions(values: dict[str, Any], context: dict[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Map durable review signals to bounded candidate hypotheses.
+
+    Data-quality findings are deliberately routed to governance rather than
+    changed into a trading parameter.  Every returned patch remains a
+    candidate and is evaluated through the existing validation gates.
+    """
+    signals = {
+        str(item.get("code") or "")
+        for item in (context.get("learning_signals") or [])
+        if isinstance(item, dict) and str(item.get("severity") or "") in {"warning", "critical"}
+    }
+    errors = context.get("error_breakdown") if isinstance(context.get("error_breakdown"), dict) else {}
+    error_types = errors.get("review_error_types") if isinstance(errors.get("review_error_types"), dict) else {}
+    evidence = {
+        "source": "periodic_performance_review_v1",
+        "period": context.get("period"),
+        "signals": sorted(signals),
+        "error_types": error_types,
+        "benchmark_coverage": context.get("benchmark_coverage") or {},
+    }
+    suggestions: list[dict[str, Any]] = []
+    governance_actions: list[dict[str, Any]] = []
+    if "high_turnover" in signals:
+        suggestions.append({
+            "name": "复盘驱动：收紧月度换手上限",
+            "reason": "月度复盘识别高换手，生成更严格的成本控制候选",
+            "patch": {"rebalance_rules": {"max_monthly_turnover": max(0.05, float(values["max_monthly_turnover"]) - 0.05)}},
+            "learning_evidence": evidence,
+        })
+    if "negative_excess_return" in signals:
+        suggestions.append({
+            "name": "复盘驱动：提高新仓确认门槛",
+            "reason": "周期相对基准为负，生成更高确认阈值的保守候选",
+            "patch": {"signal_thresholds": {"add_position_score": min(95.0, float(values["add_position_score"]) + 3.0)}},
+            "learning_evidence": evidence,
+        })
+        expansion = values.get("market_state_policy", {}).get("risk_expansion", {}) if isinstance(values.get("market_state_policy"), dict) else {}
+        current_expansion_equity = _safe_float(expansion.get("max_equity")) or 0.90
+        if current_expansion_equity < 1.0:
+            suggestions.append({
+                "name": "复盘驱动：扩张期满权益暴露",
+                "reason": "正式 OOS 的主要差距指向上涨市场暴露不足；只在风险扩张状态将权益上限提高至100%，其余风险状态、单票上限与换手约束保持不变。",
+                "patch": {"market_state_policy": {"risk_expansion": {"max_equity": 1.0}}},
+                "learning_evidence": {**evidence, "hypothesis": "risk_expansion_full_equity_only"},
+            })
+    if "review_errors" in signals and int(error_types.get("模型失效") or 0) > 0:
+        suggestions.append({
+            "name": "复盘驱动：模型失效更早复核",
+            "reason": "复核归因为模型失效，生成更早触发亏损复核的候选",
+            "patch": {"signal_thresholds": {"loss_review_threshold": round(max(-0.15, float(values["loss_review_threshold"]) + 0.01), 6)}},
+            "learning_evidence": evidence,
+        })
+    if int(error_types.get("数据质量") or 0) > 0:
+        governance_actions.append({
+            "target": "data_governance",
+            "code": "review_data_quality_errors",
+            "count": int(error_types.get("数据质量") or 0),
+            "reason": "数据质量错误不得被转化为交易参数候选；保留给硬数据与数据质量治理。",
+        })
+    return suggestions, governance_actions
+
+
 def run_strategy_policy_auto_optimization(*, force: bool = False) -> dict[str, Any]:
     active = ensure_default_strategy_policy_version()
     policy = active_strategy_policy()
     values = _policy_bounds(policy)["values"]
-    suggestions = [
+    baseline_suggestions = [
         {
             "name": "提高买入确认门槛",
             "reason": "减少弱信号新仓，降低无效换手",
@@ -595,6 +666,15 @@ def run_strategy_policy_auto_optimization(*, force: bool = False) -> dict[str, A
             "patch": {"rebalance_rules": {"max_monthly_turnover": max(0.05, float(values["max_monthly_turnover"]) - 0.03)}},
         },
     ]
+    try:
+        from app.services.performance_reports import latest_performance_learning_context
+        learning_context = latest_performance_learning_context()
+    except Exception as exc:
+        learning_context = {"available": False, "reason": f"performance_context_unavailable:{str(exc)[:160]}"}
+    learning_suggestions, governance_actions = _learning_signal_suggestions(values, learning_context)
+    # Preserve the existing periodic candidate exploration and add only the
+    # signal-specific hypotheses that have durable evidence.
+    suggestions = baseline_suggestions + learning_suggestions
     existing = _recent_strategy_patches()
     created: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
@@ -606,6 +686,7 @@ def run_strategy_policy_auto_optimization(*, force: bool = False) -> dict[str, A
         result = create_strategy_policy_candidate(
             suggestion["patch"],
             comment=f"auto_optimization: {suggestion['name']}；{suggestion['reason']}",
+            learning_evidence=suggestion.get("learning_evidence"),
         )
         version = result.get("version") or {}
         evaluation = result.get("evaluation") or {}
@@ -627,6 +708,9 @@ def run_strategy_policy_auto_optimization(*, force: bool = False) -> dict[str, A
         "skipped_count": len(skipped),
         "created": created,
         "skipped": skipped,
+        "learning_context": learning_context,
+        "learning_candidate_count": len(learning_suggestions),
+        "governance_actions": governance_actions,
         "note": "只生成候选并自动评估；弱于生产、样本不足或越界会自动拦截，不自动上线。",
         "generated_at": datetime.now().isoformat(),
     }
@@ -693,6 +777,7 @@ def _policy_bounds(policy: dict[str, Any]) -> dict[str, Any]:
             "risk_weight_gap": gap,
             "max_monthly_turnover": max_turnover,
             "max_equity_max": max(max_equity_values) if max_equity_values else None,
+            "market_state_policy": market,
         },
     }
 
@@ -753,6 +838,157 @@ def _historical_policy_replay_metrics(policy: dict[str, Any], champion_policy: d
     }
 
 
+def _missing_candidate_shadow_metrics() -> dict[str, Any]:
+    """Never use Champion outcomes as evidence for a policy Challenger."""
+    return {
+        "sample_rows": 0,
+        "net_lift": 0.0,
+        "walk_forward_lift": 0.0,
+        "worst_window_net_lift": 0.0,
+        "hit_rate": 0.0,
+        "shadow_sessions": 0,
+        "transaction_cost_bps": 25,
+        "aggressiveness_penalty": 0.0,
+        "evaluation_scope": "candidate_specific_shadow_required",
+        "blocked_reasons": ["missing_candidate_specific_shadow_outcomes"],
+    }
+
+
+def _shadow_action_for_decision(
+    decision: dict[str, Any], policy: dict[str, Any],
+) -> tuple[str, bool, float | None]:
+    """Apply a candidate policy to one immutable Champion decision opportunity."""
+    research = decision.get("research") if isinstance(decision.get("research"), dict) else {}
+    contract = decision.get("target_weight_contract") if isinstance(decision.get("target_weight_contract"), dict) else {}
+    score = _safe_float(research.get("score") or contract.get("score"))
+    kind = str(decision.get("decision_type") or "").upper()
+    if kind in {"BUY", "ADD"}:
+        if score is None:
+            return "observe_missing_score", False, None
+        action = _action_for_buy(score, policy)
+        return action, action == "add_position", score
+    if kind in {"SELL", "REDUCE", "EXIT"}:
+        return "sell_exit", True, score
+    return "hold", False, score
+
+
+def _ensure_strategy_policy_shadow_tables() -> None:
+    with business_conn() as c:
+        c.execute("""CREATE TABLE IF NOT EXISTS strategy_policy_shadow_observations (
+            id BIGSERIAL PRIMARY KEY,
+            candidate_version_id BIGINT NOT NULL,
+            decision_snapshot_id BIGINT NOT NULL,
+            decision_time VARCHAR(64) NOT NULL,
+            decision_type VARCHAR(32) NOT NULL,
+            shadow_action VARCHAR(32) NOT NULL,
+            would_trade INTEGER NOT NULL DEFAULT 0,
+            score DOUBLE PRECISION,
+            evidence_json TEXT NOT NULL DEFAULT '{}',
+            created_at VARCHAR(64) NOT NULL,
+            UNIQUE(candidate_version_id,decision_snapshot_id)
+        )""")
+        c.execute("""CREATE INDEX IF NOT EXISTS idx_strategy_policy_shadow_candidate
+            ON strategy_policy_shadow_observations(candidate_version_id,decision_time)""")
+
+
+def materialize_strategy_policy_shadow_observations(*, limit_candidates: int = 30) -> dict[str, Any]:
+    """Persist candidate-specific, post-creation shadow actions without touching the account."""
+    _ensure_strategy_policy_shadow_tables()
+    candidates = [
+        item for item in list_model_versions(STRATEGY_MODEL_KEY, limit=max(1, min(int(limit_candidates), 200)))
+        if not bool(item.get("is_active")) and str(item.get("status") or "") == "candidate"
+    ]
+    written = 0
+    opportunities = 0
+    now = datetime.now().isoformat()
+    with business_conn() as c:
+        for candidate in candidates:
+            policy = ((candidate.get("config") or {}).get("policy") or DEFAULT_STRATEGY_POLICY)
+            created_at = str(candidate.get("created_at") or "")
+            rows = [dict(row) for row in c.execute(
+                """SELECT id,decision_time,decision_type,research_state_json,target_weight_contract_json
+                   FROM decision_snapshots WHERE decision_time>=? ORDER BY decision_time,id""",
+                (created_at,),
+            ).fetchall()]
+            for row in rows:
+                try:
+                    research = json.loads(row.get("research_state_json") or "{}")
+                    contract = json.loads(row.get("target_weight_contract_json") or "{}")
+                except (TypeError, json.JSONDecodeError):
+                    research, contract = {}, {}
+                action, would_trade, score = _shadow_action_for_decision(
+                    {**row, "research": research, "target_weight_contract": contract}, policy,
+                )
+                evidence = {
+                    "schema_version": "strategy_policy_shadow_v1",
+                    "candidate_version": candidate.get("version"),
+                    "candidate_created_at": created_at,
+                    "source": "immutable_champion_decision_opportunity",
+                    "account_effect": "none",
+                }
+                c.execute(
+                    """INSERT INTO strategy_policy_shadow_observations(
+                        candidate_version_id,decision_snapshot_id,decision_time,decision_type,
+                        shadow_action,would_trade,score,evidence_json,created_at
+                    ) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(candidate_version_id,decision_snapshot_id) DO NOTHING""",
+                    (
+                        int(candidate["id"]), int(row["id"]), str(row.get("decision_time") or ""),
+                        str(row.get("decision_type") or ""), action, int(would_trade), score,
+                        json.dumps(evidence, ensure_ascii=False), now,
+                    ),
+                )
+                written += 1
+                opportunities += 1
+    return {
+        "ok": True,
+        "schema_version": "strategy_policy_shadow_v1",
+        "candidate_count": len(candidates),
+        "opportunities_seen": opportunities,
+        "observations_written": written,
+        "policy": "candidate_specific_post_creation_shadow_only; no_account_effect",
+    }
+
+
+def _candidate_shadow_metrics(
+    candidate_version_id: int, policy: dict[str, Any], champion_policy: dict[str, Any],
+) -> dict[str, Any]:
+    _ensure_strategy_policy_shadow_tables()
+    with business_conn() as c:
+        rows = [dict(row) for row in c.execute(
+            """SELECT s.decision_time,a.directional_return,a.correct
+               FROM strategy_policy_shadow_observations s
+               JOIN decision_outcome_attributions a ON a.decision_snapshot_id=s.decision_snapshot_id
+                 AND a.horizon_sessions=20
+               WHERE s.candidate_version_id=? AND s.would_trade=1
+               ORDER BY s.decision_time,s.id""",
+            (int(candidate_version_id),),
+        ).fetchall()]
+    if not rows:
+        return _missing_candidate_shadow_metrics()
+    cost = 0.0025
+    penalty = _policy_aggressiveness_penalty(policy, champion_policy)
+    net_returns = [float(row.get("directional_return") or 0.0) - cost - penalty for row in rows]
+    window_count = min(4, len(net_returns))
+    size = max(1, len(net_returns) // window_count) if window_count else 1
+    windows = [sum(net_returns[index:index + size]) / len(net_returns[index:index + size]) for index in range(0, len(net_returns), size)]
+    return {
+        "sample_rows": len(rows),
+        "shadow_sessions": len({str(row.get("decision_time") or "")[:10] for row in rows}),
+        "net_lift": round(sum(net_returns) / len(net_returns), 8),
+        "walk_forward_lift": round(sum(windows) / len(windows), 8) if windows else 0.0,
+        "worst_window_net_lift": round(min(windows), 8) if windows else 0.0,
+        "hit_rate": round(sum(value > 0 for value in net_returns) / len(net_returns), 6),
+        "transaction_cost_bps": 25,
+        "aggressiveness_penalty": penalty,
+        "window_net_lifts": [round(value, 8) for value in windows],
+        "evaluation_scope": "candidate_specific_shadow_20d",
+        "blocked_reasons": (
+            [] if len({str(row.get("decision_time") or "")[:10] for row in rows}) >= MINIMUM_CANDIDATE_SHADOW_SESSIONS
+            else ["minimum_candidate_shadow_sessions"]
+        ),
+    }
+
+
 def evaluate_strategy_policy_version(version_id: int) -> dict[str, Any]:
     version = get_model_version(int(version_id))
     if not version or version.get("model_key") != STRATEGY_MODEL_KEY:
@@ -761,7 +997,10 @@ def evaluate_strategy_policy_version(version_id: int) -> dict[str, Any]:
     policy = ((version.get("config") or {}).get("policy") or DEFAULT_STRATEGY_POLICY)
     champion_policy = ((active or {}).get("config") or {}).get("policy") or DEFAULT_STRATEGY_POLICY
     bounds = _policy_bounds(policy)
-    metrics = _historical_policy_replay_metrics(policy, champion_policy) if bounds["ok"] else {
+    metrics = (
+        _historical_policy_replay_metrics(policy, champion_policy)
+        if bounds["ok"] and bool(version.get("is_active")) else _candidate_shadow_metrics(int(version_id), policy, champion_policy)
+    ) if bounds["ok"] else {
         "sample_rows": 0,
         "net_lift": 0.0,
         "walk_forward_lift": 0.0,
@@ -771,15 +1010,19 @@ def evaluate_strategy_policy_version(version_id: int) -> dict[str, Any]:
         "aggressiveness_penalty": 0.0,
         "blocked_reasons": bounds["blocked_reasons"],
     }
+    shadow_sessions_ready = bool(version.get("is_active")) or (
+        int(metrics.get("shadow_sessions") or 0) >= MINIMUM_CANDIDATE_SHADOW_SESSIONS
+    )
     passed_metrics = (
         float(metrics.get("net_lift") or 0.0) > 0.0
         and float(metrics.get("walk_forward_lift") or 0.0) > 0.0
         and float(metrics.get("worst_window_net_lift") or 0.0) > 0.0
         and int(metrics.get("sample_rows") or 0) >= 5
+        and shadow_sessions_ready
     )
     blocked = list(bounds["blocked_reasons"]) + list(metrics.get("blocked_reasons") or [])
     if not passed_metrics:
-        for reason in ("net_lift_positive", "walk_forward_positive", "worst_window_positive", "minimum_samples"):
+        for reason in ("net_lift_positive", "walk_forward_positive", "worst_window_positive", "minimum_samples", "minimum_candidate_shadow_sessions"):
             if reason == "net_lift_positive" and float(metrics.get("net_lift") or 0.0) > 0.0:
                 continue
             if reason == "walk_forward_positive" and float(metrics.get("walk_forward_lift") or 0.0) > 0.0:
@@ -788,8 +1031,13 @@ def evaluate_strategy_policy_version(version_id: int) -> dict[str, Any]:
                 continue
             if reason == "minimum_samples" and int(metrics.get("sample_rows") or 0) >= 5:
                 continue
+            if reason == "minimum_candidate_shadow_sessions" and shadow_sessions_ready:
+                continue
             blocked.append(reason)
-    insufficient_data = int(metrics.get("sample_rows") or 0) < 5 or "missing_mature_decision_outcomes" in list(metrics.get("blocked_reasons") or [])
+    insufficient_data = int(metrics.get("sample_rows") or 0) < 5 or not shadow_sessions_ready or bool(
+        {"missing_mature_decision_outcomes", "missing_candidate_specific_shadow_outcomes"}
+        & set(metrics.get("blocked_reasons") or [])
+    )
     status = "passed" if bounds["ok"] and passed_metrics else "blocked_by_data" if bounds["ok"] and insufficient_data else "rejected"
     validation = {
         "status": status,
@@ -807,6 +1055,55 @@ def evaluate_strategy_policy_version(version_id: int) -> dict[str, Any]:
             (json.dumps(metrics, ensure_ascii=False), datetime.now().isoformat(), int(version_id)),
         )
     return {"ok": True, "version_id": int(version_id), "status": status, "metrics": metrics, "validation": validation}
+
+
+def advance_waiting_strategy_policy_candidates(*, limit: int = 30) -> dict[str, Any]:
+    """Refresh mature outcomes and re-evaluate data-blocked policy candidates.
+
+    This is a lifecycle advance only.  It can move a candidate to the existing
+    review gate or reject it, but cannot make it active or alter the Champion.
+    """
+    materialized = materialize_decision_outcomes(limit=2000)
+    shadows = materialize_strategy_policy_shadow_observations(limit_candidates=limit)
+    candidates = [
+        item for item in list_model_versions(STRATEGY_MODEL_KEY, limit=max(1, min(int(limit or 30), 200)))
+        if not bool(item.get("is_active"))
+        and str(item.get("status") or "") == "candidate"
+        and str((item.get("validation") or {}).get("status") or "") == "blocked_by_data"
+    ]
+    results: list[dict[str, Any]] = []
+    counts = {"re_evaluated": 0, "still_waiting": 0, "formal_oos_queued": 0, "rejected": 0}
+    for candidate in candidates:
+        evaluation = evaluate_strategy_policy_version(int(candidate["id"]))
+        status = str(evaluation.get("status") or "unknown")
+        counts["re_evaluated"] += 1
+        if status == "blocked_by_data":
+            counts["still_waiting"] += 1
+        elif status == "passed":
+            from app.services.evolution_orchestrator import create_strategy_controller_oos_task
+
+            queued = create_strategy_controller_oos_task(int(candidate["id"]))
+            counts["formal_oos_queued"] += 1
+        elif status == "rejected":
+            counts["rejected"] += 1
+        results.append({
+            "version_id": int(candidate["id"]),
+            "version": candidate.get("version"),
+            "status": status,
+            "sample_rows": int((evaluation.get("metrics") or {}).get("sample_rows") or 0),
+            "blocked_reasons": (evaluation.get("validation") or {}).get("blocked_reasons") or [],
+            "formal_oos_task_id": (queued.get("task") or {}).get("id") if status == "passed" else None,
+            "learning_evidence": (candidate.get("config") or {}).get("learning_evidence") or {},
+        })
+    return {
+        "ok": True,
+        "schema_version": "strategy_policy_candidate_maturity_v1",
+        "outcomes_materialized": materialized,
+        "shadow_observations": shadows,
+        "counts": counts,
+        "candidates": results,
+        "policy": "20_distinct_future_shadow_sessions_then_formal_oos_then_automatic_champion_rebind",
+    }
 
 
 def strategy_policy_replay_preview(
@@ -951,6 +1248,9 @@ def review_strategy_policy_version(version_id: int, *, decision: str, reviewer: 
     update_model_version_validation(int(version_id), validation=validation)
     if decision == "approved":
         set_active_model_version(int(version_id))
+        from app.services.production_strategy import ensure_production_strategy_champion
+
+        ensure_production_strategy_champion(force_rebind=True)
     else:
         update_model_version_status(int(version_id), status="rejected", is_active=False)
     return {"ok": True, "version": get_model_version(int(version_id))}

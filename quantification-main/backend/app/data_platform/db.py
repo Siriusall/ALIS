@@ -62,6 +62,20 @@ CREATE TABLE dc_announcement_raw (
             updated_at TEXT NOT NULL,
             UNIQUE (source_code, announcement_id)
         );
+CREATE TABLE dc_announcement_label (
+            source_code TEXT NOT NULL,
+            announcement_id TEXT NOT NULL,
+            label_version TEXT NOT NULL DEFAULT 'v1',
+            is_event INTEGER NOT NULL DEFAULT 1,
+            event_type TEXT NOT NULL DEFAULT '',
+            impact_direction TEXT NOT NULL DEFAULT 'neutral',
+            severity TEXT NOT NULL DEFAULT 'medium',
+            annotator TEXT NOT NULL DEFAULT '',
+            labelled_at TEXT NOT NULL,
+            evidence_note TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (source_code, announcement_id, label_version)
+        );
 CREATE TABLE dc_data_quality_checks (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             check_name TEXT NOT NULL,
@@ -356,6 +370,7 @@ CREATE INDEX idx_dc_web_factor_symbol_time ON dc_web_factor_snapshot (symbol, cr
 CREATE INDEX idx_dc_runs_started ON data_ingestion_runs (started_at);
 CREATE INDEX idx_dc_runs_job_started ON data_ingestion_runs (job_name, started_at);
 CREATE INDEX idx_dc_announcement_publish ON dc_announcement_raw (publish_time);
+CREATE INDEX idx_dc_announcement_label_version ON dc_announcement_label (label_version, labelled_at);
 """
 
 class Connection:

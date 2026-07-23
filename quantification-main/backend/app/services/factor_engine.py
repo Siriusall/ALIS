@@ -286,6 +286,11 @@ def _factor_book_to_price(symbol: str, hist: List[DailyBar], today: Optional[Sto
     return _unified_factor("book_to_price", symbol, hist, today, context)
 
 
+def _factor_industry_candidate(symbol: str, hist: List[DailyBar], today: Optional[StockQuote], context: FactorContext) -> float:
+    """Keep unpromoted industry factors neutral in legacy on-the-fly scoring."""
+    return 0.0
+
+
 # ---------- TuShare 截面因子（市值/估值/状态/指数成分）----------
 def _ensure_snapshot(symbol: str, context: FactorContext):
     """
@@ -428,6 +433,9 @@ FACTOR_REGISTRY: Dict[str, FactorFn] = {
     "earnings_yield": _factor_earnings_yield,
     "book_to_price": _factor_book_to_price,
     "volume_ratio_5": _factor_volume_ratio_5,
+    "industry_demand_proxy": _factor_industry_candidate,
+    "industry_inventory_proxy": _factor_industry_candidate,
+    "industry_ppi_yoy_proxy": _factor_industry_candidate,
     # TuShare 截面因子
     "float_mv": _factor_float_mv,
     "total_mv": _factor_total_mv,

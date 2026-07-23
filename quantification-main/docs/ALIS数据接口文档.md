@@ -51,6 +51,8 @@
 | 指数 | `index_weight` | `index_code + 月初/月末` | 每指数每月一次 |
 | 宏观 | `cn_gdp` | 全量/季度 | 季度增量 |
 | 宏观 | `cn_cpi` | 全量/月度 | 月度增量 |
+| 宏观 | `cn_ppi` | 全量/月度 | 先原始留痕，再按采矿、原材料、加工和耐用品 PPI 分项物化行业产品价格代理；不等同于现货或企业实现价格 |
+| 宏观 | `cn_m` | 全量/月度 | 月度原始留痕，作为流动性/工业景气辅助，不直接构成行业价格或供给指标 |
 | 宏观 | `cn_pmi` | 全量/月度 | 月度增量 |
 | 宏观 | `shibor` | 日期窗 | 每日增量 |
 | 外汇 | `fx_daily` | `ts_code + 日期窗` | 指定汇率代码按日期窗 |
@@ -73,6 +75,21 @@
 - 事件类：以成功检查的股票/日期窗口为分母；无事件是有效结论，不要求产生事件行。
 - 批量响应达到接口上限时必须分页或缩小日期窗口，禁止直接当作完整结果。
 - `success`、`valid_empty`、`not_applicable` 可计入完成；`empty_pending`、失败、未请求不得计入。
+
+## 行业研究物化接口
+
+| 方法 | 路径 | 来源与点时合同 |
+|---|---|---|
+| `POST` | `/api/data-center/materialize/free-industry-financials?max_periods=12` | 从已留存的点时 `income`、`balancesheet` 和估值快照物化行业营收扩散、库存/营收比改善、盈利扩散和估值。每个值的 `available_time` 固定为对应披露截止时点；前两项是代理，不能声称为实际订单、销量或专业库存。 |
+| `POST` | `/api/data-center/materialize/pmi-demand-proxies` | 从已留存的 `cn_pmi` 物化制造业/服务业行业需求宏观代理，保留上游原始可用时间；不替代行业产品价格、库存、产能利用率或政策供给。 |
+| `POST` | `/api/data-center/materialize/futures-price-proxies?start_date=YYYYMMDD&end_date=YYYYMMDD` | 从交易所主力连续期货映射物化产品价格代理。首次历史回填一律以本次物化时刻作为 `available_time`，禁止写入此前 OOS；不等同于现货价格。 |
+| `POST` | `/api/data-center/sync/official-policy-documents` | 从发改委、工信部、能源局、海关总署、国家统计局，以及汽车、工程机械、钢铁协会的公开目录抓取文件；每个来源单独报告失败，保留原文 URL、发布时间、正文摘录和抓取可用时间。网络失败不能当作有效空集。 |
+| `POST` | `/api/data-center/materialize/official-policy-supply` | 仅对已留痕的官方文件按行业关键词、方向和发布日期物化 `policy_supply` 事件分数；不代表政策执行效果或实际供给量。 |
+| `POST` | `/api/data-center/materialize/official-capacity-utilization` | 从已留痕的国家统计局发布中抽取工业产能利用率，映射为制造业宏观代理；不等同于细分行业开工率。 |
+| `POST` | `/api/data-center/materialize/cn-ppi-price-proxies` | 从已留存的 TuShare `cn_ppi` 分项同比物化采矿、原材料、加工和耐用品行业产品价格代理；保留原始 `available_time`，不等同于现货价格。 |
+| `GET` | `/api/model-strategy/evolution/research-data-assets` | 只读审计行业七类组件、来源、覆盖、最新可用时间及缺口。`proxy_ready` 不能满足直接源研究深度门。 |
+
+截至 2026-07-23，行业需求/销量与库存周期均已使用点时代理物化；产品价格已有交易所期货和工业 PPI 两类代理。政策和产能的官方公开连接器已配置，只有取到原文与数值后才会变为可用，定义存在但值为零显示为 `configured`。直接现货价格仍为缺口。任何后续国家统计局、行业协会或主管部门数据必须保留原始文件、来源 URL、数据日期、发布日期和 `available_time`，再通过 `dc_industry_metric_definition/value` 进入研究层。
 
 ## 模拟账本审计接口
 

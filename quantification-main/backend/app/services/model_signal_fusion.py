@@ -6,7 +6,7 @@ import pickle
 from pathlib import Path
 from typing import Any
 
-from app.db.store import get_active_model_version
+from app.db.store import _conn as business_conn, get_active_model_version
 from app.services.backtest_data_source import HistBar, SnapshotRow
 from app.services.plan_model_control import PLAN_MODELS, score_plan_model_features
 
@@ -60,6 +60,35 @@ def _percentiles(values: dict[str, float]) -> dict[str, float]:
             result[ordered[index][0]] = percentile
         start = end
     return result
+
+
+def _live_model_controls(versions: dict[str, dict[str, Any] | None]) -> dict[str, dict[str, Any]]:
+    """Read persisted live-health state without making monitoring a display-only feature."""
+    controls = {
+        key: {"status": "healthy", "weight_multiplier": 1.0, "reason": "no_live_health_override"}
+        for key in MODEL_KEYS
+    }
+    try:
+        with business_conn() as conn:
+            rows = [dict(row) for row in conn.execute(
+                "SELECT model_key,active_version,status,weight_multiplier,reason FROM model_live_health"
+            ).fetchall()]
+    except Exception:
+        return controls
+    for row in rows:
+        key = str(row.get("model_key") or "")
+        version = versions.get(key) or {}
+        # A health record for an older version must never penalize its successor.
+        if key not in controls or str(row.get("active_version") or "") != str(version.get("version") or ""):
+            continue
+        status = str(row.get("status") or "healthy")
+        multiplier = max(0.0, min(1.0, _safe(row.get("weight_multiplier") or 1.0)))
+        controls[key] = {
+            "status": status,
+            "weight_multiplier": multiplier,
+            "reason": str(row.get("reason") or ""),
+        }
+    return controls
 
 
 def _theme_evidence(themes: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
@@ -122,6 +151,7 @@ def apply_production_model_signals(
     """Fuse production model families into ranking and deterministic trade gates."""
     versions = {key: get_active_model_version(key) for key in MODEL_KEYS}
     artifacts = {key: _artifact(version) for key, version in versions.items()}
+    health_controls = _live_model_controls(versions)
     theme_by_symbol = _theme_evidence(themes)
     raw_scores: dict[str, dict[str, float]] = {key: {} for key in MODEL_KEYS}
     features_by_symbol: dict[str, dict[str, float]] = {}
@@ -155,16 +185,26 @@ def apply_production_model_signals(
                 "percentile": percentiles[key].get(symbol),
                 "version_id": (versions.get(key) or {}).get("id"),
                 "version": (versions.get(key) or {}).get("version"),
-                "status": "production" if versions.get(key) and artifacts.get(key) else "proxy_or_unavailable",
+                "status": (
+                    health_controls[key]["status"]
+                    if versions.get(key) and artifacts.get(key) else "proxy_or_unavailable"
+                ),
+                "weight_multiplier": health_controls[key]["weight_multiplier"],
+                "health_reason": health_controls[key]["reason"],
             }
             for key in MODEL_KEYS
         }
         fused = 0.45 * base_percentile.get(symbol, 0.0)
         for key, weight in MODEL_WEIGHTS.items():
-            fused += weight * float(percentiles[key].get(symbol, 0.5))
+            fused += weight * health_controls[key]["weight_multiplier"] * float(percentiles[key].get(symbol, 0.5))
         capital_pct = percentiles["capital_persistence_multitask_v1"].get(symbol)
+        capital_gate_active = bool(
+            versions.get("capital_persistence_multitask_v1")
+            and artifacts.get("capital_persistence_multitask_v1")
+            and health_controls["capital_persistence_multitask_v1"]["status"] != "degraded"
+        )
         narrative_exit = str(theme.get("lifecycle") or "") in {"退潮", "沉寂"}
-        capital_block = capital_pct is not None and capital_pct <= 0.10
+        capital_block = capital_gate_active and capital_pct is not None and capital_pct <= 0.10
         if capital_block or narrative_exit:
             blocked.append({
                 "symbol": symbol,
@@ -186,7 +226,8 @@ def apply_production_model_signals(
                 else "weak" if capital_pct is not None and capital_pct < 0.35
                 else "confirmed"
             ),
-            "add_position_eligible": capital_pct is None or capital_pct >= 0.35,
+            "capital_gate_active": capital_gate_active,
+            "add_position_eligible": not capital_gate_active or capital_pct is None or capital_pct >= 0.35,
             "leader_eligible": leader_pct is not None and leader_pct >= 0.70,
             "event_eligible": event_pct is not None and event_pct >= 0.70,
             "narrative": theme or {"lifecycle": "未识别", "score": 0.0},
@@ -205,6 +246,8 @@ def apply_production_model_signals(
                 "version_id": (versions.get(key) or {}).get("id"),
                 "version": (versions.get(key) or {}).get("version"),
                 "consumed": bool(versions.get(key) and artifacts.get(key)),
+                "health_status": health_controls[key]["status"],
+                "weight_multiplier": health_controls[key]["weight_multiplier"],
             }
             for key in MODEL_KEYS
         ],
@@ -214,8 +257,17 @@ def apply_production_model_signals(
         "policy": {
             "base_rank_weight": 0.45,
             "model_weights": MODEL_WEIGHTS,
+            "effective_model_weights": {
+                key: round(weight * health_controls[key]["weight_multiplier"], 6)
+                for key, weight in MODEL_WEIGHTS.items()
+            },
             "capital_new_position_block_percentile": 0.10,
             "add_position_min_capital_percentile": 0.35,
+            "disabled_gates": [
+                "capital_persistence_gate"
+                for key in ("capital_persistence_multitask_v1",)
+                if not (versions.get(key) and artifacts.get(key)) or health_controls[key]["status"] == "degraded"
+            ],
         },
     }
     return reranked, evidence, blocked, status

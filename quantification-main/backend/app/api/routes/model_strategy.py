@@ -49,6 +49,7 @@ from app.services.strategy_lab import build_strategy_lab
 from app.services.system_autonomy import latest_owner_summary
 from app.services.evolution_orchestrator import (
     cancel_evolution_task,
+    create_strategy_controller_oos_task,
     create_evolution_task,
     evolution_schedule_status,
     get_evolution_task,
@@ -142,6 +143,7 @@ class OOSReportRequest(BaseModel):
 
 class PurgedWalkForwardRequest(BaseModel):
     strategy_id: int | None = Field(None, ge=1)
+    strategy_controller_version_id: int | None = Field(None, ge=1)
     start_date: str | None = None
     end_date: str | None = None
     train_sessions: int = Field(756, ge=60, le=3000)
@@ -158,6 +160,11 @@ class PurgedWalkForwardRequest(BaseModel):
 class EvolutionTaskRequest(BaseModel):
     max_windows: int = Field(5, ge=1, le=20)
     max_candidates: int = Field(6, ge=1, le=20)
+    force: bool = False
+
+
+class StrategyControllerOOSTaskRequest(BaseModel):
+    max_windows: int = Field(5, ge=1, le=20)
     force: bool = False
 
 
@@ -639,7 +646,8 @@ def model_strategy_purged_walk_forward(req: PurgedWalkForwardRequest) -> dict:
     try:
         return run_purged_walk_forward_validation(
             start_date=req.start_date, end_date=req.end_date, config=config,
-            max_windows=req.max_windows, strategy_id=req.strategy_id, execute=req.execute,
+            max_windows=req.max_windows, strategy_id=req.strategy_id,
+            strategy_controller_version_id=req.strategy_controller_version_id, execute=req.execute,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -676,6 +684,13 @@ def model_strategy_ledger_audit() -> dict:
     return audit_simulation_ledger(persist=False)
 
 
+@router.get("/model-strategy/evolution/research-data-assets")
+def model_strategy_research_data_assets() -> dict:
+    """Read-only research-depth contract for the autonomy UI."""
+    from app.services.research_data_assets import audit_research_data_assets
+    return audit_research_data_assets()
+
+
 @router.get("/model-strategy/evolution/tasks/{task_id}")
 def model_strategy_evolution_task(task_id: int) -> dict:
     task = get_evolution_task(task_id)
@@ -696,6 +711,14 @@ def model_strategy_create_evolution_task(req: EvolutionTaskRequest) -> dict:
         dedupe_key=f"strategy_evolution_cycle:{datetime.now().date().isoformat()}",
         force=req.force,
     )
+
+
+@router.post("/model-strategy/evolution/strategy-controller-candidates/{version_id}/oos")
+def model_strategy_create_controller_oos_task(version_id: int, req: StrategyControllerOOSTaskRequest) -> dict:
+    try:
+        return create_strategy_controller_oos_task(version_id, max_windows=req.max_windows, force=req.force)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.post("/model-strategy/evolution/tasks/{task_id}/cancel")

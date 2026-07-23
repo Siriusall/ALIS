@@ -172,6 +172,8 @@ TUSHARE_CATALOG: list[TushareCatalogItem] = [
     TushareCatalogItem("index_weight", "指数", "指数权重", "沪深300/中证指数成分与权重", "monthly", "index_code,con_code,trade_date,weight", {"index_code": ""}),
     TushareCatalogItem("cn_gdp", "宏观", "国内生产总值", "经济周期与增长判断", "quarterly", "quarter,gdp,gdp_yoy,pi,pi_yoy,si,si_yoy,ti,ti_yoy", {}),
     TushareCatalogItem("cn_cpi", "宏观", "居民消费价格指数", "通胀与政策环境判断", "monthly", "month,nt_val,nt_yoy,nt_mom,nt_accu,town_val,town_yoy,cnt_val,cnt_yoy", {}),
+    TushareCatalogItem("cn_ppi", "宏观", "工业生产者出厂价格指数", "行业产品价格与成本的宏观代理；字段按上游实际响应留痕", "monthly", "", {}),
+    TushareCatalogItem("cn_m", "宏观", "货币供应量", "工业景气与流动性辅助；字段按上游实际响应留痕", "monthly", "", {}),
     TushareCatalogItem("cn_pmi", "宏观", "采购经理指数", "制造业与非制造业景气判断", "monthly", "MONTH,PMI010000,PMI020100,PMI030000", {}),
     TushareCatalogItem("shibor", "宏观", "上海银行间同业拆放利率", "流动性和利率环境", "daily", "date,on,1w,2w,1m,3m,6m,9m,1y", {}),
     TushareCatalogItem("fx_daily", "宏观", "美元离岸人民币", "汇率与外围风险", "daily", "ts_code,trade_date,bid_open,bid_close,bid_high,bid_low,ask_open,ask_close,ask_high,ask_low", {"ts_code": "USDCNH.FXCM"}),
@@ -323,6 +325,7 @@ def ensure_data_center_seeded() -> dict[str, Any]:
             (SOURCE_TUSHARE, "TuShare Pro", "api", 10, "active", "A股行情、财务、股东、分红、指数等结构化数据主通道", now, now),
             (SOURCE_CNINFO, "巨潮资讯", "crawler", 20, "active", "A股公告元数据、公告正文和附件主通道", now, now),
             (SOURCE_EXCHANGE_PCF, "沪深交易所 ETF PCF", "exchange_api", 15, "active", "上交所与深交所每日申购赎回篮子官方数据", now, now),
+            ("official_policy", "主管部门公开政策与供给文件", "official_web", 25, "active", "发改委、工信部、能源局、海关和统计局公开目录；保留原文链接与可用时间", now, now),
             (SOURCE_MANUAL, "手工/公开行业指标", "manual", 30, "active", "行业景气指标定义和值的人工维护或脚本导入通道", now, now),
         ):
             if c._is_mysql:
@@ -1115,10 +1118,10 @@ def sync_market_bundle(trade_date: str, *, include_suspend: bool = False, apis: 
     # Suspension/resumption and money flow are core daily inputs, not optional
     # enrichments. Include both in every normal market update so an empty
     # result is also persisted as evidence that the date was checked.
-    requested_apis = list(apis or ["daily", "daily_basic", "stk_limit", "suspend_d", "moneyflow", "moneyflow_hsgt"])
+    requested_apis = list(apis or ["daily", "daily_basic", "stk_limit", "adj_factor", "suspend_d", "moneyflow", "moneyflow_hsgt"])
     if include_suspend and "suspend_d" not in requested_apis:
         requested_apis.append("suspend_d")
-    allowed = {"daily", "daily_basic", "stk_limit", "suspend_d", "moneyflow", "moneyflow_hsgt"}
+    allowed = {"daily", "daily_basic", "stk_limit", "adj_factor", "suspend_d", "moneyflow", "moneyflow_hsgt"}
     requested_apis = [api for api in requested_apis if api in allowed]
     results = []
     for api in requested_apis:

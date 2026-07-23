@@ -806,6 +806,8 @@ CREATE TABLE IF NOT EXISTS factor_evaluations (
 );
 CREATE INDEX IF NOT EXISTS idx_factor_evaluations_factor
 ON factor_evaluations(factor_definition_id, end_date);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_factor_evaluation_window
+ON factor_evaluations(factor_definition_id, start_date, end_date);
 CREATE TABLE IF NOT EXISTS factor_version_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     factor_definition_id INTEGER NOT NULL,
@@ -1076,6 +1078,7 @@ CREATE TABLE IF NOT EXISTS factor_evaluations (
     market_state_json LONGTEXT NOT NULL,
     status VARCHAR(32) NOT NULL,
     created_at VARCHAR(64) NOT NULL,
+    UNIQUE KEY uq_factor_evaluation_window (factor_definition_id, start_date, end_date),
     INDEX idx_factor_evaluations_factor (factor_definition_id, end_date),
     FOREIGN KEY (factor_definition_id) REFERENCES factor_definitions(id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
@@ -1202,6 +1205,20 @@ def init_db() -> None:
                 c.execute(
                     """CREATE UNIQUE INDEX IF NOT EXISTS uq_quant_performance_scope_period
                        ON quant_performance_reports(scope_key,period_type,period)"""
+                )
+                # Factor evaluations are future observations. Retries must not
+                # turn one date pair into multiple samples for a promotion gate.
+                c.execute(
+                    """DELETE FROM factor_evaluations older
+                       USING factor_evaluations newer
+                       WHERE older.factor_definition_id=newer.factor_definition_id
+                         AND older.start_date=newer.start_date
+                         AND older.end_date=newer.end_date
+                         AND older.id<newer.id"""
+                )
+                c.execute(
+                    """CREATE UNIQUE INDEX IF NOT EXISTS uq_factor_evaluation_window
+                       ON factor_evaluations(factor_definition_id,start_date,end_date)"""
                 )
                 c.executescript("""
                 CREATE TABLE IF NOT EXISTS investment_theses (

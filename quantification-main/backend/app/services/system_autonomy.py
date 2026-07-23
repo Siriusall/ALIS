@@ -11,19 +11,50 @@ def _run_step(name: str, fn: Callable[[], dict[str, Any]]) -> dict[str, Any]:
     started = datetime.now().astimezone()
     try:
         result = fn()
-        return {
+        step = {
             "name": name,
             "ok": bool(result.get("ok", True)),
             "duration_seconds": round((datetime.now().astimezone() - started).total_seconds(), 3),
             "result": result,
         }
+        from app.services.autonomous_healing import classify_step_health
+
+        step["health"] = classify_step_health(step)
+        return step
     except Exception as exc:
-        return {
+        step = {
             "name": name,
             "ok": False,
             "duration_seconds": round((datetime.now().astimezone() - started).total_seconds(), 3),
             "error": str(exc)[:2000],
         }
+        from app.services.autonomous_healing import classify_step_health
+
+        step["health"] = classify_step_health(step)
+        return step
+
+
+def _skip_experimental_step(name: str, gate: dict[str, Any]) -> dict[str, Any]:
+    """Record a safe no-op when current data cannot support new research evidence."""
+    step = {
+        "name": name,
+        "ok": True,
+        "duration_seconds": 0.0,
+        "result": {
+            "ok": True,
+            "status": "observing",
+            "reason": "skipped_latest_decision_data_gate",
+            "data_gate": {
+                "status": gate.get("status"),
+                "experiment_ready": bool(gate.get("experiment_ready")),
+                "issues": gate.get("issues") if isinstance(gate.get("issues"), list) else [],
+            },
+        },
+    }
+    from app.services.autonomous_healing import classify_step_health
+
+    step["health"] = classify_step_health(step)
+    return step
 
 
 def _owner_summary(steps: list[dict[str, Any]]) -> dict[str, Any]:
@@ -37,8 +68,19 @@ def _owner_summary(steps: list[dict[str, Any]]) -> dict[str, Any]:
     )
     portfolio = profit.get("portfolio_optimization") if isinstance(profit.get("portfolio_optimization"), dict) else {}
     rebalance = profit.get("rebalance_plan") if isinstance(profit.get("rebalance_plan"), dict) else {}
+    model_monitor = profit.get("model_monitor") if isinstance(profit.get("model_monitor"), dict) else {}
+    degraded_models = [
+        {
+            "model_key": str(item.get("model_key") or ""),
+            "weight_multiplier": item.get("weight_multiplier"),
+            "reason": str(item.get("reason") or ""),
+        }
+        for item in (model_monitor.get("items") or [])
+        if str(item.get("status") or "") == "degraded"
+    ]
     model = ((by_name.get("plan_model_autonomy") or {}).get("result") or {})
     strategy = ((by_name.get("strategy_policy_candidates") or {}).get("result") or {})
+    strategy_maturity = ((by_name.get("strategy_policy_maturity") or {}).get("result") or {})
     cost = ((by_name.get("execution_cost_calibration") or {}).get("result") or {})
     corporate_actions = ((by_name.get("simulation_corporate_actions") or {}).get("result") or {})
     corporate_materialization = (
@@ -47,15 +89,22 @@ def _owner_summary(steps: list[dict[str, Any]]) -> dict[str, Any]:
     )
     ledger = ((by_name.get("simulation_ledger_audit") or {}).get("result") or {})
     performance_review = ((by_name.get("periodic_performance_review") or {}).get("result") or {})
+    data_quality_governance = ((by_name.get("review_data_quality_governance") or {}).get("result") or {})
+    llm_research = ((by_name.get("llm_research_agent") or {}).get("result") or {})
+    llm_governance = ((by_name.get("llm_research_governance") or {}).get("result") or {})
+    llm_router = ((by_name.get("llm_proposal_router") or {}).get("result") or {})
+    healing = ((by_name.get("autonomous_self_healing") or {}).get("result") or {})
     cost_active = cost.get("active") if isinstance(cost.get("active"), dict) else {}
     hard_data = ((by_name.get("hard_data_gate") or {}).get("result") or {})
+    decision_data = ((by_name.get("decision_data_gate") or {}).get("result") or {})
     optimizer = portfolio.get("optimizer") if isinstance(portfolio.get("optimizer"), dict) else {}
     anomalies = [
         {
             "module": str(step["name"]),
-            "message": str(step.get("error") or "模块返回未通过"),
+            "message": str(step.get("error") or ((step.get("health") or {}).get("reason")) or "模块返回未通过"),
         }
-        for step in steps if not bool(step.get("ok"))
+        for step in steps
+        if str((step.get("health") or {}).get("status") or ("healthy" if step.get("ok") else "failed")) in {"failed", "degraded"}
     ]
     return {
         "schema_version": "alis_owner_daily_summary_v3",
@@ -97,7 +146,12 @@ def _owner_summary(steps: list[dict[str, Any]]) -> dict[str, Any]:
                 "model_auto_promoted": int(model.get("auto_promoted_count") or 0),
                 "model_auto_rejected": int(model.get("auto_rejected_count") or 0),
                 "model_training_started": int(model.get("started_count") or 0),
+                "model_degraded_count": len(degraded_models),
+                "degraded_models": degraded_models,
                 "strategy_candidates_created": int(strategy.get("created_count") or 0),
+                "strategy_learning_candidate_count": int(strategy.get("learning_candidate_count") or 0),
+                "strategy_candidates_re_evaluated": int((strategy_maturity.get("counts") or {}).get("re_evaluated") or 0),
+                "strategy_candidates_ready_for_review": int((strategy_maturity.get("counts") or {}).get("ready_for_review") or 0),
                 "portfolio_method": optimizer.get("selected_method") or optimizer.get("optimizer"),
                 "execution_cost_version": cost_active.get("version"),
                 "execution_cost_status": cost.get("status"),
@@ -106,6 +160,13 @@ def _owner_summary(steps: list[dict[str, Any]]) -> dict[str, Any]:
                     if isinstance(cost.get("metrics"), dict) else 0
                 ),
                 "hard_data_status": hard_data.get("status"),
+                "decision_data_status": decision_data.get("status"),
+                "decision_data_experiment_ready": decision_data.get("experiment_ready"),
+                "decision_data_issue_codes": [
+                    str(item.get("code") or "")
+                    for item in (decision_data.get("issues") or [])
+                    if isinstance(item, dict) and str(item.get("code") or "")
+                ],
                 "corporate_actions_applied": len(corporate_materialization.get("applied") or []),
                 "dividend_cash_applied": round(sum(
                     float(item.get("cash_amount") or 0)
@@ -117,6 +178,15 @@ def _owner_summary(steps: list[dict[str, Any]]) -> dict[str, Any]:
                 "performance_review_status": performance_review.get("status"),
                 "performance_learning_signal_count": int(performance_review.get("learning_signal_count") or 0),
                 "performance_learning_signals": performance_review.get("learning_signals") or [],
+                "data_quality_governance_status": data_quality_governance.get("status"),
+                "data_quality_repair_count": len(((data_quality_governance.get("repair") or {}).get("dates") or [])),
+                "llm_research_status": llm_research.get("status"),
+                "llm_research_proposal_count": int(llm_research.get("proposal_count") or 0),
+                "llm_research_assessed_count": int(llm_governance.get("assessed_count") or 0),
+                "llm_research_routed_count": int(llm_router.get("routed_count") or 0),
+                "self_healing_status": healing.get("status"),
+                "self_healing_action_count": len(healing.get("actions") or []),
+                "self_healing_unresolved_count": len(healing.get("unresolved") or []),
             },
             "anomalies": anomalies,
         },
@@ -130,26 +200,74 @@ def run_system_autonomy_cycle() -> dict[str, Any]:
     from app.services.auto_pipeline import run_daily_maintenance
     from app.services.corporate_actions import run_corporate_action_cycle
     from app.services.execution_cost_calibration import calibrate_execution_cost_model
+    from app.services.factor_platform import run_factor_daily_cycle
     from app.services.plan_model_auto_optimizer import run_auto_optimization_once
     from app.services.performance_reports import run_periodic_performance_review
+    from app.services.review_data_quality_governance import run_review_data_quality_governance
+    from app.services.research_data_assets import audit_research_data_assets
+    from app.services.theme_revenue_exposure import materialize_theme_revenue_exposure
+    from app.services.free_research_data import materialize_cn_ppi_price_proxies, materialize_financial_industry_series, materialize_futures_price_proxies
+    from app.data_platform.services.data_center import sync_tushare_api_raw
+    from app.services.official_policy_data import materialize_official_capacity_utilization, materialize_official_policy_supply, sync_official_policy_documents
+    from app.data_platform.services.data_center import sync_pmi_industry_proxies
+    from app.services.llm_research_agent import run_llm_research_agent
+    from app.services.llm_research_governance import assess_llm_research_proposals
+    from app.services.llm_proposal_router import route_llm_research_proposals
     from app.services.profit_loop import _latest_trade_date, build_profit_loop
     from app.services.simulation_ledger_audit import audit_simulation_ledger
-    from app.services.strategy_controller import run_strategy_policy_auto_optimization
+    from app.services.strategy_controller import advance_waiting_strategy_policy_candidates, run_strategy_policy_auto_optimization
+    from app.services.autonomous_healing import run_autonomous_self_healing
+    from app.services.data_health import assess_latest_decision_data_health
+
+    hard_data_step = _run_step("hard_data_gate", lambda: audit_oos_hard_data(include_dates=False))
+    decision_data_step = _run_step("decision_data_gate", assess_latest_decision_data_health)
+    decision_data = decision_data_step.get("result") if isinstance(decision_data_step.get("result"), dict) else {}
+    experiments_allowed = bool(decision_data.get("experiment_ready")) and str((hard_data_step.get("result") or {}).get("status") or "") == "ready"
+    def experimental_step(name: str, fn: Callable[[], dict[str, Any]]) -> dict[str, Any]:
+        return _run_step(name, fn) if experiments_allowed else _skip_experimental_step(name, decision_data)
 
     steps = [
-        _run_step("hard_data_gate", lambda: audit_oos_hard_data(include_dates=False)),
-        _run_step("plan_model_autonomy", lambda: run_auto_optimization_once(force=False)),
-        _run_step("strategy_policy_candidates", lambda: run_strategy_policy_auto_optimization(force=False)),
+        hard_data_step,
+        decision_data_step,
+        experimental_step("factor_daily_cycle", run_factor_daily_cycle),
+        experimental_step("plan_model_autonomy", lambda: run_auto_optimization_once(force=False)),
+        _run_step("periodic_performance_review", run_periodic_performance_review),
+        _run_step("review_data_quality_governance", run_review_data_quality_governance),
+        experimental_step("strategy_policy_maturity", advance_waiting_strategy_policy_candidates),
+        experimental_step("strategy_policy_candidates", lambda: run_strategy_policy_auto_optimization(force=False)),
         _run_step("execution_cost_calibration", calibrate_execution_cost_model),
         _run_step(
             "simulation_corporate_actions",
             lambda: run_corporate_action_cycle(as_of_date=_latest_trade_date()),
         ),
         _run_step("simulation_ledger_audit", audit_simulation_ledger),
-        _run_step("profit_and_portfolio", build_profit_loop),
-        _run_step("periodic_performance_review", run_periodic_performance_review),
+        experimental_step("profit_and_portfolio", build_profit_loop),
         _run_step("research_maintenance", lambda: run_daily_maintenance(max_candidates=50)),
+        _run_step("free_industry_financials", lambda: materialize_financial_industry_series(max_periods=1)),
+        _run_step("pmi_demand_proxies", sync_pmi_industry_proxies),
+        _run_step("cn_ppi_raw", lambda: sync_tushare_api_raw("cn_ppi")),
+        _run_step("cn_ppi_price_proxies", materialize_cn_ppi_price_proxies),
+        _run_step("official_policy_documents", sync_official_policy_documents),
+        _run_step("official_policy_supply", materialize_official_policy_supply),
+        _run_step("official_capacity_utilization", materialize_official_capacity_utilization),
+        _run_step(
+            "futures_price_proxies",
+            lambda: materialize_futures_price_proxies(start_date=_latest_trade_date(), end_date=_latest_trade_date()),
+        ),
+        _run_step("theme_revenue_exposure", materialize_theme_revenue_exposure),
+        _run_step("research_data_assets", audit_research_data_assets),
+        _run_step("llm_research_agent", run_llm_research_agent),
+        _run_step("llm_research_governance", assess_llm_research_proposals),
+        _run_step("llm_proposal_router", route_llm_research_proposals),
     ]
+    healing_step = _run_step("autonomous_self_healing", lambda: run_autonomous_self_healing(steps))
+    healing_components = ((healing_step.get("result") or {}).get("components") or {})
+    for step in steps:
+        component = healing_components.get(str(step.get("name") or ""))
+        if isinstance(component, dict) and component.get("status") == "recovered":
+            step["ok"] = True
+            step["health"] = component
+    steps.append(healing_step)
     summary = _owner_summary(steps)
     return {
         "ok": all(bool(step.get("ok")) for step in steps),

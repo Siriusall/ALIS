@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 from app.integrations.tushare_client import get_tushare_client
-from app.data_platform.db import _conn
+from app.data_platform.db import _conn, _is_postgres
 
 logger = logging.getLogger("quant.backtest_data_source")
 
@@ -57,6 +57,7 @@ class BacktestDataSource:
 
         self._symbol_file_index: Dict[str, Path] = {}
         self._hist_cache: Dict[str, List[HistBar]] = {}
+        self._hist_cache_through: Dict[str, str] = {}
         self._snapshot_cache: Dict[str, List[SnapshotRow]] = {}
         self._daily_basic_cache: Dict[str, Dict[str, Dict[str, float]]] = {}
         self.data_warnings: List[str] = []
@@ -72,8 +73,14 @@ class BacktestDataSource:
         cutoff = str(cutoff or "").strip()
         if cutoff == self._as_of_time:
             return
+        # A forward replay only gains one newly visible session at each cutoff.
+        # Keep earlier bars: they were read under an earlier (therefore stricter)
+        # cutoff. A backward or unrestricted switch must discard them to avoid
+        # carrying data observed later into an earlier point-in-time replay.
+        if not cutoff or not self._as_of_time or cutoff < self._as_of_time:
+            self._hist_cache.clear()
+            self._hist_cache_through.clear()
         self._as_of_time = cutoff or None
-        self._hist_cache.clear()
         self._snapshot_cache.clear()
         self._daily_basic_cache.clear()
         self._pit_sources.clear()
@@ -210,70 +217,106 @@ class BacktestDataSource:
         return result
 
     def preload_histories(self, symbols: List[str], *, end_date: str | None = None, lookback: int | None = None) -> None:
-        """Batch-load PostgreSQL history to avoid one query per factor row."""
+        """Batch-load only the history not already visible to a forward replay."""
         wanted = []
         for raw in symbols:
             code = str(raw or "").strip().split(".", 1)[0].zfill(6)
-            if not code or code in self._hist_cache:
+            if not code:
                 continue
             suffix = ".SH" if code.startswith(("6", "9")) else ".SZ" if code.startswith(("0", "3")) else ".BJ"
             wanted.append((code, f"{code}{suffix}"))
+        end_ymd = str(end_date or "").replace("-", "")[:8]
+        if len(end_ymd) == 8 and end_ymd.isdigit():
+            wanted = [
+                item for item in wanted
+                if self._hist_cache_through.get(item[0], "") < end_ymd
+            ]
+        else:
+            wanted = [item for item in wanted if item[0] not in self._hist_cache]
         if not wanted:
             return
-        grouped: Dict[str, List[HistBar]] = {code: [] for code, _ in wanted}
-        end_ymd = str(end_date or "").replace("-", "")[:8]
-        date_clause = ""
-        date_params: tuple[str, ...] = ()
+        grouped: Dict[str, List[HistBar]] = {
+            code: list(self._hist_cache.get(code, [])) for code, _ in wanted
+        }
+        known_dates = {
+            code: {bar.date for bar in bars}
+            for code, bars in grouped.items()
+        }
+        query_groups: list[tuple[list[tuple[str, str]], str, tuple[str, ...]]] = []
         if len(end_ymd) == 8 and end_ymd.isdigit():
-            limit_days = max(1, int(lookback or 0) + 5) if lookback else 0
-            start_ymd = ""
-            if limit_days:
-                with _conn() as conn:
-                    row = conn.execute(
-                        """SELECT MIN(trade_date) AS start_date FROM (
-                             SELECT trade_date FROM dc_available_trade_dates
-                             WHERE trade_date<=?
-                             ORDER BY trade_date DESC LIMIT ?
-                           ) d""",
-                        (end_ymd, limit_days),
-                    ).fetchone()
-                start_ymd = str(dict(row).get("start_date") or "") if row else ""
-            if len(start_ymd) == 8 and start_ymd.isdigit():
-                date_clause = " AND trade_date BETWEEN ? AND ?"
-                date_params = (start_ymd, end_ymd)
-            else:
-                date_clause = " AND trade_date<=?"
-                date_params = (end_ymd,)
+            cached = [item for item in wanted if self._hist_cache_through.get(item[0])]
+            fresh = [item for item in wanted if not self._hist_cache_through.get(item[0])]
+            if cached:
+                earliest_cached = min(self._hist_cache_through[code] for code, _ in cached)
+                query_groups.append((cached, " AND trade_date>? AND trade_date<=?", (earliest_cached, end_ymd)))
+            if fresh:
+                limit_days = max(1, int(lookback or 0) + 5) if lookback else 0
+                start_ymd = ""
+                if limit_days:
+                    with _conn() as conn:
+                        row = conn.execute(
+                            """SELECT MIN(trade_date) AS start_date FROM (
+                                 SELECT trade_date FROM dc_available_trade_dates
+                                 WHERE trade_date<=?
+                                 ORDER BY trade_date DESC LIMIT ?
+                               ) d""",
+                            (end_ymd, limit_days),
+                        ).fetchone()
+                    start_ymd = str(dict(row).get("start_date") or "") if row else ""
+                if len(start_ymd) == 8 and start_ymd.isdigit():
+                    query_groups.append((fresh, " AND trade_date BETWEEN ? AND ?", (start_ymd, end_ymd)))
+                else:
+                    query_groups.append((fresh, " AND trade_date<=?", (end_ymd,)))
+        else:
+            query_groups.append((wanted, "", ()))
         try:
-            for offset in range(0, len(wanted), 500):
-                batch = wanted[offset : offset + 500]
-                placeholders = ",".join("?" for _ in batch)
-                with _conn() as conn:
-                    rows = conn.execute(
-                        f"""SELECT s.ts_code,s.trade_date,s.close,s.volume,s.turnover,s.available_time,
-                                   (a.payload_json::jsonb->>'adj_factor')::double precision AS adj_factor
-                            FROM dc_stock_daily_snapshot s
-                            JOIN dc_tushare_raw_records a
-                              ON a.api_name='adj_factor' AND a.trade_date=s.trade_date AND a.ts_code=s.ts_code
-                            WHERE s.ts_code IN ({placeholders}){date_clause.replace('trade_date', 's.trade_date')}{' AND s.available_time<=? AND a.available_time<=?' if self._as_of_time else ''}
-                            ORDER BY s.ts_code,s.trade_date""",
-                        tuple(ts_code for _, ts_code in batch) + date_params + ((self._as_of_time, self._as_of_time) if self._as_of_time else ()),
-                    ).fetchall()
-                self._record_pit_read("snapshot.history", [dict(row) for row in rows])
-                for raw_row in rows:
-                    item = dict(raw_row)
-                    code = str(item.get("ts_code") or "").split(".", 1)[0].zfill(6)
-                    if code in grouped:
-                        adjusted_close = float(item.get("close") or 0) * float(item.get("adj_factor") or 1.0)
-                        grouped[code].append(HistBar(
-                            date=self._fmt_date(str(item.get("trade_date") or "")),
-                            open=adjusted_close, high=adjusted_close,
-                            low=adjusted_close, close=adjusted_close,
-                            volume=float(item.get("volume") or 0), turnover=float(item.get("turnover") or 0),
-                        ))
+            # PostgreSQL accepts the complete A-share universe in one bound
+            # query. SQLite's variable limit remains protected for unit/test
+            # fixtures that explicitly use that dialect.
+            batch_size = 10_000 if _is_postgres() else 500
+            for group, date_clause, date_params in query_groups:
+                for offset in range(0, len(group), batch_size):
+                    batch = group[offset : offset + batch_size]
+                    placeholders = ",".join("?" for _ in batch)
+                    with _conn() as conn:
+                        rows = conn.execute(
+                            f"""WITH snapshot_rows AS MATERIALIZED (
+                                    SELECT ts_code,trade_date,close,volume,turnover,available_time
+                                    FROM dc_stock_daily_snapshot
+                                    WHERE ts_code IN ({placeholders}){date_clause}{' AND available_time<=?' if self._as_of_time else ''}
+                                )
+                                SELECT s.ts_code,s.trade_date,s.close,s.volume,s.turnover,s.available_time,
+                                       (a.payload_json::jsonb->>'adj_factor')::double precision AS adj_factor
+                                FROM snapshot_rows s
+                                JOIN dc_tushare_raw_records a
+                                  ON a.api_name='adj_factor' AND a.trade_date=s.trade_date AND a.ts_code=s.ts_code
+                                {'WHERE a.available_time<=?' if self._as_of_time else ''}
+                                ORDER BY s.ts_code,s.trade_date""",
+                            tuple(ts_code for _, ts_code in batch) + date_params + ((self._as_of_time,) if self._as_of_time else ()) + ((self._as_of_time,) if self._as_of_time else ()),
+                        ).fetchall()
+                    self._record_pit_read("snapshot.history", [dict(row) for row in rows])
+                    for raw_row in rows:
+                        item = dict(raw_row)
+                        code = str(item.get("ts_code") or "").split(".", 1)[0].zfill(6)
+                        if code in grouped:
+                            row_date = self._fmt_date(str(item.get("trade_date") or ""))
+                            if row_date in known_dates[code]:
+                                continue
+                            adjusted_close = float(item.get("close") or 0) * float(item.get("adj_factor") or 1.0)
+                            grouped[code].append(HistBar(
+                                date=row_date,
+                                open=adjusted_close, high=adjusted_close,
+                                low=adjusted_close, close=adjusted_close,
+                                volume=float(item.get("volume") or 0), turnover=float(item.get("turnover") or 0),
+                            ))
+                            known_dates[code].add(row_date)
         except Exception as exc:  # noqa: BLE001
             logger.warning("PostgreSQL backtest history preload failed: %s", str(exc)[:160])
             return
+        for code, bars in grouped.items():
+            bars.sort(key=lambda item: item.date)
+            if bars:
+                self._hist_cache_through[code] = bars[-1].date.replace("-", "")
         self._hist_cache.update(grouped)
 
     def _daily_basic_data_path_json(self, ymd: str) -> Path:
@@ -673,6 +716,7 @@ class BacktestDataSource:
                 ))
             if postgres_bars:
                 self._hist_cache[code] = postgres_bars
+                self._hist_cache_through[code] = postgres_bars[-1].date.replace("-", "")
                 return postgres_bars
         except Exception as exc:  # noqa: BLE001
             logger.warning("PostgreSQL backtest history read failed: %s", str(exc)[:160])

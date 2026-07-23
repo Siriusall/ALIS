@@ -57,12 +57,14 @@ def test_strategy_replay_uses_t_plus_one_and_isolated_ledger(monkeypatch):
         "content": {"score": {"factors": {"momentum_20": 1.0}}, "rebalance": {"freq": "daily", "top_n": 2}, "lookback_days": 30},
     })
 
+    events: list[dict] = []
     result = strategy_replay.run_strategy_replay(
         strategy_id=1,
         start_date="2026-07-01",
         end_date="2026-07-03",
         initial_cash=200_000,
         data_source=FakeReplayDataSource(),
+        progress_callback=events.append,
     )
 
     assert result["schema_version"] == "strategy_replay_v1"
@@ -79,6 +81,9 @@ def test_strategy_replay_uses_t_plus_one_and_isolated_ledger(monkeypatch):
     assert result["decisions"][0]["data_cutoff"] == "2026-07-01T15:00:00"
     assert result["data_quality"]["point_in_time"]["passed"] is True
     assert result["data_quality"]["point_in_time"]["audits"][0]["decision_cutoff"] == "2026-07-01T15:00:00"
+    assert events[0]["completed_days"] == 0
+    assert events[-1]["completed_days"] == 3
+    assert events[-1]["progress"] == 1.0
 
 
 def test_strategy_replay_rejects_single_day_range(monkeypatch):

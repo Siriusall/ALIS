@@ -28,6 +28,10 @@ def test_strategy_lab_exposes_persisted_formal_oos(monkeypatch):
             "valid_windows": 5,
             "aggregate_cost_after_return": .0258,
             "window_returns": [-.08, .01],
+            "failure_attribution": {
+                "status": "complete", "primary_cause": "transaction_costs", "confidence": "high",
+                "evidence": {"fee_burden_return": .03}, "limitations": ["industry data unavailable"],
+            },
         }},
         "validation": {
             "status": "formal_oos_failed",
@@ -42,5 +46,6 @@ def test_strategy_lab_exposes_persisted_formal_oos(monkeypatch):
     assert result["challengers"][0]["strategy_id"] == 2
     assert result["challengers"][0]["formal_oos"]["valid_windows"] == 5
     assert result["challengers"][0]["formal_oos"]["windows"][0]["return"] == -.08
+    assert result["challengers"][0]["formal_oos"]["failure_attribution"]["primary_cause"] == "transaction_costs"
     assert result["challengers"][0]["production_eligible"] is False
     assert result["baselines"] == []

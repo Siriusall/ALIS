@@ -20,6 +20,10 @@ from app.db.store import (
 
 
 EXECUTION_COST_MODEL_KEY = "execution_cost_model_v1"
+MINIMUM_CANDIDATE_OPERATIONS = 20
+MINIMUM_CANDIDATE_OPERATIONS_PER_SIDE = 8
+MINIMUM_ACTIVATION_OPERATIONS = 50
+MINIMUM_ACTIVATION_OPERATIONS_PER_SIDE = 15
 FALLBACK_COSTS = {
     "buy_rate": 0.0015,
     "sell_rate": 0.0025,
@@ -80,6 +84,25 @@ def _calibration_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _sample_gate(metrics: dict[str, Any]) -> dict[str, bool]:
+    """A side-specific estimator is not trustworthy without both trade sides."""
+    total = int(metrics.get("operation_count") or 0)
+    buy = int(metrics.get("buy_count") or 0)
+    sell = int(metrics.get("sell_count") or 0)
+    return {
+        "minimum_20_operations": total >= MINIMUM_CANDIDATE_OPERATIONS,
+        "minimum_8_operations_per_side": (
+            buy >= MINIMUM_CANDIDATE_OPERATIONS_PER_SIDE
+            and sell >= MINIMUM_CANDIDATE_OPERATIONS_PER_SIDE
+        ),
+        "automatic_activation_50_operations": total >= MINIMUM_ACTIVATION_OPERATIONS,
+        "automatic_activation_15_operations_per_side": (
+            buy >= MINIMUM_ACTIVATION_OPERATIONS_PER_SIDE
+            and sell >= MINIMUM_ACTIVATION_OPERATIONS_PER_SIDE
+        ),
+    }
+
+
 def active_execution_cost_contract() -> dict[str, Any]:
     active = get_active_model_version(EXECUTION_COST_MODEL_KEY)
     config = (active or {}).get("config") if isinstance((active or {}).get("config"), dict) else {}
@@ -115,11 +138,21 @@ def calibrate_execution_cost_model(*, limit: int = 500) -> dict[str, Any]:
             ).fetchall()
         ]
     metrics = _calibration_metrics(rows)
-    if int(metrics["operation_count"]) < 20:
+    sample_gate = _sample_gate(metrics)
+    candidate_ready = (
+        sample_gate["minimum_20_operations"]
+        and sample_gate["minimum_8_operations_per_side"]
+    )
+    if not candidate_ready:
         return {
             "ok": True,
-            "status": "insufficient_observations",
-            "minimum_operations": 20,
+            "status": (
+                "insufficient_observations"
+                if not sample_gate["minimum_20_operations"] else "insufficient_side_coverage"
+            ),
+            "minimum_operations": MINIMUM_CANDIDATE_OPERATIONS,
+            "minimum_operations_per_side": MINIMUM_CANDIDATE_OPERATIONS_PER_SIDE,
+            "gates": sample_gate,
             "metrics": metrics,
             "active": active_execution_cost_contract(),
         }
@@ -137,11 +170,17 @@ def calibrate_execution_cost_model(*, limit: int = 500) -> dict[str, Any]:
     now = datetime.now().astimezone()
     version = f"execution-cost-{now.strftime('%Y%m%d%H%M%S')}-{signature[:6]}"
     validation = {
-        "status": "passed" if int(metrics["operation_count"]) >= 50 else "observing",
-        "production_eligible": int(metrics["operation_count"]) >= 50,
+        "status": (
+            "passed"
+            if sample_gate["automatic_activation_50_operations"]
+            and sample_gate["automatic_activation_15_operations_per_side"] else "observing"
+        ),
+        "production_eligible": (
+            sample_gate["automatic_activation_50_operations"]
+            and sample_gate["automatic_activation_15_operations_per_side"]
+        ),
         "gates": {
-            "minimum_20_operations": int(metrics["operation_count"]) >= 20,
-            "automatic_activation_50_operations": int(metrics["operation_count"]) >= 50,
+            **sample_gate,
             "bounded_rate": (
                 0.0003 <= float(metrics["buy_rate"]) <= 0.02
                 and 0.0003 <= float(metrics["sell_rate"]) <= 0.02
@@ -178,7 +217,7 @@ def calibrate_execution_cost_model(*, limit: int = 500) -> dict[str, Any]:
                 "status": "passed",
                 "auto_governance": {
                     "decision": "promoted",
-                    "rule": "50_operation_bounded_simulation_cost_gate_v1",
+                    "rule": "50_operation_15_per_side_bounded_simulation_cost_gate_v2",
                     "at": now.isoformat(),
                 },
             },

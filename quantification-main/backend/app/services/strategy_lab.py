@@ -59,6 +59,8 @@ def _challenger_card(version: dict[str, Any]) -> dict[str, Any]:
     )
     quick = (version.get("metrics") or {}).get("quick_diagnostic")
     quick = quick if isinstance(quick, dict) else {}
+    failure_attribution = formal.get("failure_attribution")
+    failure_attribution = failure_attribution if isinstance(failure_attribution, dict) else {}
     return {
         "model_version_id": int(version["id"]),
         "strategy_id": strategy_id,
@@ -94,6 +96,13 @@ def _challenger_card(version: dict[str, Any]) -> dict[str, Any]:
                 {"window": index + 1, "return": _number(value)}
                 for index, value in enumerate(window_returns)
             ],
+            "failure_attribution": {
+                "status": str(failure_attribution.get("status") or "pending"),
+                "primary_cause": str(failure_attribution.get("primary_cause") or "unknown"),
+                "confidence": str(failure_attribution.get("confidence") or "low"),
+                "evidence": failure_attribution.get("evidence") if isinstance(failure_attribution.get("evidence"), dict) else {},
+                "limitations": failure_attribution.get("limitations") if isinstance(failure_attribution.get("limitations"), list) else [],
+            },
         },
         "passed_gates": validation.get("passed_gates") if isinstance(validation.get("passed_gates"), list) else [],
         "blocking_reasons": validation.get("blocking_reasons") if isinstance(validation.get("blocking_reasons"), list) else [],

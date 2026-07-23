@@ -1,4 +1,4 @@
-from app.services.system_autonomy import _owner_summary
+from app.services.system_autonomy import _owner_summary, _skip_experimental_step
 
 
 def test_owner_summary_uses_current_profit_and_autonomy_contracts():
@@ -10,6 +10,15 @@ def test_owner_summary_uses_current_profit_and_autonomy_contracts():
                 "result": {"status": "ready"},
             },
             {
+                "name": "decision_data_gate",
+                "ok": True,
+                "result": {
+                    "status": "degraded",
+                    "experiment_ready": False,
+                    "issues": [{"code": "latest_adj_factor_not_ready"}],
+                },
+            },
+            {
                 "name": "plan_model_autonomy",
                 "ok": True,
                 "result": {
@@ -19,9 +28,9 @@ def test_owner_summary_uses_current_profit_and_autonomy_contracts():
                 },
             },
             {
-                "name": "strategy_policy_candidates",
-                "ok": True,
-                "result": {"created_count": 4},
+                    "name": "strategy_policy_candidates",
+                    "ok": True,
+                    "result": {"created_count": 4, "learning_candidate_count": 2},
             },
             {
                 "name": "execution_cost_calibration",
@@ -69,6 +78,17 @@ def test_owner_summary_uses_current_profit_and_autonomy_contracts():
                         },
                     },
                     "rebalance_plan": {"status": "planned", "trade_date": "20260723"},
+                    "model_monitor": {
+                        "items": [
+                            {
+                                "model_key": "capital_persistence_multitask_v1",
+                                "status": "degraded",
+                                "weight_multiplier": 0.55,
+                                "reason": "live_ic_below_threshold",
+                            },
+                            {"model_key": "leader_lambdarank_v1", "status": "production"},
+                        ]
+                    },
                     },
                 },
                 {
@@ -83,6 +103,19 @@ def test_owner_summary_uses_current_profit_and_autonomy_contracts():
                         ],
                     },
                 },
+                {
+                    "name": "review_data_quality_governance",
+                    "ok": True,
+                    "result": {
+                        "status": "audited_no_actionable_hard_gap",
+                        "repair": {"dates": []},
+                    },
+                },
+                {
+                    "name": "strategy_policy_maturity",
+                    "ok": True,
+                    "result": {"counts": {"re_evaluated": 3, "ready_for_review": 1}},
+                },
             ]
         )
 
@@ -95,11 +128,37 @@ def test_owner_summary_uses_current_profit_and_autonomy_contracts():
     assert summary["questions"]["profit"]["benchmark_period_start"] == "20260717"
     changes = summary["questions"]["system_changes"]
     assert changes["strategy_candidates_created"] == 4
+    assert changes["strategy_learning_candidate_count"] == 2
     assert changes["portfolio_method"] == "hrp"
     assert changes["execution_cost_version"] == "builtin"
     assert changes["execution_cost_observations"] == 16
     assert changes["hard_data_status"] == "ready"
+    assert changes["decision_data_status"] == "degraded"
+    assert changes["decision_data_experiment_ready"] is False
+    assert changes["decision_data_issue_codes"] == ["latest_adj_factor_not_ready"]
     assert changes["corporate_actions_applied"] == 2
     assert changes["dividend_cash_applied"] == 123.45
     assert changes["performance_review_status"] == "attention"
     assert changes["performance_learning_signal_count"] == 2
+    assert changes["data_quality_governance_status"] == "audited_no_actionable_hard_gap"
+    assert changes["data_quality_repair_count"] == 0
+    assert changes["strategy_candidates_re_evaluated"] == 3
+    assert changes["strategy_candidates_ready_for_review"] == 1
+    assert changes["model_degraded_count"] == 1
+    assert changes["degraded_models"] == [{
+        "model_key": "capital_persistence_multitask_v1",
+        "weight_multiplier": 0.55,
+        "reason": "live_ic_below_threshold",
+    }]
+
+
+def test_data_gate_skip_keeps_research_mutation_out_of_the_cycle():
+    step = _skip_experimental_step("strategy_policy_candidates", {
+        "status": "degraded",
+        "experiment_ready": False,
+        "issues": [{"code": "latest_adj_factor_not_ready"}],
+    })
+
+    assert step["ok"] is True
+    assert step["health"]["status"] == "observing"
+    assert step["result"]["reason"] == "skipped_latest_decision_data_gate"

@@ -216,6 +216,12 @@ def training_feedback_rows(horizon: int) -> list[dict[str, Any]]:
 
 
 def model_feedback_gate(model_version: str, *, strict_version: bool = False) -> dict[str, Any]:
+    """Gate model changes on observed outcomes, never on operator availability.
+
+    Human reviews remain useful diagnostic evidence, but a simulation-only
+    autonomous system must be able to validate and degrade itself from frozen
+    20-session outcomes when nobody supplies a label.
+    """
     _ensure_tables()
     with _conn() as c:
         rows = [dict(row) for row in c.execute(
@@ -232,14 +238,20 @@ def model_feedback_gate(model_version: str, *, strict_version: bool = False) -> 
     accuracy = sum(float(row["label"]) * float(row["sample_weight"]) for row in rows) / weighted if weighted else None
     human = [row for row in rows if row.get("source") == "human_review"]
     mature = [row for row in rows if row.get("source") == "outcome_20d"]
+    mature_weight = sum(float(row["sample_weight"]) for row in mature)
+    mature_accuracy = (sum(float(row["label"]) * float(row["sample_weight"]) for row in mature) / mature_weight) if mature_weight else None
     severe = sum(str(row.get("error_type") or "") in {"数据质量","模型失效","风险执行","交易执行"} for row in human)
     severe_rate = severe / len(human) if human else None
-    gates = {"minimum_human_reviews": len(human) >= 3, "minimum_20d_outcomes": len(mature) >= 5,
-        "review_accuracy": accuracy is not None and accuracy >= 0.45,
-        "severe_error_rate": severe_rate is not None and severe_rate <= 0.35}
-    should_degrade = len(human) >= 5 and len(mature) >= 10 and ((accuracy is not None and accuracy < 0.35) or (severe_rate is not None and severe_rate > 0.5))
+    gates = {
+        "minimum_20d_outcomes": len(mature) >= 5,
+        "outcome_accuracy": mature_accuracy is not None and mature_accuracy >= 0.45,
+    }
+    should_degrade = len(mature) >= 10 and (
+        (mature_accuracy is not None and mature_accuracy < 0.35)
+        or (len(human) >= 5 and severe_rate is not None and severe_rate > 0.5)
+    )
     return {"model_version": model_version, "scope": scope, "samples": total, "human_reviews": len(human), "mature_20d_outcomes": len(mature), "weighted_accuracy": accuracy,
-        "severe_error_rate": severe_rate, "gates": gates, "passed": all(gates.values()),
+        "outcome_accuracy": mature_accuracy, "severe_error_rate": severe_rate, "gates": gates, "passed": all(gates.values()),
         "should_degrade": should_degrade, "blocked_reasons": [key for key,value in gates.items() if not value]}
 
 

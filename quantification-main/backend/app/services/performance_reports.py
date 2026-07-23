@@ -242,6 +242,42 @@ def run_periodic_performance_review() -> dict[str, Any]:
     }
 
 
+def latest_performance_learning_context() -> dict[str, Any]:
+    """Return the newest durable periodic-review evidence for governance.
+
+    The result is deliberately descriptive: downstream modules must turn it
+    into a separately validated candidate, never mutate production directly.
+    """
+    with business_conn() as conn:
+        row = conn.execute(
+            """SELECT period,payload_json,created_at FROM quant_performance_reports
+               WHERE scope_key='global' AND period_type='monthly'
+               ORDER BY period DESC,id DESC LIMIT 1"""
+        ).fetchone()
+    if not row:
+        return {
+            "available": False,
+            "reason": "no_monthly_performance_report",
+            "learning_signals": [],
+            "error_breakdown": {},
+        }
+    item = dict(row)
+    try:
+        payload = json.loads(item.get("payload_json") or "{}")
+    except (TypeError, json.JSONDecodeError):
+        payload = {}
+    return {
+        "available": True,
+        "period": str(item.get("period") or ""),
+        "created_at": str(item.get("created_at") or ""),
+        "schema_version": str(payload.get("schema_version") or ""),
+        "learning_status": str(payload.get("learning_status") or "unknown"),
+        "learning_signals": list(payload.get("learning_signals") or []),
+        "error_breakdown": dict(payload.get("error_breakdown") or {}),
+        "benchmark_coverage": dict(payload.get("benchmark_coverage") or {}),
+    }
+
+
 def _normalize_payload(period_type: str, payload: dict[str, Any]) -> dict[str, Any]:
     row = dict(payload or {})
     total_cost = row.get("total_cost", row.get("transaction_cost", row.get("cost", 0.0)))

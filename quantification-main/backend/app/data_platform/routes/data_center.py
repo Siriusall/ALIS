@@ -17,6 +17,7 @@ from app.data_platform.services.data_center import (
     financial_research_completeness,
     get_data_center_status,
     import_industry_metrics,
+    sync_pmi_industry_proxies,
     list_failed_tushare_requests,
     resume_failed_tushare_requests,
     run_data_quality_checks,
@@ -57,6 +58,9 @@ from app.data_platform.services.backfill import build_backfill_plan, get_backfil
 from app.data_platform.services.cold_archive import archive_raw_records, cold_archive_status
 from app.data_platform.services.stream_admin import bulk_handle_stream_messages, handle_stream_message, stream_admin_status
 from app.services.theme_engine import materialize_theme_snapshot_history
+from app.services.free_research_data import materialize_cn_ppi_price_proxies, materialize_financial_industry_series, materialize_futures_price_proxies
+from app.services.official_policy_data import materialize_official_capacity_utilization, materialize_official_policy_supply, sync_official_policy_documents
+from app.services.announcement_label_benchmark import import_announcement_labels
 from app.data_platform.services.exchange_etf_pcf import backfill_exchange_etf_pcf, sync_exchange_etf_pcf
 from app.data_platform.services.oos_hard_data import audit_oos_hard_data
 
@@ -658,6 +662,91 @@ def data_center_import_industry_metrics(path: str = Query(..., description="Loca
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail={"code": "industry_metric_import_failed", "message": str(exc)[:500]},
+        ) from exc
+
+
+@router.post("/data-center/import/announcement-labels")
+def data_center_import_announcement_labels(path: str = Query(..., description="Local JSON/CSV path.")) -> dict[str, Any]:
+    """Import manually reviewed announcement labels for extraction-quality acceptance."""
+
+    try:
+        return import_announcement_labels(path)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": "announcement_label_import_failed", "message": str(exc)[:500]},
+        ) from exc
+
+
+@router.post("/data-center/materialize/free-industry-financials")
+def data_center_materialize_free_industry_financials(max_periods: int = Query(default=12, ge=1, le=32)) -> dict[str, Any]:
+    """Materialise point-in-time industry demand, inventory, profit and valuation proxies from retained facts."""
+
+    try:
+        return materialize_financial_industry_series(max_periods=max_periods)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail={"code": "free_industry_financials_failed", "message": str(exc)[:500]},
+        ) from exc
+
+
+@router.post("/data-center/materialize/pmi-demand-proxies")
+def data_center_materialize_pmi_demand_proxies() -> dict[str, Any]:
+    """Materialise retained PMI as a clearly labelled industry demand proxy."""
+
+    try:
+        return sync_pmi_industry_proxies()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail={"code": "pmi_demand_proxies_failed", "message": str(exc)[:500]},
+        ) from exc
+
+
+@router.post("/data-center/sync/official-policy-documents")
+def data_center_sync_official_policy_documents() -> dict[str, Any]:
+    """Retain public policy/supply documents from configured official indexes."""
+
+    return sync_official_policy_documents()
+
+
+@router.post("/data-center/materialize/official-policy-supply")
+def data_center_materialize_official_policy_supply() -> dict[str, Any]:
+    """Materialise retained official documents as transparent policy/supply events."""
+
+    return materialize_official_policy_supply()
+
+
+@router.post("/data-center/materialize/official-capacity-utilization")
+def data_center_materialize_official_capacity_utilization() -> dict[str, Any]:
+    """Materialise retained NBS releases as a clearly labelled capacity proxy."""
+
+    return materialize_official_capacity_utilization()
+
+
+@router.post("/data-center/materialize/cn-ppi-price-proxies")
+def data_center_materialize_cn_ppi_price_proxies() -> dict[str, Any]:
+    """Materialise retained Chinese PPI components as transparent industry price proxies."""
+
+    return materialize_cn_ppi_price_proxies()
+
+
+@router.post("/data-center/materialize/futures-price-proxies")
+def data_center_materialize_futures_price_proxies(
+    start_date: str = Query(..., min_length=8, max_length=8),
+    end_date: str = Query(..., min_length=8, max_length=8),
+) -> dict[str, Any]:
+    """Materialise exchange futures price proxies without claiming they are spot-price feeds."""
+
+    if start_date > end_date:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail={"code": "invalid_date_range", "message": "start_date must be before end_date"})
+    try:
+        return materialize_futures_price_proxies(start_date=start_date, end_date=end_date)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail={"code": "futures_price_proxies_failed", "message": str(exc)[:500]},
         ) from exc
 
 

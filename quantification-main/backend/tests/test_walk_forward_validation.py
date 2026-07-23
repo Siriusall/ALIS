@@ -18,6 +18,50 @@ class FakeDates:
         return self.dates
 
 
+def test_failure_attribution_measures_cash_drag_and_blocked_order_codes():
+    replay = {
+        "initial_cash": 100,
+        "metrics": {"excess_return": -.11, "turnover_rate": .25},
+        "summary": {"total_fees": 1, "trade_count": 3, "decision_count": 2},
+        "equity_series": [
+            {"date": "2026-01-01", "total_value": 100, "cash": 50, "stock_value": 50},
+            {"date": "2026-01-02", "total_value": 105, "cash": 50, "stock_value": 55},
+            {"date": "2026-01-03", "total_value": 110, "cash": 40, "stock_value": 70},
+        ],
+        "benchmark_series": [
+            {"date": "2026-01-01", "total_value": 100},
+            {"date": "2026-01-02", "total_value": 110},
+            {"date": "2026-01-03", "total_value": 121},
+        ],
+        "blocked_events": [
+            {"code": "limit_up"}, {"code": "limit_up"}, {"code": "insufficient_cash"},
+        ],
+    }
+
+    result = wf._failure_attribution(replay, {"2026-01-02": "S0", "2026-01-03": "S0"})
+
+    assert result["status"] == "complete"
+    assert result["primary_cause"] == "market_exposure"
+    assert result["evidence"]["average_cash_weight"] == 0.48809524
+    assert result["evidence"]["estimated_cash_drag_return"] == 0.09761905
+    assert result["evidence"]["blocked_by_code"] == {"insufficient_cash": 1, "limit_up": 2}
+
+
+def test_failure_attribution_keeps_unknown_when_benchmark_path_is_missing():
+    result = wf._failure_attribution({
+        "metrics": {"excess_return": -.08},
+        "summary": {"decision_count": 1},
+        "equity_series": [
+            {"date": "2026-01-01", "total_value": 100, "cash": 20},
+            {"date": "2026-01-02", "total_value": 92, "cash": 20},
+        ],
+    }, {})
+
+    assert result["status"] == "partial"
+    assert result["primary_cause"] == "unknown"
+    assert any("基准净值" in item for item in result["limitations"])
+
+
 def test_window_builder_enforces_purge_and_embargo_boundaries():
     dates = _dates(80)
     config = wf.WalkForwardConfig(train_sessions=20, validation_sessions=10, test_sessions=10, purge_sessions=3, embargo_sessions=2, step_sessions=10, minimum_windows=3)
@@ -78,6 +122,32 @@ def test_preview_identifies_explicit_challenger(monkeypatch):
     )
     assert result["evaluated_strategy_id"] == 2
     assert result["evaluation_role"] == "challenger"
+
+
+def test_walk_forward_forwards_controller_candidate_without_rebinding_champion(monkeypatch):
+    dates = _dates(90)
+    monkeypatch.setattr(wf, "resolve_production_strategy_champion", lambda: {
+        "champion_id": 42, "champion_version": "champion-v1", "strategy_controller_version": "controller-v1", "strategy_id": 1,
+    })
+    seen: list[int | None] = []
+
+    def replay_runner(**kwargs):
+        seen.append(kwargs.get("strategy_controller_version_id"))
+        test_dates = [value for value in dates if kwargs["start_date"] <= value <= kwargs["end_date"]]
+        return {
+            "production_strategy_version": "champion-v1", "metrics": {"total_return": .01, "benchmark_return": 0, "excess_return": .01, "max_drawdown": -.01},
+            "summary": {"total_fees": 1, "trading_days": len(test_dates), "decision_count": 1},
+            "equity_series": [{"date": value, "total_value": 100_000 + index} for index, value in enumerate(test_dates)],
+            "data_quality": {"point_in_time": {"passed": True}},
+        }
+
+    result = wf.run_purged_walk_forward_validation(
+        config=wf.WalkForwardConfig(train_sessions=20, validation_sessions=5, test_sessions=8, purge_sessions=2, embargo_sessions=1, step_sessions=8, minimum_windows=2),
+        max_windows=2, data_source=FakeDates(dates), replay_runner=replay_runner,
+        state_loader=lambda values: {}, strategy_controller_version_id=55,
+    )
+    assert seen == [55, 55]
+    assert result["production_strategy_version"] == "champion-v1"
 
 
 def test_walk_forward_emits_window_progress_and_resumes_checkpoint(monkeypatch):

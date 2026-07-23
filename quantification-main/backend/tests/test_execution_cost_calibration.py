@@ -1,4 +1,4 @@
-from app.services.execution_cost_calibration import _calibration_metrics
+from app.services.execution_cost_calibration import _calibration_metrics, _sample_gate
 
 
 def test_execution_cost_calibration_uses_side_specific_conservative_percentile():
@@ -20,3 +20,17 @@ def test_execution_cost_calibration_uses_side_specific_conservative_percentile()
     assert metrics["round_trip_rate"] == round(
         metrics["buy_rate"] + metrics["sell_rate"], 8
     )
+
+
+def test_execution_cost_candidate_and_activation_require_balanced_buy_sell_samples():
+    unbalanced = _sample_gate({"operation_count": 25, "buy_count": 20, "sell_count": 5})
+    assert unbalanced["minimum_20_operations"] is True
+    assert unbalanced["minimum_8_operations_per_side"] is False
+    assert unbalanced["automatic_activation_50_operations"] is False
+
+    candidate = _sample_gate({"operation_count": 22, "buy_count": 12, "sell_count": 10})
+    assert candidate["minimum_8_operations_per_side"] is True
+    assert candidate["automatic_activation_50_operations"] is False
+
+    active = _sample_gate({"operation_count": 50, "buy_count": 30, "sell_count": 20})
+    assert all(active.values())

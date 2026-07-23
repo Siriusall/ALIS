@@ -29,6 +29,7 @@ const BackendLogsPage = lazy(() => import("../components/BackendLogsPage"));
 const CandidatePoolPage = lazy(() => import("../components/CandidatePoolPage"));
 const StrategyLabPage = lazy(() => import("../components/StrategyLabPage"));
 const FactorLabPage = lazy(() => import("../components/FactorLabPage"));
+const AutonomyCenterPage = lazy(() => import("../components/AutonomyCenterPage"));
 
 export default function DashboardPage() {
   const { user, logout } = useAuth();
@@ -42,6 +43,7 @@ export default function DashboardPage() {
 
   const setCurrentSection = useCallback((next: SectionId) => navigate(`/app/${next}`), [navigate]);
   const sections = useMemo(() => ({
+    autonomy: <AutonomyCenterPage onNavigate={setCurrentSection} />,
     market: <InvestorDashboardPage focus="returns" />,
     research: <ResearchWorkbenchPage onNavigate={setCurrentSection} />,
     dataCenter: <DataCenterPage />,

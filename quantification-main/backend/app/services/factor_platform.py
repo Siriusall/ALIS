@@ -34,6 +34,9 @@ PRODUCTION_FACTOR_SPECS: tuple[dict[str, Any], ...] = (
     {"key": "earnings_yield", "name_cn": "盈利收益率", "category": "基本面", "formula": "1/pe_ttm", "inputs": ["daily_basic.pe_ttm"], "direction": 1, "window": 1},
     {"key": "book_to_price", "name_cn": "账面市值比", "category": "基本面", "formula": "1/pb", "inputs": ["daily_basic.pb"], "direction": 1, "window": 1},
     {"key": "volume_ratio_5", "name_cn": "5日量比", "category": "量价", "formula": "volume_t/mean(volume_5)", "inputs": ["daily.vol"], "direction": 1, "window": 5},
+    {"key": "industry_demand_proxy", "name_cn": "行业需求扩散代理", "category": "行业景气", "formula": "industry.demand_orders_sales", "inputs": ["dc_industry_metric_value.demand_orders_sales"], "direction": 1, "window": 1},
+    {"key": "industry_inventory_proxy", "name_cn": "行业库存周期代理", "category": "行业景气", "formula": "industry.inventory_cycle", "inputs": ["dc_industry_metric_value.inventory_cycle"], "direction": 1, "window": 1},
+    {"key": "industry_ppi_yoy_proxy", "name_cn": "行业工业PPI代理", "category": "行业景气", "formula": "industry.cn_ppi_yoy", "inputs": ["dc_industry_metric_value.tushare.cn_ppi_proxy"], "direction": 1, "window": 1},
     {"key": "is_st", "name_cn": "是否ST", "category": "交易约束", "formula": "name_st_flag", "inputs": ["stock_basic.name"], "direction": -1, "window": 1},
     {"key": "is_suspended", "name_cn": "是否停牌", "category": "交易约束", "formula": "volume<=0", "inputs": ["daily.vol"], "direction": -1, "window": 1},
     {"key": "is_limit_up", "name_cn": "是否涨停", "category": "交易约束", "formula": "pct_chg>=9.7", "inputs": ["daily.pct_chg"], "direction": -1, "window": 1},
@@ -45,6 +48,12 @@ CORE_ACTIVE_KEYS = {
     "momentum_20", "volatility_20", "volume_ratio_5", "float_mv", "total_mv",
     "pe_ttm", "pb", "is_st", "is_suspended", "is_limit_up", "is_limit_down",
 }
+NON_ALPHA_FACTOR_CATEGORIES = {"交易约束"}
+
+
+def is_factor_governance_eligible(definition: dict[str, Any]) -> bool:
+    """Only predictive factors may enter IC-based promotion or degradation."""
+    return str(definition.get("category") or "") not in NON_ALPHA_FACTOR_CATEGORIES
 
 
 def _safe(value: Any) -> float:
@@ -78,6 +87,7 @@ def compute_registered_factor(
     *,
     benchmark_return: float | None = None,
     benchmark_returns: list[float] | None = None,
+    industry_inputs: dict[str, float] | None = None,
 ) -> float:
     """Single deterministic implementation consumed by selection, training and replay."""
     key = str(factor)
@@ -85,6 +95,8 @@ def compute_registered_factor(
     volumes = [_safe(item.volume) for item in hist]
     current = _safe(row.close)
     db = daily_basic.get(row.symbol, {})
+    if key in {"industry_demand_proxy", "industry_inventory_proxy", "industry_ppi_yoy_proxy"}:
+        return _safe((industry_inputs or {}).get(key))
     if key == "volume":
         return _safe(row.volume)
     if key == "turnover":
@@ -166,7 +178,7 @@ def ensure_factor_registry() -> list[dict[str, Any]]:
                 initial_status, str(spec["name_cn"]), str(spec["category"]),
                 json.dumps({"expression": spec["formula"], "engine": FACTOR_SCHEMA_VERSION}, ensure_ascii=False),
                 json.dumps(spec["inputs"], ensure_ascii=False), int(spec["direction"]),
-                int(spec["window"]), "T_close_available_by_T_15_00",
+                int(spec["window"]), "data_platform_available_by_T_15_00" if str(spec["key"]).startswith("industry_") else "T_close_available_by_T_15_00",
                 "cross_section_median_then_zero_if_unavailable", "passed", now,
             )
             if existing:
@@ -223,6 +235,8 @@ def factor_registry_status() -> dict[str, Any]:
         "schema_version": FACTOR_SCHEMA_VERSION,
         "active_count": sum(str(item.get("status") or "") == "active" for item in definitions),
         "candidate_count": sum(str(item.get("status") or "") == "candidate" for item in definitions),
+        "governance_eligible_count": sum(is_factor_governance_eligible(item) for item in definitions),
+        "constraint_factor_count": sum(not is_factor_governance_eligible(item) for item in definitions),
         "latest_materialized_date": str(dict(value_row).get("latest_date") or "") if value_row else "",
         "value_count": int(dict(value_row).get("value_count") or 0) if value_row else 0,
         "evaluation_count": int(dict(evaluation_row).get("evaluation_count") or 0) if evaluation_row else 0,
@@ -269,6 +283,81 @@ def _winsorized_zscores(values: dict[str, float], direction: int) -> dict[str, f
     }
 
 
+def _industry_candidate_inputs(symbols: list[str], *, trade_date: str, cutoff: str) -> tuple[dict[str, dict[str, float]], dict[str, dict[str, Any]]]:
+    """Map only point-in-time industry research metrics onto the stock slice.
+
+    This is deliberately separate from the daily market snapshot database.
+    Research values are accepted only when both their observation date and
+    recorded availability precede the decision cutoff.  Missing industries are
+    left absent, then handled by the existing cross-sectional missing policy.
+    """
+    from app.data_platform.db import _conn as data_conn
+
+    date_key = str(trade_date).replace("-", "")[:8]
+    try:
+        with data_conn() as conn:
+            # Factor values store six-digit symbols while the data platform
+            # master stores exchange-qualified codes (e.g. 000001.SZ).
+            # Read the compact master once and normalize at the boundary.
+            master = [dict(row) for row in conn.execute(
+                "SELECT ts_code,industry FROM dc_stock_master WHERE COALESCE(industry,'')<>''"
+            ).fetchall()] if symbols else []
+            rows = [dict(row) for row in conn.execute(
+                """SELECT d.metric_code,d.industry_name,d.metric_name,d.source_code,
+                          v.data_date,v.value,v.available_time
+                     FROM dc_industry_metric_definition d
+                     JOIN dc_industry_metric_value v ON v.metric_code=d.metric_code
+                    WHERE v.available_time<=?
+                      AND REPLACE(v.data_date,'-','')<=?""",
+                (cutoff, date_key),
+            ).fetchall()]
+    except Exception:
+        return {}, {}
+    requested = {str(symbol).split(".", 1)[0] for symbol in symbols}
+    industry_by_symbol = {
+        str(row.get("ts_code") or "").split(".", 1)[0]: str(row.get("industry") or "").strip()
+        for row in master if str(row.get("ts_code") or "").split(".", 1)[0] in requested
+    }
+    latest: dict[tuple[str, str], dict[str, Any]] = {}
+    for row in rows:
+        source = str(row.get("source_code") or "")
+        name = str(row.get("metric_name") or "")
+        if source == "tushare.cn_ppi_proxy":
+            key = "industry_ppi_yoy_proxy"
+        elif "需求" in name or "营收扩散" in name:
+            key = "industry_demand_proxy"
+        elif "库存" in name:
+            key = "industry_inventory_proxy"
+        else:
+            continue
+        try:
+            float(row.get("value"))
+        except (TypeError, ValueError):
+            continue
+        identity = (key, str(row.get("metric_code") or ""))
+        previous = latest.get(identity)
+        if previous is None or (str(row.get("data_date") or ""), str(row.get("available_time") or "")) > (str(previous.get("data_date") or ""), str(previous.get("available_time") or "")):
+            latest[identity] = row
+    by_industry: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for (key, _metric), row in latest.items():
+        by_industry.setdefault((key, str(row.get("industry_name") or "")), []).append(row)
+    values: dict[str, dict[str, float]] = {}
+    evidence: dict[str, dict[str, Any]] = {}
+    for symbol, industry in industry_by_symbol.items():
+        for key in ("industry_demand_proxy", "industry_inventory_proxy", "industry_ppi_yoy_proxy"):
+            selected = by_industry.get((key, industry), [])
+            if not selected:
+                continue
+            numeric = [float(item["value"]) for item in selected]
+            values.setdefault(symbol, {})[key] = sum(numeric) / len(numeric)
+            evidence.setdefault(symbol, {})[key] = {
+                "industry": industry, "metric_codes": [item["metric_code"] for item in selected],
+                "latest_data_date": max(str(item.get("data_date") or "") for item in selected),
+                "latest_available_time": max(str(item.get("available_time") or "") for item in selected),
+            }
+    return values, evidence
+
+
 def materialize_factor_snapshot(
     *,
     trade_date: str,
@@ -289,6 +378,7 @@ def materialize_factor_snapshot(
     benchmark_returns = ds.get_index_returns("000300.SH", date_key, lookback=60)
     benchmark_return = math.prod(1.0 + value for value in benchmark_returns) - 1.0 if benchmark_returns else None
     raw_by_factor: dict[str, dict[str, float]] = {str(item["factor_key"]): {} for item in definitions}
+    industry_inputs, industry_evidence = _industry_candidate_inputs([row.symbol for row in rows], trade_date=date_key, cutoff=cutoff)
     input_hashes: dict[tuple[str, str], str] = {}
     for row in rows:
         hist = ds.get_hist_window(row.symbol, date_key, max_window + 1)
@@ -298,6 +388,7 @@ def materialize_factor_snapshot(
                 key, row, hist, daily_basic,
                 benchmark_return=benchmark_return,
                 benchmark_returns=benchmark_returns,
+                industry_inputs=industry_inputs.get(row.symbol),
             )
             raw_by_factor[key][row.symbol] = raw
             digest = hashlib.sha256(json.dumps({
@@ -310,6 +401,7 @@ def materialize_factor_snapshot(
                 "daily_basic": daily_basic.get(row.symbol, {}),
                 "benchmark_return": benchmark_return,
                 "benchmark_returns": benchmark_returns,
+                "industry_input": industry_evidence.get(row.symbol, {}).get(key),
             }, sort_keys=True, default=str).encode("utf-8")).hexdigest()
             input_hashes[(key, row.symbol)] = digest
     definition_by_key = {str(item["factor_key"]): item for item in definitions}
@@ -410,6 +502,13 @@ def evaluate_materialized_factors(
     now = datetime.now().astimezone().isoformat()
     with _conn() as conn:
         for definition in definitions:
+            if not is_factor_governance_eligible(definition):
+                results.append({
+                    "factor_key": definition["factor_key"],
+                    "definition_id": definition["id"],
+                    "status": "not_applicable_constraint",
+                })
+                continue
             values = conn.execute(
                 """SELECT ts_code,standardized_value FROM factor_values
                    WHERE factor_definition_id=? AND trade_date=?""",
@@ -435,6 +534,13 @@ def evaluate_materialized_factors(
             coverage = len(pairs) / max(1, len(start_rows))
             cost_after = spread - 2 * float(transaction_cost)
             status = "healthy" if coverage >= 0.80 and rank_ic > 0 and cost_after > 0 else "degraded"
+            # Re-running a task must refresh the same future window, never
+            # manufacture additional observations for the 20-window gate.
+            conn.execute(
+                """DELETE FROM factor_evaluations
+                   WHERE factor_definition_id=? AND start_date=? AND end_date=?""",
+                (int(definition["id"]), start_key, end_key),
+            )
             conn.execute(
                 """INSERT INTO factor_evaluations(
                    factor_definition_id,start_date,end_date,sample_count,
@@ -473,6 +579,8 @@ def govern_factor_versions(minimum_evaluations: int = 20) -> dict[str, Any]:
     now = datetime.now().astimezone().isoformat()
     with _conn() as conn:
         for definition in definitions:
+            if not is_factor_governance_eligible(definition):
+                continue
             rows = [
                 dict(row) for row in conn.execute(
                     """SELECT * FROM factor_evaluations

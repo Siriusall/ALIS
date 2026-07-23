@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter
+from statistics import median
 import threading
 import time
 from typing import Any
@@ -25,6 +26,8 @@ _FACTOR_COVERAGE_THRESHOLDS = {
     "pe_ttm": 0.65,
     "pb": 0.8,
 }
+_DECISION_ROW_COUNT_DRIFT_FLOOR = 0.80
+_DECISION_DRIFT_LOOKBACK_DAYS = 5
 
 
 def _low_core_factor_coverage(coverage: dict[str, float]) -> dict[str, float]:
@@ -170,3 +173,113 @@ def build_data_health_report(limit_days: int = 30) -> dict[str, Any]:
     with _health_cache_lock:
         _health_cache[limit_days] = (time.monotonic(), report)
     return report
+
+
+def _latest_adj_factor_coverage(trade_date: str) -> dict[str, Any]:
+    """Read the compact coverage ledger instead of scanning raw factor rows."""
+    from app.data_platform.db import _conn
+
+    with _conn() as conn:
+        row = conn.execute(
+            """SELECT MAX(rows_read) AS rows_read
+               FROM dc_tushare_request_coverage
+               WHERE api_name='adj_factor' AND trade_date=? AND result_status='success'""",
+            (str(trade_date),),
+        ).fetchone()
+    rows_read = int((dict(row) if row else {}).get("rows_read") or 0)
+    return {
+        "trade_date": str(trade_date),
+        "rows_read": rows_read,
+        "ready": rows_read >= 500,
+        "minimum_rows": 500,
+    }
+
+
+def assess_latest_decision_data_health() -> dict[str, Any]:
+    """Decide whether current data may feed strategy research and simulation.
+
+    Daily execution already has its own hard gate. This broader read-only
+    contract catches coverage drift before the autonomous research bus creates
+    candidates from a partial latest market slice.
+    """
+    from app.data_platform.services.daily_update import simple_health
+
+    readiness = simple_health()
+    report = build_data_health_report(limit_days=_DECISION_DRIFT_LOOKBACK_DAYS + 1)
+    snapshots = report.get("market_snapshots") if isinstance(report.get("market_snapshots"), dict) else {}
+    recent_days = snapshots.get("recent_days") if isinstance(snapshots.get("recent_days"), list) else []
+    latest = recent_days[-1] if recent_days else {}
+    latest_date = str(latest.get("date") or readiness.get("latest_decision_ready_trade_date") or "")
+    latest_rows = int(latest.get("symbol_rows") or 0)
+    baseline_rows = [
+        int(item.get("symbol_rows") or 0)
+        for item in recent_days[:-1]
+        if int(item.get("symbol_rows") or 0) > 0
+    ][-_DECISION_DRIFT_LOOKBACK_DAYS:]
+    baseline = float(median(baseline_rows)) if len(baseline_rows) >= 3 else 0.0
+    row_ratio = latest_rows / baseline if baseline > 0 else None
+    low_core = _low_core_factor_coverage(
+        latest.get("core_factor_coverage") if isinstance(latest.get("core_factor_coverage"), dict) else {}
+    )
+    issues: list[dict[str, Any]] = []
+    if not bool(readiness.get("ok")):
+        issues.append({
+            "level": "error",
+            "code": "latest_decision_date_not_ready",
+            "message": str(readiness.get("summary") or "最新交易日决策数据未就绪"),
+        })
+    if not latest_date or latest_rows <= 0:
+        issues.append({
+            "level": "error",
+            "code": "latest_snapshot_missing",
+            "message": "最新决策截面不存在或为空",
+        })
+    if low_core:
+        issues.append({
+            "level": "error",
+            "code": "latest_core_factor_coverage_low",
+            "message": "最新决策截面核心字段覆盖不足",
+            "detail": low_core,
+        })
+    if row_ratio is not None and row_ratio < _DECISION_ROW_COUNT_DRIFT_FLOOR:
+        issues.append({
+            "level": "error",
+            "code": "latest_snapshot_row_count_drift",
+            "message": "最新截面股票数相对近期中位数异常下降",
+            "detail": {"latest_rows": latest_rows, "baseline_rows": baseline, "ratio": round(row_ratio, 4)},
+        })
+    adj_factor = _latest_adj_factor_coverage(latest_date) if latest_date else {
+        "trade_date": "", "rows_read": 0, "ready": False, "minimum_rows": 500,
+    }
+    if not adj_factor["ready"]:
+        issues.append({
+            "level": "warning",
+            "code": "latest_adj_factor_not_ready",
+            "message": "最新复权因子切片未达到正式研究合同，暂停新增策略实验",
+            "detail": adj_factor,
+        })
+    decision_ready = not any(item["level"] == "error" for item in issues)
+    experiment_ready = decision_ready and bool(adj_factor["ready"])
+    return {
+        "ok": decision_ready,
+        "status": "ready" if experiment_ready else "degraded" if decision_ready else "blocked",
+        "schema_version": "alis_latest_decision_data_health_v1",
+        "decision_ready": decision_ready,
+        "experiment_ready": experiment_ready,
+        "readiness": readiness,
+        "latest_snapshot": {
+            "trade_date": latest_date,
+            "symbol_rows": latest_rows,
+            "core_factor_coverage": latest.get("core_factor_coverage") or {},
+            "baseline_rows": baseline or None,
+            "row_count_ratio": round(row_ratio, 4) if row_ratio is not None else None,
+        },
+        "adj_factor": adj_factor,
+        "issues": issues,
+        "policy": {
+            "row_count_drift_floor": _DECISION_ROW_COUNT_DRIFT_FLOOR,
+            "minimum_prior_days_for_drift": 3,
+            "simulation_execution": "blocked only for decision-data errors",
+            "strategy_experiments": "require decision data and latest adj_factor coverage",
+        },
+    }

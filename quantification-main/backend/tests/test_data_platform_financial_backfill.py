@@ -169,10 +169,21 @@ class PlanningAndBundleCorrectnessTest(unittest.TestCase):
     def test_market_bundle_checks_trading_constraints_and_moneyflow_by_default(self, sync, _snapshot) -> None:
         result = sync_market_bundle("20260710")
         self.assertTrue(result["ok"])
+        self.assertIn("adj_factor", result["apis"])
         self.assertIn("suspend_d", result["apis"])
         self.assertIn("moneyflow", result["apis"])
+        sync.assert_any_call("adj_factor", {"trade_date": "20260710"})
         sync.assert_any_call("suspend_d", {"trade_date": "20260710"})
         sync.assert_any_call("moneyflow", {"trade_date": "20260710"})
+
+    @patch("app.data_platform.services.data_center.build_stock_daily_snapshot", return_value={"ok": True})
+    @patch("app.data_platform.services.data_center._safe_sync_raw", return_value={"ok": True})
+    def test_market_bundle_allows_targeted_adj_factor_repair(self, sync, _snapshot) -> None:
+        result = sync_market_bundle("20260710", apis=["adj_factor"])
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["apis"], ["adj_factor"])
+        sync.assert_called_once_with("adj_factor", {"trade_date": "20260710"})
 
     @patch("app.data_platform.services.data_center.ensure_data_center_seeded")
     @patch("app.data_platform.services.data_center._load_financial_missing_codes", return_value=["000001.SZ"])

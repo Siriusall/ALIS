@@ -7,10 +7,7 @@ import {
   fetchModelStrategyStatus,
   materializeFormalPerformanceReports,
   promoteModelVersion,
-  reviewCandidatePlanModels,
-  reviewPlanModelVersion,
   rollbackModelVersion,
-  runPlanModelAutoOptimization,
   startAllTrainablePlanModels,
   startPlanModelTraining,
   startModelTraining,
@@ -104,12 +101,12 @@ function approvalAdvice(candidate: Record<string, unknown> | undefined, producti
   const productionWf = metricValue(production, "walk_forward_lift");
   const candidateWorst = worstWindowLift(candidate);
   const productionWorst = worstWindowLift(production);
-  if (candidateLift == null || candidateWf == null || candidateWorst == null) return "缺少费用后验证指标，先不批准";
+  if (candidateLift == null || candidateWf == null || candidateWorst == null) return "缺少费用后验证指标，留在影子观察";
   if (candidateLift <= 0 || candidateWf <= 0 || candidateWorst <= 0) return "候选费用后指标为负，系统应自动驳回";
-  if (productionWf != null && candidateWf != null && candidateWf < productionWf) return "弱于生产模型，谨慎批准";
-  if (productionLift != null && candidateLift < productionLift) return "费用后收益弱于生产模型，谨慎批准";
-  if (productionWorst != null && candidateWorst < productionWorst) return "最差窗口弱于生产模型，谨慎批准";
-  return "候选不弱于生产模型，可进入人工批准";
+  if (productionWf != null && candidateWf != null && candidateWf < productionWf) return "弱于生产模型，系统自动驳回";
+  if (productionLift != null && candidateLift < productionLift) return "费用后收益弱于生产模型，系统自动驳回";
+  if (productionWorst != null && candidateWorst < productionWorst) return "最差窗口弱于生产模型，系统自动驳回";
+  return "候选通过比较，等待确定性硬门";
 }
 
 function autoOptimizationVerdict(item: {
@@ -119,8 +116,8 @@ function autoOptimizationVerdict(item: {
   shadow_ab?: { has_challenger?: boolean; status?: string; delta?: number; observation_sessions?: number; minimum_sessions?: number };
 }) {
   const shadow = item.shadow_ab;
-  if (item.requires_human) return { tone: "action", title: "需要你批准", detail: "候选模型已过系统筛选，上线前保留人工闸门。" };
-  if (shadow?.status === "auto_rejected" || item.trigger === "auto_rejected") return { tone: "done", title: "系统已驳回", detail: "候选弱于现有生产模型，不进入人工审批。" };
+  if (item.requires_human) return { tone: "action", title: "需要诊断", detail: "数据或模型合约出现异常，系统暂停演化并转入诊断队列。" };
+  if (shadow?.status === "auto_rejected" || item.trigger === "auto_rejected") return { tone: "done", title: "系统已驳回", detail: "候选弱于现有生产模型，不进入晋升流程。" };
   if (item.running) return { tone: "watch", title: "正在训练", detail: "系统正在生成新候选，完成后自动比较。" };
   if (item.trigger === "retrain_challenger") return { tone: "watch", title: "系统待重训", detail: "生产指标偏弱，下一轮生成候选对照。" };
   if (shadow?.has_challenger) {
@@ -228,8 +225,8 @@ const MODEL_SECTION_TITLES: Partial<Record<GovernanceSectionKey, string>> = {
   modelStatus: "模型状态总览",
   modelTraining: "模型训练过程",
   modelParameters: "模型参数与证据合同",
-  modelAutoOptimization: "自优化检查与人工闸门",
-  modelPromotion: "候选模型晋升控制",
+  modelAutoOptimization: "自优化与确定性硬门",
+  modelPromotion: "候选模型自动晋升",
   modelVersions: "模型版本与回退",
 };
 
@@ -404,7 +401,7 @@ export default function GovernancePage() {
       && latestId !== activeId
       && String(latest?.status || "") === "candidate"
       && reviewStatus !== "rejected"
-      && approvalAdvice(latest?.metrics || {}, item.active_version?.metrics || {}) === "候选不弱于生产模型，可进入人工批准";
+      && approvalAdvice(latest?.metrics || {}, item.active_version?.metrics || {}) === "候选通过比较，等待确定性硬门";
   });
   const runningPlanBookModels = planBookModels.filter((item) => item.latest_train_run?.status === "running");
   const autoReviewQueue = autoOptimization?.review_queue ?? [];
@@ -422,7 +419,7 @@ export default function GovernancePage() {
         <div>
           <span>SYSTEM CENTER</span>
           <h1>模型工厂</h1>
-          <p>这里负责训练计划书模型、查看数据参数、审核候选模型并决定是否上线到模拟决策链路。</p>
+          <p>这里展示模型训练、影子观察和确定性硬门；符合全部条件的候选会自动进入模拟决策链路。</p>
         </div>
         <button className="button ghost" onClick={() => void load()} disabled={loading}>刷新状态</button>
       </div>
@@ -438,7 +435,7 @@ export default function GovernancePage() {
             <h2>{MODEL_SECTION_TITLES[section] || "模型状态总览"}</h2>
             <p>{section === "modelStatus"
               ? "这里只回答：哪些模型在生产、哪些在候选、哪些还能训练。其他操作收进对应页。"
-              : "五个计划书模型按“状态、训练、参数、自优化、晋升、版本”拆开管理；系统负责判断，你只在上线/驳回时介入。"}</p>
+              : "五个计划书模型按“状态、训练、参数、自优化、晋升、版本”拆开管理；训练、淘汰、观察和晋升均由系统完成，只有数据或合约异常需要查看。"}</p>
           </div>
           {section === "modelTraining" && <div className="model-training-actions">
             <button className="button primary" disabled={busy !== ""} onClick={() => void action("plan-train-all", startAllTrainablePlanModels, "已启动全部可训练计划书模型")}>{busy === "plan-train-all" ? "启动中" : "训练待训练模型"}</button>
@@ -462,7 +459,7 @@ export default function GovernancePage() {
               </div>
               <em className={`status-pill status-${statusClass(item.status)}`}>{statusText(item.status)}</em>
               <p>{running ? "训练中" : item.latest_train_run ? `最近训练 #${item.latest_train_run.id} · ${statusText(item.latest_train_run.status)}` : "还没有训练记录"}</p>
-              <small>{item.status === "production" ? "已接入模拟决策链路" : item.status === "candidate" ? "等待人工在“模型晋升”里审核" : trainable ? "可在“模型训练过程”里训练" : "等待数据补齐"}</small>
+              <small>{item.status === "production" ? "已接入模拟决策链路" : item.status === "candidate" ? "正在进行自动硬门观察" : trainable ? "由系统在数据满足时训练" : "等待数据补齐"}</small>
             </article>;
           })}
           {planModels && !planBookModels.length && <div className="empty">暂无模型状态。</div>}
@@ -517,8 +514,8 @@ export default function GovernancePage() {
         {section === "modelAutoOptimization" && <details open className="model-auto-optimizer">
           <summary>
             <div>
-              <strong>模型自优化（人工闸门）</strong>
-              <span>{autoOptimization?.policy.summary || "系统自动训练 challenger、自动驳回弱候选；更优候选上线才需要人工批准。"}</span>
+              <strong>模型自优化</strong>
+              <span>{autoOptimization?.policy.summary || "系统自动训练 challenger、自动驳回弱候选；全部确定性硬门通过后自动晋升。"}</span>
             </div>
             <em>{autoReviewQueue.length ? `${autoReviewQueue.length} 个可批准` : autoOptimization?.auto_rejected?.length ? `${autoOptimization.auto_rejected.length} 个已自动驳回` : autoTrainableItems.length ? `${autoTrainableItems.length} 个可自训练` : "无需介入"}</em>
           </summary>
@@ -526,19 +523,18 @@ export default function GovernancePage() {
             <div className="model-auto-optimizer-command">
               <div>
                 <strong>候选模型 A/B 影子运行</strong>
-                <p>新模型不上线也每天虚拟打分；弱于生产模型或核心指标为负时系统自动驳回，只有不弱于生产模型的候选才交给你批准。</p>
+                <p>新模型不上线也每天虚拟打分；弱于生产模型或核心指标为负时系统自动驳回，满足全部硬门后才会自动替换生产版本。</p>
               </div>
-              <button className="button primary" disabled={busy !== ""} onClick={() => void action("plan-auto-optimize", () => runPlanModelAutoOptimization(false), "模型自优化检查已执行，候选仍需人工上线")}>{busy === "plan-auto-optimize" ? "检查中" : "运行自优化检查"}</button>
+              <span className="status-pill status-ready">按自动排程运行</span>
             </div>
             {!!candidatePlanBookModels.length && (
               <div className="model-review-now">
                 <div>
-                  <strong>{candidatePlanBookModels.length} 个候选模型等待人工批准</strong>
-                  <span>系统已自动过滤弱候选；这里只保留需要你最终上线确认的候选。</span>
+                  <strong>{candidatePlanBookModels.length} 个候选模型等待确定性硬门</strong>
+                  <span>系统已自动过滤弱候选；候选将在正式 OOS 和影子观察通过后自动晋升。</span>
                 </div>
                 <div>
                   {candidatePlanBookModels.slice(0, 5).map((item) => {
-                    const latestId = Number(item.latest_version?.id || 0);
                     const candidateMetrics = item.latest_version?.metrics || {};
                     const productionMetrics = item.active_version?.metrics || {};
                     const deltaWf = metricValue(candidateMetrics, "walk_forward_lift") != null && metricValue(productionMetrics, "walk_forward_lift") != null
@@ -562,8 +558,7 @@ export default function GovernancePage() {
                         <em><b>窗口</b>{compact(candidateMetrics.walk_forward_windows || "旧版")}</em>
                       </div>
                       <div className="model-approval-actions">
-                        <button className="button primary" disabled={busy !== "" || latestId <= 0} onClick={() => void action(`auto-direct-approve-${latestId}`, () => reviewPlanModelVersion(latestId, { decision: "approved", comment: "自优化模块人工批准上线；模拟系统豁免真实20日观察", waive_live_observation: true }), `${item.name} 已批准上线`)}>批准上线</button>
-                        <button className="button ghost" disabled={busy !== "" || latestId <= 0} onClick={() => void action(`auto-direct-reject-${latestId}`, () => reviewPlanModelVersion(latestId, { decision: "rejected", comment: "自优化模块人工驳回", waive_live_observation: false }), `${item.name} 已驳回`)}>驳回</button>
+                        <span>系统正在执行 OOS 与影子观察</span>
                       </div>
                     </article>;
                   })}
@@ -577,9 +572,9 @@ export default function GovernancePage() {
             )}
             <div className="model-auto-summary">
               <article className={autoReviewQueue.length ? "needs-action" : ""}>
-                <span>你的待办</span>
-                <strong>{autoReviewQueue.length ? `${autoReviewQueue.length} 个需批准` : "暂无人工审批"}</strong>
-                <p>{autoReviewQueue.length ? "只在候选不弱于生产模型时出现。" : "弱候选、重训、观察都交给系统处理。"}</p>
+                <span>诊断队列</span>
+                <strong>{autoReviewQueue.length ? `${autoReviewQueue.length} 项需诊断` : "暂无异常诊断"}</strong>
+                <p>{autoReviewQueue.length ? "仅在数据或模型合约异常时出现。" : "弱候选、重训、观察和晋升均由系统处理。"}</p>
               </article>
               <article>
                 <span>系统自动处理</span>
@@ -594,7 +589,6 @@ export default function GovernancePage() {
             </div>
             <div className="model-auto-list">
               {(autoOptimization?.items ?? []).map((item) => {
-                const latestId = Number(item.latest_version_id || 0);
                 const shadow = item.shadow_ab;
                 const candidateMetrics = item.candidate_metrics || {};
                 const productionMetrics = item.production_metrics || {};
@@ -628,11 +622,8 @@ export default function GovernancePage() {
                       <em><b>建议</b>{hasChallenger ? approvalAdvice(candidateMetrics, productionMetrics) : item.trigger === "retrain_challenger" ? "生产指标偏弱，系统应训练新 challenger" : "暂无新候选需要处理"}</em>
                     </div>
                     <div className="model-auto-row-actions">
-                      {item.requires_human && latestId > 0
-                        ? <>
-                          <button className="button primary" disabled={busy !== ""} onClick={() => void action(`auto-approve-${latestId}`, () => reviewPlanModelVersion(latestId, { decision: "approved", comment: "人工批准自优化候选上线；模拟系统豁免真实20日观察", waive_live_observation: true }), `${item.name} 已批准上线`)}>批准上线</button>
-                          <button className="button ghost" disabled={busy !== ""} onClick={() => void action(`auto-reject-${latestId}`, () => reviewPlanModelVersion(latestId, { decision: "rejected", comment: "人工驳回自优化候选", waive_live_observation: false }), `${item.name} 已驳回`)}>驳回</button>
-                        </>
+                      {item.requires_human
+                        ? <span>数据或模型合约异常，等待系统诊断完成</span>
                         : <span>{item.trigger === "auto_rejected" ? "系统已处理，不需要你操作" : item.running ? "训练完成后自动比较" : item.trigger === "retrain_challenger" ? "等待系统重训" : item.trigger === "healthy" ? "系统自动观察" : "系统处理"}</span>}
                     </div>
                   </div>
@@ -644,7 +635,6 @@ export default function GovernancePage() {
               <summary>查看系统自动处理记录</summary>
               <div className="model-auto-grid">
                 {(autoOptimization?.items ?? []).map((item) => {
-                  const latestId = Number(item.latest_version_id || 0);
                   const shadow = item.shadow_ab;
                   const candidateMetrics = item.candidate_metrics || {};
                   const productionMetrics = item.production_metrics || {};
@@ -668,11 +658,8 @@ export default function GovernancePage() {
                     </div>
                     <em className={`status-pill status-${statusClass(shadow?.status || item.status)}`}>{shadow?.status === "auto_rejected" ? "自动驳回" : shadow?.status === "review_ready" ? "可评审" : hasChallenger && shadow?.status === "shadow_running" ? "影子运行" : item.trigger === "retrain_challenger" ? "待重训" : "无候选"}</em>
                     <div>
-                    {item.requires_human && latestId > 0
-                      ? <>
-                        <button className="button primary" disabled={busy !== ""} onClick={() => void action(`auto-approve-${latestId}`, () => reviewPlanModelVersion(latestId, { decision: "approved", comment: "人工批准自优化候选上线；模拟系统豁免真实20日观察", waive_live_observation: true }), `${item.name} 已批准上线`)}>批准</button>
-                        <button className="button ghost" disabled={busy !== ""} onClick={() => void action(`auto-reject-${latestId}`, () => reviewPlanModelVersion(latestId, { decision: "rejected", comment: "人工驳回自优化候选", waive_live_observation: false }), `${item.name} 已驳回`)}>驳回</button>
-                      </>
+                    {item.requires_human
+                      ? <span>数据或模型合约异常，等待系统诊断完成</span>
                       : <span>{item.trigger === "auto_rejected" ? "系统已处理" : item.running ? "训练中" : item.trigger === "retrain_challenger" ? "等待重训" : item.trigger === "healthy" ? "自动观察" : "系统处理"}</span>}
                     </div>
                   </article>;
@@ -748,12 +735,11 @@ export default function GovernancePage() {
 
       {section === "modelPromotion" && <section className="model-release-panel">
         <div className="governance-section-head">
-          <div><h3>上线控制</h3><p>只有候选模型会出现在这里；先看候选/生产指标，再逐个批准或驳回。</p></div>
-          <span>{candidatePlanBookModels.length ? `${candidatePlanBookModels.length} 个待评审` : "无待评审"}</span>
+          <div><h3>自动晋升队列</h3><p>只有通过候选比较的版本会出现在这里；正式 OOS、影子观察和费用后硬门全部通过后，系统自动替换生产模型。</p></div>
+          <span>{candidatePlanBookModels.length ? `${candidatePlanBookModels.length} 个观察中` : "无观察中候选"}</span>
         </div>
         <div className="model-release-list">
           {candidatePlanBookModels.map((item) => {
-            const latestId = Number(item.latest_version?.id || 0);
             const candidateMetrics = item.latest_version?.metrics || {};
             const productionMetrics = item.active_version?.metrics || {};
             const deltaWf = metricValue(candidateMetrics, "walk_forward_lift") != null && metricValue(productionMetrics, "walk_forward_lift") != null
@@ -774,14 +760,13 @@ export default function GovernancePage() {
                 <em><b>胜率</b>{percent(candidateMetrics.hit_rate)}</em>
                 <em><b>IC/相关</b>{number(candidateMetrics.rank_return_corr)}</em>
               </div>
-              <em className="status-pill status-watch">候选待审</em>
+              <em className="status-pill status-watch">硬门观察中</em>
               <div className="model-approval-actions">
-                <button className="button primary" disabled={busy !== "" || latestId <= 0} onClick={() => void action(`plan-review-${latestId}`, () => reviewPlanModelVersion(latestId, { decision: "approved", comment: "人工批准上线；模拟系统豁免真实20日观察", waive_live_observation: true }), `${item.name} 已批准上线`)}>批准上线</button>
-                <button className="button ghost" disabled={busy !== "" || latestId <= 0} onClick={() => void action(`plan-reject-${latestId}`, () => reviewPlanModelVersion(latestId, { decision: "rejected", comment: "人工驳回，继续观察", waive_live_observation: false }), `${item.name} 已驳回`)}>驳回</button>
+                <span>由系统完成后续验证与自动晋升</span>
               </div>
             </article>;
           })}
-          {!candidatePlanBookModels.length && <div className="empty">暂无等待上线的候选模型。</div>}
+          {!candidatePlanBookModels.length && <div className="empty">暂无处于自动晋升观察的候选模型。</div>}
         </div>
       </section>}
 
@@ -828,7 +813,7 @@ export default function GovernancePage() {
                       : rejected
                         ? <span className="status-pill status-blocked">已驳回</span>
                         : candidate
-                      ? <div className="row-actions"><button disabled={busy !== ""} onClick={() => void action(`plan-version-approve-${version.id}`, () => reviewPlanModelVersion(version.id, { decision: "approved", comment: "版本管理页人工批准上线；模拟系统豁免真实20日观察", waive_live_observation: true }), `${model.name} 已批准上线`)}>批准</button><button className="danger" disabled={busy !== ""} onClick={() => void action(`plan-version-reject-${version.id}`, () => reviewPlanModelVersion(version.id, { decision: "rejected", comment: "版本管理页人工驳回", waive_live_observation: false }), `${model.name} 已驳回`)}>驳回</button></div>
+                      ? <span className="status-pill status-watch">自动观察中</span>
                       : canRollback
                         ? <button className="button ghost" disabled={busy !== ""} onClick={() => void action(`plan-version-rollback-${version.id}`, () => rollbackModelVersion(version.id), `${model.name} 已回退至 ${version.version}`)}>回退至此</button>
                       : <span className="muted">无操作</span>}</td>

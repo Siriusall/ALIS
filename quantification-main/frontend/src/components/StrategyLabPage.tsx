@@ -49,6 +49,20 @@ const lifecycleLabels: Record<string, string> = {
   rolled_back: "已自动回退",
 };
 
+const attributionLabels: Record<string, string> = {
+  market_exposure: "市场敞口",
+  transaction_costs: "交易成本",
+  execution_constraints: "执行约束",
+  selection_or_allocation_residual: "选股与配置残差",
+  unknown: "证据不足",
+};
+
+const confidenceLabels: Record<string, string> = {
+  high: "高置信",
+  medium: "中置信",
+  low: "低置信",
+};
+
 function percent(value: number | null | undefined, digits = 2) {
   return value == null || !Number.isFinite(value) ? "—" : `${(value * 100).toFixed(digits)}%`;
 }
@@ -99,6 +113,14 @@ export default function StrategyLabPage() {
     return <section className="strategy-lab-page"><div className="strategy-lab-empty">尚未登记 Challenger。</div></section>;
   }
   const oos = challenger.formal_oos;
+  const attribution = oos.failure_attribution ?? {
+    status: "pending",
+    primary_cause: "unknown",
+    confidence: "low",
+    evidence: {},
+    limitations: [],
+  };
+  const attributionEvidence = attribution.evidence;
   const chartData = oos.windows.map((item) => ({ ...item, label: `窗口 ${item.window}`, percent: (item.return ?? 0) * 100 }));
   const latestTask = tasks[0];
   const comparisons = [challenger, ...data.baselines].map((item) => ({
@@ -236,7 +258,7 @@ export default function StrategyLabPage() {
               </tbody>
             </table>
           </div>
-          <p>自动归因：多因子优于单动量，CVaR 略优于等权；当前首要缺口是上涨市场暴露，下一候选方向为动态权益仓位与 ETF 替代。</p>
+          <p>横向比较只呈现同协议的真实结果；下一候选由正式 OOS 的持久化失败归因决定，不根据基准差距猜测原因。</p>
         </article>
 
         <article className="strategy-lab-card strategy-lab-chart">
@@ -277,9 +299,27 @@ export default function StrategyLabPage() {
           </div>
         </article>
 
+        <article className="strategy-lab-card strategy-lab-attribution">
+          <header><div><span>失败归因</span><h2>正式 OOS 的可复算证据</h2></div><small>{confidenceLabels[attribution.confidence] || "待验证"}</small></header>
+          {attribution.status === "pending" ? (
+            <p>等待完成正式 OOS 后生成归因。</p>
+          ) : (
+            <>
+              <strong>{attributionLabels[attribution.primary_cause] || attribution.primary_cause}</strong>
+              <dl>
+                <div><dt>现金拖累</dt><dd>{percent(typeof attributionEvidence.estimated_cash_drag_return === "number" ? attributionEvidence.estimated_cash_drag_return : null)}</dd></div>
+                <div><dt>费用负担</dt><dd>{percent(typeof attributionEvidence.fee_burden_return === "number" ? attributionEvidence.fee_burden_return : null)}</dd></div>
+                <div><dt>被拦截订单</dt><dd>{Number(attributionEvidence.blocked_count ?? 0)}</dd></div>
+                <div><dt>未解释缺口</dt><dd>{percent(typeof attributionEvidence.residual_failure_gap_return === "number" ? attributionEvidence.residual_failure_gap_return : null)}</dd></div>
+              </dl>
+              {attribution.limitations.slice(0, 1).map((item) => <p key={item}>{item}</p>)}
+            </>
+          )}
+        </article>
+
         <article className="strategy-lab-card strategy-lab-conclusion">
           <header><div><span>怎么看</span><h2>这组数据说明什么</h2></div></header>
-          <p>Challenger V1 已把策略从 Champion 的高换手、深回撤问题中拉回，但还没有证明能创造稳定超额收益。</p>
+          <p>当前 Challenger 的结论来自固定协议、成本后 OOS 和窗口级失败归因；缺少充分证据时系统保持候选隔离。</p>
           <strong>系统已自动生成并淘汰弱 V2 候选；只有正式 OOS 与至少 20 个未来影子交易日同时通过，才会替换唯一 Champion。</strong>
         </article>
       </div>

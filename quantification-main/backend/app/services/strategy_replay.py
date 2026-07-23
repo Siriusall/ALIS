@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 import math
-from typing import Any
+from typing import Any, Callable
 
 from app.core.a_share_fees import (
     apply_slippage_buy,
@@ -198,7 +198,9 @@ def run_strategy_replay(
     benchmark_symbol: str = "000300.SH",
     exchange_group: str = "HS",
     model_version_id: int | None = None,
+    strategy_controller_version_id: int | None = None,
     data_source: BacktestDataSource | None = None,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     champion = resolve_production_strategy_champion()
     strategy_id = int(strategy_id or champion["strategy_id"])
@@ -231,12 +233,36 @@ def run_strategy_replay(
     benchmark_base: float | None = None
     pit_audits: list[dict[str, Any]] = []
     previous_market_state = ""
+    controller_version = None
     policy = champion["strategy_policy"]
+    if strategy_controller_version_id is not None:
+        controller_version = get_model_version(int(strategy_controller_version_id))
+        if not controller_version or str(controller_version.get("model_key") or "") != "strategy_controller":
+            raise ValueError("strategy_controller_version_id 不存在或不是策略控制器候选")
+        config_payload = controller_version.get("config") if isinstance(controller_version.get("config"), dict) else {}
+        candidate_policy = config_payload.get("policy") if isinstance(config_payload.get("policy"), dict) else None
+        if not candidate_policy:
+            raise ValueError("策略控制器候选缺少 policy 配置")
+        policy = candidate_policy
+    controller_version_id = int((controller_version or {}).get("id") or champion["strategy_controller_version_id"])
+    controller_version_name = str((controller_version or {}).get("version") or champion["strategy_controller_version"])
     required_factors = set(config.score)
     for item in config.filters:
         if item.get("factor"):
             required_factors.add(str(item["factor"]))
     need_daily_basic = bool(required_factors & {"float_mv", "total_mv", "pe_ttm", "pb"})
+
+    def report_progress(*, phase: str, completed_days: int, message: str) -> None:
+        if progress_callback:
+            progress_callback({
+                "phase": phase,
+                "completed_days": completed_days,
+                "total_days": len(dates),
+                "progress": round(completed_days / max(1, len(dates)), 6),
+                "message": message,
+            })
+
+    report_progress(phase="strategy_replay", completed_days=0, message="正式 OOS 窗口开始逐日重放")
 
     for index, date in enumerate(dates):
         cutoff = signal_available_time(date)
@@ -273,6 +299,12 @@ def run_strategy_replay(
         else:
             benchmark_value = benchmark_series[-1]["total_value"] if benchmark_series else initial_cash
         benchmark_series.append({"date": date, "total_value": round(float(benchmark_value), 2)})
+        if (index + 1) % 10 == 0 or index + 1 == len(dates):
+            report_progress(
+                phase="strategy_replay",
+                completed_days=index + 1,
+                message=f"正式 OOS 窗口重放 {index + 1}/{len(dates)} 个交易日",
+            )
 
         if index >= len(dates) - 1 or not ds.should_rebalance(frequency, date, previous_rebalance):
             continue
@@ -462,7 +494,7 @@ def run_strategy_replay(
             market_rows=rows,
             current_weights=current_weights,
             target_weights=target_weights,
-            context={"strategy_policy": policy, "strategy_policy_version": champion["strategy_controller_version"], "production_strategy_version": champion["champion_version"], "target_weights": target_weights, "defensive_weights": defensive_weights, "market_state": market_state, "optimizer": optimized.get("optimizer"), "data_status": "trade_date_frozen_v1", "price_by_symbol": prices},
+            context={"strategy_policy": policy, "strategy_policy_version": controller_version_name, "production_strategy_version": champion["champion_version"], "target_weights": target_weights, "defensive_weights": defensive_weights, "market_state": market_state, "optimizer": optimized.get("optimizer"), "data_status": "trade_date_frozen_v1", "price_by_symbol": prices},
         )
         decision = {
             "signal_date": date,
@@ -494,8 +526,8 @@ def run_strategy_replay(
         "strategy_name": strategy.get("name") or "",
         "production_strategy_version_id": champion["champion_id"],
         "production_strategy_version": champion["champion_version"],
-        "strategy_controller_version_id": champion["strategy_controller_version_id"],
-        "strategy_controller_version": champion["strategy_controller_version"],
+        "strategy_controller_version_id": controller_version_id,
+        "strategy_controller_version": controller_version_name,
         "model_version_id": model_version_id,
         "model_version": (model_version or {}).get("version"),
         "start_date": dates[0],
