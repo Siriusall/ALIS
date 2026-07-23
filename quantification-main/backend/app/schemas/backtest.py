@@ -16,6 +16,39 @@ class BacktestRunRequest(BaseModel):
     exchange_group: str = Field("HS", description="ALL|HS|CYB|BJ")
 
 
+class StrategyReplayRequest(BacktestRunRequest):
+    """主线策略逐交易日重放；结果使用独立历史账本。"""
+
+
+class StrategyReplayResponse(BaseModel):
+    schema_version: str
+    status: str
+    strategy_id: int
+    strategy_name: str
+    production_strategy_version_id: int
+    production_strategy_version: str
+    strategy_controller_version_id: int
+    strategy_controller_version: str
+    model_version_id: Optional[int] = None
+    model_version: Optional[str] = None
+    start_date: str
+    end_date: str
+    initial_cash: float
+    rebalance_freq: str
+    benchmark_symbol: str
+    exchange_group: str
+    component_contract: dict[str, Any]
+    metrics: dict[str, Any]
+    summary: dict[str, Any]
+    equity_series: list[dict[str, Any]]
+    benchmark_series: list[dict[str, Any]]
+    decisions: list[dict[str, Any]]
+    trades: list[dict[str, Any]]
+    blocked_events: list[dict[str, Any]]
+    data_quality: dict[str, Any]
+    generated_at: str
+
+
 class BacktestMetrics(BaseModel):
     total_return: float
     annual_return: float
@@ -32,6 +65,9 @@ class BacktestRunResponse(BaseModel):
     strategy_id: int
     model_version_id: Optional[int] = None
     model_version: Optional[str] = None
+    production_strategy_version_id: Optional[int] = None
+    production_strategy_version: Optional[str] = None
+    factor_contract: dict[str, Any] = {}
     strategy_name: str
     start_date: str
     end_date: str

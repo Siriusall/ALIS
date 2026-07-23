@@ -14,6 +14,7 @@ from app.db.store import (
     get_quant_replay_waterline,
     get_quant_run_task_health,
     get_quant_run_task_runtime_config,
+    create_quant_run_task,
     create_quant_run_task_record,
     get_quant_run_task,
     list_active_quant_run_tasks,
@@ -256,7 +257,15 @@ def start_auto_simulation_scheduler() -> bool:
                             materialize_daily_rebalance_plan()
                         except Exception as exc:
                             logger.warning("每日正式调仓方案生成失败 trade_date=%s: %s", latest, str(exc)[:200])
-                        for task in list_active_quant_run_tasks():
+                        active_tasks = list_active_quant_run_tasks()
+                        autonomous_tasks = [
+                            task for task in active_tasks
+                            if str(task.get("replay_mode") or "") == "autonomous_daily"
+                        ]
+                        # Once the dedicated production task exists, legacy
+                        # paused/manual replay tasks must never create a second
+                        # set of simulated orders for the same session.
+                        for task in autonomous_tasks or active_tasks:
                             status = str(task.get("status") or "").lower()
                             if status not in {"pending", "paused"}:
                                 continue
@@ -1073,7 +1082,7 @@ def run_quant_task_async(task_id: int) -> bool:
                     replay_target_execute_date=None,
                     processed_steps=processed_total,
                     finished_at=None,
-                    last_message=f"任务已暂停：本批执行 {processed_total} 步，等待手动继续",
+                    last_message=f"本批执行 {processed_total} 步；等待下一交易日自动继续",
                 )
                 upsert_quant_replay_waterline(
                     strategy_id=strategy_id,
@@ -1188,3 +1197,71 @@ def resume_quant_tasks_on_startup() -> int:
             ):
                 paused += 1
     return paused
+
+
+def ensure_autonomous_simulation_task() -> dict:
+    """Ensure exactly one scheduler-owned simulation task for the Champion."""
+    from app.services.production_strategy import resolve_production_strategy_champion
+
+    champion = resolve_production_strategy_champion()
+    strategy = champion.get("strategy") if isinstance(champion.get("strategy"), dict) else {}
+    content = strategy.get("content") if isinstance(strategy.get("content"), dict) else {}
+    rebalance = content.get("rebalance") if isinstance(content.get("rebalance"), dict) else {}
+    desired_top_n = int(
+        rebalance.get("top_n")
+        or ((champion.get("strategy_policy") or {}).get("top_n"))
+        or 10
+    )
+    tasks = list_active_quant_run_tasks()
+    autonomous_tasks = [
+        task for task in tasks if str(task.get("replay_mode") or "") == "autonomous_daily"
+    ]
+    matching = [
+        task for task in autonomous_tasks
+        if int(task.get("strategy_id") or 0) == int(champion["strategy_id"])
+    ]
+    existing = matching[-1] if matching else None
+    for stale in autonomous_tasks:
+        if existing and int(stale.get("id") or 0) == int(existing.get("id") or 0):
+            continue
+        update_quant_run_task(
+            int(stale["id"]),
+            status="stopped",
+            finished_at=_utc_now_iso(),
+            last_message="自动任务已由新 Champion 调度任务替代",
+        )
+    if existing:
+        if int(existing.get("top_n") or 0) != desired_top_n:
+            update_quant_run_task(
+                int(existing["id"]),
+                top_n=desired_top_n,
+                last_message="自动任务参数已与当前 Champion 同步",
+            )
+            existing = get_quant_run_task(int(existing["id"])) or existing
+        return {
+            "ok": True,
+            "created": False,
+            "task": existing,
+            "champion_version": champion.get("champion_version"),
+            "policy": "scheduler_owned_simulation_only",
+        }
+
+    dates = list_consolidated_trade_dates()
+    start_date = str(dates[-1]) if dates else None
+    task_id = create_quant_run_task(
+        strategy_id=int(champion["strategy_id"]),
+        top_n=desired_top_n,
+        budget_ratio=1.0,
+        exchange_group="HS",
+        start_date=start_date,
+        max_steps=1,
+        replay_mode="autonomous_daily",
+    )
+    task = get_quant_run_task(task_id)
+    return {
+        "ok": True,
+        "created": True,
+        "task": task,
+        "champion_version": champion.get("champion_version"),
+        "policy": "scheduler_owned_simulation_only",
+    }

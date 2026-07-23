@@ -63,6 +63,7 @@ from app.services.quant_run_engine import (
 from app.services.quant_task_runner import run_quant_task_async
 from app.services.quant_task_state_machine import can_transition, normalize_status
 from app.services.decision_store import build_review_outcome_suggestion, list_decision_snapshots, list_position_state_history, list_reviews
+from app.services.performance_reports import enrich_performance_period, load_market_state_history
 from app.services.simulation_ledger import build_simulation_ledger
 
 router = APIRouter()
@@ -810,6 +811,25 @@ def quant_run_performance(task_id: int | None = Query(None, ge=1), benchmark: st
     """Return weekly/monthly/yearly performance aggregates for the simulator."""
     curve = quant_run_curve(limit=1000, benchmark=benchmark, task_id=task_id)
     series = [x for x in (curve.get("series") or []) if x.get("date") and x.get("strategy_equity") is not None]
+    previous_point: dict | None = None
+    for point in series:
+        previous_strategy = _safe_float((previous_point or {}).get("strategy_equity"))
+        previous_strategy_cny = _safe_float((previous_point or {}).get("strategy_equity_cny"))
+        previous_benchmark = _safe_float((previous_point or {}).get("benchmark_equity"))
+        current_strategy = _safe_float(point.get("strategy_equity"))
+        current_benchmark = _safe_float(point.get("benchmark_equity"))
+        point["daily_return_pct"] = (
+            round((current_strategy / previous_strategy - 1.0) * 100.0, 4)
+            if previous_strategy > 0 and current_strategy > 0 else 0.0
+        )
+        point["daily_absolute_return"] = round(
+            _safe_float(point.get("strategy_equity_cny")) - previous_strategy_cny, 4
+        ) if previous_strategy_cny else 0.0
+        point["daily_benchmark_return_pct"] = (
+            round((current_benchmark / previous_benchmark - 1.0) * 100.0, 4)
+            if previous_benchmark > 0 and current_benchmark > 0 else None
+        )
+        previous_point = point
     task_runs = list_quant_run_task_records(task_id, limit=2000) if task_id is not None else []
     if task_id is not None:
         operations = []
@@ -818,6 +838,7 @@ def quant_run_performance(task_id: int | None = Query(None, ge=1), benchmark: st
     else:
         operations = list_operations(execution_id=None, limit=5000)
     operations.sort(key=lambda item: (str(item.get("at") or ""), int(item.get("id") or 0)))
+    decisions: list[dict] = []
     try:
         review_records = list_reviews(limit=2000)
         intervention_records = list_position_state_history(limit=2000)
@@ -852,6 +873,17 @@ def quant_run_performance(task_id: int | None = Query(None, ge=1), benchmark: st
                 attribution_by_date[exit_date]["execution"] += float(attribution.get("execution_attribution") or 0)
     except Exception:
         attribution_by_date = defaultdict(lambda: defaultdict(float))
+    market_states = load_market_state_history()
+    try:
+        from app.services.decision_version_manifest import build_decision_version_manifest
+        version_manifest = build_decision_version_manifest(
+            trade_date=str((series[-1] if series else {}).get("date") or datetime.now().date().isoformat())
+        )
+    except Exception as exc:
+        version_manifest = {
+            "schema_version": "alis_decision_version_manifest_unavailable",
+            "error": str(exc)[:300],
+        }
 
     realized_by_date: dict[str, float] = defaultdict(float)
     lots_by_symbol: dict[str, list[dict[str, float]]] = defaultdict(list)
@@ -897,8 +929,11 @@ def quant_run_performance(task_id: int | None = Query(None, ge=1), benchmark: st
             end_index = _safe_float(last.get("strategy_equity")) or start_index
             start = _safe_float(first.get("strategy_equity_cny")) or start_index
             end = _safe_float(last.get("strategy_equity_cny")) or end_index
-            bm_start = _safe_float(first.get("benchmark_equity"))
-            bm_end = _safe_float(last.get("benchmark_equity")) or bm_start
+            benchmark_points = [
+                item for item in points if _safe_float(item.get("benchmark_equity")) > 0
+            ]
+            bm_start = _safe_float((benchmark_points[0] if benchmark_points else {}).get("benchmark_equity"))
+            bm_end = _safe_float((benchmark_points[-1] if benchmark_points else {}).get("benchmark_equity"))
             drawdowns = [_safe_float(x.get("drawdown_pct")) for x in points]
             start_date, end_date = str(first["date"]), str(last["date"])
             period_ops = [x for x in operations if start_date <= str(x.get("at") or "")[:10] <= end_date]
@@ -909,11 +944,13 @@ def quant_run_performance(task_id: int | None = Query(None, ge=1), benchmark: st
             )
             rejected = 0
             market_gate_blocks = 0
+            period_blocked_events: list[dict] = []
             for run in task_runs:
                 if not (start_date <= str(run.get("execute_date") or "") <= end_date):
                     continue
                 detail = run.get("detail") or {}
                 blocked = detail.get("blocked_events") or []
+                period_blocked_events.extend(item for item in blocked if isinstance(item, dict))
                 rejected += len(blocked)
                 market_gate_blocks += sum(1 for item in blocked if "market" in str(item.get("code") or "").lower())
             model_error_count = sum(
@@ -930,13 +967,29 @@ def quant_run_performance(task_id: int | None = Query(None, ge=1), benchmark: st
             formal_attribution = {key: sum(value.get(key, 0.0) for date, value in attribution_by_date.items() if start_date <= date <= end_date) for key in ("market", "industry", "selection", "execution")}
             has_formal_attribution = any(start_date <= date <= end_date for date in attribution_by_date)
             absolute_return = end - start
-            out.append({
+            report = {
                 "period": key,
                 "start_date": start_date,
                 "end_date": end_date,
-                "return_pct": round((end_index / start_index - 1.0) * 100.0, 4) if start_index else 0.0,
-                "absolute_return": round(absolute_return, 4),
-                "benchmark_return_pct": round((bm_end / bm_start - 1.0) * 100.0, 4) if bm_start else None,
+                "return_pct": (
+                    float(last.get("daily_return_pct") or 0)
+                    if len(points) == 1 else
+                    round((end_index / start_index - 1.0) * 100.0, 4) if start_index else 0.0
+                ),
+                "absolute_return": (
+                    float(last.get("daily_absolute_return") or 0)
+                    if len(points) == 1 else round(absolute_return, 4)
+                ),
+                "benchmark_return_pct": (
+                    last.get("daily_benchmark_return_pct")
+                    if len(points) == 1 else
+                    round((bm_end / bm_start - 1.0) * 100.0, 4) if bm_start else None
+                ),
+                "benchmark_coverage": {
+                    "start_date": (benchmark_points[0].get("date") if benchmark_points else None),
+                    "end_date": (benchmark_points[-1].get("date") if benchmark_points else None),
+                    "points": len(benchmark_points),
+                },
                 "max_drawdown_pct": round(min(drawdowns), 4) if drawdowns else 0.0,
                 "turnover_rate": round(traded_amount / ((start + end) / 2.0), 6) if (start + end) > 0 else 0.0,
                 "traded_amount": round(traded_amount, 4),
@@ -953,7 +1006,17 @@ def quant_run_performance(task_id: int | None = Query(None, ge=1), benchmark: st
                 "attribution_status": "complete" if has_formal_attribution else "partial" if period_ops else "no_trades",
                 "attribution_limitations": [] if has_formal_attribution else ["尚无已实现且绑定决策快照的FIFO批次", "人工未执行差异需存在用户否决记录"],
                 "points": len(points),
-            })
+            }
+            out.append(enrich_performance_period(
+                report,
+                points=points,
+                operations=period_ops,
+                decisions=decisions,
+                reviews=review_records,
+                market_states=market_states,
+                blocked_events=period_blocked_events,
+                version_manifest=version_manifest,
+            ))
         return out
 
     result = {

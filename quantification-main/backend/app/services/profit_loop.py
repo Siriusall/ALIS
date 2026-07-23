@@ -305,7 +305,13 @@ def build_portfolio_reoptimization() -> dict[str, Any]:
     buckets = {str(c.get("symbol") or ""): str(c.get("function_bucket") or "narrative") for c in contracts}
     exposures = {str(item.get("symbol") or ""): item for item in (risk.get("exposures") or [])}
     position_map = {str(item.get("symbol") or ""): item for item in positions}
-    trading_costs = {symbol: 0.0015 for symbol in symbols}
+    from app.services.execution_cost_calibration import active_execution_cost_contract
+    execution_cost_contract = active_execution_cost_contract()
+    one_way_cost = max(
+        0.0003,
+        _safe_float(execution_cost_contract.get("round_trip_rate")) / 2.0,
+    )
+    trading_costs = {symbol: one_way_cost for symbol in symbols}
     try:
         context = live_market_context()
     except Exception:
@@ -343,7 +349,24 @@ def build_portfolio_reoptimization() -> dict[str, Any]:
         crowding=industry_penalty,
     )
     raw_weights = dict(optimizer.get("weights") or {})
-    scaled_weights = {symbol: round(_safe_float(weight) * equity_budget, 8) for symbol, weight in raw_weights.items()}
+    from app.services.portfolio_method_competition import compete_portfolio_methods
+    method_competition = compete_portfolio_methods(
+        returns_by_symbol=returns,
+        expected_returns=expected,
+        current_weights=current_weights,
+        trading_costs=trading_costs,
+        equity_budget=equity_budget,
+        cvar_weights=raw_weights,
+    )
+    scaled_weights = {
+        symbol: round(_safe_float(weight), 8)
+        for symbol, weight in (method_competition.get("weights") or {}).items()
+    }
+    optimizer["method_competition"] = method_competition
+    optimizer["selected_method"] = method_competition.get("selected_method")
+    if method_competition.get("ok"):
+        optimizer["ok"] = True
+        optimizer["status"] = f"selected_{method_competition.get('selected_method')}"
     block_by_symbol = {str(item.get("symbol") or ""): item for item in candidate_blocks}
     # A negative trend estimate may justify holding a diversifier, but never an automatic increase.
     for symbol, target in list(scaled_weights.items()):
@@ -441,8 +464,18 @@ def build_portfolio_reoptimization() -> dict[str, Any]:
     estimated_cost = sum(_safe_float(item["estimated_one_way_cost"]) for item in proposal)
     turnover = sum(abs(_safe_float(item["weight_change"])) for item in proposal)
     expected_improvement = target_expected - current_expected
+    try:
+        from app.services.simulation_ledger_audit import audit_simulation_ledger
+        ledger_audit = audit_simulation_ledger(persist=False)
+    except Exception as exc:
+        ledger_audit = {"ok": False, "status": "error", "issues": [{"message": str(exc)[:300]}]}
     execution_checks = [
         {"key": "market_data", "label": "收盘数据已锁定", "status": "pass" if _latest_trade_date() else "block", "detail": _latest_trade_date() or "缺少完整收盘日"},
+        {"key": "simulation_ledger", "label": "模拟账户账本一致", "status": "pass" if ledger_audit.get("ok") else "block", "detail": (
+            f"现金与 {len(ledger_audit.get('actual_positions') or {})} 个持仓均可由账本独立重算"
+            if ledger_audit.get("ok")
+            else "；".join(str(item.get("message") or "") for item in ledger_audit.get("issues") or []) or "账本审计不可用"
+        )},
         {"key": "optimizer", "label": "组合优化已完成", "status": "pass" if optimizer.get("ok") else "block", "detail": (
             "目标组合改善不足以覆盖成本，保持当前持仓" if (optimizer.get("cost_gate") or {}).get("triggered")
             else f"已生成目标权重（{optimizer.get('status') or 'optimal'}）" if optimizer.get("ok")
@@ -477,6 +510,7 @@ def build_portfolio_reoptimization() -> dict[str, Any]:
             "blocked_candidates": candidate_blocks,
             "admission_policy": "当前持仓、核心池及最近20只有效候选共同优化；行业偏好作为软惩罚，账户与交易安全由执行层硬门控",
         },
+        "execution_cost_contract": execution_cost_contract,
         "risk_budget": {
             "status": risk.get("status"),
             "equity_budget": actual_equity_budget,
@@ -489,7 +523,7 @@ def build_portfolio_reoptimization() -> dict[str, Any]:
 
 
 def build_portfolio_candles(limit: int = 90) -> dict[str, Any]:
-    """Reconstruct account OHLC from actual operations; never backcast today's holdings."""
+    """Reconstruct simulated account OHLC and its point-in-time benchmark."""
     limit = max(20, min(int(limit), 250))
     with business_conn() as c:
         operations = [dict(row) for row in c.execute("""SELECT symbol,side,quantity,price,at,
@@ -498,7 +532,11 @@ def build_portfolio_candles(limit: int = 90) -> dict[str, Any]:
             WHERE UPPER(side) IN ('BUY','SELL') ORDER BY at,id""").fetchall()]
     if not operations:
         return {"ok": True, "schema_version": "portfolio_candles_v1", "series": [], "position_count": 0,
-            "unit": "indexed_account_equity", "base": 100, "data_as_of_date": "", "methodology": "无真实成交记录。"}
+            "unit": "indexed_account_equity", "base": 100, "data_as_of_date": "",
+            "benchmark": {"symbol": "000300.SH", "name": "沪深300", "available": False},
+            "latest_comparison": {},
+            "corporate_actions": {"count": 0, "cash_dividend_total": 0.0, "stock_dividend_shares": 0},
+            "methodology": "无模拟成交账本记录。"}
     symbols = sorted({str(item.get("symbol") or "") for item in operations if item.get("symbol")})
     bars: dict[str, dict[str, dict[str, float]]] = {}
     with data_conn() as c:
@@ -518,9 +556,17 @@ def build_portfolio_candles(limit: int = 90) -> dict[str, Any]:
                 for row in rows if row.get("trade_date") and all(_safe_float(row.get(field)) > 0 for field in ("open", "high", "low", "close"))}
     first_date = str(operations[0].get("at") or "")[:10].replace("-", "")
     dates = sorted({date for symbol_bars in bars.values() for date in symbol_bars if date >= first_date})[-limit:]
+    from app.services.corporate_actions import build_replay_corporate_actions, load_dividend_events
+    dividend_events = load_dividend_events(
+        symbols,
+        as_of_date=dates[-1] if dates else first_date,
+        strict_event_time=True,
+    )
+    corporate_actions = build_replay_corporate_actions(operations, dividend_events)
     cash = _safe_float(get_account_baseline())
     quantities: dict[str, float] = {}
     op_index = 0
+    action_index = 0
     raw_series: list[tuple[str, dict[str, float]]] = []
     for date in dates:
         while op_index < len(operations) and str(operations[op_index].get("at") or "")[:10].replace("-", "") <= date:
@@ -536,6 +582,14 @@ def build_portfolio_candles(limit: int = 90) -> dict[str, Any]:
                 quantities[symbol] = max(0.0, quantities.get(symbol, 0.0) - quantity)
                 cash += amount - fees
             op_index += 1
+        while action_index < len(corporate_actions) and str(corporate_actions[action_index].get("event_date") or "") <= date:
+            action = corporate_actions[action_index]
+            symbol = str(action.get("symbol") or "")
+            if str(action.get("action_type") or "") == "cash_dividend":
+                cash += _safe_float(action.get("cash_amount"))
+            elif str(action.get("action_type") or "") == "stock_dividend":
+                quantities[symbol] = quantities.get(symbol, 0.0) + int(action.get("share_quantity") or 0)
+            action_index += 1
         point = {field: cash for field in ("open", "high", "low", "close")}
         complete = True
         for symbol, quantity in quantities.items():
@@ -555,15 +609,133 @@ def build_portfolio_candles(limit: int = 90) -> dict[str, Any]:
         **{field: round(point[field] / base * 100.0, 4) if base > 0 else 0.0 for field in ("open", "high", "low", "close")},
         "change_pct": round((point["close"] / raw_series[index - 1][1]["close"] - 1) * 100, 4) if index > 0 else 0.0,
     } for index, (date, point) in enumerate(raw_series)]
+    benchmark_closes = _load_point_in_time_benchmark_closes([item["date"] for item in series])
+    series, latest_comparison = _attach_benchmark_series(series, benchmark_closes)
     return {
         "ok": True,
-        "schema_version": "portfolio_candles_v1",
+        "schema_version": "portfolio_candles_v2",
         "series": series,
         "position_count": len([quantity for quantity in quantities.values() if quantity > 0]),
         "unit": "indexed_account_equity",
         "base": 100,
         "data_as_of_date": series[-1]["date"] if series else "",
-        "methodology": "从首笔真实成交开始逐日重放买卖和现金，聚合当日持仓开高低收；首日归一化为100。",
+        "benchmark": {
+            "symbol": "000300.SH",
+            "name": "沪深300",
+            "available": bool(benchmark_closes),
+            "point_in_time_cutoff": "每个交易日15:00",
+        },
+        "latest_comparison": latest_comparison,
+        "corporate_actions": {
+            "count": len(corporate_actions),
+            "cash_dividend_total": round(sum(_safe_float(item.get("cash_amount")) for item in corporate_actions), 2),
+            "stock_dividend_shares": sum(int(item.get("share_quantity") or 0) for item in corporate_actions),
+            "policy": "现金分红在派息日入账，送股在除权日增加数量；资格按股权登记日模拟持仓冻结。",
+        },
+        "methodology": "从首笔模拟成交开始逐日重放买卖、费用、分红和现金，聚合当日持仓开高低收；账户与点时沪深300均在共同首日归一化为100。",
+    }
+
+
+def _load_point_in_time_benchmark_closes(dates: list[str]) -> dict[str, float]:
+    normalized_dates = sorted({str(value or "").replace("-", "")[:8] for value in dates if value})
+    if not normalized_dates:
+        return {}
+    try:
+        with data_conn() as c:
+            rows = [
+                dict(row) for row in c.execute(
+                    """SELECT id,trade_date,payload_json,available_time
+                       FROM dc_tushare_raw_records
+                       WHERE api_name='index_daily' AND ts_code='000300.SH'
+                         AND trade_date>=? AND trade_date<=?
+                       ORDER BY trade_date,available_time,id""",
+                    (normalized_dates[0], normalized_dates[-1]),
+                ).fetchall()
+            ]
+    except Exception:
+        return {}
+    wanted = set(normalized_dates)
+    result: dict[str, float] = {}
+    for row in rows:
+        trade_date = str(row.get("trade_date") or "").replace("-", "")[:8]
+        if trade_date not in wanted or not _available_by_market_close(row.get("available_time"), trade_date):
+            continue
+        try:
+            close = float(json.loads(str(row.get("payload_json") or "{}")).get("close") or 0)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if close > 0:
+            result[trade_date] = close
+    return result
+
+
+def _available_by_market_close(value: Any, trade_date: str) -> bool:
+    if not value:
+        return False
+    try:
+        available = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        cutoff = datetime.strptime(str(trade_date), "%Y%m%d").replace(hour=15)
+        if available.tzinfo is not None:
+            cutoff = cutoff.replace(tzinfo=available.tzinfo)
+        return available <= cutoff
+    except (TypeError, ValueError):
+        return False
+
+
+def _attach_benchmark_series(
+    series: list[dict[str, Any]],
+    benchmark_closes: dict[str, float],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    common = [
+        item for item in series
+        if _safe_float(benchmark_closes.get(str(item.get("date") or ""))) > 0
+    ]
+    if not common:
+        return series, {}
+    benchmark_base = _safe_float(benchmark_closes[str(common[0]["date"])])
+    previous_benchmark_index: float | None = None
+    enriched: list[dict[str, Any]] = []
+    for item in series:
+        output = dict(item)
+        raw_close = _safe_float(benchmark_closes.get(str(item.get("date") or "")))
+        if raw_close > 0 and benchmark_base > 0:
+            benchmark_index = raw_close / benchmark_base * 100.0
+            benchmark_change = (
+                (benchmark_index / previous_benchmark_index - 1.0) * 100.0
+                if previous_benchmark_index and previous_benchmark_index > 0 else 0.0
+            )
+            portfolio_close = _safe_float(item.get("close"))
+            output.update({
+                "benchmark_close": round(benchmark_index, 4),
+                "benchmark_change_pct": round(benchmark_change, 4),
+                "excess_close": round(portfolio_close - benchmark_index, 4),
+                "excess_change_pct": round(_safe_float(item.get("change_pct")) - benchmark_change, 4),
+            })
+            previous_benchmark_index = benchmark_index
+        else:
+            output.update({
+                "benchmark_close": None,
+                "benchmark_change_pct": None,
+                "excess_close": None,
+                "excess_change_pct": None,
+            })
+        enriched.append(output)
+    latest = next(
+        (item for item in reversed(enriched) if item.get("benchmark_close") is not None),
+        None,
+    )
+    if not latest:
+        return enriched, {}
+    portfolio_return = _safe_float(latest.get("close")) - 100.0
+    benchmark_return = _safe_float(latest.get("benchmark_close")) - 100.0
+    return enriched, {
+        "date": latest.get("date"),
+        "portfolio_return_pct": round(portfolio_return, 4),
+        "benchmark_return_pct": round(benchmark_return, 4),
+        "excess_return_pct": round(portfolio_return - benchmark_return, 4),
+        "portfolio_daily_return_pct": latest.get("change_pct"),
+        "benchmark_daily_return_pct": latest.get("benchmark_change_pct"),
+        "daily_excess_return_pct": latest.get("excess_change_pct"),
     }
 
 
@@ -635,10 +807,16 @@ def materialize_daily_rebalance_plan(portfolio: dict[str, Any] | None = None) ->
     planned_execute_at = _planned_execute_at(planned_execute_date)
     portfolio = portfolio or build_portfolio_reoptimization()
     proposal = portfolio.get("rebalance_proposal") or []
+    from app.services.decision_version_manifest import build_decision_version_manifest
+    decision_version_manifest = build_decision_version_manifest(
+        trade_date=trade_date,
+        portfolio=portfolio,
+    )
     contract = {
         "trade_date": trade_date,
         "proposal": proposal,
         "risk_budget": portfolio.get("risk_budget") or {},
+        "decision_version_manifest": decision_version_manifest,
     }
     canonical = json.dumps(contract, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     input_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
@@ -679,6 +857,7 @@ def materialize_daily_rebalance_plan(portfolio: dict[str, Any] | None = None) ->
         "generated_at": row.get("generated_at"),
         "executed_at": row.get("executed_at"),
         "input_hash": input_hash,
+        "decision_version_manifest": decision_version_manifest,
         "generation_policy": "以最近完整收盘数据生成；输入未变化则复用，变化才升版本",
         "execution_policy": (
             f"执行日{effective_rebalance_clock().strftime('%H:%M')}后检查；"
@@ -730,6 +909,7 @@ def get_daily_rebalance_execution_input(signal_date: str, execute_date: str) -> 
         "target_weights": target_weights,
         "proposal": proposal,
         "risk_budget": contract.get("risk_budget") or {},
+        "decision_version_manifest": contract.get("decision_version_manifest") or {},
     }
 
 
@@ -805,6 +985,7 @@ def build_profit_loop() -> dict[str, Any]:
     monitor = build_model_live_monitor()
     portfolio = build_portfolio_reoptimization()
     rebalance_plan = materialize_daily_rebalance_plan(portfolio)
+    portfolio_candles = build_portfolio_candles()
     sells = build_sell_rebalance_diagnostics(monitor, portfolio)
     learning = build_simulation_learning_loop()
     model_contribution = build_model_return_contribution()
@@ -816,6 +997,7 @@ def build_profit_loop() -> dict[str, Any]:
         "model_monitor": monitor,
         "model_return_contribution": model_contribution,
         "portfolio_optimization": portfolio,
+        "portfolio_candles": portfolio_candles,
         "rebalance_plan": rebalance_plan,
         "sell_rebalance": sells,
         "learning": learning,

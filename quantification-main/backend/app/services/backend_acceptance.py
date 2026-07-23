@@ -6,6 +6,7 @@ from typing import Any
 from app.data_platform.db import _conn as data_conn
 from app.db.store import _conn as business_conn, get_account_baseline, list_model_versions
 from app.services.market_context import market_state_model_governance
+from app.services.simulation_ledger_audit import audit_simulation_ledger
 
 
 def _check(key: str, name: str, passed: bool, evidence: dict[str, Any], *, partial: bool = False, requirement: str = "") -> dict[str, Any]:
@@ -42,7 +43,24 @@ def backend_acceptance_matrix() -> dict[str, Any]:
     checks.append(_check("P3_CAPITAL", "模拟盘初始资金", abs(float(get_account_baseline()) - 200000.0) < .01, {"baseline": get_account_baseline()}, requirement="V1初始资金固定200000元"))
     checks.append(_check("P3_DEFENSIVE", "防御资产数据", defensive == 5, {"ready_asset_count": defensive, "required": 5}, partial=defensive > 0, requirement="货币、债券、黄金、低波和红利ETF"))
     checks.append(_check("P3_DECISION", "决策证据快照", decisions > 0, {"snapshots": decisions}, requirement="决策具备证据、版本、置信度和可回放快照"))
-    checks.append(_check("P3_LEDGER", "唯一模拟执行账本", int(operations.get("count") or 0) == int(operations.get("unique_count") or 0), {"operations": int(operations.get("count") or 0), "unique_operation_uid": int(operations.get("unique_count") or 0)}, requirement="逐笔成交不可重复且费用版本化"))
+    ledger_audit = audit_simulation_ledger(persist=False)
+    ledger_passed = (
+        int(operations.get("count") or 0) == int(operations.get("unique_count") or 0)
+        and bool(ledger_audit.get("ok"))
+    )
+    checks.append(_check(
+        "P3_LEDGER",
+        "唯一模拟执行账本",
+        ledger_passed,
+        {
+            "operations": int(operations.get("count") or 0),
+            "unique_operation_uid": int(operations.get("unique_count") or 0),
+            "independent_replay_status": ledger_audit.get("status"),
+            "cash_drift": ledger_audit.get("cash_drift"),
+            "position_drift_count": len(ledger_audit.get("position_deltas") or []),
+        },
+        requirement="逐笔成交不可重复、费用版本化，且现金与持仓可由成交及公司行动独立重算",
+    ))
     report_types = {str(dict(row).get("period_type") or "") for row in report_rows}
     required_types = {"weekly", "monthly", "yearly"}
     complete_reports = 0

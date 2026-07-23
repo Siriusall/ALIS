@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from datetime import date
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
@@ -15,6 +16,9 @@ logger = logging.getLogger("quant.factor_engine")
 from app.services.cache_consolidation import read_consolidated_cache
 from app.services.daily_data import DailyBar, get_daily_bars_lookback  # DailyCacheNotReadyError 由调用方捕获
 from app.services.strategy_config import ParsedStrategyConfig, parse_strategy_content
+from app.services.factor_platform import compute_registered_factor
+from app.services.backtest_data_source import HistBar, SnapshotRow
+from app.db.store import _conn as business_conn
 from app.services.tushare_snapshot import get_daily_snapshot, get_latest_cached_snapshot_date
 from app.services.tushare_snapshot import DailySnapshotRow
 from app.services.tushare_universe import build_index_membership_set
@@ -46,6 +50,8 @@ class FactorContext:
     """因子计算上下文：截面行情 + 日线历史面板，供需要横截面或历史的因子使用。"""
     quotes: List[StockQuote]
     daily_bars: Dict[str, List[DailyBar]]  # symbol -> 按日期升序的 DailyBar 列表
+    benchmark_return: float | None = None
+    benchmark_returns: List[float] | None = None
 
 
 # 因子函数签名：(symbol, hist, today, context) -> float
@@ -88,12 +94,33 @@ def _load_consolidated_rows(symbols: List[str]) -> Dict[str, Dict[str, Any]]:
     payload = read_consolidated_cache(date=trade_date, symbols=symbols)
     data = payload.get("data") if isinstance(payload, dict) else None
     per_day = data.get(trade_date) if isinstance(data, dict) else None
-    if not isinstance(per_day, dict):
-        return {}
     out: Dict[str, Dict[str, Any]] = {}
-    for sym, row in per_day.items():
-        if isinstance(row, dict):
-            out[_norm_symbol(str(sym))] = row
+    if isinstance(per_day, dict):
+        for sym, row in per_day.items():
+            if isinstance(row, dict):
+                out[_norm_symbol(str(sym))] = row
+    # The versioned materialization is the authoritative source when present.
+    # Legacy all-in-one fields remain a compatibility fallback during rollout.
+    try:
+        normalized = sorted({_norm_symbol(symbol) for symbol in symbols if _norm_symbol(symbol)})
+        for offset in range(0, len(normalized), 500):
+            batch = normalized[offset: offset + 500]
+            placeholders = ",".join("?" for _ in batch)
+            with business_conn() as conn:
+                rows = conn.execute(
+                    f"""SELECT v.ts_code,d.factor_key,v.raw_value
+                        FROM factor_values v
+                        JOIN factor_definitions d ON d.id=v.factor_definition_id
+                        WHERE v.trade_date=? AND d.status='active'
+                          AND v.ts_code IN ({placeholders})""",
+                    (trade_date, *batch),
+                ).fetchall()
+            for item in rows:
+                record = dict(item)
+                symbol = _norm_symbol(str(record.get("ts_code") or ""))
+                out.setdefault(symbol, {})[str(record.get("factor_key") or "")] = record.get("raw_value")
+    except Exception as exc:
+        logger.debug("versioned factor materialization unavailable: %s", str(exc)[:120])
     return out
 
 
@@ -138,13 +165,7 @@ def _factor_momentum_5(
     today: Optional[StockQuote],
     context: FactorContext,
 ) -> float:
-    if len(hist) < 5:
-        return 0.0
-    close_5_ago = hist[-5].close
-    if close_5_ago <= 0:
-        return 0.0
-    current = today.price if today else hist[-1].close
-    return (current / close_5_ago) - 1.0
+    return _unified_factor("momentum_5", symbol, hist, today, context)
 
 
 def _factor_momentum_20(
@@ -153,13 +174,7 @@ def _factor_momentum_20(
     today: Optional[StockQuote],
     context: FactorContext,
 ) -> float:
-    if len(hist) < 20:
-        return 0.0
-    close_20_ago = hist[-20].close
-    if close_20_ago <= 0:
-        return 0.0
-    current = today.price if today else hist[-1].close
-    return (current / close_20_ago) - 1.0
+    return _unified_factor("momentum_20", symbol, hist, today, context)
 
 
 def _factor_volatility_20(
@@ -168,20 +183,7 @@ def _factor_volatility_20(
     today: Optional[StockQuote],
     context: FactorContext,
 ) -> float:
-    if len(hist) < 2:
-        return 0.0
-    closes = [bar.close for bar in hist]
-    if today:
-        closes = closes + [today.price]
-    returns: List[float] = []
-    for i in range(1, len(closes)):
-        if closes[i - 1] > 0:
-            returns.append((closes[i] / closes[i - 1]) - 1.0)
-    if not returns:
-        return 0.0
-    mean_ret = sum(returns) / len(returns)
-    var = sum((r - mean_ret) ** 2 for r in returns) / len(returns)
-    return var ** 0.5 if var >= 0 else 0.0
+    return _unified_factor("volatility_20", symbol, hist, today, context)
 
 
 def _factor_volume_ratio_5(
@@ -190,12 +192,98 @@ def _factor_volume_ratio_5(
     today: Optional[StockQuote],
     context: FactorContext,
 ) -> float:
-    if len(hist) < 5 or not today or today.volume <= 0:
-        return 0.0
-    avg_vol = sum(bar.volume for bar in hist[-5:]) / 5
-    if avg_vol <= 0:
-        return 0.0
-    return today.volume / avg_vol
+    return _unified_factor("volume_ratio_5", symbol, hist, today, context)
+
+
+def _unified_factor(
+    key: str,
+    symbol: str,
+    hist: List[DailyBar],
+    today: Optional[StockQuote],
+    context: FactorContext,
+) -> float:
+    current_close = float(today.price) if today else float(hist[-1].close if hist else 0)
+    current_volume = float(today.volume) if today else float(hist[-1].volume if hist else 0)
+    row = SnapshotRow(
+        symbol=symbol,
+        date=str(date.today()),
+        open=current_close,
+        high=current_close,
+        low=current_close,
+        close=current_close,
+        prev_close=current_close,
+        change_pct=float(today.change_pct) if today else 0.0,
+        volume=current_volume,
+        turnover=float(today.turnover) if today else 0.0,
+        name=str(today.name) if today else "",
+    )
+    bars = [
+        HistBar(
+            date=str(getattr(item, "date", "")),
+            open=float(item.close), high=float(item.close), low=float(item.close),
+            close=float(item.close), volume=float(item.volume),
+            turnover=float(getattr(item, "turnover", 0) or 0),
+        )
+        for item in hist
+    ]
+    snapshot = _ensure_snapshot(symbol, context)
+    daily_basic = {
+        symbol: {
+            "float_mv": float(getattr(snapshot, "float_mv", 0) or 0) if snapshot else 0,
+            "total_mv": float(getattr(snapshot, "total_mv", 0) or 0) if snapshot else 0,
+            "pe_ttm": float(getattr(snapshot, "pe_ttm", 0) or 0) if snapshot else 0,
+            "pb": float(getattr(snapshot, "pb", 0) or 0) if snapshot else 0,
+            "turnover_rate": float(getattr(snapshot, "turnover_rate", 0) or 0) if snapshot else 0,
+        }
+    }
+    return compute_registered_factor(
+        key,
+        row,
+        bars,
+        daily_basic,
+        benchmark_return=context.benchmark_return,
+        benchmark_returns=context.benchmark_returns,
+    )
+
+
+def _factor_momentum_60(symbol: str, hist: List[DailyBar], today: Optional[StockQuote], context: FactorContext) -> float:
+    return _unified_factor("momentum_60", symbol, hist, today, context)
+
+
+def _factor_momentum_120(symbol: str, hist: List[DailyBar], today: Optional[StockQuote], context: FactorContext) -> float:
+    return _unified_factor("momentum_120", symbol, hist, today, context)
+
+
+def _factor_relative_strength_60(symbol: str, hist: List[DailyBar], today: Optional[StockQuote], context: FactorContext) -> float:
+    return _unified_factor("relative_strength_60", symbol, hist, today, context)
+
+
+def _factor_beta_60(symbol: str, hist: List[DailyBar], today: Optional[StockQuote], context: FactorContext) -> float:
+    return _unified_factor("beta_60", symbol, hist, today, context)
+
+
+def _factor_turnover_rate(symbol: str, hist: List[DailyBar], today: Optional[StockQuote], context: FactorContext) -> float:
+    return _unified_factor("turnover_rate", symbol, hist, today, context)
+
+
+def _factor_total_mv(symbol: str, hist: List[DailyBar], today: Optional[StockQuote], context: FactorContext) -> float:
+    return _unified_factor("total_mv", symbol, hist, today, context)
+
+
+def _factor_downside_volatility_60(symbol: str, hist: List[DailyBar], today: Optional[StockQuote], context: FactorContext) -> float:
+    return _unified_factor("downside_volatility_60", symbol, hist, today, context)
+
+
+def _factor_max_drawdown_60(symbol: str, hist: List[DailyBar], today: Optional[StockQuote], context: FactorContext) -> float:
+    return _unified_factor("max_drawdown_60", symbol, hist, today, context)
+
+
+def _factor_earnings_yield(symbol: str, hist: List[DailyBar], today: Optional[StockQuote], context: FactorContext) -> float:
+    return _unified_factor("earnings_yield", symbol, hist, today, context)
+
+
+def _factor_book_to_price(symbol: str, hist: List[DailyBar], today: Optional[StockQuote], context: FactorContext) -> float:
+    return _unified_factor("book_to_price", symbol, hist, today, context)
 
 
 # ---------- TuShare 截面因子（市值/估值/状态/指数成分）----------
@@ -326,13 +414,23 @@ def _factor_in_csi500(
 FACTOR_REGISTRY: Dict[str, FactorFn] = {
     "volume": _factor_volume,
     "turnover": _factor_turnover,
+    "turnover_rate": _factor_turnover_rate,
     "change_pct": _factor_change_pct,
     "momentum_5": _factor_momentum_5,
     "momentum_20": _factor_momentum_20,
+    "momentum_60": _factor_momentum_60,
+    "momentum_120": _factor_momentum_120,
+    "relative_strength_60": _factor_relative_strength_60,
     "volatility_20": _factor_volatility_20,
+    "downside_volatility_60": _factor_downside_volatility_60,
+    "max_drawdown_60": _factor_max_drawdown_60,
+    "beta_60": _factor_beta_60,
+    "earnings_yield": _factor_earnings_yield,
+    "book_to_price": _factor_book_to_price,
     "volume_ratio_5": _factor_volume_ratio_5,
     # TuShare 截面因子
     "float_mv": _factor_float_mv,
+    "total_mv": _factor_total_mv,
     "pe_ttm": _factor_pe_ttm,
     "pb": _factor_pb,
     "is_st": _factor_is_st,
@@ -344,7 +442,12 @@ FACTOR_REGISTRY: Dict[str, FactorFn] = {
 }
 
 # 需要日线历史的因子（用于决定是否拉取 daily_bars）
-FACTORS_NEED_HISTORY = {"momentum_5", "momentum_20", "volatility_20", "volume_ratio_5"}
+FACTORS_NEED_HISTORY = {
+    "momentum_5", "momentum_20", "momentum_60", "momentum_120",
+    "relative_strength_60", "volatility_20", "downside_volatility_60",
+    "max_drawdown_60", "beta_60",
+    "volume_ratio_5",
+}
 
 # 单次选股拉取日线的标的数上限（全市场约 5000+，设 10000 即不截断）
 _DAILY_BARS_SYMBOL_CAP = 10000
@@ -682,7 +785,20 @@ def score_factors_with_strategy(
             bars_ok,
         )
 
-    context = FactorContext(quotes=quotes, daily_bars=daily_bars)
+    benchmark_returns: List[float] = []
+    if required_factors & {"beta_60", "relative_strength_60"}:
+        benchmark_source = BacktestDataSource()
+        benchmark_returns = benchmark_source.get_index_returns("000300.SH", end_date, lookback=60)
+    benchmark_return = (
+        math.prod(1.0 + value for value in benchmark_returns) - 1.0
+        if benchmark_returns else None
+    )
+    context = FactorContext(
+        quotes=quotes,
+        daily_bars=daily_bars,
+        benchmark_return=benchmark_return,
+        benchmark_returns=benchmark_returns,
+    )
     quote_by_symbol = {q.symbol: q for q in quotes}
     factor_values_by_symbol: Dict[str, Dict[str, float]] = {}
 

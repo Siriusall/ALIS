@@ -18,14 +18,46 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse, unquote
 
-from app.core.a_share_fees import FEE_SCHEDULE_VERSION, commission, stamp_tax, transfer_fee
+from app.core.a_share_fees import (
+    ETF_FEE_SCHEDULE_VERSION,
+    FEE_SCHEDULE_VERSION,
+    commission,
+    is_exchange_etf,
+    stamp_tax,
+    transfer_fee,
+)
 from app.core.config import settings
 from app.core.trade_calendar import get_last_trade_date
 
 logger = logging.getLogger("quant")
 
-_DEFAULT_STRATEGY_NAME = "默认策略"
-_DEFAULT_STRATEGY_CONTENT = {"volume": 0.4, "turnover": 0.4, "change_pct": 0.2}
+_DEFAULT_STRATEGY_NAME = "ALIS Champion 综合策略"
+_LEGACY_DEFAULT_STRATEGY_NAME = "默认策略"
+_DEFAULT_STRATEGY_CONTENT = {
+    "schema_version": "alis_champion_selection_v1",
+    "universe": {"exchange_group": "HS", "exclude_st": True, "exclude_suspended": True},
+    "filters": [
+        {"factor": "is_st", "op": "==", "value": 0},
+        {"factor": "is_suspended", "op": "==", "value": 0},
+    ],
+    "score": {"factors": {
+        "momentum_20": 0.25,
+        "momentum_5": 0.10,
+        "volume_ratio_5": 0.10,
+        "turnover": 0.10,
+        "float_mv": 0.05,
+        "total_mv": 0.05,
+        "pe_ttm": -0.05,
+        "pb": -0.05,
+        "volatility_20": -0.15,
+        "change_pct": 0.05,
+    }},
+    "rebalance": {"freq": "daily", "top_n": 20},
+    "lookback_days": 60,
+    "strategy_controller": "strategy_controller",
+    "portfolio_optimizer": "empirical_cvar_slsqp_v2",
+    "execution_contract": "t_close_signal_t_plus_1_open_v1",
+}
 
 
 def _json_load(s: Any, default: Any) -> Any:
@@ -659,6 +691,130 @@ CREATE TABLE IF NOT EXISTS model_train_runs (
     updated_at TEXT NOT NULL,
     FOREIGN KEY (model_version_id) REFERENCES model_versions(id)
 );
+CREATE TABLE IF NOT EXISTS evolution_tasks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_type TEXT NOT NULL,
+    dedupe_key TEXT NOT NULL,
+    status TEXT NOT NULL,
+    phase TEXT NOT NULL DEFAULT '',
+    progress REAL NOT NULL DEFAULT 0,
+    message TEXT NOT NULL DEFAULT '',
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    checkpoint_json TEXT NOT NULL DEFAULT '{}',
+    result_json TEXT NOT NULL DEFAULT '{}',
+    error TEXT,
+    attempt INTEGER NOT NULL DEFAULT 0,
+    max_attempts INTEGER NOT NULL DEFAULT 3,
+    priority INTEGER NOT NULL DEFAULT 100,
+    stop_requested INTEGER NOT NULL DEFAULT 0,
+    deadline_at TEXT,
+    lease_owner TEXT,
+    lease_expires_at TEXT,
+    heartbeat_at TEXT,
+    next_run_at TEXT,
+    started_at TEXT,
+    finished_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_evolution_tasks_status_next
+ON evolution_tasks(status, next_run_at, priority, created_at);
+CREATE TABLE IF NOT EXISTS strategy_shadow_observations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    model_version_id INTEGER NOT NULL,
+    champion_version_id INTEGER NOT NULL,
+    trade_date TEXT NOT NULL,
+    candidate_return REAL NOT NULL DEFAULT 0,
+    champion_return REAL NOT NULL DEFAULT 0,
+    excess_delta REAL NOT NULL DEFAULT 0,
+    candidate_drawdown REAL NOT NULL DEFAULT 0,
+    champion_drawdown REAL NOT NULL DEFAULT 0,
+    point_in_time_passed INTEGER NOT NULL DEFAULT 0,
+    behavior_passed INTEGER NOT NULL DEFAULT 0,
+    metrics_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (model_version_id) REFERENCES model_versions(id),
+    FOREIGN KEY (champion_version_id) REFERENCES model_versions(id)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_strategy_shadow_observation
+ON strategy_shadow_observations(model_version_id, trade_date);
+CREATE TABLE IF NOT EXISTS strategy_promotion_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_type TEXT NOT NULL,
+    from_champion_version_id INTEGER,
+    to_champion_version_id INTEGER,
+    candidate_model_version_id INTEGER,
+    reason_json TEXT NOT NULL DEFAULT '{}',
+    evidence_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_strategy_promotion_events_created
+ON strategy_promotion_events(created_at);
+CREATE TABLE IF NOT EXISTS factor_definitions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    factor_key TEXT NOT NULL,
+    version TEXT NOT NULL,
+    status TEXT NOT NULL,
+    name_cn TEXT NOT NULL,
+    category TEXT NOT NULL,
+    formula_json TEXT NOT NULL DEFAULT '{}',
+    inputs_json TEXT NOT NULL DEFAULT '[]',
+    direction INTEGER NOT NULL DEFAULT 1,
+    window_sessions INTEGER NOT NULL DEFAULT 1,
+    available_time_rule TEXT NOT NULL,
+    missing_policy TEXT NOT NULL,
+    leakage_status TEXT NOT NULL DEFAULT 'passed',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_factor_definition_version
+ON factor_definitions(factor_key, version);
+CREATE INDEX IF NOT EXISTS idx_factor_definition_status
+ON factor_definitions(status, factor_key);
+CREATE TABLE IF NOT EXISTS factor_values (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    factor_definition_id INTEGER NOT NULL,
+    trade_date TEXT NOT NULL,
+    ts_code TEXT NOT NULL,
+    raw_value REAL,
+    standardized_value REAL,
+    available_time TEXT NOT NULL,
+    input_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (factor_definition_id) REFERENCES factor_definitions(id)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_factor_value
+ON factor_values(factor_definition_id, trade_date, ts_code);
+CREATE INDEX IF NOT EXISTS idx_factor_values_date
+ON factor_values(trade_date, factor_definition_id);
+CREATE TABLE IF NOT EXISTS factor_evaluations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    factor_definition_id INTEGER NOT NULL,
+    start_date TEXT NOT NULL,
+    end_date TEXT NOT NULL,
+    sample_count INTEGER NOT NULL DEFAULT 0,
+    information_coefficient REAL,
+    rank_ic REAL,
+    top_bottom_return REAL,
+    turnover REAL,
+    coverage REAL,
+    cost_after_incremental_oos REAL,
+    market_state_json TEXT NOT NULL DEFAULT '{}',
+    status TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (factor_definition_id) REFERENCES factor_definitions(id)
+);
+CREATE INDEX IF NOT EXISTS idx_factor_evaluations_factor
+ON factor_evaluations(factor_definition_id, end_date);
+CREATE TABLE IF NOT EXISTS factor_version_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    factor_definition_id INTEGER NOT NULL,
+    event_type TEXT NOT NULL,
+    reason_json TEXT NOT NULL DEFAULT '{}',
+    evidence_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (factor_definition_id) REFERENCES factor_definitions(id)
+);
 """
 
 _MYSQL_DDL = """
@@ -816,6 +972,122 @@ CREATE TABLE IF NOT EXISTS model_train_runs (
     updated_at VARCHAR(64) NOT NULL,
     FOREIGN KEY (model_version_id) REFERENCES model_versions(id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+CREATE TABLE IF NOT EXISTS evolution_tasks (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    task_type VARCHAR(64) NOT NULL,
+    dedupe_key VARCHAR(255) NOT NULL,
+    status VARCHAR(32) NOT NULL,
+    phase VARCHAR(64) NOT NULL DEFAULT '',
+    progress DOUBLE NOT NULL DEFAULT 0,
+    message TEXT NOT NULL,
+    payload_json LONGTEXT NOT NULL,
+    checkpoint_json LONGTEXT NOT NULL,
+    result_json LONGTEXT NOT NULL,
+    error TEXT NULL,
+    attempt INT NOT NULL DEFAULT 0,
+    max_attempts INT NOT NULL DEFAULT 3,
+    priority INT NOT NULL DEFAULT 100,
+    stop_requested TINYINT NOT NULL DEFAULT 0,
+    deadline_at VARCHAR(64) NULL,
+    lease_owner VARCHAR(128) NULL,
+    lease_expires_at VARCHAR(64) NULL,
+    heartbeat_at VARCHAR(64) NULL,
+    next_run_at VARCHAR(64) NULL,
+    started_at VARCHAR(64) NULL,
+    finished_at VARCHAR(64) NULL,
+    created_at VARCHAR(64) NOT NULL,
+    updated_at VARCHAR(64) NOT NULL,
+    INDEX idx_evolution_tasks_status_next (status, next_run_at, priority, created_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+CREATE TABLE IF NOT EXISTS strategy_shadow_observations (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    model_version_id BIGINT NOT NULL,
+    champion_version_id BIGINT NOT NULL,
+    trade_date VARCHAR(16) NOT NULL,
+    candidate_return DOUBLE NOT NULL DEFAULT 0,
+    champion_return DOUBLE NOT NULL DEFAULT 0,
+    excess_delta DOUBLE NOT NULL DEFAULT 0,
+    candidate_drawdown DOUBLE NOT NULL DEFAULT 0,
+    champion_drawdown DOUBLE NOT NULL DEFAULT 0,
+    point_in_time_passed TINYINT NOT NULL DEFAULT 0,
+    behavior_passed TINYINT NOT NULL DEFAULT 0,
+    metrics_json LONGTEXT NOT NULL,
+    created_at VARCHAR(64) NOT NULL,
+    UNIQUE KEY uq_strategy_shadow_observation (model_version_id, trade_date),
+    FOREIGN KEY (model_version_id) REFERENCES model_versions(id),
+    FOREIGN KEY (champion_version_id) REFERENCES model_versions(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+CREATE TABLE IF NOT EXISTS strategy_promotion_events (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    event_type VARCHAR(32) NOT NULL,
+    from_champion_version_id BIGINT,
+    to_champion_version_id BIGINT,
+    candidate_model_version_id BIGINT,
+    reason_json LONGTEXT NOT NULL,
+    evidence_json LONGTEXT NOT NULL,
+    created_at VARCHAR(64) NOT NULL,
+    INDEX idx_strategy_promotion_events_created (created_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+CREATE TABLE IF NOT EXISTS factor_definitions (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    factor_key VARCHAR(128) NOT NULL,
+    version VARCHAR(64) NOT NULL,
+    status VARCHAR(32) NOT NULL,
+    name_cn VARCHAR(255) NOT NULL,
+    category VARCHAR(64) NOT NULL,
+    formula_json LONGTEXT NOT NULL,
+    inputs_json LONGTEXT NOT NULL,
+    direction INT NOT NULL DEFAULT 1,
+    window_sessions INT NOT NULL DEFAULT 1,
+    available_time_rule VARCHAR(128) NOT NULL,
+    missing_policy VARCHAR(128) NOT NULL,
+    leakage_status VARCHAR(32) NOT NULL DEFAULT 'passed',
+    created_at VARCHAR(64) NOT NULL,
+    updated_at VARCHAR(64) NOT NULL,
+    UNIQUE KEY uq_factor_definition_version (factor_key, version),
+    INDEX idx_factor_definition_status (status, factor_key)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+CREATE TABLE IF NOT EXISTS factor_values (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    factor_definition_id BIGINT NOT NULL,
+    trade_date VARCHAR(16) NOT NULL,
+    ts_code VARCHAR(32) NOT NULL,
+    raw_value DOUBLE,
+    standardized_value DOUBLE,
+    available_time VARCHAR(64) NOT NULL,
+    input_hash VARCHAR(64) NOT NULL,
+    created_at VARCHAR(64) NOT NULL,
+    UNIQUE KEY uq_factor_value (factor_definition_id, trade_date, ts_code),
+    INDEX idx_factor_values_date (trade_date, factor_definition_id),
+    FOREIGN KEY (factor_definition_id) REFERENCES factor_definitions(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+CREATE TABLE IF NOT EXISTS factor_evaluations (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    factor_definition_id BIGINT NOT NULL,
+    start_date VARCHAR(16) NOT NULL,
+    end_date VARCHAR(16) NOT NULL,
+    sample_count INT NOT NULL DEFAULT 0,
+    information_coefficient DOUBLE,
+    rank_ic DOUBLE,
+    top_bottom_return DOUBLE,
+    turnover DOUBLE,
+    coverage DOUBLE,
+    cost_after_incremental_oos DOUBLE,
+    market_state_json LONGTEXT NOT NULL,
+    status VARCHAR(32) NOT NULL,
+    created_at VARCHAR(64) NOT NULL,
+    INDEX idx_factor_evaluations_factor (factor_definition_id, end_date),
+    FOREIGN KEY (factor_definition_id) REFERENCES factor_definitions(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+CREATE TABLE IF NOT EXISTS factor_version_events (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    factor_definition_id BIGINT NOT NULL,
+    event_type VARCHAR(32) NOT NULL,
+    reason_json LONGTEXT NOT NULL,
+    evidence_json LONGTEXT NOT NULL,
+    created_at VARCHAR(64) NOT NULL,
+    FOREIGN KEY (factor_definition_id) REFERENCES factor_definitions(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 """
 
 
@@ -858,6 +1130,8 @@ def init_db() -> None:
                 ALTER TABLE operations ADD COLUMN IF NOT EXISTS fee_schedule_version VARCHAR(64) NOT NULL DEFAULT '';
                 ALTER TABLE operations ADD COLUMN IF NOT EXISTS operation_uid VARCHAR(64);
                 ALTER TABLE operations ALTER COLUMN execution_id DROP NOT NULL;
+                ALTER TABLE evolution_tasks ADD COLUMN IF NOT EXISTS stop_requested INTEGER NOT NULL DEFAULT 0;
+                ALTER TABLE evolution_tasks ADD COLUMN IF NOT EXISTS deadline_at VARCHAR(64);
                 ALTER TABLE quant_run_task_runs ADD COLUMN IF NOT EXISTS detail_json TEXT NULL;
                 CREATE TABLE IF NOT EXISTS quant_run_task_meta (
                     task_id BIGINT PRIMARY KEY REFERENCES quant_run_tasks(id),
@@ -890,15 +1164,45 @@ def init_db() -> None:
                 # serial sequences behind the copied ids. Reconcile them at
                 # startup so the first new backtest/task cannot collide with
                 # an existing primary key.
-                for table in ("backtests", "executions", "operations", "quant_run_tasks", "quant_run_task_runs", "model_train_runs"):
+                for table in (
+                    "backtests", "executions", "operations", "quant_run_tasks",
+                    "quant_run_task_runs", "model_train_runs", "evolution_tasks",
+                    "strategy_shadow_observations", "strategy_promotion_events",
+                    "factor_definitions", "factor_values", "factor_evaluations",
+                    "factor_version_events",
+                ):
                     c.execute(
                         "SELECT setval(pg_get_serial_sequence(%s, 'id'), COALESCE((SELECT MAX(id) FROM " + table + "), 1), EXISTS (SELECT 1 FROM " + table + "))",
                         (table,),
                     )
                 c.execute("""CREATE TABLE IF NOT EXISTS quant_performance_reports (
                     id BIGSERIAL PRIMARY KEY, task_id BIGINT NULL, period_type VARCHAR(16) NOT NULL,
+                    scope_key VARCHAR(64) NOT NULL DEFAULT 'global',
                     period VARCHAR(32) NOT NULL, payload_json TEXT NOT NULL, created_at VARCHAR(64) NOT NULL,
-                    UNIQUE(task_id, period_type, period))""")
+                    UNIQUE(scope_key, period_type, period))""")
+                c.execute(
+                    "ALTER TABLE quant_performance_reports ADD COLUMN IF NOT EXISTS scope_key VARCHAR(64) NOT NULL DEFAULT 'global'"
+                )
+                c.execute(
+                    """UPDATE quant_performance_reports
+                       SET scope_key=CASE WHEN task_id IS NULL THEN 'global' ELSE 'task:' || task_id::text END
+                       WHERE scope_key IS NULL OR scope_key='' OR (task_id IS NOT NULL AND scope_key='global')"""
+                )
+                # Performance rows are derived snapshots.  Keep the latest
+                # copy from the legacy NULL-task uniqueness bug, then enforce
+                # one durable row per report scope and period.
+                c.execute(
+                    """DELETE FROM quant_performance_reports older
+                       USING quant_performance_reports newer
+                       WHERE older.scope_key=newer.scope_key
+                         AND older.period_type=newer.period_type
+                         AND older.period=newer.period
+                         AND older.id<newer.id"""
+                )
+                c.execute(
+                    """CREATE UNIQUE INDEX IF NOT EXISTS uq_quant_performance_scope_period
+                       ON quant_performance_reports(scope_key,period_type,period)"""
+                )
                 c.executescript("""
                 CREATE TABLE IF NOT EXISTS investment_theses (
                     id BIGSERIAL PRIMARY KEY, ts_code VARCHAR(16) NOT NULL, title VARCHAR(255) NOT NULL,
@@ -1003,21 +1307,21 @@ def init_db() -> None:
                 c.execute("ALTER TABLE position_state_history ADD COLUMN IF NOT EXISTS automatic_decision_json TEXT NOT NULL DEFAULT '{}'")
                 c.execute("ALTER TABLE position_state_history ADD COLUMN IF NOT EXISTS intervention_type VARCHAR(32) NOT NULL DEFAULT 'none'")
                 c.execute("ALTER TABLE position_state_history ADD COLUMN IF NOT EXISTS intervention_actor VARCHAR(128) NOT NULL DEFAULT ''")
-            cur = c.execute(
-                "SELECT id FROM strategies WHERE name = ?", (_DEFAULT_STRATEGY_NAME,)
-            )
+            cur = c.execute("SELECT id FROM strategies WHERE name = ?", (_DEFAULT_STRATEGY_NAME,))
             if cur.fetchone() is None:
                 now = datetime.now().isoformat()
-                c.execute(
-                    """INSERT INTO strategies (name, type, content, created_at, updated_at)
-                       VALUES (?, 'formula', ?, ?, ?)""",
-                    (
-                        _DEFAULT_STRATEGY_NAME,
-                        json.dumps(_DEFAULT_STRATEGY_CONTENT),
-                        now,
-                        now,
-                    ),
-                )
+                legacy = c.execute("SELECT id FROM strategies WHERE name = ? ORDER BY id LIMIT 1", (_LEGACY_DEFAULT_STRATEGY_NAME,)).fetchone()
+                if legacy:
+                    c.execute(
+                        "UPDATE strategies SET name=?, type='formula', content=?, updated_at=? WHERE id=?",
+                        (_DEFAULT_STRATEGY_NAME, json.dumps(_DEFAULT_STRATEGY_CONTENT, ensure_ascii=False), now, int(legacy["id"])),
+                    )
+                else:
+                    c.execute(
+                        """INSERT INTO strategies (name, type, content, created_at, updated_at)
+                           VALUES (?, 'formula', ?, ?, ?)""",
+                        (_DEFAULT_STRATEGY_NAME, json.dumps(_DEFAULT_STRATEGY_CONTENT, ensure_ascii=False), now, now),
+                    )
         logger.info("数据库初始化完成")
     except Exception as e:
         logger.exception("数据库初始化失败: %s", e)
@@ -1038,11 +1342,11 @@ def database_health() -> dict[str, Any]:
 
 
 def get_default_strategy_id() -> Optional[int]:
-    """Return the id of the default strategy, or None if not found."""
+    """Return the ALIS Champion selection strategy, with legacy fallback."""
     with _conn() as c:
         cur = c.execute(
-            "SELECT id FROM strategies WHERE name = ? LIMIT 1",
-            (_DEFAULT_STRATEGY_NAME,),
+            "SELECT id FROM strategies WHERE name IN (?, ?) ORDER BY CASE WHEN name=? THEN 0 ELSE 1 END, id LIMIT 1",
+            (_DEFAULT_STRATEGY_NAME, _LEGACY_DEFAULT_STRATEGY_NAME, _DEFAULT_STRATEGY_NAME),
         )
         row = cur.fetchone()
         return int(row["id"]) if row else None
@@ -1226,6 +1530,101 @@ def append_operations_to_execution(execution_id: int, executed_at: str, orders: 
             )
             inserted += 1
     return inserted
+
+
+def create_and_apply_buy_execution(
+    strategy_id: int,
+    executed_at: str,
+    budget: float,
+    top_n: int,
+    orders: List[Dict[str, Any]],
+    *,
+    name_by_symbol: Optional[Dict[str, str]] = None,
+) -> int:
+    """Atomically debit cash, persist BUY operations, and project positions."""
+    buy_orders = [
+        item for item in orders
+        if str(item.get("side") or "BUY").upper() == "BUY"
+        and int(item.get("quantity") or 0) > 0
+    ]
+    if not buy_orders:
+        raise ValueError("buy orders are required")
+    total_cost = round(sum(
+        float(item.get("price") or 0) * int(item.get("quantity") or 0)
+        + sum(float(item.get(key) or 0) for key in ("commission", "transfer_fee", "stamp_tax"))
+        for item in buy_orders
+    ), 2)
+    if abs(total_cost - round(float(budget or 0), 2)) > 0.05:
+        raise ValueError(f"买入预算与逐笔成本不一致: budget={float(budget or 0):.2f}, ledger={total_cost:.2f}")
+    names = name_by_symbol or {}
+    with _conn() as c:
+        account_row = c.execute(
+            "SELECT balance FROM account WHERE id=1" + (" FOR UPDATE" if c._is_postgres else "")
+        ).fetchone()
+        balance = float(account_row["balance"] or 0) if account_row else 0.0
+        if balance + 0.005 < total_cost:
+            raise ValueError(f"账户余额不足: balance={balance:.2f}, required={total_cost:.2f}")
+        c.execute(
+            """INSERT INTO executions (strategy_id,executed_at,budget,top_n,orders_json)
+               VALUES(?,?,?,?,?)""",
+            (strategy_id, executed_at, total_cost, top_n, json.dumps(buy_orders)),
+        )
+        execution_id = c.last_insert_id()
+        now = executed_at[:19] if executed_at else datetime.now().isoformat()[:19]
+        for item in buy_orders:
+            symbol = str(item.get("symbol") or "").strip()
+            quantity = int(item.get("quantity") or 0)
+            price = float(item.get("price") or 0)
+            operation_uid = _operation_uid(execution_id, symbol, "BUY", executed_at, quantity, price)
+            c.execute(
+                """INSERT INTO operations(
+                       execution_id,symbol,side,price,quantity,at,remark,name,
+                       commission,transfer_fee,stamp_tax,slippage_bps,
+                       fee_schedule_version,operation_uid,target_weight_contract_json
+                   ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    execution_id, symbol, "BUY", price, quantity, executed_at,
+                    item.get("remark"), str(names.get(symbol) or item.get("name") or "").strip(),
+                    float(item.get("commission") or 0), float(item.get("transfer_fee") or 0),
+                    float(item.get("stamp_tax") or 0), float(item.get("slippage_bps") or 0),
+                    str(item.get("fee_schedule_version") or FEE_SCHEDULE_VERSION),
+                    operation_uid,
+                    json.dumps(item.get("target_weight_contract") or {}, ensure_ascii=False),
+                ),
+            )
+            _merge_position_row(
+                c,
+                symbol=symbol,
+                quantity=quantity,
+                price=price,
+                updated_at=now,
+                name=str(names.get(symbol) or item.get("name") or "").strip(),
+                bought_at=(executed_at or now)[:10],
+            )
+        c.execute(
+            "UPDATE account SET balance=? WHERE id=1",
+            (round(balance - total_cost, 2),),
+        )
+    return int(execution_id)
+
+
+def link_recorded_operations_to_execution(execution_id: int, orders: List[Dict[str, Any]]) -> int:
+    """Attach already-atomic SELL rows to the enclosing execution for navigation."""
+    linked = 0
+    with _conn() as c:
+        for item in orders:
+            operation_at = str(item.get("at") or "")
+            uid = _operation_uid(
+                None, item.get("symbol"), item.get("side"), operation_at,
+                item.get("quantity"), item.get("price"),
+            )
+            cur = c.execute(
+                """UPDATE operations SET execution_id=?
+                   WHERE operation_uid=? AND execution_id IS NULL""",
+                (int(execution_id), uid),
+            )
+            linked += int(cur.rowcount or 0)
+    return linked
 
 
 def get_execution(execution_id: int) -> Optional[Dict[str, Any]]:
@@ -1446,6 +1845,10 @@ def sell_position(
     price: float = 0.0,
     trade_date: Optional[str] = None,
     record_operation: bool = True,
+    operation_at: Optional[str] = None,
+    operation_remark: Optional[str] = None,
+    operation_execution_id: Optional[int] = None,
+    fee_breakdown: Optional[Dict[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
     """
     卖出持仓（全部或部分）。写入 SELL operation，扣减持仓，卖出所得加回账户余额。
@@ -1484,9 +1887,14 @@ def sell_position(
         fee_comm = fee_trans = fee_tax = 0.0
         if sell_price > 0:
             amount = round(sell_qty * sell_price, 2)
-            fee_comm = round(commission(amount), 2)
-            fee_trans = round(transfer_fee(amount), 2)
-            fee_tax = round(stamp_tax(amount), 2)
+            if fee_breakdown:
+                fee_comm = round(float(fee_breakdown.get("commission") or 0), 2)
+                fee_trans = round(float(fee_breakdown.get("transfer_fee") or 0), 2)
+                fee_tax = round(float(fee_breakdown.get("stamp_tax") or 0), 2)
+            else:
+                fee_comm = round(commission(amount), 2)
+                fee_trans = 0.0 if is_exchange_etf(sym) else round(transfer_fee(amount), 2)
+                fee_tax = 0.0 if is_exchange_etf(sym) else round(stamp_tax(amount), 2)
             net = max(0.0, round(amount - fee_comm - fee_trans - fee_tax, 2))
             cur = c.execute("SELECT balance FROM account WHERE id = 1")
             row = cur.fetchone()
@@ -1494,14 +1902,20 @@ def sell_position(
             new_balance = max(0.0, round(cur_balance + net, 2))
             c.execute("UPDATE account SET balance = ? WHERE id = 1", (new_balance,))
         if record_operation:
-            operation_uid = _operation_uid(None, sym, "SELL", now, sell_qty, sell_price)
+            recorded_at = str(operation_at or now)
+            operation_uid = _operation_uid(operation_execution_id, sym, "SELL", recorded_at, sell_qty, sell_price)
             c.execute(
                 """INSERT INTO operations
                    (execution_id, symbol, side, price, quantity, at, remark, name,
                     commission, transfer_fee, stamp_tax, slippage_bps, fee_schedule_version, operation_uid, target_weight_contract_json)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (None, sym, "SELL", sell_price, sell_qty, now, "手动出售", name,
-                 fee_comm, fee_trans, fee_tax, 0.0, FEE_SCHEDULE_VERSION, operation_uid, "{}"),
+                (operation_execution_id, sym, "SELL", sell_price, sell_qty, recorded_at, operation_remark or "手动出售", name,
+                 fee_comm, fee_trans, fee_tax,
+                 float((fee_breakdown or {}).get("slippage_bps") or 0),
+                 str((fee_breakdown or {}).get("fee_schedule_version") or (
+                     ETF_FEE_SCHEDULE_VERSION if is_exchange_etf(sym) else FEE_SCHEDULE_VERSION
+                 )),
+                 operation_uid, "{}"),
             )
     if sell_qty >= pos_qty:
         return None
@@ -2627,6 +3041,15 @@ def update_model_version_validation(model_version_id: int, *, validation: dict[s
         )
 
 
+def update_model_version_metrics(model_version_id: int, *, metrics: dict[str, Any]) -> None:
+    now = datetime.now().isoformat()
+    with _conn() as c:
+        c.execute(
+            "UPDATE model_versions SET metrics_json = ?, updated_at = ? WHERE id = ?",
+            (json.dumps(metrics or {}, ensure_ascii=False), now, int(model_version_id)),
+        )
+
+
 def _model_version_from_row(r: Any) -> Dict[str, Any]:
     return {
         "id": int(r["id"]),
@@ -2711,6 +3134,9 @@ def list_model_train_runs(limit: int = 20) -> List[Dict[str, Any]]:
 
 
 def save_performance_reports(task_id: int | None, reports: dict[str, list[dict[str, Any]]]) -> int:
+    from app.services.production_strategy import resolve_production_strategy_champion
+
+    champion = resolve_production_strategy_champion()
     """Persist the latest period snapshots idempotently."""
     now = datetime.now().isoformat()
     saved = 0
@@ -2750,10 +3176,16 @@ def save_performance_reports(task_id: int | None, reports: dict[str, list[dict[s
             "attribution": attribution,
             "frozen": True,
             "frozen_at": payload.get("frozen_at") or now,
+            "production_strategy_model_key": champion["champion_model_key"],
+            "production_strategy_version_id": champion["champion_id"],
+            "production_strategy_version": champion["champion_version"],
+            "strategy_controller_version_id": champion["strategy_controller_version_id"],
+            "strategy_controller_version": champion["strategy_controller_version"],
         })
         return payload
 
     with _conn() as c:
+        scope_key = "global" if task_id is None else f"task:{int(task_id)}"
         for kind, rows in reports.items():
             for row in rows:
                 period = str(row.get("period") or "")
@@ -2761,11 +3193,11 @@ def save_performance_reports(task_id: int | None, reports: dict[str, list[dict[s
                     continue
                 payload = normalize_report(str(kind), row)
                 c.execute("""INSERT INTO quant_performance_reports
-                    (task_id, period_type, period, payload_json, created_at)
-                    VALUES (?, ?, ?, ?, ?)
-                    ON CONFLICT (task_id, period_type, period) DO UPDATE SET
+                    (task_id, scope_key, period_type, period, payload_json, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT (scope_key, period_type, period) DO UPDATE SET
                     payload_json=EXCLUDED.payload_json, created_at=EXCLUDED.created_at""",
-                    (task_id, kind, period, json.dumps(payload, ensure_ascii=False), now))
+                    (task_id, scope_key, kind, period, json.dumps(payload, ensure_ascii=False), now))
                 saved += 1
     return saved
 
@@ -2778,4 +3210,12 @@ def list_performance_reports(task_id: int | None = None, limit: int = 100) -> li
         else:
             cur = c.execute("SELECT * FROM quant_performance_reports WHERE task_id = ? ORDER BY id DESC LIMIT ?", (int(task_id), n))
         rows = cur.fetchall()
-    return [{"id": int(r["id"]), "task_id": r["task_id"], "period_type": r["period_type"], "period": r["period"], "payload": _json_load(r["payload_json"], {}), "created_at": r["created_at"]} for r in rows]
+    return [{
+        "id": int(r["id"]),
+        "task_id": r["task_id"],
+        "scope_key": r.get("scope_key") if hasattr(r, "get") else r["scope_key"],
+        "period_type": r["period_type"],
+        "period": r["period"],
+        "payload": _json_load(r["payload_json"], {}),
+        "created_at": r["created_at"],
+    } for r in rows]

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import math
 import os
 from pathlib import Path
 import time
@@ -13,16 +14,14 @@ from app.core.trading_constraints import check_open_trade_constraints
 from app.core.a_share_fees import ETF_FEE_SCHEDULE_VERSION, FEE_SCHEDULE_VERSION, is_exchange_etf, sell_cost_breakdown
 from app.core.exchange_groups import matches_exchange_group, normalize_exchange_group
 from app.db.store import (
-    add_account_balance,
-    append_operations_to_execution,
+    create_and_apply_buy_execution,
     create_execution,
     get_account_balance,
     get_active_model_version,
     get_positions,
     get_strategy,
     list_operations,
-    list_strategies,
-    merge_execution_into_positions,
+    link_recorded_operations_to_execution,
     sell_position,
 )
 from app.integrations.broker_adapter import OrderRequest
@@ -39,7 +38,9 @@ from app.services.strategy_config import parse_strategy_content
 from app.services.trend_model import analyze_trend
 from app.services.quant_risk import cvar_position_multiplier, constrained_cvar_weights, enforce_marginal_cvar_limit, hrp_fallback_weights, ledoit_wolf_covariance
 from app.services.industry_allocator import apply_industry_targets, build_industry_allocation
-from app.services.strategy_controller import active_strategy_policy_context, build_strategy_action_contracts, build_strategy_rebalance_actions, build_target_weight_explanations
+from app.services.strategy_controller import build_strategy_action_contracts, build_strategy_rebalance_actions, build_target_weight_explanations
+from app.services.production_strategy import champion_strategy_policy_context, resolve_production_strategy_champion
+from app.services.point_in_time import signal_available_time
 
 _SCORING_HEARTBEAT_EVERY = max(100, min(int(os.getenv("QUANT_SCORING_HEARTBEAT_EVERY", "300")), 2000))
 _SCORING_TIMEOUT_SEC = max(10, min(int(os.getenv("QUANT_SCORING_TIMEOUT_SEC", "90")), 1800))
@@ -63,6 +64,21 @@ class ReplayRiskGateError(Exception):
     def __init__(self, message: str, code: str = "replay_risk_gate"):
         self.code = code
         super().__init__(message)
+
+
+def _require_consistent_simulation_ledger() -> None:
+    """Stop new mutations when the account projection no longer matches its ledger."""
+    from app.services.simulation_ledger_audit import audit_simulation_ledger
+
+    audit = audit_simulation_ledger(persist=False)
+    if audit.get("ok"):
+        return
+    raise ReplayRiskGateError(
+        "模拟账户独立账本校验未通过，已阻断新成交：" + "；".join(
+            str(item.get("message") or "") for item in (audit.get("issues") or [])
+        ),
+        code="paused_simulation_ledger_drift",
+    )
 
 
 @dataclass
@@ -363,7 +379,16 @@ def _sell_position_for_rebalance(
     try:
         fee = sell_cost_breakdown(px, quantity, sym)
         exec_price = float(fee["executed_price"])
-        sell_position(int(pos["id"]), quantity=quantity, price=exec_price, trade_date=execute_date, record_operation=False)
+        sell_position(
+            int(pos["id"]),
+            quantity=quantity,
+            price=exec_price,
+            trade_date=execute_date,
+            record_operation=True,
+            operation_at=executed_at,
+            operation_remark="量化任务卖出（关联执行）",
+            fee_breakdown=fee,
+        )
     except ValueError:
         return False, turnover_remaining, "t_plus_one_or_position_constraint"
     turnover_after = max(0.0, turnover_remaining - proposed_turnover)
@@ -556,6 +581,9 @@ def _build_target_symbols(
     if not snapshot:
         return [], empty_detail
     required_factors = set(score_weights.keys())
+    # Production plan-model families consume these registered factors even
+    # when the selected formula does not explicitly weight them.
+    required_factors.update({"momentum_20", "momentum_60", "volatility_20"})
     for f in filters:
         fn = str(f.get("factor", "")).strip()
         if fn:
@@ -566,6 +594,11 @@ def _build_target_symbols(
     if progress_callback is not None:
         progress_callback("正在计算打分")
     ds.preload_histories([row.symbol for row in snapshot], end_date=signal_date, lookback=max_lookback)
+    benchmark_returns = ds.get_index_returns("000300.SH", signal_date, lookback=60) if required_factors & {"beta_60", "relative_strength_60"} else []
+    benchmark_return = (
+        math.prod(1.0 + value for value in benchmark_returns) - 1.0
+        if benchmark_returns else None
+    )
     t0 = time.monotonic()
     total = len(snapshot)
     timeout_sec = int(scoring_timeout_sec) if scoring_timeout_sec else _SCORING_TIMEOUT_SEC
@@ -580,7 +613,14 @@ def _build_target_symbols(
         hist = ds.get_hist_window(row.symbol, signal_date, max_lookback)
         vals: Dict[str, float] = {}
         for f in required_factors:
-            vals[f] = _factor_value(f, row, hist, daily_basic_map)
+            vals[f] = _factor_value(
+                f,
+                row,
+                hist,
+                daily_basic_map,
+                benchmark_return=benchmark_return,
+                benchmark_returns=benchmark_returns,
+            )
         factor_values[row.symbol] = vals
     filtered = _apply_filters(snapshot, factor_values, filters, skip_factors=set())
     if not filtered:
@@ -605,8 +645,8 @@ def _build_target_symbols(
     # industries enter the final stock ranking. This prevents a globally high
     # stock score from bypassing the current market story.
     from app.services.theme_engine import list_themes, materialize_theme_snapshots
-    materialize_theme_snapshots(as_of_time=f"{signal_date}T23:59:59")
-    themes = list_themes(as_of_time=f"{signal_date}T23:59:59", promotable_only=True, limit=100).get("items") or []
+    materialize_theme_snapshots(as_of_time=signal_available_time(signal_date))
+    themes = list_themes(as_of_time=signal_available_time(signal_date), promotable_only=True, limit=100).get("items") or []
     narrative_codes = {
         str(company.get("ts_code") or "").split(".")[0]
         for theme in themes if str(theme.get("lifecycle") or "") not in {"退潮", "沉寂"}
@@ -615,7 +655,27 @@ def _build_target_symbols(
     narrative_ranked = [item for item in ranked if str(item[0].symbol).split(".")[0] in narrative_codes]
     if narrative_ranked:
         ranked = narrative_ranked
+    from app.services.model_signal_fusion import apply_production_model_signals
+    histories = {
+        str(row.symbol): ds.get_hist_window(row.symbol, signal_date, max_lookback)
+        for row, _score in ranked
+    }
+    ranked, model_evidence, model_blocks, model_fusion = apply_production_model_signals(
+        ranked=ranked,
+        factor_values=factor_values,
+        histories=histories,
+        themes=themes,
+    )
     recall_n = max(top_n, min(80, top_n * 10))
+    selections = _selection_explanation(
+        ranked,
+        weights=score_weights,
+        factor_values=factor_values,
+        top_n=recall_n,
+    )
+    for selection in selections:
+        symbol = str(selection.get("symbol") or "")
+        selection["model_signals"] = model_evidence.get(symbol) or {}
     detail = {
         **empty_detail,
         "filter_summary": {
@@ -623,12 +683,9 @@ def _build_target_symbols(
             "universe": len(snapshot),
             "template": strategy_template.get("id"),
         },
-        "selections": _selection_explanation(
-            ranked,
-            weights=score_weights,
-            factor_values=factor_values,
-            top_n=recall_n,
-        ),
+        "selections": selections,
+        "blocked_events": model_blocks,
+        "model_signal_fusion": model_fusion,
         "narrative_recall": {
             "method": "industry_story_first_v1",
             "themes": [{"theme": item.get("theme_name"), "score": item.get("score"), "lifecycle": item.get("lifecycle")} for item in themes],
@@ -665,6 +722,7 @@ def run_for_trade_date(
             f"未来函数防护：signal_date({signal_date}) 必须早于 execute_date({execute_date})",
             code="future_guard_date_order",
         )
+    _require_consistent_simulation_ledger()
     _report("正在加载快照")
     if authoritative_plan:
         target_symbols = [str(x).strip() for x in authoritative_plan.get("target_symbols") or [] if str(x).strip()]
@@ -686,6 +744,7 @@ def run_for_trade_date(
                 "plan_version": authoritative_plan.get("plan_version"),
                 "input_hash": authoritative_plan.get("input_hash"),
             },
+            "decision_version_manifest": authoritative_plan.get("decision_version_manifest") or {},
         }
     else:
         target_symbols, selection_detail = _build_target_symbols(
@@ -697,9 +756,9 @@ def run_for_trade_date(
             progress_callback=_report,
             scoring_timeout_sec=scoring_timeout_sec,
         )
-    target_symbols, research_blocks = _apply_research_admission(target_symbols, as_of_time=f"{signal_date}T23:59:59")
+    target_symbols, research_blocks = _apply_research_admission(target_symbols, as_of_time=signal_available_time(signal_date))
     target_symbols, dynamic_blocks, dynamic_gate = _apply_dynamic_strategy_gate(
-        target_symbols, as_of_time=f"{signal_date}T23:59:59"
+        target_symbols, as_of_time=signal_available_time(signal_date)
     )
     target_symbols = target_symbols[:max(1, int(top_n))]
     equity_target_symbols = list(target_symbols)
@@ -710,7 +769,7 @@ def run_for_trade_date(
         symbol_scores=score_map,
         equity_budget=float(dynamic_gate.get("risk_budget_multiplier") or 0),
         market_state=market_state,
-        as_of_time=f"{signal_date}T23:59:59",
+        as_of_time=signal_available_time(signal_date),
     )
     admitted_industries = set((industry_allocation.get("industry_targets") or {}).keys())
     symbol_industries = industry_allocation.get("symbol_industries") or {}
@@ -1027,7 +1086,7 @@ def run_for_trade_date(
             existing_industry_value[industry] = existing_industry_value.get(industry, 0.0) + float(value or 0)
     exec_t0 = time.monotonic()
     position_limits = _pretrade_symbol_limits(
-        [str(order.symbol) for order in order_requests], cutoff=f"{signal_date}T23:59:59", max_single=max_single_position_pct,
+        [str(order.symbol) for order in order_requests], cutoff=signal_available_time(signal_date), max_single=max_single_position_pct,
     )
     for symbol in defensive_weights:
         position_limits[symbol] = .45
@@ -1075,8 +1134,6 @@ def run_for_trade_date(
         )
     total_buy_cost = _calc_total_buy_cost(filled)
     turnover_remaining = max(0.0, turnover_remaining - sum(float(o.price) * int(o.quantity) for o in filled))
-    if total_buy_cost > 0:
-        add_account_balance(-total_buy_cost)
     req_price_map = {str(x.symbol): float(x.price) for x in order_requests}
     req_name_map = {str(x.symbol): str(x.name or "") for x in order_requests}
     orders_payload = [
@@ -1102,18 +1159,24 @@ def run_for_trade_date(
             "正常交易日未形成任何可执行订单；全仓策略禁止将 no_trade 标记为成功",
             code="blocked_zero_order_full_investment",
         )
-    if orders_payload or sold_ops_payload:
-        execution_id = create_execution(
+    if orders_payload:
+        execution_id = create_and_apply_buy_execution(
             strategy_id=int(strategy_id),
             executed_at=executed_at,
             budget=total_buy_cost,
             top_n=int(top_n),
             orders=orders_payload,
         )
-        if sold_ops_payload:
-            append_operations_to_execution(execution_id, executed_at, sold_ops_payload)
-        if orders_payload:
-            merge_execution_into_positions(orders_payload, executed_at)
+    elif sold_ops_payload:
+        execution_id = create_execution(
+            strategy_id=int(strategy_id),
+            executed_at=executed_at,
+            budget=0.0,
+            top_n=int(top_n),
+            orders=[],
+        )
+    if execution_id is not None and sold_ops_payload:
+        link_recorded_operations_to_execution(execution_id, sold_ops_payload)
 
     planned_buy_count = len(order_requests)
     bought_count = len(filled)
@@ -1215,7 +1278,7 @@ def run_for_trade_date(
         target_weights=cvar_weights,
         thesis_status_by_symbol=thesis_status_by_symbol,
         context={
-            **active_strategy_policy_context(),
+            **champion_strategy_policy_context(),
             "signal_date": signal_date,
             "execute_date": execute_date,
             "data_status": "frozen",
@@ -1292,6 +1355,7 @@ def run_for_trade_date(
                 "maximum_residual_cash": 500.0,
                 "defensive_target_weight": round(defensive_target_weight, 6),
             },
+            "decision_version_manifest": selection_detail.get("decision_version_manifest") or {},
         },
     }
     transaction_cost = round(sum(
@@ -1339,7 +1403,7 @@ def run_for_trade_date(
         model_version = str(template.get("id") or "rule_fallback_v1")
         market_state = selection_detail.get("trend_analysis") or {}
         decision_time = f"{execute_date}T09:30:00"
-        data_as_of = f"{signal_date}T23:59:59"
+        data_as_of = signal_available_time(signal_date)
         for action in buy_actions:
             symbol = str(action.get("symbol") or "")
             evidence = selection_by_symbol.get(symbol) or {}
@@ -1408,10 +1472,7 @@ def analyze_market_plan(
 
     sid = int(strategy_id or 0)
     if sid <= 0:
-        strategies = list_strategies()
-        if not strategies:
-            raise ValueError("无可用策略")
-        sid = int(strategies[0]["id"])
+        sid = int(resolve_production_strategy_champion()["strategy_id"])
 
     ds = BacktestDataSource()
     exchange_group = normalize_exchange_group(exchange_group)
@@ -1423,9 +1484,9 @@ def analyze_market_plan(
         exchange_group=exchange_group,
         scoring_timeout_sec=scoring_timeout_sec,
     )
-    targets, research_blocks = _apply_research_admission(targets, as_of_time=f"{sig}T23:59:59")
+    targets, research_blocks = _apply_research_admission(targets, as_of_time=signal_available_time(sig))
     targets, dynamic_blocks, dynamic_gate = _apply_dynamic_strategy_gate(
-        targets, as_of_time=f"{sig}T23:59:59"
+        targets, as_of_time=signal_available_time(sig)
     )
     detail["research_admission"] = {"admitted": list(targets), "blocked": research_blocks}
     detail["dynamic_strategy_gate"] = dynamic_gate
@@ -1461,9 +1522,9 @@ def analyze_market_plan(
         market_rows=exec_map,
         same_day_fallback=same_day_fallback,
         mode="full_rebalance",
-        blocked_actions=research_blocks + dynamic_blocks,
+        blocked_actions=list(detail.get("blocked_events") or []) + research_blocks + dynamic_blocks,
         context={
-            **active_strategy_policy_context(),
+            **champion_strategy_policy_context(),
             "signal_date": sig,
             "execute_date": execute_date,
             "data_status": "frozen",
@@ -1539,6 +1600,8 @@ def plan_analyze_rebalance(
 ) -> Dict[str, Any]:
     """预览或执行分析调仓：次日开盘价口径、总权益仓位、单票上限、先卖后买。"""
     sig = str(signal_date or "").strip()
+    if not dry_run:
+        _require_consistent_simulation_ledger()
     dates = list_consolidated_trade_dates()
     if sig not in dates:
         raise ValueError(f"signal_date 不在可用交易日列表: {sig}")
@@ -1546,10 +1609,7 @@ def plan_analyze_rebalance(
     execute_date, same_day_fallback = resolve_execute_date(sig)
     sid = int(strategy_id or 0)
     if sid <= 0:
-        strategies = list_strategies()
-        if not strategies:
-            raise ValueError("无可用策略")
-        sid = int(strategies[0]["id"])
+        sid = int(resolve_production_strategy_champion()["strategy_id"])
 
     strategy = get_strategy(sid)
     config = parse_strategy_content(strategy.get("content"), strategy.get("type", "formula")) if strategy else None
@@ -1562,9 +1622,9 @@ def plan_analyze_rebalance(
     exec_map = {str(getattr(r, "symbol", "") or "").strip(): r for r in exec_rows}
 
     requested_targets = [str(s).strip() for s in (target_symbols or symbols or []) if str(s).strip()]
-    research_targets, research_blocks = _apply_research_admission(requested_targets, as_of_time=f"{sig}T23:59:59")
+    research_targets, research_blocks = _apply_research_admission(requested_targets, as_of_time=signal_available_time(sig))
     gated_targets, dynamic_blocks, dynamic_gate = _apply_dynamic_strategy_gate(
-        research_targets, as_of_time=f"{sig}T23:59:59"
+        research_targets, as_of_time=signal_available_time(sig)
     )
     high_risk_symbols = {
         str(item.get("symbol") or "") for item in (dynamic_gate.get("items") or [])
@@ -1598,7 +1658,7 @@ def plan_analyze_rebalance(
         mode=mode,
         blocked_actions=research_blocks + dynamic_blocks,
         context={
-            **active_strategy_policy_context(),
+            **champion_strategy_policy_context(),
             "signal_date": sig,
             "execute_date": execute_date,
             "data_status": "frozen",
@@ -1680,7 +1740,16 @@ def plan_analyze_rebalance(
             if dry_run:
                 continue
             try:
-                sell_position(int(pos["id"]), quantity=qty, price=exec_price, trade_date=execute_date, record_operation=False)
+                sell_position(
+                    int(pos["id"]),
+                    quantity=qty,
+                    price=exec_price,
+                    trade_date=execute_date,
+                    record_operation=True,
+                    operation_at=executed_at,
+                    operation_remark="量化分析调仓卖出",
+                    fee_breakdown=fee,
+                )
                 sold_count += 1
                 sold_ops_payload.append(
                     {
@@ -1778,7 +1847,7 @@ def plan_analyze_rebalance(
         target_weights = dict(plan_bl.get("weights") or target_weights)
         plan_optimizer += "+black_litterman_diagonal_v1"
     symbol_position_limits = _pretrade_symbol_limits(
-        [str(order.symbol) for order in order_requests], cutoff=f"{sig}T23:59:59", max_single=max_single,
+        [str(order.symbol) for order in order_requests], cutoff=signal_available_time(sig), max_single=max_single,
     )
     planned, buy_blocked, pruned = allocate_buy_orders(
         order_requests,
@@ -1858,7 +1927,7 @@ def plan_analyze_rebalance(
         current_weights=current_weights_for_strategy,
         target_weights=target_weights,
         context={
-            **active_strategy_policy_context(),
+            **champion_strategy_policy_context(),
             "signal_date": sig,
             "execute_date": execute_date,
             "data_status": "frozen",
@@ -1901,18 +1970,24 @@ def plan_analyze_rebalance(
         ]
         if orders_payload or sold_ops_payload:
             if orders_payload:
-                add_account_balance(-total_buy_cost)
-            execution_id = create_execution(
-                strategy_id=int(sid),
-                executed_at=executed_at,
-                budget=total_buy_cost,
-                top_n=len(order_requests),
-                orders=orders_payload,
-            )
+                execution_id = create_and_apply_buy_execution(
+                    strategy_id=int(sid),
+                    executed_at=executed_at,
+                    budget=total_buy_cost,
+                    top_n=len(order_requests),
+                    orders=orders_payload,
+                    name_by_symbol=name_by_symbol,
+                )
+            else:
+                execution_id = create_execution(
+                    strategy_id=int(sid),
+                    executed_at=executed_at,
+                    budget=0.0,
+                    top_n=len(order_requests),
+                    orders=[],
+                )
             if sold_ops_payload:
-                append_operations_to_execution(execution_id, executed_at, sold_ops_payload)
-            if orders_payload:
-                merge_execution_into_positions(orders_payload, executed_at, name_by_symbol=name_by_symbol)
+                link_recorded_operations_to_execution(execution_id, sold_ops_payload)
             bought_count = len(orders_payload)
 
     planned_buy_count = len(order_requests)
@@ -1936,7 +2011,7 @@ def plan_analyze_rebalance(
     if not dry_run and (bought_count > 0 or sold_count > 0):
         try:
             decision_time = executed_at or datetime.now().isoformat(timespec="seconds")
-            data_as_of_time = f"{sig}T23:59:59"
+            data_as_of_time = signal_available_time(sig)
             model_version = f"rebalance_strategy_{sid}" if sid else "analysis_rebalance_v1"
             shared_context = {
                 "signal_date": sig,

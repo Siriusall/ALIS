@@ -17,6 +17,231 @@ from app.data_platform.db import _conn as data_conn
 from app.db.store import _conn as business_conn
 
 
+def load_market_state_history() -> dict[str, dict[str, Any]]:
+    """Load the frozen market regime attached to each historical trade date."""
+    try:
+        with data_conn() as conn:
+            rows = conn.execute(
+                """SELECT trade_date,market_state,state_confidence,model_version
+                   FROM dc_market_context_snapshot ORDER BY trade_date"""
+            ).fetchall()
+    except Exception:
+        return {}
+    return {
+        str(dict(row).get("trade_date") or "").replace("-", "")[:8]: {
+            "state": str(dict(row).get("market_state") or "unknown"),
+            "confidence": float(dict(row).get("state_confidence") or 0),
+            "model_version": str(dict(row).get("model_version") or ""),
+        }
+        for row in rows
+        if dict(row).get("trade_date")
+    }
+
+
+def _latest_reviews(reviews: list[dict[str, Any]]) -> dict[int, dict[str, Any]]:
+    latest: dict[int, dict[str, Any]] = {}
+    for review in sorted(
+        reviews,
+        key=lambda item: (str(item.get("review_time") or ""), int(item.get("id") or 0)),
+    ):
+        decision_id = int(review.get("decision_snapshot_id") or 0)
+        if decision_id:
+            latest[decision_id] = review
+    return latest
+
+
+def enrich_performance_period(
+    report: dict[str, Any],
+    *,
+    points: list[dict[str, Any]],
+    operations: list[dict[str, Any]],
+    decisions: list[dict[str, Any]],
+    reviews: list[dict[str, Any]],
+    market_states: dict[str, dict[str, Any]],
+    blocked_events: list[dict[str, Any]],
+    version_manifest: dict[str, Any],
+) -> dict[str, Any]:
+    """Attach deterministic learning dimensions without inventing model PnL."""
+    row = dict(report)
+    start_date, end_date = str(row.get("start_date") or ""), str(row.get("end_date") or "")
+
+    fee_keys = ("commission", "transfer_fee", "stamp_tax")
+    costs = {
+        key: round(sum(float(item.get(key) or 0) for item in operations), 4)
+        for key in fee_keys
+    }
+    costs["total"] = round(sum(costs.values()), 4)
+
+    by_state: dict[str, dict[str, Any]] = {}
+    for point in points:
+        date_key = str(point.get("date") or "").replace("-", "")[:8]
+        state_info = market_states.get(date_key) or {
+            "state": "unknown", "confidence": 0.0, "model_version": ""
+        }
+        state = str(state_info.get("state") or "unknown")
+        bucket = by_state.setdefault(state, {
+            "sessions": 0,
+            "return_factor": 1.0,
+            "benchmark_factor": 1.0,
+            "confidence_total": 0.0,
+            "market_model_versions": set(),
+        })
+        bucket["sessions"] += 1
+        bucket["return_factor"] *= 1.0 + float(point.get("daily_return_pct") or 0) / 100.0
+        if point.get("daily_benchmark_return_pct") is not None:
+            bucket["benchmark_factor"] *= 1.0 + float(point["daily_benchmark_return_pct"]) / 100.0
+        bucket["confidence_total"] += float(state_info.get("confidence") or 0)
+        if state_info.get("model_version"):
+            bucket["market_model_versions"].add(str(state_info["model_version"]))
+    market_breakdown = {
+        state: {
+            "sessions": int(value["sessions"]),
+            "return_pct": round((value["return_factor"] - 1.0) * 100.0, 4),
+            "benchmark_return_pct": round((value["benchmark_factor"] - 1.0) * 100.0, 4),
+            "average_confidence": round(value["confidence_total"] / max(1, value["sessions"]), 4),
+            "market_model_versions": sorted(value["market_model_versions"]),
+        }
+        for state, value in sorted(by_state.items())
+    }
+
+    latest_review = _latest_reviews(reviews)
+    period_decisions = [
+        item for item in decisions
+        if start_date <= str(item.get("decision_time") or "")[:10] <= end_date
+    ]
+    model_breakdown: dict[str, dict[str, Any]] = {}
+    for decision in period_decisions:
+        model_version = str(decision.get("model_version") or "unknown")
+        bucket = model_breakdown.setdefault(model_version, {
+            "decision_count": 0, "buy_count": 0, "sell_count": 0,
+            "reviewed_count": 0, "error_count": 0, "error_types": {}, "symbols": set(),
+        })
+        bucket["decision_count"] += 1
+        side = str(decision.get("decision_type") or "").lower()
+        if side == "buy":
+            bucket["buy_count"] += 1
+        elif side == "sell":
+            bucket["sell_count"] += 1
+        symbol = str(decision.get("ts_code") or "")
+        if symbol:
+            bucket["symbols"].add(symbol)
+        review = latest_review.get(int(decision.get("id") or 0))
+        if review:
+            bucket["reviewed_count"] += 1
+            error_type = str(review.get("error_type") or "").strip()
+            if error_type and error_type not in {"无错误", "运气因素"}:
+                bucket["error_count"] += 1
+                bucket["error_types"][error_type] = int(bucket["error_types"].get(error_type) or 0) + 1
+    for bucket in model_breakdown.values():
+        bucket["symbols"] = sorted(bucket["symbols"])
+
+    decision_error_types: dict[str, int] = {}
+    relevant_reviews: dict[int, dict[str, Any]] = {}
+    for decision in period_decisions:
+        review = latest_review.get(int(decision.get("id") or 0))
+        error_type = str((review or {}).get("error_type") or "").strip()
+        if error_type and error_type not in {"无错误", "运气因素"}:
+            decision_error_types[error_type] = int(decision_error_types.get(error_type) or 0) + 1
+            relevant_reviews[int((review or {}).get("id") or 0)] = review
+    review_activity_error_types: dict[str, int] = {}
+    for review in latest_review.values():
+        if not (start_date <= str(review.get("review_time") or "")[:10] <= end_date):
+            continue
+        error_type = str(review.get("error_type") or "").strip()
+        if error_type and error_type not in {"无错误", "运气因素"}:
+            review_activity_error_types[error_type] = int(review_activity_error_types.get(error_type) or 0) + 1
+            relevant_reviews[int(review.get("id") or 0)] = review
+    error_types: dict[str, int] = {}
+    for review in relevant_reviews.values():
+        error_type = str(review.get("error_type") or "").strip()
+        if error_type:
+            error_types[error_type] = int(error_types.get(error_type) or 0) + 1
+    blocked_codes: dict[str, int] = {}
+    for event in blocked_events:
+        code = str(event.get("code") or "unknown")
+        blocked_codes[code] = int(blocked_codes.get(code) or 0) + 1
+
+    learning_signals = []
+    benchmark_return = row.get("benchmark_return_pct")
+    if benchmark_return is not None and float(row.get("return_pct") or 0) < float(benchmark_return):
+        learning_signals.append({
+            "code": "negative_excess_return",
+            "severity": "warning",
+            "target": "model_and_strategy_challenger",
+            "value": round(float(row.get("return_pct") or 0) - float(benchmark_return), 4),
+        })
+    if float(row.get("turnover_rate") or 0) > 0.30:
+        learning_signals.append({
+            "code": "high_turnover",
+            "severity": "warning",
+            "target": "portfolio_and_execution",
+            "value": round(float(row.get("turnover_rate") or 0), 6),
+        })
+    if error_types:
+        learning_signals.append({
+            "code": "review_errors",
+            "severity": "warning",
+            "target": "model_governance",
+            "value": sum(error_types.values()),
+        })
+    if blocked_codes:
+        learning_signals.append({
+            "code": "blocked_signals",
+            "severity": "info",
+            "target": "strategy_policy",
+            "value": sum(blocked_codes.values()),
+        })
+
+    row.update({
+        "schema_version": "formal_performance_report_v2",
+        "costs": costs,
+        "turnover": {
+            "rate": row.get("turnover_rate"),
+            "traded_amount": row.get("traded_amount"),
+            "buy_amount": round(sum(float(item.get("price") or 0) * int(item.get("quantity") or 0)
+                                    for item in operations if str(item.get("side") or "").upper() == "BUY"), 4),
+            "sell_amount": round(sum(float(item.get("price") or 0) * int(item.get("quantity") or 0)
+                                     for item in operations if str(item.get("side") or "").upper() == "SELL"), 4),
+            "operation_count": len(operations),
+        },
+        "market_state_breakdown": market_breakdown,
+        "model_version_breakdown": model_breakdown,
+        "error_breakdown": {
+            "review_error_types": error_types,
+            "decision_error_types": decision_error_types,
+            "review_activity_error_types": review_activity_error_types,
+            "blocked_signal_codes": blocked_codes,
+        },
+        "decision_version_manifest": version_manifest,
+        "learning_signals": learning_signals,
+        "learning_status": "attention" if any(item["severity"] == "warning" for item in learning_signals) else "healthy",
+    })
+    return row
+
+
+def run_periodic_performance_review() -> dict[str, Any]:
+    """Materialize all periods and expose the newest durable learning inputs."""
+    from app.api.routes.quant_runs import quant_run_performance
+
+    result = quant_run_performance(task_id=None, benchmark="000300")
+    latest = {
+        kind: (result.get(kind) or [])[-1] if result.get(kind) else None
+        for kind in ("daily", "weekly", "monthly", "yearly")
+    }
+    primary = latest.get("monthly") or latest.get("weekly") or latest.get("daily") or {}
+    signals = list(primary.get("learning_signals") or [])
+    return {
+        "ok": True,
+        "status": "attention" if any(item.get("severity") == "warning" for item in signals) else "passed",
+        "schema_version": "alis_periodic_performance_review_v1",
+        "persisted_reports": int(result.get("persisted_reports") or 0),
+        "latest": latest,
+        "learning_signals": signals,
+        "learning_signal_count": len(signals),
+        "policy": "signals_feed_challenger_governance_but_never_rewrite_champion_or_history",
+    }
+
+
 def _normalize_payload(period_type: str, payload: dict[str, Any]) -> dict[str, Any]:
     row = dict(payload or {})
     total_cost = row.get("total_cost", row.get("transaction_cost", row.get("cost", 0.0)))
@@ -171,11 +396,14 @@ def build_multi_period_validation() -> dict[str, Any]:
     Plan book: purged walk-forward, cross-market-state validation,
     transaction cost adjusted, minimum 3+ periods.
     """
+    from app.services.production_strategy import resolve_production_strategy_champion
+
+    champion = resolve_production_strategy_champion()
     reports = list_performance_reports(limit=100)
     items = reports.get("items", [])
 
     if not items:
-        return {"ok": False, "status": "insufficient_data", "reason": "无绩效报告数据"}
+        return {"ok": False, "status": "insufficient_data", "reason": "无绩效报告数据", "production_strategy_version": champion["champion_version"]}
 
     # Group by period type
     by_type: dict[str, list[dict]] = {}
@@ -201,6 +429,7 @@ def build_multi_period_validation() -> dict[str, Any]:
     # Validation
     passed = [p for p in periods if p.get("return_pct") is not None]
     has_attribution = [p for p in periods if p.get("stock_selection_contribution") is not None]
+    bound = [item for item in items if (item.get("payload") or {}).get("production_strategy_version") == champion["champion_version"]]
 
     return {
         "ok": True,
@@ -211,4 +440,12 @@ def build_multi_period_validation() -> dict[str, Any]:
         "attribution_count": len(has_attribution),
         "covered_types": list(by_type.keys()),
         "method": "multi_period_validation_v1",
+        "strategy_binding": {
+            "model_key": champion["champion_model_key"],
+            "version_id": champion["champion_id"],
+            "version": champion["champion_version"],
+            "bound_report_count": len(bound),
+            "unbound_report_count": len(items) - len(bound),
+            "policy": "new_oos_reports_must_bind_active_champion",
+        },
     }

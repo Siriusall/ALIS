@@ -221,6 +221,7 @@ export default function ReviewWorkbenchPage({ onNavigate }: Props) {
       <div className="review-scoreboard-metrics">
         <article><span>本周收益</span><strong>{latestWeek ? `${latestWeek.return_pct.toFixed(2)}%` : "—"}</strong><small>成本 {latestWeek?.transaction_cost.toFixed(2) ?? "—"}</small></article>
         <article><span>年度回撤</span><strong>{latestYear ? `${latestYear.max_drawdown_pct.toFixed(2)}%` : "—"}</strong><small>年度收益 {latestYear ? `${latestYear.return_pct.toFixed(2)}%` : "—"}</small></article>
+        <article className={(latestMonth?.learning_signals?.length ?? 0) > 0 ? "warning" : ""}><span>复盘学习信号</span><strong>{latestMonth?.learning_signals?.length ?? 0}</strong><small>市场状态 {Object.keys(latestMonth?.market_state_breakdown ?? {}).length} 类 · 模型版本 {Object.keys(latestMonth?.model_version_breakdown ?? {}).length} 个</small></article>
         <article className={(queue?.counts.high ?? 0) > 0 ? "urgent" : ""}><span>待我确认</span><strong>{queue?.counts.total ?? 0}</strong><small>{queue?.counts.high ?? 0} 条高优先级</small></article>
       </div>
     </section>

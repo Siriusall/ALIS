@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import pickle
 from functools import lru_cache
 from pathlib import Path
@@ -54,10 +55,25 @@ def score_snapshot_rows(
     artifact = _load_artifact(str(version.get("artifact_path") or ""))
     features = list(artifact.get("features") or [])
     daily_basic = ds.get_daily_basic_map(signal_date.replace("-", ""))
+    benchmark_returns = ds.get_index_returns("000300.SH", signal_date, lookback=60) if set(features) & {"beta_60", "relative_strength_60"} else []
+    benchmark_return = (
+        math.prod(1.0 + value for value in benchmark_returns) - 1.0
+        if benchmark_returns else None
+    )
     matrix: list[list[float]] = []
     for row in rows:
         hist = ds.get_hist_window(row.symbol, signal_date, 60)
-        matrix.append([_safe_float(_factor_value(f, row, hist, daily_basic)) for f in features])
+        matrix.append([
+            _safe_float(_factor_value(
+                f,
+                row,
+                hist,
+                daily_basic,
+                benchmark_return=benchmark_return,
+                benchmark_returns=benchmark_returns,
+            ))
+            for f in features
+        ])
 
     if artifact.get("model_type") == "sklearn_hgbr" and artifact.get("_model") is not None:
         preds = [float(x) for x in artifact["_model"].predict(matrix).tolist()]

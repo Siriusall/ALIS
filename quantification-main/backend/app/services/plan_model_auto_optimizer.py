@@ -133,6 +133,60 @@ def _auto_reject_weaker_candidates(family: dict[str, Any]) -> list[dict[str, Any
     return rejected
 
 
+def _auto_promote_ready_candidates(family: dict[str, Any]) -> list[dict[str, Any]]:
+    """Promote only candidates whose cost-aware and 20-session gates already passed."""
+    promoted: list[dict[str, Any]] = []
+    for item in family.get("items") or []:
+        latest = item.get("latest_version") or {}
+        active = item.get("active_version") or {}
+        if (
+            not latest.get("id")
+            or int(latest.get("id") or 0) == int(active.get("id") or 0)
+            or str(latest.get("status") or "") != "candidate"
+        ):
+            continue
+        validation = latest.get("validation") if isinstance(latest.get("validation"), dict) else {}
+        eligibility = validation.get("production_eligibility") if isinstance(validation.get("production_eligibility"), dict) else {}
+        gates = eligibility.get("gates") if isinstance(eligibility.get("gates"), dict) else {}
+        candidate_metrics = latest.get("metrics") or {}
+        active_metrics = active.get("metrics") or {}
+        cost_passed, reason = _candidate_cost_after_passed(candidate_metrics)
+        live_passed = bool(gates.get("live_observation_20_sessions"))
+        comparable = all(
+            candidate_value is None or active_value is None or candidate_value >= active_value
+            for candidate_value, active_value in (
+                (_cost_after_lift(candidate_metrics), _cost_after_lift(active_metrics)),
+                (_cost_after_walk_forward(candidate_metrics), _cost_after_walk_forward(active_metrics)),
+                (_cost_after_worst_window(candidate_metrics), _cost_after_worst_window(active_metrics)),
+                (_metric(candidate_metrics, "hit_rate"), _metric(active_metrics, "hit_rate")),
+            )
+        )
+        non_review_gates = {
+            key: bool(value) for key, value in gates.items()
+            if key not in {"human_review", "simulation_only_live_observation_waived"}
+        }
+        if not cost_passed or not live_passed or not comparable or not all(non_review_gates.values()):
+            continue
+        result = review_plan_model_version(
+            int(latest["id"]),
+            reviewer="deterministic_auto_governance",
+            decision="approved",
+            comment=(
+                "正式费用后指标、最差窗口、生产非劣和20交易日影子观察全部通过；"
+                "仅在研究与模拟交易范围自动晋升。"
+            ),
+            waive_live_observation=False,
+        )
+        if result.get("production_eligible"):
+            promoted.append({
+                "model_key": item.get("model_key"),
+                "version": latest.get("version"),
+                "reason": reason or "all_deterministic_gates_passed",
+                "result": result,
+            })
+    return promoted
+
+
 def _shadow_ab(item: dict[str, Any]) -> dict[str, Any]:
     latest = item.get("latest_version") or {}
     active = item.get("active_version") or {}
@@ -171,6 +225,9 @@ def build_auto_optimization_status(*, apply_auto_reject: bool = True) -> dict[st
     auto_rejected = _auto_reject_weaker_candidates(family) if apply_auto_reject else []
     if auto_rejected:
         family = model_family_status()
+    auto_promoted = _auto_promote_ready_candidates(family) if apply_auto_reject else []
+    if auto_promoted:
+        family = model_family_status()
     items: list[dict[str, Any]] = []
     for item in family.get("items") or []:
         latest = item.get("latest_version") or {}
@@ -197,12 +254,17 @@ def build_auto_optimization_status(*, apply_auto_reject: bool = True) -> dict[st
         "ok": True,
         "schema_version": "plan_model_auto_optimizer_v1",
         "policy": {
-            "mode": "auto_train_manual_promote",
-            "summary": "系统自动训练 challenger、自动驳回弱候选；只有更优候选上线需要人工批准。",
-            "auto_allowed": ["data_ready_check", "train_challenger", "compare_candidate", "auto_reject_weaker_candidate", "build_review_queue"],
-            "human_required": ["approve_production"],
+            "mode": "deterministic_full_autonomy_simulation_only",
+            "summary": "系统自动训练、驳回弱候选，并仅在费用后硬门与20日影子观察全部通过后自动晋升。",
+            "auto_allowed": [
+                "data_ready_check", "train_challenger", "compare_candidate",
+                "auto_reject_weaker_candidate", "shadow_observation",
+                "promote_after_all_deterministic_gates",
+            ],
+            "human_required": ["data_or_contract_anomaly_only"],
         },
         "auto_rejected": auto_rejected,
+        "auto_promoted": auto_promoted,
         "review_queue": [item for item in items if item["requires_human"]],
         "items": items,
         "generated_at": datetime.now().isoformat(),
@@ -231,6 +293,8 @@ def run_auto_optimization_once(force: bool = False) -> dict[str, Any]:
         "ok": True,
         "auto_rejected_count": len(before.get("auto_rejected") or []),
         "auto_rejected": before.get("auto_rejected") or [],
+        "auto_promoted_count": len(before.get("auto_promoted") or []),
+        "auto_promoted": before.get("auto_promoted") or [],
         "started_count": len(started),
         "skipped_count": len(skipped),
         "started": started,

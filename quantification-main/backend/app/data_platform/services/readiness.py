@@ -187,7 +187,9 @@ def _metrics() -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
     candidate_field_present = sum(int(item.get("present_field_checks") or 0) for item in candidate_field_states)
     candidate_field_complete = sum(1 for item in candidate_field_states if item.get("status") == "complete")
     from app.data_platform.services.exchange_etf_pcf import tracked_etf_codes
+    from app.data_platform.services.oos_hard_data import audit_oos_hard_data
     pcf_expected = len(tracked_etf_codes())
+    oos_hard = audit_oos_hard_data(end_date=history_end, include_dates=False)
     values = {
         "trade_calendar": (ratio(calendar_rows, calendar_expected), calendar_rows, calendar_expected, f"自然日日历 {calendar_rows}/{calendar_expected}"),
         "latest_daily": (ratio(int(_value(snap, "daily_n")), stock_count), int(_value(snap, "daily_n")), stock_count, f"目标交易日 {latest}"),
@@ -235,6 +237,10 @@ def _metrics() -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
         "theme_snapshots": (
             ratio(theme_snapshot_dates, 250), theme_snapshot_dates, 250,
             f"叙事状态转移模型要求最近250个可用行情交易日主题快照，当前 {theme_snapshot_dates}/250，截止 {usable_latest or history_end}",
+        ),
+        "oos_hard_data": (
+            float(oos_hard["coverage"]), int(oos_hard["eligible_sessions"]), int(oos_hard["required_sessions"]),
+            f"正式 Champion OOS 永久硬数据 {oos_hard['eligible_sessions']}/{oos_hard['required_sessions']} 个合格交易日",
         ),
     }
     return {key: {"coverage": round(v[0], 6), "available": v[1], "expected": v[2], "evidence": v[3]} for key, v in values.items()}, {

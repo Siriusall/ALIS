@@ -136,6 +136,7 @@ TUSHARE_CATALOG: list[TushareCatalogItem] = [
     TushareCatalogItem("fund_basic", "基金", "场内基金基础信息", "防御ETF主数据与交易状态", "monthly", "ts_code,name,management,custodian,fund_type,found_date,due_date,list_date,issue_date,delist_date,market", {"market": "E"}),
     TushareCatalogItem("fund_daily", "基金", "场内基金日线", "货币、债券、黄金、低波和红利ETF模拟交易", "daily", "ts_code,trade_date,open,high,low,close,pre_close,change,pct_chg,vol,amount", {"ts_code": ""}),
     TushareCatalogItem("fund_nav", "基金", "公募基金净值", "ETF折溢价、规模与复权净值", "daily", "ts_code,ann_date,nav_date,unit_nav,accum_nav,accum_div,net_asset,total_netasset,adj_nav", {"ts_code": ""}),
+    TushareCatalogItem("fund_div", "基金", "公募基金分红", "ETF现金分配与账户总收益", "weekly", "ts_code,ann_date,imp_anndate,base_date,div_proc,record_date,ex_date,pay_date,earpay_date,net_ex_date,div_cash", {"ts_code": ""}),
     TushareCatalogItem("weekly", "行情", "周线", "长线趋势辅助", "weekly", "ts_code,trade_date,open,high,low,close,vol,amount", {"trade_date": ""}),
     TushareCatalogItem("monthly", "行情", "月线", "长线趋势辅助", "monthly", "ts_code,trade_date,open,high,low,close,vol,amount", {"trade_date": ""}),
     TushareCatalogItem("adj_factor", "行情", "复权因子", "历史价格复权和收益计算", "daily", "ts_code,trade_date,adj_factor", {"trade_date": ""}),
@@ -736,6 +737,10 @@ VALID_EMPTY_TUSHARE_APIS = {
     # These APIs describe optional events/disclosures. No returned row is a
     # valid negative observation after a successful request.
     "express", "pledge_detail", "pledge_stat", "namechange", "suspend_d",
+    # A company or fund may never have distributed cash or shares. An empty
+    # response is therefore positive evidence of "no corporate action", not
+    # an ingestion fault.
+    "dividend", "fund_div",
     # Dragon-Tiger and long-form news are event datasets. A successful query
     # with no rows is evidence that no event occurred in the requested window.
     "top_list", "top_inst", "major_news",
@@ -1018,7 +1023,7 @@ def _upsert_raw_records(api_name: str, df: pd.DataFrame) -> int:
 
 _DISCLOSURE_APIS = {
     "income", "balancesheet", "cashflow", "fina_indicator", "fina_audit", "forecast", "express",
-    "dividend", "top10_holders", "top10_floatholders", "stk_holdernumber", "pledge_detail", "disclosure_date",
+    "dividend", "fund_div", "top10_holders", "top10_floatholders", "stk_holdernumber", "pledge_detail", "disclosure_date",
 }
 
 
@@ -2307,17 +2312,23 @@ def sync_tushare_stock_batch(
 
 
 def sync_tushare_date_batch(
-    api_name: str, *, trade_dates: list[str], limit: int = 10, require_rows: bool = False
+    api_name: str, *, trade_dates: list[str], limit: int = 10, require_rows: bool = False,
+    minimum_rows: int = 1, require_point_in_time: bool = False,
 ) -> dict[str, Any]:
     """Progress a date-based API without letting retryable empty rows block forever."""
     _catalog_item(api_name)
     wanted = list(dict.fromkeys(str(x) for x in trade_dates if str(x)))
     with _conn() as c:
         if require_rows:
+            having = "HAVING COUNT(*)>=?"
+            query_params: tuple[Any, ...] = (api_name, *wanted, max(1, int(minimum_rows)))
+            if require_point_in_time:
+                having += " AND MAX(available_time)<=(SUBSTRING(trade_date,1,4)||'-'||SUBSTRING(trade_date,5,2)||'-'||SUBSTRING(trade_date,7,2)||'T15:00:00')"
             checked = {str(dict(row).get("trade_date") or "") for row in c.execute(
-                f"""SELECT DISTINCT trade_date FROM dc_tushare_raw_records
-                    WHERE api_name=? AND trade_date IN ({','.join('?' for _ in wanted)})""",
-                (api_name, *wanted),
+                f"""SELECT trade_date FROM dc_tushare_raw_records
+                    WHERE api_name=? AND trade_date IN ({','.join('?' for _ in wanted)})
+                    GROUP BY trade_date {having}""",
+                query_params,
             ).fetchall()} if wanted else set()
         else:
             checked = {str(dict(row).get("trade_date") or "") for row in c.execute(
@@ -2334,7 +2345,8 @@ def sync_tushare_date_batch(
     cooldown_seconds = max([int(x.get("cooldown_seconds") or 0) for x in results if x.get("cooldown")] or [0])
     return {
         "ok": all(bool(x.get("ok")) for x in results) and not cooldown, "api": api_name,
-        "require_rows": require_rows,
+        "require_rows": require_rows, "minimum_rows": max(1, int(minimum_rows)),
+        "require_point_in_time": require_point_in_time,
         "total": len(results), "success": sum(1 for x in results if x.get("ok") and not x.get("cooldown")),
         "failed": sum(1 for x in results if not x.get("ok")), "concurrency": workers,
         "cooldown": cooldown,
@@ -2375,6 +2387,42 @@ def sync_governance_bundle(ts_code: str, period: str | None = None) -> dict[str,
             params["end_date"] = period
         results.append(_safe_sync_raw(api, params))
     return {"ok": True, "ts_code": ts_code, "period": period, "results": results}
+
+
+def sync_dividend_data(ts_code: str) -> dict[str, Any]:
+    """Refresh the dividend ledger without pulling the full governance bundle."""
+    code = str(ts_code or "").strip().upper()
+    if not code:
+        return {"ok": False, "api": "dividend", "ts_code": code, "error": "ts_code is required"}
+    result = _safe_sync_raw("dividend", {"ts_code": code})
+    return {
+        "ok": bool(result.get("ok")),
+        "api": "dividend",
+        "ts_code": code,
+        "rows_read": int(result.get("rows_read") or result.get("rows") or 0),
+        "rows_written": int(result.get("rows_written") or 0),
+        "soft_failed": bool(result.get("soft_failed")),
+        "error": str(result.get("error") or ""),
+        "result": result,
+    }
+
+
+def sync_fund_dividend_data(ts_code: str) -> dict[str, Any]:
+    """Refresh official public-fund cash distributions for one listed fund."""
+    code = str(ts_code or "").strip().upper()
+    if not code:
+        return {"ok": False, "api": "fund_div", "ts_code": code, "error": "ts_code is required"}
+    result = _safe_sync_raw("fund_div", {"ts_code": code})
+    return {
+        "ok": bool(result.get("ok")),
+        "api": "fund_div",
+        "ts_code": code,
+        "rows_read": int(result.get("rows_read") or result.get("rows") or 0),
+        "rows_written": int(result.get("rows_written") or 0),
+        "soft_failed": bool(result.get("soft_failed")),
+        "error": str(result.get("error") or ""),
+        "result": result,
+    }
 
 
 def sync_expectation_bundle(ts_code: str, period: str | None = None) -> dict[str, Any]:

@@ -28,10 +28,20 @@ from app.api.routes import (
 )
 from app.core.config import settings
 from app.db.store import database_health as primary_database_health, init_db
-from app.services.quant_task_runner import resume_quant_tasks_on_startup, start_auto_simulation_scheduler
+from app.services.quant_task_runner import (
+    ensure_autonomous_simulation_task,
+    resume_quant_tasks_on_startup,
+    start_auto_simulation_scheduler,
+)
 from app.data_platform.services.daily_update import start_daily_update_scheduler
 from app.services.model_governance_scheduler import start_model_governance_scheduler
 from app.services.manual_review_triage import start_manual_review_triage_scheduler
+from app.services.evolution_orchestrator import (
+    recover_evolution_tasks,
+    start_evolution_scheduler,
+    start_evolution_worker,
+)
+from app.services.production_strategy import ensure_production_strategy_champion
 from app.data_platform.db import database_health as data_platform_database_health
 from app.data_platform.db import init_db as init_data_platform_db
 from app.data_platform.redis_store import start_task_worker
@@ -61,8 +71,16 @@ def startup() -> None:
     startup_t0 = time.perf_counter()
     logger.info("Starting service: initializing database schema only.")
     init_db()
+    champion = ensure_production_strategy_champion()
+    logger.info("Active ALIS production Champion: %s", champion.get("version"))
     init_data_platform_db()
     try:
+        autonomous_task = ensure_autonomous_simulation_task()
+        logger.info(
+            "Autonomous simulation task ready: task_id=%s created=%s",
+            ((autonomous_task.get("task") or {}).get("id")),
+            autonomous_task.get("created"),
+        )
         paused = resume_quant_tasks_on_startup()
         if paused > 0:
             logger.info("Paused interrupted quant tasks on startup: %d", paused)
@@ -70,6 +88,11 @@ def startup() -> None:
         start_daily_update_scheduler()
         start_model_governance_scheduler()
         start_manual_review_triage_scheduler()
+        recovered_evolution = recover_evolution_tasks()
+        start_evolution_worker()
+        start_evolution_scheduler()
+        if recovered_evolution:
+            logger.info("Recovered interrupted evolution tasks: %d", recovered_evolution)
     except Exception as exc:  # noqa: BLE001
         logger.warning("Failed to reconcile interrupted quant tasks: %s", str(exc)[:120])
     try:

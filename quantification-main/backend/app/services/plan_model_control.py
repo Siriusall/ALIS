@@ -173,9 +173,11 @@ def score_plan_model_features(model_key: str, features: dict[str, Any], artifact
     feature_names = list(payload.get("features") or PLAN_MODEL_FEATURES)
     model_path = payload.get("model_path")
     model_type = str(payload.get("model_type") or "plan_linear_ranker")
-    if model_path:
-        with Path(model_path).open("rb") as handle:
-            model = pickle.load(handle)
+    if model_path or payload.get("_model") is not None:
+        model = payload.get("_model")
+        if model is None:
+            with Path(str(model_path)).open("rb") as handle:
+                model = pickle.load(handle)
         vector = np.asarray([_coerce_feature_vector(features, feature_names)], dtype=float)
         value = float(model.predict(vector)[0])
         return {"ok": True, "model_key": model_key, "score": round(value, 8), "model_type": model_type, "artifact_version": payload.get("version")}

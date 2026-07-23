@@ -24,9 +24,13 @@ from app.schemas.backtest import (
     BacktestRunRequest,
     BacktestRunResponse,
     BacktestTradesResponse,
+    StrategyReplayRequest,
+    StrategyReplayResponse,
 )
 from app.services.backtest_engine import run_backtest
+from app.services.strategy_replay import run_strategy_replay
 from app.services.strategy_config import get_unsupported_backtest_factors
+from app.services.production_strategy import resolve_production_strategy_champion
 
 router = APIRouter()
 logger = logging.getLogger("quant.backtest_api")
@@ -34,13 +38,36 @@ _job_lock = threading.Lock()
 _jobs: dict[str, dict] = {}
 
 
+@router.post("/backtest/strategy-replay", response_model=StrategyReplayResponse)
+def api_run_strategy_replay(body: StrategyReplayRequest) -> StrategyReplayResponse:
+    """Replay the production strategy chain on an isolated historical ledger."""
+    try:
+        result = run_strategy_replay(
+            strategy_id=body.strategy_id,
+            model_version_id=body.model_version_id,
+            start_date=body.start_date,
+            end_date=body.end_date,
+            initial_cash=body.initial_cash,
+            rebalance_freq=body.rebalance_freq,
+            benchmark_symbol=body.benchmark_symbol,
+            exchange_group=body.exchange_group,
+        )
+        return StrategyReplayResponse(**result)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("strategy replay failed strategy_id=%s", body.strategy_id)
+        raise HTTPException(status_code=500, detail=f"策略重放失败: {str(exc)[:160]}") from exc
+
+
 @router.post("/backtest/run", response_model=BacktestRunResponse)
 def api_run_backtest(body: BacktestRunRequest) -> BacktestRunResponse:
+    champion = resolve_production_strategy_champion()
     model_version_id = body.model_version_id
     if model_version_id is None and body.strategy_id is None:
-        active = get_active_model_version()
-        model_version_id = int(active["id"]) if active else None
-    strategy_id = int(body.strategy_id or get_default_strategy_id() or 0)
+        main_binding = champion["model_bindings"].get("main") or {}
+        model_version_id = int(main_binding["id"]) if main_binding.get("id") else None
+    strategy_id = int(body.strategy_id or champion["strategy_id"])
     strategy = get_strategy(strategy_id)
     if strategy is None:
         raise HTTPException(status_code=404, detail="Strategy not found")
@@ -81,11 +108,12 @@ def api_run_backtest(body: BacktestRunRequest) -> BacktestRunResponse:
 
 @router.post("/backtest/run-async", response_model=BacktestRunAsyncResponse)
 def api_run_backtest_async(body: BacktestRunRequest) -> BacktestRunAsyncResponse:
+    champion = resolve_production_strategy_champion()
     model_version_id = body.model_version_id
     if model_version_id is None and body.strategy_id is None:
-        active = get_active_model_version()
-        model_version_id = int(active["id"]) if active else None
-    strategy_id = int(body.strategy_id or get_default_strategy_id() or 0)
+        main_binding = champion["model_bindings"].get("main") or {}
+        model_version_id = int(main_binding["id"]) if main_binding.get("id") else None
+    strategy_id = int(body.strategy_id or champion["strategy_id"])
     strategy = get_strategy(strategy_id)
     if strategy is None:
         raise HTTPException(status_code=404, detail="Strategy not found")
@@ -239,4 +267,3 @@ def api_delete_backtest(backtest_id: int) -> Response:
     if not delete_backtest_result(backtest_id):
         raise HTTPException(status_code=404, detail="Backtest not found")
     return Response(status_code=204)
-

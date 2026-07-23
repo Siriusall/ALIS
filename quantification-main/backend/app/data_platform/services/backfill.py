@@ -41,6 +41,7 @@ from app.data_platform.services.data_center import (
     get_vip_backfill_status,
 )
 from app.data_platform.services.market_calendar import target_trade_day
+from app.data_platform.services.oos_hard_data import audit_oos_hard_data, repair_oos_hard_data_batch
 from app.data_platform.redis_store import ack_task, enqueue_task, get_json, set_json
 from app.services.theme_engine import materialize_theme_snapshot_history
 from app.data_platform.services.exchange_etf_pcf import backfill_exchange_etf_pcf
@@ -270,6 +271,33 @@ def build_backfill_plan(*, market_batch_days: int = 30, financial_batch_size: in
             },
         }
     )
+
+    # Permanent Champion OOS contract. This is intentionally independent of
+    # the rolling two-year UI audit window and can never age out of the plan.
+    oos_hard = audit_oos_hard_data(end_date=end_s, include_dates=True)
+    oos_repair_dates = list(oos_hard.get("repair_dates") or [])
+    oos_details = {str(item.get("trade_date") or ""): item for item in oos_hard.get("dates") or []}
+    if oos_repair_dates:
+        batch = oos_repair_dates[:max(1, market_batch_days)]
+        add({
+            "priority": 1,
+            "key": "oos_hard_data",
+            "title": "补全 Champion OOS 永久硬数据",
+            "why": f"正式五窗口 OOS 要求 {oos_hard['required_sessions']} 个合格交易日，当前 {oos_hard['eligible_sessions']}，永久阻断直到完整",
+            "action": "sync_oos_hard_data_batch",
+            "params": {"trade_dates": batch, "date_gaps": {value: oos_details.get(value, {}) for value in batch}},
+            "estimated_calls": len(batch) * 4,
+            "estimated_minutes": round(len(batch) * 0.35, 1),
+            "status": "needed",
+            "gap": {"have": int(oos_hard["eligible_sessions"]), "need": int(oos_hard["required_sessions"]), "missing": int(oos_hard["missing_sessions"]), "dates": batch},
+        })
+    else:
+        add({
+            "priority": 1, "key": "oos_hard_data", "title": "Champion OOS 永久硬数据",
+            "why": "正式五窗口 OOS 数据合同已满足", "action": "sync_oos_hard_data_batch",
+            "params": {"trade_dates": []}, "estimated_calls": 0, "estimated_minutes": 0,
+            "status": "done", "gap": {"have": int(oos_hard["eligible_sessions"]), "need": int(oos_hard["required_sessions"]), "missing": 0},
+        })
 
     # 2. Market daily bundles — day by day in batches.
     market_batches: list[list[str]] = []
@@ -751,6 +779,7 @@ def build_backfill_plan(*, market_batch_days: int = 30, financial_batch_size: in
             "supported_actions": [
                 "sync_trade_calendar",
                 "sync_market_batch",
+                "sync_oos_hard_data_batch",
                 "sync_financial_batch",
                 "sync_financial_research_period",
                 "sync_financial_research_residual_batch",
@@ -1161,6 +1190,8 @@ def _run_step(step: dict[str, Any]) -> dict[str, Any]:
             results.append(sync_market_bundle(trade_date, include_suspend=bool(params.get("include_suspend")), apis=missing_apis))
         ok = all(bool(r.get("ok")) for r in results) if results else True
         return {"ok": ok, "results": results, "dates": trade_dates}
+    if action == "sync_oos_hard_data_batch":
+        return repair_oos_hard_data_batch(list(params.get("trade_dates") or []), date_gaps=params.get("date_gaps") or {})
     if action == "sync_financial_batch":
         result = sync_financial_batch(
             str(params.get("period") or ""),
@@ -1275,6 +1306,7 @@ def _worker(plan: dict[str, Any], *, max_steps: int, stream_id: str | None = Non
             s for s in plan.get("steps") or []
             if s.get("status") == "needed" and s.get("action") in {
                 "sync_trade_calendar", "sync_market_batch", "sync_financial_batch", "sync_financial_research_period", "sync_financial_research_residual_batch",
+                "sync_oos_hard_data_batch",
                 "sync_announcements", "sync_stock_api_batch", "sync_date_api_batch", "sync_index_core", "sync_macro_core",
                 "sync_capital_history_batch", "sync_etf_history_batch", "sync_major_news_history_batch",
                 "sync_exchange_etf_pcf_batch",
@@ -1388,7 +1420,7 @@ def _worker(plan: dict[str, Any], *, max_steps: int, stream_id: str | None = Non
                 remaining = [
                     s for s in refreshed.get("steps") or []
                     if s.get("status") == "needed"
-                    and s.get("action") in {"sync_market_batch", "sync_financial_batch", "sync_financial_research_period", "sync_financial_research_residual_batch", "sync_announcements", "run_quality", "sync_stock_api_batch", "sync_date_api_batch", "sync_index_core", "sync_macro_core", "sync_capital_history_batch", "sync_etf_history_batch", "sync_major_news_history_batch", "sync_exchange_etf_pcf_batch", "materialize_theme_snapshots_batch"}
+                    and s.get("action") in {"sync_market_batch", "sync_oos_hard_data_batch", "sync_financial_batch", "sync_financial_research_period", "sync_financial_research_residual_batch", "sync_announcements", "run_quality", "sync_stock_api_batch", "sync_date_api_batch", "sync_index_core", "sync_macro_core", "sync_capital_history_batch", "sync_etf_history_batch", "sync_major_news_history_batch", "sync_exchange_etf_pcf_batch", "materialize_theme_snapshots_batch"}
                     and str(s.get("key")) not in already
                     and str(s.get("key") or s.get("id") or "") not in deferred_keys
                 ]
@@ -1412,7 +1444,7 @@ def _worker(plan: dict[str, Any], *, max_steps: int, stream_id: str | None = Non
                     # Quality is a terminal verification step. Re-adding it
                     # together with every quota-safe data batch caused
                     # "补全 -> 质量 -> 下一轮" to repeat indefinitely.
-                    and s.get("action") in {"sync_trade_calendar", "sync_market_batch", "sync_financial_batch", "sync_financial_research_period", "sync_financial_research_residual_batch", "sync_announcements", "sync_stock_api_batch", "sync_date_api_batch", "sync_index_core", "sync_macro_core", "sync_capital_history_batch", "sync_etf_history_batch", "sync_major_news_history_batch", "sync_exchange_etf_pcf_batch", "materialize_theme_snapshots_batch"}
+                    and s.get("action") in {"sync_trade_calendar", "sync_market_batch", "sync_oos_hard_data_batch", "sync_financial_batch", "sync_financial_research_period", "sync_financial_research_residual_batch", "sync_announcements", "sync_stock_api_batch", "sync_date_api_batch", "sync_index_core", "sync_macro_core", "sync_capital_history_batch", "sync_etf_history_batch", "sync_major_news_history_batch", "sync_exchange_etf_pcf_batch", "materialize_theme_snapshots_batch"}
                     and str(s.get("key") or s.get("id") or "") not in deferred_keys
                 ]
                 if remaining:

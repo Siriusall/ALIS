@@ -58,6 +58,7 @@ from app.data_platform.services.cold_archive import archive_raw_records, cold_ar
 from app.data_platform.services.stream_admin import bulk_handle_stream_messages, handle_stream_message, stream_admin_status
 from app.services.theme_engine import materialize_theme_snapshot_history
 from app.data_platform.services.exchange_etf_pcf import backfill_exchange_etf_pcf, sync_exchange_etf_pcf
+from app.data_platform.services.oos_hard_data import audit_oos_hard_data
 
 router = APIRouter(tags=["data-center"])
 
@@ -150,6 +151,11 @@ def data_center_assets() -> dict[str, Any]:
 @router.get("/data-center/assets/watermarks")
 def data_center_asset_watermarks() -> dict[str, Any]:
     return asset_watermark_status()
+
+
+@router.get("/data-center/oos-hard-data")
+def data_center_oos_hard_data(include_dates: bool = Query(default=False)) -> dict[str, Any]:
+    return audit_oos_hard_data(include_dates=include_dates)
 
 
 @router.get("/data-center/migration-manifest")

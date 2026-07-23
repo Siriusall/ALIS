@@ -30,6 +30,8 @@ from app.services.market_context import (
 from app.services.strategy_gate import evaluate_strategy_gate
 from app.services.advanced_controls import black_litterman_weights, evaluate_slo, multi_period_oos_report
 from app.services.performance_reports import list_performance_reports, validate_performance_reports, build_multi_period_validation, materialize_formal_performance_reports
+from app.services.production_strategy import production_strategy_status
+from app.services.walk_forward_validation import WalkForwardConfig, run_purged_walk_forward_validation
 from app.services.news_theme_cluster import cluster_news_themes
 from app.services.analyst_consensus import build_analyst_consensus, batch_analyst_consensus
 from app.services.acceptance_evidence import (
@@ -43,6 +45,15 @@ from app.services.defensive_assets import defensive_allocation_for_state, list_d
 from app.services.hsmm_shadow import train_hsmm_shadow
 from app.services.backend_acceptance import backend_acceptance_matrix
 from app.services.strategy_workbench import build_strategy_workbench
+from app.services.strategy_lab import build_strategy_lab
+from app.services.system_autonomy import latest_owner_summary
+from app.services.evolution_orchestrator import (
+    cancel_evolution_task,
+    create_evolution_task,
+    evolution_schedule_status,
+    get_evolution_task,
+    list_evolution_tasks,
+)
 from app.services.plan_model_control import model_family_status, request_plan_model_training, review_plan_model_version, train_all_trainable_plan_models, review_all_candidate_plan_models, score_plan_model_features
 from app.services.plan_model_auto_optimizer import build_auto_optimization_status, run_auto_optimization_once
 from app.services.strategy_controller import (
@@ -127,6 +138,27 @@ class SLORequest(BaseModel):
 
 class OOSReportRequest(BaseModel):
     periods: list[dict[str, Any]] = Field(default_factory=list, max_length=1000)
+
+
+class PurgedWalkForwardRequest(BaseModel):
+    strategy_id: int | None = Field(None, ge=1)
+    start_date: str | None = None
+    end_date: str | None = None
+    train_sessions: int = Field(756, ge=60, le=3000)
+    validation_sessions: int = Field(126, ge=20, le=1000)
+    test_sessions: int = Field(126, ge=20, le=1000)
+    purge_sessions: int = Field(20, ge=1, le=252)
+    embargo_sessions: int = Field(5, ge=1, le=126)
+    step_sessions: int = Field(126, ge=1, le=1000)
+    minimum_windows: int = Field(5, ge=1, le=20)
+    max_windows: int | None = Field(None, ge=1, le=20)
+    execute: bool = True
+
+
+class EvolutionTaskRequest(BaseModel):
+    max_windows: int = Field(5, ge=1, le=20)
+    max_candidates: int = Field(6, ge=1, le=20)
+    force: bool = False
 
 
 class HsmmReviewRequest(BaseModel):
@@ -542,6 +574,11 @@ def model_strategy_multi_period_validation() -> dict:
     return build_multi_period_validation()
 
 
+@router.get("/model-strategy/production-strategy")
+def model_strategy_production_strategy() -> dict:
+    return production_strategy_status()
+
+
 
 @router.post("/model-strategy/themes/cluster-news")
 def model_strategy_cluster_news() -> dict:
@@ -589,6 +626,84 @@ def model_strategy_slo_history(scope: str | None = None, limit: int = 100) -> di
 @router.post("/model-strategy/oos/report")
 def model_strategy_oos_report(req: OOSReportRequest) -> dict:
     return multi_period_oos_report(req.periods)
+
+
+@router.post("/model-strategy/validation/purged-walk-forward")
+def model_strategy_purged_walk_forward(req: PurgedWalkForwardRequest) -> dict:
+    config = WalkForwardConfig(
+        train_sessions=req.train_sessions, validation_sessions=req.validation_sessions,
+        test_sessions=req.test_sessions, purge_sessions=req.purge_sessions,
+        embargo_sessions=req.embargo_sessions, step_sessions=req.step_sessions,
+        minimum_windows=req.minimum_windows,
+    )
+    try:
+        return run_purged_walk_forward_validation(
+            start_date=req.start_date, end_date=req.end_date, config=config,
+            max_windows=req.max_windows, strategy_id=req.strategy_id, execute=req.execute,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/model-strategy/strategy-lab")
+def model_strategy_lab() -> dict:
+    """Read-only Champion/Challenger performance view for the investor UI."""
+    return build_strategy_lab()
+
+
+@router.get("/model-strategy/evolution/tasks")
+def model_strategy_evolution_tasks(limit: int = 20) -> dict:
+    return {
+        "ok": True,
+        "items": list_evolution_tasks(limit=limit),
+        "schedule": evolution_schedule_status(),
+    }
+
+
+@router.get("/model-strategy/evolution/schedule")
+def model_strategy_evolution_schedule() -> dict:
+    return {"ok": True, **evolution_schedule_status()}
+
+
+@router.get("/model-strategy/evolution/owner-summary")
+def model_strategy_owner_summary() -> dict:
+    return latest_owner_summary()
+
+
+@router.get("/model-strategy/evolution/ledger-audit")
+def model_strategy_ledger_audit() -> dict:
+    from app.services.simulation_ledger_audit import audit_simulation_ledger
+    return audit_simulation_ledger(persist=False)
+
+
+@router.get("/model-strategy/evolution/tasks/{task_id}")
+def model_strategy_evolution_task(task_id: int) -> dict:
+    task = get_evolution_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="evolution task not found")
+    return task
+
+
+@router.post("/model-strategy/evolution/tasks")
+def model_strategy_create_evolution_task(req: EvolutionTaskRequest) -> dict:
+    return create_evolution_task(
+        task_type="strategy_evolution_cycle",
+        payload={
+            "max_windows": req.max_windows,
+            "max_candidates": req.max_candidates,
+            "trigger": "api",
+        },
+        dedupe_key=f"strategy_evolution_cycle:{datetime.now().date().isoformat()}",
+        force=req.force,
+    )
+
+
+@router.post("/model-strategy/evolution/tasks/{task_id}/cancel")
+def model_strategy_cancel_evolution_task(task_id: int) -> dict:
+    task = cancel_evolution_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="evolution task not found")
+    return {"ok": True, "task": task}
 
 
 @router.post("/model-strategy/drift")

@@ -32,15 +32,19 @@ def materialize_defensive_asset_history(*, start_date: str | None = None, end_da
 
 def list_defensive_assets(*, as_of_date: str | None = None) -> dict[str, Any]:
     cutoff = str(as_of_date or "99999999").replace("-", "")
+    available_cutoff = (
+        f"{cutoff[:4]}-{cutoff[4:6]}-{cutoff[6:8]}T15:00:00"
+        if len(cutoff) == 8 and cutoff.isdigit() else "9999-12-31T23:59:59"
+    )
     items = []
     try:
         with _conn() as c:
             result_rows = {
                 asset["ts_code"]: c.execute(
                     """SELECT trade_date,payload_json,available_time FROM dc_tushare_raw_records
-                       WHERE api_name='fund_daily' AND ts_code=? AND trade_date<=?
+                       WHERE api_name='fund_daily' AND ts_code=? AND trade_date<=? AND available_time<=?
                        ORDER BY trade_date DESC LIMIT 21""",
-                    (asset["ts_code"], cutoff),
+                    (asset["ts_code"], cutoff, available_cutoff),
                 ).fetchall()
                 for asset in DEFENSIVE_ASSETS
             }

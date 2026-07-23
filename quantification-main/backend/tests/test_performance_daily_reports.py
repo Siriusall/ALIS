@@ -27,6 +27,7 @@ def test_performance_persists_a_daily_snapshot_with_the_same_metrics(monkeypatch
     result = quant_runs.quant_run_performance(task_id=None)
 
     assert [row["period"] for row in result["daily"]] == ["2026-07-15", "2026-07-16"]
-    assert result["daily"][1]["return_pct"] == 0.0
+    assert result["daily"][1]["return_pct"] == 2.0
+    assert result["daily"][1]["benchmark_return_pct"] == 1.0
     assert set(captured["reports"]) == {"daily", "weekly", "monthly", "yearly"}
     assert result["persisted_reports"] == 5

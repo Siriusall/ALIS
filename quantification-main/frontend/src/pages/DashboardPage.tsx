@@ -27,6 +27,8 @@ const ReviewWorkbenchPage = lazy(() => import("../components/ReviewWorkbenchPage
 const TradeHistory = lazy(() => import("../components/TradeHistory"));
 const BackendLogsPage = lazy(() => import("../components/BackendLogsPage"));
 const CandidatePoolPage = lazy(() => import("../components/CandidatePoolPage"));
+const StrategyLabPage = lazy(() => import("../components/StrategyLabPage"));
+const FactorLabPage = lazy(() => import("../components/FactorLabPage"));
 
 export default function DashboardPage() {
   const { user, logout } = useAuth();
@@ -58,6 +60,8 @@ export default function DashboardPage() {
     positionRisk: <PositionRiskPage onNavigate={setCurrentSection} />,
     reviewWorkbench: <InvestorDashboardPage focus="models" />,
     candidatePool: <CandidatePoolPage />,
+    strategyLab: <StrategyLabPage />,
+    factorLab: <FactorLabPage />,
     validation: <DecisionAnalysisPage onNavigate={setCurrentSection} />,
     decisionLogs: <DecisionAuditPage />,
     review: <ReviewPage />,

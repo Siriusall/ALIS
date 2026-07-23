@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
+from app.services.factor_platform import SPEC_BY_KEY
 
 
 @dataclass
@@ -56,7 +57,7 @@ BACKTEST_SUPPORTED_FACTORS: set[str] = {
     "is_limit_up",
     "is_limit_down",
     "is_suspended",
-}
+} | set(SPEC_BY_KEY)
 
 
 def _is_legacy_weights_only(content: Any) -> bool:

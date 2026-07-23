@@ -120,10 +120,17 @@ def _trigger_models(action: str, row: dict[str, Any]) -> list[str]:
         return ["portfolio_risk_engine_v1", "market_state_policy_v1", "defensive_asset_policy_v1"]
     if action in {"sell_exit", "reduce_position"}:
         return ["portfolio_risk_engine_v1", "narrative_transition_multitask_v1", "capital_persistence_multitask_v1"]
-    models = ["medium_horizon_lambdarank_v1", "portfolio_risk_engine_v1"]
+    signals = row.get("model_signals") if isinstance(row.get("model_signals"), dict) else {}
+    models = [
+        str(item) for item in (signals.get("trigger_models") or [])
+        if str(item)
+    ]
+    if not models:
+        models = ["medium_horizon_lambdarank_v1"]
+    models.append("portfolio_risk_engine_v1")
     if _safe_float(row.get("score")) is not None:
         models.append("capital_persistence_multitask_v1")
-    return models
+    return list(dict.fromkeys(models))
 
 
 def _risk_budget_for(symbol: str, context: dict[str, Any]) -> dict[str, Any]:
@@ -382,6 +389,10 @@ def build_strategy_rebalance_actions(
     held = {str(symbol).strip(): dict(pos or {}) for symbol, pos in held_positions.items() if str(symbol).strip()}
     current_weight_map = {str(key): float(value or 0.0) for key, value in (current_weights or {}).items()}
     target_weight_map = {str(key): float(value or 0.0) for key, value in (target_weights or {}).items()}
+    defensive_weights = {
+        str(key): float(value or 0.0)
+        for key, value in (ctx.get("defensive_weights") or {}).items()
+    } if isinstance(ctx.get("defensive_weights"), dict) else {}
     thesis_map = {str(key): str(value or "") for key, value in (thesis_status_by_symbol or {}).items()}
     buy_actions: list[dict[str, Any]] = []
     sell_actions: list[dict[str, Any]] = []
@@ -390,19 +401,38 @@ def build_strategy_rebalance_actions(
         if symbol in held:
             continue
         selection = selections.get(symbol) or {}
+        model_signals = selection.get("model_signals") if isinstance(selection.get("model_signals"), dict) else {}
+        narrative = model_signals.get("narrative") if isinstance(model_signals.get("narrative"), dict) else {}
+        add_eligible = bool(model_signals.get("add_position_eligible", True))
+        requested_action = _action_for_buy(_safe_float(selection.get("score")), policy)
+        if requested_action == "add_position" and not add_eligible:
+            requested_action = "buy_candidate"
         row = rows.get(symbol)
         buy_actions.append({
             "symbol": symbol,
             "name": selection.get("name") or str(getattr(row, "name", "") or ""),
-            "action": "defensive_switch" if symbol in defensive_weights else None,
+            "action": "defensive_switch" if symbol in defensive_weights else requested_action,
             "score": selection.get("score"),
-            "reason": "策略总控：防御资产补位，等待组合层分配权重" if symbol in defensive_weights else "策略总控：入选目标池，等待组合层分配权重",
+            "reason": (
+                "策略总控：防御资产补位，等待组合层分配权重"
+                if symbol in defensive_weights
+                else "策略总控：生产模型合成通过，等待组合层分配权重"
+            ),
             "price": ctx.get("price_by_symbol", {}).get(symbol) if isinstance(ctx.get("price_by_symbol"), dict) else None,
             "close": round(float(getattr(row, "close", 0) or 0), 4) if row else None,
             "change_pct": float(getattr(row, "change_pct", 0) or 0) if row else 0.0,
             "volume": float(getattr(row, "volume", 0) or 0) if row else 0.0,
-            "capital_confirmation": "defensive_budget_confirmed" if symbol in defensive_weights else "model_or_proxy_confirmed",
-            "narrative_lifecycle": "risk_hedge" if symbol in defensive_weights else "confirmed_or_watch",
+            "capital_confirmation": (
+                "defensive_budget_confirmed"
+                if symbol in defensive_weights
+                else str(model_signals.get("capital_confirmation") or "model_or_proxy_confirmed")
+            ),
+            "narrative_lifecycle": (
+                "risk_hedge"
+                if symbol in defensive_weights
+                else str(narrative.get("lifecycle") or "confirmed_or_watch")
+            ),
+            "model_signals": model_signals,
         })
 
     if str(mode or "full_rebalance").lower() == "full_rebalance":

@@ -27,6 +27,7 @@ _assets_cache: dict[str, Any] = {"at": 0.0, "value": None}
 _SPARSE_RAW_APIS = (
     "namechange",
     "dividend",
+    "fund_div",
     "forecast",
     "express",
     "index_basic",
@@ -1392,6 +1393,9 @@ def _compute_data_assets() -> dict[str, Any]:
                 "period_details": spec.get("period_details"),
             }
         )
+
+    from app.data_platform.services.oos_hard_data import oos_hard_data_asset
+    items.append(oos_hard_data_asset())
 
     scored = [x for x in items if x["weight"] > 0 and x["measurement"] != "event_count"]
     avg_coverage = (

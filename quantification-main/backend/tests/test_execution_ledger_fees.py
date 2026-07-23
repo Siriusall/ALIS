@@ -92,6 +92,91 @@ def test_quant_sell_can_update_cash_without_writing_manual_operation(monkeypatch
     assert not any("INSERT INTO operations" in sql for sql in statements)
 
 
+def test_quant_etf_sell_persists_projection_and_exact_fee_ledger_together(monkeypatch: pytest.MonkeyPatch) -> None:
+    statements: list[tuple[str, tuple]] = []
+
+    class _Conn:
+        def execute(self, sql, params=()):
+            normalized = " ".join(sql.split())
+            statements.append((normalized, params))
+            if "FROM positions WHERE id" in sql:
+                return _Cursor([{"id": 7, "symbol": "511880", "quantity": 100, "price": 100.0,
+                                 "name": "银华日利ETF", "bought_at": "2026-01-02"}])
+            if "SELECT balance FROM account" in sql:
+                return _Cursor([{"balance": 1000.0}])
+            return _Cursor([])
+
+    @contextmanager
+    def fake_conn():
+        yield _Conn()
+
+    monkeypatch.setattr(store, "_conn", fake_conn)
+    fee = sell_cost_breakdown(100.0, 100, "511880")
+    result = store.sell_position(
+        7,
+        quantity=100,
+        price=float(fee["executed_price"]),
+        trade_date="2026-02-02",
+        record_operation=True,
+        operation_at="2026-02-02T09:30:00",
+        operation_remark="量化任务卖出（关联执行）",
+        fee_breakdown=fee,
+    )
+
+    assert result is None
+    insert = next(params for sql, params in statements if "INSERT INTO operations" in sql)
+    assert insert[5] == "2026-02-02T09:30:00"
+    assert insert[8:11] == (fee["commission"], 0.0, 0.0)
+    assert insert[12] == ETF_FEE_SCHEDULE_VERSION
+
+
+def test_buy_execution_uses_one_transaction_for_cash_operation_and_position(monkeypatch: pytest.MonkeyPatch) -> None:
+    statements: list[str] = []
+    connection_count = 0
+
+    class _Conn:
+        _is_postgres = True
+        _is_mysql = True
+
+        def execute(self, sql, params=()):
+            normalized = " ".join(sql.split())
+            statements.append(normalized)
+            if "SELECT balance FROM account" in sql:
+                return _Cursor([{"balance": 100_000.0}])
+            if "SELECT id FROM positions" in sql:
+                return _Cursor([{"id": 9}])
+            return _Cursor([])
+
+        def last_insert_id(self):
+            return 42
+
+    @contextmanager
+    def fake_conn():
+        nonlocal connection_count
+        connection_count += 1
+        yield _Conn()
+
+    monkeypatch.setattr(store, "_conn", fake_conn)
+    execution_id = store.create_and_apply_buy_execution(
+        1,
+        "2026-02-02T09:30:00",
+        1005.0,
+        1,
+        [{
+            "symbol": "000001", "side": "BUY", "price": 10.0, "quantity": 100,
+            "commission": 5.0, "transfer_fee": 0.0, "stamp_tax": 0.0,
+            "fee_schedule_version": "cn_a_share_fee_v1",
+        }],
+    )
+
+    assert execution_id == 42
+    assert connection_count == 1
+    assert any("INSERT INTO executions" in sql for sql in statements)
+    assert any("INSERT INTO operations" in sql for sql in statements)
+    assert any("INSERT INTO positions" in sql for sql in statements)
+    assert any("UPDATE account SET balance" in sql for sql in statements)
+
+
 def test_list_operations_decodes_target_weight_contract(monkeypatch: pytest.MonkeyPatch) -> None:
     class _Conn:
         def execute(self, *_args):

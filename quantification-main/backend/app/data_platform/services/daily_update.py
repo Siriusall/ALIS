@@ -19,6 +19,7 @@ from app.data_platform.services.data_center import (
 )
 from app.data_platform.services.market_calendar import target_trade_date
 from app.data_platform.services.exchange_etf_pcf import sync_exchange_etf_pcf
+from app.data_platform.services.oos_hard_data import audit_oos_hard_data
 
 _lock = threading.Lock()
 _state: dict[str, Any] = {"running": False, "phase": "idle", "message": "等待更新"}
@@ -149,6 +150,7 @@ def _worker(parent_run_id: int) -> None:
 
         _set_state(phase="quality", message="正在检查数据完整性", progress=90)
         steps.append({"step": "quality", "result": run_data_quality_checks(trade_date)})
+        steps.append({"step": "oos_hard_data", "result": audit_oos_hard_data(end_date=trade_date, include_dates=False)})
 
         # Research maintenance is downstream of a durable market snapshot. It
         # is deliberately non-fatal: a research failure must not roll back or

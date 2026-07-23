@@ -39,6 +39,7 @@
 | 业绩 | `forecast` → `forecast_vip` | 普通接口支持股票/公告日；VIP 用 `period` 全市场 | 历史按报告期走 VIP，失败后逐股降级 |
 | 业绩 | `express` → `express_vip` | 普通接口支持股票/公告日；VIP 用 `period` 全市场 | 历史按报告期走 VIP，失败后降级普通接口 |
 | 分红 | `dividend` | 股票或公告时间窗 | 日常按公告时间窗增量，历史逐股补漏 |
+| 公募基金分红 | `fund_div` | 基金代码、公告日、除息日或派息日 | 持仓 ETF 每周逐基金刷新；模拟账户按登记日资格和派息日入账 |
 | 股东 | `top10_holders` | `period` + 显式 `fields` 可批量 | 报告期批量优先，失败才逐股逐报告期 |
 | 股东 | `top10_floatholders` | `period` + 显式 `fields` 可批量 | 报告期批量优先，失败才逐股逐报告期 |
 | 股东 | `stk_holdernumber` | 公告日期窗，单次上限3000 | 日期窗批量优先，失败才逐股；按实际返回分页 |
@@ -73,4 +74,22 @@
 - 批量响应达到接口上限时必须分页或缩小日期窗口，禁止直接当作完整结果。
 - `success`、`valid_empty`、`not_applicable` 可计入完成；`empty_pending`、失败、未请求不得计入。
 
+## 模拟账本审计接口
 
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| `GET` | `/api/model-strategy/evolution/owner-summary` | 所有者首页摘要，包含账本状态、现金漂移、持仓漂移数量和异常 |
+| `GET` | `/api/model-strategy/evolution/ledger-audit` | 只读返回固定本金、成交、费用、公司行动及显式调整的独立重算结果 |
+
+账本审计接口不会自动修改现金或持仓；未通过时自动成交使用 `paused_simulation_ledger_drift` 硬门阻断。
+
+## 周期复盘与学习接口
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| `GET` | `/api/quant-runs/performance` | 重新计算并幂等保存日、周、月、年 `formal_performance_report_v2` |
+| `GET` | `/api/quant-runs/performance/reports` | 读取已冻结报告；可按 `task_id` 查看任务作用域 |
+| `GET` | `/api/model-strategy/performance-reports` | 按 `period_type` 读取正式周期报告 |
+| `GET` | `/api/model-strategy/evolution/owner-summary` | 返回最近自治任务的复盘状态、学习信号数量及具体信号 |
+
+每份 v2 报告包含 `benchmark_coverage`、`market_state_breakdown`、`model_version_breakdown`、`decision_version_manifest`、`costs`、`turnover`、`error_breakdown` 和 `learning_signals`。基准缺失日不按零收益处理；模型分组只统计决策、复核和错误，不伪造单模型收益。学习信号只能触发后续 Challenger 与组合治理，不能直接替换 Champion。

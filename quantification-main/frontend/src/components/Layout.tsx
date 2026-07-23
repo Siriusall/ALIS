@@ -34,6 +34,8 @@ export const ALL_SECTION_IDS = [
   "positionRisk",
   "reviewWorkbench",
   "candidatePool",
+  "strategyLab",
+  "factorLab",
   "decisionLogs",
   "review",
   "validation",
@@ -48,6 +50,8 @@ export const NAV_ITEMS = [
   { id: "portfolioWorkbench", label: "调仓方案", description: "今天是否需要调整", icon: "portfolio" },
   { id: "reviewWorkbench", label: "模型贡献", description: "模型收益与有效性", icon: "review" },
   { id: "candidatePool", label: "候选池", description: "候选来源与晋升门控", icon: "research" },
+  { id: "strategyLab", label: "策略实验室", description: "Champion 与候选表现", icon: "review" },
+  { id: "factorLab", label: "因子实验室", description: "版本、物化与自动评价", icon: "data" },
   { id: "dataCenter", label: "数据中台", description: "数据资产与质量", icon: "data" },
   { id: "governance", label: "模型训练", description: "训练、评审、上线", icon: "governance" },
 ] as const;

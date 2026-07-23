@@ -6,6 +6,7 @@ from app.services.cache_consolidation import FACTOR_KEYS_FOR_COVERAGE
 from app.services.factor_engine import FACTOR_REGISTRY, FACTORS_NEED_HISTORY, SNAPSHOT_ONLY_FACTORS
 from app.services.model_training import FEATURES as MODEL_FEATURES
 from app.services.strategy_config import BACKTEST_SUPPORTED_FACTORS
+from app.services.factor_platform import factor_registry_status
 
 _FACTOR_META: dict[str, dict[str, str]] = {
     "volume": {
@@ -192,9 +193,36 @@ def factor_library_summary() -> dict[str, Any]:
     for f in factors:
         cat = str(f.get("category") or "其他")
         categories[cat] = categories.get(cat, 0) + 1
+    try:
+        versioned = factor_registry_status()
+    except Exception:
+        versioned = {
+            "schema_version": "alis_factor_registry_v1",
+            "active_count": 0,
+            "latest_materialized_date": "",
+            "value_count": 0,
+            "evaluation_count": 0,
+            "definitions": [],
+            "consumer_contract": {},
+        }
+    version_by_key = {
+        str(item.get("factor_key") or ""): item
+        for item in versioned.get("definitions") or []
+    }
+    for factor in factors:
+        definition = version_by_key.get(str(factor["key"]))
+        factor.update({
+            "definition_id": int(definition.get("id") or 0) if definition else None,
+            "version": str(definition.get("version") or "") if definition else "",
+            "status": str(definition.get("status") or "legacy_unversioned") if definition else "legacy_unversioned",
+            "available_time_rule": str(definition.get("available_time_rule") or "") if definition else "",
+            "missing_policy": str(definition.get("missing_policy") or "") if definition else "",
+            "leakage_status": str(definition.get("leakage_status") or "unknown") if definition else "unknown",
+        })
     return {
         "total": len(factors),
         "categories": categories,
         "model_training_features": list(MODEL_FEATURES),
         "factors": factors,
+        "versioned_registry": versioned,
     }

@@ -27,6 +27,7 @@ class SnapshotRow:
     volume: float
     turnover: float
     name: str = ""
+    adj_factor: float = 1.0
 
 
 @dataclass
@@ -60,6 +61,52 @@ class BacktestDataSource:
         self._daily_basic_cache: Dict[str, Dict[str, Dict[str, float]]] = {}
         self.data_warnings: List[str] = []
         self.fallback_events: List[Dict[str, str]] = []
+        self._as_of_time: str | None = None
+        self._pit_sources: Dict[str, Dict[str, object]] = {}
+        # Replay walks forward chronologically.  Anchoring each security to the
+        # first factor seen keeps prices continuous without using a future
+        # end-of-window factor (which would leak information into lot sizing).
+        self._replay_adjustment_bases: Dict[str, float] = {}
+
+    def set_as_of_time(self, cutoff: str) -> None:
+        cutoff = str(cutoff or "").strip()
+        if cutoff == self._as_of_time:
+            return
+        self._as_of_time = cutoff or None
+        self._hist_cache.clear()
+        self._snapshot_cache.clear()
+        self._daily_basic_cache.clear()
+        self._pit_sources.clear()
+
+    def _record_pit_read(self, source: str, rows: List[dict]) -> None:
+        available = [str(row.get("available_time") or "") for row in rows if row.get("available_time")]
+        current = self._pit_sources.get(source, {})
+        current_max = str(current.get("max_available_time") or "")
+        observed_max = max(available) if available else ""
+        passed = (
+            bool(self._as_of_time)
+            and all(row.get("available_time") for row in rows)
+            and all(value <= str(self._as_of_time) for value in available)
+        )
+        # All-market history is read in batches. Preserve the full audit
+        # instead of letting a later, possibly empty, batch erase prior reads.
+        self._pit_sources[source] = {
+            "source": source,
+            "cutoff": self._as_of_time,
+            "read_count": int(current.get("read_count") or 0) + len(rows),
+            "batch_count": int(current.get("batch_count") or 0) + 1,
+            "future_excluded_count": int(current.get("future_excluded_count") or 0),
+            "missing_available_time_count": (
+                int(current.get("missing_available_time_count") or 0)
+                + sum(1 for row in rows if not row.get("available_time"))
+            ),
+            "max_available_time": max(current_max, observed_max) or None,
+            "sql_predicate": "available_time <= decision_cutoff" if self._as_of_time else "disabled",
+            "passed": bool(current.get("passed", True)) and passed,
+        }
+
+    def point_in_time_sources(self) -> List[Dict[str, object]]:
+        return list(self._pit_sources.values())
 
     def _postgres_trade_dates(self, start: str, end: str) -> List[str]:
         try:
@@ -76,19 +123,91 @@ class BacktestDataSource:
 
     def _postgres_daily_rows(self, ymd: str, symbol: str = "") -> List[dict]:
         try:
-            sql = "SELECT ts_code,trade_date,payload_json FROM dc_tushare_raw_records WHERE api_name='daily' AND trade_date=?"
+            sql = "SELECT ts_code,trade_date,payload_json,available_time FROM dc_tushare_raw_records WHERE api_name='daily' AND trade_date=?"
             params: tuple = (ymd,)
+            if self._as_of_time:
+                sql += " AND available_time<=?"
+                params += (self._as_of_time,)
             if symbol:
                 code = str(symbol).strip().split(".", 1)[0].zfill(6)
                 suffix = ".SH" if code.startswith(("6", "9")) else ".SZ" if code.startswith(("0", "3")) else ".BJ"
                 sql += " AND ts_code=?"
-                params = (ymd, f"{code}{suffix}")
+                params += (f"{code}{suffix}",)
             with _conn() as conn:
                 rows = conn.execute(sql, params).fetchall()
-            return [dict(row) for row in rows]
+            result = [dict(row) for row in rows]
+            self._record_pit_read("tushare.daily", result)
+            return result
         except Exception as exc:  # noqa: BLE001
             logger.warning("PostgreSQL backtest daily read failed: %s", str(exc)[:160])
             return []
+
+    def _postgres_snapshot_rows(self, ymd: str) -> List[dict]:
+        try:
+            sql = """SELECT s.ts_code,s.trade_date,s.name,s.close,s.change_pct,s.volume,s.turnover,
+                            s.total_mv,s.circ_mv,s.pe_ttm,s.pb,s.turnover_rate,s.available_time,
+                            r.payload_json AS daily_payload_json,
+                            a.payload_json AS adj_payload_json,
+                            a.available_time AS adj_available_time
+                     FROM dc_stock_daily_snapshot s
+                     LEFT JOIN dc_tushare_raw_records r
+                       ON r.api_name='daily' AND r.trade_date=s.trade_date AND r.ts_code=s.ts_code
+                     LEFT JOIN dc_tushare_raw_records a
+                       ON a.api_name='adj_factor' AND a.trade_date=s.trade_date AND a.ts_code=s.ts_code
+                     WHERE s.trade_date=?"""
+            params: tuple = (ymd,)
+            if self._as_of_time:
+                sql += " AND s.available_time<=? AND a.available_time<=?"
+                params += (self._as_of_time, self._as_of_time)
+            with _conn() as conn:
+                rows = [dict(row) for row in conn.execute(sql, params).fetchall()]
+            self._record_pit_read("snapshot.daily", rows)
+            return rows
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("PostgreSQL point-in-time snapshot read failed: %s", str(exc)[:160])
+            return []
+
+    def load_fund_snapshot(self, date_ymd: str, ts_codes: List[str]) -> List[SnapshotRow]:
+        """Load tradable ETF bars under the same point-in-time cutoff as stocks."""
+        codes = [str(code or "").strip() for code in ts_codes if str(code or "").strip()]
+        if not codes:
+            return []
+        ymd = str(date_ymd).replace("-", "")[:8]
+        placeholders = ",".join("?" for _ in codes)
+        sql = f"""SELECT ts_code,trade_date,payload_json,available_time
+                  FROM dc_tushare_raw_records
+                  WHERE api_name='fund_daily' AND trade_date=? AND ts_code IN ({placeholders})"""
+        params: tuple = (ymd, *codes)
+        if self._as_of_time:
+            sql += " AND available_time<=?"
+            params += (self._as_of_time,)
+        with _conn() as conn:
+            raw_rows = [dict(row) for row in conn.execute(sql, params).fetchall()]
+        self._record_pit_read("tushare.fund_daily", raw_rows)
+        result: List[SnapshotRow] = []
+        for raw in raw_rows:
+            try:
+                payload = json.loads(raw.get("payload_json") or "{}")
+            except (TypeError, json.JSONDecodeError):
+                payload = {}
+            close = float(payload.get("close") or 0)
+            if close <= 0:
+                continue
+            prev_close = float(payload.get("pre_close") or close)
+            result.append(SnapshotRow(
+                symbol=str(raw.get("ts_code") or "").split(".", 1)[0],
+                date=self._fmt_date(str(raw.get("trade_date") or ymd)),
+                open=float(payload.get("open") or close),
+                high=float(payload.get("high") or close),
+                low=float(payload.get("low") or close),
+                close=close,
+                prev_close=prev_close,
+                change_pct=float(payload.get("pct_chg") or ((close / prev_close - 1.0) * 100 if prev_close else 0)),
+                volume=float(payload.get("vol") or 0),
+                turnover=float(payload.get("amount") or 0),
+                name=str(payload.get("name") or f"{str(raw.get('ts_code') or '').split('.', 1)[0]} ETF"),
+            ))
+        return result
 
     def preload_histories(self, symbols: List[str], *, end_date: str | None = None, lookback: int | None = None) -> None:
         """Batch-load PostgreSQL history to avoid one query per factor row."""
@@ -131,19 +250,25 @@ class BacktestDataSource:
                 placeholders = ",".join("?" for _ in batch)
                 with _conn() as conn:
                     rows = conn.execute(
-                        f"""SELECT ts_code,trade_date,close,volume,turnover FROM dc_stock_daily_snapshot
-                            WHERE ts_code IN ({placeholders}){date_clause}
-                            ORDER BY ts_code,trade_date""",
-                        tuple(ts_code for _, ts_code in batch) + date_params,
+                        f"""SELECT s.ts_code,s.trade_date,s.close,s.volume,s.turnover,s.available_time,
+                                   (a.payload_json::jsonb->>'adj_factor')::double precision AS adj_factor
+                            FROM dc_stock_daily_snapshot s
+                            JOIN dc_tushare_raw_records a
+                              ON a.api_name='adj_factor' AND a.trade_date=s.trade_date AND a.ts_code=s.ts_code
+                            WHERE s.ts_code IN ({placeholders}){date_clause.replace('trade_date', 's.trade_date')}{' AND s.available_time<=? AND a.available_time<=?' if self._as_of_time else ''}
+                            ORDER BY s.ts_code,s.trade_date""",
+                        tuple(ts_code for _, ts_code in batch) + date_params + ((self._as_of_time, self._as_of_time) if self._as_of_time else ()),
                     ).fetchall()
+                self._record_pit_read("snapshot.history", [dict(row) for row in rows])
                 for raw_row in rows:
                     item = dict(raw_row)
                     code = str(item.get("ts_code") or "").split(".", 1)[0].zfill(6)
                     if code in grouped:
+                        adjusted_close = float(item.get("close") or 0) * float(item.get("adj_factor") or 1.0)
                         grouped[code].append(HistBar(
                             date=self._fmt_date(str(item.get("trade_date") or "")),
-                            open=float(item.get("close") or 0), high=float(item.get("close") or 0),
-                            low=float(item.get("close") or 0), close=float(item.get("close") or 0),
+                            open=adjusted_close, high=adjusted_close,
+                            low=adjusted_close, close=adjusted_close,
                             volume=float(item.get("volume") or 0), turnover=float(item.get("turnover") or 0),
                         ))
         except Exception as exc:  # noqa: BLE001
@@ -331,6 +456,39 @@ class BacktestDataSource:
             return self._snapshot_cache[date_iso]
 
         ymd = date_iso.replace("-", "")
+        snapshot_rows = self._postgres_snapshot_rows(ymd)
+        if snapshot_rows:
+            rows = []
+            for raw in snapshot_rows:
+                if not raw.get("ts_code"):
+                    continue
+                try:
+                    daily = json.loads(str(raw.get("daily_payload_json") or "{}"))
+                except (TypeError, json.JSONDecodeError):
+                    daily = {}
+                try:
+                    adj = json.loads(str(raw.get("adj_payload_json") or "{}"))
+                except (TypeError, json.JSONDecodeError):
+                    adj = {}
+                close = float(raw.get("close") or daily.get("close") or 0)
+                symbol = str(raw.get("ts_code") or "").split(".", 1)[0].zfill(6)
+                adj_factor = float(adj.get("adj_factor") or 1.0)
+                base_factor = self._replay_adjustment_bases.setdefault(symbol, adj_factor)
+                price_factor = adj_factor / base_factor if base_factor > 0 else 1.0
+                rows.append(SnapshotRow(
+                    symbol=symbol,
+                    date=self._fmt_date(str(raw.get("trade_date") or ymd)),
+                    open=float(daily.get("open") or close) * price_factor,
+                    high=float(daily.get("high") or close) * price_factor,
+                    low=float(daily.get("low") or close) * price_factor,
+                    close=close * price_factor,
+                    prev_close=float(daily.get("pre_close") or close) * price_factor,
+                    change_pct=float(raw.get("change_pct") or 0),
+                    volume=float(raw.get("volume") or 0), turnover=float(raw.get("turnover") or 0),
+                    name=str(raw.get("name") or ""), adj_factor=adj_factor,
+                ))
+            self._snapshot_cache[date_iso] = rows
+            return rows
         postgres_rows = self._postgres_daily_rows(ymd)
         if postgres_rows:
             rows: List[SnapshotRow] = []
@@ -499,10 +657,11 @@ class BacktestDataSource:
             suffix = ".SH" if code.startswith(("6", "9")) else ".SZ" if code.startswith(("0", "3")) else ".BJ"
             with _conn() as conn:
                 rows = conn.execute(
-                    """SELECT trade_date,close,volume,turnover FROM dc_stock_daily_snapshot
-                       WHERE ts_code=? ORDER BY trade_date""",
-                    (f"{code}{suffix}",),
+                    f"""SELECT trade_date,close,volume,turnover,available_time FROM dc_stock_daily_snapshot
+                       WHERE ts_code=?{' AND available_time<=?' if self._as_of_time else ''} ORDER BY trade_date""",
+                    (f"{code}{suffix}",) + ((self._as_of_time,) if self._as_of_time else ()),
                 ).fetchall()
+            self._record_pit_read("snapshot.symbol_history", [dict(row) for row in rows])
             postgres_bars = []
             for raw in rows:
                 item = dict(raw)
@@ -556,6 +715,26 @@ class BacktestDataSource:
         return vals[-lookback:]
 
     def get_price_on_date(self, symbol: str, date_iso: str, field: str = "close") -> Optional[float]:
+        ts_code = str(symbol or "").strip().upper()
+        if "." in ts_code:
+            ymd = str(date_iso or "").replace("-", "")[:8]
+            try:
+                sql = """SELECT payload_json,available_time FROM dc_tushare_raw_records
+                         WHERE api_name='index_daily' AND ts_code=? AND trade_date=?"""
+                params: tuple = (ts_code, ymd)
+                if self._as_of_time:
+                    sql += " AND available_time<=?"
+                    params += (self._as_of_time,)
+                with _conn() as conn:
+                    raw = conn.execute(sql, params).fetchone()
+                if raw:
+                    item = dict(raw)
+                    self._record_pit_read("tushare.index_daily", [item])
+                    payload = json.loads(str(item.get("payload_json") or "{}"))
+                    value = float(payload.get(field) or 0)
+                    return value if value > 0 else None
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("PostgreSQL benchmark read failed: %s", str(exc)[:160])
         bars = self.get_symbol_history(symbol)
         if not bars:
             return None
@@ -565,6 +744,45 @@ class BacktestDataSource:
             if b.date < date_iso[:10]:
                 return None
         return None
+
+    def get_index_return(self, symbol: str, as_of_date: str, *, lookback: int = 20) -> Optional[float]:
+        returns = self.get_index_returns(symbol, as_of_date, lookback=lookback)
+        if not returns:
+            return None
+        compound = 1.0
+        for value in returns:
+            compound *= 1.0 + value
+        return compound - 1.0
+
+    def get_index_returns(self, symbol: str, as_of_date: str, *, lookback: int = 60) -> List[float]:
+        """Return point-in-time daily benchmark returns in chronological order."""
+        ts_code = str(symbol or "").strip().upper()
+        ymd = str(as_of_date or "").replace("-", "")[:8]
+        sql = """SELECT trade_date,payload_json,available_time FROM dc_tushare_raw_records
+                 WHERE api_name='index_daily' AND ts_code=? AND trade_date<=?"""
+        params: tuple = (ts_code, ymd)
+        if self._as_of_time:
+            sql += " AND available_time<=?"
+            params += (self._as_of_time,)
+        sql += " ORDER BY trade_date DESC LIMIT ?"
+        params += (max(2, min(int(lookback) + 1, 251)),)
+        try:
+            with _conn() as conn:
+                raw_rows = [dict(row) for row in conn.execute(sql, params).fetchall()]
+            self._record_pit_read("tushare.index_daily_trend", raw_rows)
+            closes = [
+                float(json.loads(str(row.get("payload_json") or "{}")).get("close") or 0)
+                for row in reversed(raw_rows)
+            ]
+            closes = [value for value in closes if value > 0]
+            return [
+                closes[index] / closes[index - 1] - 1.0
+                for index in range(1, len(closes))
+                if closes[index - 1] > 0
+            ]
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("PostgreSQL benchmark trend read failed: %s", str(exc)[:160])
+            return []
 
     def get_daily_basic_map(self, date_ymd: str) -> Dict[str, Dict[str, float]]:
         """
@@ -578,21 +796,22 @@ class BacktestDataSource:
         try:
             with _conn() as conn:
                 rows = conn.execute(
-                    "SELECT ts_code,payload_json FROM dc_tushare_raw_records WHERE api_name='daily_basic' AND trade_date=?",
-                    (ymd,),
+                    f"""SELECT ts_code,total_mv,circ_mv,pe_ttm,pb,turnover_rate,available_time
+                         FROM dc_stock_daily_snapshot WHERE trade_date=?{' AND available_time<=?' if self._as_of_time else ''}""",
+                    (ymd,) + ((self._as_of_time,) if self._as_of_time else ()),
                 ).fetchall()
+            self._record_pit_read("snapshot.daily_basic", [dict(row) for row in rows])
             postgres_payload: Dict[str, Dict[str, float]] = {}
             for raw in rows:
                 item = dict(raw)
-                payload = json.loads(str(item.get("payload_json") or "{}"))
-                symbol = str(item.get("ts_code") or payload.get("ts_code") or "").split(".", 1)[0].zfill(6)
+                symbol = str(item.get("ts_code") or "").split(".", 1)[0].zfill(6)
                 if symbol:
                     postgres_payload[symbol] = {
-                        "total_mv": float(payload.get("total_mv") or 0),
-                        "float_mv": float(payload.get("circ_mv") or 0),
-                        "pe_ttm": float(payload.get("pe_ttm") or 0),
-                        "pb": float(payload.get("pb") or 0),
-                        "turnover_rate": float(payload.get("turnover_rate") or 0),
+                        "total_mv": float(item.get("total_mv") or 0),
+                        "float_mv": float(item.get("circ_mv") or 0),
+                        "pe_ttm": float(item.get("pe_ttm") or 0),
+                        "pb": float(item.get("pb") or 0),
+                        "turnover_rate": float(item.get("turnover_rate") or 0),
                     }
             if postgres_payload:
                 self._daily_basic_cache[ymd] = postgres_payload

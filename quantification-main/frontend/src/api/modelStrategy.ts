@@ -128,6 +128,59 @@ export async function runPlanModelAutoOptimization(force = false): Promise<{ ok:
   return data;
 }
 
+export interface OwnerDailySummaryResponse {
+  ok: boolean;
+  available: boolean;
+  task_id?: number;
+  task_status?: string;
+  finished_at?: string;
+  message?: string;
+  summary?: {
+    healthy: boolean;
+    generated_at: string;
+    questions: {
+      today_rebalance: { status: string; plan_date?: string | null; summary?: Record<string, unknown>; proposal_count: number };
+      profit: {
+        daily_return_pct?: number | null;
+        monthly_return_pct?: number | null;
+        unit?: string;
+        status?: string;
+        hit_rate?: number | null;
+        period_return?: number | null;
+        benchmark_return?: number | null;
+        excess_return?: number | null;
+        total_fees?: number | null;
+        trading_cost_contribution?: number | null;
+      };
+      system_changes: {
+        model_auto_promoted: number;
+        model_auto_rejected: number;
+        model_training_started: number;
+        strategy_candidates_created?: number;
+        portfolio_method?: string | null;
+        execution_cost_version?: string | null;
+        execution_cost_status?: string | null;
+        execution_cost_observations?: number;
+        hard_data_status?: string | null;
+        corporate_actions_applied?: number;
+        dividend_cash_applied?: number;
+        ledger_status?: string | null;
+        ledger_cash_drift?: number | null;
+        ledger_position_drift_count?: number;
+        performance_review_status?: string | null;
+        performance_learning_signal_count?: number;
+        performance_learning_signals?: Array<{ code: string; severity: string; target: string; value: number }>;
+      };
+      anomalies: Array<{ module: string; message: string }>;
+    };
+  };
+}
+
+export async function fetchOwnerDailySummary(): Promise<OwnerDailySummaryResponse> {
+  const { data } = await api.get<OwnerDailySummaryResponse>("/api/model-strategy/evolution/owner-summary");
+  return data;
+}
+
 export async function startPlanModelTraining(modelKey: string): Promise<{ ok: boolean; started: boolean; run_id?: number; model_key: string; status?: string; reason?: string }> {
   const { data } = await api.post("/api/model-strategy/plan-models/train", { model_key: modelKey });
   return data;
@@ -251,6 +304,141 @@ export async function fetchStrategyWorkbench(params?: {
     // This endpoint aggregates model governance, plan acceptance and
     // operations evidence across the PostgreSQL store.
     timeout: 60_000,
+  });
+  return data;
+}
+
+export interface StrategyLabPolicy {
+  rebalance_frequency: string;
+  top_n: number;
+  max_single_weight: number | null;
+  max_rebalance_turnover: number | null;
+  min_weight_change: number | null;
+  max_entry_1d_return: number | null;
+  max_entry_5d_return: number | null;
+  rationale: string[];
+}
+
+export interface StrategyLabChallenger {
+  model_version_id: number;
+  strategy_id: number;
+  name: string;
+  version: string;
+  role: string;
+  status: string;
+  production_eligible: boolean;
+  champion_reference: string;
+  created_at: string;
+  updated_at: string;
+  policy: StrategyLabPolicy;
+  formal_oos: {
+    status: string;
+    valid_windows: number;
+    outperform_windows: number;
+    outperform_ratio: number | null;
+    aggregate_cost_after_return: number | null;
+    aggregate_benchmark_return: number | null;
+    aggregate_excess_return: number | null;
+    worst_window_drawdown: number | null;
+    total_fees: number | null;
+    windows: Array<{ window: number; return: number | null }>;
+  };
+  passed_gates: string[];
+  blocking_reasons: string[];
+  next_gate: string;
+  quick_diagnostic: Record<string, unknown>;
+  shadow: {
+    status: string;
+    session_count: number;
+    minimum_sessions: number;
+    started_after: string;
+    latest_trade_date: string;
+    gate: {
+      passed?: boolean;
+      compounded_delta?: number;
+      outperform_ratio?: number;
+      blocking_reasons?: string[];
+    };
+  };
+  baseline_key?: string;
+}
+
+export interface StrategyLabResponse {
+  ok: boolean;
+  schema_version: string;
+  champion: {
+    model_version_id: number;
+    strategy_id: number;
+    name: string;
+    version: string;
+    role: string;
+    is_active: boolean;
+  };
+  challengers: StrategyLabChallenger[];
+  baselines: StrategyLabChallenger[];
+  promotion_events: Array<{
+    id: number;
+    event_type: string;
+    from_champion_version_id?: number | null;
+    to_champion_version_id?: number | null;
+    candidate_model_version_id?: number | null;
+    reason: Record<string, unknown>;
+    evidence: Record<string, unknown>;
+    created_at: string;
+  }>;
+  summary: {
+    challenger_count: number;
+    baseline_count: number;
+    production_eligible_count: number;
+    display_policy: string;
+  };
+}
+
+export async function fetchStrategyLab(): Promise<StrategyLabResponse> {
+  const { data } = await api.get<StrategyLabResponse>("/api/model-strategy/strategy-lab");
+  return data;
+}
+
+export interface EvolutionTask {
+  id: number;
+  task_type: string;
+  status: "queued" | "running" | "retry_wait" | "completed" | "failed" | "cancelled" | string;
+  phase: string;
+  progress: number;
+  message: string;
+  attempt: number;
+  max_attempts: number;
+  checkpoint: {
+    completed?: Array<Record<string, unknown>>;
+    current?: { strategy_id?: number; windows?: Array<Record<string, unknown>> };
+  };
+  result: Record<string, unknown>;
+  error?: string | null;
+  estimated_remaining_seconds?: number | null;
+  heartbeat_at?: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface EvolutionSchedule {
+  auto_enabled: boolean;
+  worker_id: string;
+  budgets: {
+    single_worker: boolean;
+    max_candidates_per_cycle: number;
+    max_windows_per_candidate: number;
+    task_timeout_minutes: number;
+    hard_history_contract_sessions: number;
+  };
+  next_factor_cycle_at: string | null;
+  next_shadow_cycle_at: string | null;
+  next_system_cycle_at: string | null;
+  next_formal_cycle_at: string | null;
+}
+
+export async function fetchEvolutionTasks(limit = 10): Promise<{ ok: boolean; items: EvolutionTask[]; schedule: EvolutionSchedule }> {
+  const { data } = await api.get<{ ok: boolean; items: EvolutionTask[]; schedule: EvolutionSchedule }>("/api/model-strategy/evolution/tasks", {
+    params: { limit },
   });
   return data;
 }

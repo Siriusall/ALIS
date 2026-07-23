@@ -40,6 +40,7 @@ CONTRACTS = {
             ("moneyflow", "个股资金流历史", 0.99, "block"),
             ("etf_history", "ETF价格与净值历史", 0.99, "block"),
             ("etf_pcf", "ETF每日申购赎回篮子", 0.80, "degrade"),
+            ("oos_hard_data", "Champion OOS 永久硬数据", 1.0, "block"),
         ],
     },
     "position_risk": {
@@ -64,6 +65,7 @@ CONTRACTS = {
             ("etf_pcf", "ETF真实篮子核验", 0.80, "degrade"),
             ("major_news", "叙事训练语料", 0.99, "block"),
             ("theme_snapshots", "叙事状态快照", 1.0, "block"),
+            ("oos_hard_data", "Champion OOS 永久硬数据", 1.0, "block"),
         ],
     },
     "narrative_model": {

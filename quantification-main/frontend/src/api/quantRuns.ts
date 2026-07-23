@@ -47,6 +47,30 @@ export interface PerformancePeriod {
   market_contribution: number | null;
   execution_contribution: number;
   attribution_status: string;
+  learning_status?: "healthy" | "attention";
+  learning_signals?: Array<{ code: string; severity: string; target: string; value: number }>;
+  market_state_breakdown?: Record<string, {
+    sessions: number;
+    return_pct: number;
+    benchmark_return_pct: number;
+    average_confidence: number;
+    market_model_versions: string[];
+  }>;
+  model_version_breakdown?: Record<string, {
+    decision_count: number;
+    buy_count: number;
+    sell_count: number;
+    reviewed_count: number;
+    error_count: number;
+    error_types: Record<string, number>;
+    symbols: string[];
+  }>;
+  error_breakdown?: {
+    review_error_types: Record<string, number>;
+    decision_error_types?: Record<string, number>;
+    review_activity_error_types?: Record<string, number>;
+    blocked_signal_codes: Record<string, number>;
+  };
 }
 
 export interface QuantPerformanceOverview {

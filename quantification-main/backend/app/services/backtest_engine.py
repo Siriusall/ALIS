@@ -15,10 +15,12 @@ from app.core.a_share_fees import (
     transfer_fee,
 )
 from app.core.trading_constraints import check_open_trade_constraints, normalize_lot_quantity
-from app.db.store import get_default_strategy_id, get_model_version, get_strategy
+from app.db.store import get_model_version, get_strategy
+from app.services.production_strategy import resolve_production_strategy_champion
 from app.services.backtest_data_source import BacktestDataSource, HistBar, SnapshotRow
 from app.services.backtest_metrics import build_metrics
 from app.services.strategy_config import parse_strategy_content
+from app.services.factor_platform import compute_registered_factor
 
 logger = logging.getLogger("quant.backtest_engine")
 
@@ -47,64 +49,18 @@ def _factor_value(
     row: SnapshotRow,
     hist: List[HistBar],
     daily_basic: Dict[str, Dict[str, float]],
+    *,
+    benchmark_return: float | None = None,
+    benchmark_returns: List[float] | None = None,
 ) -> float:
-    if factor == "volume":
-        return row.volume
-    if factor == "turnover":
-        return row.turnover
-    if factor == "change_pct":
-        return abs(row.change_pct)
-    if factor == "momentum_5":
-        if len(hist) < 5 or hist[-5].close <= 0:
-            return 0.0
-        return row.close / hist[-5].close - 1.0
-    if factor == "momentum_20":
-        if len(hist) < 20 or hist[-20].close <= 0:
-            return 0.0
-        return row.close / hist[-20].close - 1.0
-    if factor == "volatility_20":
-        if len(hist) < 20:
-            return 0.0
-        closes = [x.close for x in hist[-20:]]
-        rets: List[float] = []
-        for i in range(1, len(closes)):
-            if closes[i - 1] > 0:
-                rets.append(closes[i] / closes[i - 1] - 1.0)
-        if not rets:
-            return 0.0
-        m = sum(rets) / len(rets)
-        var = sum((r - m) ** 2 for r in rets) / len(rets)
-        return var ** 0.5 if var > 0 else 0.0
-    if factor == "volume_ratio_5":
-        if len(hist) < 5:
-            return 0.0
-        avg = sum(x.volume for x in hist[-5:]) / 5.0
-        return row.volume / avg if avg > 0 else 0.0
-
-    db = daily_basic.get(row.symbol, {})
-    def _safe_num(v: Any) -> float:
-        try:
-            x = float(v or 0)
-            return x if math.isfinite(x) else 0.0
-        except Exception:
-            return 0.0
-    if factor == "float_mv":
-        return _safe_num(db.get("float_mv", 0))
-    if factor == "total_mv":
-        return _safe_num(db.get("total_mv", 0))
-    if factor == "pe_ttm":
-        return _safe_num(db.get("pe_ttm", 0))
-    if factor == "pb":
-        return _safe_num(db.get("pb", 0))
-    if factor == "is_st":
-        return 1.0 if row.name.upper().startswith(("ST", "*ST")) else 0.0
-    if factor == "is_limit_up":
-        return 1.0 if row.change_pct >= 9.7 else 0.0
-    if factor == "is_limit_down":
-        return 1.0 if row.change_pct <= -9.7 else 0.0
-    if factor == "is_suspended":
-        return 1.0 if row.volume <= 0 else 0.0
-    return 0.0
+    return compute_registered_factor(
+        factor,
+        row,
+        hist,
+        daily_basic,
+        benchmark_return=benchmark_return,
+        benchmark_returns=benchmark_returns,
+    )
 
 
 def _apply_filters(
@@ -182,7 +138,8 @@ def run_backtest(
     model_version_id: int | None = None,
     progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> Dict[str, Any]:
-    strategy_id = int(strategy_id or get_default_strategy_id() or 1)
+    champion = resolve_production_strategy_champion()
+    strategy_id = int(strategy_id or champion["strategy_id"])
     strategy = get_strategy(strategy_id)
     if not strategy:
         raise ValueError(f"strategy_id={strategy_id} 不存在")
@@ -472,6 +429,11 @@ def run_backtest(
         max_lookback = max(lookback, 20)
         total_universe = len(snapshot)
         ds.preload_histories([row.symbol for row in snapshot], end_date=d, lookback=max_lookback)
+        benchmark_returns = ds.get_index_returns("000300.SH", d, lookback=60) if required_factors & {"beta_60", "relative_strength_60"} else []
+        benchmark_return = (
+            math.prod(1.0 + value for value in benchmark_returns) - 1.0
+            if benchmark_returns else None
+        )
         _emit_progress(
             {
                 "date": d,
@@ -486,7 +448,14 @@ def run_backtest(
             hist = ds.get_hist_window(row.symbol, d, max_lookback)
             vals: Dict[str, float] = {}
             for f in required_factors:
-                vals[f] = _factor_value(f, row, hist, daily_basic_map)
+                vals[f] = _factor_value(
+                    f,
+                    row,
+                    hist,
+                    daily_basic_map,
+                    benchmark_return=benchmark_return,
+                    benchmark_returns=benchmark_returns,
+                )
             factor_values[row.symbol] = vals
             if i % 50 == 0 or i == total_universe:
                 _emit_progress(
@@ -556,6 +525,16 @@ def run_backtest(
         "strategy_name": f"模型策略 {model_version.get('version')}" if model_version else strategy.get("name", ""),
         "model_version_id": int(model_version_id) if model_version_id else None,
         "model_version": model_version.get("version") if model_version else None,
+        "production_strategy_version_id": champion["champion_id"],
+        "production_strategy_version": champion["champion_version"],
+        "factor_contract": {
+            "schema_version": "alis_factor_registry_v1",
+            "bindings": (
+                (model_config.get("factor_bindings") if isinstance(model_config, dict) else None)
+                or champion.get("factor_bindings")
+                or {}
+            ),
+        },
         "start_date": trade_dates[0] if trade_dates else start_date,
         "end_date": trade_dates[-1] if trade_dates else end_date,
         "initial_cash": round(float(initial_cash), 2),
