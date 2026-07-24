@@ -37,6 +37,10 @@ pnpm-debug.log*
 dist/
 build/
 *.tsbuildinfo
+backend.zip
+backups/
+.runtime/
+outputs/
 
 # Local data, cache, and generated artifacts
 .cache/

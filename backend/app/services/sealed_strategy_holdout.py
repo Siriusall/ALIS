@@ -1,0 +1,307 @@
+"""One-shot historical holdout isolated from strategy research and diagnosis."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+from datetime import datetime
+from typing import Any, Callable
+
+from app.data_platform.db import _conn as _data_conn
+from app.data_platform.services.oos_hard_data import (
+    HARD_APIS,
+    MINIMUM_DAILY_ROWS,
+    MINIMUM_HARD_API_ROWS,
+    MINIMUM_MARKET_FIELD_RATIO,
+    _date_api_sets,
+    repair_oos_hard_data_batch,
+)
+from app.db.store import _conn, get_model_version
+from app.services.production_strategy import resolve_production_strategy_champion
+from app.services.strategy_replay import run_strategy_replay
+
+
+SEALED_HOLDOUT_CONTRACT = "alis_sealed_strategy_holdout_v1"
+SEALED_HOLDOUT_START = "20190910"
+SEALED_HOLDOUT_END = "20200320"
+SEALED_HOLDOUT_SESSIONS = 126
+SEALED_HOLDOUT_DATES = (
+    "20190910", "20190911", "20190912", "20190916", "20190917", "20190918", "20190919", "20190920",
+    "20190923", "20190924", "20190925", "20190926", "20190927", "20190930", "20191008", "20191009",
+    "20191010", "20191011", "20191014", "20191015", "20191016", "20191017", "20191018", "20191021",
+    "20191022", "20191023", "20191024", "20191025", "20191028", "20191029", "20191030", "20191031",
+    "20191101", "20191104", "20191105", "20191106", "20191107", "20191108", "20191111", "20191112",
+    "20191113", "20191114", "20191115", "20191118", "20191119", "20191120", "20191121", "20191122",
+    "20191125", "20191126", "20191127", "20191128", "20191129", "20191202", "20191203", "20191204",
+    "20191205", "20191206", "20191209", "20191210", "20191211", "20191212", "20191213", "20191216",
+    "20191217", "20191218", "20191219", "20191220", "20191223", "20191224", "20191225", "20191226",
+    "20191227", "20191230", "20191231", "20200102", "20200103", "20200106", "20200107", "20200108",
+    "20200109", "20200110", "20200113", "20200114", "20200115", "20200116", "20200117", "20200120",
+    "20200121", "20200122", "20200123", "20200203", "20200204", "20200205", "20200206", "20200207",
+    "20200210", "20200211", "20200212", "20200213", "20200214", "20200217", "20200218", "20200219",
+    "20200220", "20200221", "20200224", "20200225", "20200226", "20200227", "20200228", "20200302",
+    "20200303", "20200304", "20200305", "20200306", "20200309", "20200310", "20200311", "20200312",
+    "20200313", "20200316", "20200317", "20200318", "20200319", "20200320",
+)
+
+
+def _ensure_table() -> None:
+    with _conn() as conn:
+        conn.execute("""CREATE TABLE IF NOT EXISTS strategy_sealed_holdout_results (
+            id BIGSERIAL PRIMARY KEY,
+            cohort_key VARCHAR(128) NOT NULL UNIQUE,
+            model_version_id BIGINT NOT NULL,
+            champion_version_id BIGINT NOT NULL,
+            contract_hash VARCHAR(64) NOT NULL,
+            status VARCHAR(32) NOT NULL,
+            passed INTEGER NOT NULL DEFAULT 0,
+            evidence_json TEXT NOT NULL DEFAULT '{}',
+            created_at VARCHAR(64) NOT NULL
+        )""")
+
+
+def sealed_strategy_holdout_asset() -> dict[str, Any]:
+    audit = audit_sealed_strategy_holdout(include_dates=False)
+    return {
+        "key": "sealed_strategy_holdout",
+        "name": "策略晋升密封历史保留集",
+        "domain": "模型验证",
+        "consumer": "formal_candidate_gate only",
+        "weight": 100,
+        "target_scope": f"固定 {SEALED_HOLDOUT_SESSIONS} 个交易日（研究过程不可见）",
+        "frequency": "fixed_once",
+        "source": "TuShare retained hard slices + 标准化日截面",
+        "window_start": SEALED_HOLDOUT_START,
+        "window_end": SEALED_HOLDOUT_END,
+        "window_depth": f"{SEALED_HOLDOUT_SESSIONS} sessions",
+        "rationale": "仅在正式 OOS、同批 Champion 对照和多重试验校正全部通过后消费一次",
+        "actual_records": audit["eligible_sessions"],
+        "expected_records": SEALED_HOLDOUT_SESSIONS,
+        "coverage": round(audit["eligible_sessions"] / SEALED_HOLDOUT_SESSIONS, 6),
+        "coverage_basis": audit["eligible_sessions"],
+        "coverage_expected": SEALED_HOLDOUT_SESSIONS,
+        "symbols": 0,
+        "dates": audit["eligible_sessions"],
+        "periods_actual": None,
+        "periods_expected": None,
+        "min_date": SEALED_HOLDOUT_START,
+        "max_date": SEALED_HOLDOUT_END,
+        "status": "complete" if audit["status"] == "ready" else "partial",
+        "measurement": "eligible_sessions",
+        "period_details": None,
+        "hard_requirement": True,
+    }
+
+
+def audit_sealed_strategy_holdout(*, include_dates: bool = False) -> dict[str, Any]:
+    with _data_conn() as conn:
+        rows = conn.execute(
+            """SELECT trade_date,COUNT(*) AS rows_total,
+                      SUM(CASE WHEN close IS NOT NULL AND volume IS NOT NULL AND turnover IS NOT NULL THEN 1 ELSE 0 END) AS market_rows,
+                      MAX(available_time) AS max_available_time
+               FROM dc_stock_daily_snapshot WHERE trade_date BETWEEN ? AND ?
+               GROUP BY trade_date""",
+            (SEALED_HOLDOUT_START, SEALED_HOLDOUT_END),
+        ).fetchall()
+    compact = list(SEALED_HOLDOUT_DATES)
+    api_dates = _date_api_sets(SEALED_HOLDOUT_START, SEALED_HOLDOUT_END)
+    snapshots = {str(dict(row).get("trade_date") or ""): dict(row) for row in rows}
+    details: list[dict[str, Any]] = []
+    for trade_date in compact:
+        snapshot = snapshots.get(trade_date) or {}
+        rows_total = int(snapshot.get("rows_total") or 0)
+        market_rows = int(snapshot.get("market_rows") or 0)
+        ratio = market_rows / rows_total if rows_total else 0.0
+        cutoff = f"{trade_date[:4]}-{trade_date[4:6]}-{trade_date[6:]}T15:00:00"
+        missing_apis = [api for api in HARD_APIS if trade_date not in api_dates[api]]
+        pit_ok = bool(snapshot.get("max_available_time")) and str(snapshot.get("max_available_time")) <= cutoff
+        eligible = (
+            rows_total >= MINIMUM_DAILY_ROWS
+            and ratio >= MINIMUM_MARKET_FIELD_RATIO
+            and not missing_apis
+            and pit_ok
+        )
+        reasons = []
+        if rows_total < MINIMUM_DAILY_ROWS:
+            reasons.append("snapshot_rows_insufficient")
+        if ratio < MINIMUM_MARKET_FIELD_RATIO:
+            reasons.append("market_fields_incomplete")
+        if missing_apis:
+            reasons.append("missing_hard_api_slices")
+        if not pit_ok:
+            reasons.append("point_in_time_invalid")
+        details.append({
+            "trade_date": trade_date,
+            "eligible": eligible,
+            "rows_total": rows_total,
+            "market_field_ratio": round(ratio, 6),
+            "missing_apis": missing_apis,
+            "point_in_time_passed": pit_ok,
+            "reasons": reasons,
+        })
+    eligible_dates = [item["trade_date"] for item in details if item["eligible"]]
+    repair_dates = [item["trade_date"] for item in details if not item["eligible"]]
+    ready = len(compact) == SEALED_HOLDOUT_SESSIONS and len(eligible_dates) == SEALED_HOLDOUT_SESSIONS
+    result = {
+        "schema_version": SEALED_HOLDOUT_CONTRACT,
+        "status": "ready" if ready else "blocked",
+        "start_date": SEALED_HOLDOUT_START,
+        "end_date": SEALED_HOLDOUT_END,
+        "required_sessions": SEALED_HOLDOUT_SESSIONS,
+        "calendar_sessions": len(compact),
+        "eligible_sessions": len(eligible_dates),
+        "missing_sessions": max(0, SEALED_HOLDOUT_SESSIONS - len(eligible_dates)),
+        "repair_dates": repair_dates,
+        "hard_apis": list(HARD_APIS),
+        "thresholds": {
+            "minimum_daily_rows": MINIMUM_DAILY_ROWS,
+            "minimum_hard_api_rows": MINIMUM_HARD_API_ROWS,
+            "minimum_market_field_ratio": MINIMUM_MARKET_FIELD_RATIO,
+        },
+        "policy": "details_are_not_consumable_by_candidate_generation_or_failure_attribution",
+    }
+    if include_dates:
+        result["dates"] = details
+    return result
+
+
+def repair_sealed_strategy_holdout(*, limit: int = 5) -> dict[str, Any]:
+    audit = audit_sealed_strategy_holdout(include_dates=True)
+    dates = list(audit.get("repair_dates") or [])[:max(1, min(int(limit), 20))]
+    detail_by_date = {item["trade_date"]: item for item in audit.get("dates") or []}
+    repair = repair_oos_hard_data_batch(dates, date_gaps=detail_by_date) if dates else {"ok": True, "results": []}
+    return {
+        "schema_version": "alis_sealed_strategy_holdout_repair_v1",
+        "status": "repaired_batch" if dates and repair.get("ok") else "already_ready" if not dates else "repair_partial",
+        "dates": dates,
+        "repair": repair,
+    }
+
+
+def _contract_hash(cohort_key: str) -> str:
+    payload = f"{SEALED_HOLDOUT_CONTRACT}:{SEALED_HOLDOUT_START}:{SEALED_HOLDOUT_END}:{cohort_key}"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def run_sealed_strategy_holdout(
+    model_version_id: int,
+    *,
+    reference_contract: dict[str, Any],
+    replay_runner: Callable[..., dict[str, Any]] = run_strategy_replay,
+) -> dict[str, Any]:
+    """Evaluate once and return only a redacted gate result."""
+    audit = audit_sealed_strategy_holdout(include_dates=False)
+    if audit["status"] != "ready":
+        return {
+            "schema_version": SEALED_HOLDOUT_CONTRACT,
+            "status": "blocked_by_data",
+            "passed": False,
+            "eligible_sessions": audit["eligible_sessions"],
+            "required_sessions": audit["required_sessions"],
+        }
+    version = get_model_version(int(model_version_id)) or {}
+    config = version.get("config") if isinstance(version.get("config"), dict) else {}
+    strategy_id = int(config.get("strategy_id") or 0)
+    if not strategy_id:
+        raise ValueError("候选模型版本缺少 strategy_id")
+    champion = resolve_production_strategy_champion()
+    cohort_key = hashlib.sha256(json.dumps({
+        "hard_data_window": reference_contract.get("hard_data_window"),
+        "production_strategy_version_id": reference_contract.get("production_strategy_version_id"),
+        "strategy_controller_version": reference_contract.get("strategy_controller_version"),
+    }, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+    contract_hash = _contract_hash(cohort_key)
+    _ensure_table()
+    with _conn() as conn:
+        insert_sql = """INSERT INTO strategy_sealed_holdout_results(
+                            cohort_key,model_version_id,champion_version_id,contract_hash,status,passed,evidence_json,created_at
+                        ) VALUES(?,?,?,?,?,?,?,?)"""
+        if conn._is_postgres:
+            insert_sql += " ON CONFLICT(cohort_key) DO NOTHING"
+        elif conn._is_mysql:
+            insert_sql = insert_sql.replace("INSERT INTO", "INSERT IGNORE INTO", 1)
+        else:
+            insert_sql = insert_sql.replace("INSERT INTO", "INSERT OR IGNORE INTO", 1)
+        conn.execute(
+            insert_sql,
+            (
+                cohort_key, int(model_version_id), int(champion["champion_id"]), contract_hash,
+                "running", 0, "{}", datetime.now().astimezone().isoformat(),
+            ),
+        )
+        existing = conn.execute(
+            "SELECT model_version_id,status,passed,contract_hash FROM strategy_sealed_holdout_results WHERE cohort_key=?",
+            (cohort_key,),
+        ).fetchone()
+    if existing:
+        item = dict(existing)
+        if int(item["model_version_id"]) != int(model_version_id):
+            return {
+                "schema_version": SEALED_HOLDOUT_CONTRACT,
+                "status": "cohort_already_consumed",
+                "passed": False,
+                "contract_hash": str(item["contract_hash"]),
+            }
+        if str(item["status"]) != "running":
+            return {
+                "schema_version": SEALED_HOLDOUT_CONTRACT,
+                "status": str(item["status"]),
+                "passed": bool(item["passed"]),
+                "contract_hash": str(item["contract_hash"]),
+                "reused": True,
+            }
+    candidate = replay_runner(
+        strategy_id=strategy_id,
+        model_version_id=int(model_version_id),
+        start_date=SEALED_HOLDOUT_START,
+        end_date=SEALED_HOLDOUT_END,
+    )
+    reference = replay_runner(
+        strategy_id=int(champion["strategy_id"]),
+        model_version_id=None,
+        start_date=SEALED_HOLDOUT_START,
+        end_date=SEALED_HOLDOUT_END,
+    )
+    candidate_metrics = candidate.get("metrics") or {}
+    reference_metrics = reference.get("metrics") or {}
+    candidate_return = float(candidate_metrics.get("total_return") or 0.0)
+    reference_return = float(reference_metrics.get("total_return") or 0.0)
+    benchmark_return = float(candidate_metrics.get("benchmark_return") or 0.0)
+    candidate_pit = bool(((candidate.get("data_quality") or {}).get("point_in_time") or {}).get("passed"))
+    reference_pit = bool(((reference.get("data_quality") or {}).get("point_in_time") or {}).get("passed"))
+    behavior_passed = not any(
+        str(item.get("code") or "") in {"cash_insufficient", "oversell", "empty_snapshot"}
+        for replay in (candidate, reference)
+        for item in (replay.get("blocked_events") or [])
+    )
+    passed = (
+        candidate_pit and reference_pit and behavior_passed
+        and candidate_return > reference_return
+        and candidate_return > benchmark_return
+    )
+    status = "passed" if passed else "failed"
+    evidence = {
+        "candidate_metrics": candidate_metrics,
+        "reference_metrics": reference_metrics,
+        "candidate_summary": candidate.get("summary") or {},
+        "reference_summary": reference.get("summary") or {},
+        "point_in_time_passed": candidate_pit and reference_pit,
+        "behavior_passed": behavior_passed,
+    }
+    with _conn() as conn:
+        conn.execute(
+            """UPDATE strategy_sealed_holdout_results
+               SET status=?,passed=?,evidence_json=?
+               WHERE cohort_key=? AND model_version_id=?""",
+            (
+                status, 1 if passed else 0, json.dumps(evidence, ensure_ascii=False, default=str),
+                cohort_key, int(model_version_id),
+            ),
+        )
+    return {
+        "schema_version": SEALED_HOLDOUT_CONTRACT,
+        "status": status,
+        "passed": passed,
+        "contract_hash": contract_hash,
+        "policy": "redacted_result_only",
+    }
