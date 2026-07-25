@@ -162,6 +162,20 @@ export interface OwnerDailySummaryResponse {
         strategy_learning_candidate_count?: number;
         strategy_candidates_re_evaluated?: number;
         strategy_candidates_ready_for_review?: number;
+        champion_execution_gate?: {
+          status?: string;
+          mode?: string;
+          champion_id?: number | null;
+          champion_version?: string | null;
+          reason?: string;
+          policy?: string;
+          formal_oos?: {
+            outperform_window_count?: number;
+            valid_window_count?: number;
+            aggregate_excess_return?: number;
+            blocking_reasons?: string[];
+          };
+        };
         portfolio_method?: string | null;
         execution_cost_version?: string | null;
         execution_cost_status?: string | null;
@@ -181,8 +195,38 @@ export interface OwnerDailySummaryResponse {
         llm_research_proposal_count?: number;
         llm_research_assessed_count?: number;
         llm_research_routed_count?: number;
+        self_healing_status?: string | null;
+        self_healing_action_count?: number;
+        self_healing_unresolved_count?: number;
       };
       anomalies: Array<{ module: string; message: string }>;
+      incident_supervision?: {
+        status: "healthy" | "self_managed" | "owner_action_required" | string;
+        summary: string;
+        auto_managed_count: number;
+        waiting_condition_count?: number;
+        internal_fault_count?: number;
+        owner_action_required_count: number;
+        cases: Array<{
+          module: string;
+          health: string;
+          reason: string;
+          owner: "system" | "owner" | string;
+          action: string;
+          policy: string;
+          owner_action_required: boolean;
+          resolution_class?: "waiting_condition" | "internal_fault" | "owner_required" | string;
+          waiting_for?: string;
+          retry_policy?: string;
+          failure_signature?: string;
+          progress?: { before?: number | null; after?: number | null; delta?: number | null; required?: number | null; unit?: string };
+          evidence?: unknown;
+          summary?: string;
+          system_action?: string;
+          next_check?: string;
+        }>;
+        llm?: { status?: string; model?: string; error?: string };
+      };
     };
   };
 }
@@ -481,6 +525,76 @@ export interface EvolutionSchedule {
 export async function fetchEvolutionTasks(limit = 10): Promise<{ ok: boolean; items: EvolutionTask[]; schedule: EvolutionSchedule }> {
   const { data } = await api.get<{ ok: boolean; items: EvolutionTask[]; schedule: EvolutionSchedule }>("/api/model-strategy/evolution/tasks", {
     params: { limit },
+  });
+  return data;
+}
+
+export interface TaskCenterTask {
+  id: string;
+  source: string;
+  source_id: number;
+  module: string;
+  task_type: string;
+  name: string;
+  status: "running" | "waiting" | "paused" | "failed" | "cancelled" | "completed" | "blocked" | "idle" | string;
+  raw_status: string;
+  phase: string;
+  progress: number;
+  message: string;
+  error?: string | null;
+  current_step: string;
+  next_step: string;
+  next_run_at?: string | null;
+  created_at?: string | null;
+  started_at?: string | null;
+  heartbeat_at?: string | null;
+  updated_at?: string | null;
+  finished_at?: string | null;
+  attempt: number;
+  max_attempts: number;
+  duration_seconds?: number;
+  time_source?: string;
+  checkpoint?: Record<string, unknown>;
+  activity_scope?: "current" | "current_cycle" | "history" | string;
+}
+
+export interface TaskCenterModule {
+  key: string;
+  name: string;
+  description: string;
+  status: string;
+  current_task_id?: string | null;
+  current_step: string;
+  next_step: string;
+  next_run_at?: string | null;
+  updated_at?: string | null;
+  running_count: number;
+  waiting_count: number;
+  failed_count: number;
+}
+
+export interface TaskCenterResponse {
+  ok: boolean;
+  schema_version: string;
+  generated_at: string;
+  summary: {
+    running: number;
+    waiting: number;
+    failed: number;
+    current_internal_errors: number;
+    recent_failed_records: number;
+    completed: number;
+  };
+  modules: TaskCenterModule[];
+  tasks: TaskCenterTask[];
+  logs: Array<{ id:number; level:string; logger:string; message:string; context:Record<string,unknown>; created_at:string }>;
+  schedule: EvolutionSchedule;
+  policy: Record<string, unknown>;
+}
+
+export async function fetchTaskCenter(limit = 60, logLimit = 250): Promise<TaskCenterResponse> {
+  const { data } = await api.get<TaskCenterResponse>("/api/model-strategy/task-center", {
+    params: { limit, log_limit: logLimit }, timeout: 30_000,
   });
   return data;
 }

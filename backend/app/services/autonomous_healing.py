@@ -87,9 +87,17 @@ def _refresh_latest_decision_data() -> dict[str, Any]:
     before = daily_update_status()
     started = start_daily_update()
     after = daily_update_status()
+    if bool(started.get("ok")):
+        status = "refresh_scheduled"
+    elif started.get("reason") == "already_running":
+        status = "refresh_already_running"
+    elif started.get("reason") == "cooldown_active":
+        status = "refresh_cooling_down"
+    else:
+        status = "refresh_failed"
     return {
         "kind": "latest_decision_data",
-        "status": "refresh_scheduled" if bool(started.get("ok")) else "refresh_already_running" if started.get("reason") == "already_running" else "refresh_failed",
+        "status": status,
         "before": before,
         "start": started,
         "after": after,

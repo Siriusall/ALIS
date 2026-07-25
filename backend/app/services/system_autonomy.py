@@ -20,6 +20,7 @@ def _run_step(name: str, fn: Callable[[], dict[str, Any]]) -> dict[str, Any]:
         if name in _running_steps:
             return {
                 "name": name, "ok": False, "duration_seconds": 0.0,
+                "started_at": started.isoformat(), "finished_at": started.isoformat(),
                 "error": "previous_autonomy_step_still_running",
                 "health": {"status": "degraded", "reason": "previous_autonomy_step_still_running"},
             }
@@ -42,6 +43,7 @@ def _run_step(name: str, fn: Callable[[], dict[str, Any]]) -> dict[str, Any]:
         step = {
             "name": name, "ok": False,
             "duration_seconds": round((datetime.now().astimezone() - started).total_seconds(), 3),
+            "started_at": started.isoformat(), "finished_at": datetime.now().astimezone().isoformat(),
             "error": f"step_timeout_after_{_STEP_TIMEOUT_SECONDS}s",
             "result": {"status": "timed_out", "timeout_seconds": _STEP_TIMEOUT_SECONDS},
         }
@@ -59,6 +61,7 @@ def _run_step(name: str, fn: Callable[[], dict[str, Any]]) -> dict[str, Any]:
             "name": name,
             "ok": bool(result.get("ok", True)),
             "duration_seconds": round((datetime.now().astimezone() - started).total_seconds(), 3),
+            "started_at": started.isoformat(), "finished_at": datetime.now().astimezone().isoformat(),
             "result": result,
         }
         from app.services.autonomous_healing import classify_step_health
@@ -70,6 +73,7 @@ def _run_step(name: str, fn: Callable[[], dict[str, Any]]) -> dict[str, Any]:
             "name": name,
             "ok": False,
             "duration_seconds": round((datetime.now().astimezone() - started).total_seconds(), 3),
+            "started_at": started.isoformat(), "finished_at": datetime.now().astimezone().isoformat(),
             "error": str(exc)[:2000],
         }
         from app.services.autonomous_healing import classify_step_health
@@ -80,10 +84,13 @@ def _run_step(name: str, fn: Callable[[], dict[str, Any]]) -> dict[str, Any]:
 
 def _skip_experimental_step(name: str, gate: dict[str, Any]) -> dict[str, Any]:
     """Record a safe no-op when current data cannot support new research evidence."""
+    now = datetime.now().astimezone().isoformat()
     step = {
         "name": name,
         "ok": True,
         "duration_seconds": 0.0,
+        "started_at": now,
+        "finished_at": now,
         "result": {
             "ok": True,
             "status": "observing",
@@ -140,6 +147,7 @@ def _owner_summary(steps: list[dict[str, Any]]) -> dict[str, Any]:
     llm_governance = ((by_name.get("llm_research_governance") or {}).get("result") or {})
     llm_router = ((by_name.get("llm_proposal_router") or {}).get("result") or {})
     llm_data_operations = ((by_name.get("llm_data_operations") or {}).get("result") or {})
+    incident_supervisor = ((by_name.get("llm_incident_supervisor") or {}).get("result") or {})
     healing = ((by_name.get("autonomous_self_healing") or {}).get("result") or {})
     cost_active = cost.get("active") if isinstance(cost.get("active"), dict) else {}
     hard_data = ((by_name.get("hard_data_gate") or {}).get("result") or {})
@@ -241,8 +249,9 @@ def _owner_summary(steps: list[dict[str, Any]]) -> dict[str, Any]:
                 "self_healing_unresolved_count": len(healing.get("unresolved") or []),
             },
             "anomalies": anomalies,
+            "incident_supervision": incident_supervisor,
         },
-        "healthy": not anomalies,
+        "healthy": int(incident_supervisor.get("owner_action_required_count") or 0) == 0 if incident_supervisor else not anomalies,
     }
 
 
@@ -325,11 +334,13 @@ def run_system_autonomy_cycle() -> dict[str, Any]:
             step["ok"] = True
             step["health"] = component
     steps.append(healing_step)
+    from app.services.incident_supervisor import run_incident_supervisor
+    steps.append(_run_step("llm_incident_supervisor", lambda: run_incident_supervisor(steps)))
     summary = _owner_summary(steps)
     return {
         "ok": all(bool(step.get("ok")) for step in steps),
         "schema_version": "alis_system_autonomy_cycle_v1",
-        "status": "completed_with_anomalies" if not summary["healthy"] else "completed",
+        "status": "completed_owner_action_required" if not summary["healthy"] else "completed",
         "steps": steps,
         "owner_summary": summary,
     }
@@ -392,12 +403,14 @@ def latest_owner_summary() -> dict[str, Any]:
                 "module": "simulation_ledger_audit",
                 "message": "；".join(str(item.get("message") or "") for item in ledger.get("issues") or []),
             })
-        summary["healthy"] = not anomalies
+        supervision = questions.get("incident_supervision") if isinstance(questions.get("incident_supervision"), dict) else {}
+        summary["healthy"] = int(supervision.get("owner_action_required_count") or 0) == 0 if supervision else not anomalies
     except Exception as exc:
         questions = summary.setdefault("questions", {})
         anomalies = questions.setdefault("anomalies", [])
         anomalies.append({"module": "simulation_ledger_audit", "message": f"独立账本审计失败：{str(exc)[:300]}"})
-        summary["healthy"] = False
+        supervision = questions.get("incident_supervision") if isinstance(questions.get("incident_supervision"), dict) else {}
+        summary["healthy"] = int(supervision.get("owner_action_required_count") or 0) == 0 if supervision else False
     return {
         "ok": True,
         "available": True,

@@ -18,6 +18,7 @@ import {
 
 export const ALL_SECTION_IDS = [
   "autonomy",
+  "taskCenter",
   "market",
   "research",
   "stockResearch",
@@ -48,6 +49,7 @@ export const ALL_SECTION_IDS = [
 
 export const NAV_ITEMS = [
   { id: "autonomy", label: "自治中心", description: "系统运行与研究深度", icon: "governance" },
+  { id: "taskCenter", label: "任务中心", description: "全部模块实时过程", icon: "logs" },
   { id: "market", label: "我的收益", description: "资产与收益变化", icon: "decision" },
   { id: "portfolioWorkbench", label: "调仓方案", description: "今天是否需要调整", icon: "portfolio" },
   { id: "reviewWorkbench", label: "模型贡献", description: "模型收益与有效性", icon: "review" },
@@ -58,8 +60,9 @@ export const NAV_ITEMS = [
   { id: "governance", label: "模型演化", description: "训练、观察、自动晋升", icon: "governance" },
 ] as const;
 
-const PRIMARY_NAV_ITEMS = NAV_ITEMS.slice(0, 5);
-const TOOL_NAV_ITEMS = NAV_ITEMS.slice(5);
+const PRIMARY_NAV_IDS = new Set(["market", "portfolioWorkbench", "autonomy", "taskCenter"]);
+const PRIMARY_NAV_ITEMS = NAV_ITEMS.filter((item) => PRIMARY_NAV_IDS.has(item.id));
+const TOOL_NAV_ITEMS = NAV_ITEMS.filter((item) => !PRIMARY_NAV_IDS.has(item.id));
 
 const SYSTEM_SECTIONS = [
   { key: "modelStatus", label: "模型状态", hint: "生产、候选、可训练", target: "governance" },
@@ -145,6 +148,7 @@ export default function Layout({
   onRegisterClick,
 }: LayoutProps) {
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [toolsOpen, setToolsOpen] = useState(() => !PRIMARY_NAV_IDS.has(getNavSection(currentSection)));
   const [dataCenterOpen, setDataCenterOpen] = useState(currentSection === "dataCenter");
   const [dataCenterSection, setDataCenterSection] = useState<DataCenterSectionKey>(() =>
     (window.localStorage.getItem(DATA_CENTER_SECTION_STORAGE_KEY) as DataCenterSectionKey | null) || "overview"
@@ -174,6 +178,7 @@ export default function Layout({
   useEffect(() => {
     if (navSection === "dataCenter") setDataCenterOpen(true);
     if (navSection === "governance") setGovernanceOpen(true);
+    if (!PRIMARY_NAV_IDS.has(navSection)) setToolsOpen(true);
   }, [navSection]);
 
   useEffect(() => {
@@ -299,8 +304,8 @@ export default function Layout({
       <div className="dashboard-root-inner">
         <aside className="dashboard-sidebar" aria-label="主导航">
           <div className="dashboard-sidebar-intro">
-            <span>怎么用</span>
-            <strong>先看收益，再决定调仓，最后验证模型</strong>
+            <span>日常使用</span>
+            <strong>先看账户，再看调仓；只有异常需要处理</strong>
           </div>
           <nav className="dashboard-nav">
             {PRIMARY_NAV_ITEMS.map(({ id, label, description, icon }, index) => id === "governance" ? (
@@ -327,7 +332,12 @@ export default function Layout({
                 <span className="dashboard-nav-copy"><strong>{label}</strong><small>{description}</small></span>
               </button>
             ))}
-            <div className="dashboard-nav-tools-label">系统能力</div>
+            <button type="button" className="dashboard-nav-tools-toggle" onClick={() => setToolsOpen((open) => !open)} aria-expanded={toolsOpen}>
+              <span>研究与系统</span>
+              <small>策略、因子、模型与数据</small>
+              <i className="dashboard-nav-caret" aria-hidden="true" />
+            </button>
+            <div className={`dashboard-nav-tools ${toolsOpen ? "open" : ""}`}>
             {TOOL_NAV_ITEMS.map(({ id, label, description, icon }) => id === "dataCenter" ? (
               <div className={`dashboard-nav-group ${dataCenterOpen ? "open" : ""}`} key={id}>
                 <button type="button" className={`dashboard-nav-item dashboard-nav-parent ${navSection === id ? "active" : ""}`} onClick={handleDataCenterParent} aria-expanded={dataCenterOpen}>
@@ -358,6 +368,7 @@ export default function Layout({
                 <span className="dashboard-nav-copy"><strong>{label}</strong><small>{description}</small></span>
               </button>
             ))}
+            </div>
           </nav>
           <div className="dashboard-sidebar-foot">
             <i />

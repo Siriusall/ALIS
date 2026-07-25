@@ -176,38 +176,10 @@ def evaluate_data_health_gate(limit_days: int = 5) -> RiskPauseDecision:
 
 
 def evaluate_latest_market_day_gate() -> RiskPauseDecision:
-    from app.data_platform.db import _conn
+    from app.data_platform.services.decision_data_contract import decision_data_contract
 
-    with _conn() as conn:
-        latest = conn.execute("SELECT MAX(trade_date) AS latest_trade_date FROM dc_available_trade_dates").fetchone()
-        latest_trade_date = str(dict(latest).get("latest_trade_date") or "")
-        if not latest_trade_date:
-            latest = conn.execute("SELECT MAX(trade_date) AS latest_trade_date FROM dc_stock_daily_snapshot").fetchone()
-            latest_trade_date = str(dict(latest).get("latest_trade_date") or "")
-        if not latest_trade_date:
-            return pause_decision(
-                code="paused_latest_market_day_not_ready",
-                message="最新交易日行情尚未物化，暂停任务执行。",
-                recovery_condition="先完成收盘后的 daily、daily_basic、stk_limit 入库与快照构建，再继续任务。",
-                exit_condition="若连续两次日更后仍缺最新交易日切片，停止自动任务并人工核对数据源。",
-                severity="error",
-                evidence={"latest_trade_date": "", "missing_apis": list(REQUIRED_MARKET_DAY_APIS), "snapshot_ready": False},
-            )
-        rows = conn.execute(
-            f"""SELECT api_name,COUNT(*) AS rows FROM dc_tushare_raw_records
-                WHERE trade_date=? AND api_name IN ({",".join("?" for _ in REQUIRED_MARKET_DAY_APIS)})
-                GROUP BY api_name""",
-            (latest_trade_date, *REQUIRED_MARKET_DAY_APIS),
-        ).fetchall()
-        present = {
-            str(dict(row).get("api_name") or "")
-            for row in rows
-            if int(dict(row).get("rows") or 0) > 0
-        }
-        snapshot = conn.execute("SELECT COUNT(*) AS count FROM dc_stock_daily_snapshot WHERE trade_date=?", (latest_trade_date,)).fetchone()
-    missing = [api for api in REQUIRED_MARKET_DAY_APIS if api not in present]
-    snapshot_ready = int(dict(snapshot).get("count") or 0) > 0
-    if not missing and snapshot_ready:
+    contract = decision_data_contract()
+    if contract.get("ok"):
         return no_pause()
     return pause_decision(
         code="paused_latest_market_day_not_ready",
@@ -215,12 +187,7 @@ def evaluate_latest_market_day_gate() -> RiskPauseDecision:
         recovery_condition="先完成收盘后的 daily、daily_basic、stk_limit 入库与快照构建，再继续任务。",
         exit_condition="若连续两次日更后仍缺最新交易日切片，停止自动任务并人工核对数据源。",
         severity="error",
-        evidence={
-            "latest_trade_date": latest_trade_date,
-            "missing_apis": missing,
-            "snapshot_ready": snapshot_ready,
-            "required_apis": list(REQUIRED_MARKET_DAY_APIS),
-        },
+        evidence=contract,
     )
 
 

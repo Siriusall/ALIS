@@ -16,6 +16,10 @@ from app.data_platform.services.oos_hard_data import (
     _date_api_sets,
     repair_oos_hard_data_batch,
 )
+from app.data_platform.services.trade_calendar_contract import (
+    audit_trade_calendar_range,
+    repair_trade_calendar_range,
+)
 from app.db.store import _conn, get_model_version
 from app.services.production_strategy import resolve_production_strategy_champion
 from app.services.strategy_replay import run_strategy_replay
@@ -94,6 +98,12 @@ def sealed_strategy_holdout_asset() -> dict[str, Any]:
 
 
 def audit_sealed_strategy_holdout(*, include_dates: bool = False) -> dict[str, Any]:
+    calendar = audit_trade_calendar_range(
+        SEALED_HOLDOUT_START,
+        SEALED_HOLDOUT_END,
+        expected_dates=SEALED_HOLDOUT_DATES,
+    )
+    calendar_dates = set(calendar.get("present_dates") or [])
     with _data_conn() as conn:
         rows = conn.execute(
             """SELECT trade_date,COUNT(*) AS rows_total,
@@ -114,14 +124,19 @@ def audit_sealed_strategy_holdout(*, include_dates: bool = False) -> dict[str, A
         ratio = market_rows / rows_total if rows_total else 0.0
         cutoff = f"{trade_date[:4]}-{trade_date[4:6]}-{trade_date[6:]}T15:00:00"
         missing_apis = [api for api in HARD_APIS if trade_date not in api_dates[api]]
+        calendar_ok = trade_date in calendar_dates
         pit_ok = bool(snapshot.get("max_available_time")) and str(snapshot.get("max_available_time")) <= cutoff
         eligible = (
+            calendar_ok
+            and
             rows_total >= MINIMUM_DAILY_ROWS
             and ratio >= MINIMUM_MARKET_FIELD_RATIO
             and not missing_apis
             and pit_ok
         )
         reasons = []
+        if not calendar_ok:
+            reasons.append("trade_calendar_missing")
         if rows_total < MINIMUM_DAILY_ROWS:
             reasons.append("snapshot_rows_insufficient")
         if ratio < MINIMUM_MARKET_FIELD_RATIO:
@@ -136,6 +151,7 @@ def audit_sealed_strategy_holdout(*, include_dates: bool = False) -> dict[str, A
             "rows_total": rows_total,
             "market_field_ratio": round(ratio, 6),
             "missing_apis": missing_apis,
+            "trade_calendar_present": calendar_ok,
             "point_in_time_passed": pit_ok,
             "reasons": reasons,
         })
@@ -149,6 +165,9 @@ def audit_sealed_strategy_holdout(*, include_dates: bool = False) -> dict[str, A
         "end_date": SEALED_HOLDOUT_END,
         "required_sessions": SEALED_HOLDOUT_SESSIONS,
         "calendar_sessions": len(compact),
+        "calendar_present_sessions": calendar["present_sessions"],
+        "calendar_missing_sessions": calendar["missing_sessions"],
+        "calendar_missing_dates": calendar["missing_dates"],
         "eligible_sessions": len(eligible_dates),
         "missing_sessions": max(0, SEALED_HOLDOUT_SESSIONS - len(eligible_dates)),
         "repair_dates": repair_dates,
@@ -166,15 +185,29 @@ def audit_sealed_strategy_holdout(*, include_dates: bool = False) -> dict[str, A
 
 
 def repair_sealed_strategy_holdout(*, limit: int = 5) -> dict[str, Any]:
+    before = audit_sealed_strategy_holdout(include_dates=True)
+    calendar_repair = repair_trade_calendar_range(
+        SEALED_HOLDOUT_START,
+        SEALED_HOLDOUT_END,
+        expected_dates=SEALED_HOLDOUT_DATES,
+    )
     audit = audit_sealed_strategy_holdout(include_dates=True)
     dates = list(audit.get("repair_dates") or [])[:max(1, min(int(limit), 20))]
     detail_by_date = {item["trade_date"]: item for item in audit.get("dates") or []}
     repair = repair_oos_hard_data_batch(dates, date_gaps=detail_by_date) if dates else {"ok": True, "results": []}
+    verification = audit_sealed_strategy_holdout(include_dates=False)
     return {
-        "schema_version": "alis_sealed_strategy_holdout_repair_v1",
+        "schema_version": "alis_sealed_strategy_holdout_repair_v2",
         "status": "repaired_batch" if dates and repair.get("ok") else "already_ready" if not dates else "repair_partial",
         "dates": dates,
+        "calendar_repair": calendar_repair,
         "repair": repair,
+        "verification": verification,
+        "progress": {
+            "before": int(before.get("eligible_sessions") or 0),
+            "after": int(verification.get("eligible_sessions") or 0),
+            "delta": int(verification.get("eligible_sessions") or 0) - int(before.get("eligible_sessions") or 0),
+        },
     }
 
 

@@ -25,6 +25,8 @@ export default function DataCenterPage() {
   const [status, setStatus] = useState<DataCenterStatus | null>(null);
   const [assets, setAssets] = useState<DataAssetsResponse | null>(null);
   const [update, setUpdate] = useState<DailyUpdateStatus | null>(null);
+  const [loadedOnce, setLoadedOnce] = useState(false);
+  const [loadFailures, setLoadFailures] = useState(0);
 
   useEffect(() => {
     const onChange = (event: Event) => {
@@ -37,20 +39,23 @@ export default function DataCenterPage() {
 
   useEffect(() => {
     let cancelled = false;
+    let loading = false;
     async function load() {
-      const results = await Promise.allSettled([
-        fetchSimpleDataHealth(),
-        fetchReadiness(),
-        fetchDataCenterStatus(8),
-        fetchDataAssets(),
-        fetchDailyUpdateStatus(),
-      ]);
-      if (cancelled) return;
-      if (results[0].status === "fulfilled") setHealth(results[0].value);
-      if (results[1].status === "fulfilled") setReadiness(results[1].value);
-      if (results[2].status === "fulfilled") setStatus(results[2].value);
-      if (results[3].status === "fulfilled") setAssets(results[3].value);
-      if (results[4].status === "fulfilled") setUpdate(results[4].value);
+      if (loading) return;
+      loading = true;
+      setLoadFailures(0);
+      const failed = () => !cancelled && setLoadFailures((count) => count + 1);
+      const tasks = [
+        fetchSimpleDataHealth()
+          .then((value) => { if (!cancelled) setHealth(value); })
+          .catch(failed)
+          .finally(() => { if (!cancelled) setLoadedOnce(true); }),
+        fetchReadiness().then((value) => { if (!cancelled) setReadiness(value); }).catch(failed),
+        fetchDataCenterStatus(8).then((value) => { if (!cancelled) setStatus(value); }).catch(failed),
+        fetchDataAssets().then((value) => { if (!cancelled) setAssets(value); }).catch(failed),
+        fetchDailyUpdateStatus().then((value) => { if (!cancelled) setUpdate(value); }).catch(failed),
+      ];
+      void Promise.allSettled(tasks).finally(() => { loading = false; });
     }
     void load();
     const timer = window.setInterval(load, 10000);
@@ -74,7 +79,16 @@ export default function DataCenterPage() {
     () => assets?.items.filter((item) => item.status === "partial" || item.status === "missing").length ?? 0,
     [assets],
   );
-  const recentFailedRuns = health?.failed_runs ?? 0;
+  const recentFailedRuns = health?.recent_failed_runs ?? 0;
+  const healthUnavailable = loadedOnce && !health;
+  const decisionBlocked = healthUnavailable || Boolean(health && health.level !== "healthy");
+  const updateStatus = update?.running
+    ? "更新中"
+    : update?.phase === "cooldown"
+      ? "冷却复核"
+      : update?.phase === "failed"
+        ? "自动恢复中"
+        : "等待周期";
 
   return (
     <div className="embedded-data-platform">
@@ -91,7 +105,13 @@ export default function DataCenterPage() {
             <div>
               <span>当前状态</span>
               <strong>
-                {blockedConsumers > 0
+                {healthUnavailable
+                  ? "实时数据门读取失败，当前状态未知"
+                  : !health
+                    ? "正在读取实时决策数据门"
+                    : decisionBlocked
+                  ? health?.summary || "最新交易日决策数据未就绪"
+                  : blockedConsumers > 0
                   ? `${blockedConsumers} 个消费模块被数据阻断`
                   : partialAssets > 0
                     ? `核心分析可运行，仍有 ${partialAssets} 项历史缺口`
@@ -99,30 +119,30 @@ export default function DataCenterPage() {
               </strong>
             </div>
             <button type="button" className="button primary" onClick={() => changeSection("repair")}>
-              去处理数据补全
+              查看自治修复
             </button>
           </div>
 
           <div className="product-module-grid">
             <article className="product-module-card">
               <h2>最新交易日</h2>
-              <strong>{health?.latest_trade_date || "—"}</strong>
-              <p>{health ? `${health.stock_count.toLocaleString("zh-CN")} 只股票` : "读取中"}</p>
+              <strong>{health?.target_trade_date || health?.latest_trade_date || "—"}</strong>
+              <p>{healthUnavailable ? "数据门接口不可用，禁止据此判断可执行" : decisionBlocked ? `最近决策可用 ${health?.latest_decision_ready_trade_date || "无"}` : health ? `${health.stock_count.toLocaleString("zh-CN")} 只股票` : "读取中"}</p>
             </article>
             <article className="product-module-card">
               <h2>消费就绪</h2>
               <strong>{readiness ? `${readiness.consumers.filter((item) => item.status === "ready").length}/${readiness.consumers.length}` : "—"}</strong>
-              <p>{blockedConsumers ? `${blockedConsumers} 个模块未就绪` : "前台主模块可用"}</p>
+              <p>{!readiness ? loadedOnce ? "就绪合同读取失败" : "读取中" : decisionBlocked ? "正式决策链路已安全阻断" : blockedConsumers ? `${blockedConsumers} 个模块未就绪` : "前台主模块可用"}</p>
             </article>
             <article className="product-module-card">
               <h2>数据缺口</h2>
-              <strong>{partialAssets || 0}</strong>
-              <p>{partialAssets ? "仍有待补数据" : "当前覆盖正常"}</p>
+              <strong>{assets ? partialAssets : "—"}</strong>
+              <p>{!assets ? loadedOnce ? "数据资产目录读取失败" : "读取中" : partialAssets ? "仍有待补数据" : "当前覆盖正常"}</p>
             </article>
             <article className="product-module-card">
               <h2>运行状态</h2>
-              <strong>{update?.running ? "更新中" : "空闲"}</strong>
-              <p>{recentFailedRuns ? `${recentFailedRuns} 次失败待核查` : "最近无失败"}</p>
+              <strong>{updateStatus}</strong>
+              <p>{!health ? loadedOnce ? `实时健康读取失败${loadFailures ? `（${loadFailures} 个接口异常）` : ""}` : "读取中" : recentFailedRuns ? `近 24 小时 ${recentFailedRuns} 次失败，系统正在分类复核` : "近 24 小时无失败"}</p>
             </article>
           </div>
 

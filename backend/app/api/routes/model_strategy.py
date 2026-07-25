@@ -47,6 +47,7 @@ from app.services.backend_acceptance import backend_acceptance_matrix
 from app.services.strategy_workbench import build_strategy_workbench
 from app.services.strategy_lab import build_strategy_lab
 from app.services.system_autonomy import latest_owner_summary
+from app.services.task_center import build_task_center
 from app.services.evolution_orchestrator import (
     cancel_evolution_task,
     create_strategy_controller_oos_task,
@@ -671,6 +672,12 @@ def model_strategy_evolution_tasks(limit: int = 20) -> dict:
         "items": list_evolution_tasks(limit=limit),
         "schedule": evolution_schedule_status(),
     }
+
+
+@router.get("/model-strategy/task-center")
+def model_strategy_task_center(limit: int = 50, log_limit: int = 200) -> dict:
+    """Unified read-only process view across data, factors, models and strategies."""
+    return build_task_center(limit=limit, log_limit=log_limit)
 
 
 @router.get("/model-strategy/evolution/schedule")

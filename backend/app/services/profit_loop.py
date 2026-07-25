@@ -367,6 +367,7 @@ def build_portfolio_reoptimization() -> dict[str, Any]:
     if method_competition.get("ok"):
         optimizer["ok"] = True
         optimizer["status"] = f"selected_{method_competition.get('selected_method')}"
+    selected_weights_before_forced_exits = dict(scaled_weights)
     block_by_symbol = {str(item.get("symbol") or ""): item for item in candidate_blocks}
     # A negative trend estimate may justify holding a diversifier, but never an automatic increase.
     for symbol, target in list(scaled_weights.items()):
@@ -380,6 +381,11 @@ def build_portfolio_reoptimization() -> dict[str, Any]:
         pnl_pct = live_price / cost - 1.0 if cost > 0 else 0.0
         if pnl_pct <= -0.06 and _safe_float(expected.get(symbol)) <= -0.05:
             scaled_weights[symbol] = 0.0
+    if scaled_weights != selected_weights_before_forced_exits:
+        optimizer["selected_method"] = "forced_risk_exit"
+        optimizer["status"] = "forced_risk_exit"
+        optimizer["method_competition"]["selected_method"] = "forced_risk_exit"
+        optimizer["forced_exit_policy"] = "仅对满足冻结止损合同的持仓执行退出；不得以 hold_current 名义表达减仓或清仓"
     error_breaches = [item for item in risk.get("breaches") or [] if str(item.get("severity") or "") == "error"]
     preliminary_improvement = sum(
         (_safe_float(scaled_weights.get(symbol)) - _safe_float(current_weights.get(symbol))) * _safe_float(expected.get(symbol))
@@ -469,8 +475,28 @@ def build_portfolio_reoptimization() -> dict[str, Any]:
         ledger_audit = audit_simulation_ledger(persist=False)
     except Exception as exc:
         ledger_audit = {"ok": False, "status": "error", "issues": [{"message": str(exc)[:300]}]}
+    try:
+        from app.services.data_health import assess_latest_decision_data_health
+        decision_data_gate = assess_latest_decision_data_health()
+    except Exception as exc:
+        decision_data_gate = {
+            "decision_ready": False,
+            "status": "blocked",
+            "issues": [{"message": f"决策数据门检查失败：{str(exc)[:200]}"}],
+            "readiness": {},
+            "latest_snapshot": {},
+        }
+    ready_trade_date = str((decision_data_gate.get("readiness") or {}).get("latest_decision_ready_trade_date") or "")
+    target_trade_date = str((decision_data_gate.get("readiness") or {}).get("target_trade_date") or "")
+    decision_issue_text = "；".join(
+        str(item.get("message") or "") for item in decision_data_gate.get("issues") or [] if item.get("message")
+    )
     execution_checks = [
-        {"key": "market_data", "label": "收盘数据已锁定", "status": "pass" if _latest_trade_date() else "block", "detail": _latest_trade_date() or "缺少完整收盘日"},
+        {"key": "market_data", "label": "最新决策数据门", "status": "pass" if decision_data_gate.get("decision_ready") else "block", "detail": (
+            f"{ready_trade_date or target_trade_date} 收盘数据已通过完整性检查"
+            if decision_data_gate.get("decision_ready")
+            else decision_issue_text or f"目标交易日 {target_trade_date or '未知'} 未完成，最近可用 {ready_trade_date or '无'}"
+        )},
         {"key": "simulation_ledger", "label": "模拟账户账本一致", "status": "pass" if ledger_audit.get("ok") else "block", "detail": (
             f"现金与 {len(ledger_audit.get('actual_positions') or {})} 个持仓均可由账本独立重算"
             if ledger_audit.get("ok")
@@ -498,6 +524,14 @@ def build_portfolio_reoptimization() -> dict[str, Any]:
             "method": "当前与目标权重乘以各资产历史20日均值；未承诺未来收益",
         },
         "execution_checks": execution_checks,
+        "execution_authorized": not any(item["status"] == "block" for item in execution_checks),
+        "decision_data_gate": {
+            "status": str(decision_data_gate.get("status") or "blocked"),
+            "decision_ready": bool(decision_data_gate.get("decision_ready")),
+            "target_trade_date": target_trade_date,
+            "latest_decision_ready_trade_date": ready_trade_date,
+            "issues": decision_data_gate.get("issues") or [],
+        },
         "proposal_unit": "portfolio_fraction",
         "candidate_universe": {
             "holding_count": len(holding_symbols),
@@ -798,15 +832,17 @@ def build_model_return_contribution() -> dict[str, Any]:
 def materialize_daily_rebalance_plan(portfolio: dict[str, Any] | None = None) -> dict[str, Any]:
     """Persist one immutable plan version per materially different daily input."""
     _ensure_tables()
-    trade_date = _latest_trade_date()
+    portfolio = portfolio or build_portfolio_reoptimization()
+    decision_gate = portfolio.get("decision_data_gate") if isinstance(portfolio.get("decision_data_gate"), dict) else {}
+    trade_date = str(decision_gate.get("target_trade_date") or _latest_trade_date())
     with data_conn() as c:
         next_row = c.execute(
             "SELECT MIN(cal_date) value FROM dc_trade_calendar WHERE is_open=1 AND cal_date>?", (trade_date,)
         ).fetchone() if trade_date else None
     planned_execute_date = str(dict(next_row or {}).get("value") or "")
     planned_execute_at = _planned_execute_at(planned_execute_date)
-    portfolio = portfolio or build_portfolio_reoptimization()
     proposal = portfolio.get("rebalance_proposal") or []
+    execution_authorized = bool(portfolio.get("execution_authorized"))
     from app.services.decision_version_manifest import build_decision_version_manifest
     decision_version_manifest = build_decision_version_manifest(
         trade_date=trade_date,
@@ -816,6 +852,8 @@ def materialize_daily_rebalance_plan(portfolio: dict[str, Any] | None = None) ->
         "trade_date": trade_date,
         "proposal": proposal,
         "risk_budget": portfolio.get("risk_budget") or {},
+        "execution_authorized": execution_authorized,
+        "decision_data_gate": decision_gate,
         "decision_version_manifest": decision_version_manifest,
     }
     canonical = json.dumps(contract, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
@@ -835,10 +873,11 @@ def materialize_daily_rebalance_plan(portfolio: dict[str, Any] | None = None) ->
             version = int(dict(latest or {}).get("version") or 0) + 1
             if version > 1:
                 c.execute("UPDATE daily_rebalance_plans SET status='superseded' WHERE trade_date=? AND status='planned'", (trade_date,))
+            plan_status = "planned" if execution_authorized else "blocked_by_decision_data"
             c.execute("""INSERT INTO daily_rebalance_plans
                 (trade_date,planned_execute_date,planned_execute_at,version,input_hash,status,proposal_json,generated_at)
-                VALUES(?,?,?,?,?,'planned',?,?)""",
-                (trade_date, planned_execute_date, planned_execute_at, version, input_hash, canonical, _now()))
+                VALUES(?,?,?,?,?,?,?,?)""",
+                (trade_date, planned_execute_date, planned_execute_at, version, input_hash, plan_status, canonical, _now()))
             row = dict(c.execute(
                 "SELECT * FROM daily_rebalance_plans WHERE trade_date=? AND version=?", (trade_date, version)
             ).fetchone())
@@ -851,14 +890,16 @@ def materialize_daily_rebalance_plan(portfolio: dict[str, Any] | None = None) ->
         "valid_until_date": str(row.get("planned_execute_date") or planned_execute_date),
         "version": int(row["version"]),
         "plan_version": f"{trade_date}-v{int(row['version'])}",
-        "status": row.get("status") or "planned",
+        "status": row.get("status") or ("planned" if execution_authorized else "blocked_by_decision_data"),
         "is_executed": str(row.get("status") or "") == "executed",
+        "execution_authorized": execution_authorized and str(row.get("status") or "") in {"planned", "executed"},
+        "blocked_reason": "" if execution_authorized else "最新交易日决策数据门未通过，当前方案仅作为不可执行预览",
         "execution_id": row.get("execution_id"),
         "generated_at": row.get("generated_at"),
         "executed_at": row.get("executed_at"),
         "input_hash": input_hash,
         "decision_version_manifest": decision_version_manifest,
-        "generation_policy": "以最近完整收盘数据生成；输入未变化则复用，变化才升版本",
+        "generation_policy": "仅在最新交易日决策数据门通过后生成可执行版本；未通过时保留不可执行预览",
         "execution_policy": (
             f"执行日{effective_rebalance_clock().strftime('%H:%M')}后检查；"
             "首次正式调仓后沿用其实际执行时分；收盘数据完整时自动执行，每个交易日最多一次"

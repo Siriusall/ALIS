@@ -37,3 +37,21 @@ def test_method_competition_rejects_overconcentrated_candidate():
     assert cvar["eligible"] is False
     assert "single_position" in cvar["breaches"]
     assert result["selected_method"] in {"equal_weight", "hrp"}
+
+
+def test_hold_current_preserves_existing_weights_when_new_equity_budget_is_zero():
+    current = {"000001": 0.31, "000002": 0.22}
+    result = compete_portfolio_methods(
+        returns_by_symbol={"000001": [0.001] * 60, "000002": [0.001] * 60},
+        expected_returns={"000001": 0.01, "000002": 0.01},
+        current_weights=current,
+        trading_costs={"000001": 0.0015, "000002": 0.0015},
+        equity_budget=0.0,
+        cvar_weights={},
+    )
+
+    assert result["selected_method"] == "hold_current"
+    assert result["weights"] == current
+    hold = next(item for item in result["evaluations"] if item["method"] == "hold_current")
+    assert hold["turnover"] == 0
+    assert hold["eligible"] is True

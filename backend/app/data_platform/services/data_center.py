@@ -31,6 +31,13 @@ _tushare_global_cooldown_until = 0.0
 _tushare_reduced_concurrency_until = 0.0
 _tushare_reduced_concurrency = 0
 TUSHARE_RATE_LIMIT_COOLDOWN_SECONDS = int(os.getenv("TUSHARE_RATE_LIMIT_COOLDOWN_SECONDS", "180") or 180)
+STK_LIMIT_PAGE_SIZE = max(500, min(int(os.getenv("TUSHARE_STK_LIMIT_PAGE_SIZE", "6000") or 6000), 6000))
+STK_LIMIT_MAX_PAGES = max(2, min(int(os.getenv("TUSHARE_STK_LIMIT_MAX_PAGES", "4") or 4), 10))
+STK_LIMIT_GAP_BATCH_SIZE = max(3, min(int(os.getenv("TUSHARE_STK_LIMIT_GAP_BATCH_SIZE", "25") or 25), 100))
+STK_LIMIT_MIN_STOCK_COVERAGE = max(
+    0.5,
+    min(float(os.getenv("TUSHARE_STK_LIMIT_MIN_STOCK_COVERAGE", "0.8") or 0.8), 1.0),
+)
 
 
 def set_tushare_activity_hook(hook: Callable[[dict[str, Any]], None] | None) -> None:
@@ -1263,6 +1270,218 @@ def _record_key(api_name: str, payload: dict[str, Any], idx: Any) -> str:
     return "|".join(parts)[:240]
 
 
+def _stk_limit_stock_coverage(trade_date: str) -> dict[str, Any]:
+    """Measure limit-price coverage against that day's retained A-share bars."""
+
+    with _conn() as c:
+        expected_row = c.execute(
+            """SELECT COUNT(DISTINCT daily.ts_code) AS count
+               FROM dc_tushare_raw_records daily
+               JOIN dc_stock_master stock ON stock.ts_code=daily.ts_code
+               WHERE daily.api_name='daily' AND daily.trade_date=?""",
+            (trade_date,),
+        ).fetchone()
+        covered_row = c.execute(
+            """SELECT COUNT(DISTINCT limits.ts_code) AS count
+               FROM dc_tushare_raw_records limits
+               JOIN dc_tushare_raw_records daily
+                 ON daily.api_name='daily' AND daily.trade_date=limits.trade_date
+                AND daily.ts_code=limits.ts_code
+               JOIN dc_stock_master stock ON stock.ts_code=limits.ts_code
+               WHERE limits.api_name='stk_limit' AND limits.trade_date=?""",
+            (trade_date,),
+        ).fetchone()
+        retained_row = c.execute(
+            """SELECT COUNT(DISTINCT ts_code) AS count
+               FROM dc_tushare_raw_records
+               WHERE api_name='stk_limit' AND trade_date=?""",
+            (trade_date,),
+        ).fetchone()
+    expected = int(dict(expected_row).get("count") or 0)
+    covered = int(dict(covered_row).get("count") or 0)
+    retained = int(dict(retained_row).get("count") or 0)
+    coverage = covered / expected if expected else 0.0
+    return {
+        "trade_date": trade_date,
+        "expected_stock_rows": expected,
+        "covered_stock_rows": covered,
+        "retained_rows": retained,
+        "coverage": round(coverage, 6),
+        "minimum_coverage": STK_LIMIT_MIN_STOCK_COVERAGE,
+        "ready": expected > 0 and coverage >= STK_LIMIT_MIN_STOCK_COVERAGE,
+    }
+
+
+def _missing_stk_limit_stock_codes(trade_date: str, *, limit: int) -> list[str]:
+    with _conn() as c:
+        rows = c.execute(
+            """SELECT DISTINCT daily.ts_code
+               FROM dc_tushare_raw_records daily
+               JOIN dc_stock_master stock ON stock.ts_code=daily.ts_code
+               LEFT JOIN dc_tushare_raw_records limits
+                 ON limits.api_name='stk_limit' AND limits.trade_date=daily.trade_date
+                AND limits.ts_code=daily.ts_code
+               WHERE daily.api_name='daily' AND daily.trade_date=? AND limits.id IS NULL
+               ORDER BY daily.ts_code LIMIT ?""",
+            (trade_date, max(1, int(limit))),
+        ).fetchall()
+    return [str(dict(row).get("ts_code") or "") for row in rows if str(dict(row).get("ts_code") or "")]
+
+
+def sync_stk_limit_gap_batch(trade_date: str, *, limit: int = STK_LIMIT_GAP_BATCH_SIZE) -> dict[str, Any]:
+    """Bounded exact-code fallback after the full-market slice is truncated.
+
+    This path only touches codes proven missing from the retained full-market
+    result.  Three leading probes prevent a not-yet-published upstream slice
+    from turning into hundreds of empty per-stock requests.  Successful rows
+    disappear from the next missing-code query, providing durable progress
+    without a separate cursor table.
+    """
+
+    codes = _missing_stk_limit_stock_codes(trade_date, limit=max(3, int(limit)))
+    if not codes:
+        coverage = _stk_limit_stock_coverage(trade_date)
+        return {"ok": coverage["ready"], "status": "no_gaps", "codes": [], "results": [], "coverage": coverage}
+    results: list[dict[str, Any]] = []
+    successes = 0
+    probe_count = min(3, len(codes))
+    for index, ts_code in enumerate(codes):
+        result = _safe_sync_raw("stk_limit", {"trade_date": trade_date, "ts_code": ts_code})
+        rows_read = int(result.get("rows_read") or 0)
+        results.append({"ts_code": ts_code, "ok": bool(result.get("ok")) and rows_read > 0, "rows_read": rows_read, "result": result})
+        if bool(result.get("ok")) and rows_read > 0:
+            successes += 1
+        if index + 1 == probe_count and successes == 0:
+            coverage = _stk_limit_stock_coverage(trade_date)
+            return {
+                "ok": False,
+                "status": "upstream_not_ready",
+                "category": "upstream_not_ready",
+                "codes": codes[:probe_count],
+                "results": results,
+                "coverage": coverage,
+                "cooldown": True,
+                "cooldown_seconds": 600,
+                "error": "缺失股票的精确 stk_limit 探针仍为空，等待上游完成当日切片",
+            }
+    coverage = _stk_limit_stock_coverage(trade_date)
+    return {
+        "ok": coverage["ready"],
+        "status": "completed" if coverage["ready"] else "repair_in_progress",
+        "category": "complete" if coverage["ready"] else "repair_in_progress",
+        "codes": codes,
+        "results": results,
+        "succeeded": successes,
+        "coverage": coverage,
+        "cooldown": not coverage["ready"],
+        "cooldown_seconds": 600 if not coverage["ready"] else 0,
+    }
+
+
+def sync_complete_stk_limit_slice(trade_date: str) -> dict[str, Any]:
+    """Fetch a full trade-date ``stk_limit`` slice with bounded pagination.
+
+    The endpoint can return an exact 6000-row page containing funds before all
+    A-share codes have been covered.  Offset pagination preserves the required
+    full-market batch contract and avoids an unbounded per-stock fallback.
+    """
+
+    pages: list[dict[str, Any]] = []
+    previous_retained = _stk_limit_stock_coverage(trade_date)["retained_rows"]
+    saw_full_page = False
+    for page_index in range(STK_LIMIT_MAX_PAGES):
+        params = {
+            "trade_date": trade_date,
+            "limit": STK_LIMIT_PAGE_SIZE,
+            "offset": page_index * STK_LIMIT_PAGE_SIZE,
+        }
+        result = _safe_sync_raw("stk_limit", params)
+        coverage = _stk_limit_stock_coverage(trade_date)
+        retained = int(coverage["retained_rows"])
+        rows_read = int(result.get("rows_read") or 0)
+        page = {
+            "page": page_index + 1,
+            "offset": params["offset"],
+            "rows_read": rows_read,
+            "new_retained_rows": max(0, retained - int(previous_retained)),
+            "result": result,
+            "coverage": coverage,
+        }
+        pages.append(page)
+        if not result.get("ok"):
+            return {
+                "ok": False,
+                "api": "stk_limit",
+                "trade_date": trade_date,
+                "category": str(result.get("category") or "upstream_failure"),
+                "pages": pages,
+                "coverage": coverage,
+                "cooldown": bool(result.get("cooldown")),
+                "cooldown_seconds": int(result.get("cooldown_seconds") or 0),
+                "error": str(result.get("error") or "stk_limit page failed")[:500],
+            }
+        if coverage["ready"]:
+            return {
+                "ok": True,
+                "api": "stk_limit",
+                "trade_date": trade_date,
+                "category": "complete",
+                "pages": pages,
+                "coverage": coverage,
+                "rows_read": sum(int(item["rows_read"]) for item in pages),
+                "rows_written": sum(int((item["result"] or {}).get("rows_written") or 0) for item in pages),
+            }
+        if rows_read >= STK_LIMIT_PAGE_SIZE:
+            saw_full_page = True
+        if page_index > 0 and rows_read >= STK_LIMIT_PAGE_SIZE and retained <= int(previous_retained):
+            gap_repair = sync_stk_limit_gap_batch(trade_date)
+            if gap_repair.get("coverage", {}).get("ready"):
+                return {
+                    "ok": True,
+                    "api": "stk_limit",
+                    "trade_date": trade_date,
+                    "category": "complete",
+                    "pages": pages,
+                    "gap_repair": gap_repair,
+                    "coverage": gap_repair["coverage"],
+                }
+            return {
+                "ok": False,
+                "api": "stk_limit",
+                "trade_date": trade_date,
+                "category": str(gap_repair.get("category") or "truncated"),
+                "pages": pages,
+                "gap_repair": gap_repair,
+                "coverage": gap_repair.get("coverage") or coverage,
+                "cooldown": bool(gap_repair.get("cooldown", True)),
+                "cooldown_seconds": int(gap_repair.get("cooldown_seconds") or 600),
+                "error": str(gap_repair.get("error") or "stk_limit 分页被截断，缺失股票进入有界精确补齐"),
+            }
+        previous_retained = retained
+        if rows_read < STK_LIMIT_PAGE_SIZE:
+            return {
+                "ok": False,
+                "api": "stk_limit",
+                "trade_date": trade_date,
+                "category": "incomplete_slice",
+                "pages": pages,
+                "coverage": coverage,
+                "cooldown": True,
+                "cooldown_seconds": 600,
+                "error": "stk_limit 已到分页末尾，但 A 股覆盖率仍未达到生产门",
+            }
+    coverage = _stk_limit_stock_coverage(trade_date)
+    return {
+        "ok": False,
+        "api": "stk_limit",
+        "trade_date": trade_date,
+        "category": "truncated" if saw_full_page else "incomplete_slice",
+        "pages": pages,
+        "coverage": coverage,
+        "error": f"stk_limit 在有界 {STK_LIMIT_MAX_PAGES} 页内未达到生产覆盖率",
+    }
+
+
 def sync_market_bundle(trade_date: str, *, include_suspend: bool = False, apis: list[str] | None = None) -> dict[str, Any]:
     """Sync daily market/valuation/trading-status bundle for one trade date."""
 
@@ -1276,9 +1495,26 @@ def sync_market_bundle(trade_date: str, *, include_suspend: bool = False, apis: 
     requested_apis = [api for api in requested_apis if api in allowed]
     results = []
     for api in requested_apis:
-        results.append(_safe_sync_raw(api, {"trade_date": trade_date}))
+        if api == "stk_limit":
+            result = sync_complete_stk_limit_slice(trade_date)
+        else:
+            result = _safe_sync_raw(api, {"trade_date": trade_date})
+        results.append(result)
+        if api == "stk_limit" and not result.get("ok"):
+            # The limit-price hard gate already blocks the snapshot.  Do not
+            # repeatedly pull adj-factor, suspension and money-flow datasets
+            # while this same core slice is waiting or under repair.
+            break
     snapshot = build_stock_daily_snapshot(trade_date)
-    return {"ok": all(bool(x.get("ok")) for x in results), "trade_date": trade_date, "apis": requested_apis, "results": results, "snapshot": snapshot}
+    failure_categories = [str(item.get("category") or "") for item in results if not item.get("ok")]
+    return {
+        "ok": all(bool(x.get("ok")) for x in results),
+        "trade_date": trade_date,
+        "apis": requested_apis,
+        "results": results,
+        "snapshot": snapshot,
+        "failure_category": "truncated" if "truncated" in failure_categories else (failure_categories[0] if failure_categories else ""),
+    }
 
 
 def sync_capital_structure_bundle(trade_date: str) -> dict[str, Any]:
@@ -2654,21 +2890,9 @@ def training_market_date_ready(trade_date: str) -> bool:
     value = str(trade_date or "").replace("-", "")[:8]
     if len(value) != 8 or not value.isdigit():
         return False
-    with _conn() as c:
-        apis = {
-            str(dict(row).get("api_name") or "")
-            for row in c.execute(
-                """SELECT api_name FROM dc_tushare_raw_records
-                   WHERE trade_date=? AND api_name IN ('daily','daily_basic','stk_limit')
-                   GROUP BY api_name HAVING COUNT(*)>0""",
-                (value,),
-            ).fetchall()
-        }
-        snapshot = c.execute(
-            "SELECT COUNT(*) count FROM dc_stock_daily_snapshot WHERE trade_date=? AND close IS NOT NULL",
-            (value,),
-        ).fetchone()
-    return apis == {"daily", "daily_basic", "stk_limit"} and int(dict(snapshot).get("count") or 0) > 0
+    from app.data_platform.services.decision_data_contract import decision_data_contract
+
+    return bool(decision_data_contract(value).get("ok"))
 
 
 def _safe_sync_raw(api_name: str, params: dict[str, Any] | None = None) -> dict[str, Any]:

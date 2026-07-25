@@ -105,6 +105,10 @@ export interface SimpleDataHealth {
   snapshot_count: number;
   latest_announcement?: string | null;
   failed_runs: number;
+  historical_failed_runs?: number;
+  recent_failed_runs?: number;
+  target_trade_date?: string;
+  latest_decision_ready_trade_date?: string;
 }
 
 export interface DailyUpdateStatus extends SyncResponse {

@@ -42,17 +42,19 @@ def _date_api_sets(start_date: str, end_date: str) -> dict[str, set[str]]:
                     (api, start_date, end_date, MINIMUM_HARD_API_ROWS),
                 ).fetchall()
             else:
-                # The normalized snapshot separately proves broad daily,
-                # valuation and limit-field coverage.  Avoid grouping tens of
-                # millions of core raw rows on every readiness check.
+                # dc_available_trade_dates is a compact snapshot ledger.  It
+                # gives us one indexed raw-existence probe per retained date,
+                # including legacy slices whose coverage row predates the
+                # current ledger, without scanning the full raw table.  It is
+                # intentionally independent from dc_trade_calendar.
                 rows = conn.execute(
-                    """SELECT cal.cal_date AS trade_date,? AS row_count,
-                              cal.cal_date AS max_available_time
-                       FROM dc_trade_calendar cal
-                       WHERE cal.exchange='SSE' AND cal.is_open=1 AND cal.cal_date BETWEEN ? AND ?
+                    """SELECT available.trade_date,? AS row_count,
+                              available.trade_date AS max_available_time
+                       FROM dc_available_trade_dates available
+                       WHERE available.trade_date BETWEEN ? AND ?
                          AND EXISTS (
                            SELECT 1 FROM dc_tushare_raw_records raw
-                           WHERE raw.api_name=? AND raw.trade_date=cal.cal_date
+                           WHERE raw.api_name=? AND raw.trade_date=available.trade_date
                          )""",
                     (MINIMUM_HARD_API_ROWS, start_date, end_date, api),
                 ).fetchall()

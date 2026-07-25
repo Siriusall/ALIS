@@ -1,11 +1,10 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   Bar,
   BarChart,
   CartesianGrid,
   Cell,
   ReferenceLine,
-  ResponsiveContainer,
   Tooltip,
   XAxis,
   YAxis,
@@ -42,6 +41,9 @@ const lifecycleLabels: Record<string, string> = {
   formal_oos_passed: "正式 OOS 通过",
   formal_oos_failed: "正式 OOS 未通过",
   formal_oos_rejected: "正式 OOS 淘汰",
+  formal_oos_blocked_by_statistics: "统计门阻断·等待新样本",
+  blocked_by_reference: "参照合同阻断",
+  formal_oos_blocked_by_reference: "参照合同阻断",
   shadow_observation: "未来影子观察",
   shadow_rejected: "影子期淘汰",
   promoted_cooling: "已晋升·冷却观察",
@@ -79,6 +81,8 @@ export default function StrategyLabPage() {
   const [schedule, setSchedule] = useState<EvolutionSchedule | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+  const [chartWidth, setChartWidth] = useState(0);
+  const chartContainerRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
     let active = true;
@@ -100,6 +104,16 @@ export default function StrategyLabPage() {
       if (timer) window.clearTimeout(timer);
     };
   }, []);
+
+  useEffect(() => {
+    if (loading || !chartContainerRef.current) return;
+    const element = chartContainerRef.current;
+    const updateWidth = () => setChartWidth(Math.max(0, Math.floor(element.getBoundingClientRect().width)));
+    updateWidth();
+    const observer = new ResizeObserver(updateWidth);
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, [loading, data]);
 
   if (loading) {
     return <LoadingState variant="page" title="正在打开策略实验室" detail="正在读取 Champion 与 Challenger 的正式验证数据" rows={5} />;
@@ -124,7 +138,7 @@ export default function StrategyLabPage() {
   const chartData = oos.windows.map((item) => ({ ...item, label: `窗口 ${item.window}`, percent: (item.return ?? 0) * 100 }));
   const latestTask = tasks[0];
   const comparisons = [challenger, ...data.baselines].map((item) => ({
-    name: item.role === "challenger" ? "Challenger V1" : item.name,
+    name: item.name,
     role: item.role,
     return: item.formal_oos.aggregate_cost_after_return,
     benchmark: item.formal_oos.aggregate_benchmark_return,
@@ -164,7 +178,7 @@ export default function StrategyLabPage() {
         <article className="challenger">
           <span>候选策略 · Challenger</span>
           <strong>{challenger.name}</strong>
-          <small>策略 #{challenger.strategy_id} · 正式 OOS 已完成</small>
+          <small>策略 #{challenger.strategy_id} · 版本 #{challenger.model_version_id} · {oos.valid_windows ? `正式 OOS ${oos.valid_windows} 个窗口` : "等待正式 OOS"}</small>
         </article>
       </div>
 
@@ -269,9 +283,8 @@ export default function StrategyLabPage() {
 
         <article className="strategy-lab-card strategy-lab-chart">
           <header><div><span>正式 OOS</span><h2>各窗口成本后收益</h2></div><small>绿色为正收益，红色为负收益</small></header>
-          <div className="strategy-lab-chart-body">
-            <ResponsiveContainer width="100%" height="100%">
-              <BarChart data={chartData} margin={{ top: 16, right: 16, bottom: 4, left: 2 }}>
+          <div className="strategy-lab-chart-body" ref={chartContainerRef}>
+            {chartWidth > 0 ? <BarChart width={chartWidth} height={300} data={chartData} margin={{ top: 16, right: 16, bottom: 4, left: 2 }}>
                 <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#e9eef4" />
                 <XAxis dataKey="label" tickLine={false} axisLine={false} />
                 <YAxis tickFormatter={(value) => `${value}%`} tickLine={false} axisLine={false} width={50} />
@@ -280,13 +293,12 @@ export default function StrategyLabPage() {
                 <Bar dataKey="percent" radius={[5, 5, 0, 0]}>
                   {chartData.map((entry) => <Cell key={entry.window} fill={entry.percent >= 0 ? "#159a70" : "#d84b5b"} />)}
                 </Bar>
-              </BarChart>
-            </ResponsiveContainer>
+              </BarChart> : <div className="strategy-lab-chart-loading">正在准备图表…</div>}
           </div>
         </article>
 
         <article className="strategy-lab-card">
-          <header><div><span>买卖纪律</span><h2>V1 做了什么改变</h2></div></header>
+          <header><div><span>买卖纪律</span><h2>{challenger.name} 的冻结规则</h2></div><small>版本 #{challenger.model_version_id}</small></header>
           <dl className="strategy-lab-policy">
             <div><dt>调仓频率</dt><dd>{challenger.policy.rebalance_frequency === "weekly" ? "每周" : challenger.policy.rebalance_frequency}</dd></div>
             <div><dt>单票上限</dt><dd>{percent(challenger.policy.max_single_weight, 0)}</dd></div>
@@ -308,7 +320,7 @@ export default function StrategyLabPage() {
         <article className="strategy-lab-card strategy-lab-attribution">
           <header><div><span>失败归因</span><h2>正式 OOS 的可复算证据</h2></div><small>{confidenceLabels[attribution.confidence] || "待验证"}</small></header>
           {attribution.status === "pending" ? (
-            <p>等待完成正式 OOS 后生成归因。</p>
+            <p>{oos.valid_windows > 0 ? "正式 OOS 已完成，但该版本的归因证据尚未生成；系统不会用其他版本的归因代替。" : "等待正式 OOS 完成后生成归因。"}</p>
           ) : (
             <>
               <strong>{attributionLabels[attribution.primary_cause] || attribution.primary_cause}</strong>

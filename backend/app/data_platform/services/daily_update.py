@@ -17,6 +17,7 @@ from app.data_platform.services.data_center import (
     sync_stock_basic,
     sync_trade_calendar,
 )
+from app.data_platform.services.decision_data_contract import decision_data_contract, latest_decision_ready_trade_date
 from app.data_platform.services.market_calendar import target_trade_date
 from app.data_platform.services.exchange_etf_pcf import sync_exchange_etf_pcf
 from app.data_platform.services.oos_hard_data import audit_oos_hard_data
@@ -31,7 +32,18 @@ _DAILY_UPDATE_START_TIME = dtime(
     max(0, min(int(os.getenv("ALIS_DAILY_UPDATE_HOUR", "16")), 23)),
     max(0, min(int(os.getenv("ALIS_DAILY_UPDATE_MINUTE", "5")), 59)),
 )
+_DAILY_UPDATE_INTERNAL_FAULT_COOLDOWN_SEC = max(
+    300,
+    min(int(os.getenv("ALIS_DAILY_UPDATE_INTERNAL_FAULT_COOLDOWN_SEC", "1800")), 21600),
+)
 logger = logging.getLogger("quant.daily_update")
+
+
+class DailyUpdateDataBlocked(RuntimeError):
+    def __init__(self, message: str, *, category: str, retry_after_seconds: int):
+        self.category = category
+        self.retry_after_seconds = max(0, int(retry_after_seconds))
+        super().__init__(message)
 
 
 def _now() -> str:
@@ -65,25 +77,7 @@ def _latest_usable_snapshot_date(c: Any) -> str:
 
 
 def _latest_decision_ready_trade_date(c: Any) -> str:
-    stock_count = int(dict(c.execute("SELECT COUNT(*) cnt FROM dc_stock_master").fetchone()).get("cnt") or 0)
-    threshold = max(1, int(stock_count * 0.8)) if stock_count else 1
-    row = c.execute(
-        """
-        SELECT s.trade_date value
-        FROM dc_stock_daily_snapshot s
-        WHERE EXISTS (SELECT 1 FROM dc_tushare_raw_records r WHERE r.trade_date=s.trade_date AND r.api_name='daily')
-          AND EXISTS (SELECT 1 FROM dc_tushare_raw_records r WHERE r.trade_date=s.trade_date AND r.api_name='daily_basic')
-          AND EXISTS (SELECT 1 FROM dc_tushare_raw_records r WHERE r.trade_date=s.trade_date AND r.api_name='stk_limit')
-        GROUP BY s.trade_date
-        HAVING SUM(CASE WHEN s.close IS NOT NULL THEN 1 ELSE 0 END) >= ?
-           AND SUM(CASE WHEN s.total_mv IS NOT NULL THEN 1 ELSE 0 END) >= ?
-           AND SUM(CASE WHEN s.up_limit IS NOT NULL AND s.down_limit IS NOT NULL THEN 1 ELSE 0 END) >= ?
-        ORDER BY s.trade_date DESC
-        LIMIT 1
-        """,
-        (threshold, threshold, threshold),
-    ).fetchone()
-    return str(dict(row).get("value") or "") if row else ""
+    return latest_decision_ready_trade_date(c)
 
 
 def _set_state(**values: Any) -> None:
@@ -91,9 +85,46 @@ def _set_state(**values: Any) -> None:
         _state.update(values)
 
 
+def _daily_update_retry_policy(c: Any, trade_date: str, *, now: datetime | None = None) -> dict[str, Any]:
+    """Return a persisted retry decision for the latest same-date failure."""
+
+    row = c.execute(
+        """SELECT finished_at,meta_json FROM data_ingestion_runs
+           WHERE job_name='data_platform.daily_update' AND status='failed'
+           ORDER BY id DESC LIMIT 1"""
+    ).fetchone()
+    if not row:
+        return {"allowed": True, "reason": "no_failed_run"}
+    item = dict(row)
+    try:
+        meta = json.loads(item.get("meta_json") or "{}")
+    except (TypeError, json.JSONDecodeError):
+        return {"allowed": True, "reason": "legacy_failure_without_policy"}
+    if str(meta.get("trade_date") or "") != str(trade_date):
+        return {"allowed": True, "reason": "different_trade_date"}
+    category = str(meta.get("failure_category") or "")
+    retry_after_seconds = int(meta.get("retry_after_seconds") or 0)
+    if retry_after_seconds <= 0:
+        return {"allowed": True, "reason": "retryable_failure", "category": category}
+    try:
+        finished_at = datetime.fromisoformat(str(item.get("finished_at") or ""))
+    except ValueError:
+        return {"allowed": True, "reason": "invalid_failure_timestamp", "category": category}
+    current = now or datetime.now()
+    remaining = max(0, int(retry_after_seconds - (current - finished_at).total_seconds()))
+    return {
+        "allowed": remaining <= 0,
+        "reason": "cooldown_elapsed" if remaining <= 0 else "data_refresh_cooldown",
+        "category": category,
+        "retry_after_seconds": remaining,
+    }
+
+
 def _worker(parent_run_id: int) -> None:
     steps: list[dict[str, Any]] = []
     error = ""
+    failure_category = ""
+    retry_after_seconds = 0
     trade_date = ""
     try:
         _set_state(phase="preparing", message="正在检查数据目录", progress=10)
@@ -117,7 +148,30 @@ def _worker(parent_run_id: int) -> None:
         with _conn() as c:
             ready_date = _latest_decision_ready_trade_date(c)
         if not bool(market_result.get("ok")) or ready_date != trade_date:
-            raise RuntimeError(f"上游尚未发布 {trade_date} 完整收盘数据，自动日更将在下一轮重试")
+            market_category = str(market_result.get("failure_category") or "")
+            if market_category == "truncated":
+                raise DailyUpdateDataBlocked(
+                    f"{trade_date} stk_limit 批量切片被截断，系统已停止分钟级重拉并进入有界分页诊断",
+                    category="internal_fault_truncated_slice",
+                    retry_after_seconds=_DAILY_UPDATE_INTERNAL_FAULT_COOLDOWN_SEC,
+                )
+            if market_category == "incomplete_slice":
+                raise DailyUpdateDataBlocked(
+                    f"{trade_date} stk_limit 分页结束后覆盖仍不足，系统已阻断正式消费并等待数据中台复核",
+                    category="internal_fault_incomplete_slice",
+                    retry_after_seconds=_DAILY_UPDATE_INTERNAL_FAULT_COOLDOWN_SEC,
+                )
+            if market_category == "repair_in_progress":
+                raise DailyUpdateDataBlocked(
+                    f"{trade_date} stk_limit 缺失股票正在由数据中台有界补齐，完成前禁止正式消费",
+                    category="waiting_stk_limit_gap_repair",
+                    retry_after_seconds=600,
+                )
+            raise DailyUpdateDataBlocked(
+                f"上游尚未发布 {trade_date} 完整收盘数据，自动日更将在冷却后复核",
+                category="upstream_not_ready",
+                retry_after_seconds=600,
+            )
 
         _set_state(phase="etf_daily", message=f"正在按交易日更新 {trade_date} ETF 日线", progress=68)
         try:
@@ -184,14 +238,22 @@ def _worker(parent_run_id: int) -> None:
                    finished_at=_now(), steps=steps)
     except Exception as exc:  # noqa: BLE001
         final_status, error = "failed", str(exc)[:1000]
+        failure_category = str(getattr(exc, "category", "internal_fault"))
+        retry_after_seconds = int(getattr(exc, "retry_after_seconds", 0) or 0)
         _set_state(running=False, phase="failed", message=f"更新失败：{error}", error=error,
+                   failure_category=failure_category, retry_after_seconds=retry_after_seconds,
                    finished_at=_now(), steps=steps)
     with _conn() as c:
         c.execute(
             """UPDATE data_ingestion_runs SET status=?,finished_at=?,rows_read=?,rows_written=?,error=?,meta_json=?
             WHERE id=?""",
             (final_status, _now(), len(steps), len(steps), error,
-             json.dumps({"trade_date": trade_date, "steps": steps}, ensure_ascii=False, default=str), parent_run_id),
+             json.dumps({
+                 "trade_date": trade_date,
+                 "steps": steps,
+                 "failure_category": failure_category,
+                 "retry_after_seconds": retry_after_seconds,
+             }, ensure_ascii=False, default=str), parent_run_id),
         )
 
 
@@ -200,6 +262,16 @@ def start_daily_update() -> dict[str, Any]:
         if _state.get("running"):
             return {"ok": False, "reason": "already_running", **_state}
         with _conn() as c:
+            target = target_trade_date(c)
+            retry_policy = _daily_update_retry_policy(c, target)
+            if not retry_policy.get("allowed"):
+                return {
+                    **retry_policy,
+                    "ok": False,
+                    "reason": "cooldown_active",
+                    "trade_date": target,
+                    "cooldown_reason": retry_policy.get("reason"),
+                }
             c.execute(
                 """INSERT INTO data_ingestion_runs
                 (job_name,source_code,status,started_at,rows_read,rows_written,meta_json)
@@ -232,14 +304,25 @@ def start_daily_update_scheduler() -> bool:
                     with _conn() as c:
                         target = target_trade_date(c, now=now)
                         ready = _latest_decision_ready_trade_date(c)
-                    if target and ready != target:
+                        retry_policy = _daily_update_retry_policy(c, target, now=now)
+                    if target and ready != target and retry_policy.get("allowed"):
                         result = start_daily_update()
                         if result.get("ok"):
                             logger.info("自动收盘日更已启动 target=%s previous_ready=%s", target, ready)
                         elif result.get("reason") != "already_running":
                             logger.warning("自动收盘日更启动失败 target=%s result=%s", target, result)
+                    elif target and ready != target and retry_policy.get("reason") == "data_refresh_cooldown":
+                        _set_state(
+                            running=False,
+                            phase="cooldown",
+                            message="检测到相同数据切片故障，系统按冷却窗口自主复核",
+                            trade_date=target,
+                            failure_category=retry_policy.get("category"),
+                            retry_after_seconds=retry_policy.get("retry_after_seconds"),
+                        )
             except Exception as exc:  # noqa: BLE001
                 logger.warning("自动收盘日更检查失败: %s", str(exc)[:300])
+            _set_state(next_scheduler_check_at=(datetime.now().astimezone() + timedelta(seconds=_DAILY_UPDATE_INTERVAL_SEC)).isoformat(timespec="seconds"))
             threading.Event().wait(_DAILY_UPDATE_INTERVAL_SEC)
 
     threading.Thread(target=_loop, name="data-platform-daily-update", daemon=True).start()
@@ -261,6 +344,8 @@ def daily_update_status() -> dict[str, Any]:
 
 def simple_health() -> dict[str, Any]:
     with _conn() as c:
+        target = target_trade_date(c)
+        contract = decision_data_contract(target, conn=c)
         values = {
             "stock_count": c.execute("SELECT COUNT(*) cnt FROM dc_stock_master").fetchone(),
             "snapshot_count": c.execute("SELECT COUNT(*) cnt FROM dc_stock_daily_snapshot").fetchone(),
@@ -268,14 +353,16 @@ def simple_health() -> dict[str, Any]:
             "latest_decision_ready_trade_date": {"value": _latest_decision_ready_trade_date(c)},
             "latest_announcement": c.execute("SELECT MAX(publish_time) value FROM dc_announcement_raw").fetchone(),
             "failed_runs": c.execute("SELECT COUNT(*) cnt FROM data_ingestion_runs WHERE status='failed'").fetchone(),
+            "recent_failed_runs": c.execute(
+                "SELECT COUNT(*) cnt FROM data_ingestion_runs WHERE status='failed' AND COALESCE(finished_at,started_at)>=?",
+                ((datetime.now() - timedelta(hours=24)).isoformat(timespec="seconds"),),
+            ).fetchone(),
         }
     data = {key: dict(row) for key, row in values.items()}
     latest = str(data["latest_trade_date"].get("value") or "")
     decision_ready = str(data["latest_decision_ready_trade_date"].get("value") or "")
     stock_count = int(data["stock_count"].get("cnt") or 0)
     snapshot_count = int(data["snapshot_count"].get("cnt") or 0)
-    with _conn() as c:
-        target = target_trade_date(c)
     if stock_count == 0 or snapshot_count == 0:
         level, summary = "needs_setup", "尚未完成首次数据更新"
     elif decision_ready == target:
@@ -285,7 +372,12 @@ def simple_health() -> dict[str, Any]:
     return {
         "ok": level == "healthy", "level": level, "summary": summary, "target_trade_date": target, "latest_trade_date": latest,
         "latest_decision_ready_trade_date": decision_ready,
+        "decision_contract": contract,
         "stock_count": stock_count, "snapshot_count": snapshot_count,
         "latest_announcement": data["latest_announcement"].get("value"),
+        "historical_failed_runs": int(data["failed_runs"].get("cnt") or 0),
+        "recent_failed_runs": int(data["recent_failed_runs"].get("cnt") or 0),
+        # Backward compatibility only.  UI must not call this historical total
+        # "pending" or "unresolved" failures.
         "failed_runs": int(data["failed_runs"].get("cnt") or 0),
     }

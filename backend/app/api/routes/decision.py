@@ -5,6 +5,7 @@ from typing import Any
 from fastapi import APIRouter, Query
 
 from app.data_platform.db import _conn as data_conn
+from app.data_platform.services.decision_data_contract import decision_data_contract
 from app.db.store import get_account_balance, get_account_baseline, get_account_high_water_mark, get_backtest_result, get_positions, list_backtests, list_executions, list_operations
 from app.services.backtest_data_source import BacktestDataSource
 from app.services.data_health import build_data_health_report
@@ -249,50 +250,7 @@ def _recent_execution_summary() -> dict[str, Any] | None:
 
 
 def _latest_decision_data_contract() -> dict[str, Any]:
-    with data_conn() as conn:
-        latest = conn.execute("SELECT MAX(trade_date) AS latest_trade_date FROM dc_available_trade_dates").fetchone()
-        latest_trade_date = str(dict(latest).get("latest_trade_date") or "")
-        if not latest_trade_date:
-            latest = conn.execute("SELECT MAX(trade_date) AS latest_trade_date FROM dc_stock_daily_snapshot").fetchone()
-            latest_trade_date = str(dict(latest).get("latest_trade_date") or "")
-        if not latest_trade_date:
-            return {
-                "ok": False,
-                "latest_trade_date": "",
-                "required_apis": list(REQUIRED_DECISION_MARKET_APIS),
-                "present_apis": [],
-                "missing_apis": list(REQUIRED_DECISION_MARKET_APIS),
-                "snapshot_ready": False,
-                "reason": "还没有可用交易日快照",
-            }
-        rows = conn.execute(
-            f"""SELECT api_name,COUNT(*) AS rows FROM dc_tushare_raw_records
-                WHERE trade_date=? AND api_name IN ({",".join("?" for _ in REQUIRED_DECISION_MARKET_APIS)})
-                GROUP BY api_name""",
-            (latest_trade_date, *REQUIRED_DECISION_MARKET_APIS),
-        ).fetchall()
-        present_apis = sorted(
-            str(dict(row).get("api_name") or "")
-            for row in rows
-            if int(dict(row).get("rows") or 0) > 0
-        )
-        snapshot_row = conn.execute(
-            "SELECT COUNT(*) AS count FROM dc_stock_daily_snapshot WHERE trade_date=?",
-            (latest_trade_date,),
-        ).fetchone()
-    missing_apis = [api for api in REQUIRED_DECISION_MARKET_APIS if api not in present_apis]
-    snapshot_ready = int(dict(snapshot_row).get("count") or 0) > 0
-    return {
-        "ok": not missing_apis and snapshot_ready,
-        "latest_trade_date": latest_trade_date,
-        "required_apis": list(REQUIRED_DECISION_MARKET_APIS),
-        "present_apis": present_apis,
-        "missing_apis": missing_apis,
-        "snapshot_ready": snapshot_ready,
-        "reason": ""
-        if (not missing_apis and snapshot_ready)
-        else f"{latest_trade_date} 尚未完成 daily/daily_basic/stk_limit 入库或当日快照构建",
-    }
+    return decision_data_contract()
 
 
 def _latest_model_validation(model_status: dict[str, Any]) -> dict[str, Any] | None:

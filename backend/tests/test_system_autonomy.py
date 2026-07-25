@@ -205,6 +205,7 @@ def test_full_autonomy_bus_continues_to_terminal_result_after_one_step_times_out
         "app.services.production_strategy.champion_execution_gate",
         lambda: {"status": "normal"},
     )
+    monkeypatch.setattr("app.services.incident_supervisor.get_env_value", lambda *_args: "")
 
     def controlled_run_step(name, fn):
         if name == "hard_data_gate":
@@ -219,7 +220,7 @@ def test_full_autonomy_bus_continues_to_terminal_result_after_one_step_times_out
                 name,
                 lambda: (release.wait(1), {"ok": True, "status": "completed"})[1],
             )
-        if name == "autonomous_self_healing":
+        if name in {"autonomous_self_healing", "llm_incident_supervisor"}:
             return original_run_step(name, fn)
         return original_run_step(name, lambda: {"ok": True, "status": "completed"})
 
@@ -232,5 +233,7 @@ def test_full_autonomy_bus_continues_to_terminal_result_after_one_step_times_out
     assert steps["cn_ppi_raw"]["ok"] is True
     assert steps["llm_proposal_router"]["ok"] is True
     assert steps["autonomous_self_healing"]["result"]["status"] == "blocked"
-    assert result["status"] == "completed_with_anomalies"
+    assert steps["llm_incident_supervisor"]["result"]["status"] == "self_managed"
+    assert steps["llm_incident_supervisor"]["result"]["owner_action_required_count"] == 0
+    assert result["status"] == "completed"
     release.set()

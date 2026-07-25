@@ -9,6 +9,55 @@ import { fetchOwnerDailySummary, type OwnerDailySummaryResponse } from "../api/m
 
 type Focus = "returns" | "rebalance" | "models";
 
+type OwnerNotice = { level: "block" | "degraded" | "observe"; title: string; detail: string };
+
+const MODULE_LABELS: Record<string, string> = {
+  periodic_performance_review: "收益复盘",
+  official_policy_documents: "政策资料",
+  research_data_assets: "研究数据",
+  autonomous_self_healing: "自动修复",
+  simulation_ledger_audit: "账户账本",
+  hard_data_gate: "长期数据",
+  decision_data_gate: "决策数据",
+  sealed_holdout_data_gate: "密封验证集",
+};
+
+function ownerNotice(module: string, message: string): OwnerNotice {
+  const label = MODULE_LABELS[module] || "系统模块";
+  const normalized = message.toLowerCase();
+  if (module === "sealed_holdout_data_gate") {
+    return { level: "observe", title: "密封验证集补全中", detail: "未补齐前不会运行保留集验证，无需人工操作" };
+  }
+  if (module === "decision_data_gate") {
+    return { level: "degraded", title: "今日决策数据未就绪", detail: "正式计划与策略实验已自动暂停，数据刷新后复核" };
+  }
+  if (module === "autonomous_self_healing" && (normalized.includes("timeout") || normalized.includes("timed_out"))) {
+    return { level: "degraded", title: "自动修复本轮超时", detail: "本轮已停止等待，下个周期继续检查且不会重复并发" };
+  }
+  if (module === "simulation_ledger_audit" || normalized.includes("failed") || normalized.includes("blocked")) {
+    return { level: "block", title: `${label}阻断`, detail: "系统已停止相关自动动作，需要检查后再恢复" };
+  }
+  if (normalized.includes("degraded")) {
+    return { level: "degraded", title: `${label}已降级`, detail: "保护措施已生效，核心安全门仍保持" };
+  }
+  if (normalized.includes("attention")) {
+    return { level: "observe", title: `${label}待观察`, detail: "已形成改进信号，不要求立即操作" };
+  }
+  if (normalized.includes("partial")) {
+    return { level: "observe", title: `${label}部分可用`, detail: "不影响模拟交易主链，系统将继续补充" };
+  }
+  return { level: "observe", title: `${label}待观察`, detail: message || "系统将继续自动检查" };
+}
+
+function governanceStatusText(status: string | null | undefined) {
+  return {
+    audited_no_actionable_hard_gap: "已审计，无需修复",
+    ready: "就绪",
+    blocked: "已阻断",
+    degraded: "降级运行",
+  }[String(status || "")] || "待检查";
+}
+
 function money(value: number | null | undefined) {
   return Number.isFinite(Number(value)) ? `¥${Number(value).toLocaleString("zh-CN", { maximumFractionDigits: 0 })}` : "—";
 }
@@ -66,6 +115,7 @@ export default function InvestorDashboardPage({ focus }: { focus: Focus }) {
   })();
   const checks = loop.portfolio_optimization.execution_checks ?? [];
   const isBlocked = checks.some((item) => item.status === "block");
+  const planAuthorized = loop.rebalance_plan.execution_authorized ?? !isBlocked;
   const tradeAmount = actions.reduce((sum, item) => sum + Number(item.estimated_trade_amount ?? Math.abs(Number(item.weight_change || 0)) * Number(account.assets || 0)), 0);
   const actionSummary = [
     ["新建/加仓", proposal.filter((item) => item.action === "buy").length],
@@ -75,22 +125,55 @@ export default function InvestorDashboardPage({ focus }: { focus: Focus }) {
   const modelItems = loop.model_return_contribution?.items ?? [];
   const autonomy = ownerSummary?.summary?.questions;
   const anomalies = autonomy?.anomalies ?? [];
-  const ownerProposalCount = autonomy?.today_rebalance.proposal_count ?? proposal.length;
+  const supervision = autonomy?.incident_supervision;
+  const supervisedCases = (supervision?.cases ?? [])
+    .filter((item) => item.module !== "autonomous_self_healing")
+    .map((item) => ({
+      ...item,
+      resolution_class: item.resolution_class || (["decision_data_gate", "periodic_performance_review", "official_policy_documents", "llm_data_operations"].includes(item.module) ? "waiting_condition" : "internal_fault"),
+    }));
+  const internalFaultCount = supervisedCases.filter((item) => item.resolution_class === "internal_fault").length;
+  const waitingConditionCount = supervisedCases.filter((item) => item.resolution_class === "waiting_condition").length;
+  const ownerCases = supervisedCases.filter((item) => item.owner_action_required || item.owner === "owner");
+  const notices = (supervision
+    ? ownerCases.map((item) => ({ module: item.module, message: item.summary || item.reason }))
+    : anomalies).map((item) => ownerNotice(item.module, item.message));
+  const blockingNotices = notices.filter((item) => item.level === "block");
+  const degradedNotices = notices.filter((item) => item.level === "degraded");
+  const observingNotices = notices.filter((item) => item.level === "observe");
+  const executionGate = autonomy?.system_changes.champion_execution_gate;
+  const isResearchOnly = executionGate?.status === "quarantined" || executionGate?.mode === "research_only_sell_reduce";
+  const executableActions = actions.filter((item) => !isResearchOnly || ["sell", "reduce"].includes(item.action));
+  const ownerProposalCount = planAuthorized ? executableActions.length : 0;
+  const systemState = blockingNotices.length
+    ? { tone: "blocked", title: `${blockingNotices.length} 项阻断`, detail: "自动动作已暂停，需下钻检查" }
+    : degradedNotices.length
+      ? { tone: "degraded", title: "保护运行中", detail: `${degradedNotices.length} 项降级已由系统接管` }
+      : supervision?.status === "self_managed"
+        ? { tone: "healthy", title: "系统正在自行处理", detail: `内部故障 ${internalFaultCount} 项 · 等待条件 ${waitingConditionCount} 项，无需你操作` }
+        : { tone: "healthy", title: "运行正常", detail: observingNotices.length ? `${observingNotices.length} 项观察，不需要立即处理` : "没有需要处理的异常" };
   const benchmarkComparison = candles?.latest_comparison;
   const selectedMethod = loop.portfolio_optimization.optimizer.selected_method
     ?? loop.portfolio_optimization.optimizer.method_competition?.selected_method
     ?? "等待比较";
+  const selectedMethodLabel: Record<string, string> = {
+    hold_current: "保持当前持仓",
+    forced_risk_exit: "强制风险退出",
+    empirical_cvar: "经验 CVaR",
+    equal_weight: "等权",
+    hrp: "HRP",
+  };
 
   return (
     <main className="investor-page">
       <header className="investor-heading"><div><span>{titles[focus][1]}</span><h2>{titles[focus][0]}</h2></div><time>更新于 {loop.generated_at?.slice(0, 16).replace("T", " ")}</time></header>
 
       {focus === "returns" && <>
-        <section className={`owner-autonomy-strip ${anomalies.length ? "has-anomaly" : "healthy"}`}>
-          <div><span>系统自治</span><strong>{ownerSummary?.available ? (anomalies.length ? `${anomalies.length} 项异常` : "运行正常") : "等待今日闭环"}</strong><small>{ownerSummary?.finished_at ? `最近完成 ${formatGmt8Time(ownerSummary.finished_at)}` : ownerSummary?.message || "每日自动完成数据、模型、策略、组合与复盘"}</small></div>
-          <div><span>今日调仓</span><strong>{ownerProposalCount} 项</strong><small>{loop.rebalance_plan.plan_version} · {loop.rebalance_plan.status}</small></div>
-          <div><span>系统变化</span><strong>{(autonomy?.system_changes.model_auto_promoted ?? 0) + (autonomy?.system_changes.model_training_started ?? 0) + (autonomy?.system_changes.strategy_candidates_created ?? 0) + (autonomy?.system_changes.corporate_actions_applied ?? 0) + (autonomy?.system_changes.model_degraded_count ?? 0)} 项</strong><small>模型 {autonomy?.system_changes.model_degraded_count ? `降级 ${autonomy.system_changes.model_degraded_count}` : "健康"} · 模型晋升 {autonomy?.system_changes.model_auto_promoted ?? 0} · 策略候选 {autonomy?.system_changes.strategy_candidates_created ?? 0} · 复盘候选 {autonomy?.system_changes.strategy_learning_candidate_count ?? 0} · 样本重评 {autonomy?.system_changes.strategy_candidates_re_evaluated ?? 0} · 复盘信号 {autonomy?.system_changes.performance_learning_signal_count ?? 0} · 数据治理 {autonomy?.system_changes.data_quality_governance_status || "待检查"} · 分红送股 {autonomy?.system_changes.corporate_actions_applied ?? 0} · 账本 {autonomy?.system_changes.ledger_status === "passed" ? "一致" : autonomy?.system_changes.ledger_status === "failed" ? `漂移 ${autonomy?.system_changes.ledger_position_drift_count ?? 0} 项` : "待审计"} · 组合 {(autonomy?.system_changes.portfolio_method || "待选择").toUpperCase()} · 成本 {autonomy?.system_changes.execution_cost_version || "待校准"}</small></div>
-          {anomalies.length > 0 && <ul>{anomalies.slice(0, 3).map((item) => <li key={`${item.module}-${item.message}`}>{item.module}：{item.message}</li>)}</ul>}
+        <section className={`owner-autonomy-strip ${ownerSummary?.available ? systemState.tone : "waiting"}`}>
+          <div><span>系统状态</span><strong>{ownerSummary?.available ? systemState.title : "等待今日闭环"}</strong><small>{ownerSummary?.available ? systemState.detail : ownerSummary?.message || "每日自动完成数据、模型、策略、组合与复盘"}{ownerSummary?.finished_at ? ` · 最近完整周期 ${formatGmt8Time(ownerSummary.finished_at)}` : ""}{loop.portfolio_optimization.decision_data_gate && !loop.portfolio_optimization.decision_data_gate.decision_ready ? ` · 实时决策门阻断 ${loop.portfolio_optimization.decision_data_gate.target_trade_date}` : ""}</small></div>
+          <div className={!planAuthorized || isResearchOnly ? "execution-quarantined" : ""}><span>执行权限</span><strong>{!planAuthorized ? "禁止执行" : isResearchOnly ? "仅减仓 / 卖出" : "正常模拟执行"}</strong><small>{!planAuthorized ? `最新决策数据未就绪，今日 0 项可执行动作；系统刷新后自动复核` : isResearchOnly ? `今日 ${ownerProposalCount} 项可执行动作；Champion 正式 OOS 未通过，禁止新开仓和加仓` : `今日 ${ownerProposalCount} 项可执行动作`}</small></div>
+          <div><span>系统变化</span><strong>{(autonomy?.system_changes.model_auto_promoted ?? 0) + (autonomy?.system_changes.model_training_started ?? 0) + (autonomy?.system_changes.strategy_candidates_created ?? 0) + (autonomy?.system_changes.corporate_actions_applied ?? 0) + (autonomy?.system_changes.model_degraded_count ?? 0)} 项</strong><small>模型 {autonomy?.system_changes.model_degraded_count ? `降级 ${autonomy.system_changes.model_degraded_count}` : "健康"} · 模型晋升 {autonomy?.system_changes.model_auto_promoted ?? 0} · 策略候选 {autonomy?.system_changes.strategy_candidates_created ?? 0} · 复盘候选 {autonomy?.system_changes.strategy_learning_candidate_count ?? 0} · 样本重评 {autonomy?.system_changes.strategy_candidates_re_evaluated ?? 0} · 复盘信号 {autonomy?.system_changes.performance_learning_signal_count ?? 0} · 数据治理 {governanceStatusText(autonomy?.system_changes.data_quality_governance_status)} · 分红送股 {autonomy?.system_changes.corporate_actions_applied ?? 0} · 账本 {autonomy?.system_changes.ledger_status === "passed" ? "一致" : autonomy?.system_changes.ledger_status === "failed" ? `漂移 ${autonomy?.system_changes.ledger_position_drift_count ?? 0} 项` : "待审计"} · 组合 {(autonomy?.system_changes.portfolio_method || "待选择").toUpperCase()} · 成本 {autonomy?.system_changes.execution_cost_version || "待校准"}</small></div>
+          {notices.length > 0 && <div className="owner-notice-list">{notices.slice(0, 4).map((item, index) => <article className={`notice-${item.level}`} key={`${item.title}-${index}`}><b>{item.level === "block" ? "阻断" : item.level === "degraded" ? "降级" : "观察"}</b><div><strong>{item.title}</strong><small>{item.detail}</small></div></article>)}</div>}
         </section>
         <section className="investor-hero">
           <article><span>总资产</span><strong>{money(account.assets)}</strong><small>现金 {money(account.balance)} · 持仓 {money(account.position_value)}</small></article>
@@ -104,14 +187,14 @@ export default function InvestorDashboardPage({ focus }: { focus: Focus }) {
 
       {focus === "rebalance" && <>
         <section className={`rebalance-decision ${isBlocked ? "blocked" : actions.length ? "active" : "quiet"}`}>
-          <div><span>今日结论</span><strong>{isBlocked ? "暂缓执行" : actions.length ? "建议调仓" : "今日保持不动"}</strong><small>{isBlocked ? "执行前仍有阻断项" : actionSummary || "目标权重变化不足以覆盖成本"}</small></div>
+          <div><span>今日结论</span><strong>{isBlocked ? "禁止执行" : actions.length ? "建议调仓" : "今日保持不动"}</strong><small>{isBlocked ? "系统已安全阻断；数据门恢复后会自动重算，无需人工进入模块" : actionSummary || "目标权重变化不足以覆盖成本"}</small></div>
           <dl><div><dt>涉及资产</dt><dd>{actions.length} 项</dd></div><div><dt>预计交易额</dt><dd>{money(tradeAmount)}</dd></div><div><dt>净预期改善</dt><dd className={comparison.net_expected_improvement >= 0 ? "gain" : "loss"}>{pct(comparison.net_expected_improvement)}</dd></div></dl>
         </section>
-        <section className={`plan-identity ${loop.rebalance_plan.is_executed ? "executed" : "planned"}`}><div><span>方案版本</span><strong>{loop.rebalance_plan.plan_version}</strong></div><div><span>数据截止</span><strong>{loop.rebalance_plan.data_as_of_date}</strong></div><div><span>计划执行时间</span><strong>{loop.rebalance_plan.planned_execute_at ? formatGmt8Time(loop.rebalance_plan.planned_execute_at) : "等待生成计划"}</strong></div><div><span>实际执行时间</span><strong>{loop.rebalance_plan.executed_at ? formatGmt8Time(loop.rebalance_plan.executed_at) : "等待收盘数据"}</strong></div><div><span>状态</span><strong>{loop.rebalance_plan.is_executed ? "已执行" : "等待执行"}</strong></div><small>{loop.rebalance_plan.execution_policy}；打开页面不会重复调仓。</small></section>
-        <section className="investor-panel rebalance-comparison"><header><div><span>不调仓基线 → 调仓后</span><h3>组合会发生什么变化</h3></div><em>自动选择 {selectedMethod}</em></header><div className="comparison-grid"><div><span>预期 20 日</span><strong>{pct(comparison.current.expected_20d_return)} → {pct(comparison.target.expected_20d_return)}</strong></div><div><span>现金仓位</span><strong>{pct(comparison.current.cash_weight)} → {pct(comparison.target.cash_weight)}</strong></div><div><span>最大单仓</span><strong>{pct(comparison.current.max_position_weight)} → {pct(comparison.target.max_position_weight)}</strong></div><div><span>换手率</span><strong>{pct(comparison.turnover)}</strong></div><div><span>预计成本</span><strong>{pct(comparison.estimated_one_way_cost)}</strong></div><div><span>扣成本改善</span><strong className={comparison.net_expected_improvement >= 0 ? "gain" : "loss"}>{pct(comparison.net_expected_improvement)}</strong></div></div><small>{comparison.method}；执行成本版本 {loop.portfolio_optimization.execution_cost_contract?.version || "builtin"}（样本 {loop.portfolio_optimization.execution_cost_contract?.sample_count ?? 0}）</small></section>
+        <section className={`plan-identity ${loop.rebalance_plan.is_executed ? "executed" : planAuthorized ? "planned" : "blocked"}`}><div><span>方案版本</span><strong>{loop.rebalance_plan.plan_version}</strong></div><div><span>数据截止</span><strong>{loop.rebalance_plan.data_as_of_date}</strong></div><div><span>计划执行时间</span><strong>{planAuthorized && loop.rebalance_plan.planned_execute_at ? formatGmt8Time(loop.rebalance_plan.planned_execute_at) : "未授权执行"}</strong></div><div><span>实际执行时间</span><strong>{loop.rebalance_plan.executed_at ? formatGmt8Time(loop.rebalance_plan.executed_at) : "尚未执行"}</strong></div><div><span>状态</span><strong>{loop.rebalance_plan.is_executed ? "已执行" : planAuthorized ? "等待执行" : "数据门阻断"}</strong></div><small>{planAuthorized ? `${loop.rebalance_plan.execution_policy}；打开页面不会重复调仓。` : loop.rebalance_plan.blocked_reason || "最新决策数据门未通过，当前内容仅为不可执行预览；系统会自动刷新并复核。"}</small></section>
+        <section className="investor-panel rebalance-comparison"><header><div><span>不调仓基线 → 调仓后</span><h3>{planAuthorized ? "组合会发生什么变化" : "不可执行方案预览"}</h3></div><em>自动选择 {selectedMethodLabel[selectedMethod] || selectedMethod}</em></header><div className="comparison-grid"><div><span>预期 20 日</span><strong>{pct(comparison.current.expected_20d_return)} → {pct(comparison.target.expected_20d_return)}</strong></div><div><span>现金仓位</span><strong>{pct(comparison.current.cash_weight)} → {pct(comparison.target.cash_weight)}</strong></div><div><span>最大单仓</span><strong>{pct(comparison.current.max_position_weight)} → {pct(comparison.target.max_position_weight)}</strong></div><div><span>换手率</span><strong>{pct(comparison.turnover)}</strong></div><div><span>预计成本</span><strong>{pct(comparison.estimated_one_way_cost)}</strong></div><div><span>扣成本改善</span><strong className={comparison.net_expected_improvement >= 0 ? "gain" : "loss"}>{pct(comparison.net_expected_improvement)}</strong></div></div><small>{comparison.method}；执行成本版本 {loop.portfolio_optimization.execution_cost_contract?.version || "builtin"}（样本 {loop.portfolio_optimization.execution_cost_contract?.sample_count ?? 0}）</small></section>
         <section className="execution-checks">{checks.map((item) => <article key={item.key} className={`check-${item.status}`}><b>{item.status === "pass" ? "通过" : item.status === "warn" ? "提醒" : "阻断"}</b><div><strong>{item.label}</strong><small>{item.detail}</small></div></article>)}</section>
         <section className="candidate-pipeline"><div><span>观察池</span><strong>{loop.portfolio_optimization.candidate_universe.watch_count} 只</strong></div><div><span>候选池</span><strong>{loop.portfolio_optimization.candidate_universe.candidate_count} 只</strong></div><div><span>核心池</span><strong>{loop.portfolio_optimization.candidate_universe.core_count} 只</strong></div><p>{loop.portfolio_optimization.candidate_universe.admission_policy}</p></section>
-        <section className="investor-panel"><header><div><span>按执行优先级排序</span><h3>逐项调仓清单</h3></div><em>{actionSummary || "无交易动作"}</em></header><div className="rebalance-list">{orderedProposal.map((item) => { const actionLabel = item.action === "buy" ? (item.current_weight <= .002 ? "新建仓" : "加仓") : item.action === "sell" ? "清仓" : item.action === "reduce" ? "减仓" : item.action === "observe" ? "观察" : "持有"; return <article key={item.symbol}><b className={`action-${item.action}`}>{actionLabel}</b><div className="rebalance-security"><strong>{item.name || "名称待补"}</strong><i>{item.symbol}{item.candidate_source === "core_pool" ? " · 核心池" : ""}</i></div><span>{pct(item.current_weight)} → {pct(item.target_weight)} <i>{item.weight_change >= 0 ? "+" : ""}{pct(item.weight_change)}</i></span><div className="trade-amount"><small>{money(item.current_amount)} → {money(item.target_amount)}</small><strong>{item.action === "hold" || item.action === "observe" ? "不交易" : `${item.weight_change > 0 ? "买入" : "卖出"} ${money(item.estimated_trade_amount)}`}</strong></div><div className="rebalance-detail"><small>{item.reason}</small><em>预期20日 {pct(item.expected_20d_return)} · 风险贡献 {pct(item.cvar_contribution_after)} · 成本 {pct(item.estimated_one_way_cost)}</em>{item.candidate_lineage && <i className="candidate-lineage">{item.candidate_lineage.path.join(" → ")}{item.candidate_lineage.source_reason ? ` · ${item.candidate_lineage.source_reason}` : ""}</i>}</div></article>; })}</div></section>
+        <section className="investor-panel"><header><div><span>{planAuthorized ? "按执行优先级排序" : "仅供系统复核"}</span><h3>{planAuthorized ? "逐项调仓清单" : "不可执行预览清单"}</h3></div><em>{planAuthorized ? actionSummary || "无交易动作" : "不会生成订单"}</em></header><div className="rebalance-list">{orderedProposal.map((item) => { const actionLabel = item.action === "buy" ? (item.current_weight <= .002 ? "新建仓" : "加仓") : item.action === "sell" ? "清仓" : item.action === "reduce" ? "减仓" : item.action === "observe" ? "观察" : "持有"; return <article key={item.symbol}><b className={`action-${item.action}`}>{planAuthorized ? actionLabel : "预览"}</b><div className="rebalance-security"><strong>{item.name || "名称待补"}</strong><i>{item.symbol}{item.candidate_source === "core_pool" ? " · 核心池" : ""}</i></div><span>{pct(item.current_weight)} → {pct(item.target_weight)} <i>{item.weight_change >= 0 ? "+" : ""}{pct(item.weight_change)}</i></span><div className="trade-amount"><small>{money(item.current_amount)} → {money(item.target_amount)}</small><strong>{planAuthorized ? item.action === "hold" || item.action === "observe" ? "不交易" : `${item.weight_change > 0 ? "买入" : "卖出"} ${money(item.estimated_trade_amount)}` : "禁止下单"}</strong></div><div className="rebalance-detail"><small>{item.reason}</small><em>预期20日 {pct(item.expected_20d_return)} · 风险贡献 {pct(item.cvar_contribution_after)} · 成本 {pct(item.estimated_one_way_cost)}</em>{item.candidate_lineage && <i className="candidate-lineage">{item.candidate_lineage.path.join(" → ")}{item.candidate_lineage.source_reason ? ` · ${item.candidate_lineage.source_reason}` : ""}</i>}</div></article>; })}</div></section>
       </>}
 
       {focus === "models" && <section className="investor-panel model-contribution-panel"><header><div><span>生产模型</span><h3>收益贡献与有效性</h3></div><em>{modelItems.length} 个模型</em></header><div className="model-contribution-list">{modelItems.map((item) => { const evidence = item.preferred_20d_evidence; return <article key={item.model_key}><div><strong>{item.name}</strong><span>{item.model_version || "等待版本"}</span></div><b>{item.portfolio_return_contribution_pct == null ? "观察中" : pct(item.portfolio_return_contribution_pct, true)}</b><dl><div><dt>20日样本</dt><dd>{evidence?.samples ?? 0}</dd></div><div><dt>平均超额</dt><dd>{evidence ? pct(evidence.avg_excess_return_pct, true) : "—"}</dd></div><div><dt>命中率</dt><dd>{evidence ? pct(evidence.hit_rate) : "—"}</dd></div></dl><small>{item.portfolio_return_contribution_pct == null ? "影子组合样本积累中" : "已形成可验证账户贡献"}</small></article>; })}</div></section>}

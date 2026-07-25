@@ -1,4 +1,5 @@
 import os
+from datetime import datetime
 from pathlib import Path
 from typing import Literal
 
@@ -32,8 +33,10 @@ def read_backend_log(
     """Return raw backend process output without parsing or rewriting it."""
     path = _backend_log_path(source)
     if not path.exists() or not path.is_file():
-        return {"source": source, "text": "", "offset": 0, "next_offset": 0, "size": 0, "eof": True}
-    size = path.stat().st_size
+        return {"source": source, "text": "", "offset": 0, "next_offset": 0, "size": 0, "eof": True,
+                "current_pid": os.getpid(), "file_updated_at": None, "provenance": "missing"}
+    stat = path.stat()
+    size = stat.st_size
     start = offset if offset <= size else 0
     with path.open("rb") as stream:
         stream.seek(start)
@@ -46,4 +49,8 @@ def read_backend_log(
         "next_offset": next_offset,
         "size": size,
         "eof": next_offset >= size,
+        "current_pid": os.getpid(),
+        "file_updated_at": datetime.fromtimestamp(stat.st_mtime).astimezone().isoformat(timespec="seconds"),
+        "provenance": "unverified_process_file",
+        "provenance_note": "该文件未绑定当前服务 PID，仅作为历史进程输出查看；实时运行证据请以结构化系统日志为准",
     }

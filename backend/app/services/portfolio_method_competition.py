@@ -78,9 +78,12 @@ def _evaluate(
     breaches: list[str] = []
     if any(value < -1e-12 for value in weights.values()):
         breaches.append("negative_weight")
-    if sum(weights.values()) > equity_budget + 1e-6:
+    # Holding an existing position is a no-trade safety baseline.  A newly
+    # reduced risk budget may make the existing book larger than the desired
+    # budget, but it must not silently turn "hold current" into liquidation.
+    if method != "hold_current" and sum(weights.values()) > equity_budget + 1e-6:
         breaches.append("equity_budget")
-    if max(weights.values(), default=0.0) > min(0.25, equity_budget) + 1e-6:
+    if method != "hold_current" and max(weights.values(), default=0.0) > min(0.25, equity_budget) + 1e-6:
         breaches.append("single_position")
     if len(series) < 20:
         breaches.append("return_history_lt_20")
@@ -118,7 +121,11 @@ def compete_portfolio_methods(
         "empirical_cvar": _normalise_to_budget(cvar_weights, budget),
         "equal_weight": _normalise_to_budget(equal, budget),
         "hrp": _normalise_to_budget(hrp, budget),
-        "hold_current": _normalise_to_budget(current_weights, min(budget, sum(max(0.0, _safe(value)) for value in current_weights.values()))),
+        "hold_current": {
+            str(symbol): max(0.0, _safe(value))
+            for symbol, value in current_weights.items()
+            if _safe(value) > 0
+        },
     }
     evaluations = [
         _evaluate(
