@@ -1160,6 +1160,14 @@ def init_db() -> None:
                 CREATE INDEX IF NOT EXISTS idx_ops_symbol_at ON operations (symbol, at);
                 CREATE INDEX IF NOT EXISTS idx_task_runs_task_execute ON quant_run_task_runs (task_id, execute_date);
                 CREATE INDEX IF NOT EXISTS idx_tasks_status_updated ON quant_run_tasks (status, updated_at);
+                WITH ranked AS (
+                    SELECT id,ROW_NUMBER() OVER (PARTITION BY model_key ORDER BY id DESC) AS rn
+                    FROM model_versions WHERE is_active=1
+                )
+                UPDATE model_versions SET is_active=0,status='superseded'
+                WHERE id IN (SELECT id FROM ranked WHERE rn>1);
+                CREATE UNIQUE INDEX IF NOT EXISTS uq_model_versions_one_active
+                ON model_versions(model_key) WHERE is_active=1;
                 """)
                 c.execute("ALTER TABLE account ADD COLUMN IF NOT EXISTS high_water_mark DOUBLE PRECISION NOT NULL DEFAULT 0")
                 c.execute("UPDATE account SET high_water_mark = GREATEST(high_water_mark, balance) WHERE id = 1")
@@ -1576,7 +1584,7 @@ def create_and_apply_buy_execution(
     names = name_by_symbol or {}
     with _conn() as c:
         account_row = c.execute(
-            "SELECT balance FROM account WHERE id=1" + (" FOR UPDATE" if c._is_postgres else "")
+            "SELECT balance FROM account WHERE id=1" + (" FOR UPDATE" if c._is_mysql else "")
         ).fetchone()
         balance = float(account_row["balance"] or 0) if account_row else 0.0
         if balance + 0.005 < total_cost:
@@ -1618,10 +1626,12 @@ def create_and_apply_buy_execution(
                 name=str(names.get(symbol) or item.get("name") or "").strip(),
                 bought_at=(executed_at or now)[:10],
             )
-        c.execute(
-            "UPDATE account SET balance=? WHERE id=1",
-            (round(balance - total_cost, 2),),
+        debit = c.execute(
+            "UPDATE account SET balance=ROUND(balance-?, 2) WHERE id=1 AND balance>=?",
+            (total_cost, total_cost),
         )
+        if int(getattr(debit, "rowcount", 1) or 0) != 1:
+            raise ValueError("账户余额在并发执行中发生变化，买入已整体回滚")
     return int(execution_id)
 
 
@@ -1872,9 +1882,13 @@ def sell_position(
     quantity 未传或等于当前持仓数量则全部卖出；price 为卖出单价。
     返回更新后的持仓（部分卖出）或 None（全部卖出后删除）。
     """
+    sell_qty = 0
+    pos_qty = 0
     with _conn() as c:
+        lock_suffix = " FOR UPDATE" if getattr(c, "_is_postgres", False) or getattr(c, "_is_mysql", False) else ""
         cur = c.execute(
-            "SELECT id, symbol, quantity, price, name, bought_at FROM positions WHERE id = ?", (position_id,)
+            "SELECT id, symbol, quantity, price, name, bought_at FROM positions WHERE id = ?" + lock_suffix,
+            (position_id,),
         )
         row = cur.fetchone()
         if not row:
@@ -1884,14 +1898,18 @@ def sell_position(
         sym = row["symbol"]
         name = (row["name"] or "").strip() if "name" in row.keys() else ""
         bought_at = row["bought_at"] if "bought_at" in row.keys() else None
-    if not _is_t1_sell_allowed(bought_at, trade_date):
-        raise ValueError("T+1 限制：当日买入仓位不可卖出")
-    sell_qty = min(quantity if quantity is not None and quantity > 0 else pos_qty, pos_qty)
-    if sell_qty <= 0:
-        return None
-    sell_price = max(0.0, round(float(price), 2))
-    now = datetime.now().isoformat()[:19]
-    with _conn() as c:
+        # Read, validate, mutate the position, credit cash and persist the
+        # operation under one row lock and one transaction.
+        effective_trade_date = trade_date or datetime.now().date().isoformat()
+        if not _is_t1_sell_allowed(bought_at, effective_trade_date):
+            raise ValueError("T+1 限制：当日买入仓位不可卖出")
+        sell_qty = min(quantity if quantity is not None and quantity > 0 else pos_qty, pos_qty)
+        if sell_qty <= 0:
+            return None
+        sell_price = round(float(price), 2)
+        if sell_price <= 0:
+            raise ValueError("卖出价格无效，禁止以 0 元成交")
+        now = datetime.now().isoformat()[:19]
         if sell_qty >= pos_qty:
             c.execute("DELETE FROM positions WHERE id = ?", (position_id,))
         else:
@@ -1913,11 +1931,12 @@ def sell_position(
                 fee_trans = 0.0 if is_exchange_etf(sym) else round(transfer_fee(amount), 2)
                 fee_tax = 0.0 if is_exchange_etf(sym) else round(stamp_tax(amount), 2)
             net = max(0.0, round(amount - fee_comm - fee_trans - fee_tax, 2))
-            cur = c.execute("SELECT balance FROM account WHERE id = 1")
-            row = cur.fetchone()
-            cur_balance = float(row["balance"]) if row is not None else 0.0
-            new_balance = max(0.0, round(cur_balance + net, 2))
-            c.execute("UPDATE account SET balance = ? WHERE id = 1", (new_balance,))
+            credited = c.execute(
+                "UPDATE account SET balance=ROUND(balance+?, 2) WHERE id=1",
+                (net,),
+            )
+            if int(getattr(credited, "rowcount", 1) or 0) != 1:
+                raise ValueError("模拟账户不存在，卖出已整体回滚")
         if record_operation:
             recorded_at = str(operation_at or now)
             operation_uid = _operation_uid(operation_execution_id, sym, "SELL", recorded_at, sell_qty, sell_price)
@@ -2719,6 +2738,7 @@ def create_quant_run_task_record(
     execution_id: Optional[int],
     message: str,
     detail: Optional[Dict[str, Any]] = None,
+    plan_claim_token: str = "",
 ) -> int:
     now = datetime.now().isoformat()
     detail_json = json.dumps(detail, ensure_ascii=False) if detail else None
@@ -2748,7 +2768,26 @@ def create_quant_run_task_record(
                 now,
             ),
         )
-        return c.last_insert_id()
+        record_id = c.last_insert_id()
+        if plan_claim_token:
+            signal = str(signal_date or "").replace("-", "")[:8]
+            changed = c.execute(
+                """UPDATE daily_rebalance_plans
+                   SET status='executed',execution_id=?,executed_at=?
+                   WHERE id=(SELECT id FROM daily_rebalance_plans
+                             WHERE replace(trade_date,'-','')=? AND status='executing'
+                               AND execution_claim_token=?
+                             ORDER BY version DESC LIMIT 1)""",
+                (
+                    int(execution_id) if execution_id is not None else None,
+                    now,
+                    signal,
+                    str(plan_claim_token),
+                ),
+            )
+            if int(getattr(changed, "rowcount", 0) or 0) != 1:
+                raise ValueError("正式调仓计划执行租约不存在，任务记录与计划状态已整体回滚")
+        return record_id
 
 
 def get_quant_replay_waterline(strategy_id: int, exchange_group: str = "HS") -> Optional[Dict[str, Any]]:

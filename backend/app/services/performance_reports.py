@@ -221,9 +221,9 @@ def enrich_performance_period(
 
 def run_periodic_performance_review() -> dict[str, Any]:
     """Materialize all periods and expose the newest durable learning inputs."""
-    from app.api.routes.quant_runs import quant_run_performance
+    from app.api.routes.quant_runs import build_quant_run_performance
 
-    result = quant_run_performance(task_id=None, benchmark="000300")
+    result = build_quant_run_performance(task_id=None, benchmark="000300", persist_reports=True)
     latest = {
         kind: (result.get(kind) or [])[-1] if result.get(kind) else None
         for kind in ("daily", "weekly", "monthly", "yearly")

@@ -806,8 +806,12 @@ def quant_run_simulation_ledger(
     return build_simulation_ledger(limit=limit, execution_id=execution_id)
 
 
-@router.get("/quant-runs/performance")
-def quant_run_performance(task_id: int | None = Query(None, ge=1), benchmark: str = "000300") -> dict:
+def build_quant_run_performance(
+    task_id: int | None = None,
+    benchmark: str = "000300",
+    *,
+    persist_reports: bool = False,
+) -> dict:
     """Return weekly/monthly/yearly performance aggregates for the simulator."""
     curve = quant_run_curve(limit=1000, benchmark=benchmark, task_id=task_id)
     series = [x for x in (curve.get("series") or []) if x.get("date") and x.get("strategy_equity") is not None]
@@ -1032,13 +1036,20 @@ def quant_run_performance(task_id: int | None = Query(None, ge=1), benchmark: st
         "yearly": aggregate(lambda d: d[:4]),
         "source_summary": curve.get("summary") or {},
     }
-    try:
+    if persist_reports:
         result["persisted_reports"] = save_performance_reports(
             task_id, {k: result[k] for k in ("daily", "weekly", "monthly", "yearly")}
         )
-    except Exception:
-        result["persisted_reports"] = 0
+    else:
+        result["persisted_reports"] = None
+        result["read_only"] = True
     return result
+
+
+@router.get("/quant-runs/performance")
+def quant_run_performance(task_id: int | None = Query(None, ge=1), benchmark: str = "000300") -> dict:
+    """Read performance without materialising or updating durable reports."""
+    return build_quant_run_performance(task_id=task_id, benchmark=benchmark, persist_reports=False)
 
 
 @router.get("/quant-runs/performance/reports")

@@ -41,11 +41,29 @@ function countdown(value?: string | null) {
 
 function progress(value: number) { return `${Math.round(Math.max(0, Math.min(1, value || 0)) * 100)}%`; }
 
+function duration(value?: number | null) {
+  if (value == null || !Number.isFinite(value)) return "正在计算";
+  if (value <= 0) return "即将完成";
+  const minutes = Math.max(1, Math.ceil(value / 60));
+  if (minutes < 60) return `约 ${minutes} 分钟`;
+  return `约 ${Math.floor(minutes / 60)} 小时 ${minutes % 60} 分钟`;
+}
+
+function sealedProgress(checkpoint?: Record<string, unknown>) {
+  if (!checkpoint || checkpoint.schema_version !== "alis_sealed_holdout_adj_factor_backfill_v1") return null;
+  return {
+    eligible: Number(checkpoint.eligible_sessions || 0), required: Number(checkpoint.required_sessions || 126),
+    batch: Number(checkpoint.current_batch_size || checkpoint.batch_size || 0),
+    completedBatches: Number(checkpoint.completed_batches || 0), remaining: Number(checkpoint.remaining_sessions || 0),
+    speed: Number(checkpoint.sessions_per_minute || 0), eta: checkpoint.estimated_remaining_seconds == null ? null : Number(checkpoint.estimated_remaining_seconds),
+  };
+}
+
 export default function TaskCenterPage() {
   const [data, setData] = useState<TaskCenterResponse | null>(null);
   const [selectedId, setSelectedId] = useState("");
   const [moduleFilter, setModuleFilter] = useState("all");
-  const [statusFilter, setStatusFilter] = useState("active");
+  const [statusFilter, setStatusFilter] = useState("attention");
   const [logQuery, setLogQuery] = useState("");
   const [logLevel, setLogLevel] = useState("all");
   const [showAllLogs, setShowAllLogs] = useState(false);
@@ -75,10 +93,10 @@ export default function TaskCenterPage() {
 
   const visibleTasks = useMemo(() => (data?.tasks ?? []).filter((item) => {
     const modulePass = moduleFilter === "all" || item.module === moduleFilter;
-    const statusPass = statusFilter === "all" || (statusFilter === "active"
-      ? ["running", "waiting", "observing", "blocked", "degraded", "partial"].includes(item.status)
+    const statusPass = statusFilter === "all" || (statusFilter === "attention"
+      ? ["running", "waiting", "observing", "blocked", "degraded", "partial", "failed"].includes(item.status)
       : item.status === statusFilter);
-    const scopePass = statusFilter !== "active" || item.activity_scope !== "history";
+    const scopePass = statusFilter !== "attention" || item.activity_scope !== "history";
     return modulePass && statusPass && scopePass;
   }), [data, moduleFilter, statusFilter]);
   const selected = data?.tasks.find((item) => item.id === selectedId) ?? visibleTasks[0] ?? data?.tasks[0];
@@ -122,6 +140,7 @@ export default function TaskCenterPage() {
         <div><i /><span>{item.name}</span><b>{statusLabel[item.status] || item.status}</b></div>
         <strong>{item.current_step}</strong>
         <dl><div><dt>下一步</dt><dd>{item.next_step}</dd></div><div><dt>精确时间</dt><dd>{exactTime(item.next_run_at, "等待条件")}</dd></div></dl>
+        {sealedProgress(item.checkpoint) && <SealedProgress value={sealedProgress(item.checkpoint)!} eta={item.estimated_remaining_seconds} compact />}
         <small>{item.next_run_at ? countdown(item.next_run_at) : `更新于 ${exactTime(item.updated_at)}`}</small>
       </button>)}
     </section>
@@ -131,7 +150,7 @@ export default function TaskCenterPage() {
         <header><div><span>任务流水</span><h2>模块与策略过程</h2></div><button type="button" onClick={() => setModuleFilter("all")}>全部模块</button></header>
         <div className="task-center-filters">
           <select value={moduleFilter} onChange={(event) => setModuleFilter(event.target.value)} aria-label="筛选模块"><option value="all">全部模块</option>{(data?.modules ?? []).map((item) => <option key={item.key} value={item.key}>{item.name}</option>)}</select>
-          <select value={statusFilter} onChange={(event) => setStatusFilter(event.target.value)} aria-label="筛选状态"><option value="active">当前运行、观察与阻断</option><option value="all">全部状态与历史</option><option value="running">仅运行中</option><option value="observing">仅观察中</option><option value="failed">仅失败记录</option><option value="completed">仅已完成</option></select>
+          <select value={statusFilter} onChange={(event) => setStatusFilter(event.target.value)} aria-label="筛选状态"><option value="attention">当前运行、失败与阻断</option><option value="all">全部状态与历史</option><option value="running">仅运行中</option><option value="observing">仅观察中</option><option value="failed">仅失败记录</option><option value="completed">仅已完成</option></select>
         </div>
         <div className="task-center-list">
           {visibleTasks.map((item) => <button type="button" key={item.id} className={`${selected?.id === item.id ? "selected" : ""} status-${item.status}`} onClick={() => setSelectedId(item.id)}>
@@ -158,6 +177,7 @@ function TaskDetail({ task }: { task?: TaskCenterTask }) {
   return <section className={`task-detail-panel status-${task.status}`}>
     <header><div><span>{task.source} · #{task.source_id || "—"}</span><h2>{task.name}</h2><p>{task.message || "暂无过程说明"}</p></div><b>{statusLabel[task.status] || task.status}</b></header>
     <div className="task-detail-progress"><span><i style={{ width: progress(task.progress) }} /></span><strong>{progress(task.progress)}</strong></div>
+    {sealedProgress(task.checkpoint) && <SealedProgress value={sealedProgress(task.checkpoint)!} eta={task.estimated_remaining_seconds} />}
     <div className="task-step-flow"><article><span>当前步骤</span><strong>{task.current_step}</strong><small>{task.phase || "等待调度"}</small></article><i>→</i><article><span>下一步</span><strong>{task.next_step}</strong><small>{task.next_run_at ? `${exactTime(task.next_run_at)} · ${countdown(task.next_run_at)}` : "由条件和调度器决定"}</small></article></div>
     <dl className="task-time-grid">
       <div><dt>创建</dt><dd>{exactTime(task.created_at)}</dd></div><div><dt>开始</dt><dd>{exactTime(task.started_at)}</dd></div>
@@ -168,4 +188,13 @@ function TaskDetail({ task }: { task?: TaskCenterTask }) {
     {task.error && <div className="task-detail-error"><strong>错误证据</strong><p>{task.error}</p></div>}
     {task.checkpoint && Object.keys(task.checkpoint).length > 0 && <details><summary>检查点与续跑证据</summary><pre>{JSON.stringify(task.checkpoint, null, 2)}</pre></details>}
   </section>;
+}
+
+function SealedProgress({ value, eta, compact = false }: { value: NonNullable<ReturnType<typeof sealedProgress>>; eta?: number | null; compact?: boolean }) {
+  const effectiveEta = value.eta ?? eta;
+  return <div className={`sealed-backfill-progress ${compact ? "compact" : ""}`}>
+    <strong>密封验证集 adj_factor：{value.eligible}/{value.required}</strong>
+    <span>当前批次 {value.batch} 日 · 已完成 {value.completedBatches} 批 · 剩余 {value.remaining} 日</span>
+    <small>速度 {value.speed > 0 ? `${value.speed.toFixed(1)} 日/分钟` : "计算中"} · 预计剩余 {duration(effectiveEta)}</small>
+  </div>;
 }

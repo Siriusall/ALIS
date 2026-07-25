@@ -69,6 +69,7 @@ def test_fifo_review_subtracts_proportional_entry_and_exit_fees(monkeypatch: pyt
 
 def test_quant_sell_can_update_cash_without_writing_manual_operation(monkeypatch: pytest.MonkeyPatch) -> None:
     statements: list[str] = []
+    connection_count = 0
 
     class _Conn:
         def execute(self, sql, params=()):
@@ -82,14 +83,39 @@ def test_quant_sell_can_update_cash_without_writing_manual_operation(monkeypatch
 
     @contextmanager
     def fake_conn():
+        nonlocal connection_count
+        connection_count += 1
         yield _Conn()
 
     monkeypatch.setattr(store, "_conn", fake_conn)
     result = store.sell_position(7, quantity=100, price=12.0, trade_date="2026-02-02", record_operation=False)
     assert result is None
+    assert connection_count == 1
     assert any("DELETE FROM positions" in sql for sql in statements)
-    assert any("UPDATE account SET balance" in sql for sql in statements)
+    assert any("UPDATE account SET balance=ROUND(balance+?" in sql for sql in statements)
     assert not any("INSERT INTO operations" in sql for sql in statements)
+
+
+def test_sell_rejects_missing_or_zero_price_before_mutating_position(monkeypatch: pytest.MonkeyPatch) -> None:
+    statements: list[str] = []
+
+    class _Conn:
+        def execute(self, sql, params=()):
+            statements.append(" ".join(sql.split()))
+            if "FROM positions WHERE id" in sql:
+                return _Cursor([{"id": 7, "symbol": "000001.SZ", "quantity": 100, "price": 10.0,
+                                 "name": "平安银行", "bought_at": "2026-01-02"}])
+            return _Cursor([])
+
+    @contextmanager
+    def fake_conn():
+        yield _Conn()
+
+    monkeypatch.setattr(store, "_conn", fake_conn)
+    with pytest.raises(ValueError, match="禁止以 0 元成交"):
+        store.sell_position(7, quantity=100, price=0, trade_date="2026-02-02")
+    assert not any("DELETE FROM positions" in sql for sql in statements)
+    assert not any("UPDATE positions" in sql for sql in statements)
 
 
 def test_quant_etf_sell_persists_projection_and_exact_fee_ledger_together(monkeypatch: pytest.MonkeyPatch) -> None:

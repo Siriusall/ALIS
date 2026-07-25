@@ -123,6 +123,15 @@ def decision_data_contract(trade_date: str | None = None, *, conn: Any | None = 
         "counts": counts,
         "snapshot_limit_rows": snapshot_limit_rows,
         "raw_limit_rows": raw_limit_covered,
+        # 5518 is derived from the target-date daily rows intersected with
+        # stock master; it is not an upstream guarantee for stk_limit.
+        "coverage_basis": "target_date_daily_intersection_stock_master",
+        "stock_master_count": stock_count,
+        "daily_expected_count": raw_limit_expected,
+        "stk_limit_raw_count": int(api_counts.get("stk_limit") or 0),
+        "stk_limit_snapshot_count": snapshot_limit_rows,
+        "stk_limit_matched_count": raw_limit_covered,
+        "shortfall_to_expected": max(0, raw_limit_expected - raw_limit_covered),
         "coverage": coverage,
         "shortfall": {api: max(0, minimum_rows_by_api[api] - counts[api]) for api in REQUIRED_DECISION_APIS},
         "snapshot_ready": counts["snapshot"] >= threshold,

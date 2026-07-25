@@ -14,13 +14,9 @@ import { formatGmt8Time, toGmt8ISOString } from "../utils/time";
 import type { SectionId } from "./Layout";
 import LoadingState from "./LoadingState";
 import {
-  addPosition as apiAddPosition,
-  deletePosition,
   fetchPositions,
   fetchOperations,
   fetchStockNames,
-  sellPosition as apiSellPosition,
-  updatePosition as apiUpdatePosition,
 } from "../api/positions";
 import { fetchPositionsEquityCurve } from "../api/strategies";
 import { chartGridStroke, chartLinePrimary, chartTooltipStyle } from "../chartTheme";
@@ -69,18 +65,8 @@ export default function PositionPage({ onNavigate }: PositionPageProps) {
   const [curveLoading, setCurveLoading] = useState(false);
   const [selectedSymbol, setSelectedSymbol] = useState<string | null>(null);
 
-  const [addSymbol, setAddSymbol] = useState("");
-  const [addQuantity, setAddQuantity] = useState("");
-  const [addPrice, setAddPrice] = useState("");
-  const [adding, setAdding] = useState(false);
-  const [positionError, setPositionError] = useState("");
-  const [editingId, setEditingId] = useState<number | null>(null);
-  const [editQuantity, setEditQuantity] = useState("");
-  const [editPrice, setEditPrice] = useState("");
-  const [savingId, setSavingId] = useState<number | null>(null);
   const [dataSourceTime, setDataSourceTime] = useState<string | null>(null);
   const [currentTime, setCurrentTime] = useState(() => new Date());
-  const [sellingId, setSellingId] = useState<number | null>(null);
   /** 仅对接口未返回名称的代码补请求一次，避免旧数据/手动添加的持仓没有名称 */
   const [fetchedNames, setFetchedNames] = useState<Record<string, string>>({});
 
@@ -288,58 +274,8 @@ export default function PositionPage({ onNavigate }: PositionPageProps) {
 
         {tab === "positions" && (
           <>
-            <div className="card" style={{ marginBottom: "1rem" }}>
-              <h3>模拟账户校准</h3>
-              <div className="decision-message" style={{ marginBottom: 12 }}>
-                这是低频校准动作，只用于修正本地模拟账户。正式买卖仍应通过“今日决策 → 模拟执行 → 执行账本”留下证据链。
-              </div>
-              {positionError && <div className="alert">{positionError}</div>}
-              <div className="position-calibration-form">
-                <input
-                  type="text"
-                  placeholder="代码"
-                  value={addSymbol}
-                  onChange={(e) => setAddSymbol(e.target.value.trim().toUpperCase())}
-                />
-                <input
-                  type="number"
-                  placeholder="数量"
-                  min={100}
-                  step={100}
-                  value={addQuantity}
-                  onChange={(e) => setAddQuantity(e.target.value)}
-                />
-                <input
-                  type="number"
-                  placeholder="成本价"
-                  min={0}
-                  step={0.01}
-                  value={addPrice}
-                  onChange={(e) => setAddPrice(e.target.value)}
-                />
-                <button
-                  type="button"
-                  disabled={adding || !addSymbol || !addQuantity || !addPrice}
-                  onClick={async () => {
-                    setPositionError("");
-                    setAdding(true);
-                    try {
-                      await apiAddPosition(addSymbol, Number(addQuantity), Number(addPrice));
-                      setAddSymbol("");
-                      setAddQuantity("");
-                      setAddPrice("");
-                      loadPositions(setPositions, setDataSourceTime);
-                    } catch (e: unknown) {
-                      setPositionError((e as { response?: { data?: { detail?: string } } })?.response?.data?.detail || "模拟账户校准失败");
-                    } finally {
-                      setAdding(false);
-                    }
-                  }}
-                  className="button primary"
-                >
-                  {adding ? "校准中…" : "登记校准"}
-                </button>
-              </div>
+            <div className="decision-message" style={{ marginBottom: 12 }}>
+              当前持仓由系统自动模拟执行和账本统一维护，页面仅提供查看，不支持手动增删改或卖出。
             </div>
             <div className="table-scroll">
               <table>
@@ -382,144 +318,33 @@ export default function PositionPage({ onNavigate }: PositionPageProps) {
                       }}
                     >
                       <td>{displayNames[p.symbol] ? `${displayNames[p.symbol]} ${p.symbol}` : p.symbol}</td>
-                      {editingId === p.id ? (
-                        <>
-                          <td>
-                            <input
-                              type="number"
-                              min={0}
-                              step={0.01}
-                              value={editPrice}
-                              onChange={(e) => setEditPrice(e.target.value)}
-                              style={{ width: "72px", padding: "4px" }}
-                            />
-                          </td>
-                          <td>
-                            <input
-                              type="number"
-                              min={0}
-                              step={100}
-                              value={editQuantity}
-                              onChange={(e) => setEditQuantity(e.target.value)}
-                              style={{ width: "80px", padding: "4px" }}
-                            />
-                          </td>
-                          <td>{formatNumber(Number(editPrice || 0) * Number(editQuantity || 0))}</td>
-                          <td>—</td>
-                          <td>—</td>
-                          <td>—</td>
-                          <td>—</td>
-                          <td>{p.strategy_next ?? "—"}</td>
-                          <td>
-                            <button
-                              type="button"
-                              disabled={savingId === p.id}
-                              onClick={async () => {
-                                setSavingId(p.id);
-                                try {
-                                  await apiUpdatePosition(p.id, {
-                                    quantity: Number(editQuantity) || 0,
-                                    price: Number(editPrice) || 0,
-                                  });
-                                  setEditingId(null);
-                                  loadPositions(setPositions, setDataSourceTime);
-                                } catch {
-                                  setEditingId(null);
-                                  loadPositions(setPositions, setDataSourceTime);
-                                } finally {
-                                  setSavingId(null);
-                                }
-                              }}
-                              style={{ marginRight: "6px", padding: "4px 8px", fontSize: "12px", cursor: "pointer" }}
-                            >
-                              保存
-                            </button>
-                            <button type="button" onClick={() => setEditingId(null)} style={{ padding: "4px 8px", fontSize: "12px", cursor: "pointer" }}>
-                              取消
-                            </button>
-                          </td>
-                        </>
-                      ) : (
-                        <>
-                          <td>{p.price.toFixed(2)}</td>
-                          <td>{formatNumber(p.quantity)}</td>
-                          <td>{formatNumber(p.price * p.quantity)}</td>
-                          <td>{p.current_price != null ? p.current_price.toFixed(2) : "—"}</td>
-                          <td>{p.current_value != null ? formatNumber(p.current_value) : "—"}</td>
-                          <td>
-                            {p.profit_loss != null ? (
-                              <span style={{ color: p.profit_loss >= 0 ? "#22c55e" : "#f87171" }}>
-                                {p.profit_loss >= 0 ? "+" : ""}{formatNumber(p.profit_loss)}
-                              </span>
-                            ) : "—"}
-                          </td>
-                          <td>
-                            {p.profit_loss_pct != null ? (
-                              <span style={{ color: p.profit_loss_pct >= 0 ? "#22c55e" : "#f87171" }}>
-                                {p.profit_loss_pct >= 0 ? "+" : ""}{p.profit_loss_pct.toFixed(2)}%
-                              </span>
-                            ) : "—"}
-                          </td>
-                          <td style={{ fontSize: "12px", maxWidth: "180px" }}>{p.strategy_next ?? "—"}</td>
-                          <td>
-                            <button
-                              type="button"
-                              onClick={() => {
-                                setEditingId(p.id);
-                                setEditQuantity(String(p.quantity));
-                                setEditPrice(String(p.price));
-                              }}
-                              style={{ marginRight: "6px", padding: "4px 8px", fontSize: "12px", cursor: "pointer" }}
-                            >
-                              校准
-                            </button>
-                            <button
-                              type="button"
-                              disabled={sellingId === p.id}
-                              onClick={async () => {
-                                const msg = `确定以当前价${p.current_price != null ? ` ${p.current_price.toFixed(2)} 元` : ""}卖出 ${displayNames[p.symbol] ? `${displayNames[p.symbol]} ${p.symbol}` : p.symbol} 的全部持仓（${formatNumber(p.quantity)} 股）？`;
-                                if (!confirm(msg)) return;
-                                setSellingId(p.id);
-                                setPositionError("");
-                                try {
-                                  await apiSellPosition(p.id, {});
-                                  loadPositions(setPositions, setDataSourceTime);
-                                  fetchOperations().then(setOperations).catch(() => {});
-                                } catch {
-                                  setPositionError("模拟卖出失败");
-                                } finally {
-                                  setSellingId(null);
-                                }
-                              }}
-                              style={{ marginRight: "6px", padding: "4px 8px", fontSize: "12px", cursor: "pointer", background: "#16a34a", color: "#ffffff", border: "none", borderRadius: "4px" }}
-                            >
-                              {sellingId === p.id ? "模拟卖出中…" : "模拟卖出"}
-                            </button>
-                            <button
-                              type="button"
-                              onClick={async () => {
-                                if (confirm(`确定删除 ${displayNames[p.symbol] ? `${displayNames[p.symbol]} ${p.symbol}` : p.symbol} 的持仓？`)) {
-                                  try {
-                                    await deletePosition(p.id);
-                                    loadPositions(setPositions, setDataSourceTime);
-                                  } catch {
-                                    setPositionError("删除失败");
-                                  }
-                                }
-                              }}
-                              style={{ padding: "4px 8px", fontSize: "12px", cursor: "pointer", color: "#f87171" }}
-                            >
-                              删除
-                            </button>
-                          </td>
-                        </>
-                      )}
+                      <td>{p.price.toFixed(2)}</td>
+                      <td>{formatNumber(p.quantity)}</td>
+                      <td>{formatNumber(p.price * p.quantity)}</td>
+                      <td>{p.current_price != null ? p.current_price.toFixed(2) : "—"}</td>
+                      <td>{p.current_value != null ? formatNumber(p.current_value) : "—"}</td>
+                      <td>
+                        {p.profit_loss != null ? (
+                          <span style={{ color: p.profit_loss >= 0 ? "#22c55e" : "#f87171" }}>
+                            {p.profit_loss >= 0 ? "+" : ""}{formatNumber(p.profit_loss)}
+                          </span>
+                        ) : "—"}
+                      </td>
+                      <td>
+                        {p.profit_loss_pct != null ? (
+                          <span style={{ color: p.profit_loss_pct >= 0 ? "#22c55e" : "#f87171" }}>
+                            {p.profit_loss_pct >= 0 ? "+" : ""}{p.profit_loss_pct.toFixed(2)}%
+                          </span>
+                        ) : "—"}
+                      </td>
+                      <td style={{ fontSize: "12px", maxWidth: "180px" }}>{p.strategy_next ?? "—"}</td>
+                      <td style={{ color: "#64748b", fontSize: "12px" }}>系统自动管理</td>
                     </tr>
                   ))}
                 </tbody>
               </table>
               {positions.length === 0 && (
-                <div className="empty">暂无持仓。请先从今日决策/量化验证生成模拟执行，必要时再用校准入口补录初始模拟账户。</div>
+                <div className="empty">暂无持仓。系统会在正式决策通过安全门后自动生成模拟执行。</div>
               )}
             </div>
           </>

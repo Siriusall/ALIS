@@ -1,4 +1,5 @@
 from app.api.routes import quant_runs
+import pytest
 
 
 def test_performance_persists_a_daily_snapshot_with_the_same_metrics(monkeypatch) -> None:
@@ -24,10 +25,27 @@ def test_performance_persists_a_daily_snapshot_with_the_same_metrics(monkeypatch
 
     monkeypatch.setattr(quant_runs, "save_performance_reports", save)
 
-    result = quant_runs.quant_run_performance(task_id=None)
+    read_result = quant_runs.quant_run_performance(task_id=None)
+    assert read_result["read_only"] is True
+    assert read_result["persisted_reports"] is None
+    assert "reports" not in captured
+
+    result = quant_runs.build_quant_run_performance(task_id=None, persist_reports=True)
 
     assert [row["period"] for row in result["daily"]] == ["2026-07-15", "2026-07-16"]
     assert result["daily"][1]["return_pct"] == 2.0
     assert result["daily"][1]["benchmark_return_pct"] == 1.0
     assert set(captured["reports"]) == {"daily", "weekly", "monthly", "yearly"}
     assert result["persisted_reports"] == 5
+
+
+def test_durable_performance_refresh_exposes_persistence_failure(monkeypatch) -> None:
+    monkeypatch.setattr(quant_runs, "quant_run_curve", lambda **_: {"series": [], "summary": {}})
+    monkeypatch.setattr(quant_runs, "list_operations", lambda **_: [])
+    monkeypatch.setattr(quant_runs, "list_reviews", lambda **_: [])
+    monkeypatch.setattr(quant_runs, "list_position_state_history", lambda **_: [])
+    monkeypatch.setattr(quant_runs, "list_decision_snapshots", lambda **_: [])
+    monkeypatch.setattr(quant_runs, "save_performance_reports", lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("db down")))
+
+    with pytest.raises(RuntimeError, match="db down"):
+        quant_runs.build_quant_run_performance(persist_reports=True)

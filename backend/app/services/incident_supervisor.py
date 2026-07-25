@@ -53,6 +53,13 @@ def _sealed_holdout_resolution(step: dict[str, Any], steps: list[dict[str, Any]]
         "required": _result(step).get("required_sessions"),
         "unit": "交易日",
     }
+    if str(healing.get("status") or "") == "bulk_repair_scheduled":
+        task = healing.get("task") if isinstance(healing.get("task"), dict) else {}
+        return "waiting_condition", {
+            "waiting_for": "密封验证集 adj_factor 持久批量补全任务正在推进",
+            "progress": progress,
+            "retry_policy": f"后台任务 {task.get('id') or '待创建'} 每批最多 20 日，按检查点恢复并在完成后自动复核",
+        }
     if isinstance(progress["delta"], int) and progress["delta"] > 0:
         return "waiting_condition", {
             "waiting_for": "等待下一有界补数周期继续推进",

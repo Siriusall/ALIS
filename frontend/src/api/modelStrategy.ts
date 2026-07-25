@@ -139,7 +139,7 @@ export interface OwnerDailySummaryResponse {
     healthy: boolean;
     generated_at: string;
     questions: {
-      today_rebalance: { status: string; plan_date?: string | null; summary?: Record<string, unknown>; proposal_count: number };
+      today_rebalance: { status: string; plan_date?: string | null; summary?: Record<string, unknown>; proposal_count: number; execution_authorized?: boolean; planned_execute_at?: string | null; planned_execute_date?: string | null; blocked_reason?: string | null; actions?: Array<{symbol:string;name:string;action:string;reason:string}> };
       profit: {
         daily_return_pct?: number | null;
         monthly_return_pct?: number | null;
@@ -555,6 +555,7 @@ export interface TaskCenterTask {
   duration_seconds?: number;
   time_source?: string;
   checkpoint?: Record<string, unknown>;
+  estimated_remaining_seconds?: number | null;
   activity_scope?: "current" | "current_cycle" | "history" | string;
 }
 
@@ -568,6 +569,9 @@ export interface TaskCenterModule {
   next_step: string;
   next_run_at?: string | null;
   updated_at?: string | null;
+  progress: number;
+  estimated_remaining_seconds?: number | null;
+  checkpoint?: Record<string, unknown>;
   running_count: number;
   waiting_count: number;
   failed_count: number;

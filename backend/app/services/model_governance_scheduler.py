@@ -225,7 +225,16 @@ def auto_tune_models_once(*, allow_retrain: bool = True) -> dict[str, Any]:
     from app.services.review_learning import materialize_decision_outcomes, model_feedback_gate
     review_learning = materialize_decision_outcomes()
     champion = get_active_model_version("main")
+    # A degraded/retired champion is still evidence that this model family has
+    # already entered production. Never re-use the one-time bootstrap gate
+    # merely because the active pointer was cleared by feedback governance.
+    prior_production_version = bool(champion) or any(
+        str(item.get("status") or "") in {"active", "feedback_degraded", "promoted", "rolled_back"}
+        or bool((item.get("validation") or {}).get("bootstrap_production_eligible"))
+        for item in list_model_versions("main", limit=200)
+    )
     degraded_champion = None
+    comparison_champion = champion
     if champion:
         champion_feedback = model_feedback_gate(str(champion.get("version") or ""), strict_version=True)
         if champion_feedback.get("should_degrade"):
@@ -244,11 +253,11 @@ def auto_tune_models_once(*, allow_retrain: bool = True) -> dict[str, Any]:
     # human reviews and mature 20-day outcomes here creates a bootstrap
     # deadlock. The initial champion therefore uses the full offline technical
     # gate; feedback remains mandatory for every later challenger promotion.
-    candidates = [x for x in all_candidates if bootstrap_candidate_eligible(x)] if not champion else [
+    candidates = [x for x in all_candidates if bootstrap_candidate_eligible(x)] if not prior_production_version else [
         x for x in technically_eligible
         if bool(model_feedback_gate(str(x.get("version") or "")).get("passed"))
     ]
-    if not champion and candidates:
+    if not prior_production_version and candidates:
         winner = max(
             candidates,
             key=lambda item: float((item.get("metrics") or {}).get("lift", 0) or 0)
@@ -261,16 +270,16 @@ def auto_tune_models_once(*, allow_retrain: bool = True) -> dict[str, Any]:
             "excluded": len(all_candidates) - len(candidates), "winner_id": winner.get("id"),
             "promotion_policy": "bootstrap_offline_gates",
         }
-    elif not champion:
+    elif not comparison_champion:
         result = {"decision": "no_champion", "evaluated": 0, "excluded": len(all_candidates)}
     else:
-        evaluations = [compare_champion_challenger(champion, candidate) for candidate in candidates]
+        evaluations = [compare_champion_challenger(comparison_champion, candidate) for candidate in candidates]
         winner = next((item for item in evaluations if item.get("decision") == "promote_challenger"), None)
         if winner:
             set_active_model_version(int(winner["challenger_id"]))
-            result = {"decision": "promoted", "evaluated": len(evaluations), "excluded": len(all_candidates) - len(candidates), "winner": winner, "champion_id": champion.get("id")}
+            result = {"decision": "promoted", "evaluated": len(evaluations), "excluded": len(all_candidates) - len(candidates), "winner": winner, "champion_id": comparison_champion.get("id"), "replaced_degraded_champion": bool(degraded_champion)}
         else:
-            result = {"decision": "keep_champion", "evaluated": len(evaluations), "excluded": len(all_candidates) - len(candidates), "evaluations": evaluations, "champion_id": champion.get("id")}
+            result = {"decision": "keep_champion", "evaluated": len(evaluations), "excluded": len(all_candidates) - len(candidates), "evaluations": evaluations, "champion_id": comparison_champion.get("id"), "degraded_champion": bool(degraded_champion)}
     result["market_training_history"] = training_history
     result["review_learning"] = review_learning
     result["degraded_champion"] = degraded_champion

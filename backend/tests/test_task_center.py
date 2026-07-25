@@ -89,3 +89,34 @@ def test_activity_scope_keeps_only_latest_contract_in_current_view():
     ]
     task_center._assign_activity_scope(tasks)
     assert [item["activity_scope"] for item in tasks] == ["current", "history", "current_cycle"]
+
+
+def test_evolution_runtime_tasks_expose_healthy_and_failed_components(monkeypatch):
+    monkeypatch.setattr(task_center, "evolution_runtime_status", lambda: {
+        "components": {
+            "worker": {
+                "healthy": True,
+                "disabled": False,
+                "heartbeat_at": "2026-07-25T10:00:00+08:00",
+                "heartbeat_age_seconds": 3,
+            },
+            "scheduler": {
+                "healthy": False,
+                "disabled": False,
+                "heartbeat_at": "2026-07-25T09:40:00+08:00",
+                "heartbeat_age_seconds": 1203,
+                "last_error": "database unavailable",
+            },
+        },
+    })
+
+    items = task_center._evolution_runtime_tasks()
+
+    worker = next(item for item in items if item["task_type"] == "evolution_worker_runtime")
+    scheduler = next(item for item in items if item["task_type"] == "evolution_scheduler_runtime")
+    assert worker["status"] == "running"
+    assert worker["message"] == "心跳正常"
+    assert scheduler["status"] == "failed"
+    assert scheduler["error"] == "database unavailable"
+    assert scheduler["checkpoint"]["heartbeat_age_seconds"] == 1203
+    assert scheduler["updated_at"] is not None

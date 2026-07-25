@@ -789,7 +789,10 @@ def run_strategy_shadow_cycle(
             "competition_candidate_ids": [int(item[0]["id"]) for item in promotion_ready],
             "selection_rule": "shadow_daily_equity_outperform_drawdown_formal_excess_v2",
         })
-        promoted_at = str(dates[-1])
+        # Cooling starts after the last observation actually used for the
+        # winning candidate, not after the end of the whole available window.
+        winner_observations = list_shadow_observations(int(winner["id"]))
+        promoted_at = str(winner_observations[-1].get("trade_date") or dates[-1]) if winner_observations else str(dates[-1])
         _merge_validation(
             int(winner["id"]),
             status="promoted_cooling",

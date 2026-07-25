@@ -149,9 +149,9 @@ def _worker(parent_run_id: int) -> None:
             ready_date = _latest_decision_ready_trade_date(c)
         if not bool(market_result.get("ok")) or ready_date != trade_date:
             market_category = str(market_result.get("failure_category") or "")
-            if market_category == "truncated":
+            if market_category in {"truncated", "pagination_truncated"}:
                 raise DailyUpdateDataBlocked(
-                    f"{trade_date} stk_limit 批量切片被截断，系统已停止分钟级重拉并进入有界分页诊断",
+                    f"{trade_date} stk_limit 批量切片疑似被分页截断，系统已停止无效重拉并进入有界分页诊断",
                     category="internal_fault_truncated_slice",
                     retry_after_seconds=_DAILY_UPDATE_INTERNAL_FAULT_COOLDOWN_SEC,
                 )
@@ -243,6 +243,16 @@ def _worker(parent_run_id: int) -> None:
         _set_state(running=False, phase="failed", message=f"更新失败：{error}", error=error,
                    failure_category=failure_category, retry_after_seconds=retry_after_seconds,
                    finished_at=_now(), steps=steps)
+    if final_status == "completed" and trade_date:
+        try:
+            with _conn() as c:
+                recovered_contract = decision_data_contract(trade_date, conn=c)
+            if recovered_contract.get("ok"):
+                from app.services.evolution_orchestrator import enqueue_system_autonomy_recovery
+                recovery_task = enqueue_system_autonomy_recovery(trade_date, recovered_contract)
+                steps.append({"step": "system_autonomy_recovery", "result": recovery_task})
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("决策数据恢复后自治补跑排队失败: %s", str(exc)[:300])
     with _conn() as c:
         c.execute(
             """UPDATE data_ingestion_runs SET status=?,finished_at=?,rows_read=?,rows_written=?,error=?,meta_json=?

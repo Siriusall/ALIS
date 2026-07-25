@@ -37,6 +37,21 @@ def test_sync_retains_source_url_publish_time_and_fetch_time(monkeypatch) -> Non
     assert saved[0]["available_time"] == "2026-07-23T09:00:00"
 
 
+def test_sync_stops_new_documents_at_per_source_budget(monkeypatch) -> None:
+    source = service.OfficialSource("official.test", "测试部门", "https://example.gov.cn/policy/")
+    links = "".join(f'<a href="/policy/{index}.html">关于行业产能调整的通知{index}</a>' for index in range(8))
+    fetched: list[str] = []
+    monkeypatch.setattr(service, "_request_text", lambda url: fetched.append(url) or (links if url == source.index_url else "<p>2026年7月21日 政策通知</p>"))
+    monkeypatch.setattr(service, "_save_documents", lambda rows: len(rows))
+    monkeypatch.setattr(service, "_now", lambda: "2026-07-23T09:00:00")
+
+    result = service.sync_official_policy_documents(sources=(source,))
+
+    assert result["documents_written"] == service.MAX_NEW_DOCUMENTS_PER_SOURCE_PER_CYCLE
+    assert result["sources"][0]["attempted_new"] == service.MAX_NEW_DOCUMENTS_PER_SOURCE_PER_CYCLE
+    assert len(fetched) == 1 + service.MAX_NEW_DOCUMENTS_PER_SOURCE_PER_CYCLE
+
+
 def test_policy_materialization_keeps_official_evidence(monkeypatch) -> None:
     evidence = []
 

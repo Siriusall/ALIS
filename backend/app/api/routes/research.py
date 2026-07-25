@@ -31,7 +31,7 @@ from app.services.theme_engine import list_themes, materialize_theme_snapshots
 from app.services.manual_review_queue import build_manual_review_queue, submit_manual_review_action
 from app.services.llm_review_assistant import generate_review_draft, llm_token_budget_status
 from app.services.review_learning import materialize_decision_outcomes, review_learning_overview
-from app.services.manual_review_triage import run_manual_review_triage_once, start_manual_review_triage, triage_status
+from app.services.manual_review_triage import run_manual_review_triage_once, triage_status
 from app.services.profit_loop import build_portfolio_candles, build_profit_loop
 
 router = APIRouter()
@@ -453,7 +453,7 @@ def research_materialize_review_outcomes(limit: int = Query(default=1000, ge=1, 
 
 @router.get("/research/profit-loop")
 def research_profit_loop() -> dict[str, Any]:
-    return build_profit_loop()
+    return build_profit_loop(persist=False)
 
 
 @router.get("/research/portfolio-candles")
@@ -464,8 +464,6 @@ def research_portfolio_candles(limit: int = Query(90, ge=20, le=250)) -> dict[st
 @router.get("/research/manual-review/queue")
 def research_manual_review_queue(limit: int = Query(200, ge=1, le=500)) -> dict[str, Any]:
     result = build_manual_review_queue(limit)
-    if int((result.get("ai_triage") or {}).get("pending") or 0) > 0:
-        start_manual_review_triage(limit=limit)
     result["ai_triage"] = {**(result.get("ai_triage") or {}), **triage_status()}
     result["llm_budget"] = llm_token_budget_status()
     return result

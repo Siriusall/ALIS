@@ -19,11 +19,13 @@ def _cost_after_lift(metrics: dict[str, Any] | None) -> float | None:
 
 
 def _cost_after_walk_forward(metrics: dict[str, Any] | None) -> float | None:
-    return _metric(metrics, "walk_forward_lift") or _cost_after_lift(metrics)
+    value = _metric(metrics, "walk_forward_lift")
+    return value if value is not None else _cost_after_lift(metrics)
 
 
 def _cost_after_worst_window(metrics: dict[str, Any] | None) -> float | None:
-    return _metric(metrics, "worst_window_net_lift") or _cost_after_walk_forward(metrics)
+    value = _metric(metrics, "worst_window_net_lift")
+    return value if value is not None else _cost_after_walk_forward(metrics)
 
 
 def _candidate_cost_after_passed(metrics: dict[str, Any] | None) -> tuple[bool, str]:

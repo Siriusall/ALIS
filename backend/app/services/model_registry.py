@@ -69,7 +69,10 @@ def compare_champion_challenger(champion: dict[str, Any], challenger: dict[str, 
         "validation_passed": str(validation.get("status")) == "passed",
         "holdout_lift_positive": float(xm.get("lift", 0) or 0) > 0,
         "walk_forward_lift_positive": float(xm.get("walk_forward_lift", 0) or 0) > 0,
+        "lift_not_lower_than_champion": deltas["lift"] >= 0,
+        "walk_forward_lift_not_lower_than_champion": deltas["walk_forward_lift"] >= 0,
         "hit_rate_not_materially_lower": deltas["hit_rate"] >= -0.02,
+        "walk_forward_hit_rate_not_materially_lower": deltas["walk_forward_hit_rate"] >= -0.02,
         "review_feedback_passed": bool(feedback.get("passed")),
     }
     config_a, config_b = champion.get("config") or {}, challenger.get("config") or {}

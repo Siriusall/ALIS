@@ -28,7 +28,7 @@
 | 行情 | `adj_factor` | `trade_date` 可取单日全市场 | 按交易日批量，禁止全市场逐股 |
 | 估值 | `daily_basic` | `trade_date` 可取单日全市场 | 按交易日批量 |
 | 交易状态 | `suspend_d` | `trade_date` | 按交易日批量；空结果记 `valid_empty` |
-| 交易状态 | `stk_limit` | `trade_date`，单次约覆盖全市场 | 按交易日批量 |
+| 交易状态 | `stk_limit` | `trade_date`，单次约覆盖全市场 | 按交易日批量；最新日若确认卡在 6000 行且 offset 无新增，只对缺失股票调用腾讯行情批量备用源，要求同日时间戳并与 TuShare 已有样本精确对账后写入来源证据 |
 | 资金 | `moneyflow` | `trade_date` 可取单日全市场 | 按交易日批量 |
 | 财务 | `income` → `income_vip` | 普通接口逐股；VIP 用 `period` 全市场 | 显式 `fields`，按报告期走 VIP；单接口失败才逐股降级 |
 | 财务 | `balancesheet` → `balancesheet_vip` | 普通接口逐股；VIP 用 `period` 全市场 | 显式 `fields`，按报告期走 VIP；单接口失败才逐股降级 |

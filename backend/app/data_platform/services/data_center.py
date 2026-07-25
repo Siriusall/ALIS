@@ -1352,6 +1352,29 @@ def sync_stk_limit_gap_batch(trade_date: str, *, limit: int = STK_LIMIT_GAP_BATC
         if bool(result.get("ok")) and rows_read > 0:
             successes += 1
         if index + 1 == probe_count and successes == 0:
+            from app.data_platform.services.tencent_limit_fallback import repair_stk_limit_from_tencent
+
+            try:
+                fallback = repair_stk_limit_from_tencent(trade_date)
+            except Exception as exc:  # noqa: BLE001
+                fallback = {
+                    "ok": False,
+                    "status": "fallback_request_failed",
+                    "error": str(exc)[:500],
+                }
+            fallback_coverage = _stk_limit_stock_coverage(trade_date)
+            if fallback.get("ok") and fallback_coverage.get("ready"):
+                return {
+                    "ok": True,
+                    "status": "completed_by_verified_fallback",
+                    "category": "complete",
+                    "codes": codes[:probe_count],
+                    "results": results,
+                    "fallback": fallback,
+                    "coverage": fallback_coverage,
+                    "cooldown": False,
+                    "cooldown_seconds": 0,
+                }
             coverage = _stk_limit_stock_coverage(trade_date)
             return {
                 "ok": False,
@@ -1359,6 +1382,7 @@ def sync_stk_limit_gap_batch(trade_date: str, *, limit: int = STK_LIMIT_GAP_BATC
                 "category": "upstream_not_ready",
                 "codes": codes[:probe_count],
                 "results": results,
+                "fallback": fallback,
                 "coverage": coverage,
                 "cooldown": True,
                 "cooldown_seconds": 600,
@@ -1449,7 +1473,13 @@ def sync_complete_stk_limit_slice(trade_date: str) -> dict[str, Any]:
                 "ok": False,
                 "api": "stk_limit",
                 "trade_date": trade_date,
-                "category": str(gap_repair.get("category") or "truncated"),
+                # A repeated full page with no newly retained stock rows is a
+                # pagination/truncation signal, not proof that the upstream
+                # has not published the whole date.
+                "category": "truncated" if retained <= int(previous_retained)
+                else str(gap_repair.get("category") or "truncated"),
+                "diagnostic_category": "pagination_truncated" if retained <= int(previous_retained)
+                else str(gap_repair.get("category") or "truncated"),
                 "pages": pages,
                 "gap_repair": gap_repair,
                 "coverage": gap_repair.get("coverage") or coverage,
@@ -1513,7 +1543,11 @@ def sync_market_bundle(trade_date: str, *, include_suspend: bool = False, apis: 
         "apis": requested_apis,
         "results": results,
         "snapshot": snapshot,
-        "failure_category": "truncated" if "truncated" in failure_categories else (failure_categories[0] if failure_categories else ""),
+        "failure_category": (
+            "pagination_truncated"
+            if "pagination_truncated" in failure_categories
+            else ("truncated" if "truncated" in failure_categories else (failure_categories[0] if failure_categories else ""))
+        ),
     }
 
 
@@ -3042,7 +3076,7 @@ def build_stock_daily_snapshot(trade_date: str) -> dict[str, Any]:
                     1 if ts_code in suspended else 0,
                     float(score),
                     json.dumps(flags, ensure_ascii=False),
-                    SOURCE_TUSHARE,
+                    str(limit.get("source_code") or SOURCE_TUSHARE),
                     snapshot_available_time,
                     now,
                 )

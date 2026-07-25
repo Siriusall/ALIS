@@ -15,6 +15,7 @@ from html.parser import HTMLParser
 import hashlib
 import json
 import re
+from time import monotonic
 from typing import Any
 from urllib.parse import urljoin, urlparse
 
@@ -27,6 +28,10 @@ from app.data_platform.services.data_center import _now, _upsert_industry_metric
 OFFICIAL_POLICY_SOURCE = "official_policy"
 HTTP_TIMEOUT = 20
 MAX_DOCUMENTS_PER_SOURCE = 80
+REQUEST_CONNECT_TIMEOUT = 3.0
+REQUEST_READ_TIMEOUT = 8.0
+SYNC_TIME_BUDGET_SECONDS = 90.0
+MAX_NEW_DOCUMENTS_PER_SOURCE_PER_CYCLE = 3
 
 
 @dataclass(frozen=True)
@@ -133,7 +138,7 @@ def _request_text(url: str) -> str:
     response = session.get(
         url,
         headers={"User-Agent": "ALIS/1.0 public-policy research collector"},
-        timeout=HTTP_TIMEOUT,
+        timeout=(REQUEST_CONNECT_TIMEOUT, REQUEST_READ_TIMEOUT),
     )
     response.raise_for_status()
     response.encoding = response.apparent_encoding or response.encoding
@@ -169,12 +174,33 @@ def sync_official_policy_documents(*, sources: tuple[OfficialSource, ...] = OFFI
     retained: list[dict[str, str]] = []
     results: list[dict[str, Any]] = []
     now = _now()
+    started = monotonic()
+    with _conn() as conn:
+        known_ids = {
+            str(row["announcement_id"])
+            for row in conn.execute(
+                "SELECT announcement_id FROM dc_announcement_raw WHERE source_code LIKE ? OR source_code LIKE ?",
+                ("official.%", "association.%"),
+            ).fetchall()
+        }
     for source in sources:
+        if monotonic() - started >= SYNC_TIME_BUDGET_SECONDS:
+            results.append({"source": source.code, "status": "deferred_budget", "reason": "cycle_time_budget_exhausted"})
+            continue
         try:
             index_html = _request_text(source.index_url)
             links = _source_links(source, index_html)
             documents = 0
+            skipped_existing = 0
+            attempted_new = 0
             for url, fallback_title in links:
+                announcement_id = hashlib.sha256(url.encode("utf-8")).hexdigest()[:32]
+                if announcement_id in known_ids:
+                    skipped_existing += 1
+                    continue
+                if attempted_new >= MAX_NEW_DOCUMENTS_PER_SOURCE_PER_CYCLE or monotonic() - started >= SYNC_TIME_BUDGET_SECONDS:
+                    break
+                attempted_new += 1
                 try:
                     html = _request_text(url)
                 except requests.RequestException:
@@ -189,19 +215,24 @@ def sync_official_policy_documents(*, sources: tuple[OfficialSource, ...] = OFFI
                     continue
                 retained.append({
                     "source_code": source.code,
-                    "announcement_id": hashlib.sha256(url.encode("utf-8")).hexdigest()[:32],
+                    "announcement_id": announcement_id,
                     "title": title[:1000], "publish_time": _published_time(body), "url": url,
                     "raw_text": text[:12000], "content_hash": hashlib.sha256(text.encode("utf-8")).hexdigest(),
                     "available_time": now,
                 })
+                known_ids.add(announcement_id)
                 documents += 1
-            results.append({"source": source.code, "status": "success", "links": len(links), "documents": documents})
+            results.append({"source": source.code, "status": "success", "links": len(links), "documents": documents,
+                            "attempted_new": attempted_new, "skipped_existing": skipped_existing})
         except requests.RequestException as exc:
             results.append({"source": source.code, "status": "failed", "error": str(exc)[:240]})
     written = _save_documents(retained)
     failed = [item["source"] for item in results if item["status"] == "failed"]
-    return {"ok": True, "status": "partial" if failed else "ready", "documents_written": written,
-            "sources": results, "failed_sources": failed, "contract": "official_public_policy_documents_v1"}
+    deferred = [item["source"] for item in results if item["status"] == "deferred_budget"]
+    return {"ok": True, "status": "partial" if failed or deferred else "ready", "documents_written": written,
+            "sources": results, "failed_sources": failed, "deferred_sources": deferred,
+            "elapsed_seconds": round(monotonic() - started, 3), "time_budget_seconds": SYNC_TIME_BUDGET_SECONDS,
+            "contract": "official_public_policy_documents_v2"}
 
 
 def _metric_code(industry: str) -> str:

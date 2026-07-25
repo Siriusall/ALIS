@@ -287,7 +287,7 @@ def test_controller_candidate_uses_own_identity_and_skips_generic_lifecycle(monk
     assert result["lifecycle"] == []
 
 
-def test_controller_candidate_promotes_only_after_formal_oos_and_20_session_shadow(monkeypatch):
+def test_controller_candidate_cannot_rebind_from_proxy_shadow_alone(monkeypatch):
     version = {
         "id": 55,
         "metrics": {
@@ -313,10 +313,11 @@ def test_controller_candidate_promotes_only_after_formal_oos_and_20_session_shad
         {"status": "passed", "promotion_gates": {"cost_after": True, "point_in_time": True}, "blocking_reasons": [], "summary": {}, "windows": []},
     )
 
-    assert activated == [55]
-    assert rebound == [{"force_rebind": True}]
-    assert persisted_validation["status"] == "passed"
-    assert persisted_validation["production_eligible"] is True
+    assert activated == []
+    assert rebound == []
+    assert persisted_validation["status"] == "formal_oos_passed"
+    assert persisted_validation["production_eligible"] is False
+    assert "portfolio_shadow_and_statistics_gate" in persisted_validation["blocking_reasons"]
 
 
 def test_controller_candidate_failed_formal_oos_is_rejected_without_shadow(monkeypatch):
@@ -352,7 +353,7 @@ def test_strategy_cycle_automatically_queues_remaining_lineage_candidates(monkey
     assert result["id"] == 99
     assert created[0]["task_type"] == "strategy_evolution_cycle"
     assert created[0]["payload"]["trigger"] == "automatic_lineage_continuation"
-    assert created[0]["dedupe_key"] == "strategy_evolution_continuation:58-60"
+    assert created[0]["dedupe_key"] == "strategy_evolution_continuation:v2:58-60:after-31"
 
 
 def test_reconcile_failed_controller_oos_candidate(monkeypatch):

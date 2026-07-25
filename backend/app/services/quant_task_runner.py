@@ -39,6 +39,7 @@ logger = logging.getLogger("quant.quant_task_runner")
 
 _task_lock = threading.Lock()
 _running_task_ids: set[int] = set()
+_account_execution_lock = threading.Lock()
 _REPLAY_BATCH_STEPS = max(1, min(int(os.getenv("QUANT_REPLAY_BATCH_STEPS", "3")), 5))
 _PRAGMATIC_MAX_GAP_DAYS = max(1, min(int(os.getenv("QUANT_PRAGMATIC_MAX_GAP_DAYS", "5")), 30))
 _ENFORCE_TRADING_SESSION_GATE = str(os.getenv("QUANT_ENFORCE_TRADING_SESSION_GATE", "0")).strip().lower() in {"1", "true", "yes", "on"}
@@ -68,10 +69,10 @@ def _refresh_performance_reports(task_id: int) -> None:
             # Import lazily to avoid the API/router -> task-runner import
             # cycle during application startup. Calling the same aggregation
             # function directly also works for single-worker deployments.
-            from app.api.routes.quant_runs import quant_run_performance
-            result = quant_run_performance(task_id=int(task_id))
-            if int(result.get("persisted_reports") or 0) < 0:
-                raise RuntimeError("invalid persisted report count")
+            from app.api.routes.quant_runs import build_quant_run_performance
+            result = build_quant_run_performance(task_id=int(task_id), persist_reports=True)
+            if result.get("persisted_reports") is None:
+                raise RuntimeError("performance reports were not persisted")
         except Exception as exc:
             logger.warning("performance report refresh deferred task_id=%s: %s", task_id, exc)
 
@@ -493,8 +494,18 @@ def _execute_step_with_retry(
     progress_callback,
     scoring_timeout_sec: int,
 ):
-    from app.services.profit_loop import get_daily_rebalance_execution_input
-    authoritative_plan = get_daily_rebalance_execution_input(signal_date, execute_date)
+    authoritative_plan = None
+    if str(task_live.get("replay_mode") or "") == "autonomous_daily":
+        from app.services.profit_loop import claim_daily_rebalance_execution_input
+        claim_token = f"quant-task:{int(task_id)}:{signal_date}:{execute_date}"
+        authoritative_plan = claim_daily_rebalance_execution_input(
+            signal_date, execute_date, claim_token=claim_token,
+        )
+    if str(task_live.get("replay_mode") or "") == "autonomous_daily" and authoritative_plan is None:
+        raise ReplayRiskGateError(
+            "正式调仓计划不存在、已执行或已被其他执行器领取",
+            code="formal_plan_not_claimable",
+        )
     try:
         return run_for_trade_date(
             strategy_id=int(task_live.get("strategy_id") or 0),
@@ -592,6 +603,7 @@ def _persist_step_result(
     if isinstance(detail.get("daily_report"), dict):
         detail["daily_report"] = {**detail["daily_report"], "cash_only_policy": policy}
     result.detail = detail
+    provenance = detail.get("plan_provenance") if isinstance(detail.get("plan_provenance"), dict) else {}
     rec_id = create_quant_run_task_record(
         task_id=task_id,
         signal_date=result.signal_date,
@@ -602,15 +614,10 @@ def _persist_step_result(
         execution_id=result.execution_id,
         message=result.message,
         detail=detail,
+        plan_claim_token=str(provenance.get("execution_claim_token") or ""),
     )
     if rec_id == 0:
         logger.info("quant task replay idempotent skip task_id=%s signal_date=%s already_replayed", task_id, result.signal_date)
-    else:
-        try:
-            from app.services.profit_loop import mark_daily_rebalance_plan_executed
-            mark_daily_rebalance_plan_executed(result.signal_date, result.execute_date, result.execution_id)
-        except Exception as exc:
-            logger.warning("调仓方案执行状态回写失败 signal=%s: %s", result.signal_date, str(exc)[:160])
     upsert_quant_replay_waterline(
         strategy_id=strategy_id,
         exchange_group=exchange_group,
@@ -984,43 +991,47 @@ def run_quant_task_async(task_id: int) -> bool:
                         last_message=f"{phase_text}（{step_idx}/{step_total}）",
                     )
                 step_t0 = perf_counter()
-                result = _execute_step_with_retry(
-                    task_id=task_id,
-                    task_live=task_live,
-                    signal_date=signal_date,
-                    execute_date=execute_date,
-                    progress_callback=_step_phase,
-                    scoring_timeout_sec=scoring_timeout_sec,
-                )
-                step_ms = max(1, int((perf_counter() - step_t0) * 1000))
-                prev_cnt = int(health0["step_count"])
-                prev_avg = int(health0["avg_step_latency_ms"])
-                new_cnt = prev_cnt + 1
-                new_avg = int((prev_avg * prev_cnt + step_ms) / new_cnt) if new_cnt > 0 else step_ms
-                health0["step_count"] = new_cnt
-                health0["last_step_latency_ms"] = step_ms
-                health0["avg_step_latency_ms"] = new_avg
-                health0["heartbeat_at"] = _utc_now_iso()
-                health0["last_risk_code"] = ""
-                upsert_quant_run_task_health(
-                    task_id,
-                    heartbeat_at=health0["heartbeat_at"],
-                    last_step_latency_ms=health0["last_step_latency_ms"],
-                    avg_step_latency_ms=health0["avg_step_latency_ms"],
-                    step_count=health0["step_count"],
-                    risk_hit_count=health0["risk_hit_count"],
-                    consecutive_pause_count=0,
-                    last_risk_code="",
-                )
-                _persist_step_result(
-                    task_id=task_id,
-                    result=result,
-                    processed_total=processed_total + 1,
-                    step_total=step_total,
-                    strategy_id=strategy_id,
-                    exchange_group=exchange_group,
-                    mode=mode,
-                )
+                # The simulator has one shared cash account and one position
+                # book.  Different task ids must not execute or checkpoint a
+                # trade concurrently inside the same service process.
+                with _account_execution_lock:
+                    result = _execute_step_with_retry(
+                        task_id=task_id,
+                        task_live=task_live,
+                        signal_date=signal_date,
+                        execute_date=execute_date,
+                        progress_callback=_step_phase,
+                        scoring_timeout_sec=scoring_timeout_sec,
+                    )
+                    step_ms = max(1, int((perf_counter() - step_t0) * 1000))
+                    prev_cnt = int(health0["step_count"])
+                    prev_avg = int(health0["avg_step_latency_ms"])
+                    new_cnt = prev_cnt + 1
+                    new_avg = int((prev_avg * prev_cnt + step_ms) / new_cnt) if new_cnt > 0 else step_ms
+                    health0["step_count"] = new_cnt
+                    health0["last_step_latency_ms"] = step_ms
+                    health0["avg_step_latency_ms"] = new_avg
+                    health0["heartbeat_at"] = _utc_now_iso()
+                    health0["last_risk_code"] = ""
+                    upsert_quant_run_task_health(
+                        task_id,
+                        heartbeat_at=health0["heartbeat_at"],
+                        last_step_latency_ms=health0["last_step_latency_ms"],
+                        avg_step_latency_ms=health0["avg_step_latency_ms"],
+                        step_count=health0["step_count"],
+                        risk_hit_count=health0["risk_hit_count"],
+                        consecutive_pause_count=0,
+                        last_risk_code="",
+                    )
+                    _persist_step_result(
+                        task_id=task_id,
+                        result=result,
+                        processed_total=processed_total + 1,
+                        step_total=step_total,
+                        strategy_id=strategy_id,
+                        exchange_group=exchange_group,
+                        mode=mode,
+                    )
                 done_signals.add(result.signal_date)
                 processed_total += 1
                 # 若在本步执行期间收到停止请求，本步落账后立即停止，不再继续后续步骤。

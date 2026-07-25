@@ -53,21 +53,16 @@ def top_up(body: TopUpRequest) -> AccountResponse:
 
 @router.post("/account/withdraw", response_model=AccountResponse)
 def withdraw(body: WithdrawRequest) -> AccountResponse:
-    """提现。余额不足时只提空余额。"""
+    """提现。余额不足时拒绝，不静默改成部分提现。"""
     current = get_account_balance()
-    deduct = min(body.amount, current)
-    if deduct <= 0:
-        raise HTTPException(status_code=400, detail="余额不足，无法提现")
-    new_balance = add_account_balance(-deduct)
-    add_log("INFO", f"账户提现: -{deduct}, 余额={new_balance}")
+    if body.amount > current:
+        raise HTTPException(status_code=400, detail=f"余额不足：当前余额 {current:.2f} 元")
+    new_balance = add_account_balance(-body.amount)
+    add_log("INFO", f"账户提现: -{body.amount}, 余额={new_balance}")
     pv = round(_position_total_value(), 2)
     return AccountResponse(balance=new_balance, position_value=pv, assets=round(new_balance + pv, 2))
 
 
 @router.put("/account", response_model=AccountResponse)
 def set_balance(body: SetBalanceRequest) -> AccountResponse:
-    """自定义设置账户余额（模拟初始资金等）。"""
-    new_balance = set_account_balance(body.balance)
-    add_log("INFO", f"账户设置余额: {new_balance}")
-    pv = round(_position_total_value(), 2)
-    return AccountResponse(balance=new_balance, position_value=pv, assets=round(new_balance + pv, 2))
+    raise HTTPException(status_code=410, detail="直接设置余额已关闭，请使用充值或受审计的账户调整流程")

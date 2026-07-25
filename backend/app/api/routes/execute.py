@@ -6,12 +6,10 @@ from pydantic import BaseModel, Field
 from app.api.state import add_log, ensure_manual_trade_allowed
 from app.core.a_share_fees import FEE_SCHEDULE_VERSION
 from app.db.store import (
-    add_account_balance,
-    create_execution,
+    create_and_apply_buy_execution,
     get_account_balance,
     get_default_strategy_id,
     get_strategy,
-    merge_execution_into_positions,
 )
 from app.integrations.broker_adapter import OrderRequest
 from app.schemas.execution import ExecutionOrderResponse, ExecutionResponse
@@ -79,12 +77,8 @@ def execute_open(req: ExecuteRequest) -> ExecutionResponse:
         strategy = get_strategy(get_default_strategy_id()) if get_default_strategy_id() else None
     result = simulate_open_execution(order_requests, budget=balance)
     total_cost = _order_total_cost(result.orders)
-    if total_cost > balance:
-        raise HTTPException(
-            status_code=400,
-            detail=f"本次买入需 {total_cost:.2f} 元，账户余额 {balance:.2f} 元不足",
-        )
-    add_account_balance(-total_cost)
+    if total_cost <= 0:
+        raise HTTPException(status_code=400, detail="没有可成交的有效订单")
     strategy_id_for_db = (strategy or {}).get("id") or get_default_strategy_id()
     filled_orders = [o for o in result.orders if int(getattr(o, "quantity", 0) or 0) > 0]
     request_price_by_symbol = {str(o.symbol): float(o.price) for o in order_requests}
@@ -106,15 +100,19 @@ def execute_open(req: ExecuteRequest) -> ExecutionResponse:
     ]
     execution_id = None
     if strategy_id_for_db is not None and orders_payload:
-        execution_id = create_execution(
-            strategy_id=strategy_id_for_db,
-            executed_at=result.executed_at,
-            budget=total_cost,
-            top_n=effective_top_n,
-            orders=orders_payload,
-        )
-    if orders_payload:
-        merge_execution_into_positions(orders_payload, result.executed_at, name_by_symbol=name_by_symbol)
+        try:
+            execution_id = create_and_apply_buy_execution(
+                strategy_id=strategy_id_for_db,
+                executed_at=result.executed_at,
+                budget=total_cost,
+                top_n=effective_top_n,
+                orders=orders_payload,
+                name_by_symbol=name_by_symbol,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+    elif orders_payload:
+        raise HTTPException(status_code=400, detail="未找到有效策略，拒绝写入成交")
     add_log("INFO", f"模拟买入: 扣款 {total_cost}, 余额={get_account_balance()}, execution_id={execution_id}")
     return ExecutionResponse(
         execution_id=execution_id,

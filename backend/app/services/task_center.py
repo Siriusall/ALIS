@@ -7,7 +7,7 @@ from app.data_platform.db import _conn as data_conn
 from app.data_platform.services.daily_update import daily_update_status
 from app.data_platform.services.runtime_logs import list_runtime_logs
 from app.db.store import list_quant_run_tasks
-from app.services.evolution_orchestrator import evolution_schedule_status, list_evolution_tasks
+from app.services.evolution_orchestrator import evolution_runtime_status, evolution_schedule_status, list_evolution_tasks
 from app.data_platform.services.daily_update import simple_health
 
 
@@ -62,13 +62,13 @@ STEP_LABELS = {
 TASK_TYPE_MODULE = {
     "factor_daily_cycle": "factor", "strategy_shadow_cycle": "strategy",
     "strategy_evolution_cycle": "strategy", "strategy_controller_oos": "strategy",
-    "system_autonomy_cycle": "autonomy",
+    "system_autonomy_cycle": "autonomy", "sealed_holdout_adj_factor_backfill": "data",
 }
 
 TASK_TYPE_LABEL = {
     "factor_daily_cycle": "因子日评价", "strategy_shadow_cycle": "策略影子观察",
     "strategy_evolution_cycle": "正式策略演化", "strategy_controller_oos": "策略控制器 OOS",
-    "system_autonomy_cycle": "每日自治循环",
+    "system_autonomy_cycle": "每日自治循环", "sealed_holdout_adj_factor_backfill": "密封验证集批量补全",
 }
 
 
@@ -153,6 +153,7 @@ def _evolution_next_step(task: dict[str, Any]) -> str:
             "starting": "领取任务并冻结输入版本", "quick_diagnostic": "完成快速淘汰门后决定是否进入正式 OOS",
             "formal_oos": "完成当前窗口并持久化检查点", "shadow_observation": "积累下一未来交易日影子证据",
             "factor_materialization": "完成因子截面后运行评价与治理", "system_autonomy": "继续执行下一自治步骤",
+            "sealed_holdout_adj_factor_backfill": "继续下一批 adj_factor 补全，完成后自动复核 126/126",
         }.get(phase, "继续当前步骤并写入检查点")
     if status == "retry_wait":
         return "到达重试时间后从检查点恢复"
@@ -186,6 +187,7 @@ def _normalise_evolution(task: dict[str, Any], schedule: dict[str, Any]) -> dict
         "finished_at": _iso(task.get("finished_at")), "attempt": int(task.get("attempt") or 0),
         "max_attempts": int(task.get("max_attempts") or 0),
         "checkpoint": task.get("checkpoint") if isinstance(task.get("checkpoint"), dict) else {},
+        "estimated_remaining_seconds": task.get("estimated_remaining_seconds"),
     }
 
 
@@ -327,14 +329,15 @@ def _quant_tasks(limit: int) -> list[dict[str, Any]]:
         total = int(task.get("total_steps") or 0)
         processed = int(task.get("processed_steps") or 0)
         state = _status(task.get("status"))
+        autonomous_idle = str(task.get("replay_mode") or "") == "autonomous_daily" and total == 0 and state == "completed"
         items.append({
             "id": f"quant:{task.get('id')}", "source": "quant_run", "source_id": int(task.get("id") or 0),
             "module": "execution", "task_type": "simulation_strategy_execution", "name": f"模拟策略执行 #{task.get('id')}",
             "status": state, "raw_status": str(task.get("status") or ""), "phase": str(task.get("replay_status") or ""),
             "progress": processed / total if total > 0 else (1.0 if state == "completed" else 0.0),
             "message": str(task.get("last_message") or task.get("error") or "等待执行"), "error": _iso(task.get("error")),
-            "current_step": f"已处理 {processed}/{total or '?'} 个交易日",
-            "next_step": "处理下一个交易日并写入模拟账本" if state == "running" else "等待下一正式计划执行日" if state == "completed" else "按状态机复核",
+            "current_step": "常驻模拟执行器空闲，当前没有到期订单" if autonomous_idle else f"已处理 {processed}/{total or '?'} 个交易日",
+            "next_step": "到正式计划执行时间后自动领取订单" if autonomous_idle else "处理下一个交易日并写入模拟账本" if state == "running" else "等待下一正式计划执行日" if state == "completed" else "按状态机复核",
             "next_run_at": None, "created_at": _iso(task.get("created_at")), "started_at": _iso(task.get("started_at")),
             "heartbeat_at": _iso(task.get("updated_at")), "updated_at": _iso(task.get("updated_at")),
             "finished_at": _iso(task.get("finished_at")), "attempt": 1, "max_attempts": 1,
@@ -368,6 +371,34 @@ def _assign_activity_scope(tasks: list[dict[str, Any]]) -> None:
             latest_contracts.add(key)
 
 
+def _evolution_runtime_tasks() -> list[dict[str, Any]]:
+    runtime = evolution_runtime_status()
+    observed_at = datetime.now().astimezone().isoformat()
+    items = []
+    for key, label in (("worker", "自治任务 Worker"), ("scheduler", "自治计划 Scheduler")):
+        state = (runtime.get("components") or {}).get(key) or {}
+        disabled = bool(state.get("disabled"))
+        healthy = bool(state.get("healthy"))
+        status = "completed" if disabled else "running" if healthy else "failed"
+        heartbeat = _iso(state.get("heartbeat_at"))
+        updated_at = heartbeat or observed_at
+        items.append({
+            "id": f"runtime:evolution:{key}", "source": "runtime", "source_id": 0,
+            "module": "autonomy", "task_type": f"evolution_{key}_runtime", "name": label,
+            "status": status, "raw_status": "disabled" if disabled else "alive" if healthy else "unhealthy",
+            "phase": "runtime_health", "progress": 1.0 if healthy or disabled else 0.0,
+            "message": "已禁用" if disabled else "心跳正常" if healthy else str(state.get("last_error") or "心跳超时或线程未启动"),
+            "error": None if healthy or disabled else str(state.get("last_error") or "runtime_heartbeat_unhealthy"),
+            "current_step": "持续领取持久任务" if key == "worker" else "持续创建交易日自治任务",
+            "next_step": "保持心跳" if healthy else "服务自动重启后恢复；健康页保持失败状态",
+            "next_run_at": None, "created_at": None, "started_at": None,
+            "heartbeat_at": heartbeat, "updated_at": updated_at, "finished_at": None,
+            "attempt": 1, "max_attempts": 1, "activity_scope": "current",
+            "checkpoint": {"heartbeat_age_seconds": state.get("heartbeat_age_seconds")},
+        })
+    return items
+
+
 def build_task_center(*, limit: int = 50, log_limit: int = 200) -> dict[str, Any]:
     generated = datetime.now().astimezone()
     schedule = evolution_schedule_status()
@@ -379,17 +410,33 @@ def build_task_center(*, limit: int = 50, log_limit: int = 200) -> dict[str, Any
     daily = daily_update_status()
     tasks.append(_daily_task(daily, generated))
     tasks.append(_decision_data_task(simple_health(), daily, generated))
+    tasks.extend(_evolution_runtime_tasks())
     tasks.extend(_data_runs(min(limit, 50)))
     tasks.extend(_quant_tasks(min(limit, 30)))
     tasks.sort(key=lambda item: str(item.get("updated_at") or item.get("created_at") or ""), reverse=True)
     _assign_activity_scope(tasks)
+    completed_holdout = next(
+        (item for item in tasks
+         if item.get("task_type") == "sealed_holdout_adj_factor_backfill"
+         and item.get("status") == "completed"
+         and ((item.get("checkpoint") or {}).get("eligible_sessions") == (item.get("checkpoint") or {}).get("required_sessions"))),
+        None,
+    )
+    if completed_holdout:
+        completed_at = str(completed_holdout.get("updated_at") or "")
+        for item in tasks:
+            if item.get("task_type") == "sealed_holdout_data_gate" and str(item.get("updated_at") or "") <= completed_at:
+                item["activity_scope"] = "history"
     unresolved_failures, failed_records = _latest_failure_summary(tasks)
     current_tasks = [item for item in tasks if item.get("activity_scope") != "history"]
 
     module_items = []
     for key, name, description in MODULES:
         related = [item for item in current_tasks if item.get("module") == key]
-        active = next((item for item in related if item.get("status") in {"running", "waiting", "observing", "blocked", "degraded", "partial"}), None)
+        # Failed tasks are operationally active incidents until explicitly
+        # superseded; do not let a later idle/completed task hide the failure
+        # on the module card.
+        active = next((item for item in related if item.get("status") in {"running", "waiting", "observing", "blocked", "degraded", "partial", "failed"}), None)
         latest = active or (related[0] if related else None)
         next_at = latest.get("next_run_at") if latest and latest.get("next_run_at") else _schedule_for(key, schedule)
         module_items.append({
@@ -398,6 +445,9 @@ def build_task_center(*, limit: int = 50, log_limit: int = 200) -> dict[str, Any
             "current_task_id": (latest or {}).get("id"), "current_step": str((latest or {}).get("current_step") or "当前无运行任务"),
             "next_step": str((latest or {}).get("next_step") or "等待计划周期"), "next_run_at": next_at,
             "updated_at": (latest or {}).get("updated_at"),
+            "progress": float((latest or {}).get("progress") or 0),
+            "estimated_remaining_seconds": (latest or {}).get("estimated_remaining_seconds"),
+            "checkpoint": (latest or {}).get("checkpoint") if isinstance((latest or {}).get("checkpoint"), dict) else {},
             "running_count": sum(1 for item in related if item.get("status") == "running"),
             "waiting_count": sum(1 for item in related if item.get("status") in {"waiting", "observing", "paused"}),
             "failed_count": sum(1 for item in related if item.get("status") == "failed"),

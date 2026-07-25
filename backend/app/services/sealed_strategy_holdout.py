@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from datetime import datetime
+from time import monotonic
 from typing import Any, Callable
 
 from app.data_platform.db import _conn as _data_conn
@@ -209,6 +210,104 @@ def repair_sealed_strategy_holdout(*, limit: int = 5) -> dict[str, Any]:
             "delta": int(verification.get("eligible_sessions") or 0) - int(before.get("eligible_sessions") or 0),
         },
     }
+
+
+def sealed_holdout_adj_factor_only_gap() -> dict[str, Any]:
+    """Identify the one safe bulk-repair case without exposing holdout returns."""
+    audit = audit_sealed_strategy_holdout(include_dates=True)
+    gaps = [item for item in audit.get("dates") or [] if not bool(item.get("eligible"))]
+    homogeneous = bool(gaps) and all(
+        set(item.get("missing_apis") or []) == {"adj_factor"}
+        and set(item.get("reasons") or []) == {"missing_hard_api_slices"}
+        for item in gaps
+    )
+    return {
+        "ok": True,
+        "homogeneous": homogeneous,
+        "eligible_sessions": int(audit.get("eligible_sessions") or 0),
+        "required_sessions": int(audit.get("required_sessions") or SEALED_HOLDOUT_SESSIONS),
+        "missing_sessions": int(audit.get("missing_sessions") or 0),
+        "repair_dates": [str(item.get("trade_date") or "") for item in gaps] if homogeneous else [],
+        "gap_type": "adj_factor_only" if homogeneous else "mixed_or_unknown",
+    }
+
+
+def run_sealed_holdout_adj_factor_backfill(
+    *,
+    task_id: int,
+    batch_size: int = 20,
+    heartbeat: Callable[..., None],
+    ensure_active: Callable[[int], None],
+    checkpoint: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Drain a homogeneous adj_factor gap with durable task checkpoints."""
+    size = max(5, min(int(batch_size), 30))
+    prior_checkpoint = checkpoint if isinstance(checkpoint, dict) else {}
+    completed_batches = max(0, int(prior_checkpoint.get("completed_batches") or 0))
+    total_repaired_sessions = max(0, int(prior_checkpoint.get("total_repaired_sessions") or 0))
+    total_repair_seconds = max(0.0, float(prior_checkpoint.get("total_repair_seconds") or 0.0))
+    batches: list[dict[str, Any]] = []
+    while True:
+        ensure_active(task_id)
+        gap = sealed_holdout_adj_factor_only_gap()
+        if not gap.get("homogeneous"):
+            verification = audit_sealed_strategy_holdout(include_dates=False)
+            if verification.get("status") == "ready":
+                return {
+                    "ok": True, "status": "ready", "batches": batches,
+                    "verification": verification, "batch_size": size,
+                }
+            raise RuntimeError("密封验证集缺口不再是单一 adj_factor，已停止批量补全并等待有界诊断")
+        dates = list(gap.get("repair_dates") or [])
+        if not dates:
+            verification = audit_sealed_strategy_holdout(include_dates=False)
+            return {"ok": verification.get("status") == "ready", "status": verification.get("status"),
+                    "batches": batches, "verification": verification, "batch_size": size}
+        batch = dates[:size]
+        before = int(gap.get("eligible_sessions") or 0)
+        detail = {
+            value: {"trade_date": value, "missing_apis": ["adj_factor"], "reasons": ["missing_hard_api_slices"]}
+            for value in batch
+        }
+        batch_started = monotonic()
+        repair = repair_oos_hard_data_batch(batch, date_gaps=detail)
+        batch_seconds = max(0.001, monotonic() - batch_started)
+        verification = audit_sealed_strategy_holdout(include_dates=False)
+        after = int(verification.get("eligible_sessions") or 0)
+        repaired_sessions = max(0, after - before)
+        completed_batches += 1
+        total_repaired_sessions += repaired_sessions
+        total_repair_seconds += batch_seconds
+        sessions_per_minute = total_repaired_sessions / total_repair_seconds * 60.0 if total_repair_seconds else 0.0
+        remaining_sessions = max(0, SEALED_HOLDOUT_SESSIONS - after)
+        estimated_remaining_seconds = int(remaining_sessions / sessions_per_minute * 60.0) if sessions_per_minute > 0 else None
+        batches.append({"dates": batch, "before": before, "after": after, "delta": after - before,
+                        "ok": bool(repair.get("ok")), "duration_seconds": batch_seconds})
+        heartbeat(
+            task_id,
+            phase="sealed_holdout_adj_factor_backfill",
+            progress=after / max(1, SEALED_HOLDOUT_SESSIONS),
+            message=f"密封验证集 adj_factor 补全 {after}/{SEALED_HOLDOUT_SESSIONS}，本批 {len(batch)} 日",
+            checkpoint={
+                "schema_version": "alis_sealed_holdout_adj_factor_backfill_v1",
+                "eligible_sessions": after,
+                "required_sessions": SEALED_HOLDOUT_SESSIONS,
+                "remaining_sessions": remaining_sessions,
+                "last_batch_dates": batch,
+                "current_batch_size": len(batch),
+                "completed_batches": completed_batches,
+                "batch_size": size,
+                "total_repaired_sessions": total_repaired_sessions,
+                "total_repair_seconds": round(total_repair_seconds, 3),
+                "sessions_per_minute": round(sessions_per_minute, 2),
+                "estimated_remaining_seconds": estimated_remaining_seconds,
+            },
+        )
+        if after <= before:
+            raise RuntimeError(f"密封验证集 adj_factor 批量补全无进展：{before}/{SEALED_HOLDOUT_SESSIONS}")
+        if verification.get("status") == "ready":
+            return {"ok": True, "status": "ready", "batches": batches,
+                    "verification": verification, "batch_size": size}
 
 
 def _contract_hash(cohort_key: str) -> str:

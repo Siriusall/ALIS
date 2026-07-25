@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from typing import Any
 
 
 MAX_OOS_REPAIR_DATES = 5
 _FAILED = {"failed", "blocked", "error", "rejected", "repair_partial"}
-_DEGRADED = {"partial", "degraded", "warning", "attention", "escalated"}
-_OBSERVING = {"insufficient_observations", "observing", "not_triggered", "skipped_not_configured", "unchanged"}
+_DEGRADED = {"partial", "degraded", "warning", "escalated"}
+_OBSERVING = {"attention", "insufficient_observations", "observing", "not_triggered", "skipped_not_configured", "unchanged"}
 
 
 def classify_step_health(step: dict[str, Any]) -> dict[str, str]:
@@ -50,7 +52,32 @@ def _repair_hard_data() -> dict[str, Any]:
 
 
 def _repair_sealed_holdout() -> dict[str, Any]:
-    from app.services.sealed_strategy_holdout import audit_sealed_strategy_holdout, repair_sealed_strategy_holdout
+    from app.services.evolution_orchestrator import create_evolution_task
+    from app.services.sealed_strategy_holdout import (
+        audit_sealed_strategy_holdout,
+        repair_sealed_strategy_holdout,
+        sealed_holdout_adj_factor_only_gap,
+    )
+
+    gap = sealed_holdout_adj_factor_only_gap()
+    if gap.get("homogeneous"):
+        gap_fingerprint = hashlib.sha256(json.dumps(
+            sorted(str(value) for value in gap.get("repair_dates") or []),
+            separators=(",", ":"),
+        ).encode("utf-8")).hexdigest()[:16]
+        task = create_evolution_task(
+            task_type="sealed_holdout_adj_factor_backfill",
+            dedupe_key=f"sealed_holdout_adj_factor_backfill:v2:{gap_fingerprint}",
+            payload={"batch_size": 20, "trigger": "autonomous_self_healing", "gap_type": "adj_factor_only"},
+            priority=15,
+        )
+        return {
+            "kind": "sealed_strategy_holdout",
+            "status": "bulk_repair_scheduled",
+            "task": {"id": task.get("id"), "status": task.get("status"), "progress": task.get("progress")},
+            "gap": {key: gap.get(key) for key in ("eligible_sessions", "required_sessions", "missing_sessions", "gap_type")},
+            "verification": audit_sealed_strategy_holdout(include_dates=False),
+        }
 
     repair = repair_sealed_strategy_holdout(limit=MAX_OOS_REPAIR_DATES)
     after = audit_sealed_strategy_holdout(include_dates=False)

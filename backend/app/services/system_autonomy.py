@@ -153,6 +153,11 @@ def _owner_summary(steps: list[dict[str, Any]]) -> dict[str, Any]:
     hard_data = ((by_name.get("hard_data_gate") or {}).get("result") or {})
     decision_data = ((by_name.get("decision_data_gate") or {}).get("result") or {})
     optimizer = portfolio.get("optimizer") if isinstance(portfolio.get("optimizer"), dict) else {}
+    rebalance_actions = [
+        action for action in (portfolio.get("rebalance_proposal") or portfolio.get("proposal") or [])
+        if str(action.get("action") or "") not in {"", "hold", "observe"}
+        and abs(float(action.get("weight_change") or 0)) > 1e-9
+    ]
     champion_gate = champion_execution_gate()
     anomalies = [
         {
@@ -160,6 +165,7 @@ def _owner_summary(steps: list[dict[str, Any]]) -> dict[str, Any]:
             "message": str(step.get("error") or ((step.get("health") or {}).get("reason")) or "模块返回未通过"),
         }
         for step in steps
+        if str(step.get("name") or "") not in {"autonomous_self_healing", "llm_incident_supervisor"}
         if str((step.get("health") or {}).get("status") or ("healthy" if step.get("ok") else "failed")) in {"failed", "degraded"}
     ]
     return {
@@ -170,7 +176,12 @@ def _owner_summary(steps: list[dict[str, Any]]) -> dict[str, Any]:
                 "status": str(rebalance.get("status") or "generated"),
                 "plan_date": rebalance.get("plan_date") or rebalance.get("trade_date"),
                 "summary": rebalance.get("summary") or {},
-                "proposal_count": len(portfolio.get("rebalance_proposal") or portfolio.get("proposal") or []),
+                "proposal_count": len(rebalance_actions),
+                "execution_authorized": bool(rebalance.get("execution_authorized")),
+                "planned_execute_at": rebalance.get("planned_execute_at"),
+                "planned_execute_date": rebalance.get("planned_execute_date"),
+                "blocked_reason": rebalance.get("blocked_reason"),
+                "actions": rebalance_actions,
             },
             "profit": {
                 "daily_return_pct": attribution.get("latest_daily_return_pct"),
@@ -370,6 +381,53 @@ def latest_owner_summary() -> dict[str, Any]:
         and isinstance(result.get("steps"), list)
     ):
         summary = _owner_summary(result["steps"])
+    try:
+        from app.services.sealed_strategy_holdout import audit_sealed_strategy_holdout
+        holdout = audit_sealed_strategy_holdout(include_dates=False)
+        if holdout.get("status") == "ready":
+            questions = summary.setdefault("questions", {})
+            anomalies = questions.setdefault("anomalies", [])
+            anomalies[:] = [item for item in anomalies if str(item.get("module") or "") != "sealed_holdout_data_gate"]
+            supervision = questions.get("incident_supervision") if isinstance(questions.get("incident_supervision"), dict) else {}
+            cases = supervision.get("cases") if isinstance(supervision.get("cases"), list) else []
+            supervision["cases"] = [item for item in cases if str(item.get("module") or "") != "sealed_holdout_data_gate"]
+            supervision["owner_action_required_count"] = sum(1 for case in supervision["cases"] if case.get("owner_action_required"))
+            supervision["internal_fault_count"] = sum(1 for case in supervision["cases"] if case.get("resolution_class") == "internal_fault")
+            supervision["waiting_condition_count"] = sum(1 for case in supervision["cases"] if case.get("resolution_class") == "waiting_condition")
+            supervision["status"] = "owner_action_required" if supervision["owner_action_required_count"] else "self_managed" if supervision["cases"] else "healthy"
+            questions["incident_supervision"] = supervision
+    except Exception:
+        pass
+    try:
+        from app.services.profit_loop import get_latest_daily_rebalance_plan
+        latest_plan = get_latest_daily_rebalance_plan()
+        proposal = latest_plan.get("proposal") if isinstance(latest_plan.get("proposal"), list) else []
+        actionable = [
+            action for action in proposal
+            if str(action.get("action") or "") not in {"", "hold", "observe"}
+            and abs(float(action.get("weight_change") or 0)) > 1e-9
+        ]
+        questions = summary.setdefault("questions", {})
+        questions["today_rebalance"] = {
+            "status": str(latest_plan.get("status") or "not_generated"),
+            "plan_date": latest_plan.get("trade_date"),
+            "proposal_count": len(actionable),
+            "execution_authorized": bool(latest_plan.get("execution_authorized")),
+            "planned_execute_at": latest_plan.get("planned_execute_at"),
+            "planned_execute_date": latest_plan.get("planned_execute_date"),
+            "blocked_reason": latest_plan.get("blocked_reason"),
+            "actions": [
+                {
+                    "symbol": str(action.get("symbol") or ""),
+                    "name": str(action.get("name") or ""),
+                    "action": str(action.get("action") or ""),
+                    "reason": str(action.get("reason") or ""),
+                }
+                for action in actionable
+            ],
+        }
+    except Exception:
+        pass
     try:
         from app.services.profit_loop import build_portfolio_candles
         comparison_payload = build_portfolio_candles(limit=90)

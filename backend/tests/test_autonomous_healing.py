@@ -4,6 +4,7 @@ from app.services import autonomous_healing as healing
 def test_classify_step_health_distinguishes_degraded_and_observing() -> None:
     assert healing.classify_step_health({"ok": True, "result": {"status": "partial"}})["status"] == "degraded"
     assert healing.classify_step_health({"ok": True, "result": {"status": "escalated"}})["status"] == "degraded"
+    assert healing.classify_step_health({"ok": True, "result": {"status": "attention"}})["status"] == "observing"
     assert healing.classify_step_health({"ok": True, "result": {"status": "insufficient_observations"}})["status"] == "observing"
     assert healing.classify_step_health({"ok": False, "error": "network"})["status"] == "failed"
 
@@ -44,6 +45,29 @@ def test_self_healing_repairs_sealed_holdout_in_bounded_batch(monkeypatch) -> No
     assert action["kind"] == "sealed_strategy_holdout"
     assert len(action["dates"]) == healing.MAX_OOS_REPAIR_DATES
     assert action["verification"]["eligible_sessions"] == 6
+
+
+def test_sealed_adj_factor_bulk_task_dedupe_tracks_the_actual_gap(monkeypatch) -> None:
+    created = []
+    monkeypatch.setattr(
+        "app.services.sealed_strategy_holdout.sealed_holdout_adj_factor_only_gap",
+        lambda: {"homogeneous": True, "repair_dates": ["20190910", "20190911"], "eligible_sessions": 124, "required_sessions": 126},
+    )
+    monkeypatch.setattr(
+        "app.services.sealed_strategy_holdout.audit_sealed_strategy_holdout",
+        lambda **_kwargs: {"status": "blocked", "eligible_sessions": 124, "required_sessions": 126},
+    )
+    monkeypatch.setattr(
+        "app.services.evolution_orchestrator.create_evolution_task",
+        lambda **kwargs: created.append(kwargs) or {"id": 88, "status": "queued", "progress": 0},
+    )
+
+    healing.run_autonomous_self_healing([
+        {"name": "sealed_holdout_data_gate", "ok": True, "result": {"status": "blocked"}},
+    ])
+
+    assert created[0]["dedupe_key"].startswith("sealed_holdout_adj_factor_backfill:v2:")
+    assert created[0]["dedupe_key"] != "sealed_holdout_adj_factor_backfill:v1"
 
 
 def test_self_healing_quarantines_ledger_drift_without_mutating_it() -> None:

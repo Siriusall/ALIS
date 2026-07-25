@@ -210,66 +210,24 @@ def get_positions() -> PositionsListResponse:
 
 @router.post("/positions", response_model=PositionResponse)
 def add_position(body: PositionAdd) -> PositionResponse:
-    """添加或累加持仓（同代码累加数量、加权成本）。"""
-    try:
-        ensure_manual_trade_allowed("开仓")
-    except RuntimeError as e:
-        raise HTTPException(status_code=403, detail=str(e))
-    p = add_position_store(body.symbol, body.quantity, body.price)
-    if not p:
-        raise HTTPException(status_code=400, detail="无效代码或数量")
-    return PositionResponse(**p)
+    raise HTTPException(status_code=410, detail="手动交易已关闭，持仓只能由模拟执行产生")
 
 
 @router.put("/positions/{position_id}", response_model=PositionResponse)
 def update_position_api(position_id: int, body: PositionUpdate) -> PositionResponse:
     """调整持仓数量或成本价；数量改为 0 即删除。"""
-    try:
-        ensure_manual_trade_allowed("改仓")
-    except RuntimeError as e:
-        raise HTTPException(status_code=403, detail=str(e))
-    p = update_position(position_id, quantity=body.quantity, price=body.price)
-    if p is None:
-        raise HTTPException(status_code=404, detail="持仓不存在或已删除")
-    return PositionResponse(**p)
+    raise HTTPException(status_code=410, detail="手动交易已关闭，禁止直接修改持仓")
 
 
 @router.delete("/positions/{position_id}")
 def delete_position_api(position_id: int) -> Response:
     """删除一条持仓。"""
-    try:
-        ensure_manual_trade_allowed("删仓")
-    except RuntimeError as e:
-        raise HTTPException(status_code=403, detail=str(e))
-    if not delete_position(position_id):
-        raise HTTPException(status_code=404, detail="持仓不存在")
-    return Response(status_code=204)
+    raise HTTPException(status_code=410, detail="手动交易已关闭，禁止直接删除持仓")
 
 
 @router.post("/positions/{position_id}/sell")
 def sell_position_api(position_id: int, body: PositionSell):
-    """手动卖出持仓（全部或部分）。未传 quantity 则全部卖出，未传 price 则使用当前价。全部卖出返回 204，部分卖出返回 200 及更新后持仓。"""
-    rows = get_positions_store()
-    pos = next((r for r in rows if r["id"] == position_id), None)
-    if not pos:
-        raise HTTPException(status_code=404, detail="持仓不存在")
-    price = body.price
-    if price is None:
-        prices, _ = fetch_symbol_prices_with_time([pos["symbol"]])
-        price = prices.get(pos["symbol"]) or 0.0
-    try:
-        result = sell_position_store(position_id, quantity=body.quantity, price=price)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    if result is None:
-        return Response(status_code=204)
-    row = get_positions_store()
-    updated = next((r for r in row if r["id"] == position_id), None)
-    if not updated:
-        return Response(status_code=204)
-    for k in ("current_price", "current_value", "profit_loss", "profit_loss_pct", "strategy_next"):
-        updated.setdefault(k, None)
-    return PositionResponse(**updated)
+    raise HTTPException(status_code=410, detail="手动交易已关闭，卖出只能由自动模拟执行产生")
 
 
 @router.get("/operations", response_model=list[OperationResponse])

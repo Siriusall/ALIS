@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+import hashlib
 import json
 import logging
 import os
@@ -12,6 +13,8 @@ from copy import deepcopy
 from typing import Any, Callable
 
 from app.data_platform.services.oos_hard_data import audit_oos_hard_data
+from app.data_platform.db import _conn as data_conn
+from app.core.trade_calendar import is_trade_day
 from app.db.store import (
     _conn,
     get_model_version,
@@ -40,9 +43,15 @@ MAX_CANDIDATES_PER_CYCLE = max(1, min(int(os.getenv("EVOLUTION_MAX_CANDIDATES", 
 MAX_WINDOWS_PER_CANDIDATE = max(1, min(int(os.getenv("EVOLUTION_MAX_WINDOWS", "5")), 20))
 TASK_TIMEOUT_MINUTES = max(30, min(int(os.getenv("EVOLUTION_TASK_TIMEOUT_MINUTES", "240")), 1440))
 WORKER_ID = f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
+SYSTEM_AUTONOMY_RECOVERY_POLICY_VERSION = "v2"
 _worker_started = False
 _scheduler_started = False
 _start_lock = threading.Lock()
+_runtime_lock = threading.Lock()
+_runtime_status: dict[str, dict[str, Any]] = {
+    "worker": {"started": False, "alive": False, "heartbeat_at": None, "last_error": ""},
+    "scheduler": {"started": False, "alive": False, "heartbeat_at": None, "last_error": ""},
+}
 
 
 class EvolutionTaskCancelled(RuntimeError):
@@ -51,6 +60,46 @@ class EvolutionTaskCancelled(RuntimeError):
 
 def _now() -> datetime:
     return datetime.now().astimezone()
+
+
+def _runtime_heartbeat(component: str, *, alive: bool = True, error: str = "") -> None:
+    with _runtime_lock:
+        state = _runtime_status.setdefault(component, {})
+        state.update({"started": True, "alive": bool(alive), "heartbeat_at": _now().isoformat()})
+        if error:
+            state["last_error"] = str(error)[:500]
+        elif alive:
+            state["last_error"] = ""
+
+
+def evolution_runtime_status() -> dict[str, Any]:
+    with _runtime_lock:
+        items = {key: dict(value) for key, value in _runtime_status.items()}
+    now = _now()
+    for value in items.values():
+        heartbeat = value.get("heartbeat_at")
+        try:
+            age = max(0.0, (now - datetime.fromisoformat(str(heartbeat))).total_seconds()) if heartbeat else None
+        except (TypeError, ValueError):
+            age = None
+        value["heartbeat_age_seconds"] = age
+        value["healthy"] = bool(value.get("disabled")) or (bool(value.get("alive")) and age is not None and age <= 900)
+    return {"ok": all(item.get("healthy") for item in items.values()), "components": items}
+
+
+def _is_scheduled_trade_day(value: datetime) -> bool:
+    trade_date = value.date().strftime("%Y%m%d")
+    try:
+        with data_conn() as conn:
+            row = conn.execute(
+                "SELECT is_open FROM dc_trade_calendar WHERE exchange='SSE' AND cal_date=? LIMIT 1",
+                (trade_date,),
+            ).fetchone()
+        if row is not None:
+            return bool(int(row["is_open"] or 0))
+    except Exception:
+        pass
+    return is_trade_day(value.date())
 
 
 def _lease_owner_process_alive(owner: Any) -> bool | None:
@@ -198,6 +247,8 @@ def _next_weekday_at(now: datetime, weekday: int, hour: int) -> datetime:
     candidate += timedelta(days=days)
     if candidate <= now:
         candidate += timedelta(days=7)
+    while not _is_scheduled_trade_day(candidate):
+        candidate += timedelta(days=7)
     return candidate
 
 
@@ -205,7 +256,7 @@ def _next_business_day_at(now: datetime, hour: int) -> datetime:
     candidate = now.replace(hour=hour, minute=0, second=0, microsecond=0)
     if candidate <= now:
         candidate += timedelta(days=1)
-    while candidate.weekday() >= 5:
+    while not _is_scheduled_trade_day(candidate):
         candidate += timedelta(days=1)
     return candidate
 
@@ -227,6 +278,70 @@ def evolution_schedule_status() -> dict[str, Any]:
         "next_system_cycle_at": _next_business_day_at(now, 17).isoformat() if AUTO_ENABLED else None,
         "next_formal_cycle_at": _next_weekday_at(now, AUTO_WEEKDAY, AUTO_HOUR).isoformat() if AUTO_ENABLED else None,
     }
+
+
+def enqueue_system_autonomy_recovery(trade_date: str, data_contract: dict[str, Any]) -> dict[str, Any]:
+    """Create one same-date catch-up cycle for each newly ready data contract.
+
+    The normal daily key may already belong to a cycle that safely stopped at
+    the data gate.  A contract fingerprint makes recovery idempotent while
+    still allowing a materially improved slice to trigger a fresh cycle.
+    """
+    if not trade_date or not bool(data_contract.get("ok")):
+        return {"ok": False, "reason": "decision_data_not_ready"}
+    fingerprint_payload = {
+        "trade_date": trade_date,
+        "counts": data_contract.get("counts") or {},
+        "expected_rows": data_contract.get("expected_rows") or {},
+        "coverage": data_contract.get("coverage") or {},
+    }
+    fingerprint = hashlib.sha256(
+        json.dumps(fingerprint_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()[:16]
+    return create_evolution_task(
+        task_type="system_autonomy_cycle",
+        dedupe_key=f"system_autonomy_recovery:{SYSTEM_AUTONOMY_RECOVERY_POLICY_VERSION}:{trade_date}:{fingerprint}",
+        payload={
+            "trigger": "decision_data_recovered",
+            "trade_date": trade_date,
+            "data_contract_fingerprint": fingerprint,
+        },
+        priority=85,
+    )
+
+
+def ensure_latest_ready_system_cycle() -> dict[str, Any]:
+    """Recover a missed same-date system cycle, including after restarts/weekends."""
+    from app.services.data_health import assess_latest_decision_data_health
+
+    health = assess_latest_decision_data_health()
+    readiness = health.get("readiness") if isinstance(health.get("readiness"), dict) else {}
+    trade_date = str(readiness.get("target_trade_date") or "")
+    if not trade_date or not bool(health.get("decision_ready")):
+        return {"ok": False, "reason": "decision_data_not_ready", "trade_date": trade_date}
+    for task in list_evolution_tasks(limit=30):
+        if str(task.get("task_type") or "") != "system_autonomy_cycle" or str(task.get("status") or "") != "completed":
+            continue
+        result = task.get("result") if isinstance(task.get("result"), dict) else {}
+        decision_ready_for_date = False
+        plan_status = ""
+        for step in result.get("steps") or []:
+            if not isinstance(step, dict) or str(step.get("name") or "") != "decision_data_gate":
+                if isinstance(step, dict) and str(step.get("name") or "") == "profit_and_portfolio":
+                    profit = step.get("result") if isinstance(step.get("result"), dict) else {}
+                    plan = profit.get("rebalance_plan") if isinstance(profit.get("rebalance_plan"), dict) else {}
+                    plan_status = str(plan.get("status") or "")
+                continue
+            gate = step.get("result") if isinstance(step.get("result"), dict) else {}
+            gate_readiness = gate.get("readiness") if isinstance(gate.get("readiness"), dict) else {}
+            decision_ready_for_date = bool(gate.get("decision_ready")) and str(gate_readiness.get("target_trade_date") or "") == trade_date
+        if decision_ready_for_date and plan_status != "blocked_by_decision_data":
+            return {"ok": True, "status": "already_completed", "trade_date": trade_date, "task_id": task.get("id")}
+    contract = readiness.get("decision_contract") if isinstance(readiness.get("decision_contract"), dict) else {}
+    if not contract:
+        from app.data_platform.services.decision_data_contract import decision_data_contract
+        contract = decision_data_contract(trade_date)
+    return enqueue_system_autonomy_recovery(trade_date, contract)
 
 
 def _claim_next_task() -> dict[str, Any] | None:
@@ -640,10 +755,13 @@ def _persist_candidate_result(target: dict[str, Any], result: dict[str, Any]) ->
     formal_oos_ready = str(result.get("status") or "") == "passed" and bool(promotion_gates) and all(
         bool(value) for value in promotion_gates.values()
     )
-    automatically_promoted = controller_shadow_ready and formal_oos_ready
+    # Controller candidates must enter the same portfolio-level future shadow
+    # and cooling lifecycle as selection challengers. Their candidate-specific
+    # decision proxy is insufficient evidence for a production rebind.
+    automatically_promoted = False
     next_gate = "activated_and_champion_rebound" if automatically_promoted else "automatic_evolution_diagnosis"
     if is_controller_candidate:
-        next_gate = "candidate_specific_shadow_observation" if formal_oos_ready else "formal_oos_rejected"
+        next_gate = "portfolio_shadow_and_statistics_gate" if formal_oos_ready else "formal_oos_rejected"
     validation.update({
         "status": "passed" if automatically_promoted else f"formal_oos_{result.get('status')}",
         "production_eligible": automatically_promoted,
@@ -652,7 +770,6 @@ def _persist_candidate_result(target: dict[str, Any], result: dict[str, Any]) ->
         "comparison_role": "strategy_controller_candidate" if is_controller_candidate else ("diagnostic_baseline_not_promotable" if target["role"] == "baseline" else "challenger"),
         "next_gate": next_gate,
     })
-    update_model_version_validation(target["model_version_id"], validation=validation)
     if str(result.get("status") or "") == "failed":
         from app.services.experiment_memory import record_model_experiment_outcome
 
@@ -662,6 +779,12 @@ def _persist_candidate_result(target: dict[str, Any], result: dict[str, Any]) ->
             rejected=True,
             evidence={"formal_oos": _formal_metrics(result), "blocking_reasons": result.get("blocking_reasons") or []},
         )
+    if is_controller_candidate:
+        validation["blocking_reasons"] = list(dict.fromkeys(
+            list(validation.get("blocking_reasons") or [])
+            + (["portfolio_shadow_and_statistics_gate"] if formal_oos_ready else [])
+        ))
+    update_model_version_validation(target["model_version_id"], validation=validation)
     if is_controller_candidate and not formal_oos_ready:
         update_model_version_status(int(target["model_version_id"]), status="rejected", is_active=False)
     if automatically_promoted:
@@ -937,6 +1060,16 @@ def execute_evolution_task(
             checkpoint=task.get("checkpoint") if isinstance(task.get("checkpoint"), dict) else {},
         )
         return run_factor_daily_cycle()
+    if task_type == "sealed_holdout_adj_factor_backfill":
+        from app.services.sealed_strategy_holdout import run_sealed_holdout_adj_factor_backfill
+
+        return run_sealed_holdout_adj_factor_backfill(
+            task_id=int(task["id"]),
+            batch_size=max(5, min(int((task.get("payload") or {}).get("batch_size") or 20), 30)),
+            heartbeat=_heartbeat,
+            ensure_active=_ensure_task_active,
+            checkpoint=task.get("checkpoint") if isinstance(task.get("checkpoint"), dict) else {},
+        )
     if task_type == "system_autonomy_cycle":
         from app.services.system_autonomy import run_system_autonomy_cycle
 
@@ -951,11 +1084,21 @@ def execute_evolution_task(
 
 def _finish_success(task_id: int, result: dict[str, Any]) -> None:
     now = _now().isoformat()
+    task = get_evolution_task(int(task_id)) or {}
+    task_type = str(task.get("task_type") or "")
+    message = {
+        "sealed_holdout_adj_factor_backfill": "密封验证集批量补全并复核完成",
+        "factor_daily_cycle": "因子日物化与评价完成",
+        "strategy_shadow_cycle": "策略影子观察完成",
+        "strategy_evolution_cycle": "策略进化周期完成",
+        "strategy_controller_oos": "策略控制器 OOS 完成",
+        "system_autonomy_cycle": "系统自治周期完成",
+    }.get(task_type, "自治任务完成")
     _update_active_task(
         int(task_id), statuses=("running",), require_not_stopped=True,
         expected_lease_owner=WORKER_ID,
         status="completed", phase="completed", progress=1.0,
-        message="自进化周期完成", result=result, error=None,
+        message=message, result=result, error=None,
         lease_owner=None, lease_expires_at=None, heartbeat_at=now,
         finished_at=now,
     )
@@ -979,7 +1122,7 @@ def _schedule_strategy_continuation(*, completed_task_id: int) -> dict[str, Any]
             "trigger": "automatic_lineage_continuation",
             "predecessor_task_id": int(completed_task_id),
         },
-        dedupe_key=f"strategy_evolution_continuation:{signature}",
+        dedupe_key=f"strategy_evolution_continuation:v2:{signature}:after-{int(completed_task_id)}",
         priority=55,
     )
 
@@ -1104,7 +1247,13 @@ def start_evolution_worker() -> bool:
 
     def loop() -> None:
         while True:
-            if run_worker_once() is None:
+            try:
+                _runtime_heartbeat("worker")
+                if run_worker_once() is None:
+                    time.sleep(POLL_SECONDS)
+            except Exception as exc:  # noqa: BLE001 - worker must survive transient DB/runtime faults
+                logger.exception("evolution worker loop recovered from error")
+                _runtime_heartbeat("worker", error=str(exc))
                 time.sleep(POLL_SECONDS)
 
     threading.Thread(target=loop, daemon=True, name="evolution-worker").start()
@@ -1114,6 +1263,8 @@ def start_evolution_worker() -> bool:
 def start_evolution_scheduler() -> bool:
     global _scheduler_started
     if not AUTO_ENABLED:
+        with _runtime_lock:
+            _runtime_status["scheduler"].update({"started": False, "alive": False, "disabled": True, "last_error": ""})
         return False
     with _start_lock:
         if _scheduler_started:
@@ -1122,33 +1273,39 @@ def start_evolution_scheduler() -> bool:
 
     def loop() -> None:
         while True:
-            now = _now()
-            if now.weekday() < 5 and now.hour >= 16:
-                create_evolution_task(
-                    task_type="factor_daily_cycle",
-                    dedupe_key=f"factor_daily_cycle:{now.date().isoformat()}",
-                    payload={"trigger": "daily_scheduler"},
-                    priority=20,
-                )
-                create_evolution_task(
-                    task_type="strategy_shadow_cycle",
-                    dedupe_key=f"strategy_shadow_cycle:{now.date().isoformat()}",
-                    payload={"max_new_sessions": 5, "trigger": "daily_scheduler"},
-                    priority=50,
-                )
-            if now.weekday() < 5 and now.hour >= 17:
-                create_evolution_task(
-                    task_type="system_autonomy_cycle",
-                    dedupe_key=f"system_autonomy_cycle:{now.date().isoformat()}",
-                    payload={"trigger": "daily_scheduler"},
-                    priority=70,
-                )
-            if now.weekday() == AUTO_WEEKDAY and now.hour >= AUTO_HOUR:
-                create_evolution_task(
-                    task_type="strategy_evolution_cycle",
-                    dedupe_key=f"strategy_evolution_cycle:{now.date().isoformat()}",
-                    payload={"max_windows": 5, "trigger": "weekly_scheduler"},
-                )
+            try:
+                _runtime_heartbeat("scheduler")
+                now = _now()
+                ensure_latest_ready_system_cycle()
+                if _is_scheduled_trade_day(now) and now.hour >= 16:
+                    create_evolution_task(
+                        task_type="factor_daily_cycle",
+                        dedupe_key=f"factor_daily_cycle:{now.date().isoformat()}",
+                        payload={"trigger": "daily_scheduler"},
+                        priority=20,
+                    )
+                    create_evolution_task(
+                        task_type="strategy_shadow_cycle",
+                        dedupe_key=f"strategy_shadow_cycle:{now.date().isoformat()}",
+                        payload={"max_new_sessions": 5, "trigger": "daily_scheduler"},
+                        priority=50,
+                    )
+                if _is_scheduled_trade_day(now) and now.hour >= 17:
+                    create_evolution_task(
+                        task_type="system_autonomy_cycle",
+                        dedupe_key=f"system_autonomy_cycle:{now.date().isoformat()}",
+                        payload={"trigger": "daily_scheduler"},
+                        priority=70,
+                    )
+                if _is_scheduled_trade_day(now) and now.weekday() == AUTO_WEEKDAY and now.hour >= AUTO_HOUR:
+                    create_evolution_task(
+                        task_type="strategy_evolution_cycle",
+                        dedupe_key=f"strategy_evolution_cycle:{now.date().isoformat()}",
+                        payload={"max_windows": 5, "trigger": "weekly_scheduler"},
+                    )
+            except Exception as exc:  # noqa: BLE001 - scheduler must remain alive
+                logger.exception("evolution scheduler loop recovered from error")
+                _runtime_heartbeat("scheduler", error=str(exc))
             time.sleep(300)
 
     threading.Thread(target=loop, daemon=True, name="evolution-scheduler").start()

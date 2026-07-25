@@ -777,6 +777,7 @@ def run_for_trade_date(
                 "plan_id": authoritative_plan.get("plan_id"),
                 "plan_version": authoritative_plan.get("plan_version"),
                 "input_hash": authoritative_plan.get("input_hash"),
+                "execution_claim_token": authoritative_plan.get("execution_claim_token"),
             },
             "decision_version_manifest": authoritative_plan.get("decision_version_manifest") or {},
         }

@@ -31,6 +31,24 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
+def _risk_execution_check(
+    error_breaches: list[dict[str, Any]],
+    all_breaches: list[dict[str, Any]],
+    *,
+    risk_reducing_only: bool,
+) -> dict[str, Any]:
+    if error_breaches and risk_reducing_only:
+        return {
+            "key": "risk_gate", "label": "风险门控", "status": "warn",
+            "detail": f"已有 {len(error_breaches)} 项风险超限，但当前方案只减仓/卖出，允许降低风险",
+        }
+    return {
+        "key": "risk_gate", "label": "风险门控",
+        "status": "block" if error_breaches else "warn" if all_breaches else "pass",
+        "detail": f"{len(error_breaches)} 项阻断，{len(all_breaches) - len(error_breaches)} 项提醒",
+    }
+
+
 def _ensure_tables() -> None:
     with business_conn() as c:
         c.execute("""CREATE TABLE IF NOT EXISTS model_live_health (
@@ -74,6 +92,8 @@ def _ensure_tables() -> None:
         )""")
         c.execute("ALTER TABLE daily_rebalance_plans ADD COLUMN IF NOT EXISTS planned_execute_date VARCHAR(16) NOT NULL DEFAULT ''")
         c.execute("ALTER TABLE daily_rebalance_plans ADD COLUMN IF NOT EXISTS planned_execute_at VARCHAR(40) NOT NULL DEFAULT ''")
+        c.execute("ALTER TABLE daily_rebalance_plans ADD COLUMN IF NOT EXISTS execution_claim_token VARCHAR(160) NOT NULL DEFAULT ''")
+        c.execute("ALTER TABLE daily_rebalance_plans ADD COLUMN IF NOT EXISTS execution_claimed_at VARCHAR(64)")
 
 
 def _fallback_execution_clock() -> dtime:
@@ -168,8 +188,10 @@ def _position_returns(symbols: list[str], limit: int = 120) -> dict[str, list[fl
     return result
 
 
-def build_return_attribution_loop() -> dict[str, Any]:
-    materialized = materialize_decision_outcomes(limit=2000)
+def build_return_attribution_loop(*, persist: bool = True) -> dict[str, Any]:
+    materialized = materialize_decision_outcomes(limit=2000) if persist else {
+        "ok": True, "status": "read_only", "written": 0,
+    }
     daily = _latest_report("daily")
     monthly = _latest_report("monthly")
     with business_conn() as c:
@@ -212,7 +234,7 @@ def build_return_attribution_loop() -> dict[str, Any]:
     }
 
 
-def build_model_live_monitor() -> dict[str, Any]:
+def build_model_live_monitor(*, persist: bool = True) -> dict[str, Any]:
     _ensure_tables()
     family = model_family_status()
     rows = []
@@ -249,15 +271,16 @@ def build_model_live_monitor() -> dict[str, Any]:
             "reason": reason,
             "feedback": feedback,
         }
-        with business_conn() as c:
-            c.execute("""INSERT INTO model_live_health
+        if persist:
+            with business_conn() as c:
+                c.execute("""INSERT INTO model_live_health
                 (model_key,active_version,status,live_ic,hit_rate,turnover,drawdown_contribution,decay,weight_multiplier,reason,metrics_json,updated_at)
                 VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(model_key) DO UPDATE SET
                 active_version=excluded.active_version,status=excluded.status,live_ic=excluded.live_ic,hit_rate=excluded.hit_rate,
                 turnover=excluded.turnover,drawdown_contribution=excluded.drawdown_contribution,decay=excluded.decay,
                 weight_multiplier=excluded.weight_multiplier,reason=excluded.reason,metrics_json=excluded.metrics_json,updated_at=excluded.updated_at""",
-                (str(item.get("model_key") or ""), version, status, live_ic, hit_rate, turnover, drawdown_contribution,
+                    (str(item.get("model_key") or ""), version, status, live_ic, hit_rate, turnover, drawdown_contribution,
                  decay, multiplier, reason, json.dumps(payload, ensure_ascii=False), _now()))
         rows.append(payload)
     return {"ok": True, "schema_version": "model_live_monitor_v1", "items": rows, "degraded_count": sum(1 for x in rows if x["status"] == "degraded")}
@@ -470,6 +493,10 @@ def build_portfolio_reoptimization() -> dict[str, Any]:
     estimated_cost = sum(_safe_float(item["estimated_one_way_cost"]) for item in proposal)
     turnover = sum(abs(_safe_float(item["weight_change"])) for item in proposal)
     expected_improvement = target_expected - current_expected
+    risk_reducing_only = bool(proposal) and all(
+        _safe_float(item.get("target_weight")) <= _safe_float(item.get("current_weight")) + 1e-9
+        for item in proposal
+    )
     try:
         from app.services.simulation_ledger_audit import audit_simulation_ledger
         ledger_audit = audit_simulation_ledger(persist=False)
@@ -507,7 +534,7 @@ def build_portfolio_reoptimization() -> dict[str, Any]:
             else f"已生成目标权重（{optimizer.get('status') or 'optimal'}）" if optimizer.get("ok")
             else "；".join(optimizer.get("blocked_reasons") or ["优化器没有有效解"])
         )},
-        {"key": "risk_gate", "label": "风险门控", "status": "block" if error_breaches else "warn" if risk.get("breaches") else "pass", "detail": f"{len(error_breaches)} 项阻断，{len(risk.get('breaches') or []) - len(error_breaches)} 项提醒"},
+        _risk_execution_check(error_breaches, risk.get("breaches") or [], risk_reducing_only=risk_reducing_only),
         {"key": "cost_benefit", "label": "收益改善覆盖成本", "status": "pass" if expected_improvement > estimated_cost else "warn", "detail": f"预期改善 {expected_improvement:.2%}，单边成本 {estimated_cost:.2%}"},
     ]
     return {
@@ -525,6 +552,7 @@ def build_portfolio_reoptimization() -> dict[str, Any]:
         },
         "execution_checks": execution_checks,
         "execution_authorized": not any(item["status"] == "block" for item in execution_checks),
+        "risk_reducing_only": risk_reducing_only,
         "decision_data_gate": {
             "status": str(decision_data_gate.get("status") or "blocked"),
             "decision_ready": bool(decision_data_gate.get("decision_ready")),
@@ -829,6 +857,22 @@ def build_model_return_contribution() -> dict[str, Any]:
     }
 
 
+def _plan_block_status(portfolio: dict[str, Any]) -> tuple[str, str]:
+    blocked = [item for item in portfolio.get("execution_checks") or [] if item.get("status") == "block"]
+    if not blocked:
+        return "planned", ""
+    keys = {str(item.get("key") or "") for item in blocked}
+    if "market_data" in keys:
+        return "blocked_by_decision_data", "最新交易日决策数据门未通过，当前方案仅作为不可执行预览"
+    if "simulation_ledger" in keys:
+        return "blocked_by_ledger", "模拟账户账本不一致，禁止生成可执行计划"
+    if "risk_gate" in keys:
+        return "blocked_by_risk", "方案会增加或维持禁止的风险暴露，风险门拒绝执行"
+    if "optimizer" in keys:
+        return "blocked_by_optimizer", "组合优化没有形成安全可执行解"
+    return "blocked_by_execution_checks", "执行前置检查未全部通过"
+
+
 def materialize_daily_rebalance_plan(portfolio: dict[str, Any] | None = None) -> dict[str, Any]:
     """Persist one immutable plan version per materially different daily input."""
     _ensure_tables()
@@ -843,6 +887,9 @@ def materialize_daily_rebalance_plan(portfolio: dict[str, Any] | None = None) ->
     planned_execute_at = _planned_execute_at(planned_execute_date)
     proposal = portfolio.get("rebalance_proposal") or []
     execution_authorized = bool(portfolio.get("execution_authorized"))
+    plan_status, blocked_reason = _plan_block_status(portfolio)
+    if execution_authorized:
+        plan_status, blocked_reason = "planned", ""
     from app.services.decision_version_manifest import build_decision_version_manifest
     decision_version_manifest = build_decision_version_manifest(
         trade_date=trade_date,
@@ -859,11 +906,19 @@ def materialize_daily_rebalance_plan(portfolio: dict[str, Any] | None = None) ->
     canonical = json.dumps(contract, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     input_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
     with business_conn() as c:
+        inflight = c.execute(
+            """SELECT * FROM daily_rebalance_plans
+               WHERE trade_date=? AND status IN ('executing','blocked_by_execution_recovery')
+               ORDER BY version DESC LIMIT 1""",
+            (trade_date,),
+        ).fetchone()
         existing = c.execute(
             "SELECT * FROM daily_rebalance_plans WHERE trade_date=? AND input_hash=?",
             (trade_date, input_hash),
         ).fetchone()
-        if existing:
+        if inflight:
+            row = dict(inflight)
+        elif existing:
             row = dict(existing)
         else:
             latest = c.execute(
@@ -873,7 +928,6 @@ def materialize_daily_rebalance_plan(portfolio: dict[str, Any] | None = None) ->
             version = int(dict(latest or {}).get("version") or 0) + 1
             if version > 1:
                 c.execute("UPDATE daily_rebalance_plans SET status='superseded' WHERE trade_date=? AND status='planned'", (trade_date,))
-            plan_status = "planned" if execution_authorized else "blocked_by_decision_data"
             c.execute("""INSERT INTO daily_rebalance_plans
                 (trade_date,planned_execute_date,planned_execute_at,version,input_hash,status,proposal_json,generated_at)
                 VALUES(?,?,?,?,?,?,?,?)""",
@@ -881,6 +935,11 @@ def materialize_daily_rebalance_plan(portfolio: dict[str, Any] | None = None) ->
             row = dict(c.execute(
                 "SELECT * FROM daily_rebalance_plans WHERE trade_date=? AND version=?", (trade_date, version)
             ).fetchone())
+    row_status = str(row.get("status") or plan_status)
+    row_blocked_reason = {
+        "executing": "正式调仓计划已被执行器领取，正在原子落账",
+        "blocked_by_execution_recovery": "上次执行中断；为防止重复成交，已隔离并等待账本复核",
+    }.get(row_status, "" if execution_authorized else blocked_reason)
     return {
         "id": int(row["id"]),
         "trade_date": trade_date,
@@ -890,10 +949,10 @@ def materialize_daily_rebalance_plan(portfolio: dict[str, Any] | None = None) ->
         "valid_until_date": str(row.get("planned_execute_date") or planned_execute_date),
         "version": int(row["version"]),
         "plan_version": f"{trade_date}-v{int(row['version'])}",
-        "status": row.get("status") or ("planned" if execution_authorized else "blocked_by_decision_data"),
+        "status": row_status,
         "is_executed": str(row.get("status") or "") == "executed",
-        "execution_authorized": execution_authorized and str(row.get("status") or "") in {"planned", "executed"},
-        "blocked_reason": "" if execution_authorized else "最新交易日决策数据门未通过，当前方案仅作为不可执行预览",
+        "execution_authorized": execution_authorized and row_status in {"planned", "executed"},
+        "blocked_reason": row_blocked_reason,
         "execution_id": row.get("execution_id"),
         "generated_at": row.get("generated_at"),
         "executed_at": row.get("executed_at"),
@@ -907,7 +966,7 @@ def materialize_daily_rebalance_plan(portfolio: dict[str, Any] | None = None) ->
     }
 
 
-def get_daily_rebalance_execution_input(signal_date: str, execute_date: str) -> dict[str, Any] | None:
+def claim_daily_rebalance_execution_input(signal_date: str, execute_date: str, *, claim_token: str) -> dict[str, Any] | None:
     """Return the latest immutable dashboard plan when it is due for execution.
 
     Historical replay deliberately gets no override: only a still-planned row
@@ -916,25 +975,40 @@ def get_daily_rebalance_execution_input(signal_date: str, execute_date: str) -> 
     _ensure_tables()
     signal = str(signal_date or "").replace("-", "")[:8]
     execute = str(execute_date or "").replace("-", "")[:8]
+    token = str(claim_token or "").strip()
+    if not token:
+        raise ValueError("execution claim token is required")
+    claimed_at = datetime.now().astimezone().isoformat(timespec="seconds")
     with business_conn() as c:
+        query = """SELECT * FROM daily_rebalance_plans
+                   WHERE replace(trade_date,'-','')=?
+                     AND replace(planned_execute_date,'-','')=?
+                     AND status='planned'
+                   ORDER BY version DESC LIMIT 1"""
+        if getattr(c, "_is_postgres", False) or getattr(c, "_is_mysql", False):
+            query += " FOR UPDATE"
         row = c.execute(
-            """SELECT * FROM daily_rebalance_plans
-               WHERE replace(trade_date,'-','')=?
-                 AND replace(planned_execute_date,'-','')=?
-                 AND status='planned'
-               ORDER BY version DESC LIMIT 1""",
+            query,
             (signal, execute),
         ).fetchone()
-    if not row:
-        return None
-    record = dict(row)
-    try:
-        contract = json.loads(record.get("proposal_json") or "{}")
-    except (TypeError, json.JSONDecodeError):
-        return None
-    proposal = contract.get("proposal") if isinstance(contract, dict) else None
-    if not isinstance(proposal, list):
-        return None
+        if not row:
+            return None
+        record = dict(row)
+        try:
+            contract = json.loads(record.get("proposal_json") or "{}")
+        except (TypeError, json.JSONDecodeError):
+            return None
+        proposal = contract.get("proposal") if isinstance(contract, dict) else None
+        if not isinstance(proposal, list):
+            return None
+        changed = c.execute(
+            """UPDATE daily_rebalance_plans
+               SET status='executing',execution_claim_token=?,execution_claimed_at=?
+               WHERE id=? AND status='planned'""",
+            (token, claimed_at, int(row["id"])),
+        )
+        if int(getattr(changed, "rowcount", 1) or 0) != 1:
+            return None
     target_weights = {
         str(item.get("symbol") or "").strip(): max(0.0, _safe_float(item.get("target_weight")))
         for item in proposal if str(item.get("symbol") or "").strip()
@@ -951,21 +1025,102 @@ def get_daily_rebalance_execution_input(signal_date: str, execute_date: str) -> 
         "proposal": proposal,
         "risk_budget": contract.get("risk_budget") or {},
         "decision_version_manifest": contract.get("decision_version_manifest") or {},
+        "execution_claim_token": token,
     }
 
 
-def mark_daily_rebalance_plan_executed(signal_date: str, execute_date: str, execution_id: int | None) -> None:
+def release_daily_rebalance_execution_claim(signal_date: str, *, claim_token: str, reason: str) -> bool:
+    signal = str(signal_date or "").replace("-", "")[:8]
+    with business_conn() as c:
+        changed = c.execute(
+            """UPDATE daily_rebalance_plans
+               SET status='planned',execution_claim_token='',execution_claimed_at=NULL
+               WHERE trade_date=? AND status='executing' AND execution_claim_token=?""",
+            (signal, str(claim_token or "")),
+        )
+    return int(getattr(changed, "rowcount", 0) or 0) == 1
+
+
+def recover_interrupted_daily_rebalance_plans() -> int:
+    """Quarantine crash-interrupted executions instead of replaying trades."""
+    _ensure_tables()
+    with business_conn() as c:
+        changed = c.execute(
+            """UPDATE daily_rebalance_plans
+               SET status='blocked_by_execution_recovery'
+               WHERE status='executing'"""
+        )
+    return int(getattr(changed, "rowcount", 0) or 0)
+
+
+def get_latest_daily_rebalance_plan(trade_date: str = "") -> dict[str, Any]:
+    """Read the latest persisted plan without generating a new version."""
+    _ensure_tables()
+    with business_conn() as c:
+        row = c.execute(
+            """SELECT * FROM daily_rebalance_plans
+               WHERE (?='' OR trade_date=?) ORDER BY trade_date DESC,version DESC LIMIT 1""",
+            (trade_date, trade_date),
+        ).fetchone()
+    if not row:
+        return {"status": "not_generated", "execution_authorized": False}
+    item = dict(row)
+    try:
+        contract = json.loads(item.get("proposal_json") or "{}")
+    except (TypeError, json.JSONDecodeError):
+        contract = {}
+    return {
+        "id": int(item["id"]), "trade_date": str(item.get("trade_date") or ""),
+        "data_as_of_date": str(item.get("trade_date") or ""),
+        "planned_execute_date": str(item.get("planned_execute_date") or ""),
+        "planned_execute_at": str(item.get("planned_execute_at") or ""),
+        "valid_until_date": str(item.get("planned_execute_date") or ""),
+        "version": int(item.get("version") or 0),
+        "plan_version": f"{item.get('trade_date')}-v{int(item.get('version') or 0)}",
+        "status": str(item.get("status") or ""),
+        "is_executed": str(item.get("status") or "") == "executed",
+        "execution_authorized": str(item.get("status") or "") in {"planned", "executed"},
+        "blocked_reason": {
+            "executing": "正式计划已被唯一执行器领取，正在原子落账",
+            "blocked_by_decision_data": "最新交易日决策数据门未通过",
+            "blocked_by_ledger": "模拟账户账本不一致",
+            "blocked_by_risk": "风险门拒绝会增加风险的方案",
+            "blocked_by_optimizer": "组合优化没有形成安全可执行解",
+            "blocked_by_execution_checks": "执行前置检查未全部通过",
+            "blocked_by_execution_recovery": "上次执行在成交与任务确认之间中断；为防止重复成交，已隔离并等待账本复核",
+        }.get(str(item.get("status") or ""), ""),
+        "proposal": contract.get("proposal") or [],
+        "risk_budget": contract.get("risk_budget") or {},
+        "decision_data_gate": contract.get("decision_data_gate") or {},
+        "decision_version_manifest": contract.get("decision_version_manifest") or {},
+        "generated_at": item.get("generated_at"), "executed_at": item.get("executed_at"),
+        "generation_policy": "计划只由自治周期生成；本接口只读已有版本",
+        "execution_policy": "到计划执行时间后由模拟执行调度器检查，每个交易日最多一次",
+        "read_only": True,
+    }
+
+
+def mark_daily_rebalance_plan_executed(
+    signal_date: str, execute_date: str, execution_id: int | None, *, claim_token: str = "",
+) -> None:
     """Bind execution to the immutable plan built from the prior close signal."""
     signal = str(signal_date or "").replace("-", "")[:8]
     executed_at = datetime.now().astimezone().isoformat(timespec="seconds")
     with business_conn() as c:
-        c.execute("""UPDATE daily_rebalance_plans SET status='executed',execution_id=?,executed_at=?
+        changed = c.execute("""UPDATE daily_rebalance_plans SET status='executed',execution_id=?,executed_at=?
             WHERE id=(SELECT id FROM daily_rebalance_plans
-                      WHERE trade_date=? AND status='planned' ORDER BY version DESC LIMIT 1)""",
-            (execution_id, executed_at, signal))
+                      WHERE trade_date=? AND status='executing' AND execution_claim_token=?
+                      ORDER BY version DESC LIMIT 1)""",
+            (execution_id, executed_at, signal, str(claim_token or "")))
+        if int(getattr(changed, "rowcount", 0) or 0) != 1:
+            raise RuntimeError("正式调仓计划执行状态回写失败：执行租约不存在或已转移")
 
 
-def build_sell_rebalance_diagnostics(model_monitor: dict[str, Any] | None = None, portfolio: dict[str, Any] | None = None) -> dict[str, Any]:
+def build_sell_rebalance_diagnostics(
+    model_monitor: dict[str, Any] | None = None,
+    portfolio: dict[str, Any] | None = None,
+    *, persist: bool = True,
+) -> dict[str, Any]:
     positions = get_positions()
     ds = BacktestDataSource()
     trade_date = _latest_trade_date()
@@ -991,7 +1146,7 @@ def build_sell_rebalance_diagnostics(model_monitor: dict[str, Any] | None = None
         if pnl_pct > 0.25 and target_weight < current_weight:
             reasons.append({"code": "valuation_overextension", "label": "估值/涨幅透支", "detail": "已有较大盈利且组合目标降权"})
         action = "sell_or_reduce" if any(x["code"] in {"risk_budget_shrink", "model_decay", "loss_exceeds_expected"} for x in reasons) else "hold"
-        if reasons:
+        if reasons and persist:
             with business_conn() as c:
                 c.execute("""INSERT INTO simulation_trade_learning_labels
                     (symbol,label_date,label,reason,pnl_pct,expected_vs_actual_json,created_at)
@@ -1011,8 +1166,10 @@ def build_sell_rebalance_diagnostics(model_monitor: dict[str, Any] | None = None
     return {"ok": True, "schema_version": "sell_rebalance_diagnostics_v1", "items": items, "learning_labels_written": learning_written}
 
 
-def build_simulation_learning_loop() -> dict[str, Any]:
-    materialized = materialize_decision_outcomes(limit=2000)
+def build_simulation_learning_loop(*, persist: bool = True) -> dict[str, Any]:
+    materialized = materialize_decision_outcomes(limit=2000) if persist else {
+        "ok": True, "status": "read_only", "written": 0,
+    }
     overview = review_learning_overview()
     with business_conn() as c:
         labels = [dict(row) for row in c.execute(
@@ -1021,14 +1178,14 @@ def build_simulation_learning_loop() -> dict[str, Any]:
     return {"ok": True, "schema_version": "simulation_learning_loop_v1", "materialized": materialized, "overview": overview, "sell_labels": labels}
 
 
-def build_profit_loop() -> dict[str, Any]:
-    attribution = build_return_attribution_loop()
-    monitor = build_model_live_monitor()
+def build_profit_loop(*, persist: bool = True) -> dict[str, Any]:
+    attribution = build_return_attribution_loop(persist=persist)
+    monitor = build_model_live_monitor(persist=persist)
     portfolio = build_portfolio_reoptimization()
-    rebalance_plan = materialize_daily_rebalance_plan(portfolio)
+    rebalance_plan = materialize_daily_rebalance_plan(portfolio) if persist else get_latest_daily_rebalance_plan()
     portfolio_candles = build_portfolio_candles()
-    sells = build_sell_rebalance_diagnostics(monitor, portfolio)
-    learning = build_simulation_learning_loop()
+    sells = build_sell_rebalance_diagnostics(monitor, portfolio, persist=persist)
+    learning = build_simulation_learning_loop(persist=persist)
     model_contribution = build_model_return_contribution()
     return {
         "ok": True,
