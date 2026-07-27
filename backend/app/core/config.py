@@ -10,7 +10,7 @@ load_project_env()
 class Settings(BaseModel):
     app_name: str = "Quantification Server"
     env: str = os.getenv("APP_ENV", "dev")
-    local_debug_auth_bypass: bool = os.getenv("LOCAL_DEBUG_AUTH_BYPASS", "true").strip().lower() in {
+    local_debug_auth_bypass: bool = os.getenv("LOCAL_DEBUG_AUTH_BYPASS", "false").strip().lower() in {
         "1",
         "true",
         "yes",
@@ -26,6 +26,7 @@ class Settings(BaseModel):
     )
     database_connect_timeout_seconds: int = int(os.getenv("DATABASE_CONNECT_TIMEOUT_SECONDS", "5"))
     database_statement_timeout_ms: int = int(os.getenv("DATABASE_STATEMENT_TIMEOUT_MS", "30000"))
+    background_runtime_mode: str = os.getenv("ALIS_BACKGROUND_RUNTIME", "enabled").strip().lower()
     cors_origins: str = os.getenv(
         "CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173"
     )
@@ -36,6 +37,9 @@ class Settings(BaseModel):
 
 
 settings = Settings()
+
+if settings.background_runtime_mode not in {"enabled", "disabled"}:
+    raise RuntimeError("ALIS_BACKGROUND_RUNTIME must be either 'enabled' or 'disabled'.")
 
 if not settings.database_url.lower().startswith(("postgresql://", "postgres://", "postgresql+psycopg://")):
     raise RuntimeError("DATABASE_URL must use PostgreSQL; other runtime databases are not supported.")

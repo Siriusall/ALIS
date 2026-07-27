@@ -429,6 +429,10 @@ def build_task_center(*, limit: int = 50, log_limit: int = 200) -> dict[str, Any
                 item["activity_scope"] = "history"
     unresolved_failures, failed_records = _latest_failure_summary(tasks)
     current_tasks = [item for item in tasks if item.get("activity_scope") != "history"]
+    from app.services.system_autonomy import build_autonomy_slo
+    autonomy_slo = build_autonomy_slo()
+    from app.services.profit_loop import build_execution_chain_slo
+    execution_slo = build_execution_chain_slo()
 
     module_items = []
     for key, name, description in MODULES:
@@ -464,6 +468,8 @@ def build_task_center(*, limit: int = 50, log_limit: int = 200) -> dict[str, Any
             "completed": sum(1 for item in current_tasks if item.get("status") == "completed"),
         },
         "modules": module_items, "tasks": tasks[: max(20, min(limit * 3, 200))],
+        "autonomy_slo": autonomy_slo,
+        "execution_slo": execution_slo,
         "logs": list_runtime_logs(limit=max(20, min(log_limit, 500))), "schedule": schedule,
         "policy": {
             "read_only": True,

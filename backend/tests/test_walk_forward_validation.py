@@ -62,6 +62,26 @@ def test_failure_attribution_keeps_unknown_when_benchmark_path_is_missing():
     assert any("基准净值" in item for item in result["limitations"])
 
 
+def test_paired_daily_returns_freezes_aligned_non_overlapping_returns():
+    result = wf._paired_daily_returns({
+        "equity_series": [
+            {"date": "2026-01-01", "total_value": 100},
+            {"date": "2026-01-02", "total_value": 102},
+            {"date": "2026-01-03", "total_value": 101},
+        ],
+        "benchmark_series": [
+            {"date": "2026-01-01", "total_value": 100},
+            {"date": "2026-01-02", "total_value": 101},
+            {"date": "2026-01-03", "total_value": 103},
+        ],
+    })
+    assert result["status"] == "complete"
+    assert result["observation_count"] == 2
+    assert result["observations"][0] == {
+        "date": "2026-01-02", "strategy_return": .02, "benchmark_return": .01,
+    }
+
+
 def test_window_builder_enforces_purge_and_embargo_boundaries():
     dates = _dates(80)
     config = wf.WalkForwardConfig(train_sessions=20, validation_sessions=10, test_sessions=10, purge_sessions=3, embargo_sessions=2, step_sessions=10, minimum_windows=3)
@@ -110,6 +130,33 @@ def test_default_protocol_reports_insufficient_history_for_fewer_than_five_windo
     assert result["available_window_count"] == 4
     assert result["required_window_count"] == 5
     assert result["capacity_status"] == "insufficient_data"
+
+
+def test_walk_forward_rejects_positive_but_economically_thin_excess(monkeypatch):
+    dates = _dates(90)
+    monkeypatch.setattr(wf, "resolve_production_strategy_champion", lambda: {
+        "champion_id": 42, "champion_version": "champion-v1", "strategy_controller_version": "controller-v1",
+    })
+
+    def replay_runner(**kwargs):
+        test_dates = [value for value in dates if kwargs["start_date"] <= value <= kwargs["end_date"]]
+        return {
+            "production_strategy_version": "champion-v1",
+            "metrics": {"total_return": .0101, "benchmark_return": .01, "excess_return": .0001, "max_drawdown": -.01},
+            "summary": {"total_fees": 1, "trading_days": len(test_dates), "decision_count": 1},
+            "equity_series": [{"date": value, "total_value": 100_000 + index} for index, value in enumerate(test_dates)],
+            "data_quality": {"point_in_time": {"passed": True}},
+        }
+
+    result = wf.run_purged_walk_forward_validation(
+        config=wf.WalkForwardConfig(train_sessions=20, validation_sessions=5, test_sessions=8, purge_sessions=2, embargo_sessions=1, step_sessions=8, minimum_windows=5),
+        data_source=FakeDates(dates), replay_runner=replay_runner,
+        state_loader=lambda values: {value: ("S0", "S1", "S2", "S3")[index % 4] for index, value in enumerate(values)},
+    )
+    assert result["summary"]["aggregate_excess_return"] > 0
+    assert result["summary"]["annualized_relative_excess_return"] < .03
+    assert result["promotion_gates"]["annualized_relative_excess_at_least_3pct"] is False
+    assert result["status"] == "failed"
 
 
 def test_preview_identifies_explicit_challenger(monkeypatch):

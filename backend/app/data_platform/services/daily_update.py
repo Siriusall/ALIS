@@ -21,6 +21,7 @@ from app.data_platform.services.decision_data_contract import decision_data_cont
 from app.data_platform.services.market_calendar import target_trade_date
 from app.data_platform.services.exchange_etf_pcf import sync_exchange_etf_pcf
 from app.data_platform.services.oos_hard_data import audit_oos_hard_data
+from app.core.error_evidence import error_evidence
 
 _lock = threading.Lock()
 _state: dict[str, Any] = {"running": False, "phase": "idle", "message": "等待更新"}
@@ -185,7 +186,10 @@ def _worker(parent_run_id: int) -> None:
             steps.append({"step": "etf_daily", "result": etf_daily})
         except Exception as exc:  # noqa: BLE001
             logger.warning("daily ETF market update deferred: %s", str(exc)[:300])
-            steps.append({"step": "etf_daily", "result": {"ok": False, "deferred": True, "error": str(exc)[:300]}})
+            steps.append({"step": "etf_daily", "result": error_evidence(
+                exc, operation="daily_update:etf_daily", source="data_platform", deferred=True,
+                context={"trade_date": trade_date},
+            )})
 
         _set_state(phase="etf_pcf", message=f"正在更新 {trade_date} ETF 申购赎回篮子", progress=72)
         try:
@@ -193,7 +197,10 @@ def _worker(parent_run_id: int) -> None:
             steps.append({"step": "etf_pcf", "result": pcf})
         except Exception as exc:  # noqa: BLE001
             logger.warning("daily exchange ETF PCF update deferred: %s", str(exc)[:300])
-            steps.append({"step": "etf_pcf", "result": {"ok": False, "deferred": True, "error": str(exc)[:300]}})
+            steps.append({"step": "etf_pcf", "result": error_evidence(
+                exc, operation="daily_update:etf_pcf", source="exchange", deferred=True,
+                context={"trade_date": trade_date},
+            )})
 
         _set_state(phase="announcements", message="正在更新最近公告", progress=75)
         ann_start = (date.today() - timedelta(days=3)).strftime("%Y%m%d")
@@ -232,7 +239,10 @@ def _worker(parent_run_id: int) -> None:
             steps.append({"step": "research_pool", "result": {"screen": screen, "stage": staged, "candidate_enrichment": candidate_enrichment, "promote": promote}})
         except Exception as exc:  # noqa: BLE001
             logger.warning("daily research maintenance deferred: %s", str(exc)[:300])
-            steps.append({"step": "research_pool", "result": {"ok": False, "deferred": True, "error": str(exc)[:300]}})
+            steps.append({"step": "research_pool", "result": error_evidence(
+                exc, operation="daily_update:research_pool", source="research", deferred=True,
+                context={"trade_date": trade_date},
+            )})
         final_status = "completed"
         _set_state(running=False, phase="completed", message=f"数据已更新到 {trade_date}", progress=100,
                    finished_at=_now(), steps=steps)

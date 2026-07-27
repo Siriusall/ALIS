@@ -1,4 +1,15 @@
+import sqlite3
+from contextlib import contextmanager
+
 from app.services import defensive_assets
+
+
+def _connection_context(connection):
+    @contextmanager
+    def _open():
+        yield connection
+
+    return _open
 
 
 def test_defensive_policy_fills_exact_complement_of_equity_target(monkeypatch):
@@ -27,3 +38,22 @@ def test_no_equity_candidates_allocate_full_account_to_defensive_assets(monkeypa
     assert policy["status"] == "ready"
     assert abs(sum(policy["target_weights"].values()) - 1.0) < .001
     assert max(policy["target_weights"].values()) <= .45
+
+
+def test_defensive_asset_bar_uses_latest_point_in_time_record(monkeypatch):
+    connection = sqlite3.connect(":memory:")
+    connection.row_factory = sqlite3.Row
+    connection.executescript("""
+        CREATE TABLE dc_tushare_raw_records (
+            api_name TEXT, ts_code TEXT, trade_date TEXT, payload_json TEXT, available_time TEXT
+        );
+        INSERT INTO dc_tushare_raw_records VALUES
+            ('fund_daily', '510880.SH', '20260723', '{"close": 1.12}', '2026-07-23T15:00:00'),
+            ('fund_daily', '510880.SH', '20260724', '{"close": 1.13}', '2026-07-24T16:00:00');
+    """)
+    monkeypatch.setattr(defensive_assets, "_conn", _connection_context(connection))
+
+    bar = defensive_assets.defensive_asset_bar("510880.SH", "20260724")
+
+    assert bar is not None
+    assert bar["close"] == 1.12

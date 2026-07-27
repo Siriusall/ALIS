@@ -1029,6 +1029,35 @@ def claim_daily_rebalance_execution_input(signal_date: str, execute_date: str, *
     }
 
 
+def list_pending_daily_rebalance_execution_inputs() -> list[dict[str, str]]:
+    """List the latest unclaimed formal plan for each signal date.
+
+    This is intentionally read-only.  The simulator still acquires the plan
+    through ``claim_daily_rebalance_execution_input`` immediately before it
+    writes any ledger state.
+    """
+    _ensure_tables()
+    with business_conn() as c:
+        rows = c.execute(
+            """SELECT trade_date, planned_execute_date, version
+               FROM daily_rebalance_plans
+               WHERE status='planned'
+               ORDER BY trade_date ASC, version DESC"""
+        ).fetchall()
+    latest_by_signal: dict[str, dict[str, str]] = {}
+    for row in rows:
+        item = dict(row)
+        signal_date = str(item.get("trade_date") or "").replace("-", "")[:8]
+        execute_date = str(item.get("planned_execute_date") or "").replace("-", "")[:8]
+        if len(signal_date) != 8 or len(execute_date) != 8:
+            continue
+        latest_by_signal.setdefault(signal_date, {
+            "signal_date": signal_date,
+            "execute_date": execute_date,
+        })
+    return list(latest_by_signal.values())
+
+
 def release_daily_rebalance_execution_claim(signal_date: str, *, claim_token: str, reason: str) -> bool:
     signal = str(signal_date or "").replace("-", "")[:8]
     with business_conn() as c:
@@ -1114,6 +1143,134 @@ def mark_daily_rebalance_plan_executed(
             (execution_id, executed_at, signal, str(claim_token or "")))
         if int(getattr(changed, "rowcount", 0) or 0) != 1:
             raise RuntimeError("正式调仓计划执行状态回写失败：执行租约不存在或已转移")
+
+
+EXECUTION_SLO_WINDOW_PLANS = 20
+EXECUTION_SLO_TARGETS = {
+    "resolved_due_plan_rate": 0.95,
+    "on_schedule_execution_rate": 0.95,
+    "execution_binding_integrity_rate": 1.0,
+}
+
+
+def _plan_has_actionable_orders(plan: dict[str, Any]) -> bool:
+    try:
+        contract = json.loads(plan.get("proposal_json") or "{}")
+    except (TypeError, json.JSONDecodeError):
+        return True
+    proposal = contract.get("proposal") if isinstance(contract, dict) else []
+    return any(
+        str(item.get("action") or "") not in {"", "hold", "observe"}
+        and abs(_safe_float(item.get("weight_change"))) > 1e-9
+        for item in proposal if isinstance(item, dict)
+    )
+
+
+def _plan_execution_authorized(plan: dict[str, Any]) -> bool:
+    try:
+        contract = json.loads(plan.get("proposal_json") or "{}")
+    except (TypeError, json.JSONDecodeError):
+        return False
+    return bool(contract.get("execution_authorized")) if isinstance(contract, dict) else False
+
+
+def build_execution_chain_slo(
+    plans: list[dict[str, Any]] | None = None,
+    operations: list[dict[str, Any]] | None = None,
+    *,
+    as_of_date: str | None = None,
+    window_plans: int = EXECUTION_SLO_WINDOW_PLANS,
+) -> dict[str, Any]:
+    """Measure plan-to-execution integrity from immutable plan and ledger links."""
+    _ensure_tables()
+    cutoff = str(as_of_date or datetime.now().astimezone().date().isoformat()).replace("-", "")[:8]
+    if plans is None:
+        with business_conn() as c:
+            rows = c.execute(
+                """SELECT * FROM daily_rebalance_plans
+                   WHERE status<>'superseded' ORDER BY trade_date DESC,version DESC LIMIT 200"""
+            ).fetchall()
+        plans = [dict(row) for row in rows]
+    if operations is None:
+        from app.db.store import list_operations
+        operations = list_operations(execution_id=None, limit=200000)
+    latest_by_signal: dict[str, dict[str, Any]] = {}
+    for plan in plans:
+        signal_date = str(plan.get("trade_date") or "").replace("-", "")[:8]
+        execute_date = str(plan.get("planned_execute_date") or "").replace("-", "")[:8]
+        if not signal_date or not execute_date or execute_date > cutoff:
+            continue
+        current = latest_by_signal.get(signal_date)
+        if current is None or int(plan.get("version") or 0) > int(current.get("version") or 0):
+            latest_by_signal[signal_date] = plan
+    due = sorted(
+        (item for item in latest_by_signal.values() if _plan_execution_authorized(item)),
+        key=lambda item: str(item.get("planned_execute_date") or ""), reverse=True,
+    )
+    due = due[:max(1, int(window_plans))]
+    selected_execution_ids = {int(item.get("execution_id") or 0) for item in due if int(item.get("execution_id") or 0) > 0}
+    scoped_operations = [item for item in operations if int(item.get("execution_id") or 0) in selected_execution_ids]
+    operation_execution_ids = {int(item.get("execution_id") or 0) for item in scoped_operations}
+    operation_uids = [str(item.get("operation_uid") or "") for item in scoped_operations if str(item.get("operation_uid") or "")]
+    duplicate_operation_uid_count = len(operation_uids) - len(set(operation_uids))
+    observations: list[dict[str, Any]] = []
+    for plan in reversed(due):
+        status = str(plan.get("status") or "")
+        execution_id = int(plan.get("execution_id") or 0)
+        actionable = _plan_has_actionable_orders(plan)
+        executed_at = str(plan.get("executed_at") or "")
+        executed_date = executed_at[:10].replace("-", "") if executed_at else ""
+        execute_date = str(plan.get("planned_execute_date") or "").replace("-", "")[:8]
+        resolved = status == "executed"
+        binding_valid = bool(resolved and ((actionable and execution_id in operation_execution_ids) or (not actionable and execution_id == 0)))
+        observations.append({
+            "plan_id": int(plan.get("id") or 0),
+            "signal_date": str(plan.get("trade_date") or "").replace("-", "")[:8],
+            "planned_execute_date": execute_date,
+            "status": status,
+            "actionable": actionable,
+            "execution_id": execution_id or None,
+            "resolved": resolved,
+            "on_schedule": bool(resolved and executed_date == execute_date),
+            "binding_valid": binding_valid,
+            "stranded_execution": status in {"executing", "blocked_by_execution_recovery"},
+        })
+    count = len(observations)
+
+    def rate(key: str) -> float | None:
+        return round(sum(bool(item.get(key)) for item in observations) / count, 6) if count else None
+
+    execution_ids = [int(item["execution_id"]) for item in observations if item.get("execution_id")]
+    metrics = {
+        "resolved_due_plan_rate": rate("resolved"),
+        "on_schedule_execution_rate": rate("on_schedule"),
+        "execution_binding_integrity_rate": rate("binding_valid"),
+        "duplicate_plan_execution_id_count": len(execution_ids) - len(set(execution_ids)),
+        "duplicate_operation_uid_count": duplicate_operation_uid_count,
+        "stranded_execution_count": sum(bool(item["stranded_execution"]) for item in observations),
+    }
+    enough_samples = count >= max(1, int(window_plans))
+    gates = {
+        key: bool(enough_samples and metrics[key] is not None and float(metrics[key]) >= target)
+        for key, target in EXECUTION_SLO_TARGETS.items()
+    }
+    gates.update({
+        "no_duplicate_plan_execution_ids": bool(enough_samples and metrics["duplicate_plan_execution_id_count"] == 0),
+        "no_duplicate_operation_uids": bool(enough_samples and metrics["duplicate_operation_uid_count"] == 0),
+        "no_stranded_executions": bool(enough_samples and metrics["stranded_execution_count"] == 0),
+    })
+    status = "observing" if not enough_samples else "passed" if all(gates.values()) else "failed"
+    return {
+        "schema_version": "alis_execution_chain_rolling_slo_v1",
+        "status": status,
+        "window_plans": int(window_plans),
+        "observed_due_plans": count,
+        "targets": EXECUTION_SLO_TARGETS,
+        "metrics": metrics,
+        "gates": gates,
+        "observations": observations,
+        "policy": "latest_execution_authorized_non_superseded_due_plan_per_signal_date; actionable_execution_requires_linked_operations; zero_order_execution_requires_frozen_no_action_proposal",
+    }
 
 
 def build_sell_rebalance_diagnostics(

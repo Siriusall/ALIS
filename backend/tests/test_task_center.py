@@ -32,6 +32,12 @@ def test_task_center_unifies_modules_tasks_next_time_and_logs(monkeypatch):
         "id": 1, "level": "INFO", "logger": "strategy", "message": "window completed",
         "context": {"window": 1}, "created_at": "2026-07-24T23:02:00+08:00",
     }])
+    monkeypatch.setattr("app.services.system_autonomy.build_autonomy_slo", lambda: {
+        "schema_version": "alis_autonomy_rolling_slo_v1", "status": "observing", "observed_sessions": 1,
+    })
+    monkeypatch.setattr("app.services.profit_loop.build_execution_chain_slo", lambda: {
+        "schema_version": "alis_execution_chain_rolling_slo_v1", "status": "observing", "observed_due_plans": 1,
+    })
 
     result = task_center.build_task_center(limit=20, log_limit=20)
 
@@ -48,6 +54,8 @@ def test_task_center_unifies_modules_tasks_next_time_and_logs(monkeypatch):
     data_module = next(item for item in result["modules"] if item["key"] == "data")
     assert data_module["status"] in {"waiting", "blocked"}
     assert result["logs"][0]["logger"] == "strategy"
+    assert result["autonomy_slo"]["status"] == "observing"
+    assert result["execution_slo"]["status"] == "observing"
 
 
 def test_cycle_step_uses_recorded_precise_times():

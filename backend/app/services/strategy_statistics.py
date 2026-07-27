@@ -11,6 +11,9 @@ from typing import Any
 
 BOOTSTRAP_REPLICATIONS = 2_000
 DSR_CONFIDENCE_THRESHOLD = 0.95
+DSR_MINIMUM_WINDOWS = 5
+DSR_MINIMUM_DAILY_OBSERVATIONS = 60
+OOS_PAIRED_RETURN_CONTRACT = "alis_oos_paired_daily_returns_v1"
 
 
 def _number(value: Any) -> float:
@@ -33,16 +36,35 @@ def deflated_sharpe_ratio(
     *,
     trial_count: int,
 ) -> dict[str, Any]:
-    """Deflate window-level excess Sharpe for the number of tried strategies."""
+    """Deflate daily OOS excess Sharpe while preserving window independence."""
     rows = [item for item in windows if bool(item.get("data_complete", True)) and bool(item.get("point_in_time_passed", True))]
-    excess = [_number((item.get("metrics") or {}).get("excess_return")) for item in rows]
+    observations: list[dict[str, Any]] = []
+    contracts_complete = True
+    for window in rows:
+        paired = window.get("paired_daily_returns") if isinstance(window.get("paired_daily_returns"), dict) else {}
+        if paired.get("schema_version") != OOS_PAIRED_RETURN_CONTRACT or paired.get("status") != "complete":
+            contracts_complete = False
+            continue
+        for item in paired.get("observations") or []:
+            if not isinstance(item, dict) or not str(item.get("date") or ""):
+                contracts_complete = False
+                continue
+            observations.append(item)
+    dates = [str(item.get("date") or "") for item in observations]
+    unique_dates = len(set(dates)) == len(dates)
+    excess = [
+        _number(item.get("strategy_return")) - _number(item.get("benchmark_return"))
+        for item in observations
+    ]
     sample_count = len(excess)
+    window_count = len(rows)
     trials = max(1, int(trial_count))
     mean = sum(excess) / sample_count if sample_count else 0.0
     centered = [value - mean for value in excess]
     variance = sum(value * value for value in centered) / max(1, sample_count - 1)
     standard_deviation = math.sqrt(max(0.0, variance))
-    observed_sharpe = mean / standard_deviation if standard_deviation > 0 else math.inf if mean > 0 else 0.0
+    observed_daily_sharpe = mean / standard_deviation if standard_deviation > 0 else math.inf if mean > 0 else 0.0
+    observed_annualized_sharpe = observed_daily_sharpe * math.sqrt(252) if math.isfinite(observed_daily_sharpe) else observed_daily_sharpe
     second_moment = sum(value * value for value in centered) / sample_count if sample_count else 0.0
     if second_moment > 0:
         skewness = (sum(value ** 3 for value in centered) / sample_count) / (second_moment ** 1.5)
@@ -50,10 +72,10 @@ def deflated_sharpe_ratio(
     else:
         skewness = 0.0
         kurtosis = 3.0
-    if sample_count >= 2 and math.isfinite(observed_sharpe):
+    if sample_count >= 2 and math.isfinite(observed_daily_sharpe):
         sharpe_standard_error = math.sqrt(max(
             1e-12,
-            (1.0 - skewness * observed_sharpe + ((kurtosis - 1.0) / 4.0) * observed_sharpe ** 2)
+            (1.0 - skewness * observed_daily_sharpe + ((kurtosis - 1.0) / 4.0) * observed_daily_sharpe ** 2)
             / (sample_count - 1),
         ))
     else:
@@ -67,27 +89,41 @@ def deflated_sharpe_ratio(
         )
     else:
         expected_max_sharpe = 0.0
-    if sample_count < 5:
+    evidence_complete = (
+        contracts_complete
+        and unique_dates
+        and window_count >= DSR_MINIMUM_WINDOWS
+        and sample_count >= DSR_MINIMUM_DAILY_OBSERVATIONS
+    )
+    if not evidence_complete:
         probability = None
-    elif math.isinf(observed_sharpe):
+    elif math.isinf(observed_daily_sharpe):
         probability = 1.0
     elif sharpe_standard_error > 0:
-        probability = NormalDist().cdf((observed_sharpe - expected_max_sharpe) / sharpe_standard_error)
+        probability = NormalDist().cdf((observed_daily_sharpe - expected_max_sharpe) / sharpe_standard_error)
     else:
         probability = 0.0
     return {
-        "schema_version": "alis_deflated_sharpe_ratio_v1",
+        "schema_version": "alis_deflated_sharpe_ratio_v2",
         "sample_count": sample_count,
+        "window_count": window_count,
         "trial_count": trials,
-        "observed_window_excess_sharpe": round(observed_sharpe, 8) if math.isfinite(observed_sharpe) else "infinity",
+        "return_contract": OOS_PAIRED_RETURN_CONTRACT,
+        "daily_return_contract_complete": contracts_complete,
+        "unique_trade_dates": unique_dates,
+        "minimum_daily_observations": DSR_MINIMUM_DAILY_OBSERVATIONS,
+        "minimum_windows": DSR_MINIMUM_WINDOWS,
+        "observed_daily_excess_sharpe": round(observed_daily_sharpe, 8) if math.isfinite(observed_daily_sharpe) else "infinity",
+        "observed_annualized_daily_excess_sharpe": round(observed_annualized_sharpe, 8) if math.isfinite(observed_annualized_sharpe) else "infinity",
         "expected_max_sharpe_under_selection": round(expected_max_sharpe, 8),
+        "selection_bias_sharpe_frequency": "daily",
         "sharpe_standard_error": round(sharpe_standard_error, 8),
         "skewness": round(skewness, 8),
         "kurtosis": round(kurtosis, 8),
         "probability_sharpe_exceeds_selection_bias": round(probability, 8) if probability is not None else None,
         "confidence_threshold": DSR_CONFIDENCE_THRESHOLD,
-        "passed": bool(probability is not None and probability >= DSR_CONFIDENCE_THRESHOLD),
-        "limitation": "仅使用正式OOS窗口级超额收益；小样本结果必须与未来影子和搜索预算共同使用。",
+        "passed": bool(evidence_complete and probability is not None and probability >= DSR_CONFIDENCE_THRESHOLD),
+        "limitation": "使用正式OOS窗口内配对非重叠日收益；仍须与五窗口稳定性、未来影子、成本和搜索预算共同使用。",
     }
 
 

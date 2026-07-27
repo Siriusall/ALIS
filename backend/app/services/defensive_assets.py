@@ -132,12 +132,18 @@ def defensive_allocation_for_state(
 
 
 def defensive_asset_bar(ts_code: str, trade_date: str) -> dict[str, Any] | None:
+    cutoff = str(trade_date).replace("-", "")
+    available_cutoff = (
+        f"{cutoff[:4]}-{cutoff[4:6]}-{cutoff[6:8]}T15:00:00"
+        if len(cutoff) == 8 and cutoff.isdigit()
+        else "9999-12-31T23:59:59"
+    )
     with _conn() as c:
         row = c.execute(
             """SELECT payload_json,available_time FROM dc_tushare_raw_records
-               WHERE api_name='fund_daily' AND ts_code=? AND trade_date=?
-               ORDER BY available_time DESC LIMIT 1""",
-            (str(ts_code), str(trade_date).replace("-", "")),
+               WHERE api_name='fund_daily' AND ts_code=? AND trade_date<=? AND available_time<=?
+               ORDER BY trade_date DESC, available_time DESC LIMIT 1""",
+            (str(ts_code), cutoff, available_cutoff),
         ).fetchone()
     if not row:
         return None

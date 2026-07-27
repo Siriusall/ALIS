@@ -67,3 +67,37 @@ def test_ensure_autonomous_simulation_task_starts_from_latest_data(monkeypatch):
         "max_steps": 1,
         "replay_mode": "autonomous_daily",
     }
+
+
+def test_autonomous_plan_uses_next_due_formal_plan(monkeypatch):
+    monkeypatch.setattr(
+        "app.services.profit_loop.list_pending_daily_rebalance_execution_inputs",
+        lambda: [
+            {"signal_date": "20260724", "execute_date": "20260727"},
+            {"signal_date": "20260723", "execute_date": "20260724"},
+        ],
+    )
+
+    plan = runner._build_autonomous_plan_context([
+        "2026-07-23", "2026-07-24", "2026-07-27",
+    ])
+
+    assert plan["ok"] is True
+    assert plan["start_idx"] == 0
+    assert plan["current_execute_date"] == "2026-07-24"
+
+
+def test_autonomous_plan_waits_when_no_due_formal_plan(monkeypatch):
+    monkeypatch.setattr(
+        "app.services.profit_loop.list_pending_daily_rebalance_execution_inputs",
+        lambda: [{"signal_date": "20260724", "execute_date": "20260727"}],
+    )
+
+    plan = runner._build_autonomous_plan_context(["2026-07-24"])
+
+    assert plan == {"ok": False, "reason": "no_due_formal_plan"}
+
+
+def test_autonomous_daily_mode_is_not_downgraded_to_replay():
+    assert runner._normalized_replay_mode("autonomous_daily") == "autonomous_daily"
+    assert runner._normalized_replay_mode("unknown") == "pragmatic_recover"

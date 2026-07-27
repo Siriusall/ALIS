@@ -9,6 +9,7 @@ from typing import Any, Iterable
 
 from app.db.store import _conn
 from app.services.backtest_data_source import BacktestDataSource, HistBar, SnapshotRow
+from app.services.factor_dsl import DSL_SCHEMA_VERSION, evaluate_expression
 from app.services.point_in_time import signal_available_time
 
 
@@ -49,6 +50,7 @@ CORE_ACTIVE_KEYS = {
     "pe_ttm", "pb", "is_st", "is_suspended", "is_limit_up", "is_limit_down",
 }
 NON_ALPHA_FACTOR_CATEGORIES = {"交易约束"}
+_DSL_FORMULA_CACHE: dict[str, dict[str, Any] | None] = {}
 
 
 def is_factor_governance_eligible(definition: dict[str, Any]) -> bool:
@@ -162,7 +164,53 @@ def compute_registered_factor(
         return 1.0 if _safe(row.change_pct) >= 9.7 else 0.0
     if key == "is_limit_down":
         return 1.0 if _safe(row.change_pct) <= -9.7 else 0.0
+    formula = _DSL_FORMULA_CACHE.get(key)
+    if key not in _DSL_FORMULA_CACHE:
+        try:
+            with _conn() as conn:
+                stored = conn.execute(
+                    """SELECT formula_json FROM factor_definitions
+                       WHERE factor_key=? AND status IN ('active','candidate','degraded')
+                       ORDER BY id DESC LIMIT 1""",
+                    (key,),
+                ).fetchone()
+            formula = json.loads(dict(stored).get("formula_json") or "{}") if stored else None
+        except Exception:
+            formula = None
+        _DSL_FORMULA_CACHE[key] = formula
+    if isinstance(formula, dict) and str(formula.get("engine") or "") == DSL_SCHEMA_VERSION:
+        expression = formula.get("expression")
+        if isinstance(expression, dict):
+            return evaluate_expression(expression, row, hist, daily_basic.get(row.symbol, {}))
     return 0.0
+
+
+def compute_factor_definition(
+    definition: dict[str, Any],
+    row: SnapshotRow,
+    hist: list[HistBar],
+    daily_basic: dict[str, dict[str, float]],
+    *,
+    benchmark_return: float | None = None,
+    benchmark_returns: list[float] | None = None,
+    industry_inputs: dict[str, float] | None = None,
+) -> float:
+    """Evaluate built-in and open DSL factors through one materialization path."""
+    formula = definition.get("formula") if isinstance(definition.get("formula"), dict) else {}
+    if str(formula.get("engine") or "") == DSL_SCHEMA_VERSION:
+        expression = formula.get("expression")
+        if not isinstance(expression, dict):
+            return 0.0
+        return evaluate_expression(expression, row, hist, daily_basic.get(row.symbol, {}))
+    return compute_registered_factor(
+        str(definition.get("factor_key") or ""),
+        row,
+        hist,
+        daily_basic,
+        benchmark_return=benchmark_return,
+        benchmark_returns=benchmark_returns,
+        industry_inputs=industry_inputs,
+    )
 
 
 def ensure_factor_registry() -> list[dict[str, Any]]:
@@ -384,8 +432,8 @@ def materialize_factor_snapshot(
         hist = ds.get_hist_window(row.symbol, date_key, max_window + 1)
         for definition in definitions:
             key = str(definition["factor_key"])
-            raw = compute_registered_factor(
-                key, row, hist, daily_basic,
+            raw = compute_factor_definition(
+                definition, row, hist, daily_basic,
                 benchmark_return=benchmark_return,
                 benchmark_returns=benchmark_returns,
                 industry_inputs=industry_inputs.get(row.symbol),
@@ -490,6 +538,7 @@ def evaluate_materialized_factors(
     trade_date: str,
     forward_date: str,
     transaction_cost: float = 0.0015,
+    forward_sessions: int = 1,
     data_source: BacktestDataSource | None = None,
 ) -> dict[str, Any]:
     definitions = ensure_factor_registry()
@@ -528,12 +577,31 @@ def evaluate_materialized_factors(
             rank_ic = _pearson(_ranks(xs), _ranks(ys))
             ordered = sorted(pairs, key=lambda item: item[0])
             bucket = max(1, len(ordered) // 5) if ordered else 1
+            quintile_returns = [
+                mean(item[1] for item in ordered[index * bucket:(index + 1) * bucket])
+                if ordered[index * bucket:(index + 1) * bucket] else 0.0
+                for index in range(5)
+            ]
             top = mean(item[1] for item in ordered[-bucket:]) if ordered else 0.0
             bottom = mean(item[1] for item in ordered[:bucket]) if ordered else 0.0
             spread = top - bottom
+            monotonicity = _pearson(
+                [float(index) for index in range(len(quintile_returns))],
+                quintile_returns,
+            )
             coverage = len(pairs) / max(1, len(start_rows))
             cost_after = spread - 2 * float(transaction_cost)
-            status = "healthy" if coverage >= 0.80 and rank_ic > 0 and cost_after > 0 else "degraded"
+            status = (
+                "healthy"
+                if coverage >= 0.80 and rank_ic > 0 and cost_after > 0 and monotonicity > 0
+                else "degraded"
+            )
+            diagnostics = {
+                "schema_version": "alis_factor_cross_section_diagnostics_v1",
+                "forward_sessions": int(forward_sessions),
+                "quintile_returns": [round(value, 8) for value in quintile_returns],
+                "monotonicity": round(monotonicity, 8),
+            }
             # Re-running a task must refresh the same future window, never
             # manufacture additional observations for the 20-window gate.
             conn.execute(
@@ -549,7 +617,8 @@ def evaluate_materialized_factors(
                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     int(definition["id"]), start_key, end_key, len(pairs), ic, rank_ic,
-                    spread, 1.0, coverage, cost_after, "{}", status, now,
+                    spread, 1.0, coverage, cost_after,
+                    json.dumps(diagnostics, ensure_ascii=False), status, now,
                 ),
             )
             results.append({
@@ -561,6 +630,9 @@ def evaluate_materialized_factors(
                 "top_bottom_return": round(spread, 8),
                 "coverage": round(coverage, 8),
                 "cost_after_incremental_oos": round(cost_after, 8),
+                "forward_sessions": int(forward_sessions),
+                "quintile_returns": diagnostics["quintile_returns"],
+                "monotonicity": diagnostics["monotonicity"],
                 "status": status,
             })
     return {
@@ -568,6 +640,7 @@ def evaluate_materialized_factors(
         "schema_version": "alis_factor_evaluation_v1",
         "start_date": start_key,
         "end_date": end_key,
+        "forward_sessions": int(forward_sessions),
         "results": results,
     }
 
@@ -578,16 +651,26 @@ def govern_factor_versions(minimum_evaluations: int = 20) -> dict[str, Any]:
     events: list[dict[str, Any]] = []
     now = datetime.now().astimezone().isoformat()
     with _conn() as conn:
+        trial_row = conn.execute(
+            """SELECT COUNT(*) AS n FROM factor_definitions
+               WHERE category<>'交易约束'"""
+        ).fetchone()
+        trial_count = max(1, int(dict(trial_row).get("n") or 1))
         for definition in definitions:
             if not is_factor_governance_eligible(definition):
                 continue
             rows = [
                 dict(row) for row in conn.execute(
                     """SELECT * FROM factor_evaluations
-                       WHERE factor_definition_id=? ORDER BY end_date DESC LIMIT 60""",
+                       WHERE factor_definition_id=?
+                       ORDER BY end_date DESC,start_date ASC LIMIT 240""",
                     (int(definition["id"]),),
                 ).fetchall()
             ]
+            unique_future_dates: dict[str, dict[str, Any]] = {}
+            for row in rows:
+                unique_future_dates.setdefault(str(row.get("end_date") or ""), row)
+            rows = list(unique_future_dates.values())
             if len(rows) < int(minimum_evaluations):
                 continue
             recent = rows[:int(minimum_evaluations)]
@@ -595,17 +678,36 @@ def govern_factor_versions(minimum_evaluations: int = 20) -> dict[str, Any]:
             avg_cost_after = mean(_safe(row.get("cost_after_incremental_oos")) for row in recent)
             avg_coverage = mean(_safe(row.get("coverage")) for row in recent)
             positive_ratio = sum(_safe(row.get("rank_ic")) > 0 for row in recent) / len(recent)
+            rank_ics = [_safe(row.get("rank_ic")) for row in recent]
+            rank_ic_variance = mean((value - avg_rank_ic) ** 2 for value in rank_ics)
+            rank_ic_standard_error = math.sqrt(rank_ic_variance / len(rank_ics)) if rank_ics else 0.0
+            raw_z = avg_rank_ic / rank_ic_standard_error if rank_ic_standard_error > 0 else 0.0
+            selection_penalty = math.sqrt(2.0 * math.log(max(1, trial_count)))
+            selection_adjusted_z = raw_z - selection_penalty
+            multiple_testing_passed = selection_adjusted_z >= 1.645
             evidence = {
                 "evaluation_count": len(recent),
                 "average_rank_ic": round(avg_rank_ic, 8),
                 "positive_rank_ic_ratio": round(positive_ratio, 8),
                 "average_cost_after_incremental_oos": round(avg_cost_after, 8),
                 "average_coverage": round(avg_coverage, 8),
+                "trial_count": trial_count,
+                "raw_rank_ic_z": round(raw_z, 8),
+                "selection_penalty": round(selection_penalty, 8),
+                "selection_adjusted_z": round(selection_adjusted_z, 8),
+                "multiple_testing_passed": multiple_testing_passed,
             }
             current = str(definition.get("status") or "")
             event_type = ""
             new_status = current
-            if current == "candidate" and avg_rank_ic >= 0.02 and positive_ratio >= 0.60 and avg_cost_after > 0 and avg_coverage >= 0.80:
+            if (
+                current == "candidate"
+                and avg_rank_ic >= 0.02
+                and positive_ratio >= 0.60
+                and avg_cost_after > 0
+                and avg_coverage >= 0.80
+                and multiple_testing_passed
+            ):
                 event_type, new_status = "promoted", "active"
             elif current == "active" and (avg_rank_ic <= -0.02 or avg_cost_after <= -0.01 or avg_coverage < 0.60):
                 event_type, new_status = "degraded", "degraded"
@@ -635,6 +737,7 @@ def govern_factor_versions(minimum_evaluations: int = 20) -> dict[str, Any]:
                 "to_status": new_status,
                 "evidence": evidence,
             })
+            _DSL_FORMULA_CACHE.pop(str(definition["factor_key"]), None)
     return {"ok": True, "events": events}
 
 
@@ -677,6 +780,9 @@ def block_factor_for_leakage(
 
 
 def run_factor_daily_cycle() -> dict[str, Any]:
+    from app.services.factor_discovery import run_open_factor_discovery_cycle
+
+    discovery = run_open_factor_discovery_cycle()
     ds = BacktestDataSource()
     dates = ds.get_available_trade_dates("2000-01-01", datetime.now().date().isoformat())
     if not dates:
@@ -688,18 +794,38 @@ def run_factor_daily_cycle() -> dict[str, Any]:
         ).fetchone()
     previous_materialized = str(dict(row).get("latest_date") or "") if row else ""
     materialized = materialize_factor_snapshot(trade_date=latest, data_source=ds)
-    evaluation: dict[str, Any] | None = None
-    if previous_materialized and previous_materialized < latest.replace("-", ""):
-        evaluation = evaluate_materialized_factors(
-            trade_date=previous_materialized,
-            forward_date=latest,
+    evaluations: list[dict[str, Any]] = []
+    latest_key = latest.replace("-", "")
+    available_keys = [str(value).replace("-", "") for value in dates]
+    for forward_sessions in (1, 5, 20, 60):
+        if len(available_keys) <= forward_sessions:
+            continue
+        start_key = available_keys[-forward_sessions - 1]
+        with _conn() as conn:
+            start_exists = conn.execute(
+                "SELECT 1 AS present FROM factor_values WHERE trade_date=? LIMIT 1",
+                (start_key,),
+            ).fetchone()
+        if not start_exists or start_key >= latest_key:
+            continue
+        evaluations.append(evaluate_materialized_factors(
+            trade_date=start_key,
+            forward_date=latest_key,
+            forward_sessions=forward_sessions,
             data_source=ds,
-        )
+        ))
+    evaluation = evaluations[0] if evaluations else None
     governance = govern_factor_versions()
+    from app.services.factor_strategy_evolution import run_factor_strategy_evolution_cycle
+
+    strategy_evolution = run_factor_strategy_evolution_cycle()
     return {
         "schema_version": "alis_factor_daily_cycle_v1",
         "status": "completed",
+        "discovery": discovery,
         "materialization": materialized,
         "evaluation": evaluation,
+        "evaluations": evaluations,
         "governance": governance,
+        "factor_strategy_evolution": strategy_evolution,
     }

@@ -35,3 +35,9 @@ def test_research_confidence_accepts_bounded_words():
 
 def test_research_lists_do_not_split_model_strings_into_characters():
     assert agent._string_list("样本不足", limit=8, item_limit=300) == ["样本不足"]
+
+
+def test_research_proposal_audit_json_is_fail_closed():
+    assert agent._json_object('{"status":"accepted"}') == {"status": "accepted"}
+    assert agent._json_object("not-json") == {}
+    assert agent._json_object("[]") == {}

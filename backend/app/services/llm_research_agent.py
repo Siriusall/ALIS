@@ -46,6 +46,66 @@ def _ensure_tables() -> None:
         )""")
 
 
+def _json_object(value: Any) -> dict[str, Any]:
+    try:
+        decoded = json.loads(value or "{}")
+    except (TypeError, json.JSONDecodeError):
+        decoded = {}
+    return decoded if isinstance(decoded, dict) else {}
+
+
+def list_llm_research_proposals(*, limit: int = 50) -> dict[str, Any]:
+    """Return proposal, deterministic assessment and route evidence without executing work."""
+    _ensure_tables()
+    n = max(1, min(int(limit or 50), 200))
+    with _conn() as conn:
+        conn.execute("""CREATE TABLE IF NOT EXISTS llm_research_proposal_assessments (
+            id BIGSERIAL PRIMARY KEY, proposal_id BIGINT NOT NULL UNIQUE, status VARCHAR(32) NOT NULL,
+            assessment_json TEXT NOT NULL DEFAULT '{}', created_at VARCHAR(64) NOT NULL, updated_at VARCHAR(64) NOT NULL
+        )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS llm_research_routes (
+            id BIGSERIAL PRIMARY KEY, proposal_id BIGINT NOT NULL, hypothesis_index INTEGER NOT NULL,
+            route_key VARCHAR(64) NOT NULL, status VARCHAR(32) NOT NULL, evidence_json TEXT NOT NULL DEFAULT '{}',
+            result_json TEXT NOT NULL DEFAULT '{}', created_at VARCHAR(64) NOT NULL, updated_at VARCHAR(64) NOT NULL,
+            UNIQUE(proposal_id,hypothesis_index,route_key)
+        )""")
+        proposals = [dict(row) for row in conn.execute(
+            "SELECT * FROM llm_research_proposals ORDER BY id DESC LIMIT ?", (n,),
+        ).fetchall()]
+        ids = [int(row["id"]) for row in proposals]
+        assessments: dict[int, dict[str, Any]] = {}
+        routes: dict[int, list[dict[str, Any]]] = {}
+        if ids:
+            placeholders = ",".join("?" for _ in ids)
+            for row in conn.execute(
+                f"SELECT * FROM llm_research_proposal_assessments WHERE proposal_id IN ({placeholders})", ids,
+            ).fetchall():
+                item = dict(row)
+                item["assessment"] = _json_object(item.pop("assessment_json", "{}"))
+                assessments[int(item["proposal_id"])] = item
+            for row in conn.execute(
+                f"SELECT * FROM llm_research_routes WHERE proposal_id IN ({placeholders}) ORDER BY id", ids,
+            ).fetchall():
+                item = dict(row)
+                item["evidence"] = _json_object(item.pop("evidence_json", "{}"))
+                item["result"] = _json_object(item.pop("result_json", "{}"))
+                routes.setdefault(int(item["proposal_id"]), []).append(item)
+    items = []
+    for row in proposals:
+        proposal_id = int(row["id"])
+        row["payload"] = _json_object(row.pop("payload_json", "{}"))
+        row["assessment"] = assessments.get(proposal_id)
+        row["routes"] = routes.get(proposal_id, [])
+        items.append(row)
+    return {
+        "ok": True,
+        "schema_version": "alis_llm_research_proposal_audit_v1",
+        "count": len(items),
+        "items": items,
+        "policy": "read_only; proposal_evidence_only; no_generation_or_execution",
+    }
+
+
 def _normalise_proposal(payload: dict[str, Any], context: dict[str, Any]) -> dict[str, Any]:
     hypotheses = []
     for item in payload.get("hypotheses") or []:

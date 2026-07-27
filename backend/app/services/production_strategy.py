@@ -187,7 +187,13 @@ def champion_execution_gate() -> dict[str, Any]:
             "aggregate_excess_return": summary.get("aggregate_excess_return"),
             "blocking_reasons": list(formal.get("blocking_reasons") or []),
         },
-        "policy": "block_new_and_add_positions_allow_reduce_sell_and_audit_only",
+        "defensive_continuity": {
+            "enabled": True,
+            "maximum_total_weight": 0.30,
+            "asset_scope": "registered_defensive_etf_only",
+            "individual_equity_buys_allowed": False,
+        },
+        "policy": "block_equity_new_and_add_allow_bounded_defensive_etf_reduce_sell_and_audit",
     }
 
 

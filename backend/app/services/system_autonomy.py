@@ -6,6 +6,7 @@ import os
 import threading
 from typing import Any, Callable
 
+from app.core.error_evidence import error_evidence
 from app.db.store import _conn
 
 
@@ -376,11 +377,40 @@ def latest_owner_summary() -> dict[str, Any]:
     except Exception:
         result = {}
     summary = result.get("owner_summary") or {}
+
+    def append_read_error(exc: BaseException, operation: str) -> None:
+        questions = summary.setdefault("questions", {})
+        questions.setdefault("evidence_errors", []).append(
+            error_evidence(
+                exc,
+                operation=operation,
+                source="owner_summary",
+                deferred=True,
+            )
+        )
     if (
         str(summary.get("schema_version") or "") not in {"alis_owner_daily_summary_v2", "alis_owner_daily_summary_v3"}
         and isinstance(result.get("steps"), list)
     ):
         summary = _owner_summary(result["steps"])
+    try:
+        from app.services.acceptance_progress import build_acceptance_progress
+
+        summary["acceptance_progress"] = build_acceptance_progress()
+    except Exception as exc:
+        evidence = error_evidence(
+            exc,
+            operation="owner_summary:acceptance_progress",
+            source="owner_summary",
+            deferred=True,
+        )
+        summary["acceptance_progress"] = {
+            "schema_version": "alis_acceptance_progress_v1",
+            "status": "unavailable",
+            "stages": [],
+            "error": evidence["message"],
+            "error_evidence": evidence,
+        }
     try:
         from app.services.sealed_strategy_holdout import audit_sealed_strategy_holdout
         holdout = audit_sealed_strategy_holdout(include_dates=False)
@@ -396,8 +426,8 @@ def latest_owner_summary() -> dict[str, Any]:
             supervision["waiting_condition_count"] = sum(1 for case in supervision["cases"] if case.get("resolution_class") == "waiting_condition")
             supervision["status"] = "owner_action_required" if supervision["owner_action_required_count"] else "self_managed" if supervision["cases"] else "healthy"
             questions["incident_supervision"] = supervision
-    except Exception:
-        pass
+    except Exception as exc:
+        append_read_error(exc, "owner_summary:sealed_holdout")
     try:
         from app.services.profit_loop import get_latest_daily_rebalance_plan
         latest_plan = get_latest_daily_rebalance_plan()
@@ -426,8 +456,8 @@ def latest_owner_summary() -> dict[str, Any]:
                 for action in actionable
             ],
         }
-    except Exception:
-        pass
+    except Exception as exc:
+        append_read_error(exc, "owner_summary:latest_rebalance_plan")
     try:
         from app.services.profit_loop import build_portfolio_candles
         comparison_payload = build_portfolio_candles(limit=90)
@@ -442,8 +472,8 @@ def latest_owner_summary() -> dict[str, Any]:
                 ),
                 "benchmark_period_end": comparison.get("date"),
             })
-    except Exception:
-        pass
+    except Exception as exc:
+        append_read_error(exc, "owner_summary:portfolio_comparison")
     try:
         from app.services.simulation_ledger_audit import audit_simulation_ledger
         ledger = audit_simulation_ledger(persist=False)
@@ -466,9 +496,41 @@ def latest_owner_summary() -> dict[str, Any]:
     except Exception as exc:
         questions = summary.setdefault("questions", {})
         anomalies = questions.setdefault("anomalies", [])
-        anomalies.append({"module": "simulation_ledger_audit", "message": f"独立账本审计失败：{str(exc)[:300]}"})
+        evidence = error_evidence(
+            exc,
+            operation="owner_summary:simulation_ledger_audit",
+            source="owner_summary",
+        )
+        anomalies.append({
+            "module": "simulation_ledger_audit",
+            "message": f"独立账本审计失败：{evidence['message']}",
+            "error_evidence": evidence,
+        })
         supervision = questions.get("incident_supervision") if isinstance(questions.get("incident_supervision"), dict) else {}
         summary["healthy"] = int(supervision.get("owner_action_required_count") or 0) == 0 if supervision else False
+    try:
+        # The stored daily summary is historical evidence, but execution
+        # permission is live state. Never leave the UI on a stale Champion gate
+        # after quarantine, promotion, rollback, or recovery-policy changes.
+        from app.services.production_strategy import champion_execution_gate
+
+        questions = summary.setdefault("questions", {})
+        changes = questions.setdefault("system_changes", {})
+        changes["champion_execution_gate"] = champion_execution_gate()
+    except Exception as exc:
+        questions = summary.setdefault("questions", {})
+        changes = questions.setdefault("system_changes", {})
+        evidence = error_evidence(
+            exc,
+            operation="owner_summary:champion_execution_gate",
+            source="owner_summary",
+        )
+        changes["champion_execution_gate"] = {
+            "status": "unavailable",
+            "mode": "fail_closed",
+            "reason": f"live_champion_gate_unavailable:{evidence['message']}",
+            "error_evidence": evidence,
+        }
     return {
         "ok": True,
         "available": True,
@@ -476,4 +538,108 @@ def latest_owner_summary() -> dict[str, Any]:
         "task_status": str(item.get("status") or ""),
         "finished_at": str(item.get("finished_at") or ""),
         "summary": summary,
+    }
+
+
+AUTONOMY_SLO_WINDOW_SESSIONS = 20
+AUTONOMY_SLO_TARGETS = {
+    "cycle_completion_rate": 0.95,
+    "critical_data_gate_rate": 0.95,
+    "ledger_zero_drift_rate": 1.0,
+    "recovery_rate": 0.90,
+}
+
+
+def _autonomy_trade_date(task: dict[str, Any]) -> str:
+    result = task.get("result") if isinstance(task.get("result"), dict) else {}
+    steps = result.get("steps") if isinstance(result.get("steps"), list) else []
+    decision = next((item for item in steps if item.get("name") == "decision_data_gate"), {})
+    decision_result = decision.get("result") if isinstance(decision.get("result"), dict) else {}
+    value = (
+        decision_result.get("target_trade_date")
+        or decision_result.get("latest_decision_ready_trade_date")
+        or (task.get("payload") or {}).get("trade_date")
+        or str(task.get("created_at") or "")[:10]
+    )
+    return str(value or "").replace("-", "")[:8]
+
+
+def build_autonomy_slo(tasks: list[dict[str, Any]] | None = None, *, window_sessions: int = AUTONOMY_SLO_WINDOW_SESSIONS) -> dict[str, Any]:
+    """Measure rolling autonomy reliability from persisted cycle evidence."""
+    if tasks is None:
+        with _conn() as conn:
+            rows = conn.execute(
+                """SELECT * FROM evolution_tasks WHERE task_type='system_autonomy_cycle'
+                   ORDER BY id DESC LIMIT 200"""
+            ).fetchall()
+        from app.services.evolution_orchestrator import _row
+        tasks = [_row(row) for row in rows]
+    sessions: dict[str, list[dict[str, Any]]] = {}
+    for task in tasks:
+        if str(task.get("task_type") or "") != "system_autonomy_cycle":
+            continue
+        trade_date = _autonomy_trade_date(task)
+        if trade_date:
+            sessions.setdefault(trade_date, []).append(task)
+    selected_dates = sorted(sessions, reverse=True)[:max(1, int(window_sessions))]
+    observations: list[dict[str, Any]] = []
+    for trade_date in sorted(selected_dates):
+        attempts = sorted(sessions[trade_date], key=lambda item: int(item.get("id") or 0))
+        successful = [item for item in attempts if str(item.get("status") or "") == "completed"]
+        latest = successful[-1] if successful else attempts[-1]
+        result = latest.get("result") if isinstance(latest.get("result"), dict) else {}
+        steps = result.get("steps") if isinstance(result.get("steps"), list) else []
+        by_name = {str(item.get("name") or ""): item for item in steps if isinstance(item, dict)}
+        hard_result = (by_name.get("hard_data_gate") or {}).get("result") or {}
+        decision_result = (by_name.get("decision_data_gate") or {}).get("result") or {}
+        hard_data_ok = bool((by_name.get("hard_data_gate") or {}).get("ok")) and str(hard_result.get("status") or "") == "ready"
+        decision_data_ok = (
+            bool((by_name.get("decision_data_gate") or {}).get("ok"))
+            and bool(decision_result.get("decision_ready", decision_result.get("ok", False)))
+        )
+        ledger_result = (by_name.get("simulation_ledger_audit") or {}).get("result") or {}
+        ledger_ok = bool((by_name.get("simulation_ledger_audit") or {}).get("ok")) and abs(float(ledger_result.get("cash_drift") or 0.0)) <= .01 and not (ledger_result.get("position_deltas") or [])
+        observations.append({
+            "trade_date": trade_date,
+            "attempt_count": len(attempts),
+            "completed_count": len(successful),
+            "cycle_completed": bool(successful),
+            "critical_data_gates_passed": hard_data_ok and decision_data_ok,
+            "ledger_zero_drift": ledger_ok,
+            "recovery_required": len(attempts) > 1 or any(str(item.get("status") or "") in {"failed", "retry_wait"} for item in attempts[:-1]),
+            "recovered": bool(successful),
+        })
+    count = len(observations)
+    recovery_rows = [item for item in observations if item["recovery_required"]]
+
+    def rate(key: str, rows: list[dict[str, Any]] = observations) -> float | None:
+        return round(sum(bool(item.get(key)) for item in rows) / len(rows), 6) if rows else None
+
+    metrics = {
+        "cycle_completion_rate": rate("cycle_completed"),
+        "critical_data_gate_rate": rate("critical_data_gates_passed"),
+        "ledger_zero_drift_rate": rate("ledger_zero_drift"),
+        "recovery_rate": rate("recovered", recovery_rows),
+        "duplicate_successful_cycle_count": sum(max(0, int(item["completed_count"]) - 1) for item in observations),
+    }
+    enough_samples = count >= max(1, int(window_sessions))
+    gates = {
+        key: bool(enough_samples and metrics[key] is not None and float(metrics[key]) >= target)
+        for key, target in AUTONOMY_SLO_TARGETS.items()
+        if key != "recovery_rate" or recovery_rows
+    }
+    gates["no_duplicate_successful_cycles"] = bool(enough_samples and metrics["duplicate_successful_cycle_count"] == 0)
+    status = "observing" if not enough_samples else "passed" if all(gates.values()) else "failed"
+    return {
+        "schema_version": "alis_autonomy_rolling_slo_v1",
+        "status": status,
+        "window_sessions": int(window_sessions),
+        "observed_sessions": count,
+        "window_start": observations[0]["trade_date"] if observations else None,
+        "window_end": observations[-1]["trade_date"] if observations else None,
+        "targets": AUTONOMY_SLO_TARGETS,
+        "metrics": metrics,
+        "gates": gates,
+        "observations": observations,
+        "limitations": ["T日计划到T+1成交的跨表及时率由后续执行链SLO单独验收。"],
     }

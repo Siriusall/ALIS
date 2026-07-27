@@ -1,4 +1,5 @@
 from contextlib import contextmanager
+import json
 
 from app.services import profit_loop
 
@@ -112,3 +113,46 @@ def test_formal_plan_can_only_be_claimed_once(monkeypatch):
     assert first and first["execution_claim_token"] == "task-1"
     assert second is None
     assert state == {"status": "executing", "token": "task-1"}
+
+
+def _slo_plan(index: int, *, actionable: bool = True, status: str = "executed", execution_id: int | None = None) -> dict:
+    signal_day = index
+    execute_day = index + 1
+    proposal = [{"action": "buy", "weight_change": .1}] if actionable else [{"action": "hold", "weight_change": 0}]
+    return {
+        "id": index, "trade_date": f"202607{signal_day:02d}", "planned_execute_date": f"202607{execute_day:02d}",
+        "version": 1, "status": status, "execution_id": execution_id,
+        "executed_at": f"2026-07-{execute_day:02d}T16:05:00+08:00" if status == "executed" else None,
+        "proposal_json": json.dumps({"proposal": proposal, "execution_authorized": True}),
+    }
+
+
+def test_execution_chain_slo_observes_then_passes_linked_and_zero_order_plans(monkeypatch):
+    monkeypatch.setattr(profit_loop, "_ensure_tables", lambda: None)
+    plans = [_slo_plan(index, execution_id=index) for index in range(1, 20)]
+    plans.append(_slo_plan(20, actionable=False, execution_id=None))
+    operations = [
+        {"execution_id": index, "operation_uid": f"op-{index}"}
+        for index in range(1, 20)
+    ]
+    observing = profit_loop.build_execution_chain_slo(plans[:19], operations, as_of_date="20260731")
+    passed = profit_loop.build_execution_chain_slo(plans, operations, as_of_date="20260731")
+    assert observing["status"] == "observing"
+    assert passed["status"] == "passed"
+    assert passed["metrics"]["execution_binding_integrity_rate"] == 1.0
+
+
+def test_execution_chain_slo_fails_duplicates_stranded_and_late_execution(monkeypatch):
+    monkeypatch.setattr(profit_loop, "_ensure_tables", lambda: None)
+    plans = [_slo_plan(index, execution_id=index) for index in range(1, 21)]
+    plans[0]["execution_id"] = 2
+    plans[1]["executed_at"] = "2026-07-05T16:05:00+08:00"
+    plans[2].update(status="blocked_by_execution_recovery", executed_at=None, execution_id=None)
+    operations = [{"execution_id": index, "operation_uid": f"op-{index}"} for index in range(1, 21)]
+    operations.append({"execution_id": 2, "operation_uid": "op-2"})
+    result = profit_loop.build_execution_chain_slo(plans, operations, as_of_date="20260731")
+    assert result["status"] == "failed"
+    assert result["metrics"]["duplicate_plan_execution_id_count"] == 1
+    assert result["metrics"]["duplicate_operation_uid_count"] == 1
+    assert result["metrics"]["stranded_execution_count"] == 1
+    assert result["gates"]["on_schedule_execution_rate"] is False

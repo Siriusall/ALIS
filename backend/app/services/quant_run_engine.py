@@ -1,10 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from datetime import datetime, timezone
 import math
 import os
-from pathlib import Path
 import time
 from typing import Any, Callable, Dict, List, Optional
 from types import SimpleNamespace
@@ -31,7 +29,6 @@ from app.services.rebalance_allocator import allocate_buy_orders, planned_to_ord
 from app.services.decision_store import create_decision_snapshot
 from app.services.advanced_controls import black_litterman_weights
 from app.services.stock_pool_sync import sync_pool_from_confirmed_execution
-from app.services.cache_consolidation import list_available_trade_dates
 from app.services.strategy_recommender import recommend_strategy_template
 from app.services.strategy_config import (
     get_strategy_factor_names,
@@ -45,61 +42,17 @@ from app.services.industry_allocator import apply_industry_targets, build_indust
 from app.services.strategy_controller import build_strategy_action_contracts, build_strategy_rebalance_actions, build_target_weight_explanations
 from app.services.production_strategy import champion_execution_gate, champion_strategy_policy_context, resolve_production_strategy_champion
 from app.services.point_in_time import signal_available_time
+from app.services.quant_run_contracts import (
+    HistoricalDataMissingError,
+    QuantRunExecResult,
+    ReplayRiskGateError,
+    require_consistent_simulation_ledger as _require_consistent_simulation_ledger,
+)
+from app.services import quant_run_primitives as _primitives
+from app.services.quant_run_plan_input import build_authoritative_selection_detail, normalize_authoritative_plan
 
 _SCORING_HEARTBEAT_EVERY = max(100, min(int(os.getenv("QUANT_SCORING_HEARTBEAT_EVERY", "300")), 2000))
 _SCORING_TIMEOUT_SEC = max(10, min(int(os.getenv("QUANT_SCORING_TIMEOUT_SEC", "90")), 1800))
-
-
-class HistoricalDataMissingError(Exception):
-    """
-    历史数据缺失（统一映射为 508）。
-    用于任务线程/接口层识别后触发 backfill。
-    """
-
-    def __init__(self, message: str = "历史交易数据不足，无法执行任务", code: str = "historical_data_missing_508"):
-        self.status_code = 508
-        self.code = code
-        super().__init__(message)
-
-
-class ReplayRiskGateError(Exception):
-    """补跑风控门触发（数据门/资金门/时段门）。"""
-
-    def __init__(self, message: str, code: str = "replay_risk_gate"):
-        self.code = code
-        super().__init__(message)
-
-
-def _require_consistent_simulation_ledger() -> None:
-    """Stop new mutations when the account projection no longer matches its ledger."""
-    from app.services.simulation_ledger_audit import audit_simulation_ledger
-
-    audit = audit_simulation_ledger(persist=False)
-    if audit.get("ok"):
-        return
-    raise ReplayRiskGateError(
-        "模拟账户独立账本校验未通过，已阻断新成交：" + "；".join(
-            str(item.get("message") or "") for item in (audit.get("issues") or [])
-        ),
-        code="paused_simulation_ledger_drift",
-    )
-
-
-@dataclass
-class QuantRunExecResult:
-    signal_date: str
-    execute_date: str
-    sold_count: int
-    bought_count: int
-    total_buy_cost: float
-    execution_id: int | None
-    message: str
-    planned_buy_count: int = 0
-    executed_buy_count: int = 0
-    fill_rate_pct: float = 0.0
-    avg_slippage_bps: float = 0.0
-    exec_latency_ms: int = 0
-    detail: Dict[str, Any] | None = None
 
 
 def _ts_code(symbol: str) -> str:
@@ -251,60 +204,24 @@ def _frozen_research_evidence(symbol: str, *, as_of_time: str) -> tuple[Dict[str
     return research_payload, valuation_payload
 
 
-def _repo_root() -> Path:
-    return Path(__file__).resolve().parents[3]
-
-
 def list_consolidated_trade_dates() -> List[str]:
-    out: List[str] = []
-    for ymd in list_available_trade_dates():
-        if len(ymd) == 8 and ymd.isdigit():
-            out.append(f"{ymd[:4]}-{ymd[4:6]}-{ymd[6:8]}")
-    return sorted(set(out))
+    return _primitives.list_consolidated_trade_dates()
 
 
 def require_consolidated_trade_dates(min_count: int = 2) -> List[str]:
-    dates = list_consolidated_trade_dates()
-    if len(dates) < max(1, int(min_count or 2)):
-        raise HistoricalDataMissingError("可用交易日不足，无法执行任务/补跑")
-    return dates
+    return _primitives.require_consolidated_trade_dates(min_count, date_loader=list_consolidated_trade_dates)
 
 
 def resolve_execute_date(signal_date: str) -> tuple[str, bool]:
-    """根据信号日解析执行日。返回 (execute_date, same_day_fallback)。"""
-    dates = list_consolidated_trade_dates()
-    sig = str(signal_date or "").strip()
-    if sig not in dates:
-        raise ValueError(f"signal_date 不在可用交易日列表: {sig}")
-    idx = dates.index(sig)
-    if idx + 1 < len(dates):
-        return dates[idx + 1], False
-    return sig, True
+    return _primitives.resolve_execute_date(signal_date, date_loader=list_consolidated_trade_dates)
 
 
 def _row_trade_price(row: Any, *, prefer_open: bool = True) -> float:
-    if row is None:
-        return 0.0
-    open_px = float(getattr(row, "open", 0) or 0)
-    close_px = float(getattr(row, "close", 0) or 0)
-    if prefer_open and open_px > 0:
-        return open_px
-    if close_px > 0:
-        return close_px
-    return open_px
+    return _primitives.row_trade_price(row, prefer_open=prefer_open)
 
 
 def _parse_risk_budget(risk_budget: Dict[str, Any] | None) -> tuple[float, float]:
-    rb = risk_budget if isinstance(risk_budget, dict) else {}
-    try:
-        target_pct = float(rb.get("target_position_pct", 1.0) or 1.0)
-    except Exception:
-        target_pct = 1.0
-    try:
-        max_single = float(rb.get("max_single_position_pct", 0.15) or 0.15)
-    except Exception:
-        max_single = 0.15
-    return max(0.0, min(1.0, target_pct)), max(0.0, min(1.0, max_single))
+    return _primitives.parse_risk_budget(risk_budget)
 
 
 def _portfolio_state(ds: BacktestDataSource, valuation_date: str) -> Dict[str, Any]:
@@ -757,30 +674,20 @@ def run_for_trade_date(
     _require_consistent_simulation_ledger()
     execution_guard = champion_execution_gate()
     champion_quarantined = str(execution_guard.get("status") or "") == "quarantined"
+    defensive_continuity = (
+        execution_guard.get("defensive_continuity")
+        if isinstance(execution_guard.get("defensive_continuity"), dict)
+        else {}
+    )
     _report("正在加载快照")
     if authoritative_plan:
-        target_symbols = [str(x).strip() for x in authoritative_plan.get("target_symbols") or [] if str(x).strip()]
-        selection_detail = {
-            "signal_date": signal_date,
-            "exchange_group": exchange_group,
-            "strategy_template": {"id": "authoritative_daily_plan", "name": "统一日调仓计划"},
-            "risk_budget": authoritative_plan.get("risk_budget") or {},
-            "selections": [
-                {"symbol": str(item.get("symbol") or ""), "name": str(item.get("name") or ""),
-                 "score": float(item.get("expected_20d_return") or 0) * 100}
-                for item in authoritative_plan.get("proposal") or []
-                if str(item.get("symbol") or "") in target_symbols
-            ],
-            "blocked_events": [], "sell_triggers": [],
-            "plan_provenance": {
-                "source": "daily_rebalance_plans",
-                "plan_id": authoritative_plan.get("plan_id"),
-                "plan_version": authoritative_plan.get("plan_version"),
-                "input_hash": authoritative_plan.get("input_hash"),
-                "execution_claim_token": authoritative_plan.get("execution_claim_token"),
-            },
-            "decision_version_manifest": authoritative_plan.get("decision_version_manifest") or {},
-        }
+        authoritative_plan = normalize_authoritative_plan(authoritative_plan)
+        target_symbols = list(authoritative_plan["target_symbols"])
+        selection_detail = build_authoritative_selection_detail(
+            authoritative_plan,
+            signal_date=signal_date,
+            exchange_group=exchange_group,
+        )
     else:
         target_symbols, selection_detail = _build_target_symbols(
             ds=ds,
@@ -802,7 +709,7 @@ def run_for_trade_date(
             "date": execute_date,
             "side": "BUY",
             "code": "champion_formal_oos_quarantined",
-            "message": "当前 Champion 正式 OOS 失败；已隔离新开仓和加仓，仅允许减仓、卖出与账本审计",
+            "message": "当前 Champion 正式 OOS 失败；已隔离个股新开仓和加仓，仅允许受限防御 ETF、减仓、卖出与账本审计",
             "execution_guard": execution_guard,
         })
     target_symbols = target_symbols[:max(1, int(top_n))]
@@ -831,10 +738,27 @@ def run_for_trade_date(
     defensive_policy = dynamic_gate.get("defensive_allocation") or {}
     defensive_weights = {str(code).split(".")[0]: float(weight) for code, weight in (defensive_policy.get("target_weights") or {}).items()}
     if champion_quarantined:
-        # A defensive ETF is still a new/add order.  Formal OOS isolation is
-        # intentionally stricter: cash is acceptable while the failed bundle
-        # is only retained as a research reference.
-        defensive_weights = {}
+        if bool(defensive_continuity.get("enabled")):
+            maximum = max(
+                0.0,
+                min(
+                    float(defensive_continuity.get("maximum_total_weight") or 0.0),
+                    0.30,
+                ),
+            )
+            total = sum(max(0.0, weight) for weight in defensive_weights.values())
+            scale = (maximum / total) if total > maximum > 0 else 1.0
+            defensive_weights = {
+                symbol: max(0.0, weight) * scale
+                for symbol, weight in defensive_weights.items()
+                if weight > 0
+            } if maximum > 0 else {}
+            dynamic_gate["defensive_continuity"] = {
+                **defensive_continuity,
+                "applied_total_weight": round(sum(defensive_weights.values()), 8),
+            }
+        else:
+            defensive_weights = {}
     high_risk_symbols = {
         str(item.get("symbol") or "") for item in (dynamic_gate.get("items") or [])
         if str((item.get("risk") or {}).get("risk_level") or "") == "high"
@@ -1041,9 +965,9 @@ def run_for_trade_date(
         blocked_events.append({"date": execute_date, "side": "BUY", "code": "marginal_cvar_infeasible", "message": marginal_cvar.get("reason") or "单股边际CVaR贡献12%硬约束不可行"})
     if authoritative_plan:
         planned_weights = {
-            str(symbol): max(0.0, float(weight or 0))
+            str(symbol): float(weight)
             for symbol, weight in (authoritative_plan.get("target_weights") or {}).items()
-            if str(symbol) in target_symbols and float(weight or 0) > 0
+            if str(symbol) in target_symbols and float(weight) > 0
         }
         cvar_weights = planned_weights
         optimizer_name = "authoritative_daily_plan_weights_v1"

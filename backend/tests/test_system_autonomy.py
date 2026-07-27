@@ -168,6 +168,41 @@ def test_data_gate_skip_keeps_research_mutation_out_of_the_cycle():
     assert step["result"]["reason"] == "skipped_latest_decision_data_gate"
 
 
+def _slo_task(task_id: int, trade_date: str, *, status: str = "completed", cash_drift: float = 0.0) -> dict:
+    return {
+        "id": task_id, "task_type": "system_autonomy_cycle", "status": status,
+        "created_at": f"{trade_date[:4]}-{trade_date[4:6]}-{trade_date[6:]}T17:00:00+08:00",
+        "payload": {"trade_date": trade_date},
+        "result": {"steps": [
+            {"name": "hard_data_gate", "ok": True, "result": {"status": "ready"}},
+            {"name": "decision_data_gate", "ok": True, "result": {"target_trade_date": trade_date, "decision_ready": True}},
+            {"name": "simulation_ledger_audit", "ok": cash_drift == 0, "result": {"cash_drift": cash_drift, "position_deltas": []}},
+        ]} if status == "completed" else {},
+    }
+
+
+def test_autonomy_slo_observes_until_twenty_sessions_then_passes():
+    tasks = [_slo_task(index, f"202607{index:02d}") for index in range(1, 21)]
+    observing = system_autonomy.build_autonomy_slo(tasks[:19])
+    passed = system_autonomy.build_autonomy_slo(tasks)
+    assert observing["status"] == "observing"
+    assert observing["observed_sessions"] == 19
+    assert passed["status"] == "passed"
+    assert passed["metrics"]["cycle_completion_rate"] == 1.0
+    assert passed["metrics"]["duplicate_successful_cycle_count"] == 0
+
+
+def test_autonomy_slo_fails_duplicate_success_and_ledger_drift():
+    tasks = [_slo_task(index, f"202607{index:02d}") for index in range(1, 21)]
+    tasks.append(_slo_task(21, "20260720"))
+    tasks[0] = _slo_task(1, "20260701", cash_drift=1.0)
+    result = system_autonomy.build_autonomy_slo(tasks)
+    assert result["status"] == "failed"
+    assert result["metrics"]["duplicate_successful_cycle_count"] == 1
+    assert result["gates"]["no_duplicate_successful_cycles"] is False
+    assert result["gates"]["ledger_zero_drift_rate"] is False
+
+
 def test_step_timeout_records_failure_without_blocking_bus(monkeypatch):
     monkeypatch.setattr(system_autonomy, "_STEP_TIMEOUT_SECONDS", 0.02)
 

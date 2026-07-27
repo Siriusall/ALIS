@@ -5,6 +5,11 @@ from types import SimpleNamespace
 from app.services import simulation_ledger
 
 
+class _UnexpectedNumericError:
+    def __float__(self):
+        raise RuntimeError("unexpected numeric failure")
+
+
 def test_simulation_ledger_exposes_operations_fees_and_task_context(monkeypatch):
     monkeypatch.setattr(simulation_ledger, "list_executions", lambda limit=20: [
         {"id": 11, "strategy_id": 1, "executed_at": "2026-07-15T09:30:00", "orders": [{"symbol": "000001", "status": "filled"}]},
@@ -51,3 +56,46 @@ def test_simulation_ledger_exposes_operations_fees_and_task_context(monkeypatch)
     assert op["assumption"]["slippage_bps"] == 10.0
     assert op["mark_to_market_pnl"] == 50.0
     assert item["links"]["task_run_detail"].endswith("execute_date=2026-07-15")
+    assert result["evidence_warnings"] == []
+
+
+def test_numeric_parsing_only_tolerates_conversion_errors():
+    assert simulation_ledger._safe_float("invalid") == 0.0
+    assert simulation_ledger._safe_int("invalid") == 0
+
+    try:
+        simulation_ledger._safe_float(_UnexpectedNumericError())
+    except RuntimeError as exc:
+        assert str(exc) == "unexpected numeric failure"
+    else:
+        raise AssertionError("unexpected numeric errors must remain visible")
+
+
+def test_simulation_ledger_exposes_optional_evidence_failures(monkeypatch):
+    monkeypatch.setattr(simulation_ledger, "list_executions", lambda limit=20: [
+        {"id": 11, "strategy_id": 1, "executed_at": "2026-07-15T09:30:00", "orders": []},
+    ])
+    monkeypatch.setattr(simulation_ledger, "list_recent_quant_run_task_records", lambda limit=100: [
+        {"id": 5, "task_id": 3, "signal_date": "2026-07-14", "execute_date": "2026-07-15", "execution_id": 11},
+    ])
+    monkeypatch.setattr(
+        simulation_ledger,
+        "list_quant_run_task_records",
+        lambda task_id, limit=5000: (_ for _ in ()).throw(RuntimeError("task lookup failed")),
+    )
+    monkeypatch.setattr(simulation_ledger, "list_operations", lambda execution_id, limit=5000: [])
+
+    class FailingDS:
+        def load_snapshot(self, date_ymd):
+            raise RuntimeError("snapshot lookup failed")
+
+    monkeypatch.setattr(simulation_ledger, "BacktestDataSource", FailingDS)
+
+    result = simulation_ledger.build_simulation_ledger(limit=5)
+
+    assert result["ok"] is True
+    assert [warning["code"] for warning in result["evidence_warnings"]] == [
+        "task_context_unavailable",
+        "execution_snapshot_unavailable",
+    ]
+    assert result["items"][0]["evidence_warnings"] == result["evidence_warnings"]

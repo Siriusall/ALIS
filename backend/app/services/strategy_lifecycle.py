@@ -107,6 +107,7 @@ def formal_candidate_gate(
     candidate: dict[str, Any],
     champion: dict[str, Any] | None,
     *,
+    opportunity_cost_baselines: list[dict[str, Any]] | None = None,
     sealed_holdout: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     candidate_summary = candidate.get("summary") if isinstance(candidate.get("summary"), dict) else {}
@@ -127,17 +128,42 @@ def formal_candidate_gate(
     champion_drawdown = metric(champion_summary, "worst_window_drawdown")
     candidate_fees = metric(candidate_summary, "total_fees")
     champion_fees = metric(champion_summary, "total_fees")
+    candidate_annualized_excess = metric(candidate_summary, "annualized_relative_excess_return")
+    minimum_annualized_excess = metric(candidate_summary, "minimum_annualized_relative_excess_return")
     reference_metrics_complete = all(value is not None for value in (
         champion_return, champion_drawdown, champion_fees,
     ))
     candidate_metrics_complete = all(value is not None for value in (
         candidate_return, candidate_drawdown, candidate_fees,
+        candidate_annualized_excess, minimum_annualized_excess,
     ))
     reference_ready = reference_compatible and reference_metrics_complete
+    baseline_gate_enabled = opportunity_cost_baselines is not None
+    baseline_rows = opportunity_cost_baselines if isinstance(opportunity_cost_baselines, list) else []
+    compatible_baselines = [
+        item for item in baseline_rows
+        if isinstance(item, dict)
+        and item.get("reference_contract") == candidate_reference
+        and metric(item.get("summary") if isinstance(item.get("summary"), dict) else {}, "aggregate_cost_after_return") is not None
+    ]
+    required_baseline_keys = {"multifactor_equal_weight", "simple_momentum"}
+    compatible_baseline_keys = {str(item.get("baseline_key") or "") for item in compatible_baselines}
+    opportunity_cost_reference_ready = (
+        required_baseline_keys.issubset(compatible_baseline_keys)
+        if baseline_gate_enabled else True
+    )
+    best_baseline = max(
+        compatible_baselines,
+        key=lambda item: metric(item.get("summary") or {}, "aggregate_cost_after_return") or float("-inf"),
+        default=None,
+    )
+    best_baseline_return = metric(best_baseline.get("summary") or {}, "aggregate_cost_after_return") if best_baseline else None
     candidate_statistics = candidate.get("statistics") if isinstance(candidate.get("statistics"), dict) else {}
     multiple_testing = candidate_statistics.get("multiple_testing") if isinstance(candidate_statistics.get("multiple_testing"), dict) else {}
     statistical_evidence_complete = (
-        multiple_testing.get("schema_version") == "alis_deflated_sharpe_ratio_v1"
+        multiple_testing.get("schema_version") == "alis_deflated_sharpe_ratio_v2"
+        and multiple_testing.get("daily_return_contract_complete") is True
+        and multiple_testing.get("unique_trade_dates") is True
         and multiple_testing.get("probability_sharpe_exceeds_selection_bias") is not None
     )
     multiple_testing_support = statistical_evidence_complete and bool(multiple_testing.get("passed"))
@@ -146,11 +172,24 @@ def formal_candidate_gate(
     holdout_passed = bool(holdout.get("passed")) and holdout_status == "passed"
     gates = {
         "same_run_window_cost_reference": reference_ready,
+        "opportunity_cost_references_complete": opportunity_cost_reference_ready,
         "candidate_metrics_complete": candidate_metrics_complete,
         "formal_oos_protocol_passed": str(candidate.get("status") or "") == "passed",
         "multiple_testing_adjusted_support": multiple_testing_support,
         "sealed_historical_holdout_passed": holdout_passed,
+        "economically_meaningful_annualized_excess": bool(
+            candidate_annualized_excess is not None
+            and minimum_annualized_excess is not None
+            and candidate_annualized_excess >= minimum_annualized_excess
+        ),
         "return_not_worse_than_champion": bool(reference_ready and candidate_return is not None and candidate_return >= champion_return),
+        "return_above_best_low_complexity_baseline": bool(
+            not baseline_gate_enabled
+            or (opportunity_cost_reference_ready
+            and candidate_return is not None
+            and best_baseline_return is not None
+            and candidate_return > best_baseline_return)
+        ),
         "drawdown_not_materially_worse_than_champion": bool(
             reference_ready and candidate_drawdown is not None and candidate_drawdown >= champion_drawdown - 0.02
         ),
@@ -160,7 +199,7 @@ def formal_candidate_gate(
             and (champion_fees <= 0 or candidate_fees <= max(champion_fees * 1.5, champion_fees + 500.0))
         ),
     }
-    if not reference_ready:
+    if not reference_ready or not opportunity_cost_reference_ready:
         decision = "blocked_by_reference"
     elif str(candidate.get("status") or "") != "passed" or not candidate_metrics_complete:
         decision = "rejected"
@@ -187,6 +226,12 @@ def formal_candidate_gate(
             "champion_drawdown": champion_drawdown,
             "candidate_fees": candidate_fees,
             "champion_fees": champion_fees,
+            "candidate_annualized_relative_excess_return": candidate_annualized_excess,
+            "minimum_annualized_relative_excess_return": minimum_annualized_excess,
+            "best_low_complexity_baseline_key": str((best_baseline or {}).get("baseline_key") or "") or None,
+            "best_low_complexity_baseline_return": best_baseline_return,
+            "required_low_complexity_baselines": sorted(required_baseline_keys),
+            "available_low_complexity_baselines": sorted(compatible_baseline_keys),
         },
     }
 
@@ -198,6 +243,7 @@ def advance_formal_candidate_lifecycle(
     holdout_runner: Callable[..., dict[str, Any]] = run_sealed_strategy_holdout,
 ) -> list[dict[str, Any]]:
     champion = next((item for item in items if item.get("role") == "champion"), None)
+    opportunity_cost_baselines = [item for item in items if item.get("role") == "baseline"]
     outcomes: list[dict[str, Any]] = []
     for item in items:
         if item.get("role") != "challenger" or not int(item.get("model_version_id") or 0):
@@ -211,6 +257,7 @@ def advance_formal_candidate_lifecycle(
         model_version_id = int(item["model_version_id"])
         pre_holdout_gate = formal_candidate_gate(
             item, champion,
+            opportunity_cost_baselines=opportunity_cost_baselines,
             sealed_holdout={"status": "passed", "passed": True, "policy": "pre_holdout_gate_only"},
         )
         sealed_holdout: dict[str, Any] | None = None
@@ -219,14 +266,31 @@ def advance_formal_candidate_lifecycle(
                 model_version_id,
                 reference_contract=item.get("reference_contract") or {},
             )
-        gate = formal_candidate_gate(item, champion, sealed_holdout=sealed_holdout)
+            gate = formal_candidate_gate(
+                item,
+                champion,
+                opportunity_cost_baselines=opportunity_cost_baselines,
+                sealed_holdout=sealed_holdout,
+            )
+        else:
+            gate = pre_holdout_gate
         if gate["decision"] == "eligible":
+            existing_version = get_model_version(model_version_id) or {}
+            existing_validation = (
+                existing_version.get("validation")
+                if isinstance(existing_version.get("validation"), dict)
+                else {}
+            )
+            effective_shadow_start = max(
+                _date_key(shadow_start_date),
+                _date_key(existing_validation.get("parallel_shadow_started_after")),
+            )
             _merge_validation(
                 model_version_id,
                 status="shadow_observation",
                 production_eligible=False,
                 formal_comparison=gate,
-                shadow_started_after=shadow_start_date,
+                shadow_started_after=effective_shadow_start,
                 shadow_minimum_sessions=SHADOW_MINIMUM_SESSIONS,
                 shadow_observation_sessions=0,
                 next_gate="future_shadow_observation",
@@ -597,8 +661,21 @@ def run_strategy_shadow_cycle(
     all_versions = list_model_versions("alis_strategy_challenger", limit=100)
     candidates = [
         version for version in all_versions
-        if str((version.get("validation") or {}).get("status") or "")
-        in {"shadow_observation", "shadow_passed", "promoted_cooling"}
+        if (
+            str((version.get("validation") or {}).get("status") or "")
+            in {"shadow_observation", "shadow_passed", "promoted_cooling"}
+            or (
+                bool((version.get("validation") or {}).get("parallel_shadow_enabled"))
+                and str((version.get("validation") or {}).get("status") or "")
+                in {
+                    "pending_oos",
+                    "quick_diagnostic_passed",
+                    "formal_oos_blocked_by_reference",
+                    "formal_oos_blocked_by_statistics",
+                    "formal_oos_blocked_by_holdout_data",
+                }
+            )
+        )
     ]
     results: list[dict[str, Any]] = []
     promotion_ready: list[tuple[dict[str, Any], dict[str, Any]]] = []
@@ -620,10 +697,26 @@ def run_strategy_shadow_cycle(
         candidate_config = candidate.get("config") if isinstance(candidate.get("config"), dict) else {}
         candidate_strategy_id = int(candidate_config.get("strategy_id") or 0)
         observations = list_shadow_observations(int(candidate["id"]))
+        if bool(validation.get("parallel_shadow_enabled")):
+            parallel_floor = _date_key(
+                validation.get("parallel_shadow_started_after")
+            )
+            observations = [
+                item for item in observations
+                if _date_key(item.get("trade_date")) > parallel_floor
+            ]
         if str(validation.get("status") or "") == "shadow_observation":
             shadow_floor = _date_key(validation.get("shadow_started_after"))
             observations = [item for item in observations if _date_key(item.get("trade_date")) > shadow_floor]
-        last_date = str(observations[-1].get("trade_date") or "") if observations else str(validation.get("shadow_started_after") or "")
+        last_date = (
+            str(observations[-1].get("trade_date") or "")
+            if observations
+            else str(
+                validation.get("parallel_shadow_started_after")
+                or validation.get("shadow_started_after")
+                or ""
+            )
+        )
         pending_dates = [
             date for date in dates if _date_key(date) > _date_key(last_date)
         ][:max(1, int(max_new_sessions_per_candidate))]
@@ -715,6 +808,20 @@ def run_strategy_shadow_cycle(
                 )
                 result_status = "shadow_observation"
             results.append({"model_version_id": int(candidate["id"]), "status": result_status, "gate": gate})
+        elif bool(validation.get("parallel_shadow_enabled")):
+            _merge_validation(
+                int(candidate["id"]),
+                parallel_shadow_observation_sessions=len(observations),
+                parallel_shadow_latest_trade_date=(
+                    str(observations[-1].get("trade_date") or "")
+                    if observations else ""
+                ),
+            )
+            results.append({
+                "model_version_id": int(candidate["id"]),
+                "status": "parallel_shadow_observation",
+                "observation_sessions": len(observations),
+            })
         else:
             cooling = cooling_rollback_gate(observations, promoted_after=str(validation.get("promoted_at") or ""))
             if cooling["rollback"]:

@@ -206,7 +206,9 @@ def build_backfill_plan(*, market_batch_days: int = 30, financial_batch_size: in
     cal_end = min(today + timedelta(days=180), date(today.year, 12, 31))
     quarters = _report_periods(today)
     annuals = _annual_periods(today)
-    assets = get_data_assets()
+    # Plan generation is an explicit heavy operation and needs a fresh catalog;
+    # the read-only GET endpoint intentionally serves a persisted snapshot.
+    assets = get_data_assets(force=True)
     asset_status = {str(item.get("key") or ""): str(item.get("status") or "") for item in assets.get("items") or []}
     stocks = int(assets["scope"]["stocks"] or 0)
     open_days = _open_dates(start_s, end_s)

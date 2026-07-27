@@ -316,6 +316,11 @@ def _as_float(v: object, default: float) -> float:
         return float(default)
 
 
+def _normalized_replay_mode(value: object) -> str:
+    mode = str(value or "pragmatic_recover").strip().lower()
+    return mode if mode in {"strict_replay", "pragmatic_recover", "autonomous_daily"} else "pragmatic_recover"
+
+
 def _compute_start_index(dates: list[str], task: dict, done_signals: set[str]) -> int:
     if not dates:
         return 0
@@ -567,6 +572,38 @@ def _build_replay_plan_context(
     return plan, last_exec_date
 
 
+def _build_autonomous_plan_context(dates: list[str]) -> dict:
+    """Select the next due immutable formal plan instead of replaying gaps."""
+    from app.services.profit_loop import list_pending_daily_rebalance_execution_inputs
+
+    normalized_dates = {str(value).replace("-", ""): str(value) for value in dates}
+    pending = sorted(
+        list_pending_daily_rebalance_execution_inputs(),
+        key=lambda item: (
+            str(item.get("signal_date") or "").replace("-", "")[:8],
+            str(item.get("execute_date") or "").replace("-", "")[:8],
+        ),
+    )
+    for item in pending:
+        signal_key = str(item.get("signal_date") or "").replace("-", "")[:8]
+        execute_key = str(item.get("execute_date") or "").replace("-", "")[:8]
+        signal_date = normalized_dates.get(signal_key)
+        execute_date = normalized_dates.get(execute_key)
+        # A plan is due only after its execution-date market slice exists.
+        if signal_date and execute_date:
+            return {
+                "ok": True,
+                "start_idx": dates.index(signal_date),
+                "batch_end_idx": dates.index(signal_date),
+                "target_end_idx": dates.index(signal_date),
+                "gap_days": 1,
+                "batch_steps": 1,
+                "current_execute_date": execute_date,
+                "target_execute_date": execute_date,
+            }
+    return {"ok": False, "reason": "no_due_formal_plan"}
+
+
 def _persist_step_result(
     *,
     task_id: int,
@@ -659,9 +696,7 @@ def run_quant_task_async(task_id: int) -> bool:
             scoring_timeout_sec = max(10, min(_as_int(runtime_cfg.get("scoring_timeout_sec"), _DEFAULT_SCORING_TIMEOUT_SEC), 3600))
             min_account_balance = max(0.0, _as_float(runtime_cfg.get("min_account_balance"), _DEFAULT_MIN_ACCOUNT_BALANCE))
             max_consecutive_losses = max(0, min(_as_int(runtime_cfg.get("max_consecutive_losses"), _DEFAULT_MAX_CONSECUTIVE_LOSSES), 30))
-            mode = str(task0.get("replay_mode") or "pragmatic_recover").strip().lower()
-            if mode not in {"strict_replay", "pragmatic_recover"}:
-                mode = "pragmatic_recover"
+            mode = _normalized_replay_mode(task0.get("replay_mode"))
             health0 = {
                 "heartbeat_at": now,
                 "last_step_latency_ms": 0,
@@ -793,28 +828,35 @@ def run_quant_task_async(task_id: int) -> bool:
             strategy_id = int(task0.get("strategy_id") or 0)
             exchange_group = str(task0.get("exchange_group") or "HS")
             waterline = get_quant_replay_waterline(strategy_id=strategy_id, exchange_group=exchange_group)
-            plan, last_exec_date = _build_replay_plan_context(
-                task=task0,
-                dates=dates,
-                done_signals=done_signals,
-                records=records,
-                waterline=waterline,
-                mode=mode,
-            )
+            if mode == "autonomous_daily":
+                plan = _build_autonomous_plan_context(dates)
+                last_exec_date = _derive_last_execute_date(task0, records, waterline)
+            else:
+                plan, last_exec_date = _build_replay_plan_context(
+                    task=task0,
+                    dates=dates,
+                    done_signals=done_signals,
+                    records=records,
+                    waterline=waterline,
+                    mode=mode,
+                )
             if not plan.get("ok"):
                 _transition_task_status(
                     task_id,
                     "paused",
                     "batch_completed",
                     replay_mode=mode,
-                    replay_status="no_gap",
+                    replay_status=("waiting_formal_plan" if mode == "autonomous_daily" else "no_gap"),
                     replay_gap_days=0,
                     replay_current_execute_date=None,
                     replay_target_execute_date=None,
                     processed_steps=0,
                     total_steps=0,
                     finished_at=None,
-                    last_message="任务已暂停：当前无可补跑缺口",
+                    last_message=(
+                        "自治任务等待下一份到期正式调仓计划"
+                        if mode == "autonomous_daily" else "任务已暂停：当前无可补跑缺口"
+                    ),
                 )
                 upsert_quant_replay_waterline(
                     strategy_id=strategy_id,

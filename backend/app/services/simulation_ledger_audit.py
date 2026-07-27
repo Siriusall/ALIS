@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import hashlib
 from datetime import datetime
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Any
 
 from app.db.store import _conn as business_conn, get_account_baseline
@@ -15,8 +15,33 @@ _CENT = Decimal("0.01")
 def _money(value: Any) -> Decimal:
     try:
         return Decimal(str(value or 0))
-    except Exception:
+    except (TypeError, ValueError, InvalidOperation):
         return Decimal("0")
+
+
+def _ledger_money(value: Any, *, allow_negative: bool = False, positive: bool = False) -> Decimal | None:
+    try:
+        parsed = Decimal(str(value if value is not None else 0))
+    except (TypeError, ValueError, InvalidOperation):
+        return None
+    if not parsed.is_finite() or (parsed < 0 and not allow_negative) or (positive and parsed <= 0):
+        return None
+    return parsed
+
+
+def _quantity(value: Any, *, allow_negative: bool = False) -> int | None:
+    try:
+        parsed = Decimal(str(value if value is not None else 0))
+    except (TypeError, ValueError, InvalidOperation):
+        return None
+    if not parsed.is_finite() or parsed != parsed.to_integral_value() or (parsed < 0 and not allow_negative):
+        return None
+    return int(parsed)
+
+
+def _row_id(value: Any, fallback: int) -> int:
+    parsed = _quantity(value)
+    return parsed if parsed is not None else fallback
 
 
 def _round_money(value: Decimal) -> Decimal:
@@ -35,33 +60,41 @@ def replay_simulation_ledger(
     adjustments: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Independently derive cash and quantities from immutable ledger rows."""
-    cash = _round_money(_money(baseline_cash))
     quantities: dict[str, int] = {}
     invalid_operations: list[dict[str, Any]] = []
+    baseline_value = _ledger_money(baseline_cash)
+    if baseline_value is None:
+        invalid_operations.append({
+            "code": "invalid_baseline_cash",
+            "field": "baseline_cash",
+            "value": baseline_cash,
+        })
+        baseline_value = Decimal("0")
+    cash = _round_money(baseline_value)
     total_fees = Decimal("0")
     buy_turnover = Decimal("0")
     sell_turnover = Decimal("0")
 
     timeline: list[tuple[str, int, int, dict[str, Any]]] = []
-    for operation in operations:
+    for index, operation in enumerate(operations):
         timeline.append((
             str(operation.get("at") or ""),
             0,
-            int(operation.get("id") or 0),
+            _row_id(operation.get("id"), index),
             {"kind": "operation", **operation},
         ))
     for index, action in enumerate(corporate_actions):
         timeline.append((
             f"{str(action.get('event_date') or '')}T15:00:00",
             1,
-            int(action.get("id") or index),
+            _row_id(action.get("id"), index),
             {"kind": "corporate_action", **action},
         ))
     for index, adjustment in enumerate(adjustments or []):
         timeline.append((
             str(adjustment.get("adjusted_at") or ""),
             2,
-            int(adjustment.get("id") or index),
+            _row_id(adjustment.get("id"), index),
             {"kind": "adjustment", **adjustment},
         ))
 
@@ -69,27 +102,85 @@ def replay_simulation_ledger(
         kind = str(item.get("kind") or "")
         symbol = _symbol(item.get("symbol"))
         if kind == "adjustment":
-            cash = _round_money(cash + _money(item.get("cash_delta")))
+            quantity_delta = _quantity(item.get("quantity_delta"), allow_negative=True)
+            if quantity_delta is None:
+                invalid_operations.append({
+                    "adjustment_id": item.get("id"),
+                    "symbol": symbol,
+                    "code": "invalid_adjustment_quantity",
+                    "value": item.get("quantity_delta"),
+                })
+                continue
+            cash_delta = _ledger_money(item.get("cash_delta"), allow_negative=True)
+            if cash_delta is None:
+                invalid_operations.append({
+                    "adjustment_id": item.get("id"),
+                    "symbol": symbol,
+                    "code": "invalid_adjustment_cash",
+                    "field": "cash_delta",
+                    "value": item.get("cash_delta"),
+                })
+                continue
+            cash = _round_money(cash + cash_delta)
             if symbol:
-                quantities[symbol] = quantities.get(symbol, 0) + int(item.get("quantity_delta") or 0)
+                quantities[symbol] = quantities.get(symbol, 0) + quantity_delta
             continue
         if not symbol:
             continue
         if kind == "corporate_action":
             action_type = str(item.get("action_type") or "")
             if action_type == "cash_dividend":
-                cash = _round_money(cash + _money(item.get("cash_amount")))
+                cash_amount = _ledger_money(item.get("cash_amount"))
+                if cash_amount is None:
+                    invalid_operations.append({
+                        "corporate_action_id": item.get("id"),
+                        "symbol": symbol,
+                        "code": "invalid_corporate_action_cash",
+                        "field": "cash_amount",
+                        "value": item.get("cash_amount"),
+                    })
+                    continue
+                cash = _round_money(cash + cash_amount)
             elif action_type == "stock_dividend":
-                quantities[symbol] = quantities.get(symbol, 0) + int(item.get("share_quantity") or 0)
+                share_quantity = _quantity(item.get("share_quantity"))
+                if share_quantity is None:
+                    invalid_operations.append({
+                        "corporate_action_id": item.get("id"),
+                        "symbol": symbol,
+                        "code": "invalid_corporate_action_quantity",
+                        "value": item.get("share_quantity"),
+                    })
+                    continue
+                quantities[symbol] = quantities.get(symbol, 0) + share_quantity
             continue
 
         side = str(item.get("side") or "").upper()
-        quantity = max(0, int(item.get("quantity") or 0))
-        amount = _money(item.get("price")) * Decimal(quantity)
-        fees = sum(
-            (_money(item.get(name)) for name in ("commission", "transfer_fee", "stamp_tax")),
-            Decimal("0"),
-        )
+        quantity = _quantity(item.get("quantity"))
+        if quantity is None:
+            invalid_operations.append({
+                "operation_id": item.get("id"),
+                "symbol": symbol,
+                "code": "invalid_operation_quantity",
+                "value": item.get("quantity"),
+            })
+            continue
+        price = _ledger_money(item.get("price"), positive=True)
+        fee_values = {
+            name: _ledger_money(item.get(name))
+            for name in ("commission", "transfer_fee", "stamp_tax")
+        }
+        invalid_field = "price" if price is None else next((name for name, value in fee_values.items() if value is None), None)
+        if invalid_field:
+            invalid_operations.append({
+                "operation_id": item.get("id"),
+                "symbol": symbol,
+                "code": "invalid_operation_money",
+                "field": invalid_field,
+                "value": item.get(invalid_field),
+            })
+            continue
+        amount = price * Decimal(quantity)
+        fees = sum(fee_values.values(), Decimal("0"))
         total_fees += fees
         if side == "BUY":
             quantities[symbol] = quantities.get(symbol, 0) + quantity
@@ -99,7 +190,7 @@ def replay_simulation_ledger(
             available = quantities.get(symbol, 0)
             if quantity > available:
                 invalid_operations.append({
-                    "operation_id": int(item.get("id") or 0),
+                    "operation_id": item.get("id"),
                     "symbol": symbol,
                     "code": "oversell",
                     "available": available,
@@ -111,7 +202,7 @@ def replay_simulation_ledger(
 
     return {
         "schema_version": "alis_simulation_ledger_replay_v1",
-        "baseline_cash": float(_round_money(_money(baseline_cash))),
+        "baseline_cash": float(_round_money(baseline_value)),
         "cash": float(_round_money(cash)),
         "positions": {
             symbol: quantity
@@ -243,7 +334,7 @@ def audit_simulation_ledger(*, persist: bool = True) -> dict[str, Any]:
     if replay["invalid_operations"]:
         issues.append({
             "code": "invalid_operation_sequence",
-            "message": f"{len(replay['invalid_operations'])} 笔成交出现超卖或顺序异常",
+            "message": f"{len(replay['invalid_operations'])} 条账本记录存在数量、超卖或顺序异常",
             "items": replay["invalid_operations"],
         })
     status = "passed" if not issues else "failed"

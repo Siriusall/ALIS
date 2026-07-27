@@ -61,7 +61,7 @@ ALIS 是面向沪深 A 股的个人研究与模拟交易系统。目标不是堆
 | 0 | P0 | 模型失效闭环 | **已完成 V1**：健康状态已进入融合、动作证据和所有者摘要 | 降级状态确定性改变有效权重/资金准入门；影响范围可回放；不自动替换 Champion |
 | 1 | P0 | 现有自治链连续验收 | 十一步骤日循环已跑通一次，未来样本不足 | 连续跨交易日完成数据门、T+1 模拟成交、账本审计、复盘和异常恢复 |
 | 2 | P0 | 因子有效性闭环 | **工程闭环已加固**：24 因子已注册物化，候选尚未有 20 个未来评价截面 | 每个候选依据唯一的未来 IC、稳定性和成本后增量 OOS 自动晋升、降级或淘汰 |
-| 3 | P1 | 策略 Challenger 成熟与晋升 | V4 经济收益门通过但 DSR 仅 15.11%，当前 `formal_oos_blocked_by_statistics`；密封保留集 11/126 待补 | 先补齐不可见历史保留集，再等待候选通过 DSR、密封集和 20～60 日未来 Shadow 后自动晋升或淘汰 |
+| 3 | P1 | 策略 Challenger 成熟与晋升 | V4 经济收益门通过但 DSR 仅 15.11%，当前 `formal_oos_blocked_by_statistics`；密封保留集已达 126/126 `ready` 但尚未消费 | 等待候选通过未来前移 OOS 的 DSR 门，再一次性消费密封集并进入 20～60 日未来 Shadow，最终自动晋升或淘汰 |
 | 4 | P1 | 成本与调仓自校准 | 已有保守成本合同，模拟成交观察尚未达到双侧 20/50 笔门槛 | 合计 20 笔且买卖各 8 笔才生成候选；合计 50 笔且各 15 笔后才允许自动激活；历史账本永不改写 |
 | 5 | P1 | 叙事模型生产化 | 叙事规则门可用，监督模型尚无合格激活版本 | 补足点时样本、通过模型门和策略级成本后 OOS 后才进入融合 |
 | 6 | P2 | 所有者界面收敛 | 首页已经展示收益、调仓与异常，但专业页面信息仍偏展开 | 日常只看调仓、收益、异常；因子/模型/策略细节默认折叠且可下钻 |
@@ -258,6 +258,38 @@ ALIS 的目标运行方式调整为“系统自治、结果可见、异常才打
 
 2026-07-24 继续加固统计防过拟合合同：正式 OOS 为每个 Challenger 按数据库内已有正式候选试验数计算窗口级 Deflated Sharpe Ratio，选择偏差校正后概率要求至少 95%；未达到时保留候选为 `formal_oos_blocked_by_statistics`，等待硬数据窗口自然前移后重评，不将弱证据永久淘汰，也不允许同日循环刷样本。候选生成侧将每个自治谱系根的总试验预算限制为 8，自适应参数搜索限制为 4 个唯一模板，预算耗尽后停止生成。Shadow 保持至少 20 个未来交易日，并新增至少 4 个候选有效调仓日以及配对区块 bootstrap 95% 复合超额区间下界大于 0；调仓或置信度不足时自动延长至最多 60 日。任务 35 已在同一冻结合同内完成 Champion 与 V4 各五窗口重验：V4 收益仍为 `+40.228928%`、基准 `+39.756224%`、3/5 跑赢，但窗口平均超额仅 `+0.09464%`，普通 bootstrap 95% 区间为 `[-7.90126%, +6.76942%]`；按数据库内 4 次正式试验校正后，窗口超额 Sharpe `0.01029273`、选择偏差期望最大 Sharpe `0.52743821`、DSR 概率仅 `15.113186%`，未达到 `95%`。生命周期已自动将 V4 从 Shadow 恢复为候选状态 `formal_oos_blocked_by_statistics`，`production_eligible=false`、下一关为 `future_formal_oos_refresh`；没有晋升、没有改写 Champion，当前无活动进化任务。
 
+2026-07-25 完成正式 OOS 统计合同 V2：每个测试窗口从组合与同期基准权益曲线冻结 `alis_oos_paired_daily_returns_v1` 非重叠配对日收益，Deflated Sharpe Ratio 改为使用日频超额收益估计偏度、峰度、标准误和多重试验选择偏差，年化 Sharpe 只作展示，不再代入日频概率计算。统计门同时要求至少 5 个合格窗口、60 个唯一交易日、完整配对合同且窗口间交易日不重叠；生命周期只接受 `alis_deflated_sharpe_ratio_v2`，旧 V1 或缺少逐日基准路径的历史证据继续停留在 `formal_oos_blocked_by_statistics`，等待 OOS 窗口自然前移后重评，不从窗口聚合收益反推逐日数据。本次只升级未来验证合同，没有运行密封集、没有重算 V4、没有修改 Champion。涉及 `backend/app/services/walk_forward_validation.py`、`strategy_statistics.py`、`strategy_lifecycle.py` 及对应测试；定向回归 `59 passed`，后端全量回归 `444 passed、1 skipped、6 subtests passed`。
+
+2026-07-25 完成 Challenger 经济意义门 V1：正式 OOS 不再把“复合超额刚好大于 0”视为足够的收益证据，新增成本后年化相对超额至少 `3%` 的硬门。年化值按组合与基准复合财富比、正式有效测试日数计算，避免简单线性外推；阈值冻结到 OOS 协议、摘要、持久化正式指标和生命周期比较证据。收益来源假设限定为相对低成本基准的持续 Alpha；若超额只来自少数窗口、复利后不足以覆盖模型误差和真实滑点，或年化相对超额低于 `3%`，候选正式 OOS 直接失败，不消费密封历史保留集、不进入未来 Shadow。旧正式结果缺少新字段时同样不能越过生命周期门。本次没有重算 V4、没有消费密封集、没有修改 Champion；涉及 `backend/app/services/walk_forward_validation.py`、`evolution_orchestrator.py`、`strategy_lifecycle.py` 及对应测试，定向回归 `61 passed`，后端全量回归 `446 passed、1 skipped、6 subtests passed`。
+
+2026-07-25 完成正式 OOS 机会成本基准组 V1：每个含 Challenger 的正式 cohort 除同批 Champion 和 replay 内置沪深300外，自动按 `alis_strategy_baseline` 注册表的稳定 `baseline_key` 注入 `multifactor_equal_weight` 与 `simple_momentum`，不依赖数据库策略 ID，也不现场创建或改写基线。两条低复杂度基线不占 Challenger 数量预算，必须使用相同任务、硬数据窗口、五窗口、Champion/Controller 版本和成本协议；缺少任一基线或参考合同不一致时进入 `blocked_by_reference`，不得把缺失收益当 0。Challenger 成本后复合收益还必须严格高于同批最佳低复杂度基线，否则正式拒绝，并在消费密封历史保留集前终止。收益来源假设因此从“优于失效 Champion”收紧为“相对沪深300具有经济意义的 Alpha，且复杂策略相对可直接运行的简单策略仍有增量”；失效场景是复杂度没有带来超过多因子等权或简单动量的成本后收益。涉及 `backend/app/services/evolution_orchestrator.py`、`strategy_lifecycle.py` 及对应测试，定向回归 `46 passed`，后端全量回归 `448 passed、1 skipped、6 subtests passed`；未运行真实 OOS、未消费密封集、未修改 Champion。
+
+2026-07-25 完成自治滚动 SLO V1：直接读取持久化 `system_autonomy_cycle` 结果，按最近 20 个实际存在自治证据的交易日计算周期完成率、OOS/最新决策关键数据门成功率、账本零漂移率、失败或重试后的恢复率，以及同交易日重复成功周期数。目标分别为 `>=95% / >=95% / 100% / >=90% / 0`；不足 20 个交易日时只能为 `observing`，不能宣称通过或失败。关键数据门要求步骤执行成功且硬数据状态为 `ready`、决策合同为 `decision_ready=true`；账本要求现金漂移绝对值不超过 0.01 元且持仓差异为空。SLO 已进入任务中心只读接口，复用现有任务结果，不新增日志或状态表。当前版本明确不混入尚未严格关联的 T 日计划到 T+1 成交及时率，该项留给后续执行链 SLO。涉及 `backend/app/services/system_autonomy.py`、`task_center.py` 及对应测试，定向回归 `24 passed`，后端全量回归 `450 passed、1 skipped、6 subtests passed`。
+
+2026-07-25 完成执行链滚动 SLO V1：通过 `daily_rebalance_plans.execution_id → executions/operations.execution_id → operations.operation_uid` 的稳定键，按最近 20 个已授权、已到计划执行日、非 superseded 的最新正式计划计算到期计划确定终态率、计划日完成率、计划到成交绑定完整率，目标分别为 `>=95% / >=95% / 100%`；同时要求计划 execution ID 不重复、窗口内成交 UID 不重复、`executing/blocked_by_execution_recovery` 遗留执行数为 0。存在可执行动作的计划必须关联至少一条同 execution 成交；冻结提案明确无动作的计划允许 `execution_id=NULL`，但仍必须原子进入 `executed`。不可执行预览不进入执行器 SLO 分母，继续由数据、账本、风险和优化器门负责；不足 20 个到期正式计划时只能为 `observing`。结果已接入任务中心只读接口，数据库查询和成交范围均有界，不改变计划生成或执行调度。涉及 `backend/app/services/profit_loop.py`、`task_center.py` 及对应测试，定向回归 `27 passed`，后端全量回归 `452 passed、1 skipped、6 subtests passed`。
+
+2026-07-25 完成量化执行引擎渐进拆分 V1：新增 `backend/app/services/quant_run_contracts.py`，从 2,233 行的 `quant_run_engine.py` 抽离跨 API、任务 worker 和执行引擎共享的 `HistoricalDataMissingError`、`ReplayRiskGateError`、`QuantRunExecResult` 与模拟账本一致性硬门。原引擎继续重导出同一对象，现有导入路径、异常类身份、HTTP/worker 捕获和交易行为保持兼容；本次没有移动选股、资金、成交事务或决策证据逻辑。新增合同级测试验证旧导入兼容和账本漂移阻断，执行相关定向回归 `34 passed`，后端全量回归 `454 passed、1 skipped、6 subtests passed`。
+
+2026-07-25 完成量化执行引擎渐进拆分 V2：新增 `backend/app/services/quant_run_primitives.py`，抽离数据平台交易日规范化、最少交易日硬门、T+1 执行日解析、执行价选择和风险预算裁剪五个纯函数。`quant_run_engine.py` 保留原函数名包装并显式注入自身日期 loader，现有 API/worker 导入与 monkeypatch 边界不变；日期继续输出 `YYYY-MM-DD`，最新交易日仍返回同日 fallback，历史不足仍抛同一 508 合同异常。风险预算解析只捕获 `TypeError/ValueError`，不再用宽泛异常掩盖编程错误。本次未改变数据读取、策略、资金或成交行为；新增纯函数和兼容边界测试，定向回归 `23 passed`，后端全量回归 `457 passed、1 skipped、6 subtests passed`。
+
+2026-07-25 完成量化执行引擎渐进拆分 V3：新增 `backend/app/services/quant_run_plan_input.py`，抽离已领取正式调仓计划的校验、规范化、来源证据和选股输入构造。计划 ID、版本、输入哈希和执行租约 token 必须完整；目标标的不得重复；权重必须有限、非负、只属于目标池且总和不超过 100%。损坏计划统一在成交前以 `invalid_authoritative_plan` 风险门阻断，不再把负权重静默裁为 0 或继续使用不完整来源。合法计划仍继续经过既有研究准入、动态风险、交易约束和账本硬门，未绕过任何安全合同，也未改变选股收益假设或成交事务。新增计划合同测试并覆盖领取、自治任务、组合约束与执行账本，定向回归 `33 passed`，后端全量回归 `463 passed、1 skipped、6 subtests passed`。
+
+2026-07-25 完成账本解析与证据可见性 V1：`backend/app/services/simulation_ledger.py` 的浮点数和整数兼容解析只容忍 `TypeError/ValueError`，`backend/app/services/simulation_ledger_audit.py` 的金额解析只容忍 `TypeError/ValueError/InvalidOperation`，不再用宽泛异常掩盖非数据转换类程序错误。模拟账本的任务上下文查询和执行日快照属于只读补充证据，读取失败仍不阻断账本展示或交易，但会在顶层及对应执行项的 `evidence_warnings` 中留下错误码、执行 ID、任务/日期和截断消息，不再静默退化为空。正常账本结构和逐笔费用、成交、盯市输出保持兼容；本次未修改账本余额、持仓、成交事务、策略、收益假设或 Champion。新增转换边界、任务上下文失败和快照失败测试，账本定向回归 `7 passed`，后端全量回归 `466 passed、1 skipped、6 subtests passed`。
+
+2026-07-25 完成独立账本数量完整性 V1：`backend/app/services/simulation_ledger_audit.py` 对成交数量、送股数量和显式迁移数量统一要求有限整数；成交与送股禁止负数，迁移调整保留合法的正负数量方向。负数、小数、NaN 或非数字不再被静默裁为 0、截断为整数或导致整次审计崩溃；损坏记录不会部分改变现金或持仓投影，而是分别留下 `invalid_operation_quantity`、`invalid_corporate_action_quantity` 或 `invalid_adjustment_quantity`，并通过既有 `invalid_operation_sequence` 审计问题进入账本失败和新增自动成交阻断。异常记录 ID 也改为安全排序，不因损坏 ID 阻断审计。未自动修账、未修改历史、成交事务、策略或 Champion。数量与执行硬门定向回归 `17 passed`，后端全量回归 `470 passed、1 skipped、6 subtests passed`。
+
+2026-07-25 完成独立账本金额完整性 V1：`backend/app/services/simulation_ledger_audit.py` 新增按业务类型区分的有限金额合同。成交价必须大于 0，佣金、过户费和印花税必须非负，现金分红必须非负；显式迁移现金允许正负，但必须有限；基准本金必须有限且非负。NaN、Infinity、非数字、零成交价、负费用或负分红不再回退为 0 或传播非有限结果。任一成交、公司行动或迁移记录的金额损坏时整条记录不参与现金与持仓投影，分别留下 `invalid_operation_money`、`invalid_corporate_action_cash` 或 `invalid_adjustment_cash`；损坏基准本金留下 `invalid_baseline_cash`，只用 0 完成确定性审计输出，审计仍必定失败并沿用既有新增自动成交阻断。未修改历史数据、真实账本、成交事务、策略或 Champion。账本金额与执行硬门定向回归 `23 passed`，后端全量回归 `476 passed、1 skipped、6 subtests passed`。
+
+2026-07-25 完成统一验收距离视图 V1：新增 `alis_acceptance_progress_v1` 只读聚合合同，在所有者首页统一展示候选因子未来评价、成本候选生成、成本自动激活和跨交易日自治链四个阶段的当前值、目标值、剩余缺口、进度及状态。候选因子按最慢候选计算，避免平均值掩盖单因子样本不足；成本门同时约束总成交、买侧和卖侧，进度取三者最短板；自治链复用最近 20 个实际交易日 SLO，满窗后继续校验完成率、关键数据门、账本零漂移、恢复率和防重复。owner-summary 每次读取时实时聚合，不依赖上一轮自治快照，不产生操作入口，不修改候选、成本版本、交易或 Champion。涉及 `backend/app/services/acceptance_progress.py`、`system_autonomy.py`、`frontend/src/api/modelStrategy.ts`、`InvestorDashboardPage.tsx`、`styles.css` 及测试；定向回归 `17 passed`，后端全量 `478 passed、1 skipped、6 subtests passed`，前端生产构建 840 个模块通过。
+
+2026-07-25 完成所有者前端信息架构 V2：前端不再按自治中心、任务中心、候选池、策略实验室、因子实验室、数据中台和模型演化等后端模块平铺一级导航，统一收敛为“总览、今日决策、账户与组合、策略进化、研究中心、系统运行”六个用户任务域。原有专业页面和深链接全部保留为域内下钻，不丢失后端能力；新增固定域内上下文栏，所有二级页明确显示所属问题域。总览按结论、原因、证据分层，新增今日正式结论、执行权限、可执行动作、组合方法和完整计划入口；账户基础接口先返回即展示真实资产与安全状态，较慢的调仓、收益归因、组合 K 线和验收进度随后增量补齐，不再用单个慢接口阻塞整页。候选因子、成本样本和跨日自治验收距离继续位于总览；高风险训练、晋升、回滚和数据写接口没有被提升为日常按钮。账户、策略、研究和系统域标题同步改为所有者语言，专业术语保留在证据层。桌面 1280×720 与移动 390×844 真实页面检查均无横向溢出，移动侧栏正确收起，六域和域内导航可达；前端生产构建 840 个模块通过，后端全量 `478 passed、1 skipped、6 subtests passed`。涉及 `frontend/src/components/Layout.tsx`、`InvestorDashboardPage.tsx`、`PositionPage.tsx`、`StrategyLabPage.tsx`、`ResearchWorkbenchPage.tsx`、`AutonomyCenterPage.tsx`、`frontend/src/pages/DashboardPage.tsx` 和 `frontend/src/styles.css`。
+
+2026-07-25 完成模拟投资控制台 V3 全量重建：删除旧前端业务页面、API 分片、认证壳和静态构建产物，只保留并整体重写全局 CSS，同时保留 Vite、TypeScript、依赖清单和 HTML 等必要构建文件。从空白源码重建为单一只读控制台，一级导航严格收敛为“总览、今日决策、账户与组合、策略进化、研究中心”五项；系统运行从总览异常区下钻，不占一级导航。总览、正式动作、权重与执行证据、账户净值与账本、组合竞赛、Champion/Challenger 漏斗、密封集脱敏状态、研究工作台、自治任务和异常责任分组统一遵循结论、原因、证据三层信息顺序。所有数据请求仅使用后端 GET 接口；接口缺失或失败明确显示未知或空证据，不用演示数字代替真实账户值；训练、晋升、回滚、补数和交易写接口均未成为按钮。生产构建完成 `1594 modules transformed`；浏览器在 1280×720 验证五项一级导航、总览五个核心区块和页面宽度 1280/1280，在 390×844 验证侧栏默认收起、页面宽度 390/390、系统运行下钻入口存在，均无页面级横向溢出。涉及新 `frontend/src/App.tsx`、`api.ts`、`useConsoleData.ts`、`components.tsx`、`pages.tsx`、`main.tsx` 与整体重写的 `styles.css`。
+
+2026-07-25 完成模拟投资控制台 V3 契约自查与纠偏：前端统一解包 `owner-summary.summary` 并按 `questions.today_rebalance / profit / system_changes / incident_supervision` 读取 V3 真实合同；Champion 执行门改读 `questions.system_changes.champion_execution_gate`，将 `allowed/normal` 翻译为“允许执行”、`quarantined/research_only_sell_reduce` 翻译为“研究隔离”，证据缺失时不再显示 `unknown`。修复 `null` 被 JavaScript 转为 `¥0/0.00%`、owner-summary 百分点被误放大 100 倍、模拟成交批次被误当当前持仓、OOS/密封集 `eligible_sessions/required_sessions` 字段错读、组合竞赛与异常责任分组路径错读等问题；当前持仓改读只读 `/api/positions`，组合竞赛改读 `portfolio_optimization.optimizer.method_competition.evaluations`。移除无行为的研究搜索框和分类按钮。只读接口改为按路由、逐接口增量加载，每个请求 20 秒独立超时，慢查询不再阻塞全控制台。前端生产构建 `1594 modules transformed`；浏览器逐页验证总览、今日决策、账户与组合、策略进化、研究中心、系统运行六条路由均无 `unknown`、无横向溢出和控制台错误，缺值显示 `--`；390×844 页面宽度 390/390、移动侧栏默认收起。
+
+2026-07-25 完成统一加载界面 V1：所有一级页面及系统运行下钻统一使用路由级加载界面，不再在页面内容中混杂 `--`、局部空态和不同加载文案。加载界面显示当前页面名称、已完成/总数据域、真实百分比、只读安全说明和稳定骨架；手动刷新复用同一状态，刷新期间按钮禁用。成功、失败和 20 秒超时均计入完成，最终必定退出加载态；路由切换会取消旧请求，迟到响应不得污染新页面数据或进度。最小展示 300ms，避免快缓存下闪烁，不改变慢接口硬超时。前端构建 `1594 modules transformed`；浏览器验证账户页显示“正在加载账户与组合”、`0/7` 数据域和只读说明，接口完成后正常进入内容且无控制台错误；390×844 策略页加载界面宽度 390/390、四个骨架块和移动菜单均正常。
+
 验收：系统可从 V1 失败归因自动生成 V2 候选；全流程无需人工触发；未满足硬门不会成为 Champion。
 
 #### 阶段 C：统一因子平台（P1）
@@ -416,7 +448,7 @@ ALIS 的目标运行方式调整为“系统自治、结果可见、异常才打
 | 主题与叙事 | 部分实现 | 66% | 有聚类、生命周期和公司映射；主营收入和产业链暴露不足 |
 | 一致预期 | 部分实现 | 62% | 有业绩预告、评级和目标价；缺完整 EPS/收入/利润点时版本库 |
 | 股票池与投资逻辑 | 基础可用 | 85% | 准入、迁移、逻辑卡、复核和失效条件已形成 |
-| 策略总控 | 基础可用 | 95% | DSR、密封历史保留集和自适应 Shadow 工程门已接通；V4 统计证据不足；密封集已识别为单一 `adj_factor` 缺口并进入持久批量补全 |
+| 策略总控 | 基础可用 | 95% | DSR、密封历史保留集和自适应 Shadow 工程门已接通；V4 统计证据不足；密封集已由任务 #44 补至 126/126 `ready`，尚未消费 |
 | 组合优化 | 基础可用 | 94% | CVaR、等权、HRP、保持持仓自动竞赛和成本后切换门已落地 |
 | 模拟执行与账本 | 基础可用 | 98% | 费用、整数手、FIFO、分红送股、独立现金/持仓重算、漂移阻断及买卖原子提交已形成；真实观察量待积累 |
 | 回测与策略验证 | 基础可用 | 95% | Purged Walk-Forward、五窗口、四状态和成本门已落地；V4 首次通过全部正式收益门，未来影子尚未完成 |
@@ -574,12 +606,81 @@ ALIS 的目标运行方式调整为“系统自治、结果可见、异常才打
 
 验收标准：每项改进必须能关联原始决策、成交、错误类型、新策略版本和验证结果。
 
+### 2026-07-25 后端运行架构审计（待处理）
+
+- [x] 认证默认值收紧：`LOCAL_DEBUG_AUTH_BYPASS` 已改为默认 `false`，仅允许显式开启；前端恢复登录、注册、Token 持久化、Authorization header、会话过期处理和退出入口。生产环境继续保持永不绕过硬门。
+- [x] 固化单实例运行合同：2026-07-26 新增 `postgres_session_advisory_lock_v1` 后台运行边界。每个 FastAPI 进程仍可提供 Web API，但只有成功持有固定 PostgreSQL 会话级 advisory lock 的进程可以执行 Champion 初始化、任务恢复、模拟调仓、收盘日更、模型治理、人工复核、演化调度和 Redis worker；其他进程明确进入 `held_by_another_process` 纯 Web 状态。持锁连接随进程生命周期保持，正常退出显式解锁，异常退出由 PostgreSQL 自动释放，避免依赖单机 PID 或进程内锁。
+- [x] 隔离集成测试与真实后台任务：新增 `ALIS_BACKGROUND_RUNTIME=disabled` 显式模式；该模式只完成双库 schema 初始化，不连接后台租约、不创建 Champion、不恢复任务且不启动任何 scheduler/worker。PostgreSQL `TestClient` 集成测试已显式切换该模式，健康接口同时区分后台持有者、纯 Web 跟随实例和显式禁用实例，不再把纯 Web 实例误报为演化 worker 故障。
+- [ ] 继续拆分超大核心模块：当前后端约 7.1 万行 Python、278 个路由，`quant_run_engine.py`、`strategy_candidate_generator.py`、`evolution_orchestrator.py`、`profit_loop.py`和 `quant_task_runner.py` 均超过 1,200 行。后续按运行编排、交易合同、持久化和证据生成拆分，不在本轮审计中做无关重构。
+- [x] 统一异常证据合同 V1：新增 `alis_error_evidence_v1`，固定区分 `valid_empty / data_unavailable / query_failed / degraded_data / contract_not_met / internal_fault`，并记录操作、来源、异常类型、可重试性、是否延后、发生时间和上下文。FastAPI 启动组件、数据中台 worker、日更 ETF/PCF/研究延后步骤及所有者摘要中的密封集、调仓计划、组合比较、验收进度、独立账本和 Champion 执行门均已接入；关键证据读取失败不再静默转换为空集合或零值。其余纯展示或兼容性解析中的宽泛捕获继续按触达模块逐步迁移，不做无关全库重构。
+
+验证记录：后端全量回归 `478 passed、1 skipped、6 subtests passed`；Python 编译和 `git diff --check` 通过。显式开启 PostgreSQL 集成测试后，主业务库和数据平台库连接及 schema 检查通过，但未带 Token 的 `/api/account` 因本机调试绕过返回 `200`，集成结果为 `2 passed、1 failed`。
+
+2026-07-26 后台运行边界 V1 涉及 `backend/app/core/config.py`、`backend/app/main.py`、`backend/app/services/runtime_boundary.py`、`backend/tests/test_runtime_boundary.py` 和 `backend/tests/test_postgres_runtime_integration.py`。针对性测试覆盖显式禁用、成功持锁、竞争失败、退出解锁和纯 Web 启动无后台副作用；后端全量回归 `500 passed、1 skipped、6 subtests passed`，显式 PostgreSQL 集成测试 `3 passed`，Python 编译与相关文件 `git diff --check` 通过。运行约定：唯一后台实例使用默认 `ALIS_BACKGROUND_RUNTIME=enabled`；额外 Web 实例可同样以 `enabled` 启动并由数据库锁自动选主，也可显式设为 `disabled`；测试必须使用 `disabled`。
+
+2026-07-26 完成异常证据合同与数据资产慢接口优化 V1：`/api/data-center/assets` 从“缓存失效时由首个 GET 同步扫描原始大表”改为 stale-while-revalidate。冷读直接从 PostgreSQL `dc_asset_watermark` 重建最近持久快照，并以进程内单飞线程刷新完整审计；显式 `force=True` 仅保留给补全计划等确实需要新鲜结果的重操作。真实冷缓存读取由约 `31.03s` 降至 `0.0573s`，返回 48 个资产水位；后台刷新不阻塞请求，失败时保留旧快照并写入 `alis_error_evidence_v1`。涉及 `backend/app/core/error_evidence.py`、`backend/app/main.py`、`backend/app/services/system_autonomy.py`、`backend/app/data_platform/services/assets.py`、`asset_watermarks.py`、`daily_update.py`、`backfill.py` 及对应测试。新增/相关定向测试 `20 passed`，后端全量回归 `504 passed、1 skipped、6 subtests passed`。
+
+### 2026-07-25 前后端功能映射审计（待处理）
+
+当前前端重构为 6 个只读页面，实际声明 16 个 GET 数据源；后端当前有 278 个路由。大量后台写路由本来就不应暴露为日常人工操作，因此不以路由数量追求一一对应；但所有者需要的关键只读证据也明显缺失。
+
+| 后端能力 | 当前前端映射 | 审计结论 |
+|---|---|---|
+| 所有者摘要、账户收益、Champion 隔离 | 总览 | 基本可见，是当前最完整的主路径 |
+| 正式调仓计划、StrategyController 动作合同 | 今日决策 | 部分可见；后端实例返回 `sell`，前端只按 `sell_exit` 分组，导致动作组计数全为 0；收益来源、模型、风险预算和退出条件也未按真实响应层级读取 |
+| 持仓、净值、组合风险、方法竞赛、独立账本 | 账户与组合 | 持仓和净值可见；风险页从错误层级读取 CVaR/集中度，方法竞赛读取路径与真实 `profit-loop` 结构不一致；成交账本明细虽已请求但没有渲染 |
+| Champion、Challenger、OOS、DSR、密封集、Shadow | 策略进化 | 框架可见，但多个字段路径与真实合同不一致：真实收益位于 `formal_oos.aggregate_excess_return`，阻塞项为 `blocking_reasons`，基线是数组而非固定对象键；当前页面会大量显示空值 |
+| 持久任务、步骤、租约、日志和异常责任 | 系统运行 | 只展示任务摘要；步骤、检查点、租约、结构化日志均没有下钻；后端进度是 `0..1`，前端直接加 `%`；该页存在但不在侧边导航中 |
+| 股票、行业、主题、事件、估值、预期、投资逻辑 | 研究中心 | 当前基本未接通；页面请求 `/research/profit-loop`，该响应不包含 `items/theses/focus/selected`，因此研究对象和命题只能显示占位内容 |
+| 24 因子注册、物化、评价与治理 | 无 | 所有者无法查看 20 个未来截面的积累和候选因子状态 |
+| 模型版本、健康、训练、影子、降级与晋升 | 无 | 只能从所有者摘要看降级数，无法查看模型级证据和叙事模型未激活原因 |
+| 数据资产、水位、失败请求、日更、补全、LLM 数据运维 | 系统运行中的 readiness/OOS/密封集摘要 | 只有硬门总数，无资产、字段覆盖、失败分类、水位和运维处置证据 |
+| 回测、策略重放、决策版本、证据 diff、周期复盘 | 部分散落于策略和总览 | 无正式只读下钻，不能从今日决策追到版本、历史重放、分窗和归因明细 |
+| 认证与用户会话 | 已移除 | 前端 `fetch` 不发 Authorization header；当后端按上述审计关闭默认认证绕过后，当前整个前端将全部返回 `401` |
+
+优先补全顺序：
+
+1. [x] [P0] 恢复会话与 Authorization header，并修复调仓动作枚举、风险、策略统计、任务进度等真实数据合同。
+2. [x] [P0] 将“系统运行”放回显式导航，提供任务步骤、检查点、日志、账本警告和异常证据下钻。
+3. [x] [P1] 恢复因子、模型治理、数据资产三个只读工作台；保留自动晋升和数据修复的后台所有权，不恢复日常人工晋升按钮。
+4. [x] [P1] 按股票/行业/主题/事件重新接通真实研究接口，不再用 `profit-loop` 冒充研究数据源；当前完成对象列表和原始合同下钻，更深的单对象交互式详情继续按真实数据成熟度扩展。
+5. [x] [P2] 补决策版本、成交账本、周期复盘和 LLM 提案只读证据链；LLM 提案新增只读 API，同时返回确定性质量评估和固定模板路由结果，不提供生成或执行按钮。
+
+验证记录：当前前端 `npm run build` 通过，Vite 构建 1,594 个模块；真实后端 `/api/health` 为 `ready=true`，已抽核的所有者摘要、决策、账本、持仓、绩效、组合风险、策略实验室和任务中心等 GET 接口均返回 `200`；缺口主要是前端未请求、未渲染或字段路径不匹配，不能据此声称后端功能已全面体现在前端。
+
+2026-07-25 研究中心真实合同复验：研究评分的顶层 `status` 可能是包含 `score / coverage / lifecycle / components` 的对象，前端已改为只从 `status.status / status.lifecycle / lifecycle.status` 等路径读取标量状态，并对非标量值安全回退。`npm run build` 完成 1,595 个模块；真实浏览器验证股票 37、行业 113、主题 100、事件 100 项正常渲染，刷新后无新增 React 控制台错误。
+
+2026-07-26 完成前端接口治理与关键证据扩展 V1：系统运行页实时读取 FastAPI OpenAPI，按 GET 直接读取、GET 待聚合/分类和后台写控制面展示全部接口地图，当前识别 280 个操作、128 个 GET、152 个写操作，前端端点注册表直接覆盖 64 个 GET；写操作不生成按钮。新增自治/量化任务、调度、执行批次、逐笔操作、账本审计和恢复状态；研究中心新增一致预期、事件跟踪、研究数据资产、治理、持仓研究状态和合同证据，并支持从真实股票池 37 只股票和 113 个行业中选择对象，按需读取公司研究、估值、预期、准入、财务完整度和行业详情；模型治理新增生产策略、StrategyController、输出合同、证据绑定和多周期验证；数据资产新增日更、数据流、可观测性和持久化补全状态；证据链新增回测清单和独立账本审计。错误条现在展示失败数据域及原因。现场生成补全计划等重查询不作为页面直连，保留为待聚合接口。前端生产构建 1,595 个模块通过；真实浏览器验证研究中心和系统运行页完成加载、无接口错误、无控制台错误，系统运行接口地图显示真实覆盖数，桌面页面宽度 1280/1280 无横向溢出。
+
+2026-07-27 修复全局加载完成语义：`useConsoleData` 不再在固定 300 毫秒后提前关闭加载界面，而是等待当前页面全部只读请求进入成功或失败终态后再渲染页面；进度条因此与实际完成数一致，慢接口不会继续在“加载完成”的页面后方静默填充。前端生产构建 1,595 个模块通过并部署到 kevin2，线上资源为 `assets/index-BVek5WA4.js`；域名健康检查继续返回 `ready=true`、`degraded=false`。
+
+2026-07-27 完成 Evolution Worker 跨云运行拆分与配置留档：kevin2 保留 FastAPI、Redis、日更/模拟交易及 Evolution scheduler，通过 `ALIS_EVOLUTION_WORKER_ENABLED=false` 将内置 Worker 标记为 `external_worker`；阿里云 2 核 2GB 节点以独立 `alis-evolution-worker.service` 运行 `app.evolution_worker_main`，真实验证 PostgreSQL 双库连接、`active`、`ExecMainStatus=0` 和 `Standalone evolution worker ready`。任务继续使用 PostgreSQL 租约、心跳、检查点和恢复合同。腾讯数据库仅对白名单中的 kevin2 与阿里固定公网 IP 开放 TLS 5432，数据库密码完成轮换。完整脱敏配置、验收、故障恢复及已知公网延迟问题记录在 `docs/ALIS云端服务器与数据库配置基线.md`；未将密码、Token 或私钥写入文档。
+
+2026-07-26 完成模型治理工作台 V2：修复旧页面将 `/model-strategy/status` 的 3 条 `main` 通用训练版本误当作全部模型的问题，改以 `/model-strategy/plan-models` 为计划模型主合同，并单列 HSMM 市场状态治理。页面现展示 6 个核心模型族：`market_regime_hsmm_v1`、中期排序、资金持续、龙头排序、事件预期差和叙事状态转移；真实状态为 4 个计划模型生产激活、1 个叙事模型候选，HSMM 当前治理状态 `ready`，不因页面推断而虚报其生产版本。每个模型卡展示职责、算法族、生产/最新版本、覆盖门、产物、训练运行、验证阻塞、所需数据和确定性回退；另展示市场状态历史、生产策略与 StrategyController 绑定、决策字段证据映射、绩效报告和底层 `main` 注册版本。共享状态组件增加对象型状态的标量保护。前端生产构建 1,595 个模块通过；真实浏览器验证 6 张模型卡、模型名称与状态正确，无接口错误、无控制台错误，页面宽度 1280/1280。
+
+2026-07-26 完成研究评分工作台 V2：参考 Git 中旧版 `ResearchWorkbenchPage / IndustryResearchPage / SentimentPage / StockPoolPage` 的信息结构，按当前只读合同重构研究中心，不恢复旧人工写操作。新增“行业与板块、主题与叙事、股票池、事件与反证”四视图；行业表展示综合分、景气分、叙事分、覆盖率、生命周期、预算权重和准入结论，明确综合分为叙事 60% + 行业质量 20% + 候选选择分 20%；主题按分数排序并展示生命周期、可晋升状态、公司映射和评分证据；股票池从冻结准入理由读取研究分并区分观察/候选/持仓；事件按衰减后影响分排序并展示方向、置信度、跟踪状态和下一步。顶部同步市场状态、111/113 可评价行业、15/100 可晋升主题、37 只研究股票和 100 条投资逻辑；保留单股票公司/估值/预期/准入/财务完整度及单行业详情下钻。前端生产构建和真实浏览器四视图验收通过，无接口错误、无控制台错误，桌面宽度 1280/1280。
+
+2026-07-26 修复账户净值与基准曲线合同：`portfolio-candles_v2` 返回账户 `close` 和点时沪深300 `benchmark_close`，旧前端仍读取 `strategy_equity / equity / value`，导致有 3 个真实交易日数据却生成空 SVG。曲线现优先读取 `close / benchmark_close`，统一使用全部有效值计算带最小边距的纵轴，分别绘制账户实线和沪深300虚线，并展示区间收益；单点、平坦序列、基准缺失和无可绘制净值均有明确处理。前端生产构建 1,595 个模块通过；浏览器实测两条曲线各 3 个点，账户 +0.55%、基准 +4.64%，折线边界框非零、无接口错误、无控制台错误，页面宽度 1280/1280。
+
+2026-07-26 完成决策证据链工作台 V2：原页面的散列表和原始 JSON 改为按冻结决策选择的四阶段审计时间线。决策选择器展示快照 ID、决策时间、标的和动作；阶段 1 核对数据截止、未来数据、市场、研究和估值证据，阶段 2 展示模型版本、证据模式、哈希、组合与目标权重合同，阶段 3 关联执行批次、逐笔操作、成交日、费用和账本证据，阶段 4 展示后续结果、错误类型、收益归因和复盘经验。选择快照后自动调用 `/research/evidence/verify/{id}` 严格回验冻结哈希；周期绩效/回测、LLM 预算与提案、独立账本和学习治理收敛到次级区域，LLM 明确禁止修改生产。真实状态为 43 条冻结决策、36 条关联执行、12 条已复盘，当前审计质量报告有 2 条证据异常；浏览器验证 43 个选择项、4 个时间线阶段，切换快照后哈希均正确更新为 `verified`，无接口错误、无控制台错误，页面宽度 1280/1280。前端生产构建 1,595 个模块通过。
+
+完成日期：2026-07-25（UTC+8）
+
+完成内容：完成上述 P0/P1/P2 只读控制台补全；导航扩展为总览、今日决策、账户与组合、策略进化、研究中心、因子平台、模型治理、数据资产、证据链和系统运行十个入口。修复 `sell -> sell_exit` 动作兼容、`tail_risk.cvar`、`formal_oos`、`blocking_reasons`、基线数组和 `0..1` 任务进度合同。新增 LLM 研究提案只读审计接口。
+
+涉及文件：`backend/app/core/config.py`、`backend/app/services/llm_research_agent.py`、`backend/app/api/routes/research.py`、`backend/tests/test_llm_research_agent.py`、`frontend/src/api.ts`、`frontend/src/auth.tsx`、`frontend/src/App.tsx`、`frontend/src/useConsoleData.ts`、`frontend/src/pages.tsx`、`frontend/src/styles.css`。
+
+验证方式：后端全量回归、显式 PostgreSQL 集成测试、前端生产构建、真实 GET 接口抽核、真实 PostgreSQL LLM 提案读取、浏览器桌面与 390px 移动端检查。
+
+验证结果：后端 `479 passed、1 skipped、6 subtests passed`；PostgreSQL 集成 `3 passed`；新增定向测试 `7 passed`；前端构建 1,595 个模块通过；抽核新增接口除完整 `/api/data-center/assets` 慢查询外均在 25 秒内返回 `200`；桌面与移动端无页面级横向溢出或浏览器控制台错误。后端已重启并确认 `/api/health ready=true`、匿名业务请求返回 `401`、LLM 提案审计返回 2 条真实记录。
+遗留限制：`/api/data-center/assets` 当前超过 25 秒，前端改用快速 watermarks 合同避免阻塞；后端仍需按上节审计处理多实例调度租约。
+
 ## 七、默认实施顺序
 
 每次只做一个可独立验收的小目标，默认顺序：
 
-1. [一次性历史补全] 密封历史保留集已确认剩余缺口全部仅为 `adj_factor`，由持久批量任务每批 20 日连续补至 126/126；未知或混合缺口仍维持每周期最多 5 日。完成前禁止回放和消费。
-2. [自然积累] 等待正式 OOS 窗口前移，使 V4 或后继候选重新通过 95% DSR 门；之后一次性通过密封保留集，才进入 20～60 日自适应未来 Shadow。
+1. [自然积累] 等待正式 OOS 窗口前移，使 V4 或后继候选重新通过 95% DSR 门；之后才允许一次性消费已达 126/126 `ready` 的密封历史保留集，并进入 20～60 日自适应未来 Shadow。
+2. [持续审计] 维持密封历史保留集 126/126 `ready`；发现数据漂移时仅修复明确缺口，数据就绪本身不得触发提前回放、消费或结果泄露。
 3. [自然积累] 20 个未来因子评价截面，完成首批候选因子真实晋升/淘汰。
 4. [自然积累] 模拟成交达到合计 20 笔且买卖各 8 笔、再达到合计 50 笔且买卖各 15 笔后，验收成本候选和自动激活，再优化换手阈值与频率。
 5. [待实施] 补足叙事生命周期点时样本并通过模型生产门；此前保留规则门。

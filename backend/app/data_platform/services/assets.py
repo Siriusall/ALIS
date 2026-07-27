@@ -22,6 +22,8 @@ FALLBACK_OPEN_DAYS = 500
 _ASSETS_CACHE_TTL_SEC = 45.0
 _assets_cache_lock = threading.Lock()
 _assets_cache: dict[str, Any] = {"at": 0.0, "value": None}
+_assets_refresh_lock = threading.Lock()
+_assets_refresh_state: dict[str, Any] = {"running": False, "last_error": None}
 
 # Sparse / non-daily APIs that need a whole-table sample (usually tiny vs daily).
 _SPARSE_RAW_APIS = (
@@ -97,7 +99,53 @@ def _annual_periods(today: date | None = None) -> list[str]:
     return [f"{year}1231" for year in range(latest_year, latest_year - FINANCIAL_ANNUAL_YEARS, -1)]
 
 
+def _store_assets(payload: dict[str, Any]) -> dict[str, Any]:
+    from app.data_platform.services.asset_watermarks import apply_terminal_states, persist_asset_watermarks
+
+    payload = apply_terminal_states(payload)
+    persist_asset_watermarks(payload)
+    with _assets_cache_lock:
+        _assets_cache["at"] = time.monotonic()
+        _assets_cache["value"] = payload
+    set_json("alis:data-platform:assets:v4", payload, ttl=int(_ASSETS_CACHE_TTL_SEC))
+    return payload
+
+
+def _refresh_assets_worker() -> None:
+    from app.core.error_evidence import error_evidence
+
+    try:
+        _store_assets(_compute_data_assets())
+        result = None
+    except Exception as exc:  # noqa: BLE001 - stale snapshot remains readable
+        result = error_evidence(
+            exc,
+            operation="data_assets:refresh",
+            source="data_platform",
+            deferred=True,
+        )
+    finally:
+        with _assets_refresh_lock:
+            _assets_refresh_state["running"] = False
+            _assets_refresh_state["last_error"] = result
+
+
+def _start_assets_refresh() -> bool:
+    with _assets_refresh_lock:
+        if _assets_refresh_state["running"]:
+            return False
+        _assets_refresh_state["running"] = True
+    threading.Thread(
+        target=_refresh_assets_worker,
+        daemon=True,
+        name="data-assets-refresh",
+    ).start()
+    return True
+
+
 def get_data_assets(*, force: bool = False) -> dict[str, Any]:
+    if force:
+        return _store_assets(_compute_data_assets())
     if not force:
         redis_cached = get_json("alis:data-platform:assets:v4")
         if isinstance(redis_cached, dict):
@@ -112,14 +160,15 @@ def get_data_assets(*, force: bool = False) -> dict[str, Any]:
         ):
             return cached
 
-    payload = _compute_data_assets()
-    from app.data_platform.services.asset_watermarks import apply_terminal_states, persist_asset_watermarks
-    payload = apply_terminal_states(payload)
-    persist_asset_watermarks(payload)
-    with _assets_cache_lock:
-        _assets_cache["at"] = time.monotonic()
-        _assets_cache["value"] = payload
-    set_json("alis:data-platform:assets:v4", payload, ttl=int(_ASSETS_CACHE_TTL_SEC))
+    from app.data_platform.services.asset_watermarks import load_asset_catalog_snapshot
+
+    payload = load_asset_catalog_snapshot()
+    started = _start_assets_refresh()
+    payload["refresh"] = {
+        "running": bool(_assets_refresh_state["running"]),
+        "started": started,
+        "last_error": _assets_refresh_state["last_error"],
+    }
     return payload
 
 

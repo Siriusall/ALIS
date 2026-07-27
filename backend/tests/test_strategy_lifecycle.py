@@ -18,7 +18,9 @@ def _formal_reference(*, cycle_task_id: int = 1) -> dict:
 
 def _formal_statistics(*, passed: bool = True) -> dict:
     return {"multiple_testing": {
-        "schema_version": "alis_deflated_sharpe_ratio_v1",
+        "schema_version": "alis_deflated_sharpe_ratio_v2",
+        "daily_return_contract_complete": True,
+        "unique_trade_dates": True,
         "probability_sharpe_exceeds_selection_bias": .99 if passed else .60,
         "confidence_threshold": .95,
         "passed": passed,
@@ -32,6 +34,27 @@ def _passed_holdout() -> dict:
         "passed": True,
         "contract_hash": "sealed-contract",
     }
+
+
+def _candidate_summary(*, annualized_excess: float = .06) -> dict:
+    return {
+        "aggregate_cost_after_return": .12,
+        "worst_window_drawdown": -.11,
+        "total_fees": 800,
+        "annualized_relative_excess_return": annualized_excess,
+        "minimum_annualized_relative_excess_return": .03,
+    }
+
+
+def _opportunity_cost_baselines() -> list[dict]:
+    return [
+        {
+            "role": "baseline", "baseline_key": key,
+            "reference_contract": _formal_reference(),
+            "summary": {"aggregate_cost_after_return": value},
+        }
+        for key, value in (("multifactor_equal_weight", .03), ("simple_momentum", -.02))
+    ]
 
 
 def _shadow_rows(count: int, *, delta: float = 0.002) -> list[dict]:
@@ -60,11 +83,7 @@ def test_formal_gate_requires_protocol_and_non_worse_champion():
             "status": "passed",
             "reference_contract": _formal_reference(),
             "statistics": _formal_statistics(),
-            "summary": {
-                "aggregate_cost_after_return": 0.12,
-                "worst_window_drawdown": -0.11,
-                "total_fees": 800,
-            },
+            "summary": _candidate_summary(),
         },
         {
             "reference_contract": _formal_reference(),
@@ -115,7 +134,7 @@ def test_formal_gate_preserves_candidate_when_multiple_testing_support_is_weak()
     candidate = {
         "status": "passed", "reference_contract": _formal_reference(),
         "statistics": _formal_statistics(passed=False),
-        "summary": {"aggregate_cost_after_return": .12, "worst_window_drawdown": -.1, "total_fees": 800},
+        "summary": _candidate_summary(),
     }
     champion = {
         "reference_contract": _formal_reference(),
@@ -125,6 +144,21 @@ def test_formal_gate_preserves_candidate_when_multiple_testing_support_is_weak()
     assert gate["decision"] == "blocked_by_statistics"
     assert gate["passed"] is False
     assert "multiple_testing_adjusted_support" in gate["blocking_reasons"]
+
+
+def test_formal_gate_rejects_economically_thin_excess_before_holdout():
+    candidate = {
+        "status": "passed", "reference_contract": _formal_reference(),
+        "statistics": _formal_statistics(),
+        "summary": _candidate_summary(annualized_excess=.012),
+    }
+    champion = {
+        "reference_contract": _formal_reference(),
+        "summary": {"aggregate_cost_after_return": .08, "worst_window_drawdown": -.1, "total_fees": 700},
+    }
+    gate = lifecycle.formal_candidate_gate(candidate, champion, sealed_holdout=_passed_holdout())
+    assert gate["decision"] == "rejected"
+    assert "economically_meaningful_annualized_excess" in gate["blocking_reasons"]
 
 
 def test_shadow_gate_cannot_promote_before_twenty_future_sessions():
@@ -282,6 +316,7 @@ def test_formal_lifecycle_opens_shadow_only_for_eligible_candidate(monkeypatch):
     )
     outcomes = lifecycle.advance_formal_candidate_lifecycle(
         [
+            *_opportunity_cost_baselines(),
             {
                 "role": "champion",
                 "strategy_id": 1,
@@ -299,11 +334,7 @@ def test_formal_lifecycle_opens_shadow_only_for_eligible_candidate(monkeypatch):
                 "status": "passed",
                 "reference_contract": _formal_reference(),
                 "statistics": _formal_statistics(),
-                "summary": {
-                    "aggregate_cost_after_return": 0.09,
-                    "worst_window_drawdown": -0.10,
-                    "total_fees": 900,
-                },
+                "summary": _candidate_summary(),
             },
         ],
         shadow_start_date="20260722",
@@ -320,6 +351,7 @@ def test_formal_lifecycle_blocks_for_sealed_holdout_data_without_rejecting_candi
     monkeypatch.setattr(lifecycle, "_merge_validation", lambda _id, **updates: validations.append(updates) or updates)
     monkeypatch.setattr(lifecycle, "update_model_version_status", lambda *_args, **_kwargs: None)
     items = [
+        *_opportunity_cost_baselines(),
         {
             "role": "champion", "reference_contract": _formal_reference(),
             "summary": {"aggregate_cost_after_return": .08, "worst_window_drawdown": -.1, "total_fees": 700},
@@ -327,7 +359,7 @@ def test_formal_lifecycle_blocks_for_sealed_holdout_data_without_rejecting_candi
         {
             "role": "challenger", "model_version_id": 9, "status": "passed",
             "reference_contract": _formal_reference(), "statistics": _formal_statistics(),
-            "summary": {"aggregate_cost_after_return": .12, "worst_window_drawdown": -.1, "total_fees": 800},
+            "summary": _candidate_summary(),
         },
     ]
     outcome = lifecycle.advance_formal_candidate_lifecycle(
@@ -345,6 +377,7 @@ def test_formal_lifecycle_does_not_expose_holdout_details_to_failure_memory(monk
     monkeypatch.setattr(lifecycle, "_merge_validation", lambda _id, **updates: validations.append(updates) or updates)
     monkeypatch.setattr(lifecycle, "update_model_version_status", lambda *_args, **_kwargs: None)
     items = [
+        *_opportunity_cost_baselines(),
         {
             "role": "champion", "reference_contract": _formal_reference(),
             "summary": {"aggregate_cost_after_return": .08, "worst_window_drawdown": -.1, "total_fees": 700},
@@ -352,7 +385,7 @@ def test_formal_lifecycle_does_not_expose_holdout_details_to_failure_memory(monk
         {
             "role": "challenger", "model_version_id": 9, "status": "passed",
             "reference_contract": _formal_reference(), "statistics": _formal_statistics(),
-            "summary": {"aggregate_cost_after_return": .12, "worst_window_drawdown": -.1, "total_fees": 800},
+            "summary": _candidate_summary(),
         },
     ]
     outcome = lifecycle.advance_formal_candidate_lifecycle(
@@ -397,6 +430,7 @@ def test_formal_lifecycle_waits_for_future_window_when_dsr_is_weak(monkeypatch):
     monkeypatch.setattr(lifecycle, "_merge_validation", lambda _id, **updates: validations.append(updates) or updates)
     monkeypatch.setattr(lifecycle, "update_model_version_status", lambda *_args, **_kwargs: None)
     items = [
+        *_opportunity_cost_baselines(),
         {
             "role": "champion", "reference_contract": _formal_reference(),
             "summary": {"aggregate_cost_after_return": .08, "worst_window_drawdown": -.1, "total_fees": 700},
@@ -404,7 +438,7 @@ def test_formal_lifecycle_waits_for_future_window_when_dsr_is_weak(monkeypatch):
         {
             "role": "challenger", "model_version_id": 9, "status": "passed",
             "reference_contract": _formal_reference(), "statistics": _formal_statistics(passed=False),
-            "summary": {"aggregate_cost_after_return": .12, "worst_window_drawdown": -.1, "total_fees": 800},
+            "summary": _candidate_summary(),
         },
     ]
     outcome = lifecycle.advance_formal_candidate_lifecycle(items, shadow_start_date="20260731")[0]
@@ -412,6 +446,48 @@ def test_formal_lifecycle_waits_for_future_window_when_dsr_is_weak(monkeypatch):
     assert validations[0]["status"] == "formal_oos_blocked_by_statistics"
     assert validations[0]["formal_statistics_blocked_after"] == "20260731"
     assert validations[0]["next_gate"] == "future_formal_oos_refresh"
+
+
+def test_formal_lifecycle_blocks_when_required_baseline_is_missing(monkeypatch):
+    monkeypatch.setattr(lifecycle, "_merge_validation", lambda _id, **updates: updates)
+    monkeypatch.setattr(lifecycle, "update_model_version_status", lambda *_args, **_kwargs: None)
+    outcome = lifecycle.advance_formal_candidate_lifecycle([
+        _opportunity_cost_baselines()[0],
+        {
+            "role": "champion", "reference_contract": _formal_reference(),
+            "summary": {"aggregate_cost_after_return": .08, "worst_window_drawdown": -.1, "total_fees": 700},
+        },
+        {
+            "role": "challenger", "model_version_id": 9, "status": "passed",
+            "reference_contract": _formal_reference(), "statistics": _formal_statistics(),
+            "summary": _candidate_summary(),
+        },
+    ], shadow_start_date="20260731")[0]
+    assert outcome["status"] == "blocked_by_reference"
+    assert "opportunity_cost_references_complete" in outcome["blocking_reasons"]
+
+
+def test_formal_lifecycle_rejects_candidate_below_best_baseline_without_holdout(monkeypatch):
+    monkeypatch.setattr(lifecycle, "_merge_validation", lambda _id, **updates: updates)
+    monkeypatch.setattr(lifecycle, "update_model_version_status", lambda *_args, **_kwargs: None)
+    holdout_calls: list[int] = []
+    baselines = _opportunity_cost_baselines()
+    baselines[0]["summary"]["aggregate_cost_after_return"] = .15
+    outcome = lifecycle.advance_formal_candidate_lifecycle([
+        *baselines,
+        {
+            "role": "champion", "reference_contract": _formal_reference(),
+            "summary": {"aggregate_cost_after_return": .08, "worst_window_drawdown": -.1, "total_fees": 700},
+        },
+        {
+            "role": "challenger", "model_version_id": 9, "status": "passed",
+            "reference_contract": _formal_reference(), "statistics": _formal_statistics(),
+            "summary": _candidate_summary(),
+        },
+    ], shadow_start_date="20260731", holdout_runner=lambda model_id, **_kwargs: holdout_calls.append(model_id) or _passed_holdout())[0]
+    assert outcome["status"] == "formal_oos_rejected"
+    assert "return_above_best_low_complexity_baseline" in outcome["blocking_reasons"]
+    assert holdout_calls == []
 
 
 def test_shadow_competition_promotes_exactly_one_candidate(monkeypatch):

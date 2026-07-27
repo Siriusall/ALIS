@@ -10,19 +10,20 @@ from app.services.backtest_data_source import BacktestDataSource
 def _safe_float(value: Any) -> float:
     try:
         return float(value or 0)
-    except Exception:
+    except (TypeError, ValueError):
         return 0.0
 
 
 def _safe_int(value: Any) -> int:
     try:
         return int(value or 0)
-    except Exception:
+    except (TypeError, ValueError):
         return 0
 
 
-def _task_context_by_execution(limit: int) -> dict[int, dict[str, Any]]:
+def _task_context_by_execution(limit: int) -> tuple[dict[int, dict[str, Any]], list[dict[str, Any]]]:
     out: dict[int, dict[str, Any]] = {}
+    warnings: list[dict[str, Any]] = []
     for record in list_recent_quant_run_task_records(limit=limit):
         execution_id = record.get("execution_id")
         if execution_id is None:
@@ -31,10 +32,16 @@ def _task_context_by_execution(limit: int) -> dict[int, dict[str, Any]]:
         try:
             records = list_quant_run_task_records(int(record["task_id"]), limit=5000)
             detail = next((item.get("detail") or {} for item in records if item.get("id") == record.get("id")), {})
-        except Exception:
+        except Exception as exc:
             detail = {}
+            warnings.append({
+                "code": "task_context_unavailable",
+                "execution_id": int(execution_id),
+                "task_id": record.get("task_id"),
+                "message": str(exc)[:240],
+            })
         out[int(execution_id)] = {**record, "detail": detail}
-    return out
+    return out, warnings
 
 
 def _operation_row(operation: dict[str, Any], *, close_price: float | None = None) -> dict[str, Any]:
@@ -77,11 +84,12 @@ def build_simulation_ledger(*, limit: int = 20, execution_id: int | None = None)
     n = max(1, min(int(limit or 20), 100))
     executions = [get_execution(int(execution_id))] if execution_id is not None else list_executions(limit=n)
     executions = [item for item in executions if item]
-    context_map = _task_context_by_execution(limit=max(100, n * 5))
+    context_map, evidence_warnings = _task_context_by_execution(limit=max(100, n * 5))
     ds = BacktestDataSource()
     items: list[dict[str, Any]] = []
     for execution in executions:
         eid = int(execution.get("id") or 0)
+        item_warnings = [warning for warning in evidence_warnings if warning.get("execution_id") == eid]
         context = context_map.get(eid) or {}
         signal_date = context.get("signal_date")
         execute_date = context.get("execute_date") or str(execution.get("executed_at") or "")[:10]
@@ -91,8 +99,16 @@ def build_simulation_ledger(*, limit: int = 20, execution_id: int | None = None)
         try:
             snap = ds.load_snapshot(str(execute_date or "").replace("-", ""))
             close_map = {str(row.symbol): _safe_float(getattr(row, "close", 0)) for row in snap}
-        except Exception:
+        except Exception as exc:
             close_map = {}
+            warning = {
+                "code": "execution_snapshot_unavailable",
+                "execution_id": eid,
+                "execute_date": execute_date,
+                "message": str(exc)[:240],
+            }
+            evidence_warnings.append(warning)
+            item_warnings.append(warning)
         rows = [_operation_row(op, close_price=close_map.get(str(op.get("symbol") or ""))) for op in sorted(operations, key=lambda x: int(x.get("id") or 0))]
         blocked = []
         actions = detail.get("rebalance_actions") if isinstance(detail.get("rebalance_actions"), dict) else {}
@@ -115,6 +131,7 @@ def build_simulation_ledger(*, limit: int = 20, execution_id: int | None = None)
             "orders": orders,
             "operations": rows,
             "blocked_signals": blocked,
+            "evidence_warnings": item_warnings,
             "summary": {
                 "operation_count": len(rows),
                 "buy_count": sum(1 for row in rows if row["side"] == "BUY"),
@@ -134,6 +151,7 @@ def build_simulation_ledger(*, limit: int = 20, execution_id: int | None = None)
         "schema_version": "simulation_ledger_v1",
         "generated_at": datetime.now().astimezone().isoformat(),
         "items": items,
+        "evidence_warnings": evidence_warnings,
         "limitations": [
             "mark_to_market_pnl is an execution-day estimate; formal FIFO realized attribution is exposed through decision review outcomes.",
         ],

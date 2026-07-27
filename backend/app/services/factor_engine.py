@@ -891,7 +891,10 @@ def score_factors_with_strategy(
     )
 
     # 仅对打分因子做截面归一化并加权
-    score_factor_names = [f for f in score_weights.keys() if f in FACTOR_REGISTRY]
+    score_factor_names = [
+        f for f in score_weights.keys()
+        if f in FACTOR_REGISTRY or f in consolidated_fields
+    ]
     if not score_factor_names:
         score_factor_names = ["volume", "turnover", "change_pct"]
         score_weights = _DEFAULT_WEIGHTS

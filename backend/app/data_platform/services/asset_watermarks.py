@@ -40,7 +40,8 @@ def persist_asset_watermarks(payload: dict[str, Any]) -> None:
                      "complete" if status in {"complete", "available"} else "repairable",
                      "", 10 if key in CORE_ASSETS else 50 if _tier(key) == "enhanced" else 90,
                      str(item.get("source") or ""), json.dumps({"coverage": item.get("coverage"), "window_start": item.get("window_start"),
-                     "window_end": item.get("window_end"), "measurement": item.get("measurement")}, ensure_ascii=False), now, now))
+                     "window_end": item.get("window_end"), "measurement": item.get("measurement"),
+                     "asset_snapshot": item}, ensure_ascii=False, default=str), now, now))
         for detail in item.get("period_details") or []:
             period = str(detail.get("period") or "")
             checks = int(detail.get("checks") or 0)
@@ -108,6 +109,36 @@ def asset_watermark_status() -> dict[str, Any]:
         "terminal": sum(x["status"] in {"upstream_unavailable", "not_applicable", "permission_denied"} for x in items),
         "missing_count": sum(int(x["missing_count"] or 0) for x in items if x["slice_key"] == "overall"),
     }}
+
+
+def load_asset_catalog_snapshot() -> dict[str, Any]:
+    """Rebuild the last persisted catalog without scanning raw data tables."""
+    status = asset_watermark_status()
+    overall = [item for item in status["items"] if item["slice_key"] == "overall"]
+    items = []
+    for row in overall:
+        snapshot = dict((row.get("metadata") or {}).get("asset_snapshot") or {})
+        snapshot.setdefault("key", row["asset_key"])
+        snapshot.setdefault("source", row["source_code"])
+        snapshot.setdefault("actual", row["available_count"])
+        snapshot.setdefault("expected", row["expected_count"])
+        snapshot["status"] = (
+            snapshot.get("status")
+            or ("complete" if row["status"] == "complete" else row["status"])
+        )
+        snapshot["watermark_checked_at"] = row["checked_at"]
+        items.append(snapshot)
+    checked = max((str(item.get("checked_at") or "") for item in overall), default="")
+    return {
+        "ok": True,
+        "items": items,
+        "summary": status["summary"],
+        "snapshot": {
+            "source": "dc_asset_watermark",
+            "checked_at": checked,
+            "stale": True,
+        },
+    }
 
 
 MIGRATION_TABLES = (

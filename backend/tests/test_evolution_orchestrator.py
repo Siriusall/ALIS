@@ -4,6 +4,42 @@ from datetime import timedelta
 from app.services import evolution_orchestrator as evolution
 
 
+def test_formal_trial_count_is_scoped_to_same_lineage_cohort():
+    candidate = {
+        "config": {
+            "champion_reference": "champion-1",
+            "lineage": {
+                "root_model_version_id": 50,
+                "hypothesis_family": "factor_combination_distillation",
+            },
+        },
+    }
+    versions = [
+        {
+            "id": 1,
+            "config": candidate["config"],
+            "metrics": {"formal_oos": {"status": "passed"}},
+        },
+        {
+            "id": 2,
+            "config": {
+                "champion_reference": "champion-1",
+                "lineage": {
+                    "root_model_version_id": 50,
+                    "hypothesis_family": "unrelated_family",
+                },
+            },
+            "metrics": {"formal_oos": {"status": "failed"}},
+        },
+        {"id": 3, "config": candidate["config"], "metrics": {}},
+    ]
+
+    cohort = evolution._formal_trial_cohort(candidate, versions)
+
+    assert cohort["trial_count"] == 1
+    assert cohort["model_version_ids"] == [1]
+
+
 def test_strategy_diagnosis_prioritizes_market_exposure():
     result = evolution.diagnose_strategy_results([
         {
@@ -226,7 +262,10 @@ def test_direct_challenger_cycle_injects_same_run_champion_reference(monkeypatch
     monkeypatch.setattr(evolution, "_ensure_task_active", lambda *_args: None)
     monkeypatch.setattr(evolution, "_heartbeat", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(evolution, "_persist_candidate_result", lambda *_args: None)
-    monkeypatch.setattr(evolution, "list_model_versions", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(evolution, "list_model_versions", lambda model_key, **_kwargs: [
+        {"id": 44, "version": "equal-weight", "config": {"baseline_key": "multifactor_equal_weight", "strategy_id": 3}},
+        {"id": 45, "version": "momentum", "config": {"baseline_key": "simple_momentum", "strategy_id": 4}},
+    ] if model_key == "alis_strategy_baseline" else [])
     captured: list[list[dict]] = []
     monkeypatch.setattr(
         evolution,
@@ -259,8 +298,9 @@ def test_direct_challenger_cycle_injects_same_run_champion_reference(monkeypatch
         validation_runner=runner,
     )
 
-    assert [item["role"] for item in result["strategies"]] == ["champion", "challenger"]
-    assert captured and captured[0][0]["reference_contract"] == captured[0][1]["reference_contract"]
+    assert [item["role"] for item in result["strategies"]] == ["champion", "baseline", "baseline", "challenger"]
+    assert [item.get("baseline_key") for item in result["strategies"][1:3]] == ["multifactor_equal_weight", "simple_momentum"]
+    assert captured and len({item["reference_contract"]["cycle_task_id"] for item in captured[0]}) == 1
 
 
 def test_controller_candidate_uses_own_identity_and_skips_generic_lifecycle(monkeypatch):

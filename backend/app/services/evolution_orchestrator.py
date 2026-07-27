@@ -41,6 +41,7 @@ AUTO_WEEKDAY = max(0, min(int(os.getenv("EVOLUTION_AUTO_WEEKDAY", "4")), 6))
 AUTO_HOUR = max(0, min(int(os.getenv("EVOLUTION_AUTO_HOUR", "18")), 23))
 MAX_CANDIDATES_PER_CYCLE = max(1, min(int(os.getenv("EVOLUTION_MAX_CANDIDATES", "6")), 20))
 MAX_WINDOWS_PER_CANDIDATE = max(1, min(int(os.getenv("EVOLUTION_MAX_WINDOWS", "5")), 20))
+REQUIRED_OPPORTUNITY_COST_BASELINES = ("multifactor_equal_weight", "simple_momentum")
 TASK_TIMEOUT_MINUTES = max(30, min(int(os.getenv("EVOLUTION_TASK_TIMEOUT_MINUTES", "240")), 1440))
 WORKER_ID = f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
 SYSTEM_AUTONOMY_RECOVERY_POLICY_VERSION = "v2"
@@ -70,6 +71,24 @@ def _runtime_heartbeat(component: str, *, alive: bool = True, error: str = "") -
             state["last_error"] = str(error)[:500]
         elif alive:
             state["last_error"] = ""
+
+
+def mark_evolution_component_disabled(component: str, *, reason: str) -> None:
+    """Mark a component healthy-by-delegation when another process owns it."""
+
+    if component not in {"worker", "scheduler"}:
+        raise ValueError("unsupported evolution runtime component")
+    with _runtime_lock:
+        _runtime_status[component].update(
+            {
+                "started": False,
+                "alive": False,
+                "disabled": True,
+                "disabled_reason": str(reason),
+                "heartbeat_at": None,
+                "last_error": "",
+            }
+        )
 
 
 def evolution_runtime_status() -> dict[str, Any]:
@@ -274,6 +293,12 @@ def evolution_schedule_status() -> dict[str, Any]:
             "hard_history_contract_sessions": 1537,
         },
         "next_factor_cycle_at": _next_business_day_at(now, 16).isoformat() if AUTO_ENABLED else None,
+        "continuous_factor_research": {
+            "enabled": AUTO_ENABLED,
+            "cadence": "persistent_low_priority_continuation",
+            "requires_market_close": False,
+            "priority": 90,
+        },
         "next_shadow_cycle_at": _next_business_day_at(now, 16).isoformat() if AUTO_ENABLED else None,
         "next_system_cycle_at": _next_business_day_at(now, 17).isoformat() if AUTO_ENABLED else None,
         "next_formal_cycle_at": _next_weekday_at(now, AUTO_WEEKDAY, AUTO_HOUR).isoformat() if AUTO_ENABLED else None,
@@ -613,6 +638,76 @@ def _strategy_targets() -> list[dict[str, Any]]:
     return targets
 
 
+def _formal_trial_cohort(
+    candidate: dict[str, Any],
+    versions: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Count only trials exposed to the same selection process.
+
+    Unrelated strategy families must not make every future experiment
+    progressively impossible, while siblings from the same search lineage still
+    receive the full multiple-testing penalty.
+    """
+    config = candidate.get("config") if isinstance(candidate.get("config"), dict) else {}
+    lineage = config.get("lineage") if isinstance(config.get("lineage"), dict) else {}
+    identity = {
+        "champion_reference": str(config.get("champion_reference") or ""),
+        "root_model_version_id": int(lineage.get("root_model_version_id") or 0),
+        "hypothesis_family": str(
+            lineage.get("hypothesis_family")
+            or config.get("generation")
+            or "unclassified"
+        ),
+    }
+    matching: list[int] = []
+    for version in versions:
+        metrics = version.get("metrics") if isinstance(version.get("metrics"), dict) else {}
+        if not isinstance(metrics.get("formal_oos"), dict):
+            continue
+        other_config = version.get("config") if isinstance(version.get("config"), dict) else {}
+        other_lineage = (
+            other_config.get("lineage")
+            if isinstance(other_config.get("lineage"), dict)
+            else {}
+        )
+        other_identity = {
+            "champion_reference": str(other_config.get("champion_reference") or ""),
+            "root_model_version_id": int(other_lineage.get("root_model_version_id") or 0),
+            "hypothesis_family": str(
+                other_lineage.get("hypothesis_family")
+                or other_config.get("generation")
+                or "unclassified"
+            ),
+        }
+        if other_identity == identity:
+            matching.append(int(version.get("id") or 0))
+    return {
+        "schema_version": "alis_formal_trial_cohort_v1",
+        "identity": identity,
+        "trial_count": max(1, len(matching)),
+        "model_version_ids": matching,
+    }
+
+
+def _opportunity_cost_baseline_targets() -> list[dict[str, Any]]:
+    """Resolve registered baselines by stable key rather than database ID."""
+    resolved: dict[str, dict[str, Any]] = {}
+    for version in list_model_versions("alis_strategy_baseline", limit=100):
+        config = version.get("config") if isinstance(version.get("config"), dict) else {}
+        baseline_key = str(config.get("baseline_key") or "")
+        strategy_id = int(config.get("strategy_id") or 0)
+        if baseline_key not in REQUIRED_OPPORTUNITY_COST_BASELINES or strategy_id <= 0:
+            continue
+        resolved.setdefault(baseline_key, {
+            "role": "baseline",
+            "baseline_key": baseline_key,
+            "strategy_id": strategy_id,
+            "model_version_id": int(version.get("id") or 0),
+            "name": str(version.get("version") or baseline_key),
+        })
+    return [resolved[key] for key in REQUIRED_OPPORTUNITY_COST_BASELINES if key in resolved]
+
+
 def create_strategy_controller_oos_task(
     strategy_controller_version_id: int, *, max_windows: int = 5, force: bool = False,
 ) -> dict[str, Any]:
@@ -696,6 +791,9 @@ def _formal_metrics(result: dict[str, Any]) -> dict[str, Any]:
         "aggregate_cost_after_return": summary.get("aggregate_cost_after_return"),
         "aggregate_benchmark_return": summary.get("aggregate_benchmark_return"),
         "aggregate_excess_return": summary.get("aggregate_excess_return"),
+        "annualized_relative_excess_return": summary.get("annualized_relative_excess_return"),
+        "minimum_annualized_relative_excess_return": summary.get("minimum_annualized_relative_excess_return"),
+        "effective_test_sessions": summary.get("effective_test_sessions"),
         "worst_window_drawdown": summary.get("worst_window_drawdown"),
         "total_fees": summary.get("total_fees"),
         "failure_attribution": result.get("failure_attribution") or {},
@@ -813,10 +911,17 @@ def _execute_strategy_cycle(
             "model_version_id": int(champion["champion_id"]),
             "name": str((champion.get("strategy") or {}).get("name") or "Champion"),
         }, *targets]
+    if any(item.get("role") == "challenger" for item in targets):
+        existing_keys = {str(item.get("baseline_key") or "") for item in targets if item.get("role") == "baseline"}
+        targets.extend(
+            item for item in _opportunity_cost_baseline_targets()
+            if str(item.get("baseline_key") or "") not in existing_keys
+        )
     max_candidates = max(1, min(int(payload.get("max_candidates") or MAX_CANDIDATES_PER_CYCLE), MAX_CANDIDATES_PER_CYCLE))
     champion_targets = [item for item in targets if item.get("role") == "champion"][:1]
-    research_targets = [item for item in targets if item.get("role") != "champion"][:max_candidates]
-    targets = champion_targets + research_targets
+    baseline_targets = [item for item in targets if item.get("role") == "baseline"]
+    research_targets = [item for item in targets if item.get("role") not in {"champion", "baseline"}][:max_candidates]
+    targets = champion_targets + baseline_targets + research_targets
     max_windows = max(1, min(int(payload.get("max_windows") or MAX_WINDOWS_PER_CANDIDATE), MAX_WINDOWS_PER_CANDIDATE))
     checkpoint = task.get("checkpoint") if isinstance(task.get("checkpoint"), dict) else {}
     completed = checkpoint.get("completed") if isinstance(checkpoint.get("completed"), list) else []
@@ -899,16 +1004,22 @@ def _execute_strategy_cycle(
             checkpoint_results=prior_windows,
         )
         if target.get("role") == "challenger":
-            formal_trials = sum(
-                1
-                for version in list_model_versions("alis_strategy_challenger", limit=500)
-                if isinstance((version.get("metrics") or {}).get("formal_oos"), dict)
+            challenger_versions = list_model_versions(
+                "alis_strategy_challenger", limit=500
+            )
+            candidate_version = get_model_version(
+                int(target.get("model_version_id") or 0)
+            ) or {}
+            formal_cohort = _formal_trial_cohort(
+                candidate_version,
+                challenger_versions,
             )
             statistics = dict(result.get("statistics") or {})
             statistics["multiple_testing"] = deflated_sharpe_ratio(
                 result.get("windows") if isinstance(result.get("windows"), list) else [],
-                trial_count=max(1, formal_trials),
+                trial_count=int(formal_cohort["trial_count"]),
             )
+            statistics["formal_trial_cohort"] = formal_cohort
             result["statistics"] = statistics
         _persist_candidate_result(target, result)
         reference_contract = _formal_reference_contract(
@@ -922,6 +1033,7 @@ def _execute_strategy_cycle(
             "model_version_id": int(target.get("model_version_id") or 0),
             "controller_version_id": target.get("controller_version_id"),
             "role": target.get("role"),
+            "baseline_key": target.get("baseline_key"),
             "name": target.get("name"),
             "status": result.get("status"),
             "summary": result.get("summary"),
@@ -1060,6 +1172,38 @@ def execute_evolution_task(
             checkpoint=task.get("checkpoint") if isinstance(task.get("checkpoint"), dict) else {},
         )
         return run_factor_daily_cycle()
+    if task_type == "factor_research_cycle":
+        from app.services.continuous_factor_research import (
+            run_continuous_factor_research_cycle,
+        )
+
+        _heartbeat(
+            int(task["id"]), phase="continuous_factor_research", progress=0.05,
+            message="正在冻结历史截面并搜索因子组合",
+            checkpoint=task.get("checkpoint") if isinstance(task.get("checkpoint"), dict) else {},
+        )
+        return run_continuous_factor_research_cycle(
+            candidates_per_task=max(
+                1, min(int((task.get("payload") or {}).get("candidates_per_task") or 1), 3)
+            ),
+            progress_callback=lambda progress: _heartbeat(
+                int(task["id"]),
+                phase="continuous_factor_research",
+                progress=min(
+                    0.9,
+                    0.1
+                    + 0.8
+                    * float(progress.get("completed_folds") or 0)
+                    / max(1, int(progress.get("total_folds") or 1)),
+                ),
+                message=(
+                    "连续因子组合回测 "
+                    f"{int(progress.get('completed_folds') or 0)}/"
+                    f"{int(progress.get('total_folds') or 1)}"
+                ),
+                checkpoint=progress,
+            ),
+        )
     if task_type == "sealed_holdout_adj_factor_backfill":
         from app.services.sealed_strategy_holdout import run_sealed_holdout_adj_factor_backfill
 
@@ -1089,6 +1233,7 @@ def _finish_success(task_id: int, result: dict[str, Any]) -> None:
     message = {
         "sealed_holdout_adj_factor_backfill": "密封验证集批量补全并复核完成",
         "factor_daily_cycle": "因子日物化与评价完成",
+        "factor_research_cycle": "连续因子组合研究完成",
         "strategy_shadow_cycle": "策略影子观察完成",
         "strategy_evolution_cycle": "策略进化周期完成",
         "strategy_controller_oos": "策略控制器 OOS 完成",
@@ -1125,6 +1270,36 @@ def _schedule_strategy_continuation(*, completed_task_id: int) -> dict[str, Any]
         dedupe_key=f"strategy_evolution_continuation:v2:{signature}:after-{int(completed_task_id)}",
         priority=55,
     )
+
+
+def _schedule_factor_research_continuation(
+    *,
+    completed_task_id: int,
+    result: dict[str, Any],
+) -> dict[str, Any] | None:
+    if not bool(result.get("continue_research")):
+        return None
+    snapshot = result.get("snapshot") if isinstance(result.get("snapshot"), dict) else {}
+    snapshot_id = str(snapshot.get("snapshot_id") or "unknown")
+    task = create_evolution_task(
+        task_type="factor_research_cycle",
+        payload={
+            "trigger": "continuous_research_continuation",
+            "candidates_per_task": 1,
+            "predecessor_task_id": int(completed_task_id),
+        },
+        dedupe_key=(
+            f"factor_research_continuation:{snapshot_id}:"
+            f"after-{int(completed_task_id)}"
+        ),
+        priority=90,
+    )
+    if task.get("id") and str(task.get("status") or "") == "queued":
+        _update_task(
+            int(task["id"]),
+            next_run_at=(_now() + timedelta(seconds=5)).isoformat(),
+        )
+    return get_evolution_task(int(task["id"])) if task.get("id") else task
 
 
 def _finish_failure(task: dict[str, Any], exc: Exception) -> None:
@@ -1183,6 +1358,28 @@ def run_worker_once() -> dict[str, Any] | None:
                 _schedule_strategy_continuation(completed_task_id=int(task["id"]))
             except Exception:  # noqa: BLE001 - continuation failure must not rewrite completed result
                 logger.exception("failed to schedule strategy lineage continuation task_id=%s", task.get("id"))
+        if str(task.get("task_type") or "") == "factor_research_cycle":
+            try:
+                _schedule_factor_research_continuation(
+                    completed_task_id=int(task["id"]),
+                    result=result,
+                )
+                distillation = (
+                    result.get("distillation")
+                    if isinstance(result.get("distillation"), dict)
+                    else {}
+                )
+                distilled = (
+                    distillation.get("distillation")
+                    if isinstance(distillation.get("distillation"), dict)
+                    else {}
+                )
+                if (distilled.get("generated") or distilled.get("reused")):
+                    _schedule_strategy_continuation(
+                        completed_task_id=int(task["id"])
+                    )
+            except Exception:  # noqa: BLE001 - completed research evidence remains valid
+                logger.exception("failed to schedule factor research continuation task_id=%s", task.get("id"))
     except Exception as exc:
         logger.exception("evolution task failed id=%s", task.get("id"))
         _finish_failure(get_evolution_task(int(task["id"])) or task, exc)
@@ -1276,6 +1473,15 @@ def start_evolution_scheduler() -> bool:
             try:
                 _runtime_heartbeat("scheduler")
                 now = _now()
+                create_evolution_task(
+                    task_type="factor_research_cycle",
+                    dedupe_key=f"factor_research_seed:v1:{now.date().isoformat()}",
+                    payload={
+                        "trigger": "continuous_scheduler",
+                        "candidates_per_task": 1,
+                    },
+                    priority=90,
+                )
                 ensure_latest_ready_system_cycle()
                 if _is_scheduled_trade_day(now) and now.hour >= 16:
                     create_evolution_task(

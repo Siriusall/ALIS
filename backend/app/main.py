@@ -1,4 +1,5 @@
 import logging
+import os
 import sys
 import time
 from contextlib import asynccontextmanager
@@ -27,6 +28,7 @@ from app.api.routes import (
     strategies,
 )
 from app.core.config import settings
+from app.core.error_evidence import error_evidence
 from app.db.store import database_health as primary_database_health, init_db
 from app.services.quant_task_runner import (
     ensure_autonomous_simulation_task,
@@ -38,12 +40,14 @@ from app.services.model_governance_scheduler import start_model_governance_sched
 from app.services.manual_review_triage import start_manual_review_triage_scheduler
 from app.services.evolution_orchestrator import (
     evolution_runtime_status,
+    mark_evolution_component_disabled,
     recover_evolution_tasks,
     start_evolution_scheduler,
     start_evolution_worker,
 )
 from app.services.production_strategy import ensure_production_strategy_champion
 from app.services.profit_loop import recover_interrupted_daily_rebalance_plans
+from app.services.runtime_boundary import BackgroundRuntimeLease, acquire_background_runtime_lease
 from app.data_platform.db import database_health as data_platform_database_health
 from app.data_platform.db import init_db as init_data_platform_db
 from app.data_platform.redis_store import start_task_worker
@@ -63,6 +67,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger("quant")
 _startup_components: dict[str, dict] = {}
+_background_runtime_lease: BackgroundRuntimeLease | None = None
+
+
+def _env_enabled(name: str, default: bool = True) -> bool:
+    fallback = "1" if default else "0"
+    return str(os.getenv(name, fallback)).strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _start_component(name: str, fn) -> object | None:
@@ -71,7 +81,16 @@ def _start_component(name: str, fn) -> object | None:
         _startup_components[name] = {"status": "started", "error": "", "result": result}
         return result
     except Exception as exc:  # noqa: BLE001 - one subsystem must not suppress the rest
-        _startup_components[name] = {"status": "failed", "error": str(exc)[:500]}
+        evidence = error_evidence(
+            exc,
+            operation=f"startup:{name}",
+            source="fastapi_lifespan",
+        )
+        _startup_components[name] = {
+            "status": "failed",
+            "error": evidence["message"],
+            "error_evidence": evidence,
+        }
         logger.exception("Startup component failed: %s", name)
         return None
 
@@ -82,12 +101,25 @@ def startup() -> None:
     and the dashboard can come up even when TuShare or local caches are not ready.
     """
 
+    global _background_runtime_lease
     startup_t0 = time.perf_counter()
+    _startup_components.clear()
     logger.info("Starting service: initializing database schema only.")
     init_db()
+    init_data_platform_db()
+    _background_runtime_lease = acquire_background_runtime_lease()
+    _startup_components["background_runtime_boundary"] = {
+        "status": "started",
+        "error": "",
+        "result": _background_runtime_lease.status(),
+    }
+    if not _background_runtime_lease.should_start:
+        logger.info("Background runtime not started: %s", _background_runtime_lease.reason)
+        logger.info("Web API startup completed in %.3fs.", time.perf_counter() - startup_t0)
+        return
+
     champion = ensure_production_strategy_champion()
     logger.info("Active ALIS production Champion: %s", champion.get("version"))
-    init_data_platform_db()
     autonomous_task = _start_component("autonomous_simulation_task", ensure_autonomous_simulation_task)
     if isinstance(autonomous_task, dict):
         logger.info(
@@ -104,7 +136,15 @@ def startup() -> None:
     _start_component("model_governance_scheduler", start_model_governance_scheduler)
     _start_component("manual_review_scheduler", start_manual_review_triage_scheduler)
     recovered_evolution = _start_component("evolution_recovery", recover_evolution_tasks)
-    _start_component("evolution_worker", start_evolution_worker)
+    if _env_enabled("ALIS_EVOLUTION_WORKER_ENABLED"):
+        _start_component("evolution_worker", start_evolution_worker)
+    else:
+        mark_evolution_component_disabled("worker", reason="external_worker")
+        _startup_components["evolution_worker"] = {
+            "status": "disabled",
+            "error": "",
+            "result": {"reason": "external_worker"},
+        }
     _start_component("evolution_scheduler", start_evolution_scheduler)
     if isinstance(recovered_evolution, int) and recovered_evolution:
         logger.info("Recovered interrupted evolution tasks: %d", recovered_evolution)
@@ -121,6 +161,17 @@ def startup() -> None:
             write_runtime_log("INFO", "backfill", "已自动确认过期补全队列消息", cleaned)
         write_runtime_log("INFO", "data-platform", "统一后端中的数据中台已启动")
     except Exception as exc:  # noqa: BLE001
+        evidence = error_evidence(
+            exc,
+            operation="startup:data_platform_worker",
+            source="fastapi_lifespan",
+            deferred=True,
+        )
+        _startup_components["data_platform_worker"] = {
+            "status": "failed",
+            "error": evidence["message"],
+            "error_evidence": evidence,
+        }
         logger.warning("Failed to initialize data-platform worker: %s", str(exc)[:200])
     logger.info("Service startup completed in %.3fs. Use POST /api/init to refresh market data.", time.perf_counter() - startup_t0)
 
@@ -128,10 +179,20 @@ def startup() -> None:
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     startup()
-    yield
+    try:
+        yield
+    finally:
+        if _background_runtime_lease is not None:
+            _background_runtime_lease.release()
 
 
 app = FastAPI(title=settings.app_name, lifespan=lifespan)
+
+
+@app.get("/api/openapi.json", include_in_schema=False)
+def api_openapi() -> dict:
+    """Serve the API catalog under the same /api prefix as browser requests."""
+    return app.openapi()
 
 
 app.add_middleware(
@@ -178,14 +239,20 @@ def health() -> dict:
     ready = primary.get("status") == "ok" and data_platform.get("status") == "ok"
     redis = redis_health()
     evolution = evolution_runtime_status()
+    runtime_boundary = (
+        _background_runtime_lease.status()
+        if _background_runtime_lease is not None
+        else {"mode": settings.background_runtime_mode, "should_start": False, "reason": "not_started"}
+    )
+    background_owner = bool(runtime_boundary.get("should_start"))
     failed_components = [name for name, item in _startup_components.items() if item.get("status") == "failed"]
     runtime_issues = [f"Startup component failed: {name}" for name in failed_components]
-    if not evolution.get("ok"):
+    if background_owner and not evolution.get("ok"):
         runtime_issues.append("Evolution worker or scheduler heartbeat is unhealthy")
     issues = ([] if redis.get("available", False) else ["Redis unavailable: durable stream tasks are disabled"]) + runtime_issues
     return {
-        "status": "ok" if ready and not failed_components and evolution.get("ok") else "error",
-        "ready": ready and not failed_components and bool(evolution.get("ok")),
+        "status": "ok" if ready and not failed_components and (not background_owner or evolution.get("ok")) else "error",
+        "ready": ready and not failed_components and bool(not background_owner or evolution.get("ok")),
         "degraded": ready and bool(issues),
         "issues": issues,
         "dependencies": {
@@ -193,6 +260,7 @@ def health() -> dict:
             "data_platform_database": data_platform,
             "redis": redis,
             "startup_components": _startup_components,
+            "background_runtime": runtime_boundary,
             "evolution_runtime": evolution,
         },
     }

@@ -65,6 +65,12 @@ def test_failed_formal_oos_quarantines_only_the_bound_active_champion(monkeypatc
     assert gate["status"] == "quarantined"
     assert gate["mode"] == "research_only_sell_reduce"
     assert gate["formal_oos"]["valid_window_count"] == 5
+    assert gate["defensive_continuity"] == {
+        "enabled": True,
+        "maximum_total_weight": 0.30,
+        "asset_scope": "registered_defensive_etf_only",
+        "individual_equity_buys_allowed": False,
+    }
 
 
 def test_old_or_unbound_oos_failure_does_not_quarantine_champion(monkeypatch):

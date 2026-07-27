@@ -11,6 +11,10 @@ from app.services.strategy_replay import run_strategy_replay
 from app.services.strategy_statistics import compare_strategy_windows
 
 
+PAIRED_DAILY_RETURN_CONTRACT = "alis_oos_paired_daily_returns_v1"
+MINIMUM_ANNUALIZED_RELATIVE_EXCESS_RETURN = 0.03
+
+
 @dataclass(frozen=True)
 class WalkForwardConfig:
     train_sessions: int = 756
@@ -131,6 +135,42 @@ def _number(value: Any) -> float:
         return float(value or 0.0)
     except (TypeError, ValueError):
         return 0.0
+
+
+def _paired_daily_returns(replay: dict[str, Any]) -> dict[str, Any]:
+    """Freeze aligned, non-overlapping strategy and benchmark daily returns."""
+    equity_by_date = {
+        str(item.get("date") or ""): _number(item.get("total_value"))
+        for item in replay.get("equity_series") or []
+        if str(item.get("date") or "")
+    }
+    benchmark_by_date = {
+        str(item.get("date") or ""): _number(item.get("total_value"))
+        for item in replay.get("benchmark_series") or []
+        if str(item.get("date") or "")
+    }
+    dates = sorted(set(equity_by_date) & set(benchmark_by_date))
+    observations: list[dict[str, Any]] = []
+    for previous_date, current_date in zip(dates, dates[1:]):
+        previous_equity = equity_by_date[previous_date]
+        current_equity = equity_by_date[current_date]
+        previous_benchmark = benchmark_by_date[previous_date]
+        current_benchmark = benchmark_by_date[current_date]
+        if min(previous_equity, current_equity, previous_benchmark, current_benchmark) <= 0:
+            continue
+        observations.append({
+            "date": current_date,
+            "strategy_return": round(current_equity / previous_equity - 1.0, 10),
+            "benchmark_return": round(current_benchmark / previous_benchmark - 1.0, 10),
+        })
+    expected_count = max(0, len(dates) - 1)
+    return {
+        "schema_version": PAIRED_DAILY_RETURN_CONTRACT,
+        "status": "complete" if observations and len(observations) == expected_count else "insufficient_data",
+        "aligned_equity_points": len(dates),
+        "observation_count": len(observations),
+        "observations": observations,
+    }
 
 
 def _failure_attribution(replay: dict[str, Any], states: dict[str, str]) -> dict[str, Any]:
@@ -280,7 +320,13 @@ def run_purged_walk_forward_validation(
         "evaluated_strategy_id": int(strategy_id or champion.get("strategy_id") or 0),
         "evaluation_role": "challenger" if strategy_id and int(strategy_id) != int(champion.get("strategy_id") or 0) else "champion",
         "strategy_controller_version": str(strategy_controller_version_id or champion["strategy_controller_version"]),
-        "protocol": {**cfg.__dict__, "split_policy": "rolling_origin_with_fixed_train_span", "estimator_policy": "frozen_champion_no_refit_inside_evaluation", "cost_policy": "A-share fees and slippage included by strategy replay"},
+        "protocol": {
+            **cfg.__dict__,
+            "split_policy": "rolling_origin_with_fixed_train_span",
+            "estimator_policy": "frozen_champion_no_refit_inside_evaluation",
+            "cost_policy": "A-share fees and slippage included by strategy replay",
+            "minimum_annualized_relative_excess_return": MINIMUM_ANNUALIZED_RELATIVE_EXCESS_RETURN,
+        },
         "available_sessions": len(dates), "available_window_count": len(windows),
         "required_window_count": cfg.minimum_windows,
     }
@@ -327,6 +373,7 @@ def run_purged_walk_forward_validation(
             "production_strategy_version": replay.get("production_strategy_version"),
             "market_state_attribution": _state_attribution(replay, states),
             "failure_attribution": _failure_attribution(replay, states),
+            "paired_daily_returns": _paired_daily_returns(replay),
         }
         results.append(window_result)
         results.sort(key=lambda item: int(item.get("index") or 0))
@@ -352,10 +399,17 @@ def run_purged_walk_forward_validation(
         aggregate_benchmark *= 1.0 + float(item["metrics"].get("benchmark_return") or 0)
         worst_drawdown = min(worst_drawdown, float(item["metrics"].get("max_drawdown") or 0))
         total_fees += float(item["summary"].get("total_fees") or 0)
+    effective_test_sessions = sum(int((item.get("test") or {}).get("sessions") or 0) for item in valid)
+    relative_wealth = aggregate_return / aggregate_benchmark if aggregate_benchmark > 0 else 0.0
+    annualized_relative_excess = (
+        relative_wealth ** (252.0 / effective_test_sessions) - 1.0
+        if relative_wealth > 0 and effective_test_sessions > 0 else -1.0
+    )
     gates = {
         "minimum_required_windows": len(valid) >= cfg.minimum_windows,
         "majority_windows_outperform": bool(valid) and len(wins) / len(valid) >= 0.60,
         "aggregate_cost_after_excess_positive": aggregate_return > aggregate_benchmark,
+        "annualized_relative_excess_at_least_3pct": annualized_relative_excess >= MINIMUM_ANNUALIZED_RELATIVE_EXCESS_RETURN,
         "all_four_market_states_covered": set(covered_states) == {"S0", "S1", "S2", "S3"},
         "point_in_time_all_passed": all(item["point_in_time_passed"] for item in results),
         "same_champion_all_windows": all(item["production_strategy_version"] == champion["champion_version"] for item in results),
@@ -373,6 +427,9 @@ def run_purged_walk_forward_validation(
             "aggregate_cost_after_return": round(aggregate_return - 1.0, 8),
             "aggregate_benchmark_return": round(aggregate_benchmark - 1.0, 8),
             "aggregate_excess_return": round(aggregate_return - aggregate_benchmark, 8),
+            "annualized_relative_excess_return": round(annualized_relative_excess, 8),
+            "minimum_annualized_relative_excess_return": MINIMUM_ANNUALIZED_RELATIVE_EXCESS_RETURN,
+            "effective_test_sessions": effective_test_sessions,
             "worst_window_drawdown": round(worst_drawdown, 8), "total_fees": round(total_fees, 2),
             "covered_market_states": covered_states,
         },

@@ -51,7 +51,10 @@ def test_data_platform_postgres_schema_is_ready() -> None:
     assert {"dc_stock_daily_snapshot", "dc_market_context_snapshot", "dc_runtime_logs"} <= tables
 
 
-def test_business_routes_require_a_bearer_token() -> None:
+def test_business_routes_require_a_bearer_token(monkeypatch) -> None:
+    from app.core.config import settings
+
+    monkeypatch.setattr(settings, "background_runtime_mode", "disabled")
     from app.main import app
 
     username = f"integration_{uuid.uuid4().hex[:12]}"

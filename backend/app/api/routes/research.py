@@ -30,6 +30,7 @@ from app.services.advanced_controls import bayesian_update, freeze_evidence, tra
 from app.services.theme_engine import list_themes, materialize_theme_snapshots
 from app.services.manual_review_queue import build_manual_review_queue, submit_manual_review_action
 from app.services.llm_review_assistant import generate_review_draft, llm_token_budget_status
+from app.services.llm_research_agent import list_llm_research_proposals
 from app.services.review_learning import materialize_decision_outcomes, review_learning_overview
 from app.services.manual_review_triage import run_manual_review_triage_once, triage_status
 from app.services.profit_loop import build_portfolio_candles, build_profit_loop
@@ -150,6 +151,11 @@ class PositionStateConfirmRequest(PositionTransitionRequest):
 def research_capabilities() -> dict[str, Any]:
     items = capability_registry()
     return {"ok": True, "items": items, "counts": {status: sum(1 for x in items if x["status"] == status) for status in ("ready", "partial", "building", "missing")}}
+
+
+@router.get("/research/llm/proposals")
+def research_llm_proposals(limit: int = Query(default=50, ge=1, le=200)) -> dict[str, Any]:
+    return list_llm_research_proposals(limit=limit)
 
 
 @router.get("/research/themes")
