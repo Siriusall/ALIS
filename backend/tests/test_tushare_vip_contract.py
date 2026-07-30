@@ -150,13 +150,20 @@ def test_etf_history_filters_unlisted_and_uses_listing_date(monkeypatch):
     assert all(params["start_date"] == "20200101" for _, params in calls)
 
 
-def test_major_news_history_slices_each_source_by_calendar_day(monkeypatch):
+def test_major_news_history_batches_days_by_source_and_preserves_daily_coverage(monkeypatch):
     calls = []
+    coverage = []
     monkeypatch.setattr(data_center, "_request_is_complete", lambda *_args: False)
     monkeypatch.setattr(
         data_center,
+        "_record_request_coverage",
+        lambda api, params, limit, rows, **kwargs: coverage.append((api, params, rows, kwargs)),
+    )
+    monkeypatch.setattr(
+        data_center,
         "_safe_sync_raw",
-        lambda api, params: calls.append((api, params)) or {"ok": True, "rows_written": 1},
+        lambda api, params: calls.append((api, params))
+        or {"ok": True, "rows_read": 10, "rows_written": 10},
     )
     result = data_center.backfill_major_news_history(
         start_date="20230719", end_date="20230720", limit_days=7
@@ -164,6 +171,48 @@ def test_major_news_history_slices_each_source_by_calendar_day(monkeypatch):
     assert result["days_processed"] == 2
     assert result["cursor"] == "20230720"
     assert result["has_more"] is False
-    assert len(calls) == 2 * len(data_center.MAJOR_NEWS_SOURCES)
+    assert len(calls) == len(data_center.MAJOR_NEWS_SOURCES)
+    assert len(coverage) == 2 * len(data_center.MAJOR_NEWS_SOURCES)
     assert all(params["start_date"].endswith("00:00:00") for _, params in calls)
     assert all(params["end_date"].endswith("23:59:59") for _, params in calls)
+
+
+def test_major_news_history_splits_capped_windows(monkeypatch):
+    calls = []
+    monkeypatch.setattr(data_center, "MAJOR_NEWS_SOURCES", ("同花顺",))
+    monkeypatch.setattr(data_center, "_request_is_complete", lambda *_args: False)
+    monkeypatch.setattr(data_center, "_record_request_coverage", lambda *_args, **_kwargs: None)
+
+    def sync(_api, params):
+        calls.append(params)
+        is_wide = params["start_date"][:10] != params["end_date"][:10]
+        return {
+            "ok": True,
+            "rows_read": 800 if is_wide else 100,
+            "rows_written": 100,
+        }
+
+    monkeypatch.setattr(data_center, "_safe_sync_raw", sync)
+
+    result = data_center.backfill_major_news_history(
+        start_date="20230719", end_date="20230720", limit_days=7
+    )
+
+    assert result["ok"] is True
+    assert len(calls) == 3
+    assert result["requests_executed"] == 3
+def test_data_center_catalog_seed_runs_once_per_process(monkeypatch):
+    calls = []
+    monkeypatch.setattr(data_center, "_data_center_seeded", False)
+    monkeypatch.setattr(
+        data_center,
+        "_seed_data_center_catalog",
+        lambda: calls.append(True) or {"ok": True, "catalog_count": 1},
+    )
+
+    first = data_center.ensure_data_center_seeded()
+    second = data_center.ensure_data_center_seeded()
+
+    assert first["ok"] is True
+    assert second["ok"] is True
+    assert calls == [True]

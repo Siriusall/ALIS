@@ -206,10 +206,10 @@ def _snapshot_cache_file(trade_date: str) -> Path:
     return _SNAPSHOT_DISK_CACHE_DIR / f"{trade_date}.json"
 
 
-def get_latest_cached_snapshot_date() -> Optional[str]:
+def get_latest_cached_snapshot_date(*, on_or_before: str | None = None) -> Optional[str]:
     """
     返回磁盘快照缓存中已有的最新交易日 YYYYMMDD；无有效缓存时返回 None。
-    用于 cache_only 路径下请求的 trade_date 无缓存时，回退到「缓存中最新一日」与日线逻辑一致。
+    指定 on_or_before 时只允许回退到目标日或更早，防止历史研究读取未来截面。
     """
     if not _SNAPSHOT_DISK_CACHE_DIR.exists():
         return None
@@ -219,6 +219,8 @@ def get_latest_cached_snapshot_date() -> Optional[str]:
             continue
         stem = p.stem
         if len(stem) == 8 and stem.isdigit():
+            if on_or_before and stem > str(on_or_before).replace("-", "")[:8]:
+                continue
             if latest is None or stem > latest:
                 latest = stem
     return latest
@@ -670,4 +672,3 @@ def get_daily_snapshot(
         finally:
             _release_redis_lock(trade_date, redis_lock_token)
             _release_file_lock(lock_fd, lock_path)
-

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import threading
+from bisect import bisect_right
 from datetime import date, datetime, timedelta
 from typing import Any
 
@@ -18,6 +19,10 @@ from app.data_platform.services.assets import (
     get_data_assets,
     invalidate_data_assets_cache,
 )
+
+PLAN_MODEL_REQUIRED_LABELED_SESSIONS = 1577
+MODEL_DATA_BACKFILL_TASK = "data_platform.plan_model_data_backfill"
+MODEL_DATA_BACKFILL_STATE_KEY = "alis:data-platform:plan-model-data-backfill:state"
 from app.data_platform.services.asset_watermarks import mark_asset_terminal
 from app.data_platform.services.data_center import (
     enrich_financial_research_batch,
@@ -42,12 +47,21 @@ from app.data_platform.services.data_center import (
 )
 from app.data_platform.services.market_calendar import target_trade_day
 from app.data_platform.services.oos_hard_data import audit_oos_hard_data, repair_oos_hard_data_batch
-from app.data_platform.redis_store import ack_task, enqueue_task, get_json, set_json
+from app.data_platform.redis_store import (
+    STREAM_MAX_ATTEMPTS,
+    ack_task,
+    enqueue_task,
+    get_json,
+    set_json,
+    stream_health,
+    task_attempts,
+)
 from app.services.theme_engine import materialize_theme_snapshot_history
 from app.data_platform.services.exchange_etf_pcf import backfill_exchange_etf_pcf
 
 _lock = threading.Lock()
 _state: dict[str, Any] = {"running": False, "phase": "idle", "message": "尚未生成计划"}
+_model_backfill_status_cache: dict[str, Any] = {"at": 0.0, "value": None}
 # Recoverable process/rate-limit failures must be finite. Permanent upstream
 # failures are surfaced to the operator after this many automatic resumes.
 AUTO_RESUME_MAX_ATTEMPTS = 5
@@ -586,21 +600,38 @@ def build_backfill_plan(*, market_batch_days: int = 30, financial_batch_size: in
             "status": "done" if batch_checked or (stocks > 0 and checked >= stocks) else "needed",
             "gap": {"checked_symbols": checked, "need_symbols": stocks, "batch": financial_batch_size, "period_batch_checked": batch_checked},
         })
+    all_historical_open_days = _open_dates("20100101", end_s)
+    moneyflow_open_days = all_historical_open_days[-(PLAN_MODEL_REQUIRED_LABELED_SESSIONS + 30):]
     for api_name, title in (("suspend_d", "补全停复牌检查"), ("moneyflow", "补全资金流")):
-        checked_dates = _request_date_coverage(api_name, start_s, end_s)
-        remaining_dates = max(0, len(open_days) - checked_dates)
+        target_days = moneyflow_open_days if api_name == "moneyflow" else open_days
+        target_start = target_days[0] if target_days else start_s
+        checked_dates = _request_date_coverage(api_name, target_start, end_s)
+        remaining_dates = max(0, len(target_days) - checked_dates)
         add({
-            "priority": 4, "key": f"date_api_{api_name}", "title": title,
-            "why": f"{api_name} 已通过真实接口验证；按交易日分批，成功空结果也记为已检查",
+            "priority": 2 if api_name == "moneyflow" else 4,
+            "key": f"date_api_{api_name}",
+            "title": title,
+            "why": (
+                "资金模型正式五窗要求1,577个可标注日，按交易日全市场回补并校验至少500行及收盘点时"
+                if api_name == "moneyflow"
+                else f"{api_name} 已通过真实接口验证；按交易日分批，成功空结果也记为已检查"
+            ),
             "action": "sync_date_api_batch",
-            "params": {"api_name": api_name, "trade_dates": open_days, "limit": market_batch_days},
+            "params": {
+                "api_name": api_name,
+                "trade_dates": target_days,
+                "limit": market_batch_days,
+                "require_rows": api_name == "moneyflow",
+                "minimum_rows": 500 if api_name == "moneyflow" else 1,
+                "require_point_in_time": api_name == "moneyflow",
+            },
             # Date requests are executed by the shared 16-worker pool. Keep
             # the call count exact, but estimate wall time by concurrent waves;
             # any TuShare cooldown is added dynamically by the worker.
             "estimated_calls": remaining_dates,
             "estimated_minutes": round((remaining_dates / 16) * 0.2, 1),
-            "status": "done" if open_days and checked_dates >= len(open_days) else "needed",
-            "gap": {"checked_dates": checked_dates, "need_dates": len(open_days), "batch": market_batch_days},
+            "status": "done" if target_days and checked_dates >= len(target_days) else "needed",
+            "gap": {"checked_dates": checked_dates, "need_dates": len(target_days), "batch": market_batch_days},
         })
     add({
         "priority": 4, "key": "index_core", "title": "补全沪深300指数与权重",
@@ -1223,6 +1254,8 @@ def _run_step(step: dict[str, Any]) -> dict[str, Any]:
             str(params.get("api_name") or ""), trade_dates=list(params.get("trade_dates") or []),
             limit=int(params.get("limit") or 10),
             require_rows=bool(params.get("require_rows")),
+            minimum_rows=int(params.get("minimum_rows") or 1),
+            require_point_in_time=bool(params.get("require_point_in_time")),
         )
     if action == "sync_capital_history_batch":
         return backfill_capital_structure_history(
@@ -1761,7 +1794,33 @@ def start_backfill(*, max_steps: int = 0, market_batch_days: int = 30, financial
 
 def process_stream_task(fields: dict[str, str]) -> dict[str, Any]:
     """Recover a queued backfill without enqueueing a second message."""
-    if str(fields.get("task_type") or "") != "data_platform.backfill":
+    task_type = str(fields.get("task_type") or "")
+    if task_type == MODEL_DATA_BACKFILL_TASK:
+        try:
+            payload = json.loads(fields.get("payload_json") or "{}")
+        except Exception:
+            payload = {}
+        try:
+            result = _process_plan_model_data_backfill(payload)
+        except Exception as exc:
+            _set_model_data_backfill_state(
+                status="retry_wait",
+                error=str(exc)[:1000],
+                last_failure_at=_now(),
+            )
+            raise
+        if not bool(result.get("ok")):
+            _set_model_data_backfill_state(
+                status="retry_wait",
+                error=str(
+                    result.get("error")
+                    or result.get("reason")
+                    or "plan_model_data_backfill_failed"
+                )[:1000],
+                last_failure_at=_now(),
+            )
+        return result
+    if task_type != "data_platform.backfill":
         return {"ok": False, "skipped": True, "reason": "unsupported_task"}
     try:
         payload = json.loads(fields.get("payload_json") or "{}")
@@ -1772,3 +1831,611 @@ def process_stream_task(fields: dict[str, str]) -> dict[str, Any]:
         enqueue_stream=False,
         auto_resume_attempt=int(payload.get("auto_resume_attempt") or 0),
     )
+
+
+def _set_model_data_backfill_state(**values: Any) -> dict[str, Any]:
+    state = get_json(MODEL_DATA_BACKFILL_STATE_KEY)
+    if not isinstance(state, dict):
+        state = {}
+    state.update(values)
+    state["updated_at"] = _now()
+    set_json(MODEL_DATA_BACKFILL_STATE_KEY, state, ttl=86400 * 30)
+    _model_backfill_status_cache.update({"at": 0.0, "value": None})
+    return state
+
+
+def _model_data_backfill_result_summary(result: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: result.get(key)
+        for key in (
+            "ok",
+            "api",
+            "total",
+            "success",
+            "failed",
+            "rows_written",
+            "days_processed",
+            "requests_executed",
+            "requests_skipped",
+            "normalized_available_time_rows",
+            "cursor",
+            "has_more",
+            "cooldown",
+            "cooldown_seconds",
+            "error",
+        )
+        if result.get(key) is not None
+    }
+
+
+def enqueue_plan_model_data_backfill(
+    *,
+    phase: str = "moneyflow",
+    cursor: str = "",
+    trade_dates: list[str] | None = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {"phase": phase, "cursor": cursor}
+    if trade_dates:
+        payload["trade_dates"] = list(dict.fromkeys(str(item) for item in trade_dates if str(item)))[:120]
+    message_id = enqueue_task(
+        MODEL_DATA_BACKFILL_TASK,
+        payload,
+    )
+    state = _set_model_data_backfill_state(
+        status="queued" if message_id else "queue_unavailable",
+        phase=phase,
+        cursor=cursor,
+        message_id=message_id or "",
+        next_message_id="",
+        residual_count=len(payload.get("trade_dates") or []),
+    )
+    return {"ok": bool(message_id), **state}
+
+
+def _moneyflow_required_coverage() -> tuple[list[str], set[str], list[str]]:
+    required_raw = PLAN_MODEL_REQUIRED_LABELED_SESSIONS + 30
+    with _conn() as c:
+        rows = c.execute(
+            """SELECT cal.cal_date,
+                      EXISTS (
+                          SELECT 1
+                          FROM dc_tushare_raw_records raw
+                          WHERE raw.api_name='moneyflow'
+                            AND raw.trade_date=cal.cal_date
+                            AND raw.available_time<>''
+                      ) covered
+               FROM (
+                   SELECT cal_date
+                   FROM dc_trade_calendar
+                   WHERE exchange='SSE' AND is_open=1 AND cal_date<=?
+                   ORDER BY cal_date DESC
+                   LIMIT ?
+               ) cal
+               ORDER BY cal.cal_date ASC""",
+            (datetime.now().strftime("%Y%m%d"), required_raw),
+        ).fetchall()
+    trade_dates = [str(dict(row).get("cal_date") or "") for row in rows]
+    covered_dates = {
+        str(dict(row).get("cal_date") or "")
+        for row in rows
+        if bool(dict(row).get("covered"))
+    }
+    missing_dates = [item for item in trade_dates if item and item not in covered_dates]
+    return trade_dates, covered_dates, missing_dates
+
+
+def _model_moneyflow_checklist() -> dict[str, Any]:
+    required_raw = PLAN_MODEL_REQUIRED_LABELED_SESSIONS + 30
+    trade_dates, covered_dates, missing_dates = _moneyflow_required_coverage()
+    raw_sessions = len(covered_dates)
+    effective_sessions = max(0, raw_sessions - 30)
+    return {
+        "id": "capital_moneyflow_history",
+        "label": "资金持续模型：全市场 moneyflow 历史",
+        "status": (
+            "completed"
+            if len(trade_dates) >= required_raw and not missing_dates
+            else "running"
+        ),
+        "target_raw_sessions": required_raw,
+        "covered_raw_sessions": raw_sessions,
+        "target_effective_sessions": PLAN_MODEL_REQUIRED_LABELED_SESSIONS,
+        "covered_effective_sessions": effective_sessions,
+        "missing_count": len(missing_dates),
+        "missing_dates": missing_dates[:120],
+        "window_start": trade_dates[0] if trade_dates else "",
+        "window_end": trade_dates[-1] if trade_dates else "",
+        "acceptance": (
+            "每个交易日全市场批量 moneyflow 至少 500 行、具有点时 available_time；"
+            "扣除 20 日特征窗口和 10 日未来标签后达到 1,577 日"
+        ),
+    }
+
+
+def _news_source_progress(*, phase: str, cursor: str, status: str) -> dict[str, Any]:
+    start = date(2020, 1, 1)
+    end = datetime.now().date()
+    total_days = max(1, (end - start).days + 1)
+    processed_days = 0
+    if phase == "major_news":
+        try:
+            cursor_date = datetime.strptime(cursor, "%Y%m%d").date()
+            processed_days = max(0, min(total_days, (cursor_date - start).days + 1))
+        except ValueError:
+            processed_days = 0
+    elif status == "completed":
+        processed_days = total_days
+    return {
+        "id": "event_major_news_history",
+        "label": "事件预期差模型：重大新闻历史源检查",
+        "status": (
+            "completed"
+            if status == "completed"
+            else "running"
+            if phase == "major_news"
+            else "pending"
+        ),
+        "source_window_start": start.strftime("%Y%m%d"),
+        "source_window_end": end.strftime("%Y%m%d"),
+        "cursor": cursor if phase == "major_news" else "",
+        "processed_calendar_days": processed_days,
+        "target_calendar_days": total_days,
+        "progress": round(processed_days / total_days, 6),
+        "acceptance": (
+            "按来源和自然日完整检查 major_news，800 行截断时递归拆分；"
+            "完成只证明来源历史已检查，不等于事件模型已达到 1,577 个有效事件日"
+        ),
+    }
+
+
+def audit_plan_model_data_contract() -> dict[str, Any]:
+    """Recompute real model-domain coverage after source backfill completes."""
+
+    from app.services.plan_model_control import (
+        _base_coverage_snapshot,
+        _coverage_snapshot,
+    )
+
+    base = _base_coverage_snapshot()
+    models = {
+        model_key: _coverage_snapshot(model_key, base)
+        for model_key in (
+            "capital_persistence_multitask_v1",
+            "event_surprise_lgbm_v1",
+        )
+    }
+    return {
+        "schema_version": "alis_plan_model_data_contract_audit_v1",
+        "status": "completed",
+        "audited_at": _now(),
+        "models": models,
+        "all_domain_minimum_ready": all(
+            bool(item.get("domain_minimum_ready")) for item in models.values()
+        ),
+        "all_formal_history_ready": all(
+            bool(item.get("formal_history_ready")) for item in models.values()
+        ),
+        "policy": (
+            "audit_execution_may_complete_while_a_model_remains_not_ready;"
+            "source_scan_never_fabricates_effective_event_sessions"
+        ),
+    }
+
+
+def get_plan_model_data_backfill_status(*, cache_seconds: int = 15) -> dict[str, Any]:
+    """Build the read-only work-order view consumed by the task center."""
+    import time
+
+    now = time.monotonic()
+    cached = _model_backfill_status_cache.get("value")
+    if (
+        isinstance(cached, dict)
+        and now - float(_model_backfill_status_cache.get("at") or 0)
+        < max(1, cache_seconds)
+    ):
+        return cached
+    state = get_json(MODEL_DATA_BACKFILL_STATE_KEY)
+    if not isinstance(state, dict) or not state:
+        result = {
+            "ok": True,
+            "schema_version": "alis_model_data_backfill_work_order_v1",
+            "status": "not_started",
+            "phase": "idle",
+            "progress": 0.0,
+            "checklist": [],
+            "queue": stream_health(),
+        }
+        _model_backfill_status_cache.update({"at": now, "value": result})
+        return result
+    phase = str(state.get("phase") or "moneyflow")
+    raw_status = str(state.get("status") or "queued")
+    cursor = str(state.get("cursor") or "")
+    post_backfill_audit = (
+        state.get("post_backfill_audit")
+        if isinstance(state.get("post_backfill_audit"), dict)
+        else {}
+    )
+    message_id = str(state.get("next_message_id") or state.get("message_id") or "")
+    attempts = task_attempts(message_id)
+    moneyflow = _model_moneyflow_checklist()
+    news = _news_source_progress(phase=phase, cursor=cursor, status=raw_status)
+    trade_start = str(moneyflow.get("window_start") or "")
+    trade_end = str(moneyflow.get("window_end") or "")
+    processed_trade_dates = 0
+    target_raw = int(moneyflow.get("target_raw_sessions") or 1)
+    if phase == "moneyflow" and cursor and trade_start and trade_end:
+        with _conn() as c:
+            row = c.execute(
+                """SELECT COUNT(*) n
+                   FROM dc_trade_calendar
+                   WHERE exchange='SSE' AND is_open=1
+                     AND cal_date BETWEEN ? AND ? AND cal_date<=?""",
+                (trade_start, trade_end, cursor),
+            ).fetchone()
+        processed_trade_dates = int(dict(row).get("n") or 0)
+    elif phase in {"moneyflow_residual", "major_news"} or raw_status == "completed":
+        processed_trade_dates = target_raw
+    moneyflow["cursor"] = cursor if phase == "moneyflow" else trade_end
+    moneyflow["processed_trade_dates"] = min(target_raw, processed_trade_dates)
+    moneyflow["progress"] = round(
+        min(target_raw, processed_trade_dates) / max(1, target_raw),
+        6,
+    )
+    if raw_status == "completed":
+        normalized_status = "completed"
+    elif raw_status in {"failed", "queue_unavailable"}:
+        normalized_status = "failed"
+    elif raw_status == "retry_wait" or attempts > 0:
+        normalized_status = (
+            "failed" if attempts >= STREAM_MAX_ATTEMPTS else "retry_wait"
+        )
+    elif raw_status == "queued":
+        normalized_status = "queued"
+    else:
+        normalized_status = "running"
+    progress = round(
+        (
+            float(moneyflow.get("progress") or 0.0)
+            + float(news.get("progress") or 0.0)
+        )
+        / 2.0,
+        6,
+    )
+    result = {
+        "ok": True,
+        "schema_version": "alis_model_data_backfill_work_order_v1",
+        "work_order_id": "plan-model-history-20260729-v1",
+        "task_type": MODEL_DATA_BACKFILL_TASK,
+        "status": normalized_status,
+        "raw_status": raw_status,
+        "phase": phase,
+        "cursor": cursor,
+        "progress": 1.0 if normalized_status == "completed" else progress,
+        "message_id": message_id,
+        "attempt": attempts + 1 if normalized_status in {"running", "retry_wait"} else attempts,
+        "max_attempts": STREAM_MAX_ATTEMPTS,
+        "error": str(state.get("error") or ""),
+        "updated_at": state.get("updated_at"),
+        "last_result": state.get("last_result") or {},
+        "checklist": [
+            moneyflow,
+            news,
+            {
+                "id": "post_backfill_contract_audit",
+                "label": "补数后重新计算模型数据门",
+                "status": (
+                    "completed"
+                    if str(post_backfill_audit.get("status") or "") == "completed"
+                    else "pending"
+                    if normalized_status != "completed"
+                    else "audit_missing"
+                ),
+                "result": post_backfill_audit,
+                "acceptance": (
+                    "资金按 1,577 个有效交易日验收；事件按真实可映射事件样本重新审计，"
+                    "不得因为来源扫描完成就伪造 1,577 个事件日"
+                ),
+            },
+        ],
+        "queue": stream_health(),
+        "intervention": {
+            "automatic": (
+                "瞬时异常由 Redis 持久消息最多重试 "
+                f"{STREAM_MAX_ATTEMPTS} 次；重启后从游标恢复"
+            ),
+            "current": (
+                "检查死信和上游/权限异常，保持模型 N/A"
+                if normalized_status == "failed"
+                else "系统自行处理，无需人工操作"
+            ),
+            "forbidden": "不得伪造空结果、放宽点时门或绕过模型评价合同",
+        },
+    }
+    _model_backfill_status_cache.update({"at": now, "value": result})
+    return result
+
+
+def ensure_plan_model_data_backfill() -> dict[str, Any]:
+    """Idempotently start the registered model-data checklist when absent."""
+    status = get_plan_model_data_backfill_status(cache_seconds=1)
+    current = str(status.get("status") or "not_started")
+    if current in {"queued", "running", "retry_wait"}:
+        return {"ok": True, "created": False, "reason": "already_active", "task": status}
+    if current == "completed":
+        return {"ok": True, "created": False, "reason": "work_order_completed", "task": status}
+    if current == "failed":
+        return {
+            "ok": False,
+            "created": False,
+            "reason": "dead_letter_or_retry_budget_exhausted",
+            "task": status,
+        }
+    queued = enqueue_plan_model_data_backfill(phase="moneyflow", cursor="")
+    _model_backfill_status_cache.update({"at": 0.0, "value": None})
+    return {"ok": bool(queued.get("ok")), "created": bool(queued.get("ok")), "task": queued}
+
+
+def _normalize_moneyflow_available_time(
+    trade_dates: list[str],
+    *,
+    chunk_size: int = 10,
+) -> int:
+    """Normalize historical economic availability without one oversized UPDATE."""
+    normalized = 0
+    size = max(1, min(int(chunk_size), 20))
+    for offset in range(0, len(trade_dates), size):
+        batch = trade_dates[offset:offset + size]
+        if not batch:
+            continue
+        placeholders = ",".join("?" for _ in batch)
+        with _conn() as c:
+            result = c.execute(
+                f"""UPDATE dc_tushare_raw_records
+                    SET available_time=SUBSTRING(trade_date,1,4)||'-'||
+                                       SUBSTRING(trade_date,5,2)||'-'||
+                                       SUBSTRING(trade_date,7,2)||'T15:00:00'
+                    WHERE api_name='moneyflow'
+                      AND trade_date IN ({placeholders})
+                      AND available_time<>SUBSTRING(trade_date,1,4)||'-'||
+                                          SUBSTRING(trade_date,5,2)||'-'||
+                                          SUBSTRING(trade_date,7,2)||'T15:00:00'""",
+                tuple(batch),
+            )
+            normalized += max(0, int(getattr(result, "rowcount", 0) or 0))
+    return normalized
+
+
+def _process_plan_model_data_backfill(payload: dict[str, Any]) -> dict[str, Any]:
+    phase = str(payload.get("phase") or "moneyflow")
+    cursor = str(payload.get("cursor") or "")
+    _set_model_data_backfill_state(status="running", phase=phase, cursor=cursor, error="")
+    if phase == "moneyflow":
+        with _conn() as c:
+            rows = c.execute(
+                """SELECT cal_date
+                   FROM dc_trade_calendar
+                   WHERE exchange='SSE' AND is_open=1 AND cal_date<=?
+                   ORDER BY cal_date DESC LIMIT ?""",
+                (
+                    datetime.now().strftime("%Y%m%d"),
+                    PLAN_MODEL_REQUIRED_LABELED_SESSIONS + 30,
+                ),
+            ).fetchall()
+        trade_dates = sorted(
+            str(dict(row).get("cal_date") or "")
+            for row in rows
+            if dict(row).get("cal_date")
+        )
+        start_index = 0
+        if cursor:
+            start_index = bisect_right(trade_dates, cursor)
+        batch_dates = trade_dates[start_index:start_index + 60]
+        if not batch_dates:
+            _, _, missing_dates = _moneyflow_required_coverage()
+            if missing_dates:
+                next_task = enqueue_plan_model_data_backfill(
+                    phase="moneyflow_residual",
+                    cursor="",
+                    trade_dates=missing_dates,
+                )
+                _set_model_data_backfill_state(
+                    status="running",
+                    phase="moneyflow_residual",
+                    cursor="",
+                    residual_count=len(missing_dates),
+                    next_message_id=next_task.get("message_id") or "",
+                )
+                return {
+                    "ok": True,
+                    "phase": phase,
+                    "completed": False,
+                    "next_phase": "moneyflow_residual",
+                    "residual_count": len(missing_dates),
+                }
+            next_task = enqueue_plan_model_data_backfill(phase="major_news", cursor="20191231")
+            _set_model_data_backfill_state(
+                status="moneyflow_completed",
+                phase="major_news",
+                cursor=cursor,
+                next_message_id=next_task.get("message_id") or "",
+            )
+            return {"ok": True, "phase": phase, "completed": True}
+        normalized_rows = _normalize_moneyflow_available_time(batch_dates)
+        result = sync_tushare_date_batch(
+            "moneyflow",
+            trade_dates=batch_dates,
+            limit=60,
+            require_rows=True,
+            minimum_rows=500,
+            require_point_in_time=True,
+        )
+        result["normalized_available_time_rows"] = normalized_rows
+        if not result.get("ok"):
+            _set_model_data_backfill_state(
+                status="failed",
+                phase=phase,
+                error=str(result.get("error") or "moneyflow_backfill_failed"),
+                last_result=_model_data_backfill_result_summary(result),
+            )
+            return result
+        if int(result.get("total") or 0) > 0:
+            next_cursor = batch_dates[-1]
+            next_task = enqueue_plan_model_data_backfill(phase="moneyflow", cursor=next_cursor)
+            _set_model_data_backfill_state(
+                status="running",
+                phase=phase,
+                cursor=next_cursor,
+                completed_in_batch=int(result.get("success") or 0),
+                next_message_id=next_task.get("message_id") or "",
+                last_result=_model_data_backfill_result_summary(result),
+            )
+        else:
+            next_cursor = batch_dates[-1]
+            next_task = enqueue_plan_model_data_backfill(phase="moneyflow", cursor=next_cursor)
+            _set_model_data_backfill_state(
+                status="running",
+                phase=phase,
+                cursor=next_cursor,
+                next_message_id=next_task.get("message_id") or "",
+                last_result=_model_data_backfill_result_summary(result),
+            )
+        return {"ok": True, "phase": phase, "result": result}
+    if phase == "moneyflow_residual":
+        batch_dates = list(
+            dict.fromkeys(
+                str(item)
+                for item in (payload.get("trade_dates") or [])
+                if str(item)
+            )
+        )[:60]
+        if not batch_dates:
+            _, _, batch_dates = _moneyflow_required_coverage()
+            batch_dates = batch_dates[:60]
+        if batch_dates:
+            normalized_rows = _normalize_moneyflow_available_time(batch_dates)
+            result = sync_tushare_date_batch(
+                "moneyflow",
+                trade_dates=batch_dates,
+                limit=60,
+                require_rows=True,
+                minimum_rows=500,
+                require_point_in_time=True,
+            )
+            result["normalized_available_time_rows"] = normalized_rows
+            if not result.get("ok"):
+                _set_model_data_backfill_state(
+                    status="failed",
+                    phase=phase,
+                    error=str(result.get("error") or "moneyflow_residual_backfill_failed"),
+                    last_result=_model_data_backfill_result_summary(result),
+                )
+                return result
+        else:
+            result = {
+                "ok": True,
+                "api": "moneyflow",
+                "total": 0,
+                "success": 0,
+                "failed": 0,
+            }
+        _, _, remaining = _moneyflow_required_coverage()
+        if remaining:
+            next_task = enqueue_plan_model_data_backfill(
+                phase="moneyflow_residual",
+                cursor="",
+                trade_dates=remaining,
+            )
+            _set_model_data_backfill_state(
+                status="running",
+                phase=phase,
+                cursor="",
+                residual_count=len(remaining),
+                next_message_id=next_task.get("message_id") or "",
+                last_result=_model_data_backfill_result_summary(result),
+            )
+        else:
+            next_task = enqueue_plan_model_data_backfill(
+                phase="major_news",
+                cursor="20191231",
+            )
+            _set_model_data_backfill_state(
+                status="moneyflow_completed",
+                phase="major_news",
+                cursor="20191231",
+                residual_count=0,
+                next_message_id=next_task.get("message_id") or "",
+                last_result=_model_data_backfill_result_summary(result),
+            )
+        return {
+            "ok": True,
+            "phase": phase,
+            "result": result,
+            "remaining": len(remaining),
+        }
+    if phase == "major_news":
+        _, _, moneyflow_missing = _moneyflow_required_coverage()
+        if moneyflow_missing:
+            next_task = enqueue_plan_model_data_backfill(
+                phase="moneyflow_residual",
+                cursor="",
+                trade_dates=moneyflow_missing,
+            )
+            _set_model_data_backfill_state(
+                status="running",
+                phase="moneyflow_residual",
+                cursor="",
+                residual_count=len(moneyflow_missing),
+                next_message_id=next_task.get("message_id") or "",
+            )
+            return {
+                "ok": True,
+                "phase": phase,
+                "redirected_to": "moneyflow_residual",
+                "residual_count": len(moneyflow_missing),
+            }
+        end_date = datetime.now().strftime("%Y%m%d")
+        result = backfill_major_news_history(
+            start_date="20200101",
+            end_date=end_date,
+            cursor=cursor,
+            limit_days=7,
+        )
+        if not result.get("ok"):
+            _set_model_data_backfill_state(
+                status="failed",
+                phase=phase,
+                cursor=cursor,
+                error="major_news_backfill_failed",
+                last_result=_model_data_backfill_result_summary(result),
+            )
+            return result
+        next_cursor = str(result.get("cursor") or cursor)
+        if result.get("has_more"):
+            next_task = enqueue_plan_model_data_backfill(phase="major_news", cursor=next_cursor)
+            _set_model_data_backfill_state(
+                status="running",
+                phase=phase,
+                cursor=next_cursor,
+                next_message_id=next_task.get("message_id") or "",
+                last_result=_model_data_backfill_result_summary(result),
+            )
+        else:
+            post_backfill_audit = audit_plan_model_data_contract()
+            _set_model_data_backfill_state(
+                status="completed",
+                phase=phase,
+                cursor=next_cursor,
+                last_result=_model_data_backfill_result_summary(result),
+                post_backfill_audit=post_backfill_audit,
+            )
+        return {
+            "ok": True,
+            "phase": phase,
+            "result": result,
+            "post_backfill_audit": (
+                post_backfill_audit if not result.get("has_more") else {}
+            ),
+        }
+    result = {"ok": False, "error": f"unknown_plan_model_data_backfill_phase:{phase}"}
+    _set_model_data_backfill_state(status="failed", phase=phase, error=result["error"])
+    return result

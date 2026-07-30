@@ -342,6 +342,7 @@ CREATE INDEX idx_dc_industry_metric_industry ON dc_industry_metric_definition (i
 CREATE INDEX idx_dc_quality_checked ON dc_data_quality_checks (checked_at);
 CREATE INDEX idx_dc_quality_status ON dc_data_quality_checks (status);
 CREATE INDEX idx_dc_raw_api_date ON dc_tushare_raw_records (api_name, trade_date);
+CREATE INDEX idx_dc_raw_api_date_available ON dc_tushare_raw_records (api_name, trade_date) WHERE available_time<>'';
 CREATE INDEX idx_dc_raw_api_period ON dc_tushare_raw_records (api_name, period);
 CREATE INDEX idx_dc_raw_ts_code ON dc_tushare_raw_records (ts_code);
 CREATE INDEX idx_dc_raw_trade_date ON dc_tushare_raw_records (trade_date);

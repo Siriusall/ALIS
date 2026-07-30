@@ -121,6 +121,26 @@ def _daily_update_retry_policy(c: Any, trade_date: str, *, now: datetime | None 
     }
 
 
+def _scheduler_should_check(now: datetime, target_trade_date_value: str) -> bool:
+    """Allow overdue slices to recover before today's close-data window.
+
+    The close clock protects only the current trade date from intraday reads.
+    Once the target is an earlier calendar date, keeping that same clock gate
+    would strand an upstream-delayed slice until 16:05 on every following day.
+    """
+
+    raw = str(target_trade_date_value or "").replace("-", "")[:8]
+    if len(raw) != 8 or not raw.isdigit():
+        return False
+    try:
+        target_date = datetime.strptime(raw, "%Y%m%d").date()
+    except ValueError:
+        return False
+    if target_date < now.date():
+        return True
+    return target_date == now.date() and now.weekday() < 5 and now.time() >= _DAILY_UPDATE_START_TIME
+
+
 def _worker(parent_run_id: int) -> None:
     steps: list[dict[str, Any]] = []
     error = ""
@@ -222,7 +242,11 @@ def _worker(parent_run_id: int) -> None:
             from app.services.research_workflow import process_watch_pool, stage_watch_pool_candidates
 
             research_limit = max(1, min(int(os.getenv("ALIS_DAILY_RESEARCH_LIMIT", "100")), 500))
-            screen = run_daily_screener(top_n=max(100, research_limit * 3), research_limit=research_limit)
+            screen = run_daily_screener(
+                top_n=max(100, research_limit * 3),
+                research_limit=research_limit,
+                trade_date=trade_date,
+            )
             staged = stage_watch_pool_candidates(limit=min(50, research_limit))
             candidate_enrichment = []
             enrichment_limit = max(1, min(int(os.getenv("ALIS_DAILY_CANDIDATE_ENRICH_LIMIT", "5")), 20))
@@ -317,14 +341,21 @@ def start_daily_update_scheduler() -> bool:
         _scheduler_started = True
 
     def _loop() -> None:
+        from app.services.runtime_heartbeat import mark_started, beat
+        mark_started("daily_update_scheduler", interval_seconds=_DAILY_UPDATE_INTERVAL_SEC)
         while True:
             try:
                 now = datetime.now()
-                if now.weekday() < 5 and now.time() >= _DAILY_UPDATE_START_TIME:
-                    with _conn() as c:
-                        target = target_trade_date(c, now=now)
+                with _conn() as c:
+                    target = target_trade_date(c, now=now)
+                    should_check = _scheduler_should_check(now, target)
+                    if should_check:
                         ready = _latest_decision_ready_trade_date(c)
                         retry_policy = _daily_update_retry_policy(c, target, now=now)
+                    else:
+                        ready = ""
+                        retry_policy = {"allowed": False, "reason": "before_close_data_window"}
+                if should_check:
                     if target and ready != target and retry_policy.get("allowed"):
                         result = start_daily_update()
                         if result.get("ok"):
@@ -340,13 +371,19 @@ def start_daily_update_scheduler() -> bool:
                             failure_category=retry_policy.get("category"),
                             retry_after_seconds=retry_policy.get("retry_after_seconds"),
                         )
+                beat("daily_update_scheduler")
             except Exception as exc:  # noqa: BLE001
                 logger.warning("自动收盘日更检查失败: %s", str(exc)[:300])
+                beat("daily_update_scheduler", error=str(exc))
             _set_state(next_scheduler_check_at=(datetime.now().astimezone() + timedelta(seconds=_DAILY_UPDATE_INTERVAL_SEC)).isoformat(timespec="seconds"))
             threading.Event().wait(_DAILY_UPDATE_INTERVAL_SEC)
 
     threading.Thread(target=_loop, name="data-platform-daily-update", daemon=True).start()
-    logger.info("独立收盘日更调度已启动，%s 后每 %ss 检查", _DAILY_UPDATE_START_TIME.strftime("%H:%M"), _DAILY_UPDATE_INTERVAL_SEC)
+    logger.info(
+        "独立收盘日更调度已启动：当天 %s 后检查，跨日遗留缺口全天按冷却重试；每 %ss 轮询",
+        _DAILY_UPDATE_START_TIME.strftime("%H:%M"),
+        _DAILY_UPDATE_INTERVAL_SEC,
+    )
     return True
 
 

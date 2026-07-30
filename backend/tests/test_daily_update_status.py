@@ -52,3 +52,34 @@ def test_persisted_data_failure_suppresses_minute_level_retry() -> None:
     assert result["allowed"] is False
     assert result["reason"] == "data_refresh_cooldown"
     assert result["retry_after_seconds"] == 300
+
+
+def test_scheduler_retries_an_overdue_trade_date_before_today_close() -> None:
+    assert daily_update._scheduler_should_check(
+        datetime(2026, 7, 29, 9, 30, 0),
+        "20260728",
+    )
+
+
+def test_scheduler_retries_an_overdue_trade_date_on_weekend() -> None:
+    assert daily_update._scheduler_should_check(
+        datetime(2026, 8, 1, 9, 30, 0),
+        "20260731",
+    )
+
+
+def test_scheduler_does_not_pull_current_trade_date_before_close() -> None:
+    assert not daily_update._scheduler_should_check(
+        datetime(2026, 7, 29, 15, 59, 0),
+        "20260729",
+    )
+    assert daily_update._scheduler_should_check(
+        datetime(2026, 7, 29, 16, 5, 0),
+        "20260729",
+    )
+
+
+def test_scheduler_rejects_invalid_or_future_target_date() -> None:
+    now = datetime(2026, 7, 29, 17, 0, 0)
+    assert not daily_update._scheduler_should_check(now, "")
+    assert not daily_update._scheduler_should_check(now, "20260730")

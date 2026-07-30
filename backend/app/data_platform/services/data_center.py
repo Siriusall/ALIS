@@ -26,12 +26,14 @@ SOURCE_EXCHANGE_PCF = "exchange_etf_pcf"
 
 _tushare_activity_local = threading.local()
 _tushare_cooldown_lock = threading.Lock()
+_data_center_seed_lock = threading.Lock()
+_data_center_seeded = False
 _tushare_api_cooldown_until: dict[str, float] = {}
 _tushare_global_cooldown_until = 0.0
 _tushare_reduced_concurrency_until = 0.0
 _tushare_reduced_concurrency = 0
 TUSHARE_RATE_LIMIT_COOLDOWN_SECONDS = int(os.getenv("TUSHARE_RATE_LIMIT_COOLDOWN_SECONDS", "180") or 180)
-STK_LIMIT_PAGE_SIZE = max(500, min(int(os.getenv("TUSHARE_STK_LIMIT_PAGE_SIZE", "6000") or 6000), 6000))
+STK_LIMIT_PAGE_SIZE = max(500, min(int(os.getenv("TUSHARE_STK_LIMIT_PAGE_SIZE", "5800") or 5800), 5800))
 STK_LIMIT_MAX_PAGES = max(2, min(int(os.getenv("TUSHARE_STK_LIMIT_MAX_PAGES", "4") or 4), 10))
 STK_LIMIT_GAP_BATCH_SIZE = max(3, min(int(os.getenv("TUSHARE_STK_LIMIT_GAP_BATCH_SIZE", "25") or 25), 100))
 STK_LIMIT_MIN_STOCK_COVERAGE = max(
@@ -150,6 +152,7 @@ TUSHARE_CATALOG: list[TushareCatalogItem] = [
     TushareCatalogItem("daily_basic", "估值", "每日指标", "估值、市值、换手、量化快照", "daily", "ts_code,trade_date,close,turnover_rate,volume_ratio,pe,pe_ttm,pb,ps,ps_ttm,total_mv,circ_mv", {"trade_date": ""}),
     TushareCatalogItem("suspend_d", "交易状态", "停复牌", "交易约束、风险过滤", "daily", "ts_code,trade_date,suspend_timing,suspend_type", {"trade_date": ""}),
     TushareCatalogItem("stk_limit", "交易状态", "涨跌停价", "交易约束、涨跌停识别", "daily", "ts_code,trade_date,up_limit,down_limit", {"trade_date": ""}),
+    TushareCatalogItem("stock_st", "交易状态", "ST股票列表", "风险警示状态与涨跌停规则校验", "daily", "ts_code,name,trade_date,type,type_name", {"trade_date": ""}),
     TushareCatalogItem("moneyflow", "资金", "个股资金流", "资金确认项、短中期风险辅助", "daily", "ts_code,trade_date,buy_sm_vol,sell_sm_vol,buy_lg_vol,sell_lg_vol,net_mf_vol,net_mf_amount", {"trade_date": ""}),
     TushareCatalogItem("moneyflow_hsgt", "资金", "沪深港通资金流向", "北向资金净流入和南向资金观测", "daily", "trade_date,ggt_ss,ggt_sz,hgt,sgt,north_money,south_money", {"start_date": "", "end_date": ""}),
     TushareCatalogItem("hk_hold", "资金", "沪深股通持股明细", "外资持仓变化、行业和龙头资金确认", "daily", "code,trade_date,ts_code,name,vol,ratio,exchange", {"trade_date": "", "exchange": "SH"}),
@@ -326,6 +329,18 @@ def _recent_calendar_window(days_back: int = 30, days_forward: int = 60) -> tupl
 
 
 def ensure_data_center_seeded() -> dict[str, Any]:
+    global _data_center_seeded
+    if _data_center_seeded:
+        return {"ok": True, "source": SOURCE_TUSHARE, "catalog_count": len(TUSHARE_CATALOG)}
+    with _data_center_seed_lock:
+        if _data_center_seeded:
+            return {"ok": True, "source": SOURCE_TUSHARE, "catalog_count": len(TUSHARE_CATALOG)}
+        result = _seed_data_center_catalog()
+        _data_center_seeded = True
+        return result
+
+
+def _seed_data_center_catalog() -> dict[str, Any]:
     now = _now()
     with _conn() as c:
         for values in (
@@ -1405,12 +1420,13 @@ def sync_stk_limit_gap_batch(trade_date: str, *, limit: int = STK_LIMIT_GAP_BATC
 def sync_complete_stk_limit_slice(trade_date: str) -> dict[str, Any]:
     """Fetch a full trade-date ``stk_limit`` slice with bounded pagination.
 
-    The endpoint can return an exact 6000-row page containing funds before all
+    The endpoint can return an exact maximum-size page containing funds before all
     A-share codes have been covered.  Offset pagination preserves the required
     full-market batch contract and avoids an unbounded per-stock fallback.
     """
 
     pages: list[dict[str, Any]] = []
+    rule_fallback: dict[str, Any] | None = None
     previous_retained = _stk_limit_stock_coverage(trade_date)["retained_rows"]
     saw_full_page = False
     for page_index in range(STK_LIMIT_MAX_PAGES):
@@ -1433,6 +1449,25 @@ def sync_complete_stk_limit_slice(trade_date: str) -> dict[str, Any]:
         }
         pages.append(page)
         if not result.get("ok"):
+            if str(result.get("category") or "") == "upstream_not_ready" and page_index == 0:
+                from app.data_platform.services.derived_limit_price import (
+                    repair_stk_limit_from_exchange_rules,
+                )
+
+                rule_fallback = repair_stk_limit_from_exchange_rules(trade_date)
+                fallback_coverage = _stk_limit_stock_coverage(trade_date)
+                if rule_fallback.get("ok") and fallback_coverage.get("ready"):
+                    return {
+                        "ok": True,
+                        "api": "stk_limit",
+                        "trade_date": trade_date,
+                        "category": "complete",
+                        "pages": pages,
+                        "rule_fallback": rule_fallback,
+                        "coverage": fallback_coverage,
+                        "rows_read": int(rule_fallback.get("requested") or 0),
+                        "rows_written": int(rule_fallback.get("rows_written") or 0),
+                    }
             return {
                 "ok": False,
                 "api": "stk_limit",
@@ -1443,6 +1478,7 @@ def sync_complete_stk_limit_slice(trade_date: str) -> dict[str, Any]:
                 "cooldown": bool(result.get("cooldown")),
                 "cooldown_seconds": int(result.get("cooldown_seconds") or 0),
                 "error": str(result.get("error") or "stk_limit page failed")[:500],
+                "rule_fallback": rule_fallback,
             }
         if coverage["ready"]:
             return {
@@ -1896,7 +1932,7 @@ MAJOR_NEWS_SOURCES = (
 def backfill_major_news_history(
     *, start_date: str, end_date: str, cursor: str = "", limit_days: int = 7
 ) -> dict[str, Any]:
-    """Backfill long-form news by source/day to stay below the 400-row cap."""
+    """Backfill news in adaptive source/time windows without crossing the 800-row cap."""
     try:
         start = datetime.strptime(start_date, "%Y%m%d").date()
         end = datetime.strptime(end_date, "%Y%m%d").date()
@@ -1908,53 +1944,107 @@ def backfill_major_news_history(
     limit_days = max(1, min(int(limit_days), 31))
     first = max(start, after + timedelta(days=1))
     days = [first + timedelta(days=i) for i in range(limit_days) if first + timedelta(days=i) <= end]
-    pending_requests: list[tuple[str, dict[str, Any]]] = []
+    pending_sources: list[str] = []
     skipped = 0
-    for day in days:
-        day_text = day.isoformat()
-        for source in MAJOR_NEWS_SOURCES:
+    for source in MAJOR_NEWS_SOURCES:
+        daily_params = [
+            {
+                "src": source,
+                "start_date": f"{day.isoformat()} 00:00:00",
+                "end_date": f"{day.isoformat()} 23:59:59",
+            }
+            for day in days
+        ]
+        if daily_params and all(_request_is_complete("major_news", params) for params in daily_params):
+            skipped += len(daily_params)
+        else:
+            pending_sources.append(source)
+
+    def fetch_source(source: str) -> dict[str, Any]:
+        if not days:
+            return {"ok": True, "source": source, "results": [], "requests_executed": 0}
+        results: list[dict[str, Any]] = []
+
+        def fetch_interval(start_at: datetime, end_at: datetime, depth: int = 0) -> bool:
             params = {
                 "src": source,
-                "start_date": f"{day_text} 00:00:00",
-                "end_date": f"{day_text} 23:59:59",
+                "start_date": start_at.strftime("%Y-%m-%d %H:%M:%S"),
+                "end_date": end_at.strftime("%Y-%m-%d %H:%M:%S"),
             }
-            if _request_is_complete("major_news", params):
-                skipped += 1
-            else:
-                pending_requests.append(("major_news", params))
+            result = {
+                "api_name": "major_news",
+                "request": params,
+                **_safe_sync_raw("major_news", params),
+            }
+            results.append(result)
+            rows_read = int(result.get("rows_read") or 0)
+            duration = (end_at - start_at).total_seconds()
+            if result.get("ok") and rows_read >= 800 and duration > 60 and depth < 16:
+                midpoint = start_at + (end_at - start_at) / 2
+                return (
+                    fetch_interval(start_at, midpoint, depth + 1)
+                    and fetch_interval(midpoint + timedelta(seconds=1), end_at, depth + 1)
+                )
+            return bool(result.get("ok")) and rows_read < 800
 
-    def fetch_one(item: tuple[str, dict[str, Any]]) -> dict[str, Any]:
-        api_name, params = item
-        return {"api_name": api_name, "request": params, **_safe_sync_raw(api_name, params)}
-
-    results: list[dict[str, Any]] = []
-    workers = 0
-    for offset in range(0, len(pending_requests), 4):
-        chunk_results, chunk_workers = _parallel_tushare_map(
-            pending_requests[offset : offset + 4], fetch_one, prefix="tushare-major-news-history"
+        complete = fetch_interval(
+            datetime.combine(days[0], datetime.min.time()),
+            datetime.combine(days[-1], datetime.max.time()).replace(microsecond=0),
         )
-        results.extend(chunk_results)
-        workers = max(workers, chunk_workers)
+        if complete:
+            for day in days:
+                day_text = day.isoformat()
+                _record_request_coverage(
+                    "major_news",
+                    {
+                        "src": source,
+                        "start_date": f"{day_text} 00:00:00",
+                        "end_date": f"{day_text} 23:59:59",
+                    },
+                    None,
+                    sum(int(item.get("rows_read") or 0) for item in results),
+                    result_status="success",
+                    result_reason="adaptive_source_window_complete_v1",
+                )
+        return {
+            "ok": complete,
+            "source": source,
+            "results": results,
+            "requests_executed": len(results),
+            "rows_written": sum(int(item.get("rows_written") or 0) for item in results),
+        }
+
+    source_results, workers = _parallel_tushare_map(
+        pending_sources,
+        fetch_source,
+        prefix="tushare-major-news-adaptive",
+    ) if pending_sources else ([], 0)
+    results = [
+        item
+        for source_result in source_results
+        for item in source_result.get("results") or []
+    ]
     next_cursor = days[-1].strftime("%Y%m%d") if days else cursor
     return {
-        "ok": all(bool(item.get("ok")) for item in results),
+        "ok": all(bool(item.get("ok")) for item in source_results),
         "start_date": start_date,
         "end_date": end_date,
         "cursor": next_cursor,
         "days_processed": len(days),
         "has_more": bool(days) and days[-1] < end,
         "sources": list(MAJOR_NEWS_SOURCES),
-        "requests_executed": len(results),
+        "requests_executed": sum(int(item.get("requests_executed") or 0) for item in source_results),
         "requests_skipped": skipped,
         "concurrency": workers,
-        "rows_written": sum(int(item.get("rows_written") or 0) for item in results),
-        "failed": sum(1 for item in results if not item.get("ok")),
+        "rows_written": sum(int(item.get("rows_written") or 0) for item in source_results),
+        "failed": sum(1 for item in source_results if not item.get("ok")),
+        "source_results": source_results,
         "results": results,
     }
 
 
 def get_vip_backfill_status(
-    *, capital_start: str = "20200101", end_date: str, news_start: str = "20230719"
+    *, capital_start: str = "20200101", end_date: str, news_start: str = "20200101"
 ) -> dict[str, Any]:
     """Return request-slice coverage for the three VIP backfill contracts."""
     terminal = {"success", "not_applicable", "valid_empty", "deferred_empty"}

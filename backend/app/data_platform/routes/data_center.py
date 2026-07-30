@@ -499,8 +499,8 @@ def data_center_backfill_major_news(
 @router.post("/data-center/backfill/theme-snapshots")
 def data_center_backfill_theme_snapshots(
     end_date: str = Query(default="", description="YYYYMMDD；默认最新交易日"),
-    target_sessions: int = Query(default=250, ge=3, le=760),
-    limit_dates: int = Query(default=30, ge=1, le=80),
+    target_sessions: int = Query(default=1577, ge=3, le=2400),
+    limit_dates: int = Query(default=30, ge=1, le=250),
 ) -> dict[str, Any]:
     """Materialize derived theme snapshots for narrative lifecycle training."""
     return materialize_theme_snapshot_history(

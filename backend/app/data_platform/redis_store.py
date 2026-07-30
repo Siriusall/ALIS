@@ -188,6 +188,17 @@ def record_task_failure(message_id: str, fields: dict[str, str], *, stream: str 
         return False
 
 
+def task_attempts(message_id: str, *, stream: str = STREAM_KEY) -> int:
+    """Return the durable retry count for one stream message."""
+    value = client()
+    if value is None or not message_id:
+        return 0
+    try:
+        return int(value.get(f"{stream}:attempts:{message_id}") or 0)
+    except Exception:
+        return 0
+
+
 def reclaim_pending(*, min_idle_ms: int = 60000, count: int = 10, stream: str = STREAM_KEY,
                     group: str = STREAM_GROUP, consumer: str = STREAM_CONSUMER) -> list[tuple[str, dict[str, str]]]:
     """Reclaim tasks left pending after a worker crash."""
@@ -196,7 +207,9 @@ def reclaim_pending(*, min_idle_ms: int = 60000, count: int = 10, stream: str = 
         return []
     try:
         rows = value.xautoclaim(stream, group, consumer, min_idle_time=max(0, min_idle_ms), start_id="0-0", count=count)
-        messages = rows[1] if isinstance(rows, tuple) else []
+        # redis-py returns a three-item list for XAUTOCLAIM in current
+        # releases; older clients and test doubles may return a tuple.
+        messages = rows[1] if isinstance(rows, (list, tuple)) and len(rows) > 1 else []
         return [(str(message_id), {str(k): str(v) for k, v in fields.items()})
                 for message_id, fields in messages]
     except Exception:
@@ -235,20 +248,60 @@ def start_task_worker(handler) -> bool:
     if _worker_started or client() is None:
         return False
     _worker_started = True
+    from app.services.runtime_heartbeat import mark_started, beat
+    # One full-market backfill slice can legitimately take several minutes.
+    # Keep the health timeout aligned with the five-minute reclaim boundary so
+    # an active handler is not reported dead while it is still inside a valid
+    # source/database operation.
+    mark_started("redis_stream_worker", interval_seconds=120)
 
     def loop() -> None:
         while True:
-            messages = reclaim_pending(min_idle_ms=1000, count=1)
-            messages += read_tasks(count=1, block_ms=1000)
-            for message_id, fields in messages:
-                try:
-                    handler(fields)
-                except Exception:
-                    # Keep it pending until retry budget is exhausted, then
-                    # move it to a durable dead-letter stream.
-                    record_task_failure(message_id, fields)
-                    continue
-                ack_task(message_id)
+            try:
+                # Data backfill batches can legitimately run for minutes. A
+                # one-second reclaim window causes another backend instance to
+                # execute the same message while the original worker is alive.
+                messages = reclaim_pending(min_idle_ms=300000, count=1)
+                messages += read_tasks(count=1, block_ms=1000)
+                for message_id, fields in messages:
+                    try:
+                        result = handler(fields)
+                        if (
+                            isinstance(result, dict)
+                            and not bool(result.get("ok", True))
+                            and not bool(result.get("skipped"))
+                        ):
+                            reason = str(
+                                result.get("error")
+                                or result.get("reason")
+                                or result.get("message")
+                                or "stream_task_returned_not_ok"
+                            )
+                            raise RuntimeError(reason)
+                    except Exception as exc:
+                        record_task_failure(message_id, fields)
+                        try:
+                            from app.data_platform.services.runtime_logs import write_runtime_log
+
+                            write_runtime_log(
+                                "ERROR",
+                                "redis-stream-worker",
+                                "持久数据任务执行失败，系统将按重试预算自动重领",
+                                {
+                                    "message_id": message_id,
+                                    "task_type": fields.get("task_type"),
+                                    "attempt": task_attempts(message_id),
+                                    "error": str(exc)[:1000],
+                                },
+                            )
+                        except Exception:
+                            pass
+                        continue
+                    ack_task(message_id)
+                beat("redis_stream_worker")
+            except Exception as exc:  # keep the consumer alive after infrastructure errors
+                beat("redis_stream_worker", error=str(exc))
+                time.sleep(1)
 
     threading.Thread(target=loop, name="redis-stream-worker", daemon=True).start()
     return True
