@@ -36,16 +36,30 @@ INDUSTRY_KEYWORDS: dict[str, list[str]] = {
 
 # 股票代码到公司简称的映射（从dc_stock_master获取）
 _STOCK_NAMES: dict[str, str] = {}
+_STOCK_CODE_LOOKUP: dict[str, tuple[str, str]] = {}
+_STOCK_NAME_LOOKUP: dict[str, tuple[str, str]] = {}
+_STOCK_NAME_PATTERN: re.Pattern[str] | None = None
 
 
 def _load_stock_names() -> dict[str, str]:
-    global _STOCK_NAMES
+    global _STOCK_NAMES, _STOCK_CODE_LOOKUP, _STOCK_NAME_LOOKUP, _STOCK_NAME_PATTERN
     if not _STOCK_NAMES:
         with _conn() as c:
             rows = [dict(row) for row in c.execute(
                 "SELECT ts_code, name FROM dc_stock_master"
             ).fetchall()]
             _STOCK_NAMES = {str(r.get("ts_code", "")): str(r.get("name", "")) for r in rows}
+        _STOCK_CODE_LOOKUP = {
+            code.split(".")[0]: (code, name)
+            for code, name in _STOCK_NAMES.items()
+        }
+        _STOCK_NAME_LOOKUP = {
+            name: (code, name)
+            for code, name in _STOCK_NAMES.items()
+            if len(name) >= 3
+        }
+        names = sorted(_STOCK_NAME_LOOKUP, key=len, reverse=True)
+        _STOCK_NAME_PATTERN = re.compile("|".join(re.escape(name) for name in names)) if names else None
     return _STOCK_NAMES
 
 
@@ -68,10 +82,42 @@ def _extract_keywords(text: str) -> list[str]:
 def _match_companies(text: str) -> list[dict[str, str]]:
     """Match company names/stock codes in text."""
     names = _load_stock_names()
+    code_lookup = _STOCK_CODE_LOOKUP or {
+        code.split(".")[0]: (code, name)
+        for code, name in names.items()
+    }
+    name_lookup = _STOCK_NAME_LOOKUP or {
+        name: (code, name)
+        for code, name in names.items()
+        if len(name) >= 3
+    }
+    name_pattern = _STOCK_NAME_PATTERN
+    if name_pattern is None and name_lookup:
+        name_pattern = re.compile(
+            "|".join(re.escape(name) for name in sorted(name_lookup, key=len, reverse=True))
+        )
     matched = []
-    for code, name in names.items():
-        if name and name in text:
-            matched.append({"ts_code": code, "name": name})
+    seen: set[str] = set()
+    # Long-form news commonly embeds six-digit A-share codes in links. Reading
+    # those codes avoids scanning every one of ~5,500 company names through
+    # every full article during historical reconstruction.
+    for raw_code in re.findall(r"(?<!\d)([036]\d{5})(?!\d)", text):
+        item = code_lookup.get(raw_code)
+        if not item or item[0] in seen:
+            continue
+        seen.add(item[0])
+        matched.append({"ts_code": item[0], "name": item[1]})
+        if len(matched) >= 10:
+            break
+    # Titles without embedded codes still get a bounded exact-name fallback.
+    if not matched:
+        title_text = text[:300]
+        for name in dict.fromkeys(
+            match.group(0)
+            for match in (name_pattern.finditer(title_text) if name_pattern else [])
+        ):
+            code, canonical_name = name_lookup[name]
+            matched.append({"ts_code": code, "name": canonical_name})
             if len(matched) >= 10:
                 break
     return matched
@@ -80,15 +126,32 @@ def _match_companies(text: str) -> list[dict[str, str]]:
 def cluster_news_themes(*, as_of_time: str | None = None) -> dict[str, Any]:
     """Cluster news articles into themes and map to companies."""
     cutoff = str(as_of_time or "")[:10].replace("-", "")
-    cutoff_clause = " AND trade_date<=?" if cutoff else ""
-    params: tuple[Any, ...] = (cutoff,) if cutoff else ()
+    cutoff_iso = (
+        f"{cutoff[:4]}-{cutoff[4:6]}-{cutoff[6:8]}T23:59:59"
+        if len(cutoff) == 8 else ""
+    )
+    # major_news is an event dataset: its generic trade_date column is empty.
+    # Point-in-time filtering must use the publisher timestamp and the raw
+    # record's available_time, otherwise every historical article is silently
+    # excluded from reconstruction.
+    cutoff_clause = """
+      AND COALESCE(NULLIF(payload_json::jsonb->>'pub_time',''),available_time)<=?
+      AND available_time<=?
+    """ if cutoff_iso else ""
+    params: tuple[Any, ...] = (cutoff_iso, cutoff_iso) if cutoff_iso else ()
 
     with _conn() as c:
         rows = [dict(row) for row in c.execute(
-            f"""SELECT payload_json, trade_date, ts_code, id
+            f"""SELECT payload_json,
+                       REPLACE(SUBSTRING(
+                         COALESCE(NULLIF(payload_json::jsonb->>'pub_time',''),available_time),
+                         1,10
+                       ),'-','') AS trade_date,
+                       ts_code,id
                 FROM dc_tushare_raw_records
                 WHERE api_name='major_news' {cutoff_clause}
-                ORDER BY trade_date DESC LIMIT 2000""", params
+                ORDER BY COALESCE(NULLIF(payload_json::jsonb->>'pub_time',''),available_time) DESC
+                LIMIT 2000""", params
         ).fetchall()]
 
     if not rows:

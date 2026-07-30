@@ -8,22 +8,42 @@ from app.data_platform.db import _conn
 from app.services.market_context import score_theme_narratives
 
 
+NARRATIVE_LIFECYCLE_STATES = ("形成", "扩散", "成熟/拥挤", "衰退")
+NARRATIVE_LIFECYCLE_ALLOWED_TRANSITIONS = {
+    "形成": ("形成", "扩散", "衰退"),
+    "扩散": ("形成", "扩散", "成熟/拥挤", "衰退"),
+    "成熟/拥挤": ("扩散", "成熟/拥挤", "衰退"),
+    "衰退": ("形成", "衰退"),
+}
+
+
 def _clip(value: float, low: float = 0.0, high: float = 1.0) -> float:
     return max(low, min(high, float(value)))
 
 
-def _lifecycle(*, score: float, momentum: float, breadth: float, crowding: float) -> str:
-    if momentum < -.01:
-        return "退潮" if score >= 40 else "沉寂"
-    if score >= 80 and crowding >= .65:
-        return "亢奋"
-    if score >= 70 and breadth >= .65:
-        return "加速"
-    if score >= 55 and breadth >= .55:
+def _lifecycle(
+    *,
+    score: float,
+    base_score: float,
+    momentum: float,
+    breadth: float,
+    crowding: float,
+    price_confirmation: float,
+) -> str:
+    """Map observable theme evidence to a four-state lifecycle.
+
+    ``score`` already contains the crowding penalty, so using
+    ``score >= 80 and crowding >= .65`` made the old crowded state
+    mathematically unreachable.  Maturity therefore uses the pre-penalty
+    evidence score and an independently observed turnover concentration.
+    """
+    if momentum < -.01 or (score < 40 and price_confirmation < .42):
+        return "衰退"
+    if base_score >= 55 and crowding >= .60 and price_confirmation >= .50:
+        return "成熟/拥挤"
+    if base_score >= 55 and breadth >= .55 and price_confirmation >= .50:
         return "扩散"
-    if score >= 40 and momentum > 0:
-        return "启动"
-    return "萌芽"
+    return "形成"
 
 
 def materialize_theme_snapshots(*, as_of_time: str | None = None, lookback: int = 20) -> dict[str, Any]:
@@ -129,11 +149,51 @@ def materialize_theme_snapshots(*, as_of_time: str | None = None, lookback: int 
         written = mappings = 0
         for item in scored:
             raw = raw_by_name[item["theme"]]
-            item["lifecycle"] = _lifecycle(score=float(item["score"]), momentum=raw["momentum"], breadth=raw["breadth"], crowding=raw["crowding"])
+            item["lifecycle"] = _lifecycle(
+                score=float(item["score"]),
+                base_score=float(item.get("base_score") or 0.0),
+                momentum=float(raw["momentum"]),
+                breadth=float(raw["breadth"]),
+                crowding=float(raw["crowding"]),
+                price_confirmation=float(
+                    (item.get("components") or {}).get("price_confirmation")
+                    or 0.0
+                ),
+            )
+            item["lifecycle_contract"] = {
+                "schema_version": "alis_narrative_lifecycle_observable_v2",
+                "states": list(NARRATIVE_LIFECYCLE_STATES),
+                "allowed_transitions": {
+                    state: list(destinations)
+                    for state, destinations
+                    in NARRATIVE_LIFECYCLE_ALLOWED_TRANSITIONS.items()
+                },
+                "observations": {
+                    "score_after_crowding_penalty": round(float(item["score"]), 8),
+                    "base_score_before_crowding_penalty": round(
+                        float(item.get("base_score") or 0.0),
+                        8,
+                    ),
+                    "momentum_5_session": round(float(raw["momentum"]), 8),
+                    "breadth_5_session": round(float(raw["breadth"]), 8),
+                    "turnover_top_decile_concentration": round(
+                        float(raw["crowding"]),
+                        8,
+                    ),
+                },
+            }
             # A confirmed score is still not buyable once price has rolled
             # over; this explicitly retires old stories such as a faded CPO.
-            item["promotable"] = bool(item["promotable"] and item["lifecycle"] not in {"退潮", "沉寂"})
-            item["state"] = "confirmed" if item["promotable"] else "fading" if item["lifecycle"] in {"退潮", "沉寂"} else "watch"
+            item["promotable"] = bool(
+                item["promotable"] and item["lifecycle"] != "衰退"
+            )
+            item["state"] = (
+                "confirmed"
+                if item["promotable"]
+                else "fading"
+                if item["lifecycle"] == "衰退"
+                else "watch"
+            )
             item["knowledge_graph"] = {"theme": item["theme"], "industry": raw["industry"], "company_count": len(raw["companies"]), "evidence_types": ["price_volume"] + (["company_financial_aggregate"] if raw["state"].get("status") == "ready" else [])}
             theme_code = f"industry:{raw['industry']}"
             c.execute(
@@ -144,7 +204,7 @@ def materialize_theme_snapshots(*, as_of_time: str | None = None, lookback: int 
                    promotable=excluded.promotable,payload_json=excluded.payload_json,
                    model_version=excluded.model_version,available_time=excluded.available_time,updated_at=excluded.updated_at""",
                 (dates[-1], theme_code, item["theme"], item["lifecycle"], item["score"], 1 if item["promotable"] else 0,
-                 json.dumps(item, ensure_ascii=False), "industry_price_fundamental_theme_v1", cutoff or now, now, now),
+                 json.dumps(item, ensure_ascii=False), "industry_price_fundamental_theme_v2", cutoff or now, now, now),
             )
             written += 1
             max_turnover = max((float(company.get("turnover") or 0) for company in raw["companies"]), default=1.0)
@@ -159,12 +219,12 @@ def materialize_theme_snapshots(*, as_of_time: str | None = None, lookback: int 
                     (dates[-1], theme_code, company.get("ts_code"), exposure, json.dumps(evidence, ensure_ascii=False), now),
                 )
                 mappings += 1
-    return {"ok": True, "as_of_date": dates[-1], "themes_written": written, "company_mappings_written": mappings, "promotable": sum(1 for item in scored if item["promotable"]), "model_version": "industry_price_fundamental_theme_v1"}
+    return {"ok": True, "as_of_date": dates[-1], "themes_written": written, "company_mappings_written": mappings, "promotable": sum(1 for item in scored if item["promotable"]), "model_version": "industry_price_fundamental_theme_v2"}
 
 
 def materialize_theme_snapshot_history(*, end_date: str = "", target_sessions: int = 250, limit_dates: int = 20) -> dict[str, Any]:
-    target = max(1, min(int(target_sessions or 250), 760))
-    limit = max(1, min(int(limit_dates or 20), 80))
+    target = max(1, min(int(target_sessions or 250), 2400))
+    limit = max(1, min(int(limit_dates or 20), 250))
     cutoff = str(end_date or "").replace("-", "")[:8]
     with _conn() as c:
         if not cutoff:
@@ -194,12 +254,56 @@ def materialize_theme_snapshot_history(*, end_date: str = "", target_sessions: i
         target_dates = [str(dict(row).get("cal_date") or "") for row in rows if dict(row).get("cal_date")]
         placeholders = ",".join("?" for _ in target_dates)
         existing_rows = c.execute(
-            f"SELECT DISTINCT as_of_date FROM dc_theme_snapshot WHERE as_of_date IN ({placeholders})",
+            f"""SELECT as_of_date,payload_json,model_version
+                FROM dc_theme_snapshot
+                WHERE as_of_date IN ({placeholders})
+                  AND LEFT(theme_code,9)='industry:'""",
             tuple(target_dates),
         ).fetchall() if target_dates else []
-        existing = {str(dict(row).get("as_of_date") or "") for row in existing_rows}
-    missing = sorted([trade_date for trade_date in target_dates if trade_date not in existing])
-    batch = missing[:limit]
+        existing = {
+            str(dict(row).get("as_of_date") or "")
+            for row in existing_rows
+        }
+        quality_by_date: dict[str, list[bool]] = {}
+        for row in existing_rows:
+            item = dict(row)
+            payload = item.get("payload_json") or {}
+            if isinstance(payload, str):
+                try:
+                    payload = json.loads(payload)
+                except (TypeError, json.JSONDecodeError):
+                    payload = {}
+            components = (
+                payload.get("components")
+                if isinstance(payload, dict)
+                and isinstance(payload.get("components"), dict)
+                else {}
+            )
+            evidence = (
+                payload.get("evidence")
+                if isinstance(payload, dict)
+                and isinstance(payload.get("evidence"), dict)
+                else {}
+            )
+            degenerate = (
+                float(components.get("breadth") or 0.0) == 0.0
+                and float(components.get("capital_persistence") or 0.0) == 0.0
+                and int(evidence.get("source_types") or 0) == 0
+            )
+            quality_by_date.setdefault(
+                str(item.get("as_of_date") or ""),
+                [],
+            ).append(degenerate)
+    missing = sorted(
+        trade_date for trade_date in target_dates if trade_date not in existing
+    )
+    invalid = sorted(
+        trade_date
+        for trade_date, flags in quality_by_date.items()
+        if flags and sum(flags) / len(flags) >= .80
+    )
+    pending = sorted(set(missing) | set(invalid))
+    batch = pending[:limit]
     results = []
     for trade_date in batch:
         try:
@@ -214,10 +318,12 @@ def materialize_theme_snapshot_history(*, end_date: str = "", target_sessions: i
         "effective_end_date": usable_cutoff,
         "existing_sessions": len(existing),
         "missing_sessions": len(missing),
+        "invalid_sessions": len(invalid),
+        "invalid_dates": invalid[:20],
         "processed_sessions": len(batch),
         "written_sessions": len(written_dates),
         "written_dates": written_dates,
-        "remaining_sessions": max(0, len(missing) - len(written_dates)),
+        "remaining_sessions": max(0, len(pending) - len(written_dates)),
         "results": results[:10],
     }
 
