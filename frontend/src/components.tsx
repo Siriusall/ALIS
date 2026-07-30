@@ -17,7 +17,9 @@ export function Status({ children, tone }: { children: ReactNode; tone?: Tone })
   const value = children && typeof children === "object" && !Array.isArray(children) && !("$$typeof" in objectValue)
     ? String(objectValue.label ?? objectValue.state ?? objectValue.status ?? "证据已记录")
     : children;
-  return <span className={`status status-${tone || toneOf(value)}`}><i />{value}</span>;
+  const labels: Record<string, string> = { ok: "正常", ready: "就绪", healthy: "健康", running: "运行中", waiting: "等待", observing: "观察中", degraded: "降级", blocked: "阻断", failed: "失败", completed: "完成", passed: "通过", owner: "本机持有", follower: "跟随实例", disabled: "已委托" };
+  const label = typeof value === "string" ? labels[value.toLowerCase()] || value : value;
+  return <span className={`status status-${tone || toneOf(value)}`}><i />{label}</span>;
 }
 
 export function PageHeader({ eyebrow, title, summary, actions }: { eyebrow: string; title: string; summary: string; actions?: ReactNode }) {

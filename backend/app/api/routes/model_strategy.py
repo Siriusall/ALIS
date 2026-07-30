@@ -6,14 +6,8 @@ from typing import Any
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
-from app.db.store import get_active_model_version, get_model_version, set_active_model_version, update_model_version_validation
-from app.services.model_registry import compare_champion_challenger, evaluate_model_drift, get_model_constitution, get_model_status, get_train_run_status, model_artifact_status
-from app.services.model_governance_scheduler import (
-    auto_tune_models_once,
-    bootstrap_candidate_eligible,
-    mark_bootstrap_promotion,
-    request_model_training,
-)
+from app.db.store import get_model_version, update_model_version_validation
+from app.services.model_registry import evaluate_model_drift, get_model_constitution, get_model_status, get_train_run_status
 from app.services.quant_risk import bocpd_change_probability, garch11_forecast, historical_cvar, hsmm_regime, kalman_level, ledoit_wolf_covariance
 from app.services.training_protocol import training_protocol_contract, validate_feature_frame_contract, validate_training_run_manifest
 from app.services.model_evidence_contract import evidence_binding_registry, model_output_contracts, normalize_model_output
@@ -56,7 +50,7 @@ from app.services.evolution_orchestrator import (
     get_evolution_task,
     list_evolution_tasks,
 )
-from app.services.plan_model_control import model_family_status, request_plan_model_training, review_plan_model_version, train_all_trainable_plan_models, review_all_candidate_plan_models, score_plan_model_features
+from app.services.plan_model_control import model_family_status, plan_model_operations_status, request_plan_model_training, review_plan_model_version, train_all_trainable_plan_models, review_all_candidate_plan_models, score_plan_model_features
 from app.services.plan_model_auto_optimizer import build_auto_optimization_status, run_auto_optimization_once
 from app.services.strategy_controller import (
     create_strategy_policy_candidate,
@@ -189,6 +183,7 @@ class PlanModelReviewRequest(BaseModel):
 class PlanModelScoreRequest(BaseModel):
     model_key: str = Field(..., min_length=3, max_length=128)
     features: dict[str, Any] = Field(default_factory=dict)
+    allow_proxy: bool = Field(False, description="仅研究诊断允许显式启用线性代理")
 
 
 class FeatureFrameContractRequest(BaseModel):
@@ -233,13 +228,6 @@ class StrategyPolicyReplayRequest(BaseModel):
     limit: int = Field(120, ge=1, le=1000)
 
 
-def _passed_cost_after_metrics(metrics: dict[str, Any]) -> bool:
-    net_lift = float(metrics.get("net_lift", metrics.get("lift", 0)) or 0)
-    walk_forward = float(metrics.get("walk_forward_lift", metrics.get("net_lift", metrics.get("lift", 0))) or 0)
-    worst_window = float(metrics.get("worst_window_net_lift", walk_forward) or 0)
-    return net_lift > 0 and walk_forward > 0 and worst_window > 0
-
-
 @router.get("/model-strategy/status")
 def model_strategy_status() -> dict:
     return get_model_status()
@@ -248,6 +236,11 @@ def model_strategy_status() -> dict:
 @router.get("/model-strategy/plan-models")
 def model_strategy_plan_models() -> dict:
     return model_family_status()
+
+
+@router.get("/model-strategy/plan-models/operations")
+def model_strategy_plan_model_operations() -> dict:
+    return plan_model_operations_status()
 
 
 @router.post("/model-strategy/plan-models/train")
@@ -354,7 +347,10 @@ def model_strategy_review_candidate_plan_models(req: PlanModelReviewRequest) -> 
 
 @router.post("/model-strategy/plan-models/score")
 def model_strategy_score_plan_model(req: PlanModelScoreRequest) -> dict:
-    return score_plan_model_features(req.model_key, req.features)
+    result = score_plan_model_features(req.model_key, req.features, allow_proxy=req.allow_proxy)
+    if not result.get("ok"):
+        raise HTTPException(status_code=409, detail=result)
+    return result
 
 
 @router.get("/model-strategy/training-protocol")
@@ -748,80 +744,34 @@ def model_strategy_drift(req: ModelDriftRequest) -> dict:
 
 @router.post("/model-strategy/promote/{model_version_id}")
 def model_strategy_promote(model_version_id: int) -> dict:
-    """Promote only a candidate that passed both validation gates."""
-    version = get_model_version(model_version_id)
-    if not version:
-        raise HTTPException(status_code=404, detail="模型版本不存在")
-    validation = version.get("validation") or {}
-    metrics = version.get("metrics") or {}
-    champion = get_active_model_version("main")
-    bootstrap = champion is None and str(version.get("model_key") or "") == "main"
-    artifact = model_artifact_status(version)
-    if not artifact.get("ok"):
-        raise HTTPException(status_code=409, detail={"code": "model_artifact_unavailable", **artifact})
-    if not bool(validation.get("production_eligible")) and not (bootstrap and bootstrap_candidate_eligible(version)):
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "code": "model_not_production_eligible",
-                "production_eligibility": validation.get("production_eligibility") or {},
-            },
-        )
-    if str(validation.get("status")) != "passed" or not _passed_cost_after_metrics(metrics):
-        raise HTTPException(status_code=409, detail="模型未同时通过费用后测试集、walk-forward 与最差窗口晋升门槛")
-    from app.services.review_learning import model_feedback_gate
-    feedback = model_feedback_gate(str(version.get("version") or ""))
-    if not bootstrap and not feedback.get("passed"):
-        raise HTTPException(status_code=409, detail={"code": "review_feedback_gate_blocked", "review_feedback": feedback})
-    if bootstrap:
-        mark_bootstrap_promotion(version)
-    set_active_model_version(model_version_id)
-    return {
-        "ok": True, "model_version_id": model_version_id, "status": "active",
-        "review_feedback": feedback,
-        "promotion_policy": "bootstrap_offline_gates" if bootstrap else "challenger_full_gates",
-    }
+    del model_version_id
+    raise HTTPException(
+        status_code=410,
+        detail="旧通用模型晋升协议已退休；使用五模型任务原生评价与自动治理。",
+    )
 
 
 @router.post("/model-strategy/rollback/{model_version_id}")
 def model_strategy_rollback(model_version_id: int) -> dict:
-    """Return to a previously validated version without bypassing promotion gates."""
-    target = get_model_version(model_version_id)
-    if not target:
-        raise HTTPException(status_code=404, detail="模型版本不存在")
-    validation = target.get("validation") or {}
-    metrics = target.get("metrics") or {}
-    artifact = model_artifact_status(target)
-    if not artifact.get("ok"):
-        raise HTTPException(status_code=409, detail={"code": "model_artifact_unavailable", **artifact})
-    if not bool(validation.get("production_eligible")):
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "code": "model_not_production_eligible",
-                "production_eligibility": validation.get("production_eligibility") or {},
-            },
-        )
-    if str(validation.get("status")) != "passed" or not _passed_cost_after_metrics(metrics):
-        raise HTTPException(status_code=409, detail="只能回退到费用后测试集、walk-forward 与最差窗口均通过的模型版本")
-    previous = get_active_model_version(str(target.get("model_key") or "main"))
-    set_active_model_version(model_version_id)
-    return {"ok": True, "status": "rolled_back", "previous_model_version_id": previous.get("id") if previous else None, "model_version_id": model_version_id}
+    del model_version_id
+    raise HTTPException(
+        status_code=410,
+        detail="旧通用模型回退协议已退休；生产模型绑定由统一五模型治理维护。",
+    )
 
 
 @router.post("/model-strategy/compare")
 def model_strategy_compare(champion_id: int, challenger_id: int) -> dict:
-    champion = get_model_version(champion_id)
-    challenger = get_model_version(challenger_id)
-    if not champion or not challenger:
-        raise HTTPException(status_code=404, detail="Champion或Challenger模型不存在")
-    return compare_champion_challenger(champion, challenger)
+    del champion_id, challenger_id
+    raise HTTPException(
+        status_code=410,
+        detail="旧通用模型比较协议已退休；使用任务原生 OOS 与冻结策略 A/B。",
+    )
 
 
 @router.post("/model-strategy/auto-tune")
 def model_strategy_auto_tune() -> dict:
-    """Evaluate candidate versions and promote at most one safe challenger."""
-    return auto_tune_models_once()
+    return run_auto_optimization_once(force=False)
 
 
 @router.get("/model-strategy/train-runs/{run_id}")
@@ -834,9 +784,8 @@ def model_strategy_train_run(run_id: int) -> dict:
 
 @router.post("/model-strategy/train")
 def model_strategy_train(req: ModelTrainRequest) -> dict:
-    return request_model_training(
-        start_date=req.start_date,
-        end_date=req.end_date,
-        exchange_group=req.exchange_group,
-        force=True,
+    del req
+    raise HTTPException(
+        status_code=410,
+        detail="旧通用 main 模型训练协议已退休；使用 /model-strategy/plan-models/train。",
     )

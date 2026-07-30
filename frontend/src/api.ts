@@ -1,15 +1,15 @@
 export type Json = Record<string, any>;
 
 const API_BASE = String(import.meta.env.VITE_API_BASE || "").replace(/\/$/, "");
-const API_READ_TIMEOUT_MS = Number(import.meta.env.VITE_API_READ_TIMEOUT_MS || 0);
+const API_READ_TIMEOUT_MS = Number(import.meta.env.VITE_API_READ_TIMEOUT_MS || 60_000);
 const TOKEN_KEY = "alis_access_token";
 
 export function getToken() { return window.localStorage.getItem(TOKEN_KEY); }
 export function setToken(token: string | null) { if (token) window.localStorage.setItem(TOKEN_KEY, token); else window.localStorage.removeItem(TOKEN_KEY); }
 
-export async function readApi(path: string, signal?: AbortSignal): Promise<Json> {
+export async function readApi(path: string, signal?: AbortSignal, timeoutMs = API_READ_TIMEOUT_MS): Promise<Json> {
   const timeout = new AbortController();
-  const timer = API_READ_TIMEOUT_MS > 0 ? window.setTimeout(() => timeout.abort(), API_READ_TIMEOUT_MS) : undefined;
+  const timer = timeoutMs > 0 ? window.setTimeout(() => timeout.abort(), timeoutMs) : undefined;
   const abort = () => timeout.abort();
   if (signal?.aborted) timeout.abort();
   else signal?.addEventListener("abort", abort, { once: true });
@@ -39,6 +39,7 @@ export async function writeApi(path: string, body?: unknown): Promise<Json> {
 }
 
 export const endpoints = {
+  health: "/api/health",
   apiCatalog: "/api/openapi.json",
   owner: "/api/model-strategy/evolution/owner-summary",
   decision: "/api/decision/summary",
@@ -51,7 +52,7 @@ export const endpoints = {
   risk: "/api/research/portfolio-risk/live",
   strategy: "/api/model-strategy/strategy-lab",
   tasks: "/api/model-strategy/task-center?limit=30&log_limit=80",
-  evolutionTasks: "/api/model-strategy/evolution/tasks?limit=30",
+  evolutionTasks: "/api/model-strategy/evolution/tasks?limit=60",
   evolutionSchedule: "/api/model-strategy/evolution/schedule",
   ledgerAudit: "/api/model-strategy/evolution/ledger-audit",
   quantTasks: "/api/quant-runs/tasks?limit=50",
@@ -77,9 +78,16 @@ export const endpoints = {
   factors: "/api/factors/registry",
   factorStatus: "/api/factors",
   factorResearch: "/api/factors/research/status",
+  researchAnalytics: "/api/factors/research/analytics",
+  researchFactorAnalytics: "/api/factors/research/analytics/factors?limit=600",
+  researchTimeseries: "/api/factors/research/analytics/timeseries?limit=1000",
+  researchExpertHistory: "/api/factors/research/analytics/experts/history?limit=1000",
+  researchEnvironmentSimilarity: "/api/factors/research/analytics/environment-similarity",
+  researchArchive: "/api/factors/research/analytics/archive",
   factorLineage: "/api/factors/strategy-lineage",
   models: "/api/model-strategy/status",
   planModels: "/api/model-strategy/plan-models",
+  modelOperations: "/api/model-strategy/plan-models/operations",
   modelWorkbench: "/api/model-strategy/workbench",
   modelGovernance: "/api/model-strategy/market-context/governance",
   modelReports: "/api/model-strategy/performance-reports",
