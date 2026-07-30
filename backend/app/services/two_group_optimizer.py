@@ -21,6 +21,46 @@ def _normalize(weights: dict[str, float]) -> dict[str, float]:
     return {symbol: max(0.0, float(value)) / total for symbol, value in weights.items()}
 
 
+def _bounded_fallback(
+    weights: dict[str, float],
+    symbols: list[str],
+    bounds: dict[str, dict[str, float]],
+    budget: float,
+) -> dict[str, float]:
+    result = {
+        symbol: max(
+            float((bounds.get(symbol) or {}).get("min_weight") or 0.0),
+            min(
+                float((bounds.get(symbol) or {}).get("max_weight") or 0.0),
+                max(0.0, float(weights.get(symbol) or 0.0)),
+            ),
+        )
+        for symbol in symbols
+    }
+    for _ in range(max(4, len(symbols) * 2)):
+        gap = budget - sum(result.values())
+        if abs(gap) <= 1e-10:
+            break
+        if gap > 0:
+            room = {
+                symbol: max(0.0, float((bounds.get(symbol) or {}).get("max_weight") or 0.0) - result[symbol])
+                for symbol in symbols
+            }
+        else:
+            room = {
+                symbol: max(0.0, result[symbol] - float((bounds.get(symbol) or {}).get("min_weight") or 0.0))
+                for symbol in symbols
+            }
+        total_room = sum(room.values())
+        if total_room <= 1e-12:
+            break
+        magnitude = min(abs(gap), total_room)
+        direction = 1.0 if gap > 0 else -1.0
+        for symbol in symbols:
+            result[symbol] += direction * magnitude * room[symbol] / total_room
+    return result
+
+
 def _aligned_return_matrix(observations: dict[str, list[float]], symbols: list[str]) -> np.ndarray:
     """Align on the most recent common window without inventing observations."""
     common = min((len(observations[symbol]) for symbol in symbols), default=0)
@@ -94,6 +134,8 @@ def two_group_cvar_optimizer(
     current_weights: dict[str, float] | None = None,
     trading_costs: dict[str, float] | None = None,
     crowding: dict[str, float] | None = None,
+    weight_bounds: dict[str, dict[str, float]] | None = None,
+    target_budget: float = 1.0,
     risk_aversion: float = 2.0,
     concentration_penalty: float = 0.50,
 ) -> dict[str, Any]:
@@ -133,10 +175,24 @@ def two_group_cvar_optimizer(
         }
 
     expected_vector = np.asarray([float((expected_returns or {}).get(symbol) or 0.0) for symbol in symbols])
-    current = _normalize({symbol: float((current_weights or {}).get(symbol) or 0.0) for symbol in symbols})
+    current = {symbol: max(0.0, float((current_weights or {}).get(symbol) or 0.0)) for symbol in symbols}
+    raw_bounds = dict(weight_bounds or {})
+    bounds_map = {
+        symbol: {
+            "min_weight": max(0.0, float((raw_bounds.get(symbol) or {}).get("min_weight") or 0.0)),
+            "max_weight": max(0.0, min(1.0, float((raw_bounds.get(symbol) or {}).get("max_weight") if (raw_bounds.get(symbol) or {}).get("max_weight") is not None else 1.0))),
+        }
+        for symbol in symbols
+    }
+    minimum_budget = sum(item["min_weight"] for item in bounds_map.values())
+    maximum_budget = sum(item["max_weight"] for item in bounds_map.values())
+    budget = max(minimum_budget, min(maximum_budget, max(0.0, min(1.0, float(target_budget or 0.0)))))
     current_vector = np.asarray([current.get(symbol, 0.0) for symbol in symbols])
     if float(np.sum(current_vector)) <= 0:
-        current_vector = np.asarray(list(_inverse_volatility_fallback(matrix, symbols).values()))
+        current = _bounded_fallback(_inverse_volatility_fallback(matrix, symbols), symbols, bounds_map, budget)
+    else:
+        current = _bounded_fallback(current, symbols, bounds_map, budget)
+    current_vector = np.asarray([current.get(symbol, 0.0) for symbol in symbols])
     cost_vector = np.asarray([max(0.0, float((trading_costs or {}).get(symbol) or 0.0)) for symbol in symbols])
     crowding_vector = np.asarray([max(0.0, float((crowding or {}).get(symbol) or 0.0)) for symbol in symbols])
 
@@ -152,26 +208,26 @@ def two_group_cvar_optimizer(
         objective,
         current_vector,
         method="SLSQP",
-        bounds=[(0.0, 1.0) for _ in symbols],
-        constraints=[{"type": "eq", "fun": lambda weights: float(np.sum(weights) - 1.0)}],
+        bounds=[(bounds_map[symbol]["min_weight"], bounds_map[symbol]["max_weight"]) for symbol in symbols],
+        constraints=[{"type": "eq", "fun": lambda weights: float(np.sum(weights) - budget)}],
         options={"maxiter": 500, "ftol": 1e-10},
     )
     fallback_used = not bool(result.success) or result.x is None or not np.all(np.isfinite(result.x))
     if fallback_used:
-        weight_map = _hrp_fallback(matrix, symbols) or _inverse_volatility_fallback(matrix, symbols)
+        fallback = _hrp_fallback(matrix, symbols) or _inverse_volatility_fallback(matrix, symbols)
+        weight_map = _bounded_fallback(fallback, symbols, bounds_map, budget)
         status = "fallback"
         solver_message = str(result.message)
     else:
         solved = np.maximum(np.asarray(result.x, dtype=float), 0.0)
-        solved /= float(np.sum(solved)) or 1.0
         weight_map = {symbol: float(solved[index]) for index, symbol in enumerate(symbols)}
         status = "optimal"
         solver_message = str(result.message)
 
     weights = {symbol: round(weight, 8) for symbol, weight in weight_map.items()}
-    # Remove rounding drift while preserving a fully invested continuous solution.
+    # Remove rounding drift while preserving the Controller-bounded budget.
     largest = max(weights, key=weights.get)
-    weights[largest] = round(weights[largest] + (1.0 - sum(weights.values())), 8)
+    weights[largest] = round(weights[largest] + (budget - sum(weights.values())), 8)
     bucket_map = {symbol: str((buckets or {}).get(symbol) or "unclassified") for symbol in symbols}
     stable_weight = sum(weights[symbol] for symbol in symbols if bucket_map[symbol] in STABLE_BUCKETS)
     offensive_weight = sum(weights[symbol] for symbol in symbols if bucket_map[symbol] in OFFENSIVE_BUCKETS)
@@ -215,7 +271,16 @@ def two_group_cvar_optimizer(
         "weights": weights,
         "weight_sum": round(sum(weights.values()), 8),
         "risk_groups": {"stable": round(stable_weight, 8), "offensive": round(offensive_weight, 8)},
-        "gates": {"weight_sum_100": abs(sum(weights.values()) - 1.0) <= 1e-6, "long_only": all(value >= 0 for value in weights.values())},
+        "gates": {
+            "weight_sum_target": abs(sum(weights.values()) - budget) <= 1e-6,
+            "long_only": all(value >= 0 for value in weights.values()),
+            "controller_bounds": all(
+                bounds_map[symbol]["min_weight"] - 1e-8 <= weights[symbol] <= bounds_map[symbol]["max_weight"] + 1e-8
+                for symbol in symbols
+            ),
+        },
+        "target_budget": round(budget, 8),
+        "weight_bounds": bounds_map,
         "blocked_reasons": [],
         "soft_constraints": ["concentration", "turnover", "crowding", "bucket_exposure_descriptive_only"],
         "solver": {"success": bool(result.success), "message": solver_message, "iterations": int(getattr(result, "nit", 0) or 0)},

@@ -16,6 +16,7 @@ from app.db.store import (
     update_model_version_status,
     update_model_version_validation,
 )
+from app.services.model_artifacts import resolve_model_artifact_path
 
 CHAMPION_MODEL_KEY = "alis_production_strategy"
 CHAMPION_SCHEMA_VERSION = "alis_production_strategy_bundle_v1"
@@ -35,6 +36,16 @@ def _model_ref(model_key: str) -> dict[str, Any] | None:
     version = get_active_model_version(model_key)
     if not version:
         return None
+    if model_key in MODEL_BINDING_KEYS and model_key not in {
+        "main",
+        "market_regime_hsmm_v1",
+    }:
+        from app.services.plan_model_control import (
+            audit_plan_model_production_eligibility,
+        )
+
+        if not audit_plan_model_production_eligibility(version).get("passed"):
+            return None
     validation = version.get("validation") if isinstance(version.get("validation"), dict) else {}
     return {
         "id": int(version["id"]),
@@ -43,6 +54,40 @@ def _model_ref(model_key: str) -> dict[str, Any] | None:
         "status": str(version.get("status") or ""),
         "production_eligible": bool(validation.get("production_eligible")),
     }
+
+
+def _validated_market_state_binding(binding: dict[str, Any] | None) -> dict[str, Any]:
+    value = dict(binding or {})
+    requested = str(value.get("production_model") or "transparent_four_state_v1")
+    if requested not in {"transparent_four_state_v1", "market_regime_hsmm_v1"}:
+        raise ValueError(f"候选策略包市场状态模型无效：{requested}")
+    if requested == "transparent_four_state_v1":
+        return value
+    hsmm_binding = value.get("hsmm_shadow")
+    hsmm_id = int((hsmm_binding or {}).get("id") or 0) if isinstance(hsmm_binding, dict) else 0
+    hsmm_version = get_model_version(hsmm_id) if hsmm_id else None
+    if not hsmm_version or str(hsmm_version.get("model_key") or "") != "market_regime":
+        raise ValueError("候选策略包 HSMM 市场状态绑定无效")
+    artifact_path = str(hsmm_version.get("artifact_path") or "")
+    resolved_artifact_path = resolve_model_artifact_path(artifact_path)
+    validation = (
+        hsmm_version.get("validation")
+        if isinstance(hsmm_version.get("validation"), dict) else {}
+    )
+    if str(validation.get("status") or "") != "passed":
+        raise ValueError("候选策略包 HSMM 市场状态版本未通过验证")
+    if not artifact_path or not resolved_artifact_path.is_file():
+        raise ValueError("候选策略包 HSMM 市场状态产物不存在")
+    value["hsmm_shadow"] = {
+        **dict(hsmm_binding or {}),
+        "id": int(hsmm_version["id"]),
+        "model_key": "market_regime",
+        "version": str(hsmm_version.get("version") or ""),
+        "artifact_path": str(resolved_artifact_path),
+        "created_at": str(hsmm_version.get("created_at") or ""),
+        "validation_status": "passed",
+    }
+    return value
 
 
 def _build_bundle_config() -> dict[str, Any]:
@@ -55,10 +100,15 @@ def _build_bundle_config() -> dict[str, Any]:
         from app.services.strategy_controller import ensure_default_strategy_policy_version
 
         controller = ensure_default_strategy_policy_version()
-    from app.services.factor_platform import active_factor_bindings
+    from app.services.factor_platform import registered_factor_bindings
     from app.services.strategy_config import get_strategy_factor_names
 
     factor_keys = get_strategy_factor_names(strategy.get("content"), strategy.get("type", "formula"))
+    factor_keys.update({"momentum_20", "momentum_60", "volatility_20"})
+    strategy_content = strategy.get("content") if isinstance(strategy.get("content"), dict) else {}
+    universe = strategy_content.get("universe") if isinstance(strategy_content.get("universe"), dict) else {}
+    if float(universe.get("exclude_smallest_float_mv_pct") or 0.0) > 0:
+        factor_keys.add("float_mv")
     return {
         "schema_version": CHAMPION_SCHEMA_VERSION,
         "name": "ALIS Champion 综合生产策略",
@@ -75,7 +125,12 @@ def _build_bundle_config() -> dict[str, Any]:
             "version": str(controller.get("version") or ""),
         },
         "model_bindings": {key: _model_ref(key) for key in MODEL_BINDING_KEYS},
-        "factor_bindings": active_factor_bindings(factor_keys),
+        "market_state_binding": {
+            "production_model": "transparent_four_state_v1",
+            "change_model": "bocpd_gaussian_v1",
+            "hsmm_shadow": _model_ref("market_regime"),
+        },
+        "factor_bindings": registered_factor_bindings(factor_keys),
         "portfolio_optimizer": {
             "schema_version": "portfolio_cvar_optimizer_v2",
             "implementation": "empirical_cvar_slsqp_v2",
@@ -138,6 +193,7 @@ def resolve_production_strategy_champion() -> dict[str, Any]:
         "strategy_controller_version": str((controller or {}).get("version") or ""),
         "strategy_policy": ((controller or {}).get("config") or {}).get("policy") or {},
         "model_bindings": config.get("model_bindings") or {},
+        "market_state_binding": config.get("market_state_binding") or {},
         "factor_bindings": config.get("factor_bindings") or {},
         "portfolio_optimizer": config.get("portfolio_optimizer") or {},
         "execution_contract": config.get("execution_contract") or {},
@@ -275,8 +331,30 @@ def promote_strategy_candidate(
     strategy = get_strategy(strategy_id)
     if not strategy:
         raise ValueError("候选绑定的策略不存在")
+    candidate_model_bindings = (
+        candidate_config.get("model_bindings")
+        if isinstance(candidate_config.get("model_bindings"), dict)
+        else {}
+    )
+    for model_key, binding in candidate_model_bindings.items():
+        if binding is None:
+            continue
+        version_id = int((binding or {}).get("id") or 0) if isinstance(binding, dict) else int(binding or 0)
+        version = get_model_version(version_id) if version_id else None
+        if not version or str(version.get("model_key") or "") != str(model_key):
+            raise ValueError(f"候选策略包模型绑定无效：{model_key}")
+    market_state_binding = _validated_market_state_binding(
+        candidate_config.get("market_state_binding")
+        if isinstance(candidate_config.get("market_state_binding"), dict) else {}
+    )
+    controller_id = int(candidate_config.get("strategy_controller_version_id") or 0)
+    controller = get_model_version(controller_id) if controller_id else None
+    if controller_id and (
+        not controller or str(controller.get("model_key") or "") != CONTROLLER_MODEL_KEY
+    ):
+        raise ValueError("候选策略包 StrategyController 绑定无效")
 
-    from app.services.factor_platform import active_factor_bindings
+    from app.services.factor_platform import registered_factor_bindings
     from app.services.strategy_config import get_strategy_factor_names
 
     active_config = deepcopy(active_config)
@@ -291,8 +369,34 @@ def promote_strategy_candidate(
             "type": strategy.get("type"),
             "content": strategy.get("content"),
         },
-        "factor_bindings": active_factor_bindings(
-            get_strategy_factor_names(strategy.get("content"), strategy.get("type", "formula"))
+        "factor_bindings": (
+            candidate_config.get("factor_bindings")
+            if isinstance(candidate_config.get("factor_bindings"), dict)
+            else registered_factor_bindings(
+                get_strategy_factor_names(strategy.get("content"), strategy.get("type", "formula"))
+                | {"momentum_20", "momentum_60", "volatility_20"}
+            )
+        ),
+        "model_bindings": candidate_model_bindings or active_config.get("model_bindings") or {},
+        "market_state_binding": market_state_binding or active_config.get("market_state_binding") or {},
+        "strategy_controller": (
+            {"id": controller_id, "version": str((controller or {}).get("version") or "")}
+            if controller_id else active_config.get("strategy_controller")
+        ),
+        "portfolio_optimizer": (
+            candidate_config.get("portfolio_optimizer")
+            if isinstance(candidate_config.get("portfolio_optimizer"), dict)
+            else active_config.get("portfolio_optimizer") or {}
+        ),
+        "execution_contract": (
+            candidate_config.get("execution_contract")
+            if isinstance(candidate_config.get("execution_contract"), dict)
+            else active_config.get("execution_contract") or {}
+        ),
+        "research_package_hash": candidate_config.get("research_package_hash"),
+        "research_spec": (
+            candidate_config.get("research_spec")
+            if isinstance(candidate_config.get("research_spec"), dict) else {}
         ),
         "promotion": {
             "mode": "automatic_deterministic_gates",

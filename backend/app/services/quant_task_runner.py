@@ -164,10 +164,18 @@ def _mark_running(task_id: int, running: bool) -> None:
 
 
 def _market_slice_ready(stock_count: int, counts: dict[str, int]) -> bool:
-    """Apply the same daily / valuation / limit contract used by execution."""
+    """Apply the complete T-day decision contract."""
     return bool(stock_count) and (
         counts["daily_n"] / stock_count >= 0.995
         and counts["valuation_n"] / stock_count >= 0.95
+        and counts["limit_n"] / stock_count >= 0.99
+    )
+
+
+def _execution_slice_ready(stock_count: int, counts: dict[str, int]) -> bool:
+    """Require only market and limit data needed by a frozen T+1 plan."""
+    return bool(stock_count) and (
+        counts["daily_n"] / stock_count >= 0.995
         and counts["limit_n"] / stock_count >= 0.99
     )
 
@@ -200,14 +208,16 @@ def _close_data_status() -> tuple[str, bool, dict[str, int]]:
 
 
 def _ensure_close_data_ready() -> tuple[str, bool]:
-    """Start the durable daily update when today's execution slice is absent.
+    """Refresh the full bundle while independently reporting T+1 readiness.
 
     ``start_daily_update`` is single-flight, so scheduler ticks safely join an
-    in-progress update.  A later tick runs the simulator only after the bundle
-    has been written and passes the same data contract as the decision page.
+    in-progress update. Missing valuation data blocks today's new decision, but
+    it must not block yesterday's immutable plan once daily and limit data are
+    available for execution safety checks.
     """
-    target, ready, counts = _close_data_status()
-    if ready:
+    target, decision_ready, counts = _close_data_status()
+    execution_ready = _execution_slice_ready(int(counts.get("stock_count") or 0), counts)
+    if decision_ready:
         return target, True
     from app.data_platform.services.daily_update import start_daily_update
 
@@ -216,7 +226,7 @@ def _ensure_close_data_ready() -> tuple[str, bool]:
         logger.info("收盘日更已启动 target=%s counts=%s", target, counts)
     elif result.get("reason") != "already_running":
         logger.warning("收盘日更未启动 target=%s result=%s", target, result)
-    return target, False
+    return target, execution_ready
 
 
 def start_auto_simulation_scheduler() -> bool:
@@ -234,6 +244,8 @@ def start_auto_simulation_scheduler() -> bool:
         _auto_scheduler_started = True
 
     def _loop() -> None:
+        from app.services.runtime_heartbeat import mark_started, beat
+        mark_started("auto_simulation_scheduler", interval_seconds=_AUTO_SIMULATION_INTERVAL_SEC)
         while True:
             try:
                 now = datetime.now()
@@ -253,28 +265,32 @@ def start_auto_simulation_scheduler() -> bool:
                         threading.Event().wait(_AUTO_SIMULATION_INTERVAL_SEC)
                         continue
                     if latest:
-                        try:
-                            from app.services.profit_loop import materialize_daily_rebalance_plan
-                            materialize_daily_rebalance_plan()
-                        except Exception as exc:
-                            logger.warning("每日正式调仓方案生成失败 trade_date=%s: %s", latest, str(exc)[:200])
-                        active_tasks = list_active_quant_run_tasks()
-                        autonomous_tasks = [
-                            task for task in active_tasks
-                            if str(task.get("replay_mode") or "") == "autonomous_daily"
-                        ]
-                        # Once the dedicated production task exists, legacy
-                        # paused/manual replay tasks must never create a second
-                        # set of simulated orders for the same session.
-                        for task in autonomous_tasks or active_tasks:
-                            status = str(task.get("status") or "").lower()
-                            if status not in {"pending", "paused"}:
-                                continue
-                            if str(task.get("last_execute_date") or "") == latest:
-                                continue
-                            run_quant_task_async(int(task["id"]))
+                        # Execution eligibility belongs to the immutable plan
+                        # whose execute-date slice is now available. It must not
+                        # depend on whether today's new T-day plan was generated.
+                        formal_plan_claimable = bool(
+                            _materialize_current_plan_and_find_due_context(dates).get("ok")
+                        )
+                        if formal_plan_claimable:
+                            active_tasks = list_active_quant_run_tasks()
+                            autonomous_tasks = [
+                                task for task in active_tasks
+                                if str(task.get("replay_mode") or "") == "autonomous_daily"
+                            ]
+                            # Once the dedicated production task exists, legacy
+                            # paused/manual replay tasks must never create a second
+                            # set of simulated orders for the same session.
+                            for task in autonomous_tasks or active_tasks:
+                                status = str(task.get("status") or "").lower()
+                                if status not in {"pending", "paused"}:
+                                    continue
+                                if str(task.get("last_execute_date") or "") == latest:
+                                    continue
+                                run_quant_task_async(int(task["id"]))
+                beat("auto_simulation_scheduler")
             except Exception as exc:  # noqa: BLE001
                 logger.warning("自动模拟调度检查失败: %s", str(exc)[:200])
+                beat("auto_simulation_scheduler", error=str(exc))
             threading.Event().wait(_AUTO_SIMULATION_INTERVAL_SEC)
 
     threading.Thread(target=_loop, name="quant-auto-simulation", daemon=True).start()
@@ -504,7 +520,10 @@ def _execute_step_with_retry(
         from app.services.profit_loop import claim_daily_rebalance_execution_input
         claim_token = f"quant-task:{int(task_id)}:{signal_date}:{execute_date}"
         authoritative_plan = claim_daily_rebalance_execution_input(
-            signal_date, execute_date, claim_token=claim_token,
+            signal_date,
+            execute_date,
+            claim_token=claim_token,
+            expected_strategy_id=int(task_live.get("strategy_id") or 0),
         )
     if str(task_live.get("replay_mode") or "") == "autonomous_daily" and authoritative_plan is None:
         raise ReplayRiskGateError(
@@ -573,10 +592,16 @@ def _build_replay_plan_context(
 
 
 def _build_autonomous_plan_context(dates: list[str]) -> dict:
-    """Select the next due immutable formal plan instead of replaying gaps."""
+    """Select only the immutable plan due on the latest available session.
+
+    Autonomous execution is a live T+1 path, not a historical catch-up runner.
+    A plan missed on its frozen execution date must stay visible for audit and
+    replay, but must never be executed late against another day's prices.
+    """
     from app.services.profit_loop import list_pending_daily_rebalance_execution_inputs
 
     normalized_dates = {str(value).replace("-", ""): str(value) for value in dates}
+    latest_execute_key = str(dates[-1]).replace("-", "")[:8] if dates else ""
     pending = sorted(
         list_pending_daily_rebalance_execution_inputs(),
         key=lambda item: (
@@ -587,9 +612,11 @@ def _build_autonomous_plan_context(dates: list[str]) -> dict:
     for item in pending:
         signal_key = str(item.get("signal_date") or "").replace("-", "")[:8]
         execute_key = str(item.get("execute_date") or "").replace("-", "")[:8]
+        if execute_key != latest_execute_key:
+            continue
         signal_date = normalized_dates.get(signal_key)
         execute_date = normalized_dates.get(execute_key)
-        # A plan is due only after its execution-date market slice exists.
+        # The frozen signal and exact T+1 execution-date slices must both exist.
         if signal_date and execute_date:
             return {
                 "ok": True,
@@ -602,6 +629,25 @@ def _build_autonomous_plan_context(dates: list[str]) -> dict:
                 "target_execute_date": execute_date,
             }
     return {"ok": False, "reason": "no_due_formal_plan"}
+
+
+def _materialize_current_plan_and_find_due_context(dates: list[str]) -> dict:
+    """Attempt today's plan, then independently resolve any already due plan."""
+    latest = str(dates[-1]) if dates else ""
+    materialization: dict = {}
+    if latest:
+        try:
+            from app.services.profit_loop import materialize_daily_rebalance_plan
+
+            result = materialize_daily_rebalance_plan()
+            materialization = result if isinstance(result, dict) else {"result": result}
+        except Exception as exc:  # noqa: BLE001 - due execution remains independent
+            logger.warning("每日正式调仓方案生成失败 trade_date=%s: %s", latest, str(exc)[:200])
+            materialization = {"ok": False, "status": "error", "error": str(exc)[:300]}
+    return {
+        **_build_autonomous_plan_context(dates),
+        "today_materialization": materialization,
+    }
 
 
 def _persist_step_result(

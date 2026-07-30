@@ -192,42 +192,27 @@ def evaluate_latest_market_day_gate() -> RiskPauseDecision:
 
 
 def evaluate_model_readiness_gate(model_status: dict[str, Any] | None = None) -> RiskPauseDecision:
-    """Use one production-model contract for UI decisions and task execution."""
-    if model_status is None:
-        from app.services.model_registry import get_model_status
+    """Delegate model authority to the unified frozen decision contract.
 
-        model_status = get_model_status()
-    active = dict((model_status or {}).get("active_version") or {})
-    if not active:
-        return pause_decision(
-            code="paused_model_not_ready",
-            message="当前没有已激活的生产模型，暂停自动调仓。",
-            recovery_condition="完成至少1512个交易日的训练与验证，并晋升一个production_eligible模型。",
-            exit_condition="若暂不启用模型，只允许人工分析，不得由后台规则回退自动成交。",
-            severity="error",
-            evidence={"has_active_model": False},
-        )
-    validation = dict(active.get("validation") or {})
-    eligibility = dict(validation.get("production_eligibility") or {})
-    fully_eligible = bool(validation.get("production_eligible")) and bool(eligibility.get("eligible", True))
-    bootstrap_eligible = bool(validation.get("bootstrap_production_eligible")) and validation.get("promotion_policy") == "bootstrap_offline_gates"
-    production_eligible = fully_eligible or bootstrap_eligible
-    if not bool(active.get("is_active")) or str(validation.get("status") or "") != "passed" or not production_eligible:
-        return pause_decision(
-            code="paused_model_not_production_eligible",
-            message="当前模型尚未同时满足激活、样本外验证和生产历史门槛，暂停自动调仓。",
-            recovery_condition="补齐至少1512个交易日并通过holdout与walk-forward后重新晋升模型。",
-            exit_condition="保持模拟任务暂停，禁止静默退回规则模型自动成交。",
-            severity="error",
-            evidence={
-                "model_version_id": active.get("id"),
-                "model_version": active.get("version"),
-                "validation_status": validation.get("status"),
-                "production_eligible": production_eligible,
-                "production_eligibility": eligibility,
-            },
-        )
-    return no_pause()
+    The retired generic ``main`` model must neither block nor authorize a
+    formal decision. Model identities, degraded bindings, Champion quarantine
+    and action permissions are validated by the unified decision manifest and
+    StrategyController.
+    """
+    del model_status
+    return RiskPauseDecision(
+        should_pause=False,
+        code="unified_model_contract_delegated",
+        message="模型门已交由统一决策版本、五模型绑定和 StrategyController 验证。",
+        recovery_condition="",
+        exit_condition="",
+        severity="info",
+        evidence={
+            "legacy_main_model_authority": False,
+            "authoritative_contract": "alis_unified_daily_decision_v1",
+            "production_change_forbidden": True,
+        },
+    )
 
 
 def _safe_float(v: object) -> float:

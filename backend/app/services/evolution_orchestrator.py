@@ -37,6 +37,7 @@ TERMINAL_STATES = ("completed", "failed", "cancelled")
 LEASE_MINUTES = max(10, min(int(os.getenv("EVOLUTION_LEASE_MINUTES", "30")), 180))
 POLL_SECONDS = max(2, min(int(os.getenv("EVOLUTION_POLL_SECONDS", "5")), 60))
 AUTO_ENABLED = str(os.getenv("EVOLUTION_AUTO_ENABLED", "1")).lower() in {"1", "true", "yes", "on"}
+V10_RESEARCH_ENABLED = str(os.getenv("ALIS_V10_RESEARCH_ENABLED", "1")).lower() in {"1", "true", "yes", "on"}
 AUTO_WEEKDAY = max(0, min(int(os.getenv("EVOLUTION_AUTO_WEEKDAY", "4")), 6))
 AUTO_HOUR = max(0, min(int(os.getenv("EVOLUTION_AUTO_HOUR", "18")), 23))
 MAX_CANDIDATES_PER_CYCLE = max(1, min(int(os.getenv("EVOLUTION_MAX_CANDIDATES", "6")), 20))
@@ -186,6 +187,7 @@ def create_evolution_task(
     max_attempts: int = 3,
     priority: int = 100,
     force: bool = False,
+    coalesce_active_type: bool = False,
 ) -> dict[str, Any]:
     now = _now().isoformat()
     payload = dict(payload or {})
@@ -194,7 +196,22 @@ def create_evolution_task(
         key = f"{key}:{uuid.uuid4().hex[:8]}"
     with _conn() as conn:
         if conn._is_postgres:
-            conn.execute("SELECT pg_advisory_xact_lock(hashtext(?))", (key,))
+            lock_key = (
+                f"active-task-type:{task_type}"
+                if coalesce_active_type
+                else key
+            )
+            conn.execute("SELECT pg_advisory_xact_lock(hashtext(?))", (lock_key,))
+        if coalesce_active_type:
+            active = conn.execute(
+                """SELECT * FROM evolution_tasks
+                   WHERE task_type=?
+                     AND status IN ('queued','running','retry_wait')
+                   ORDER BY priority ASC,created_at ASC LIMIT 1""",
+                (str(task_type),),
+            ).fetchone()
+            if active:
+                return _row(active)
         existing = conn.execute(
             """SELECT * FROM evolution_tasks
                WHERE dedupe_key=?
@@ -217,6 +234,38 @@ def create_evolution_task(
         )
         task_id = conn.last_insert_id()
     return get_evolution_task(task_id) or {"id": task_id, "status": "queued"}
+
+
+def enqueue_factor_strategy_research_event(
+    *,
+    trigger: str,
+    evidence_type: str,
+    evidence_id: str | int,
+    evidence: dict[str, Any] | None = None,
+    priority: int = 80,
+) -> dict[str, Any]:
+    """Wake the continuous loop only once for each new piece of research evidence."""
+    identity = {
+        "trigger": str(trigger),
+        "evidence_type": str(evidence_type),
+        "evidence_id": str(evidence_id),
+    }
+    digest = hashlib.sha256(
+        json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()[:20]
+    task_type = "strategy_candidate_generation" if V10_RESEARCH_ENABLED else "factor_research_cycle"
+    return create_evolution_task(
+        task_type=task_type,
+        payload={
+            **identity,
+            "trigger": str(trigger),
+            **({"batch_size": 4} if V10_RESEARCH_ENABLED else {"candidates_per_task": 1}),
+            "evidence": dict(evidence or {}),
+        },
+        dedupe_key=f"factor_strategy_research_event:v2:{task_type}:{digest}",
+        priority=max(60, min(int(priority), 95)),
+        coalesce_active_type=V10_RESEARCH_ENABLED,
+    )
 
 
 def get_evolution_task(task_id: int) -> dict[str, Any] | None:
@@ -257,7 +306,25 @@ def cancel_evolution_task(task_id: int) -> dict[str, Any] | None:
         lease_expires_at=None,
         heartbeat_at=now,
     )
-    return get_evolution_task(int(task_id))
+    cancelled = get_evolution_task(int(task_id))
+    if (
+        cancelled
+        and V10_RESEARCH_ENABLED
+        and str(cancelled.get("task_type") or "") == "strategy_environment_backtest"
+    ):
+        candidate_id = str((cancelled.get("payload") or {}).get("candidate_id") or "")
+        if candidate_id:
+            from app.services.continuous_strategy_research import (
+                cancel_candidate_research_event,
+            )
+
+            cancellation = cancel_candidate_research_event(candidate_id)
+            if bool(cancellation.get("wave_ready_for_distillation")):
+                _schedule_v10_research_continuation(
+                    completed_task=cancelled,
+                    result=cancellation,
+                )
+    return cancelled
 
 
 def _next_weekday_at(now: datetime, weekday: int, hour: int) -> datetime:
@@ -283,14 +350,33 @@ def _next_business_day_at(now: datetime, hour: int) -> datetime:
 def evolution_schedule_status() -> dict[str, Any]:
     now = _now()
     return {
+        "factor_strategy_operating_model": "continuous_research",
+        "factor_strategy_operating_model_version": "alis_factor_strategy_continuous_research_v1",
         "auto_enabled": AUTO_ENABLED,
         "worker_id": WORKER_ID,
+        "scheduler_tick_seconds": 300,
         "budgets": {
             "single_worker": True,
             "max_candidates_per_cycle": MAX_CANDIDATES_PER_CYCLE,
             "max_windows_per_candidate": MAX_WINDOWS_PER_CANDIDATE,
             "task_timeout_minutes": TASK_TIMEOUT_MINUTES,
             "hard_history_contract_sessions": 1537,
+        },
+        "factor_strategy_cadence_contract": {
+            "runtime": {
+                "cadence": "always_on_queue_worker",
+                "poll_seconds": POLL_SECONDS,
+                "requires_market_close": False,
+            },
+            "research": {
+                "cadence": "continuous_budgeted_queue",
+                "requires_market_close": False,
+                "stops_on_same_snapshot_epoch_complete": True,
+            },
+            "formal_oos": {
+                "cadence": "window_or_candidate_event",
+                "requires_market_close": False,
+            },
         },
         "next_factor_cycle_at": _next_business_day_at(now, 16).isoformat() if AUTO_ENABLED else None,
         "continuous_factor_research": {
@@ -350,17 +436,22 @@ def ensure_latest_ready_system_cycle() -> dict[str, Any]:
         result = task.get("result") if isinstance(task.get("result"), dict) else {}
         decision_ready_for_date = False
         plan_status = ""
+        plan_is_unified_persisted = False
         for step in result.get("steps") or []:
             if not isinstance(step, dict) or str(step.get("name") or "") != "decision_data_gate":
                 if isinstance(step, dict) and str(step.get("name") or "") == "profit_and_portfolio":
                     profit = step.get("result") if isinstance(step.get("result"), dict) else {}
                     plan = profit.get("rebalance_plan") if isinstance(profit.get("rebalance_plan"), dict) else {}
                     plan_status = str(plan.get("status") or "")
+                    plan_is_unified_persisted = bool(
+                        plan.get("persisted", plan.get("id") is not None)
+                        and str(plan.get("decision_contract_schema_version") or "") == "alis_unified_daily_decision_v1"
+                    )
                 continue
             gate = step.get("result") if isinstance(step.get("result"), dict) else {}
             gate_readiness = gate.get("readiness") if isinstance(gate.get("readiness"), dict) else {}
             decision_ready_for_date = bool(gate.get("decision_ready")) and str(gate_readiness.get("target_trade_date") or "") == trade_date
-        if decision_ready_for_date and plan_status != "blocked_by_decision_data":
+        if decision_ready_for_date and plan_is_unified_persisted and plan_status != "compatibility_preview_only":
             return {"ok": True, "status": "already_completed", "trade_date": trade_date, "task_id": task.get("id")}
     contract = readiness.get("decision_contract") if isinstance(readiness.get("decision_contract"), dict) else {}
     if not contract:
@@ -466,6 +557,109 @@ def _heartbeat(task_id: int, *, phase: str, progress: float, message: str, check
         lease_owner=WORKER_ID,
         lease_expires_at=(now + timedelta(minutes=LEASE_MINUTES)).isoformat(),
     )
+
+
+def _run_with_heartbeat_pulse(
+    task_id: int,
+    *,
+    phase: str,
+    message: str,
+    runner: Callable[[], dict[str, Any]],
+) -> dict[str, Any]:
+    """Keep long in-process research work visible without faking sub-step progress."""
+    stopped = threading.Event()
+    started = time.monotonic()
+
+    def pulse() -> None:
+        while not stopped.wait(5):
+            elapsed = max(1, int(time.monotonic() - started))
+            try:
+                _runtime_heartbeat("worker")
+                latest = get_evolution_task(int(task_id)) or {}
+                latest_checkpoint = (
+                    latest.get("checkpoint")
+                    if isinstance(latest.get("checkpoint"), dict)
+                    else {}
+                )
+                business_checkpoint = any(
+                    key not in {"elapsed_seconds", "heartbeat_only"}
+                    for key in latest_checkpoint
+                )
+                _heartbeat(
+                    task_id,
+                    phase=str(latest.get("phase") or phase),
+                    progress=max(
+                        0.1,
+                        float(latest.get("progress") or 0.0),
+                    ),
+                    message=(
+                        f"{str(latest.get('message') or message).split(' · 已运行', 1)[0]}"
+                        f" · 已运行 {elapsed} 秒"
+                    ),
+                    checkpoint={
+                        **latest_checkpoint,
+                        "elapsed_seconds": elapsed,
+                        "heartbeat_only": not business_checkpoint,
+                    },
+                )
+            except EvolutionTaskCancelled:
+                return
+            except Exception as exc:
+                logger.warning("V10 task heartbeat failed for %s: %s", task_id, exc)
+
+    thread = threading.Thread(
+        target=pulse,
+        daemon=True,
+        name=f"evolution-task-pulse-{task_id}",
+    )
+    thread.start()
+    try:
+        return runner()
+    finally:
+        stopped.set()
+        thread.join(timeout=1)
+
+
+def _wait_for_model_train_runs(
+    task_id: int,
+    run_ids: list[int],
+    *,
+    phase_prefix: str,
+) -> list[dict[str, Any]]:
+    from app.db.store import get_model_train_run
+
+    completed_runs: list[dict[str, Any]] = []
+    for run_id in run_ids:
+        while True:
+            run = get_model_train_run(int(run_id))
+            if not run:
+                raise RuntimeError(f"模型训练运行不存在：{run_id}")
+            status = str(run.get("status") or "")
+            progress = max(0.1, min(0.95, float(run.get("progress") or 0.0)))
+            model_key = str((run.get("metrics") or {}).get("model_key") or "")
+            _heartbeat(
+                int(task_id),
+                phase=f"{phase_prefix}_{str(run.get('phase') or 'running')}",
+                progress=progress,
+                message=(
+                    f"单模型资源锁定中：{model_key}"
+                    f" · {str(run.get('message') or status)}"
+                ),
+                checkpoint={
+                    "model_train_run_id": int(run_id),
+                    "model_train_status": status,
+                },
+            )
+            if status in {"completed", "failed", "cancelled"}:
+                completed_runs.append({
+                    "run_id": int(run_id),
+                    "status": status,
+                    "model_version_id": run.get("model_version_id"),
+                    "error": run.get("error"),
+                })
+                break
+            time.sleep(2)
+    return completed_runs
 
 
 def _ensure_task_active(task_id: int) -> None:
@@ -631,6 +825,17 @@ def _strategy_targets() -> list[dict[str, Any]]:
                 "name": generated_names.get(strategy_id, str(version.get("version") or "challenger")),
                 "generation": str(config.get("generation") or ""),
                 "validation_status": validation_status,
+                "factor_bindings": (
+                    config.get("factor_bindings")
+                    if isinstance(config.get("factor_bindings"), dict) else None
+                ),
+                "model_bindings": (
+                    config.get("model_bindings")
+                    if isinstance(config.get("model_bindings"), dict) else None
+                ),
+                "market_state_binding": config.get("market_state_binding") or {},
+                "controller_version_id": config.get("strategy_controller_version_id"),
+                "research_package_hash": config.get("research_package_hash"),
             })
     for item in targets:
         if generated and int(item["strategy_id"]) == int(generated["strategy_id"]):
@@ -743,6 +948,11 @@ def _run_quick_gate(target: dict[str, Any], audit: dict[str, Any]) -> dict[str, 
         strategy_id=int(target["strategy_id"]),
         start_date=quick_dates[0],
         end_date=quick_dates[-1],
+        factor_bindings=target.get("factor_bindings"),
+        model_bindings=target.get("model_bindings"),
+        market_state_binding=target.get("market_state_binding"),
+        strategy_controller_version_id=target.get("controller_version_id"),
+        research_package_hash=target.get("research_package_hash"),
     )
     metrics = replay.get("metrics") or {}
     candidate_return = float(metrics.get("total_return") or 0.0)
@@ -999,6 +1209,10 @@ def _execute_strategy_cycle(
             end_date=str(audit["window_end"]),
             max_windows=max_windows,
             strategy_controller_version_id=target.get("controller_version_id"),
+            factor_bindings=target.get("factor_bindings"),
+            model_bindings=target.get("model_bindings"),
+            market_state_binding=target.get("market_state_binding"),
+            research_package_hash=target.get("research_package_hash"),
             execute=True,
             progress_callback=progress,
             checkpoint_results=prior_windows,
@@ -1142,7 +1356,13 @@ def execute_evolution_task(
     validation_runner: Callable[..., dict[str, Any]] = run_purged_walk_forward_validation,
 ) -> dict[str, Any]:
     task_type = str(task.get("task_type") or "")
-    if task_type in {"strategy_evolution_cycle", "strategy_controller_oos", "strategy_shadow_cycle", "factor_daily_cycle"}:
+    if task_type in {
+        "strategy_evolution_cycle",
+        "strategy_controller_oos",
+        "strategy_shadow_cycle",
+        "factor_daily_cycle",
+        "model_shadow_observation",
+    }:
         gate = _experiment_data_gate()
         if not bool(gate.get("experiment_ready")):
             return _blocked_by_decision_data(task, gate)
@@ -1179,13 +1399,14 @@ def execute_evolution_task(
 
         _heartbeat(
             int(task["id"]), phase="continuous_factor_research", progress=0.05,
-            message="正在冻结历史截面并搜索因子组合",
+            message="正在冻结完整研究包并搜索因子、模型与策略组合",
             checkpoint=task.get("checkpoint") if isinstance(task.get("checkpoint"), dict) else {},
         )
         return run_continuous_factor_research_cycle(
             candidates_per_task=max(
                 1, min(int((task.get("payload") or {}).get("candidates_per_task") or 1), 3)
             ),
+            refresh_evidence=bool((task.get("payload") or {}).get("evidence_type")),
             progress_callback=lambda progress: _heartbeat(
                 int(task["id"]),
                 phase="continuous_factor_research",
@@ -1197,13 +1418,284 @@ def execute_evolution_task(
                     / max(1, int(progress.get("total_folds") or 1)),
                 ),
                 message=(
-                    "连续因子组合回测 "
+                    "连续因子模型策略回测 "
                     f"{int(progress.get('completed_folds') or 0)}/"
                     f"{int(progress.get('total_folds') or 1)}"
                 ),
                 checkpoint=progress,
             ),
         )
+    if task_type == "strategy_candidate_generation":
+        from app.services.continuous_strategy_research import run_active_candidate_generation_line
+
+        _heartbeat(
+            int(task["id"]), phase="strategy_candidate_generation", progress=0.1,
+            message="正在持续生成动态规模因子策略候选",
+            checkpoint=task.get("checkpoint") if isinstance(task.get("checkpoint"), dict) else {},
+        )
+        payload = task.get("payload") if isinstance(task.get("payload"), dict) else {}
+        evidence = payload.get("evidence") if isinstance(payload.get("evidence"), dict) else {}
+        return run_active_candidate_generation_line(
+            batch_size=max(1, min(int(payload.get("batch_size") or 4), 20)),
+            model_version_id=(
+                int(payload.get("evidence_id"))
+                if str(payload.get("evidence_type") or "") == "model_version"
+                and str(payload.get("evidence_id") or "").isdigit()
+                else None
+            ),
+            model_key=str(evidence.get("model_key") or "") or None,
+        )
+    if task_type == "strategy_environment_backtest":
+        from app.services.continuous_strategy_research import run_next_environment_backtest
+
+        candidate_id = str((task.get("payload") or {}).get("candidate_id") or "")
+        _heartbeat(
+            int(task["id"]), phase="strategy_environment_backtest", progress=0.1,
+            message=(
+                f"正在执行候选 {candidate_id[-8:]} 的动态市场环境矩阵"
+                if candidate_id else "环境回测任务缺少候选绑定"
+            ),
+            checkpoint={
+                **(task.get("checkpoint") if isinstance(task.get("checkpoint"), dict) else {}),
+                "candidate_id": candidate_id or None,
+            },
+        )
+        return _run_with_heartbeat_pulse(
+            int(task["id"]),
+            phase="strategy_environment_backtest",
+            message=(
+                f"正在执行候选 {candidate_id[-8:]} 的动态市场环境矩阵"
+                if candidate_id else "环境回测任务缺少候选绑定"
+            ),
+            runner=lambda: run_next_environment_backtest(
+                candidate_id=candidate_id or None
+            ),
+        )
+    if task_type == "strategy_cluster_distillation":
+        from app.services.continuous_strategy_research import run_cluster_distillation_line
+
+        _heartbeat(
+            int(task["id"]), phase="strategy_cluster_distillation", progress=0.1,
+            message="正在蒸馏完整策略簇原型",
+            checkpoint=task.get("checkpoint") if isinstance(task.get("checkpoint"), dict) else {},
+        )
+        return run_cluster_distillation_line(
+            snapshot_id=(task.get("payload") or {}).get("snapshot_id"),
+            research_wave_id=(task.get("payload") or {}).get("research_wave_id"),
+        )
+    if task_type == "strategy_portfolio_research":
+        from app.services.continuous_strategy_research import run_strategy_portfolio_line
+
+        _heartbeat(
+            int(task["id"]), phase="strategy_portfolio_research", progress=0.1,
+            message="正在组合互补策略簇并准备二次回测",
+            checkpoint=task.get("checkpoint") if isinstance(task.get("checkpoint"), dict) else {},
+        )
+        return run_strategy_portfolio_line(
+            maximum_members=max(2, min(int((task.get("payload") or {}).get("maximum_members") or 4), 12))
+        )
+    if task_type == "strategy_failure_model_training":
+        from app.services.continuous_strategy_research import dispatch_targeted_model_training
+
+        _heartbeat(
+            int(task["id"]), phase="strategy_failure_model_training", progress=0.1,
+            message="正在按策略失败归因派发定向模型训练",
+            checkpoint=task.get("checkpoint") if isinstance(task.get("checkpoint"), dict) else {},
+        )
+        return dispatch_targeted_model_training(
+            limit=max(1, min(int((task.get("payload") or {}).get("limit") or 3), 10))
+        )
+    if task_type == "model_candidate_research":
+        from app.services.model_candidate_research import run_model_candidate_search
+
+        model_version_id = int((task.get("payload") or {}).get("model_version_id") or 0)
+        _heartbeat(
+            int(task["id"]), phase="model_candidate_quick_diagnostic", progress=0.1,
+            message="正在归因最差正式窗口并快速淘汰模型候选",
+            checkpoint={
+                **(task.get("checkpoint") if isinstance(task.get("checkpoint"), dict) else {}),
+                "model_version_id": model_version_id,
+            },
+        )
+        if model_version_id <= 0:
+            raise ValueError("模型候选研究任务缺少 model_version_id")
+        result = _run_with_heartbeat_pulse(
+            int(task["id"]),
+            phase="model_candidate_quick_diagnostic",
+            message="正在运行受约束模型候选的两窗口快速诊断",
+            runner=lambda: run_model_candidate_search(
+                model_version_id=model_version_id,
+                maximum_formal_winners=1,
+            ),
+        )
+        run_ids = [
+            int(item.get("run_id") or 0)
+            for item in result.get("formal_dispatches") or []
+            if int(item.get("run_id") or 0) > 0
+        ]
+        result["completed_training_runs"] = _wait_for_model_train_runs(
+            int(task["id"]),
+            run_ids,
+            phase_prefix="model_candidate_formal_training",
+        )
+        result["resource_lock_contract"] = (
+            "single_worker_held_until_model_train_terminal_v1"
+        )
+        return result
+    if task_type == "model_strategy_impact_validation":
+        from app.services.model_strategy_impact import run_controlled_model_strategy_ab
+
+        model_version_id = int((task.get("payload") or {}).get("model_version_id") or 0)
+        if model_version_id <= 0:
+            raise ValueError("模型策略影响验证任务缺少 model_version_id")
+        checkpoint = task.get("checkpoint") if isinstance(
+            task.get("checkpoint"), dict
+        ) else {}
+        _heartbeat(
+            int(task["id"]), phase="model_strategy_impact_validation", progress=0.1,
+            message="正在固定 Champion 全部变量并仅替换模型版本执行五窗口 A/B",
+            checkpoint={
+                **checkpoint,
+                "model_version_id": model_version_id,
+            },
+        )
+        return _run_with_heartbeat_pulse(
+            int(task["id"]),
+            phase="model_strategy_impact_validation",
+            message="正在执行新模型版本完整策略影响验证",
+            runner=lambda: run_controlled_model_strategy_ab(
+                model_version_id=model_version_id,
+                checkpoint_results=(
+                    checkpoint.get("completed_windows")
+                    if isinstance(checkpoint.get("completed_windows"), list)
+                    else []
+                ),
+                checkpoint_contract_hash=str(
+                    checkpoint.get("contract_hash") or ""
+                ),
+                progress_callback=lambda progress: _heartbeat(
+                    int(task["id"]),
+                    phase="model_strategy_impact_validation",
+                    progress=max(
+                        0.1,
+                        min(0.98, float(progress.get("progress") or 0.1)),
+                    ),
+                    message=str(
+                        progress.get("message")
+                        or "正在执行新模型版本完整策略影响验证"
+                    ),
+                    checkpoint={
+                        "model_version_id": model_version_id,
+                        "contract_hash": progress.get("contract_hash"),
+                        "completed_windows": progress.get(
+                            "completed_windows"
+                        ) or [],
+                    },
+                ),
+            ),
+        )
+    if task_type == "model_shadow_observation":
+        from app.services.model_shadow_observation import (
+            advance_model_shadow_candidate,
+        )
+
+        payload = task.get("payload") if isinstance(task.get("payload"), dict) else {}
+        model_version_id = int(payload.get("model_version_id") or 0)
+        through_trade_date = str(payload.get("through_trade_date") or "")
+        if model_version_id <= 0 or not through_trade_date:
+            raise ValueError("模型未来影子任务缺少版本或截止交易日")
+        checkpoint = task.get("checkpoint") if isinstance(
+            task.get("checkpoint"), dict
+        ) else {}
+        _heartbeat(
+            int(task["id"]),
+            phase="model_shadow_observation",
+            progress=0.05,
+            message="正在重放冻结参考模型与候选模型的未来组合表现",
+            checkpoint={
+                **checkpoint,
+                "model_version_id": model_version_id,
+                "through_trade_date": through_trade_date,
+            },
+        )
+        return _run_with_heartbeat_pulse(
+            int(task["id"]),
+            phase="model_shadow_observation",
+            message="正在累计模型真实未来 Shadow 证据",
+            runner=lambda: advance_model_shadow_candidate(
+                model_version_id,
+                through_trade_date=through_trade_date,
+                progress_callback=lambda progress: _heartbeat(
+                    int(task["id"]),
+                    phase=str(
+                        progress.get("phase") or "model_shadow_observation"
+                    ),
+                    progress=max(
+                        0.05,
+                        min(0.98, float(progress.get("progress") or 0.05)),
+                    ),
+                    message=str(
+                        progress.get("message")
+                        or "正在累计模型真实未来 Shadow 证据"
+                    ),
+                    checkpoint={
+                        "model_version_id": model_version_id,
+                        "through_trade_date": through_trade_date,
+                        "side": progress.get("side"),
+                        "completed_days": progress.get("completed_days"),
+                        "total_days": progress.get("total_days"),
+                        "observed_return_sessions": progress.get(
+                            "observed_return_sessions"
+                        ),
+                    },
+                ),
+            ),
+        )
+    if task_type == "plan_model_autonomy":
+        from app.services.plan_model_auto_optimizer import run_auto_optimization_once
+
+        payload = task.get("payload") if isinstance(task.get("payload"), dict) else {}
+        failure_recovery = payload.get("training_failure_recovery") if isinstance(
+            payload.get("training_failure_recovery"), dict
+        ) else None
+        _heartbeat(
+            int(task["id"]), phase="plan_model_autonomy", progress=0.1,
+            message=(
+                "正在分类并自动处理模型训练故障"
+                if failure_recovery
+                else "正在按单模型资源预算继续任务原生模型重训"
+            ),
+            checkpoint=task.get("checkpoint") if isinstance(task.get("checkpoint"), dict) else {},
+        )
+        result = (
+            run_auto_optimization_once(
+                force=False,
+                training_failure_recovery=failure_recovery,
+            )
+            if failure_recovery
+            else run_auto_optimization_once(force=False)
+        )
+        run_ids = [
+            int(item.get("run_id") or 0)
+            for item in result.get("started") or []
+            if int(item.get("run_id") or 0) > 0
+        ]
+        result["completed_training_runs"] = _wait_for_model_train_runs(
+            int(task["id"]),
+            run_ids,
+            phase_prefix="plan_model_training",
+        )
+        result["resource_lock_contract"] = "single_worker_held_until_model_train_terminal_v1"
+        return result
+    if task_type == "strategy_portfolio_formal_queue":
+        from app.services.continuous_strategy_research import materialize_next_portfolio_challenger
+
+        _heartbeat(
+            int(task["id"]), phase="strategy_portfolio_formal_queue", progress=0.1,
+            message="正在冻结多策略组合并送入正式验证队列",
+            checkpoint=task.get("checkpoint") if isinstance(task.get("checkpoint"), dict) else {},
+        )
+        return materialize_next_portfolio_challenger()
     if task_type == "sealed_holdout_adj_factor_backfill":
         from app.services.sealed_strategy_holdout import run_sealed_holdout_adj_factor_backfill
 
@@ -1233,7 +1725,17 @@ def _finish_success(task_id: int, result: dict[str, Any]) -> None:
     message = {
         "sealed_holdout_adj_factor_backfill": "密封验证集批量补全并复核完成",
         "factor_daily_cycle": "因子日物化与评价完成",
-        "factor_research_cycle": "连续因子组合研究完成",
+        "factor_research_cycle": "连续因子、模型与策略研究完成",
+        "strategy_candidate_generation": "动态规模策略候选生成完成",
+        "strategy_environment_backtest": "动态市场环境矩阵回测完成",
+        "strategy_cluster_distillation": "完整策略簇蒸馏完成",
+        "strategy_portfolio_research": "多策略组合研究完成",
+        "strategy_failure_model_training": "策略失败归因模型训练派发完成",
+        "model_candidate_research": "模型最差窗口归因与候选分层筛选完成",
+        "model_strategy_impact_validation": "新模型版本完整策略影响验证完成",
+        "model_shadow_observation": "模型未来影子观察完成",
+        "plan_model_autonomy": "任务原生模型单模型自治调度完成",
+        "strategy_portfolio_formal_queue": "多策略组合正式验证入队完成",
         "strategy_shadow_cycle": "策略影子观察完成",
         "strategy_evolution_cycle": "策略进化周期完成",
         "strategy_controller_oos": "策略控制器 OOS 完成",
@@ -1277,20 +1779,33 @@ def _schedule_factor_research_continuation(
     completed_task_id: int,
     result: dict[str, Any],
 ) -> dict[str, Any] | None:
+    if V10_RESEARCH_ENABLED:
+        return None
     if not bool(result.get("continue_research")):
         return None
     snapshot = result.get("snapshot") if isinstance(result.get("snapshot"), dict) else {}
     snapshot_id = str(snapshot.get("snapshot_id") or "unknown")
+    research_progress = {
+        "experiment_count": int(result.get("experiment_count") or 0),
+        "quick_screen_completed": int(result.get("quick_screen_completed") or 0),
+        "confirmation_completed": int(result.get("confirmation_completed") or 0),
+        "current_stage": str(result.get("current_stage") or result.get("status") or "unknown"),
+        "rollover_epoch": bool(result.get("rollover_epoch")),
+    }
+    progress_signature = hashlib.sha256(
+        _json(research_progress).encode("utf-8")
+    ).hexdigest()[:16]
     task = create_evolution_task(
         task_type="factor_research_cycle",
         payload={
             "trigger": "continuous_research_continuation",
             "candidates_per_task": 1,
             "predecessor_task_id": int(completed_task_id),
+            "research_progress": research_progress,
         },
         dedupe_key=(
-            f"factor_research_continuation:{snapshot_id}:"
-            f"after-{int(completed_task_id)}"
+            f"factor_research_continuation:v2:{snapshot_id}:"
+            f"progress-{progress_signature}"
         ),
         priority=90,
     )
@@ -1300,6 +1815,114 @@ def _schedule_factor_research_continuation(
             next_run_at=(_now() + timedelta(seconds=5)).isoformat(),
         )
     return get_evolution_task(int(task["id"])) if task.get("id") else task
+
+
+def _schedule_v10_research_continuation(
+    *,
+    completed_task: dict[str, Any],
+    result: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Connect the V10 research lines when the default engine is enabled."""
+    if not V10_RESEARCH_ENABLED:
+        return []
+    task_type = str(completed_task.get("task_type") or "")
+    source_id = int(completed_task.get("id") or 0)
+    created: list[dict[str, Any]] = []
+
+    def enqueue(kind: str, payload: dict[str, Any], suffix: str, priority: int) -> None:
+        created.append(create_evolution_task(
+            task_type=kind,
+            payload={**payload, "predecessor_task_id": source_id},
+            dedupe_key=f"v10:{kind}:{suffix}",
+            priority=priority,
+            coalesce_active_type=kind in {
+                "strategy_candidate_generation",
+                "strategy_portfolio_research",
+                "strategy_failure_model_training",
+            },
+        ))
+
+    if task_type == "strategy_candidate_generation":
+        for item in result.get("generated") or []:
+            enqueue(
+                "strategy_environment_backtest",
+                {
+                    "trigger": "candidate_generated",
+                    "candidate_id": item.get("candidate_id"),
+                    "research_wave_id": item.get("research_wave_id"),
+                },
+                str(item.get("candidate_id") or source_id),
+                88,
+            )
+    elif task_type == "strategy_environment_backtest":
+        research_wave_id = str(
+            result.get("research_wave_id")
+            or (completed_task.get("payload") or {}).get("research_wave_id")
+            or ""
+        )
+        if research_wave_id and not bool(result.get("wave_ready_for_distillation")):
+            return created
+        generation_task_id = int(
+            (completed_task.get("payload") or {}).get("predecessor_task_id") or source_id
+        )
+        wave_suffix = research_wave_id or f"legacy-{generation_task_id}"
+        enqueue(
+            "strategy_cluster_distillation",
+            {
+                "trigger": "environment_wave_completed",
+                "research_wave_id": research_wave_id or None,
+            },
+            wave_suffix,
+            90,
+        )
+        enqueue(
+            "strategy_failure_model_training",
+            {
+                "trigger": "strategy_failure_attribution",
+                "research_wave_id": research_wave_id or None,
+                "limit": 3,
+            },
+            wave_suffix,
+            91,
+        )
+    elif task_type == "strategy_cluster_distillation":
+        generated_ids = sorted(str(item.get("prototype_id") or "") for item in (result.get("generated") or []))
+        if generated_ids:
+            signature = hashlib.sha256(_json(generated_ids).encode("utf-8")).hexdigest()[:16]
+            enqueue(
+                "strategy_portfolio_research",
+                {"trigger": "strategy_prototypes_distilled", "maximum_members": 4},
+                signature,
+                92,
+            )
+        enqueue(
+            "strategy_candidate_generation",
+            {
+                "trigger": (
+                    "distilled_prototypes_available"
+                    if generated_ids else "cluster_needs_more_evidence"
+                ),
+                "batch_size": 4,
+            },
+            f"after-cluster-{source_id}",
+            94,
+        )
+    elif task_type == "strategy_portfolio_research":
+        if str(result.get("status") or "") == "formal_validation_queued":
+            enqueue(
+                "strategy_portfolio_formal_queue",
+                {"trigger": "portfolio_secondary_backtest_passed"},
+                str(result.get("portfolio_id") or source_id),
+                86,
+            )
+    elif task_type == "strategy_portfolio_formal_queue" and result.get("model_version_id"):
+        enqueue(
+            "strategy_evolution_cycle",
+            {"trigger": "v10_portfolio_challenger", "max_candidates": 1},
+            str(result["model_version_id"]),
+            90,
+        )
+    return created
 
 
 def _finish_failure(task: dict[str, Any], exc: Exception) -> None:
@@ -1353,6 +1976,11 @@ def run_worker_once() -> dict[str, Any] | None:
     try:
         result = execute_evolution_task(task)
         _finish_success(int(task["id"]), result)
+        if str(task.get("task_type") or "").startswith("strategy_"):
+            try:
+                _schedule_v10_research_continuation(completed_task=task, result=result)
+            except Exception:  # noqa: BLE001 - completed evidence remains immutable
+                logger.exception("failed to schedule V10 research continuation task_id=%s", task.get("id"))
         if str(task.get("task_type") or "") == "strategy_evolution_cycle":
             try:
                 _schedule_strategy_continuation(completed_task_id=int(task["id"]))
@@ -1380,6 +2008,25 @@ def run_worker_once() -> dict[str, Any] | None:
                     )
             except Exception:  # noqa: BLE001 - completed research evidence remains valid
                 logger.exception("failed to schedule factor research continuation task_id=%s", task.get("id"))
+        if str(task.get("task_type") or "") in {"factor_daily_cycle", "system_autonomy_cycle"}:
+            try:
+                evidence_type = (
+                    "factor_evaluation"
+                    if str(task.get("task_type") or "") == "factor_daily_cycle"
+                    else "market_state_window"
+                )
+                enqueue_factor_strategy_research_event(
+                    trigger=f"{evidence_type}_completed",
+                    evidence_type=evidence_type,
+                    evidence_id=int(task["id"]),
+                    evidence={"source_task_id": int(task["id"])},
+                    priority=85,
+                )
+            except Exception:  # noqa: BLE001 - source task remains completed
+                logger.exception(
+                    "failed to schedule research evidence task source_task_id=%s",
+                    task.get("id"),
+                )
     except Exception as exc:
         logger.exception("evolution task failed id=%s", task.get("id"))
         _finish_failure(get_evolution_task(int(task["id"])) or task, exc)
@@ -1473,12 +2120,16 @@ def start_evolution_scheduler() -> bool:
             try:
                 _runtime_heartbeat("scheduler")
                 now = _now()
+                research_task_type = (
+                    "strategy_candidate_generation"
+                    if V10_RESEARCH_ENABLED else "factor_research_cycle"
+                )
                 create_evolution_task(
-                    task_type="factor_research_cycle",
-                    dedupe_key=f"factor_research_seed:v1:{now.date().isoformat()}",
+                    task_type=research_task_type,
+                    dedupe_key=f"research_seed:v2:{research_task_type}:{now.date().isoformat()}",
                     payload={
                         "trigger": "continuous_scheduler",
-                        "candidates_per_task": 1,
+                        **({"batch_size": 4} if V10_RESEARCH_ENABLED else {"candidates_per_task": 1}),
                     },
                     priority=90,
                 )

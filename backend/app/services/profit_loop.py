@@ -18,6 +18,9 @@ from app.services.plan_model_control import model_family_status
 from app.services.review_learning import materialize_decision_outcomes, model_feedback_gate, review_learning_overview
 from app.services.two_group_optimizer import two_group_cvar_optimizer
 
+UNIFIED_DAILY_DECISION_SCHEMA_VERSION = "alis_unified_daily_decision_v1"
+UNIFIED_EXECUTION_SAFETY_SCHEMA_VERSION = "alis_t1_execution_safety_v1"
+
 
 def _now() -> str:
     return datetime.now().isoformat(timespec="seconds")
@@ -29,6 +32,24 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
         return parsed if parsed == parsed else default
     except Exception:
         return default
+
+
+def _merge_expected_return_items(
+    base_items: list[dict[str, Any]],
+    override_items: list[dict[str, Any]],
+    *,
+    symbol_order: list[str],
+) -> list[dict[str, Any]]:
+    by_symbol = {
+        str(item.get("symbol") or ""): dict(item)
+        for item in [*base_items, *override_items]
+        if isinstance(item, dict) and str(item.get("symbol") or "")
+    }
+    return [
+        by_symbol[symbol]
+        for symbol in dict.fromkeys(str(value or "") for value in symbol_order)
+        if symbol in by_symbol
+    ]
 
 
 def _risk_execution_check(
@@ -47,6 +68,19 @@ def _risk_execution_check(
         "status": "block" if error_breaches else "warn" if all_breaches else "pass",
         "detail": f"{len(error_breaches)} 项阻断，{len(all_breaches) - len(error_breaches)} 项提醒",
     }
+
+
+def _legacy_pool_preview_inputs(
+    *, unified_available: bool,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], str]:
+    if unified_available:
+        return [], [], [], "not_consumed_non_authoritative"
+    return (
+        list_pool_members("core"),
+        list_pool_members("candidate"),
+        list_pool_members("watch"),
+        "compatibility_preview_consumed",
+    )
 
 
 def _ensure_tables() -> None:
@@ -188,6 +222,47 @@ def _position_returns(symbols: list[str], limit: int = 120) -> dict[str, list[fl
     return result
 
 
+def _latest_decision_data_gate() -> dict[str, Any]:
+    try:
+        from app.services.data_health import assess_latest_decision_data_health
+
+        return assess_latest_decision_data_health()
+    except Exception as exc:
+        return {
+            "decision_ready": False,
+            "status": "blocked",
+            "issues": [{"message": f"决策数据门检查失败：{str(exc)[:200]}"}],
+            "readiness": {},
+            "latest_snapshot": {},
+        }
+
+
+def _build_formal_unified_selection(*, trade_date: str, holding_symbols: list[str] | None = None) -> dict[str, Any]:
+    if not trade_date:
+        return {
+            "ok": False,
+            "status": "blocked",
+            "schema_version": "alis_unified_stock_selection_v1",
+            "error": "latest_decision_trade_date_missing",
+        }
+    try:
+        from app.services.unified_stock_selection import build_unified_stock_selection
+
+        return build_unified_stock_selection(
+            signal_date=trade_date,
+            top_n=20,
+            exchange_group="HS",
+            holding_symbols=holding_symbols or [],
+        )
+    except Exception as exc:
+        return {
+            "ok": False,
+            "status": "blocked",
+            "schema_version": "alis_unified_stock_selection_v1",
+            "error": str(exc)[:500],
+        }
+
+
 def build_return_attribution_loop(*, persist: bool = True) -> dict[str, Any]:
     materialized = materialize_decision_outcomes(limit=2000) if persist else {
         "ok": True, "status": "read_only", "written": 0,
@@ -250,13 +325,18 @@ def build_model_live_monitor(*, persist: bool = True) -> dict[str, Any]:
         live_ic = _safe_float(metrics.get("live_ic"), 0.0)
         turnover = _safe_float(metrics.get("live_turnover"), 0.0)
         drawdown_contribution = -abs(_safe_float(metrics.get("live_drawdown_contribution", 0.0)))
-        has_live_signal = has_live_ic or has_hit_rate or bool(feedback.get("samples"))
+        mature_outcomes = int(feedback.get("mature_20d_outcomes") or 0)
+        evidence_mature = mature_outcomes >= 5
+        # Human review labels and placeholder zeros are not live performance.
+        # Until forward outcomes mature, keep the model neutral and call it
+        # observation rather than incorrectly declaring production health.
+        has_live_signal = evidence_mature and (has_live_ic or has_hit_rate)
         production = str(item.get("status") or "") == "production"
         decay = max(0.0, min(1.0, 0.05 - live_ic)) if has_live_ic and live_ic < 0.05 else max(0.0, 0.45 - hit_rate) if has_hit_rate else 0.0
         should_degrade = production and has_live_signal and (bool(feedback.get("should_degrade")) or (has_live_ic and live_ic < -0.02) or (has_hit_rate and hit_rate < 0.38))
         multiplier = 0.55 if should_degrade else 0.8 if production and decay > 0.25 else 1.0
-        status = "degraded" if should_degrade else "watch" if production and not has_live_signal else "watch" if multiplier < 1 else str(item.get("status") or "unknown")
-        reason = "上线后指标失效，自动降权" if should_degrade else "上线后样本不足，先观察不降权" if production and not has_live_signal else "指标衰减，降低影响权重" if multiplier < 1 else "非生产模型不参与降权" if not production else "生产健康"
+        status = "degraded" if should_degrade else "observing" if production and not has_live_signal else "watch" if multiplier < 1 else str(item.get("status") or "unknown")
+        reason = "上线后指标失效，自动降权" if should_degrade else "未来20日样本不足，观察中且不调整权重" if production and not has_live_signal else "指标衰减，降低影响权重" if multiplier < 1 else "非生产模型不参与降权" if not production else "生产健康"
         payload = {
             "model_key": item.get("model_key"),
             "name": item.get("name"),
@@ -269,6 +349,11 @@ def build_model_live_monitor(*, persist: bool = True) -> dict[str, Any]:
             "decay": round(decay, 6),
             "weight_multiplier": round(multiplier, 4),
             "reason": reason,
+            "evidence_maturity": {
+                "status": "mature" if evidence_mature else "insufficient",
+                "mature_20d_outcomes": mature_outcomes,
+                "minimum_required": 5,
+            },
             "feedback": feedback,
         }
         if persist:
@@ -291,9 +376,25 @@ def build_portfolio_reoptimization() -> dict[str, Any]:
     names = {str(p.get("symbol") or ""): str(p.get("name") or "") for p in positions}
     risk = build_live_portfolio_risk()
     holding_symbols = [str(p.get("symbol") or "") for p in positions if str(p.get("symbol") or "")]
-    core_members = list_pool_members("core")
-    candidate_members = list_pool_members("candidate")
-    watch_members = list_pool_members("watch")
+    decision_data_gate = _latest_decision_data_gate()
+    readiness = decision_data_gate.get("readiness") if isinstance(decision_data_gate.get("readiness"), dict) else {}
+    ready_trade_date = str(readiness.get("latest_decision_ready_trade_date") or "")
+    target_trade_date = str(readiness.get("target_trade_date") or "")
+    selection_trade_date = target_trade_date or ready_trade_date or _latest_trade_date()
+    unified_selection = (
+        _build_formal_unified_selection(trade_date=selection_trade_date, holding_symbols=holding_symbols)
+        if decision_data_gate.get("decision_ready")
+        else {
+            "ok": False,
+            "status": "blocked",
+            "schema_version": "alis_unified_stock_selection_v1",
+            "error": "latest_decision_data_gate_not_ready",
+        }
+    )
+    unified_available = bool(unified_selection.get("ok")) and str(unified_selection.get("status") or "") in {"ready", "empty_opportunity"}
+    core_members, candidate_members, watch_members, legacy_pool_status = _legacy_pool_preview_inputs(
+        unified_available=unified_available,
+    )
     core_symbols = [str(item.get("ts_code") or "").split(".")[0] for item in core_members if str(item.get("status") or "active") == "active"]
     candidate_symbols = [
         str(item.get("ts_code") or "").split(".")[0]
@@ -304,9 +405,20 @@ def build_portfolio_reoptimization() -> dict[str, Any]:
         str(item.get("ts_code") or "").split(".")[0]: item
         for item in core_members if str(item.get("status") or "active") == "active"
     }
-    # Optimisation needs a real choice set.  Recently researched candidates
-    # may compete for weight, while execution safety remains downstream.
-    symbols = list(dict.fromkeys(holding_symbols + core_symbols + candidate_symbols))
+    selection_contract = dict(unified_selection.get("selection_contract") or {}) if unified_available else {}
+    unified_symbols = [
+        str(value or "").split(".")[0]
+        for value in (selection_contract.get("admitted_symbols") or [])
+        if str(value or "")
+    ]
+    legacy_symbols = list(dict.fromkeys(core_symbols + candidate_symbols))
+    selection_candidate_symbols = unified_symbols if unified_available else legacy_symbols
+    selection_source = "unified_full_market_selection" if unified_available else "legacy_pool_preview_blocked"
+    # Existing holdings always remain in the optimisation set so the unified
+    # selector can express hold/reduce/exit without losing account continuity.
+    symbols = list(dict.fromkeys(holding_symbols + selection_candidate_symbols))
+    # The selection payload is immutable once hashed. Portfolio and holding
+    # scope belong to the containing daily-decision contract, never inside it.
     missing_names = [symbol for symbol in symbols if not names.get(symbol)]
     if missing_names:
         with data_conn() as c:
@@ -323,7 +435,6 @@ def build_portfolio_reoptimization() -> dict[str, Any]:
     if not current_weights:
         total_cost = sum(_safe_float(p.get("quantity")) * _safe_float(p.get("price")) for p in positions) or 1.0
         current_weights = {str(p.get("symbol")): _safe_float(p.get("quantity")) * _safe_float(p.get("price")) / total_cost for p in positions}
-    expected = {symbol: (mean(values[-20:]) * 20 if values else 0.0) for symbol, values in returns.items()}
     contracts = risk.get("target_weight_contracts") or []
     buckets = {str(c.get("symbol") or ""): str(c.get("function_bucket") or "narrative") for c in contracts}
     exposures = {str(item.get("symbol") or ""): item for item in (risk.get("exposures") or [])}
@@ -335,27 +446,132 @@ def build_portfolio_reoptimization() -> dict[str, Any]:
         _safe_float(execution_cost_contract.get("round_trip_rate")) / 2.0,
     )
     trading_costs = {symbol: one_way_cost for symbol in symbols}
-    try:
-        context = live_market_context()
-    except Exception:
-        context = {}
-    state = str((context.get("market_state") or {}).get("state") or "S1")
+    if unified_available:
+        environment_snapshot = (
+            selection_contract.get("environment_snapshot")
+            if isinstance(selection_contract.get("environment_snapshot"), dict) else {}
+        )
+        state = str(
+            environment_snapshot.get("selection_market_state")
+            or environment_snapshot.get("production_market_state")
+            or "S1"
+        )
+        context = {
+            "market_state": {"state": state},
+            "market_profile": environment_snapshot.get("market_profile") or {},
+            "source": "frozen_unified_selection",
+        }
+    else:
+        try:
+            context = live_market_context()
+        except Exception:
+            context = {}
+        state = str((context.get("market_state") or {}).get("state") or "S1")
     market_budget = {"S0": 1.0, "S1": 0.85, "S2": 0.55, "S3": 0.70}.get(state, 0.55)
     profile_budget = max(0.85, min(1.0, _safe_float((context.get("market_profile") or {}).get("risk_budget_multiplier"), 1.0)))
     risk_status = str(risk.get("status") or "unknown")
     portfolio_budget = 0.0 if risk_status == "blocked" else 0.75 if risk_status == "warning" else 1.0 if risk_status == "ready" else 0.5
     equity_budget = round(market_budget * profile_budget * portfolio_budget, 6)
+    frozen_signal_symbols = (
+        ((selection_contract.get("model_signal_snapshot") or {}).get("symbols") or {})
+        if unified_available else {}
+    )
+    unified_selection_by_symbol = {
+        str(symbol): item.get("selection")
+        for symbol, item in frozen_signal_symbols.items()
+        if isinstance(item, dict)
+        and isinstance(item.get("selection"), dict)
+        and item.get("selection")
+    }
+    research_evidence = {
+        str(key): value
+        for key, value in (
+            (selection_contract.get("research_evidence") or {})
+            if unified_available else (unified_selection.get("research_evidence") or {})
+        ).items()
+        if isinstance(value, dict)
+    }
+    from app.services.a_share_expected_return import build_a_share_expected_return_contract
+    expected_return_contract = build_a_share_expected_return_contract(
+        symbols=symbols,
+        selections=unified_selection_by_symbol,
+        research_evidence=research_evidence,
+        returns_by_symbol=returns,
+        market_state=state,
+        trading_costs=trading_costs,
+    )
+    expected = (
+        dict(expected_return_contract.get("optimizer_expected_returns") or {})
+        if unified_available
+        else {symbol: (mean(values[-20:]) * 20 if values else 0.0) for symbol, values in returns.items()}
+    )
+    from app.services.defensive_assets import DEFENSIVE_ASSETS, defensive_allocation_for_state
+    from app.services.production_strategy import champion_execution_gate
+    execution_guard = champion_execution_gate()
+    defensive_policy = defensive_allocation_for_state(
+        state,
+        as_of_date=selection_trade_date,
+        equity_target_weight=equity_budget,
+    )
+    defensive_weights = {
+        str(code).split(".")[0]: max(0.0, float(weight or 0.0))
+        for code, weight in (defensive_policy.get("target_weights") or {}).items()
+        if float(weight or 0.0) > 0
+    }
+    if str(execution_guard.get("mode") or "") == "research_only_sell_reduce":
+        continuity = execution_guard.get("defensive_continuity") if isinstance(execution_guard.get("defensive_continuity"), dict) else {}
+        maximum = max(0.0, min(0.30, float(continuity.get("maximum_total_weight") or 0.0))) if continuity.get("enabled") else 0.0
+        defensive_total = sum(defensive_weights.values())
+        scale = maximum / defensive_total if defensive_total > maximum > 0 else 1.0
+        defensive_weights = {
+            symbol: round(weight * scale, 8)
+            for symbol, weight in defensive_weights.items()
+            if maximum > 0
+        }
+    defensive_meta = {str(item["ts_code"]).split(".")[0]: item for item in DEFENSIVE_ASSETS}
+    for symbol, weight in defensive_weights.items():
+        if symbol not in symbols:
+            symbols.append(symbol)
+        names[symbol] = str((defensive_meta.get(symbol) or {}).get("name") or names.get(symbol) or symbol)
+        trading_costs[symbol] = one_way_cost
+    defensive_returns = _position_returns(list(defensive_weights))
+    returns.update(defensive_returns)
+    expected_items = (
+        expected_return_contract.get("items")
+        if isinstance(expected_return_contract.get("items"), list) else []
+    )
+    defensive_expected_items: list[dict[str, Any]] = []
+    for symbol in defensive_weights:
+        values = returns.get(symbol) or []
+        defensive_expected = max(-0.03, min(0.04, mean(values[-20:]) * 20 if values else 0.0))
+        expected[symbol] = round(defensive_expected, 8)
+        defensive_expected_items.append({
+            "symbol": symbol,
+            "expected_20d_return_before_trade_cost": round(defensive_expected, 8),
+            "estimated_entry_net_20d_return": round(defensive_expected - one_way_cost, 8),
+            "components": {"defensive_asset_point_in_time_trend": round(defensive_expected, 8)},
+            "penalties": {"one_way_trade_cost_if_entered": round(one_way_cost, 8)},
+            "evidence": {"return_history_count": len(values), "asset_class": str((defensive_meta.get(symbol) or {}).get("asset_class") or "")},
+            "fallback_policy": "registered_defensive_asset_only",
+        })
+    expected_return_contract["optimizer_expected_returns"] = expected
+    expected_return_contract["items"] = _merge_expected_return_items(
+        expected_items,
+        defensive_expected_items,
+        symbol_order=symbols,
+    )
     equity_candidates = [symbol for symbol in symbols if symbol not in {"510880", "511010", "511880", "512890", "518880"}]
     industry_allocation = build_industry_allocation(
         symbols=equity_candidates,
         symbol_scores={symbol: _safe_float(expected.get(symbol)) * 100 for symbol in equity_candidates},
         equity_budget=equity_budget,
         market_state=state,
+        as_of_time=str(selection_contract.get("data_as_of_time") or "") if unified_available else None,
     )
     admitted_industries = set((industry_allocation.get("industry_targets") or {}).keys())
     symbol_industries = industry_allocation.get("symbol_industries") or {}
     candidate_blocks = []
-    for symbol in list(dict.fromkeys(core_symbols + candidate_symbols)):
+    for symbol in selection_candidate_symbols:
         industry = str(symbol_industries.get(symbol) or "未分类")
         if industry not in admitted_industries:
             candidate_blocks.append({"symbol": symbol, "name": names.get(symbol, ""), "industry": industry, "code": "industry_soft_penalty", "reason": "所属行业未获得优先预算，已施加软惩罚但未禁止入选"})
@@ -363,6 +579,57 @@ def build_portfolio_reoptimization() -> dict[str, Any]:
         symbol: (0.002 if symbol in equity_candidates and str(symbol_industries.get(symbol) or "未分类") not in admitted_industries else 0.0)
         for symbol in symbols
     }
+    from app.services.strategy_controller import build_pretrade_strategy_controller
+    if unified_available:
+        thesis_status_by_symbol = {
+            str(symbol): str((item.get("thesis_snapshot") or {}).get("derived_status") or "")
+            for symbol, item in research_evidence.items()
+            if isinstance(item.get("thesis_snapshot"), dict)
+        }
+    else:
+        from app.services.thesis_store import list_theses
+        thesis_status_by_symbol = {
+            str(item.get("ts_code") or "").split(".")[0]: str(item.get("derived_status") or "")
+            for item in list_theses(limit=1000)
+        }
+    position_pnl_by_symbol: dict[str, float] = {}
+    for symbol, position in position_map.items():
+        quantity = _safe_float(position.get("quantity"))
+        cost_basis = _safe_float(position.get("price"))
+        market_value = _safe_float((exposures.get(symbol) or {}).get("market_value"))
+        live_price = market_value / quantity if quantity > 0 and market_value > 0 else cost_basis
+        position_pnl_by_symbol[symbol] = live_price / cost_basis - 1.0 if cost_basis > 0 else 0.0
+    reviewed_holding_symbols = [
+        str(value or "").split(".")[0]
+        for value in (
+            (selection_contract.get("holding_admitted_symbols") or [])
+            if unified_available else (unified_selection.get("holding_admitted_symbols") or [])
+        )
+        if str(value or "")
+    ]
+    controller_candidates = list(dict.fromkeys(unified_symbols + reviewed_holding_symbols))
+    pretrade_controller = build_pretrade_strategy_controller(
+        candidate_symbols=controller_candidates,
+        holding_symbols=holding_symbols,
+        selections=unified_selection_by_symbol,
+        research_evidence=research_evidence,
+        expected_returns=expected,
+        current_weights=current_weights,
+        thesis_status_by_symbol=thesis_status_by_symbol,
+        position_pnl_by_symbol=position_pnl_by_symbol,
+        defensive_weights=defensive_weights,
+        max_single_position=0.15,
+        execution_guard=execution_guard,
+        context={
+            "signal_date": selection_trade_date,
+            "data_as_of_time": str(selection_contract.get("data_as_of_time") or ""),
+            "data_status": "frozen",
+            "risk_budget": {"equity_budget": equity_budget, "max_single_position_pct": 0.15},
+            "market_state": state,
+        },
+    )
+    controller_bounds = dict(pretrade_controller.get("weight_bounds") or {})
+    target_budget = min(1.0, equity_budget + sum(defensive_weights.values()))
     optimizer = two_group_cvar_optimizer(
         returns,
         expected_returns=expected,
@@ -370,6 +637,8 @@ def build_portfolio_reoptimization() -> dict[str, Any]:
         current_weights=current_weights,
         trading_costs=trading_costs,
         crowding=industry_penalty,
+        weight_bounds=controller_bounds,
+        target_budget=target_budget,
     )
     raw_weights = dict(optimizer.get("weights") or {})
     from app.services.portfolio_method_competition import compete_portfolio_methods
@@ -378,8 +647,11 @@ def build_portfolio_reoptimization() -> dict[str, Any]:
         expected_returns=expected,
         current_weights=current_weights,
         trading_costs=trading_costs,
-        equity_budget=equity_budget,
+        equity_budget=target_budget,
         cvar_weights=raw_weights,
+        weight_bounds=controller_bounds,
+        symbol_industries=symbol_industries,
+        industry_targets=industry_allocation.get("industry_targets") or {},
     )
     scaled_weights = {
         symbol: round(_safe_float(weight), 8)
@@ -390,25 +662,7 @@ def build_portfolio_reoptimization() -> dict[str, Any]:
     if method_competition.get("ok"):
         optimizer["ok"] = True
         optimizer["status"] = f"selected_{method_competition.get('selected_method')}"
-    selected_weights_before_forced_exits = dict(scaled_weights)
     block_by_symbol = {str(item.get("symbol") or ""): item for item in candidate_blocks}
-    # A negative trend estimate may justify holding a diversifier, but never an automatic increase.
-    for symbol, target in list(scaled_weights.items()):
-        if _safe_float(expected.get(symbol)) < 0 and target > _safe_float(current_weights.get(symbol)):
-            scaled_weights[symbol] = round(_safe_float(current_weights.get(symbol)), 8)
-        position = position_map.get(symbol) or {}
-        quantity = _safe_float(position.get("quantity"))
-        cost = _safe_float(position.get("price"))
-        market_value = _safe_float((exposures.get(symbol) or {}).get("market_value"))
-        live_price = market_value / quantity if quantity > 0 and market_value > 0 else cost
-        pnl_pct = live_price / cost - 1.0 if cost > 0 else 0.0
-        if pnl_pct <= -0.06 and _safe_float(expected.get(symbol)) <= -0.05:
-            scaled_weights[symbol] = 0.0
-    if scaled_weights != selected_weights_before_forced_exits:
-        optimizer["selected_method"] = "forced_risk_exit"
-        optimizer["status"] = "forced_risk_exit"
-        optimizer["method_competition"]["selected_method"] = "forced_risk_exit"
-        optimizer["forced_exit_policy"] = "仅对满足冻结止损合同的持仓执行退出；不得以 hold_current 名义表达减仓或清仓"
     error_breaches = [item for item in risk.get("breaches") or [] if str(item.get("severity") or "") == "error"]
     preliminary_improvement = sum(
         (_safe_float(scaled_weights.get(symbol)) - _safe_float(current_weights.get(symbol))) * _safe_float(expected.get(symbol))
@@ -418,17 +672,13 @@ def build_portfolio_reoptimization() -> dict[str, Any]:
         abs(_safe_float(scaled_weights.get(symbol)) - _safe_float(current_weights.get(symbol))) * _safe_float(trading_costs.get(symbol))
         for symbol in set(current_weights) | set(scaled_weights)
     )
-    if not error_breaches and preliminary_improvement <= preliminary_cost:
-        scaled_weights = {symbol: round(weight, 8) for symbol, weight in current_weights.items()}
-        optimizer["status"] = "hold_current_cost_gate"
-        optimizer["cost_gate"] = {
-            "triggered": True,
-            "expected_improvement": round(preliminary_improvement, 8),
-            "estimated_one_way_cost": round(preliminary_cost, 8),
-            "reason": "目标组合的预期改善不能覆盖交易成本，保持当前持仓",
-        }
-    else:
-        optimizer["cost_gate"] = {"triggered": False}
+    optimizer["cost_gate"] = {
+        "triggered": str(method_competition.get("selected_method") or "") == "hold_current",
+        "expected_improvement": round(preliminary_improvement, 8),
+        "estimated_one_way_cost": round(preliminary_cost, 8),
+        "reason": "组合竞赛的成本后改善不足，保持 Controller 允许的当前权重"
+        if str(method_competition.get("selected_method") or "") == "hold_current" else "",
+    }
     optimizer["unscaled_weights"] = raw_weights
     optimizer["weights"] = scaled_weights
     optimizer["equity_budget"] = equity_budget
@@ -438,6 +688,16 @@ def build_portfolio_reoptimization() -> dict[str, Any]:
     proposal = []
     account_equity = _safe_float((risk.get("account") or {}).get("equity"))
     explanations = optimizer.get("explanations") or {}
+    controller_by_symbol = {
+        str(item.get("symbol") or ""): item
+        for item in (pretrade_controller.get("actions") or [])
+        if isinstance(item, dict) and str(item.get("symbol") or "")
+    }
+    expected_by_symbol = {
+        str(item.get("symbol") or ""): item
+        for item in (expected_return_contract.get("items") or [])
+        if isinstance(item, dict) and str(item.get("symbol") or "")
+    }
     for symbol in sorted(set(current_weights) | set(scaled_weights)):
         current_weight = _safe_float(current_weights.get(symbol))
         target_weight = _safe_float(scaled_weights.get(symbol))
@@ -451,7 +711,9 @@ def build_portfolio_reoptimization() -> dict[str, Any]:
         live_price = market_value / quantity if quantity > 0 and market_value > 0 else cost_basis
         pnl_pct = live_price / cost_basis - 1.0 if cost_basis > 0 else 0.0
         full_exit = current_weight > 0.002 and target_weight <= 0.002
-        new_candidate = current_weight <= 0.002 and symbol in set(core_symbols + candidate_symbols)
+        new_candidate = current_weight <= 0.002 and symbol in set(selection_candidate_symbols)
+        unified_evidence = unified_selection_by_symbol.get(symbol) or {}
+        controller_evidence = controller_by_symbol.get(symbol) or {}
         proposal.append({
             "symbol": symbol,
             "name": names.get(symbol, ""),
@@ -463,6 +725,13 @@ def build_portfolio_reoptimization() -> dict[str, Any]:
             "target_amount": round(target_weight * account_equity, 2),
             "estimated_trade_amount": round(abs(delta) * account_equity, 2),
             "expected_20d_return": round(expected_return, 8),
+            "expected_return_contract": expected_by_symbol.get(symbol) or {},
+            "controller_action": str(controller_evidence.get("action") or ""),
+            "controller_permission_allowed": bool(controller_evidence.get("permission_allowed", True)),
+            "controller_weight_bounds": {
+                "min_weight": _safe_float(controller_evidence.get("min_weight")),
+                "max_weight": _safe_float(controller_evidence.get("max_weight")),
+            },
             "expected_return_contribution_before": round(current_weight * expected_return, 8),
             "expected_return_contribution_after": round(target_weight * expected_return, 8),
             "estimated_one_way_cost": round(abs(delta) * _safe_float(trading_costs.get(symbol)), 8),
@@ -475,8 +744,17 @@ def build_portfolio_reoptimization() -> dict[str, Any]:
                 else "目标组合提高该资产配置" if delta > 0.002
                 else "风险预算或组合相关性要求降低配置" if delta < -0.002
                 else "权重偏差不足以覆盖调仓成本",
-            "candidate_source": "core_pool" if symbol in core_symbols and symbol not in holding_symbols else "candidate_pool" if symbol in candidate_symbols and symbol not in holding_symbols else "holding",
+            "candidate_source": "unified_full_market_selection" if unified_available and symbol in unified_symbols and symbol not in holding_symbols
+                else "core_pool_compatibility_preview" if symbol in core_symbols and symbol not in holding_symbols
+                else "candidate_pool_compatibility_preview" if symbol in candidate_symbols and symbol not in holding_symbols
+                else "holding",
             "candidate_lineage": ({
+                "selection_hash": str(selection_contract.get("selection_hash") or ""),
+                "rank_score": unified_evidence.get("score"),
+                "factor_contributions": unified_evidence.get("factor_contributions") or [],
+                "model_signals": unified_evidence.get("model_signals") or {},
+                "path": ["全市场点时截面", "冻结因子公式", "生产模型融合", "研究硬门", "动态策略门", "行业预算", "组合优化"],
+            } if unified_available and symbol in unified_symbols and symbol not in holding_symbols else {
                 "entry_pool": "core",
                 "entered_at": str((core_member_by_symbol.get(symbol) or {}).get("entered_at") or ""),
                 "source_reason": str((core_member_by_symbol.get(symbol) or {}).get("reason") or ""),
@@ -497,24 +775,25 @@ def build_portfolio_reoptimization() -> dict[str, Any]:
         _safe_float(item.get("target_weight")) <= _safe_float(item.get("current_weight")) + 1e-9
         for item in proposal
     )
+    controller_bound_violations = [
+        {
+            "symbol": symbol,
+            "weight": round(_safe_float(scaled_weights.get(symbol)), 8),
+            "min_weight": round(_safe_float(bound.get("min_weight")), 8),
+            "max_weight": round(_safe_float(bound.get("max_weight")), 8),
+        }
+        for symbol, bound in controller_bounds.items()
+        if (
+            _safe_float(scaled_weights.get(symbol)) < _safe_float(bound.get("min_weight")) - 1e-8
+            or _safe_float(scaled_weights.get(symbol)) > _safe_float(bound.get("max_weight")) + 1e-8
+        )
+    ]
+    controller_complete = set(symbols) <= set(controller_bounds)
     try:
         from app.services.simulation_ledger_audit import audit_simulation_ledger
         ledger_audit = audit_simulation_ledger(persist=False)
     except Exception as exc:
         ledger_audit = {"ok": False, "status": "error", "issues": [{"message": str(exc)[:300]}]}
-    try:
-        from app.services.data_health import assess_latest_decision_data_health
-        decision_data_gate = assess_latest_decision_data_health()
-    except Exception as exc:
-        decision_data_gate = {
-            "decision_ready": False,
-            "status": "blocked",
-            "issues": [{"message": f"决策数据门检查失败：{str(exc)[:200]}"}],
-            "readiness": {},
-            "latest_snapshot": {},
-        }
-    ready_trade_date = str((decision_data_gate.get("readiness") or {}).get("latest_decision_ready_trade_date") or "")
-    target_trade_date = str((decision_data_gate.get("readiness") or {}).get("target_trade_date") or "")
     decision_issue_text = "；".join(
         str(item.get("message") or "") for item in decision_data_gate.get("issues") or [] if item.get("message")
     )
@@ -523,6 +802,16 @@ def build_portfolio_reoptimization() -> dict[str, Any]:
             f"{ready_trade_date or target_trade_date} 收盘数据已通过完整性检查"
             if decision_data_gate.get("decision_ready")
             else decision_issue_text or f"目标交易日 {target_trade_date or '未知'} 未完成，最近可用 {ready_trade_date or '无'}"
+        )},
+        {"key": "unified_selection", "label": "统一正式选股链路", "status": "pass" if unified_available else "block", "detail": (
+            f"全市场因子模型、研究硬门和动态门已冻结，入选 {len(unified_symbols)} 只"
+            if unified_available
+            else f"统一选股不可用，旧研究池结果仅保留预览：{unified_selection.get('error') or unified_selection.get('status') or 'unknown'}"
+        )},
+        {"key": "strategy_controller", "label": "StrategyController 冻结动作与权重边界", "status": "pass" if controller_complete and not controller_bound_violations else "block", "detail": (
+            f"已为 {len(controller_bounds)} 个候选、持仓和防御资产冻结动作及权重上下界"
+            if controller_complete and not controller_bound_violations
+            else f"动作不完整或目标权重越界：missing={sorted(set(symbols) - set(controller_bounds))} violations={controller_bound_violations}"
         )},
         {"key": "simulation_ledger", "label": "模拟账户账本一致", "status": "pass" if ledger_audit.get("ok") else "block", "detail": (
             f"现金与 {len(ledger_audit.get('actual_positions') or {})} 个持仓均可由账本独立重算"
@@ -548,11 +837,19 @@ def build_portfolio_reoptimization() -> dict[str, Any]:
             "target": {"expected_20d_return": round(target_expected, 8), "cash_weight": optimizer["cash_target"], "max_position_weight": round(max(scaled_weights.values(), default=0.0), 8)},
             "expected_improvement": round(expected_improvement, 8), "estimated_one_way_cost": round(estimated_cost, 8),
             "net_expected_improvement": round(expected_improvement - estimated_cost, 8), "turnover": round(turnover, 8),
-            "method": "当前与目标权重乘以各资产历史20日均值；未承诺未来收益",
+            "method": "A股20日预期收益合同乘以当前/目标权重；交易成本仅按权重变化扣除一次",
         },
         "execution_checks": execution_checks,
         "execution_authorized": not any(item["status"] == "block" for item in execution_checks),
         "risk_reducing_only": risk_reducing_only,
+        "selection_source": selection_source,
+        "unified_selection": unified_selection,
+        "selection_snapshot": selection_contract,
+        "expected_return_contract": expected_return_contract,
+        "pretrade_controller": pretrade_controller,
+        "industry_allocation": industry_allocation,
+        "portfolio_method_competition": method_competition,
+        "final_target_weights": scaled_weights,
         "decision_data_gate": {
             "status": str(decision_data_gate.get("status") or "blocked"),
             "decision_ready": bool(decision_data_gate.get("decision_ready")),
@@ -563,14 +860,22 @@ def build_portfolio_reoptimization() -> dict[str, Any]:
         "proposal_unit": "portfolio_fraction",
         "candidate_universe": {
             "holding_count": len(holding_symbols),
+            "legacy_pool_status": legacy_pool_status,
             "watch_count": len(watch_members),
             "candidate_count": len(candidate_members),
             "core_count": len(core_symbols),
+            "unified_ranked_count": len(selection_contract.get("ranked_symbols") or []),
+            "unified_research_admitted_count": len(selection_contract.get("research_admitted_symbols") or []),
+            "unified_admitted_count": len(unified_symbols),
             "optimization_count": len(returns),
-            "new_core_symbols": [symbol for symbol in core_symbols if symbol not in holding_symbols],
+            "new_unified_symbols": [symbol for symbol in unified_symbols if symbol not in holding_symbols],
             "industry_allocation": industry_allocation,
             "blocked_candidates": candidate_blocks,
-            "admission_policy": "当前持仓、核心池及最近20只有效候选共同优化；行业偏好作为软惩罚，账户与交易安全由执行层硬门控",
+            "admission_policy": (
+                "统一全市场因子模型召回通过研究和动态硬门后，与当前持仓共同优化"
+                if unified_available
+                else "统一链路失败；当前持仓、核心池和候选池只生成不可执行兼容预览"
+            ),
         },
         "execution_cost_contract": execution_cost_contract,
         "risk_budget": {
@@ -864,6 +1169,8 @@ def _plan_block_status(portfolio: dict[str, Any]) -> tuple[str, str]:
     keys = {str(item.get("key") or "") for item in blocked}
     if "market_data" in keys:
         return "blocked_by_decision_data", "最新交易日决策数据门未通过，当前方案仅作为不可执行预览"
+    if "unified_selection" in keys:
+        return "blocked_by_selection", "统一全市场选股链路未完成，旧研究池结果仅作为不可执行预览"
     if "simulation_ledger" in keys:
         return "blocked_by_ledger", "模拟账户账本不一致，禁止生成可执行计划"
     if "risk_gate" in keys:
@@ -873,38 +1180,125 @@ def _plan_block_status(portfolio: dict[str, Any]) -> tuple[str, str]:
     return "blocked_by_execution_checks", "执行前置检查未全部通过"
 
 
+def build_daily_decision_contract(
+    *,
+    portfolio: dict[str, Any],
+    trade_date: str,
+    planned_execute_date: str,
+) -> dict[str, Any]:
+    """Build the immutable T-day decision payload without persisting a plan."""
+    from app.services.decision_version_manifest import build_decision_version_manifest
+
+    decision_gate = portfolio.get("decision_data_gate") if isinstance(portfolio.get("decision_data_gate"), dict) else {}
+    proposal = portfolio.get("rebalance_proposal") or []
+    execution_checks = [
+        dict(item) for item in (portfolio.get("execution_checks") or [])
+        if isinstance(item, dict)
+    ]
+    execution_authorized = bool(decision_gate.get("decision_ready")) and bool(execution_checks) and not any(
+        str(item.get("status") or "") == "block" for item in execution_checks
+    )
+    decision_version_manifest = build_decision_version_manifest(
+        trade_date=trade_date,
+        portfolio=portfolio,
+    )
+    final_target_weights = {
+        str(symbol): round(max(0.0, _safe_float(weight)), 8)
+        for symbol, weight in (portfolio.get("final_target_weights") or {}).items()
+        if str(symbol)
+    }
+    # Any positive frozen weight remains an execution target.  A display or
+    # rebalance materiality threshold must never turn a small holding into an
+    # implicit T+1 liquidation.
+    target_symbols = [symbol for symbol, weight in final_target_weights.items() if weight > 1e-12]
+    execution_target_weights = {
+        symbol: weight for symbol, weight in final_target_weights.items() if symbol in target_symbols
+    }
+    unified_contract = str(portfolio.get("selection_source") or "") == "unified_full_market_selection"
+    return {
+        "schema_version": UNIFIED_DAILY_DECISION_SCHEMA_VERSION if unified_contract else "alis_legacy_daily_plan_v1",
+        "trade_date": trade_date,
+        "signal_date": trade_date,
+        "data_as_of_time": str((portfolio.get("selection_snapshot") or {}).get("data_as_of_time") or ""),
+        "planned_execute_date": planned_execute_date,
+        "proposal": proposal,
+        "target_symbols": target_symbols,
+        "target_weights": execution_target_weights,
+        "final_target_weights": final_target_weights,
+        "risk_budget": portfolio.get("risk_budget") or {},
+        "execution_authorized": execution_authorized,
+        "execution_checks": execution_checks,
+        "decision_data_gate": decision_gate,
+        "selection_snapshot": portfolio.get("selection_snapshot") or {},
+        "pretrade_controller": portfolio.get("pretrade_controller") or {},
+        "industry_allocation": portfolio.get("industry_allocation") or {},
+        "expected_return_contract": portfolio.get("expected_return_contract") or {},
+        "portfolio_method_competition": portfolio.get("portfolio_method_competition") or {},
+        "execution_safety_contract": {
+            "schema_version": UNIFIED_EXECUTION_SAFETY_SCHEMA_VERSION,
+            "investment_opinion_frozen_on_signal_date": True,
+            "t1_rerank_forbidden": True,
+            "t1_research_refresh_forbidden": True,
+            "t1_industry_reallocation_forbidden": True,
+            "t1_controller_regeneration_forbidden": True,
+            "t1_portfolio_reoptimization_forbidden": True,
+            "allowed_vetoes": [
+                "missing_open_price", "suspension", "st_status", "limit_up_down", "lot_size",
+                "liquidity_capacity", "cash_no_overdraft", "no_oversell",
+                "t1_sell_restriction", "ledger_consistency",
+                "overnight_champion_restriction_only",
+            ],
+        },
+        "decision_version_manifest": decision_version_manifest,
+    }
+
+
 def materialize_daily_rebalance_plan(portfolio: dict[str, Any] | None = None) -> dict[str, Any]:
     """Persist one immutable plan version per materially different daily input."""
-    _ensure_tables()
     portfolio = portfolio or build_portfolio_reoptimization()
     decision_gate = portfolio.get("decision_data_gate") if isinstance(portfolio.get("decision_data_gate"), dict) else {}
     trade_date = str(decision_gate.get("target_trade_date") or _latest_trade_date())
+    if str(portfolio.get("selection_source") or "") != "unified_full_market_selection":
+        return {
+            "id": None,
+            "trade_date": trade_date,
+            "data_as_of_date": trade_date,
+            "planned_execute_date": "",
+            "planned_execute_at": "",
+            "version": None,
+            "plan_version": "",
+            "status": "compatibility_preview_only",
+            "persisted": False,
+            "is_executed": False,
+            "execution_authorized": False,
+            "blocked_reason": "统一全市场选股合同未完成；旧研究池结果只保留兼容预览，不能写入正式计划",
+            "proposal": portfolio.get("rebalance_proposal") or [],
+            "selection_snapshot": portfolio.get("selection_snapshot") or {},
+            "decision_contract_schema_version": "alis_legacy_daily_plan_v1",
+            "generation_policy": "旧选股池和旧合同只读兼容，不得新建或覆盖正式调仓计划",
+        }
     with data_conn() as c:
         next_row = c.execute(
             "SELECT MIN(cal_date) value FROM dc_trade_calendar WHERE is_open=1 AND cal_date>?", (trade_date,)
         ).fetchone() if trade_date else None
     planned_execute_date = str(dict(next_row or {}).get("value") or "")
     planned_execute_at = _planned_execute_at(planned_execute_date)
-    proposal = portfolio.get("rebalance_proposal") or []
-    execution_authorized = bool(portfolio.get("execution_authorized"))
+    contract = build_daily_decision_contract(
+        portfolio=portfolio,
+        trade_date=trade_date,
+        planned_execute_date=planned_execute_date,
+    )
+    from app.services.quant_run_plan_input import validate_unified_decision_contract
+    validate_unified_decision_contract(contract)
+    proposal = contract["proposal"]
+    decision_version_manifest = contract["decision_version_manifest"]
+    execution_authorized = bool(contract.get("execution_authorized"))
     plan_status, blocked_reason = _plan_block_status(portfolio)
     if execution_authorized:
         plan_status, blocked_reason = "planned", ""
-    from app.services.decision_version_manifest import build_decision_version_manifest
-    decision_version_manifest = build_decision_version_manifest(
-        trade_date=trade_date,
-        portfolio=portfolio,
-    )
-    contract = {
-        "trade_date": trade_date,
-        "proposal": proposal,
-        "risk_budget": portfolio.get("risk_budget") or {},
-        "execution_authorized": execution_authorized,
-        "decision_data_gate": decision_gate,
-        "decision_version_manifest": decision_version_manifest,
-    }
     canonical = json.dumps(contract, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     input_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    _ensure_tables()
     with business_conn() as c:
         inflight = c.execute(
             """SELECT * FROM daily_rebalance_plans
@@ -950,6 +1344,7 @@ def materialize_daily_rebalance_plan(portfolio: dict[str, Any] | None = None) ->
         "version": int(row["version"]),
         "plan_version": f"{trade_date}-v{int(row['version'])}",
         "status": row_status,
+        "persisted": True,
         "is_executed": str(row.get("status") or "") == "executed",
         "execution_authorized": execution_authorized and row_status in {"planned", "executed"},
         "blocked_reason": row_blocked_reason,
@@ -958,6 +1353,8 @@ def materialize_daily_rebalance_plan(portfolio: dict[str, Any] | None = None) ->
         "executed_at": row.get("executed_at"),
         "input_hash": input_hash,
         "decision_version_manifest": decision_version_manifest,
+        "selection_snapshot": contract.get("selection_snapshot") or {},
+        "decision_contract_schema_version": contract.get("schema_version"),
         "generation_policy": "仅在最新交易日决策数据门通过后生成可执行版本；未通过时保留不可执行预览",
         "execution_policy": (
             f"执行日{effective_rebalance_clock().strftime('%H:%M')}后检查；"
@@ -966,7 +1363,13 @@ def materialize_daily_rebalance_plan(portfolio: dict[str, Any] | None = None) ->
     }
 
 
-def claim_daily_rebalance_execution_input(signal_date: str, execute_date: str, *, claim_token: str) -> dict[str, Any] | None:
+def claim_daily_rebalance_execution_input(
+    signal_date: str,
+    execute_date: str,
+    *,
+    claim_token: str,
+    expected_strategy_id: int | None = None,
+) -> dict[str, Any] | None:
     """Return the latest immutable dashboard plan when it is due for execution.
 
     Historical replay deliberately gets no override: only a still-planned row
@@ -998,6 +1401,41 @@ def claim_daily_rebalance_execution_input(signal_date: str, execute_date: str, *
             contract = json.loads(record.get("proposal_json") or "{}")
         except (TypeError, json.JSONDecodeError):
             return None
+        canonical = json.dumps(contract, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        actual_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        if actual_hash != str(record.get("input_hash") or ""):
+            from app.services.quant_run_contracts import ReplayRiskGateError
+            raise ReplayRiskGateError(
+                "正式调仓计划完整合同哈希校验失败",
+                code="invalid_authoritative_plan_hash",
+            )
+        if str(contract.get("schema_version") or "") == UNIFIED_DAILY_DECISION_SCHEMA_VERSION:
+            from app.services.quant_run_plan_input import validate_unified_decision_contract
+
+            validate_unified_decision_contract(contract)
+            if (
+                str(contract.get("signal_date") or "").replace("-", "")[:8] != signal
+                or str(contract.get("planned_execute_date") or "").replace("-", "")[:8] != execute
+            ):
+                from app.services.quant_run_contracts import ReplayRiskGateError
+
+                raise ReplayRiskGateError(
+                    "统一正式计划日期与数据库领取条件不一致",
+                    code="invalid_authoritative_plan",
+                )
+            frozen_strategy_id = int(
+                ((contract.get("selection_snapshot") or {}).get("strategy_id")) or 0
+            )
+            if (
+                expected_strategy_id is not None
+                and frozen_strategy_id != int(expected_strategy_id)
+            ):
+                from app.services.quant_run_contracts import ReplayRiskGateError
+
+                raise ReplayRiskGateError(
+                    "统一正式计划与执行任务的策略身份不一致",
+                    code="invalid_authoritative_plan",
+                )
         proposal = contract.get("proposal") if isinstance(contract, dict) else None
         if not isinstance(proposal, list):
             return None
@@ -1009,11 +1447,15 @@ def claim_daily_rebalance_execution_input(signal_date: str, execute_date: str, *
         )
         if int(getattr(changed, "rowcount", 1) or 0) != 1:
             return None
-    target_weights = {
-        str(item.get("symbol") or "").strip(): max(0.0, _safe_float(item.get("target_weight")))
-        for item in proposal if str(item.get("symbol") or "").strip()
-    }
-    target_symbols = [symbol for symbol, weight in target_weights.items() if weight > 0.002]
+    if str(contract.get("schema_version") or "") == UNIFIED_DAILY_DECISION_SCHEMA_VERSION:
+        target_weights = dict(contract.get("target_weights") or {})
+        target_symbols = list(contract.get("target_symbols") or [])
+    else:
+        target_weights = {
+            str(item.get("symbol") or "").strip(): max(0.0, _safe_float(item.get("target_weight")))
+            for item in proposal if str(item.get("symbol") or "").strip()
+        }
+        target_symbols = [symbol for symbol, weight in target_weights.items() if weight > 0.002]
     return {
         "plan_id": int(record["id"]),
         "plan_version": f"{record['trade_date']}-v{int(record['version'])}",
@@ -1024,7 +1466,10 @@ def claim_daily_rebalance_execution_input(signal_date: str, execute_date: str, *
         "target_weights": target_weights,
         "proposal": proposal,
         "risk_budget": contract.get("risk_budget") or {},
+        "selection_snapshot": contract.get("selection_snapshot") or {},
         "decision_version_manifest": contract.get("decision_version_manifest") or {},
+        "decision_contract": contract,
+        "decision_contract_schema_version": str(contract.get("schema_version") or ""),
         "execution_claim_token": token,
     }
 
@@ -1107,11 +1552,13 @@ def get_latest_daily_rebalance_plan(trade_date: str = "") -> dict[str, Any]:
         "version": int(item.get("version") or 0),
         "plan_version": f"{item.get('trade_date')}-v{int(item.get('version') or 0)}",
         "status": str(item.get("status") or ""),
+        "persisted": True,
         "is_executed": str(item.get("status") or "") == "executed",
         "execution_authorized": str(item.get("status") or "") in {"planned", "executed"},
         "blocked_reason": {
             "executing": "正式计划已被唯一执行器领取，正在原子落账",
             "blocked_by_decision_data": "最新交易日决策数据门未通过",
+            "blocked_by_selection": "统一全市场选股链路未完成",
             "blocked_by_ledger": "模拟账户账本不一致",
             "blocked_by_risk": "风险门拒绝会增加风险的方案",
             "blocked_by_optimizer": "组合优化没有形成安全可执行解",
@@ -1121,6 +1568,8 @@ def get_latest_daily_rebalance_plan(trade_date: str = "") -> dict[str, Any]:
         "proposal": contract.get("proposal") or [],
         "risk_budget": contract.get("risk_budget") or {},
         "decision_data_gate": contract.get("decision_data_gate") or {},
+        "selection_snapshot": contract.get("selection_snapshot") or {},
+        "decision_contract_schema_version": str(contract.get("schema_version") or ""),
         "decision_version_manifest": contract.get("decision_version_manifest") or {},
         "generated_at": item.get("generated_at"), "executed_at": item.get("executed_at"),
         "generation_policy": "计划只由自治周期生成；本接口只读已有版本",

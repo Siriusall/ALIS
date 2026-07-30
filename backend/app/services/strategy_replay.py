@@ -16,10 +16,14 @@ from app.core.exchange_groups import matches_exchange_group, normalize_exchange_
 from app.core.trading_constraints import check_open_trade_constraints, normalize_lot_quantity
 from app.db.store import get_model_version, get_strategy
 from app.services.backtest_data_source import BacktestDataSource, HistBar, SnapshotRow
-from app.services.backtest_engine import _apply_filters, _apply_universe_controls, _factor_value, _score_rows
-from app.services.backtest_metrics import build_metrics
+from app.services.backtest_engine import _apply_filters, _apply_universe_controls, _score_rows
+from app.services.backtest_metrics import build_market_state_metrics, build_metrics
+from app.services.model_signal_fusion import MODEL_KEYS, apply_model_signals
+from app.services.hsmm_shadow import infer_hsmm_state_as_of
+from app.services.factor_platform import compute_bound_factor
 from app.services.strategy_config import (
     get_strategy_factor_names,
+    get_strategy_expert_route,
     get_strategy_score_for_market_state,
     parse_strategy_content,
     resolve_selection_market_state,
@@ -28,6 +32,7 @@ from app.services.strategy_controller import build_strategy_rebalance_actions
 from app.services.production_strategy import resolve_production_strategy_champion
 from app.services.point_in_time import point_in_time_contract, signal_available_time
 from app.services.two_group_optimizer import two_group_cvar_optimizer
+from app.services.quant_risk import hrp_fallback_weights
 from app.services.defensive_assets import DEFENSIVE_ASSETS, defensive_allocation_for_state
 from app.services.market_context import (
     _transparent_regime,
@@ -395,10 +400,17 @@ def run_strategy_replay(
     benchmark_symbol: str = "000300.SH",
     exchange_group: str = "HS",
     model_version_id: int | None = None,
+    factor_bindings: dict[str, Any] | None = None,
+    model_bindings: dict[str, Any] | None = None,
+    market_state_binding: dict[str, Any] | None = None,
     strategy_controller_version_id: int | None = None,
     strategy_content: dict[str, Any] | None = None,
     strategy_name: str | None = None,
     data_source: BacktestDataSource | None = None,
+    themes: list[dict[str, Any]] | None = None,
+    consume_point_in_time_themes: bool = True,
+    research_package_hash: str | None = None,
+    evaluate_market_states: bool = True,
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     champion = resolve_production_strategy_champion()
@@ -420,8 +432,10 @@ def run_strategy_replay(
     controls = raw_content.get("challenger_controls") if isinstance(raw_content.get("challenger_controls"), dict) else {}
     exposure_policy = raw_content.get("dynamic_market_exposure") if isinstance(raw_content.get("dynamic_market_exposure"), dict) else {}
     regime_scores = raw_content.get("regime_scores") if isinstance(raw_content.get("regime_scores"), dict) else {}
-    uses_market_state = bool(exposure_policy or regime_scores)
+    uses_market_state = bool(exposure_policy or regime_scores or evaluate_market_states)
     allocation_method = str(raw_content.get("portfolio_method") or "cvar").strip().lower()
+    if allocation_method not in {"cvar", "equal_weight", "hrp"}:
+        raise ValueError(f"策略重放不支持组合方法：{allocation_method}")
     config = parse_strategy_content(strategy.get("content"), strategy.get("type", "formula"))
     frequency = rebalance_freq or str(config.rebalance.get("freq", "daily"))
     top_n = int(((model_version or {}).get("config") or {}).get("top_n") or config.rebalance.get("top_n", 20))
@@ -442,6 +456,8 @@ def run_strategy_replay(
     previous_rebalance: str | None = None
     benchmark_base: float | None = None
     pit_audits: list[dict[str, Any]] = []
+    market_state_series: list[dict[str, Any]] = []
+    model_fusion_history: list[dict[str, Any]] = []
     previous_market_state = ""
     previous_selection_market_state = ""
     market_amount_history: list[float] = []
@@ -460,13 +476,90 @@ def run_strategy_replay(
         policy = candidate_policy
     controller_version_id = int((controller_version or {}).get("id") or champion["strategy_controller_version_id"])
     controller_version_name = str((controller_version or {}).get("version") or champion["strategy_controller_version"])
+    explicit_factor_bindings = factor_bindings is not None
+    replay_factor_bindings = factor_bindings
+    if replay_factor_bindings is None and isinstance(champion.get("factor_bindings"), dict):
+        replay_factor_bindings = champion.get("factor_bindings") or {}
+    explicit_model_bindings = model_bindings is not None
+    replay_model_bindings = model_bindings
+    if replay_model_bindings is None and isinstance(champion.get("model_bindings"), dict):
+        frozen = {
+            key: champion["model_bindings"].get(key)
+            for key in MODEL_KEYS
+        }
+        if any(value is not None for value in frozen.values()):
+            replay_model_bindings = frozen
+            explicit_model_bindings = True
+    replay_market_state_binding = (
+        dict(market_state_binding)
+        if isinstance(market_state_binding, dict)
+        else dict(champion.get("market_state_binding") or {})
+    )
+    if not replay_market_state_binding:
+        replay_market_state_binding = {
+            "production_model": "transparent_four_state_v1",
+            "change_model": "bocpd_gaussian_v1",
+        }
+    production_market_state_model = str(
+        replay_market_state_binding.get("production_model") or "transparent_four_state_v1"
+    )
+    if production_market_state_model not in {
+        "transparent_four_state_v1",
+        "market_regime_hsmm_v1",
+    }:
+        raise ValueError(f"策略重放暂不支持市场状态生产模型：{production_market_state_model}")
+    hsmm_binding = replay_market_state_binding.get("hsmm_shadow")
+    if production_market_state_model == "market_regime_hsmm_v1" and not isinstance(hsmm_binding, dict):
+        raise ValueError("HSMM 市场状态候选缺少冻结版本绑定")
     required_factors = get_strategy_factor_names(raw_content, strategy.get("type", "formula"))
+    required_factors.update({"momentum_20", "momentum_60", "volatility_20"})
     if float(config.universe.get("exclude_smallest_float_mv_pct") or 0.0) > 0:
         required_factors.add("float_mv")
     for item in config.filters:
         if item.get("factor"):
             required_factors.add(str(item["factor"]))
+    if explicit_factor_bindings:
+        missing_bindings = sorted(
+            factor for factor in required_factors
+            if not isinstance((replay_factor_bindings or {}).get(factor), dict)
+        )
+        if missing_bindings:
+            raise ValueError(f"冻结策略包缺少因子绑定：{','.join(missing_bindings)}")
     need_daily_basic = bool(required_factors & {"float_mv", "total_mv", "pe_ttm", "pb"})
+    theme_history: list[dict[str, Any]] = []
+    theme_cache: dict[str, list[dict[str, Any]]] = {}
+
+    def themes_as_of(cutoff: str) -> list[dict[str, Any]]:
+        if themes is not None:
+            return list(themes)
+        if not consume_point_in_time_themes:
+            return []
+        cache_key = str(cutoff)[:10]
+        if cache_key in theme_cache:
+            return theme_cache[cache_key]
+        try:
+            from app.services.theme_engine import list_themes
+
+            loaded = list_themes(
+                as_of_time=cutoff,
+                promotable_only=False,
+                limit=300,
+            ).get("items") or []
+            theme_cache[cache_key] = list(loaded)
+            theme_history.append({
+                "date": cache_key,
+                "status": "ready" if loaded else "valid_empty",
+                "count": len(loaded),
+            })
+        except Exception as exc:  # Theme fallback must not invalidate price-only replay.
+            theme_cache[cache_key] = []
+            theme_history.append({
+                "date": cache_key,
+                "status": "unavailable_fallback",
+                "count": 0,
+                "error": str(exc)[:300],
+            })
+        return theme_cache[cache_key]
 
     def report_progress(*, phase: str, completed_days: int, message: str) -> None:
         if progress_callback:
@@ -500,9 +593,50 @@ def run_strategy_replay(
                 signal_history=market_signal_history,
                 previous_state=previous_market_state,
             )
+            transparent_state = str(latest_market_risk["market_state"])
+            effective_market_state_model = "transparent_four_state_v1"
+            market_state_fallback_reason = ""
+            state_confidence: float | None = None
+            hsmm_evidence: dict[str, Any] | None = None
+            if production_market_state_model == "market_regime_hsmm_v1":
+                hsmm_evidence = infer_hsmm_state_as_of(
+                    hsmm_binding,
+                    as_of_time=cutoff,
+                )
+                hsmm_state = str(hsmm_evidence.get("state") or "")
+                if bool(hsmm_evidence.get("ok")) and hsmm_state in {"S0", "S1", "S2", "S3"}:
+                    latest_market_risk["market_state"] = hsmm_state
+                    latest_market_risk["market_profile"] = classify_market_profile(
+                        hsmm_state,
+                        latest_market_risk.get("observations") or {},
+                    )
+                    effective_market_state_model = "market_regime_hsmm_v1"
+                    state_confidence = float(hsmm_evidence.get("confidence") or 0.0)
+                else:
+                    market_state_fallback_reason = str(
+                        hsmm_evidence.get("reason") or "hsmm_point_in_time_state_unavailable"
+                    )
             previous_market_state = str(latest_market_risk["market_state"])
             market_amount_history.append(float(latest_market_risk["amount"]))
             market_signal_history.append(float(latest_market_risk["signal"]))
+            if state_confidence is None:
+                sentiment_score = float((latest_market_risk.get("sentiment") or {}).get("score") or 50.0)
+                state_confidence = min(0.85, 0.45 + abs(sentiment_score - 50.0) / 100.0)
+            market_state_series.append({
+                "date": date,
+                "state": str(latest_market_risk.get("market_state") or "S1"),
+                "confidence": round(state_confidence, 6),
+                "uncertain": state_confidence < 0.55,
+                "change_probability": float(
+                    (latest_market_risk.get("change_alarm") or {}).get("p_change_1d") or 0.0
+                ),
+                "model": effective_market_state_model,
+                "requested_model": production_market_state_model,
+                "effective_model": effective_market_state_model,
+                "fallback_reason": market_state_fallback_reason,
+                "transparent_state": transparent_state,
+                "hsmm_evidence": hsmm_evidence or {},
+            })
         if pending:
             cash = _execute_target(date=date, target_weights=pending["target_weights"], positions=positions, cash=cash, rows=rows, trades=trades, blocked=blocked)
             pending = None
@@ -554,8 +688,13 @@ def run_strategy_replay(
             history = ds.get_hist_window(symbol, date, lookback)
             histories[symbol] = history
             factor_values[symbol] = {
-                factor: _factor_value(
+                factor: compute_bound_factor(
                     factor,
+                    (
+                        (replay_factor_bindings or {}).get(factor)
+                        if isinstance((replay_factor_bindings or {}).get(factor), dict)
+                        else None
+                    ),
                     row,
                     history,
                     daily_basic,
@@ -590,12 +729,28 @@ def run_strategy_replay(
             strategy.get("type", "formula"),
             market_state_for_score,
         )
+        expert_route = get_strategy_expert_route(
+            raw_content,
+            market_state_for_score,
+        )
         ranked = _score_rows(
             filtered,
             score_weights,
             factor_values,
             normalization=config.score_normalization,
         )
+        ranked, model_signal_map, model_blocked, model_fusion = apply_model_signals(
+            ranked=ranked,
+            factor_values=factor_values,
+            histories=histories,
+            themes=themes_as_of(cutoff),
+            model_bindings=replay_model_bindings,
+            use_live_health=False if explicit_model_bindings else None,
+            as_of_time=cutoff,
+            market_state=market_state_for_score,
+        )
+        model_fusion_history.append({"trade_date": date, **model_fusion})
+        blocked.extend({"date": date, **item} for item in model_blocked)
         candidates = _select_rank_buffer_candidates(
             ranked,
             held_symbols=set(positions),
@@ -626,6 +781,18 @@ def run_strategy_replay(
                 "weights": target_weights,
             }
             status = "equal_weight" if target_weights else "keep_current"
+        elif allocation_method == "hrp":
+            target_weights = hrp_fallback_weights(
+                returns_by_symbol,
+                max_single=max(0.01, min(1.0, float(controls.get("max_single_weight") or 1.0))),
+            )
+            optimized = {
+                "ok": bool(target_weights),
+                "status": "hrp" if target_weights else "keep_current",
+                "optimizer": "hrp_inverse_volatility_v1",
+                "weights": target_weights,
+            }
+            status = "hrp" if target_weights else "keep_current"
         else:
             optimized = two_group_cvar_optimizer(returns_by_symbol, expected_returns=expected_returns, current_weights=current_weights, trading_costs={symbol: 0.0015 for symbol in returns_by_symbol})
             if not optimized.get("ok"):
@@ -748,7 +915,15 @@ def run_strategy_replay(
                         }
                 target_weights.update(defensive_weights)
             status = f"{status}_dynamic_exposure_{market_state}"
-        selection_map = {row.symbol: {"symbol": row.symbol, "name": row.name, "score": float(score)} for row, score in candidates}
+        selection_map = {
+            row.symbol: {
+                "symbol": row.symbol,
+                "name": row.name,
+                "score": float(score),
+                "model_signals": model_signal_map.get(row.symbol) or {},
+            }
+            for row, score in candidates
+        }
         strategy_decision = build_strategy_rebalance_actions(
             target_symbols=list(target_weights),
             held_positions=_position_payload(positions),
@@ -771,6 +946,7 @@ def run_strategy_replay(
             "selection_short_benchmark_return": selection_short_return,
             "selection_long_benchmark_return": benchmark_return,
             "selection_score_weights": score_weights,
+            "selection_expert_route": expert_route,
             "market_profile": market_profile,
             "change_alarm": change_alarm,
             "exposure_trace": exposure_trace,
@@ -787,6 +963,12 @@ def run_strategy_replay(
         pending = decision
 
     metrics = build_metrics(equity_series, benchmark_series, trades)
+    metrics["market_state_matrix"] = build_market_state_metrics(
+        equity_series,
+        benchmark_series,
+        market_state_series,
+        trades=trades,
+    )
     total_fees = round(sum(float(item.get("fees") or 0.0) for item in trades), 2)
     return {
         "schema_version": "strategy_replay_v1",
@@ -799,6 +981,7 @@ def run_strategy_replay(
         "strategy_controller_version": controller_version_name,
         "model_version_id": model_version_id,
         "model_version": (model_version or {}).get("version"),
+        "research_package_hash": research_package_hash,
         "start_date": dates[0],
         "end_date": dates[-1],
         "initial_cash": round(initial_cash, 2),
@@ -809,11 +992,27 @@ def run_strategy_replay(
             "production_strategy": champion["champion_version"],
             "selection_strategy_id": strategy_id,
             "factor_registry": "alis_factor_registry_v1",
-            "factor_bindings": (
-                ((model_version or {}).get("config") or {}).get("factor_bindings")
-                or champion.get("factor_bindings")
-                or {}
-            ),
+            "factor_bindings": replay_factor_bindings or {},
+            "factor_binding_mode": "frozen" if explicit_factor_bindings else "champion_or_runtime",
+            "model_bindings": replay_model_bindings or {},
+            "model_binding_mode": "frozen" if explicit_model_bindings else "active_runtime",
+            "market_state_binding": replay_market_state_binding,
+            "market_state_model": production_market_state_model,
+            "market_state_runtime": {
+                "requested_model": production_market_state_model,
+                "effective_days": {
+                    model: sum(
+                        str(item.get("effective_model") or item.get("model") or "") == model
+                        for item in market_state_series
+                    )
+                    for model in ("transparent_four_state_v1", "market_regime_hsmm_v1")
+                },
+                "fallback_days": sum(bool(item.get("fallback_reason")) for item in market_state_series),
+            },
+            "theme_contract": {
+                "mode": "explicit" if themes is not None else "point_in_time_snapshot" if consume_point_in_time_themes else "disabled",
+                "history": theme_history,
+            },
             "universe": config.universe,
             "score_normalization": config.score_normalization,
             "expected_return": {
@@ -824,7 +1023,13 @@ def run_strategy_replay(
             "dynamic_market_exposure": exposure_policy,
             "strategy": "StrategyController",
             "allocation_method": allocation_method,
-            "optimizer": "equal_weight_baseline_v1" if allocation_method == "equal_weight" else "two_group_cvar_optimizer_v2",
+            "optimizer": (
+                "equal_weight_baseline_v1"
+                if allocation_method == "equal_weight"
+                else "hrp_inverse_volatility_v1"
+                if allocation_method == "hrp"
+                else "two_group_cvar_optimizer_v2"
+            ),
             "execution": "A-share open constraints + shared fee/slippage rules",
             "ledger": "isolated_in_memory_replay_v1",
             "signal_execution": "T close signal / T+1 open execution",
@@ -835,6 +1040,8 @@ def run_strategy_replay(
         "equity_series": equity_series,
         "benchmark_series": benchmark_series,
         "decisions": decisions,
+        "market_state_series": market_state_series,
+        "model_fusion_history": model_fusion_history,
         "trades": trades,
         "blocked_events": blocked,
         "data_quality": {
@@ -846,9 +1053,9 @@ def run_strategy_replay(
                 "decision_count": len(pit_audits),
                 "audits": pit_audits,
                 "source_scope": {
-                    "consumed": ["daily", "daily_basic", "adj_factor", "stock_daily_snapshot"] + (["fund_daily"] if exposure_policy else []),
+                    "consumed": ["daily", "daily_basic", "adj_factor", "stock_daily_snapshot"] + (["theme"] if themes is not None or consume_point_in_time_themes else []) + (["fund_daily"] if exposure_policy else []),
                     "upstream_as_of_contract": ["financial", "announcement", "event", "news", "theme", "expectation", "valuation", "industry"],
-                    "not_consumed_by_replay_v1": ["financial", "announcement", "event", "news", "theme", "expectation", "valuation", "industry"],
+                    "not_consumed_by_replay_v1": ["financial", "announcement", "event", "news", "expectation", "valuation", "industry"],
                 },
             },
             "limitations": ["生产重放固定 Champion；历史版本自动切换仅保留为可选审计模式"],

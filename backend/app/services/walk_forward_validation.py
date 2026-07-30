@@ -301,6 +301,10 @@ def run_purged_walk_forward_validation(
     config: WalkForwardConfig | None = None, max_windows: int | None = None,
     strategy_id: int | None = None,
     strategy_controller_version_id: int | None = None,
+    factor_bindings: dict[str, Any] | None = None,
+    model_bindings: dict[str, Any] | None = None,
+    market_state_binding: dict[str, Any] | None = None,
+    research_package_hash: str | None = None,
     execute: bool = True, data_source: BacktestDataSource | None = None,
     replay_runner: Callable[..., dict[str, Any]] = run_strategy_replay,
     state_loader: Callable[[list[str]], dict[str, str]] = _market_states,
@@ -320,6 +324,19 @@ def run_purged_walk_forward_validation(
         "evaluated_strategy_id": int(strategy_id or champion.get("strategy_id") or 0),
         "evaluation_role": "challenger" if strategy_id and int(strategy_id) != int(champion.get("strategy_id") or 0) else "champion",
         "strategy_controller_version": str(strategy_controller_version_id or champion["strategy_controller_version"]),
+        "factor_bindings": (
+            factor_bindings if factor_bindings is not None
+            else champion.get("factor_bindings") or {}
+        ),
+        "model_bindings": (
+            model_bindings if model_bindings is not None
+            else champion.get("model_bindings") or {}
+        ),
+        "market_state_binding": (
+            market_state_binding if market_state_binding is not None
+            else champion.get("market_state_binding") or {}
+        ),
+        "research_package_hash": research_package_hash,
         "protocol": {
             **cfg.__dict__,
             "split_policy": "rolling_origin_with_fixed_train_span",
@@ -359,6 +376,10 @@ def run_purged_walk_forward_validation(
         replay = replay_runner(
             strategy_id=strategy_id,
             strategy_controller_version_id=strategy_controller_version_id,
+            factor_bindings=factor_bindings,
+            model_bindings=model_bindings,
+            market_state_binding=market_state_binding,
+            research_package_hash=research_package_hash,
             start_date=test["start"], end_date=test["end"], data_source=BacktestDataSource(),
             progress_callback=replay_progress,
         )

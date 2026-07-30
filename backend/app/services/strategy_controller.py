@@ -9,6 +9,7 @@ from app.db.store import _conn as business_conn, create_model_version, get_activ
 from app.services.review_learning import materialize_decision_outcomes
 
 STRATEGY_CONTROLLER_VERSION = "strategy_controller_v1"
+PRETRADE_CONTROLLER_SCHEMA_VERSION = "alis_strategy_controller_pretrade_v1"
 STRATEGY_MODEL_KEY = "strategy_controller"
 MINIMUM_CANDIDATE_SHADOW_SESSIONS = 20
 
@@ -119,18 +120,12 @@ def _return_source(action: str, row: dict[str, Any], context: dict[str, Any]) ->
 def _trigger_models(action: str, row: dict[str, Any]) -> list[str]:
     if action == "defensive_switch":
         return ["portfolio_risk_engine_v1", "market_state_policy_v1", "defensive_asset_policy_v1"]
-    if action in {"sell_exit", "reduce_position"}:
-        return ["portfolio_risk_engine_v1", "narrative_transition_multitask_v1", "capital_persistence_multitask_v1"]
     signals = row.get("model_signals") if isinstance(row.get("model_signals"), dict) else {}
     models = [
         str(item) for item in (signals.get("trigger_models") or [])
         if str(item)
     ]
-    if not models:
-        models = ["medium_horizon_lambdarank_v1"]
     models.append("portfolio_risk_engine_v1")
-    if _safe_float(row.get("score")) is not None:
-        models.append("capital_persistence_multitask_v1")
     return list(dict.fromkeys(models))
 
 
@@ -302,6 +297,154 @@ def build_strategy_action_contracts(
         "blocked": blocked,
         "trace": trace,
         "summary": f"策略控制器生成 {len(contracts)} 个动作合同；弱约束与交易拦截 {len(blocked)} 条。",
+    }
+
+
+def build_pretrade_strategy_controller(
+    *,
+    candidate_symbols: list[str],
+    holding_symbols: list[str],
+    selections: dict[str, dict[str, Any]] | None = None,
+    research_evidence: dict[str, dict[str, Any]] | None = None,
+    expected_returns: dict[str, float] | None = None,
+    current_weights: dict[str, float] | None = None,
+    thesis_status_by_symbol: dict[str, str] | None = None,
+    position_pnl_by_symbol: dict[str, float] | None = None,
+    defensive_weights: dict[str, float] | None = None,
+    max_single_position: float = 0.15,
+    execution_guard: dict[str, Any] | None = None,
+    context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Freeze Controller permissions before portfolio method competition."""
+
+    ctx = {**active_strategy_policy_context(), **dict(context or {})}
+    policy = ctx.get("strategy_policy") if isinstance(ctx.get("strategy_policy"), dict) else active_strategy_policy()
+    selection_map = dict(selections or {})
+    evidence_map = dict(research_evidence or {})
+    expected_map = {str(key): float(value or 0.0) for key, value in (expected_returns or {}).items()}
+    current = {str(key): max(0.0, float(value or 0.0)) for key, value in (current_weights or {}).items()}
+    thesis = {str(key): str(value or "") for key, value in (thesis_status_by_symbol or {}).items()}
+    position_pnl = {str(key): float(value or 0.0) for key, value in (position_pnl_by_symbol or {}).items()}
+    defensive = {str(key): max(0.0, float(value or 0.0)) for key, value in (defensive_weights or {}).items()}
+    candidates = list(dict.fromkeys(str(value or "").strip() for value in candidate_symbols if str(value or "").strip()))
+    holdings = list(dict.fromkeys(str(value or "").strip() for value in holding_symbols if str(value or "").strip()))
+    candidate_set = set(candidates)
+    holding_set = set(holdings)
+    guard = dict(execution_guard or {})
+    quarantined = str(guard.get("mode") or "") == "research_only_sell_reduce"
+    single_cap = max(0.0, min(1.0, float(max_single_position or 0.0)))
+    minimum_change = max(0.0, _safe_float((policy.get("rebalance_rules") or {}).get("min_weight_change")) or 0.01)
+    rows: list[dict[str, Any]] = []
+
+    for symbol in list(dict.fromkeys(holdings + candidates + list(defensive))):
+        selection = selection_map.get(symbol) or {}
+        research = evidence_map.get(symbol) or {}
+        model_signals = selection.get("model_signals") if isinstance(selection.get("model_signals"), dict) else {}
+        current_weight = current.get(symbol, 0.0)
+        expected = expected_map.get(symbol, 0.0)
+        is_holding = symbol in holding_set and current_weight > 1e-9
+        is_candidate = symbol in candidate_set
+        is_defensive = symbol in defensive
+        thesis_invalid = thesis.get(symbol) in {"invalidated", "failed"}
+        research_error = str(research.get("evaluation_status") or "") == "error"
+        research_eligible = bool(research.get("eligible_for_core", is_candidate or is_defensive))
+        add_eligible = bool(model_signals.get("add_position_eligible", True))
+        proposed_action = "hold"
+        action = "hold"
+        allowed = True
+        reason = "继续持有；未触发退出、减仓或加仓条件"
+        min_weight = current_weight
+        max_weight = current_weight
+
+        if is_defensive:
+            proposed_action = action = "defensive_switch"
+            desired = defensive.get(symbol, 0.0)
+            min_weight = 0.0
+            max_weight = desired
+            reason = "市场环境冻结的防御资产预算"
+        elif is_holding and research_error:
+            allowed = False
+            reason = "持仓研究刷新异常；缺少可证伪证据时冻结持有，禁止把系统错误解释为卖出信号"
+        elif is_holding and (thesis_invalid or not research_eligible or not is_candidate):
+            proposed_action = action = "sell_exit"
+            min_weight = max_weight = 0.0
+            reason = "持仓 Thesis 已失效，冻结退出" if thesis_invalid else "持仓未通过当日统一研究准入，冻结退出"
+        elif is_holding and position_pnl.get(symbol, 0.0) <= -0.06 and expected <= -0.05:
+            proposed_action = action = "sell_exit"
+            min_weight = max_weight = 0.0
+            reason = "浮亏超过6%且20日预期低于-5%，冻结完整退出"
+        elif is_holding and expected < 0:
+            proposed_action = action = "reduce_position"
+            min_weight = 0.0
+            max_weight = current_weight
+            reason = "20日预期收益为负，只允许降权"
+        elif is_holding and is_candidate and add_eligible and expected > minimum_change:
+            proposed_action = action = "add_position"
+            min_weight = current_weight
+            max_weight = max(current_weight, single_cap)
+            reason = "持仓继续通过准入且预期收益覆盖最小改善门，允许加仓"
+        elif not is_holding and is_candidate:
+            proposed_action = action = "buy_candidate"
+            min_weight = 0.0
+            max_weight = min(single_cap, 0.10)
+            reason = "统一 Top K、研究与动态准入均通过，允许初始建仓"
+
+        if quarantined and not is_defensive and action in {"buy_candidate", "add_position"}:
+            allowed = False
+            min_weight = current_weight if is_holding else 0.0
+            max_weight = current_weight if is_holding else 0.0
+            reason = "当前 Champion 正式 OOS 失败；冻结个股买入和加仓权限"
+
+        source_row = {
+            "symbol": symbol,
+            "name": str(selection.get("name") or ""),
+            "score": selection.get("score"),
+            "reason": reason,
+            "model_signals": model_signals,
+        }
+        contract = asdict(_contract(
+            row=source_row,
+            action=action,
+            side="BUY" if action in {"buy_candidate", "add_position", "defensive_switch"} else "SELL" if action in {"reduce_position", "sell_exit"} else "HOLD",
+            priority=len(rows) + 1,
+            context={**ctx, "target_weights": {symbol: max_weight}, "optimizer": "pending_controller_bounded_competition"},
+            source="pretrade_unified_decision",
+        ))
+        rows.append({
+            **contract,
+            "proposed_action": proposed_action,
+            "permission_allowed": allowed,
+            "current_weight": round(current_weight, 8),
+            "min_weight": round(min_weight, 8),
+            "max_weight": round(max_weight, 8),
+            "expected_20d_return_before_trade_cost": round(expected, 8),
+            "research_eligible": research_eligible,
+            "is_defensive_asset": is_defensive,
+        })
+
+    bounds = {
+        item["symbol"]: {
+            "min_weight": item["min_weight"],
+            "max_weight": item["max_weight"],
+            "action": item["action"],
+            "permission_allowed": item["permission_allowed"],
+        }
+        for item in rows
+    }
+    return {
+        "schema_version": PRETRADE_CONTROLLER_SCHEMA_VERSION,
+        "generated_at": str(ctx.get("data_as_of_time") or datetime.now().isoformat()),
+        "strategy_policy_version": ctx.get("strategy_policy_version") or "production_or_default",
+        "strategy_policy_version_id": ctx.get("strategy_policy_version_id"),
+        "execution_mode": str(guard.get("mode") or "normal"),
+        "champion_execution_guard": guard,
+        "actions": rows,
+        "weight_bounds": bounds,
+        "policy": {
+            "controller_precedes_optimizer": True,
+            "optimizer_may_not_change_action_direction": True,
+            "quarantine_equity_buy_add_forbidden": quarantined,
+        },
     }
 
 

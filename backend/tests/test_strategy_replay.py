@@ -94,6 +94,248 @@ def test_strategy_replay_uses_t_plus_one_and_isolated_ledger(monkeypatch):
     assert events[-1]["progress"] == 1.0
 
 
+def test_replay_consumes_full_frozen_package_and_routes_model_evidence(monkeypatch):
+    monkeypatch.setattr(strategy_replay, "resolve_production_strategy_champion", lambda: {
+        "champion_id": 99, "champion_version": "alis-champion-test", "strategy_id": 1,
+        "strategy_controller_version_id": 31, "strategy_controller_version": "controller-test",
+        "strategy_policy": {}, "factor_bindings": {}, "model_bindings": {},
+    })
+    monkeypatch.setattr(strategy_replay, "get_strategy", lambda strategy_id: {
+        "id": strategy_id,
+        "name": "完整冻结包测试",
+        "type": "formula",
+        "content": {
+            "score": {"normalization": "rank_percentile", "factors": {"momentum_20": 1.0}},
+            "rebalance": {"freq": "daily", "top_n": 2},
+            "lookback_days": 30,
+        },
+    })
+    seen: list[dict] = []
+
+    def fake_apply_model_signals(**kwargs):
+        seen.append(kwargs)
+        evidence = {
+            row.symbol: {
+                "trigger_models": ["capital_persistence_multitask_v1"],
+                "capital_confirmation": "strong",
+                "add_position_eligible": True,
+            }
+            for row, _score in kwargs["ranked"]
+        }
+        return kwargs["ranked"], evidence, [], {
+            "binding_mode": "frozen_research_bundle",
+        }
+
+    monkeypatch.setattr(strategy_replay, "apply_model_signals", fake_apply_model_signals)
+    factor_bindings = {
+        key: {
+            "factor_key": key,
+            "definition_id": index,
+            "version": "v1",
+            "formula": {},
+            "leakage_status": "passed",
+        }
+        for index, key in enumerate(
+            ("momentum_20", "momentum_60", "volatility_20"), start=1
+        )
+    }
+    model_bindings = {
+        "capital_persistence_multitask_v1": {"id": 21, "model_key": "capital_persistence_multitask_v1"},
+    }
+    market_state_binding = {
+        "production_model": "transparent_four_state_v1",
+        "change_model": "bocpd_gaussian_v1",
+    }
+
+    result = strategy_replay.run_strategy_replay(
+        strategy_id=1,
+        start_date="2026-07-01",
+        end_date="2026-07-03",
+        data_source=FakeReplayDataSource(),
+        factor_bindings=factor_bindings,
+        model_bindings=model_bindings,
+        market_state_binding=market_state_binding,
+        research_package_hash="package-hash-1",
+        themes=[],
+    )
+
+    assert seen and all(item["model_bindings"] == model_bindings for item in seen)
+    assert all(item["use_live_health"] is False for item in seen)
+    assert result["component_contract"]["factor_bindings"] == factor_bindings
+    assert result["component_contract"]["model_bindings"] == model_bindings
+    assert result["component_contract"]["market_state_binding"] == market_state_binding
+    assert result["research_package_hash"] == "package-hash-1"
+    assert result["metrics"]["market_state_matrix"]["schema_version"] == "alis_replay_market_state_matrix_v1"
+    assert "turnover_rate" in result["metrics"]["market_state_matrix"]["states"]["S0"]
+    assert "pre_3_sessions" in result["metrics"]["market_state_matrix"]["transitions"]
+    assert any(
+        "capital_persistence_multitask_v1" in action.get("trigger_models", [])
+        for decision in result["decisions"]
+        for action in decision["strategy_action_contracts"]
+    )
+
+
+def test_action_attribution_does_not_invent_unavailable_models():
+    from app.services.strategy_controller import _trigger_models
+
+    unavailable = {
+        "score": 88.0,
+        "model_signals": {"trigger_models": []},
+    }
+
+    assert _trigger_models("buy_candidate", unavailable) == [
+        "portfolio_risk_engine_v1"
+    ]
+    assert _trigger_models("sell_exit", unavailable) == [
+        "portfolio_risk_engine_v1"
+    ]
+
+    available = {
+        "model_signals": {
+            "trigger_models": ["medium_horizon_lambdarank_v1"]
+        },
+    }
+    assert _trigger_models("hold", available) == [
+        "medium_horizon_lambdarank_v1",
+        "portfolio_risk_engine_v1",
+    ]
+
+
+def test_replay_uses_point_in_time_hsmm_market_state(monkeypatch):
+    monkeypatch.setattr(strategy_replay, "resolve_production_strategy_champion", lambda: {
+        "champion_id": 99, "champion_version": "alis-champion-test", "strategy_id": 1,
+        "strategy_controller_version_id": 31, "strategy_controller_version": "controller-test",
+        "strategy_policy": {},
+    })
+    monkeypatch.setattr(strategy_replay, "get_strategy", lambda strategy_id: {
+        "id": strategy_id,
+        "name": "HSMM 状态测试",
+        "type": "formula",
+        "content": {
+            "score": {"factors": {"momentum_20": 1.0}},
+            "rebalance": {"freq": "daily", "top_n": 2},
+            "lookback_days": 30,
+        },
+    })
+    cutoffs = []
+    monkeypatch.setattr(strategy_replay, "infer_hsmm_state_as_of", lambda binding, *, as_of_time: (
+        cutoffs.append((binding["id"], as_of_time))
+        or {"ok": True, "status": "ready", "state": "S2", "confidence": 0.78, "version_id": binding["id"]}
+    ))
+    monkeypatch.setattr(strategy_replay, "apply_model_signals", lambda **kwargs: (
+        kwargs["ranked"], {}, [], {"binding_mode": "test"},
+    ))
+
+    result = strategy_replay.run_strategy_replay(
+        strategy_id=1,
+        start_date="2026-07-01",
+        end_date="2026-07-03",
+        data_source=FakeReplayDataSource(),
+        market_state_binding={
+            "production_model": "market_regime_hsmm_v1",
+            "change_model": "bocpd_gaussian_v1",
+            "hsmm_shadow": {"id": 41, "version": "hsmm-v2"},
+        },
+        themes=[],
+    )
+
+    assert len(cutoffs) == 3
+    assert all(item["state"] == "S2" for item in result["market_state_series"])
+    assert all(item["effective_model"] == "market_regime_hsmm_v1" for item in result["market_state_series"])
+    assert all(not item["fallback_reason"] for item in result["market_state_series"])
+    assert result["component_contract"]["market_state_runtime"] == {
+        "requested_model": "market_regime_hsmm_v1",
+        "effective_days": {
+            "transparent_four_state_v1": 0,
+            "market_regime_hsmm_v1": 3,
+        },
+        "fallback_days": 0,
+    }
+
+
+def test_replay_records_transparent_fallback_when_hsmm_is_not_point_in_time_available(monkeypatch):
+    monkeypatch.setattr(strategy_replay, "resolve_production_strategy_champion", lambda: {
+        "champion_id": 99, "champion_version": "alis-champion-test", "strategy_id": 1,
+        "strategy_controller_version_id": 31, "strategy_controller_version": "controller-test",
+        "strategy_policy": {},
+    })
+    monkeypatch.setattr(strategy_replay, "get_strategy", lambda strategy_id: {
+        "id": strategy_id,
+        "name": "HSMM 回退测试",
+        "type": "formula",
+        "content": {
+            "score": {"factors": {"momentum_20": 1.0}},
+            "rebalance": {"freq": "daily", "top_n": 2},
+            "lookback_days": 30,
+        },
+    })
+    monkeypatch.setattr(strategy_replay, "infer_hsmm_state_as_of", lambda _binding, *, as_of_time: {
+        "ok": False,
+        "status": "fallback",
+        "reason": "hsmm_version_created_after_cutoff",
+    })
+    monkeypatch.setattr(strategy_replay, "apply_model_signals", lambda **kwargs: (
+        kwargs["ranked"], {}, [], {"binding_mode": "test"},
+    ))
+
+    result = strategy_replay.run_strategy_replay(
+        strategy_id=1,
+        start_date="2026-07-01",
+        end_date="2026-07-03",
+        data_source=FakeReplayDataSource(),
+        market_state_binding={
+            "production_model": "market_regime_hsmm_v1",
+            "change_model": "bocpd_gaussian_v1",
+            "hsmm_shadow": {"id": 41, "version": "hsmm-v2"},
+        },
+        themes=[],
+    )
+
+    assert all(item["effective_model"] == "transparent_four_state_v1" for item in result["market_state_series"])
+    assert all(
+        item["fallback_reason"] == "hsmm_version_created_after_cutoff"
+        for item in result["market_state_series"]
+    )
+    assert result["component_contract"]["market_state_runtime"]["fallback_days"] == 3
+
+
+def test_replay_uses_existing_hrp_portfolio_method(monkeypatch):
+    monkeypatch.setattr(strategy_replay, "resolve_production_strategy_champion", lambda: {
+        "champion_id": 99, "champion_version": "alis-champion-test", "strategy_id": 1,
+        "strategy_controller_version_id": 31, "strategy_controller_version": "controller-test",
+        "strategy_policy": {},
+    })
+    monkeypatch.setattr(strategy_replay, "get_strategy", lambda strategy_id: {
+        "id": strategy_id,
+        "name": "HRP 组合测试",
+        "type": "formula",
+        "content": {
+            "score": {"factors": {"momentum_20": 1.0}},
+            "rebalance": {"freq": "daily", "top_n": 2},
+            "lookback_days": 30,
+            "portfolio_method": "hrp",
+        },
+    })
+    monkeypatch.setattr(strategy_replay, "apply_model_signals", lambda **kwargs: (
+        kwargs["ranked"], {}, [], {"binding_mode": "test"},
+    ))
+    monkeypatch.setattr(strategy_replay, "hrp_fallback_weights", lambda values, max_single: {
+        symbol: 1.0 / len(values) for symbol in values
+    })
+
+    result = strategy_replay.run_strategy_replay(
+        strategy_id=1,
+        start_date="2026-07-01",
+        end_date="2026-07-03",
+        data_source=FakeReplayDataSource(),
+        themes=[],
+    )
+
+    assert result["component_contract"]["allocation_method"] == "hrp"
+    assert result["component_contract"]["optimizer"] == "hrp_inverse_volatility_v1"
+    assert any("hrp" in str(item.get("status") or "") for item in result["decisions"])
+
+
 def test_strategy_replay_rejects_single_day_range(monkeypatch):
     source = FakeReplayDataSource()
     source._dates = ["2026-07-01"]

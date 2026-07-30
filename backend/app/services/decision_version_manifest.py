@@ -20,7 +20,7 @@ def build_decision_version_manifest(
     """Freeze every production component that can change a simulated decision."""
     champion = resolve_production_strategy_champion()
     strategy_policy = active_strategy_policy_context()
-    model_versions = {
+    active_model_versions = {
         key: {
             "id": int(active["id"]),
             "version": str(active.get("version") or ""),
@@ -31,6 +31,42 @@ def build_decision_version_manifest(
         if active
     }
     optimizer = (portfolio or {}).get("optimizer") if isinstance((portfolio or {}).get("optimizer"), dict) else {}
+    selection = (
+        (portfolio or {}).get("selection_snapshot")
+        if isinstance((portfolio or {}).get("selection_snapshot"), dict) else {}
+    )
+    controller = (
+        (portfolio or {}).get("pretrade_controller")
+        if isinstance((portfolio or {}).get("pretrade_controller"), dict) else {}
+    )
+    factor_snapshot = (
+        selection.get("factor_expert_snapshot")
+        if isinstance(selection.get("factor_expert_snapshot"), dict) else {}
+    )
+    frozen_factor_bindings = (
+        factor_snapshot.get("factor_bindings")
+        if isinstance(factor_snapshot.get("factor_bindings"), dict) else {}
+    )
+    model_snapshot = (
+        selection.get("model_signal_snapshot")
+        if isinstance(selection.get("model_signal_snapshot"), dict) else {}
+    )
+    fusion = (
+        model_snapshot.get("fusion")
+        if isinstance(model_snapshot.get("fusion"), dict) else {}
+    )
+    frozen_model_versions = {
+        str(item.get("model_key") or ""): {
+            "id": int(item["version_id"]),
+            "version": str(item.get("version") or ""),
+            "status": str(item.get("health_status") or ""),
+        }
+        for item in (fusion.get("production_models") or [])
+        if isinstance(item, dict)
+        and str(item.get("model_key") or "")
+        and item.get("version_id") is not None
+    }
+    model_versions = frozen_model_versions or active_model_versions
     manifest = {
         "schema_version": "alis_decision_version_manifest_v1",
         "trade_date": str(trade_date).replace("-", "")[:8],
@@ -40,15 +76,29 @@ def build_decision_version_manifest(
         },
         "factor_contract": {
             "schema_version": FACTOR_SCHEMA_VERSION,
-            "bindings": active_factor_bindings(),
+            "bindings": frozen_factor_bindings or active_factor_bindings(),
         },
         "model_versions": model_versions,
+        "selection": {
+            "schema_version": selection.get("schema_version"),
+            "selection_hash": selection.get("selection_hash"),
+            "environment_snapshot": selection.get("environment_snapshot") or {},
+            "factor_expert_snapshot": selection.get("factor_expert_snapshot") or {},
+        },
         "strategy": {
             "model_version_id": int(champion.get("champion_id") or 0),
             "version": str(champion.get("champion_version") or ""),
             "strategy_id": int(champion.get("strategy_id") or 0),
-            "strategy_controller_version_id": strategy_policy.get("strategy_policy_version_id"),
-            "strategy_controller_version": strategy_policy.get("strategy_policy_version"),
+            "strategy_controller_version_id": (
+                controller.get("strategy_policy_version_id")
+                if controller.get("strategy_policy_version_id") is not None
+                else strategy_policy.get("strategy_policy_version_id")
+            ),
+            "strategy_controller_version": (
+                controller.get("strategy_policy_version")
+                or strategy_policy.get("strategy_policy_version")
+            ),
+            "pretrade_controller_schema": controller.get("schema_version"),
         },
         "portfolio": {
             "selected_method": optimizer.get("selected_method") or optimizer.get("optimizer"),

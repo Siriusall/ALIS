@@ -133,8 +133,7 @@ def build_strategy_workbench(limit: int = 10, *, include_details: bool = False) 
             "experiments": experiments,
             "failed_experiments": failed_or_watch,
             "links": {
-                "status": "/api/model-strategy/status",
-                "train": "/api/model-strategy/train",
+                "status": "/api/model-strategy/plan-models",
                 "auto_tune": "/api/model-strategy/auto-tune",
                 "oos_report": "/api/model-strategy/oos/report",
                 "drift": "/api/model-strategy/drift",

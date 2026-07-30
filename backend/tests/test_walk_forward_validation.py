@@ -197,6 +197,71 @@ def test_walk_forward_forwards_controller_candidate_without_rebinding_champion(m
     assert result["production_strategy_version"] == "champion-v1"
 
 
+def test_walk_forward_forwards_complete_frozen_research_package(monkeypatch):
+    dates = _dates(90)
+    monkeypatch.setattr(wf, "resolve_production_strategy_champion", lambda: {
+        "champion_id": 42, "champion_version": "champion-v1",
+        "strategy_controller_version": "controller-v1", "strategy_id": 1,
+        "factor_bindings": {}, "model_bindings": {}, "market_state_binding": {},
+    })
+    seen: list[dict] = []
+
+    def replay_runner(**kwargs):
+        seen.append(kwargs)
+        test_dates = [value for value in dates if kwargs["start_date"] <= value <= kwargs["end_date"]]
+        return {
+            "production_strategy_version": "champion-v1",
+            "metrics": {
+                "total_return": .01, "benchmark_return": 0,
+                "excess_return": .01, "max_drawdown": -.01,
+            },
+            "summary": {
+                "total_fees": 1, "trading_days": len(test_dates), "decision_count": 1,
+            },
+            "equity_series": [
+                {"date": value, "total_value": 100_000 + index}
+                for index, value in enumerate(test_dates)
+            ],
+            "data_quality": {"point_in_time": {"passed": True}},
+        }
+
+    factor_bindings = {"momentum_20": {"definition_id": 1, "version": "v1"}}
+    model_bindings = {
+        "medium_horizon_lambdarank_v1": {
+            "id": 21, "model_key": "medium_horizon_lambdarank_v1",
+        },
+    }
+    market_state_binding = {
+        "production_model": "transparent_four_state_v1",
+        "change_model": "bocpd_gaussian_v1",
+    }
+    result = wf.run_purged_walk_forward_validation(
+        config=wf.WalkForwardConfig(
+            train_sessions=20, validation_sessions=5, test_sessions=8,
+            purge_sessions=2, embargo_sessions=1, step_sessions=8, minimum_windows=2,
+        ),
+        max_windows=2,
+        data_source=FakeDates(dates),
+        replay_runner=replay_runner,
+        state_loader=lambda values: {},
+        strategy_id=2,
+        strategy_controller_version_id=55,
+        factor_bindings=factor_bindings,
+        model_bindings=model_bindings,
+        market_state_binding=market_state_binding,
+        research_package_hash="package-hash-1",
+    )
+
+    assert len(seen) == 2
+    assert all(item["factor_bindings"] == factor_bindings for item in seen)
+    assert all(item["model_bindings"] == model_bindings for item in seen)
+    assert all(item["market_state_binding"] == market_state_binding for item in seen)
+    assert all(item["research_package_hash"] == "package-hash-1" for item in seen)
+    assert result["factor_bindings"] == factor_bindings
+    assert result["model_bindings"] == model_bindings
+    assert result["market_state_binding"] == market_state_binding
+
+
 def test_walk_forward_emits_window_progress_and_resumes_checkpoint(monkeypatch):
     dates = _dates(90)
     monkeypatch.setattr(wf, "resolve_production_strategy_champion", lambda: {

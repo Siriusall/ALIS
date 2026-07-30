@@ -4,6 +4,59 @@ from datetime import timedelta
 from app.services import evolution_orchestrator as evolution
 
 
+def test_plan_model_autonomy_holds_worker_until_training_is_terminal(monkeypatch):
+    from app.db import store
+    from app.services import plan_model_auto_optimizer
+
+    statuses = iter([
+        {
+            "id": 65,
+            "status": "running",
+            "phase": "training",
+            "progress": 0.55,
+            "message": "training",
+            "metrics": {"model_key": "medium_horizon_lambdarank_v1"},
+        },
+        {
+            "id": 65,
+            "status": "completed",
+            "phase": "completed",
+            "progress": 1.0,
+            "message": "completed",
+            "model_version_id": 95,
+            "metrics": {"model_key": "medium_horizon_lambdarank_v1"},
+        },
+    ])
+    heartbeats = []
+    monkeypatch.setattr(
+        plan_model_auto_optimizer,
+        "run_auto_optimization_once",
+        lambda force=False: {
+            "ok": True,
+            "started": [{"run_id": 65, "started": True}],
+        },
+    )
+    monkeypatch.setattr(store, "get_model_train_run", lambda _run_id: next(statuses))
+    monkeypatch.setattr(evolution, "_heartbeat", lambda task_id, **values: heartbeats.append((task_id, values)))
+    monkeypatch.setattr(evolution.time, "sleep", lambda _seconds: None)
+
+    result = evolution.execute_evolution_task({
+        "id": 947,
+        "task_type": "plan_model_autonomy",
+        "payload": {},
+        "checkpoint": {},
+    })
+
+    assert result["resource_lock_contract"] == "single_worker_held_until_model_train_terminal_v1"
+    assert result["completed_training_runs"] == [{
+        "run_id": 65,
+        "status": "completed",
+        "model_version_id": 95,
+        "error": None,
+    }]
+    assert any("单模型资源锁定中" in values["message"] for _, values in heartbeats)
+
+
 def test_formal_trial_count_is_scoped_to_same_lineage_cohort():
     candidate = {
         "config": {
@@ -539,3 +592,304 @@ def test_restart_recovery_does_not_steal_a_live_workers_unexpired_lease(monkeypa
 
     assert evolution.recover_evolution_tasks() == 0
     assert len(queries) == 2
+
+
+def test_research_event_uses_stable_evidence_dedupe_key(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(evolution, "V10_RESEARCH_ENABLED", True)
+    monkeypatch.setattr(
+        evolution,
+        "create_evolution_task",
+        lambda **kwargs: captured.update(kwargs) or {"id": 71, "status": "queued"},
+    )
+
+    result = evolution.enqueue_factor_strategy_research_event(
+        trigger="plan_model_training_completed",
+        evidence_type="model_version",
+        evidence_id=21,
+        evidence={"model_key": "medium_horizon_lambdarank_v1"},
+        priority=75,
+    )
+
+    assert result == {"id": 71, "status": "queued"}
+    assert captured["task_type"] == "strategy_candidate_generation"
+    assert captured["payload"]["evidence_id"] == "21"
+    assert captured["payload"]["batch_size"] == 4
+    assert captured["dedupe_key"].startswith(
+        "factor_strategy_research_event:v2:strategy_candidate_generation:"
+    )
+    assert captured["priority"] == 75
+
+
+def test_factor_research_continuation_reuses_same_snapshot_progress(monkeypatch):
+    monkeypatch.setattr(evolution, "V10_RESEARCH_ENABLED", False)
+    tasks_by_key = {}
+    created_keys = []
+
+    def create_task(**kwargs):
+        key = kwargs["dedupe_key"]
+        if key not in tasks_by_key:
+            tasks_by_key[key] = {
+                "id": len(tasks_by_key) + 1,
+                "status": "queued",
+                "payload": kwargs["payload"],
+            }
+            created_keys.append(key)
+        return tasks_by_key[key]
+
+    monkeypatch.setattr(evolution, "create_evolution_task", create_task)
+    monkeypatch.setattr(evolution, "_update_task", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        evolution,
+        "get_evolution_task",
+        lambda task_id: next(
+            item for item in tasks_by_key.values() if item["id"] == task_id
+        ),
+    )
+    result = {
+        "continue_research": True,
+        "snapshot": {"snapshot_id": "snapshot-1"},
+        "experiment_count": 15,
+        "quick_screen_completed": 12,
+        "confirmation_completed": 3,
+        "current_stage": "confirmation",
+        "rollover_epoch": True,
+    }
+
+    first = evolution._schedule_factor_research_continuation(
+        completed_task_id=513,
+        result=result,
+    )
+    second = evolution._schedule_factor_research_continuation(
+        completed_task_id=514,
+        result=result,
+    )
+
+    assert first["id"] == second["id"]
+    assert len(created_keys) == 1
+    assert created_keys[0].startswith(
+        "factor_research_continuation:v2:snapshot-1:progress-"
+    )
+    assert first["payload"]["research_progress"] == {
+        "experiment_count": 15,
+        "quick_screen_completed": 12,
+        "confirmation_completed": 3,
+        "current_stage": "confirmation",
+        "rollover_epoch": True,
+    }
+
+
+def test_factor_research_continuation_allows_progress_to_advance(monkeypatch):
+    monkeypatch.setattr(evolution, "V10_RESEARCH_ENABLED", False)
+    captured = []
+
+    def create_task(**kwargs):
+        captured.append(kwargs)
+        return {"id": len(captured), "status": "completed"}
+
+    monkeypatch.setattr(evolution, "create_evolution_task", create_task)
+    monkeypatch.setattr(
+        evolution,
+        "get_evolution_task",
+        lambda task_id: {"id": task_id, "status": "completed"},
+    )
+    base = {
+        "continue_research": True,
+        "snapshot": {"snapshot_id": "snapshot-1"},
+        "experiment_count": 15,
+        "quick_screen_completed": 12,
+        "confirmation_completed": 3,
+        "current_stage": "confirmation",
+        "rollover_epoch": False,
+    }
+
+    evolution._schedule_factor_research_continuation(
+        completed_task_id=513,
+        result=base,
+    )
+    evolution._schedule_factor_research_continuation(
+        completed_task_id=515,
+        result={**base, "experiment_count": 16, "confirmation_completed": 4},
+    )
+
+    assert len(captured) == 2
+    assert captured[0]["dedupe_key"] != captured[1]["dedupe_key"]
+
+
+def test_factor_research_continuation_stops_without_continue_flag(monkeypatch):
+    monkeypatch.setattr(
+        evolution,
+        "create_evolution_task",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("must not enqueue")),
+    )
+
+    result = evolution._schedule_factor_research_continuation(
+        completed_task_id=513,
+        result={
+            "continue_research": False,
+            "snapshot": {"snapshot_id": "snapshot-1"},
+            "experiment_count": 15,
+        },
+    )
+
+    assert result is None
+
+
+def test_v10_environment_completion_uses_one_wave_followup_without_extra_drain(monkeypatch):
+    monkeypatch.setattr(evolution, "V10_RESEARCH_ENABLED", True)
+    captured = []
+    monkeypatch.setattr(
+        evolution,
+        "create_evolution_task",
+        lambda **kwargs: captured.append(kwargs) or {
+            "id": len(captured),
+            "status": "queued",
+        },
+    )
+
+    evolution._schedule_v10_research_continuation(
+        completed_task={
+            "id": 765,
+            "task_type": "strategy_environment_backtest",
+            "payload": {"predecessor_task_id": 764},
+        },
+        result={"candidate_id": "candidate-a", "status": "completed"},
+    )
+
+    assert [item["task_type"] for item in captured] == [
+        "strategy_cluster_distillation",
+        "strategy_failure_model_training",
+    ]
+    assert all("legacy-764" in item["dedupe_key"] for item in captured)
+    assert [item["priority"] for item in captured] == [90, 91]
+    assert captured[1]["coalesce_active_type"] is True
+
+
+def test_v10_candidate_generation_propagates_wave_binding_to_backtest(monkeypatch):
+    monkeypatch.setattr(evolution, "V10_RESEARCH_ENABLED", True)
+    captured = []
+    monkeypatch.setattr(
+        evolution,
+        "create_evolution_task",
+        lambda **kwargs: captured.append(kwargs) or {
+            "id": len(captured),
+            "status": "queued",
+        },
+    )
+
+    evolution._schedule_v10_research_continuation(
+        completed_task={"id": 800, "task_type": "strategy_candidate_generation"},
+        result={
+            "generated": [{
+                "candidate_id": "candidate-a",
+                "research_wave_id": "wave-a",
+            }],
+        },
+    )
+
+    assert captured[0]["task_type"] == "strategy_environment_backtest"
+    assert captured[0]["payload"]["candidate_id"] == "candidate-a"
+    assert captured[0]["payload"]["research_wave_id"] == "wave-a"
+
+
+def test_v10_wave_waits_for_every_bound_candidate_before_distillation(monkeypatch):
+    monkeypatch.setattr(evolution, "V10_RESEARCH_ENABLED", True)
+    monkeypatch.setattr(
+        evolution,
+        "create_evolution_task",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("must not enqueue")),
+    )
+
+    created = evolution._schedule_v10_research_continuation(
+        completed_task={
+            "id": 900,
+            "task_type": "strategy_environment_backtest",
+            "payload": {
+                "candidate_id": "candidate-a",
+                "research_wave_id": "wave-a",
+            },
+        },
+        result={
+            "candidate_id": "candidate-a",
+            "status": "completed",
+            "research_wave_id": "wave-a",
+            "wave_ready_for_distillation": False,
+        },
+    )
+
+    assert created == []
+
+
+def test_v10_completed_wave_schedules_one_wave_scoped_followup(monkeypatch):
+    monkeypatch.setattr(evolution, "V10_RESEARCH_ENABLED", True)
+    captured = []
+    monkeypatch.setattr(
+        evolution,
+        "create_evolution_task",
+        lambda **kwargs: captured.append(kwargs) or {
+            "id": len(captured),
+            "status": "queued",
+        },
+    )
+
+    evolution._schedule_v10_research_continuation(
+        completed_task={
+            "id": 904,
+            "task_type": "strategy_environment_backtest",
+            "payload": {
+                "candidate_id": "candidate-d",
+                "research_wave_id": "wave-a",
+            },
+        },
+        result={
+            "candidate_id": "candidate-d",
+            "status": "completed",
+            "research_wave_id": "wave-a",
+            "wave_ready_for_distillation": True,
+        },
+    )
+
+    assert [item["task_type"] for item in captured] == [
+        "strategy_cluster_distillation",
+        "strategy_failure_model_training",
+    ]
+    assert all("wave-a" in item["dedupe_key"] for item in captured)
+    assert captured[0]["payload"]["research_wave_id"] == "wave-a"
+
+
+def test_v10_portfolio_needs_improvement_does_not_double_generate(monkeypatch):
+    monkeypatch.setattr(evolution, "V10_RESEARCH_ENABLED", True)
+    monkeypatch.setattr(
+        evolution,
+        "create_evolution_task",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("must not enqueue")),
+    )
+
+    created = evolution._schedule_v10_research_continuation(
+        completed_task={"id": 772, "task_type": "strategy_portfolio_research"},
+        result={"status": "needs_improvement", "portfolio_id": "portfolio-a"},
+    )
+
+    assert created == []
+
+
+def test_v10_cluster_followups_coalesce_global_research_lines(monkeypatch):
+    monkeypatch.setattr(evolution, "V10_RESEARCH_ENABLED", True)
+    captured = []
+    monkeypatch.setattr(
+        evolution,
+        "create_evolution_task",
+        lambda **kwargs: captured.append(kwargs) or {
+            "id": len(captured),
+            "status": "queued",
+        },
+    )
+
+    evolution._schedule_v10_research_continuation(
+        completed_task={"id": 901, "task_type": "strategy_cluster_distillation"},
+        result={"generated": [{"prototype_id": "prototype-a"}]},
+    )
+
+    by_type = {item["task_type"]: item for item in captured}
+    assert by_type["strategy_portfolio_research"]["coalesce_active_type"] is True
+    assert by_type["strategy_candidate_generation"]["coalesce_active_type"] is True

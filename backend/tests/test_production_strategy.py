@@ -146,3 +146,131 @@ def test_candidate_promotion_is_idempotent_after_champion_was_created(monkeypatc
         "candidate_model_version_id": 11,
         "version": "champion-v99",
     }
+
+
+def test_candidate_promotion_preserves_complete_research_package(monkeypatch):
+    factor_bindings = {
+        "momentum_20": {
+            "definition_id": 1,
+            "factor_key": "momentum_20",
+            "version": "v1",
+            "formula": {},
+            "leakage_status": "passed",
+        },
+    }
+    model_bindings = {
+        "medium_horizon_lambdarank_v1": {
+            "id": 21,
+            "model_key": "medium_horizon_lambdarank_v1",
+            "version": "medium-v2",
+        },
+    }
+    market_state_binding = {
+        "production_model": "transparent_four_state_v1",
+        "change_model": "bocpd_gaussian_v1",
+    }
+    research_spec = {
+        "research_package_hash": "package-hash-1",
+        "optimization_lane": "model",
+    }
+    candidate = {
+        "id": 11,
+        "model_key": "alis_strategy_challenger",
+        "version": "challenger-v11",
+        "config": {
+            "strategy_id": 7,
+            "factor_bindings": factor_bindings,
+            "model_bindings": model_bindings,
+            "market_state_binding": market_state_binding,
+            "strategy_controller_version_id": 31,
+            "portfolio_optimizer": {"implementation": "empirical_cvar_slsqp_v2"},
+            "execution_contract": {"signal": "T_close", "execution": "T_plus_1_open"},
+            "research_package_hash": "package-hash-1",
+            "research_spec": research_spec,
+        },
+        "validation": {"status": "shadow_passed", "production_eligible": True},
+    }
+    versions = {
+        11: candidate,
+        21: {"id": 21, "model_key": "medium_horizon_lambdarank_v1", "version": "medium-v2"},
+        31: {"id": 31, "model_key": "strategy_controller", "version": "controller-v2"},
+    }
+    active = {
+        "id": 50,
+        "version": "champion-v50",
+        "config": _bundle(),
+    }
+    captured = {}
+    monkeypatch.setattr(production_strategy, "get_model_version", lambda version_id: versions.get(int(version_id)))
+    monkeypatch.setattr(production_strategy, "ensure_production_strategy_champion", lambda: active)
+    monkeypatch.setattr(production_strategy, "get_strategy", lambda strategy_id: {
+        "id": strategy_id,
+        "name": "candidate strategy",
+        "type": "formula",
+        "content": {"score": {"factors": {"momentum_20": 1.0}}},
+    })
+    monkeypatch.setattr(
+        production_strategy,
+        "create_model_version",
+        lambda **kwargs: captured.update(kwargs) or 51,
+    )
+    monkeypatch.setattr(production_strategy, "update_model_version_status", lambda *args, **kwargs: None)
+
+    result = production_strategy.promote_strategy_candidate(11, evidence={"shadow": "passed"})
+
+    promoted = captured["config"]
+    assert result["event"] == "promoted"
+    assert promoted["factor_bindings"] == factor_bindings
+    assert promoted["model_bindings"] == model_bindings
+    assert promoted["market_state_binding"] == market_state_binding
+    assert promoted["strategy_controller"] == {"id": 31, "version": "controller-v2"}
+    assert promoted["research_package_hash"] == "package-hash-1"
+    assert promoted["research_spec"] == research_spec
+
+
+def test_hsmm_market_state_binding_requires_validated_existing_artifact(monkeypatch, tmp_path):
+    artifact = tmp_path / "hsmm.json"
+    artifact.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(production_strategy, "get_model_version", lambda version_id: {
+        "id": int(version_id),
+        "model_key": "market_regime",
+        "version": "hsmm-v2",
+        "artifact_path": str(artifact),
+        "created_at": "2026-07-24T16:00:00+08:00",
+        "validation": {"status": "passed"},
+    })
+
+    binding = production_strategy._validated_market_state_binding({
+        "production_model": "market_regime_hsmm_v1",
+        "change_model": "bocpd_gaussian_v1",
+        "hsmm_shadow": {"id": 41},
+    })
+
+    assert binding["hsmm_shadow"] == {
+        "id": 41,
+        "model_key": "market_regime",
+        "version": "hsmm-v2",
+        "artifact_path": str(artifact),
+        "created_at": "2026-07-24T16:00:00+08:00",
+        "validation_status": "passed",
+    }
+
+
+def test_hsmm_market_state_binding_rejects_missing_artifact(monkeypatch, tmp_path):
+    monkeypatch.setattr(production_strategy, "get_model_version", lambda version_id: {
+        "id": int(version_id),
+        "model_key": "market_regime",
+        "version": "hsmm-v2",
+        "artifact_path": str(tmp_path / "missing.json"),
+        "validation": {"status": "passed"},
+    })
+
+    try:
+        production_strategy._validated_market_state_binding({
+            "production_model": "market_regime_hsmm_v1",
+            "hsmm_shadow": {"id": 41},
+        })
+    except ValueError as exc:
+        assert "产物不存在" in str(exc)
+    else:
+        raise AssertionError("missing HSMM artifact must block Champion promotion")

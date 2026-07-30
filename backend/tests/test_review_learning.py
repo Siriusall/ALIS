@@ -115,10 +115,10 @@ def test_materialized_outcome_persists_numeric_directional_return(monkeypatch):
     assert inserts[0][5] == inserts[0][4]
 
 
-def test_challenger_comparison_consumes_review_feedback(monkeypatch):
-    monkeypatch.setattr(review_learning, "model_feedback_gate", lambda _version: {"passed": False, "blocked_reasons": ["minimum_20d_outcomes"]})
+def test_retired_generic_challenger_comparison_cannot_change_production():
     champion = {"id": 1, "version": "old", "metrics": {"lift": .01, "walk_forward_lift": .01, "hit_rate": .5}}
     challenger = {"id": 2, "version": "new", "metrics": {"lift": .03, "walk_forward_lift": .02, "hit_rate": .55}, "validation": {"status": "passed"}}
     result = model_registry.compare_champion_challenger(champion, challenger)
-    assert result["decision"] == "keep_champion"
-    assert result["gates"]["review_feedback_passed"] is False
+    assert result["decision"] == "no_action"
+    assert result["status"] == "retired_legacy_generic_model_protocol"
+    assert result["production_change_forbidden"] is True
