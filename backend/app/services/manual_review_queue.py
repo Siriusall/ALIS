@@ -105,7 +105,7 @@ def submit_manual_review_action(*, review_key: str, item_kind: str, action: str,
                         reviewer=actor or "manual-review",
                         decision="approved" if action in {"approved", "modified_approved", "ai_adopted"} else "rejected",
                         comment=comment,
-                        waive_live_observation=True,
+                        waive_live_observation=False,
                     )
                     break
         except Exception:

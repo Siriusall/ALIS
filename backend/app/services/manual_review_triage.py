@@ -139,8 +139,14 @@ def start_manual_review_triage_scheduler() -> bool:
     except ValueError: interval = 300
 
     def loop() -> None:
+        from app.services.runtime_heartbeat import mark_started, beat
+        mark_started("manual_review_scheduler", interval_seconds=interval)
         while True:
-            start_manual_review_triage(limit=200)
+            try:
+                start_manual_review_triage(limit=200)
+                beat("manual_review_scheduler")
+            except Exception as exc:  # a single triage failure must not kill the scheduler
+                beat("manual_review_scheduler", error=str(exc))
             time.sleep(interval)
 
     threading.Thread(target=loop,daemon=True,name="manual-review-triage-scheduler").start()

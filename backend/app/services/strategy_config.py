@@ -201,6 +201,15 @@ def get_strategy_factor_names(content: Any, strategy_type: str) -> set[str]:
             for score_cfg in regime_scores.values():
                 if isinstance(score_cfg, dict):
                     out.update(_normalize_score_factors(score_cfg).keys())
+        router = content.get("environment_expert_router")
+        if isinstance(router, dict):
+            experts = router.get("experts")
+            if isinstance(experts, dict):
+                for expert in experts.values():
+                    if isinstance(expert, dict):
+                        out.update(
+                            str(key) for key in (expert.get("factor_weights") or {})
+                        )
     for f in cfg.filters:
         fn = str(f.get("factor", "")).strip()
         if fn:
@@ -217,6 +226,13 @@ def get_strategy_score_for_market_state(
     cfg = parse_strategy_content(content, strategy_type)
     if not isinstance(content, dict) or not market_state:
         return dict(cfg.score)
+    route = get_strategy_expert_route(content, market_state)
+    if route:
+        resolved = _normalize_score_factors({
+            "factors": route.get("factor_weights") or {},
+        })
+        if resolved:
+            return resolved
     regime_scores = content.get("regime_scores")
     if not isinstance(regime_scores, dict):
         return dict(cfg.score)
@@ -225,6 +241,39 @@ def get_strategy_score_for_market_state(
         return dict(cfg.score)
     resolved = _normalize_score_factors(score_cfg)
     return resolved or dict(cfg.score)
+
+
+def get_strategy_expert_route(
+    content: Any,
+    market_state: str | None,
+) -> Dict[str, Any]:
+    if not isinstance(content, dict):
+        return {}
+    router = content.get("environment_expert_router")
+    if not isinstance(router, dict):
+        return {}
+    state_experts = router.get("state_experts")
+    experts = router.get("experts")
+    route = (
+        state_experts.get(str(market_state))
+        if market_state and isinstance(state_experts, dict) else None
+    )
+    expert_id = str((route or {}).get("prototype_id") or "") if isinstance(route, dict) else ""
+    if not expert_id:
+        expert_id = str(router.get("fallback_prototype_id") or "")
+    expert = experts.get(expert_id) if expert_id and isinstance(experts, dict) else None
+    if not isinstance(expert, dict):
+        return {}
+    return {
+        "schema_version": str(router.get("schema_version") or ""),
+        "market_state": str(market_state or ""),
+        "prototype_id": expert_id,
+        "cluster_id": str(expert.get("cluster_id") or ""),
+        "factor_weights": expert.get("factor_weights") or {},
+        "environment_ids": list((route or {}).get("environment_ids") or []) if isinstance(route, dict) else [],
+        "environment_versions": list(router.get("environment_versions") or []),
+        "fallback_used": not bool(route),
+    }
 
 
 def resolve_selection_market_state(

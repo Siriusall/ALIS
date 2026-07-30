@@ -8,12 +8,21 @@ from app.services.research_engine import build_stock_research, build_valuation_s
 from app.services.thesis_store import generate_thesis_for_stock, list_theses
 
 
-def evaluate_core_pool_eligibility(ts_code: str, *, as_of_time: str | None = None) -> dict[str, Any]:
+def evaluate_core_pool_eligibility(
+    ts_code: str,
+    *,
+    as_of_time: str | None = None,
+    prepared_thesis: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Evaluate all plan-defined evidence gates against one authoritative snapshot."""
     normalized = str(ts_code).strip().upper()
     research = build_stock_research(normalized, as_of_time=as_of_time)
     valuation = build_valuation_state(normalized, as_of_time=as_of_time)
-    theses = list_theses(ts_code=normalized, limit=20)
+    theses = (
+        [prepared_thesis]
+        if isinstance(prepared_thesis, dict) and prepared_thesis
+        else list_theses(ts_code=normalized, limit=20)
+    )
     active_theses = [item for item in theses if item.get("derived_status") not in {"invalidated", "failed", "draft"}]
     financial_fields = financial_research_completeness(normalized, period_limit=5, as_of_time=as_of_time)
     dimensions = research.get("dimensions") or {}
@@ -33,9 +42,31 @@ def evaluate_core_pool_eligibility(ts_code: str, *, as_of_time: str | None = Non
         "eligible_for_core": all(item["passed"] for item in gates),
         "gates": gates,
         "research_state": research.get("research_state"),
+        "research_dimensions": {
+            key: {
+                "status": value.get("status"),
+                "score": value.get("score"),
+            }
+            for key, value in dimensions.items()
+            if isinstance(value, dict)
+        },
+        "raw_metrics": {
+            key: (research.get("raw_metrics") or {}).get(key)
+            for key in (
+                "revenue_growth", "core_profit_growth", "cash_conversion",
+                "debt_to_assets", "valuation_base_upside", "growth_acceleration",
+            )
+            if (research.get("raw_metrics") or {}).get(key) is not None
+        },
         "financial_field_completeness": financial_fields,
-        "valuation": {"status": valuation.get("status"), "method": valuation.get("method"), "scenarios": valuation.get("scenarios")},
+        "valuation": {
+            "status": valuation.get("status"),
+            "method": valuation.get("method"),
+            "scenarios": valuation.get("scenarios"),
+            "dimension": valuation.get("dimension") or {},
+        },
         "thesis_count": len(active_theses),
+        "thesis_source": "prepared_point_in_time" if prepared_thesis else "persisted_compatibility",
     }
 
 

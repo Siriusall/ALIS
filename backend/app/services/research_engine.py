@@ -288,7 +288,7 @@ def capability_registry() -> list[dict[str, Any]]:
         {"key": "decisions", "name": "决策日志", "status": "ready", "api": "/api/research/decisions", "missing": []},
         {"key": "review", "name": "复盘中心", "status": "ready", "api": "/api/research/reviews", "missing": []},
         {"key": "governance", "name": "系统任务与模型治理", "status": "ready", "api": "/api/model-strategy/slo/evaluate", "missing": []},
-        {"key": "strategy", "name": "策略工作台", "status": "ready", "api": "/api/model-strategy/compare", "missing": []},
+        {"key": "strategy", "name": "策略工作台", "status": "ready", "api": "/api/model-strategy/plan-models", "missing": []},
     ]
 
 
