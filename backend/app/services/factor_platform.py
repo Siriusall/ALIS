@@ -213,6 +213,47 @@ def compute_factor_definition(
     )
 
 
+def compute_bound_factor(
+    factor: str,
+    binding: dict[str, Any] | None,
+    row: SnapshotRow,
+    hist: list[HistBar],
+    daily_basic: dict[str, dict[str, float]],
+    *,
+    benchmark_return: float | None = None,
+    benchmark_returns: list[float] | None = None,
+    industry_inputs: dict[str, float] | None = None,
+) -> float:
+    """Evaluate one factor from its frozen binding instead of the latest registry row."""
+    if not binding:
+        return compute_registered_factor(
+            factor,
+            row,
+            hist,
+            daily_basic,
+            benchmark_return=benchmark_return,
+            benchmark_returns=benchmark_returns,
+            industry_inputs=industry_inputs,
+        )
+    bound_key = str(binding.get("factor_key") or factor)
+    if bound_key != str(factor):
+        raise ValueError(f"因子绑定类型不匹配：期望 {factor}，实际 {bound_key}")
+    if str(binding.get("leakage_status") or "passed") != "passed":
+        raise ValueError(f"因子绑定未通过泄漏门：{factor}")
+    return compute_factor_definition(
+        {
+            "factor_key": str(factor),
+            "formula": binding.get("formula") if isinstance(binding.get("formula"), dict) else {},
+        },
+        row,
+        hist,
+        daily_basic,
+        benchmark_return=benchmark_return,
+        benchmark_returns=benchmark_returns,
+        industry_inputs=industry_inputs,
+    )
+
+
 def ensure_factor_registry() -> list[dict[str, Any]]:
     now = datetime.now().astimezone().isoformat()
     with _conn() as conn:
@@ -299,20 +340,31 @@ def factor_registry_status() -> dict[str, Any]:
     }
 
 
-def active_factor_bindings(keys: Iterable[str] | None = None) -> dict[str, dict[str, Any]]:
+def registered_factor_bindings(
+    keys: Iterable[str] | None = None,
+    *,
+    statuses: Iterable[str] = ("active", "candidate"),
+) -> dict[str, dict[str, Any]]:
     wanted = {str(key) for key in keys} if keys is not None else None
+    allowed = {str(status) for status in statuses}
     return {
         str(item["factor_key"]): {
             "definition_id": int(item["id"]),
+            "factor_key": str(item["factor_key"]),
             "version": str(item["version"]),
+            "status": str(item.get("status") or ""),
             "formula": item["formula"],
             "available_time_rule": item["available_time_rule"],
             "leakage_status": item["leakage_status"],
         }
         for item in ensure_factor_registry()
-        if str(item.get("status") or "") == "active"
+        if str(item.get("status") or "") in allowed
         and (wanted is None or str(item["factor_key"]) in wanted)
     }
+
+
+def active_factor_bindings(keys: Iterable[str] | None = None) -> dict[str, dict[str, Any]]:
+    return registered_factor_bindings(keys, statuses=("active",))
 
 
 def _winsorized_zscores(values: dict[str, float], direction: int) -> dict[str, float]:

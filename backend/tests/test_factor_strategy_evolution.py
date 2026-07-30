@@ -90,6 +90,27 @@ def test_confirmed_continuous_research_winner_is_distilled(monkeypatch):
                 "positive_excess_window_ratio": 2 / 3,
                 "worst_drawdown": -0.10,
             },
+            "research_spec": {
+                "research_package_hash": "package-hash-1",
+                "factor_bindings": {
+                    "alpha_a": {"definition_id": 101, "factor_key": "alpha_a", "version": "v1"},
+                    "alpha_b": {"definition_id": 102, "factor_key": "alpha_b", "version": "v1"},
+                    "alpha_c": {"definition_id": 103, "factor_key": "alpha_c", "version": "v1"},
+                },
+                "model_bindings": {
+                    "medium_horizon_lambdarank_v1": {
+                        "id": 21,
+                        "model_key": "medium_horizon_lambdarank_v1",
+                        "version": "medium-v2",
+                    },
+                },
+                "market_state_binding": {
+                    "production_model": "transparent_four_state_v1",
+                    "change_model": "bocpd_gaussian_v1",
+                },
+                "strategy_controller_version_id": 31,
+                "portfolio_method": "cvar",
+            },
         }),
         "fitness": 0.03,
         "generation": 4,
@@ -105,12 +126,6 @@ def test_confirmed_continuous_research_winner_is_distilled(monkeypatch):
                 return _Cursor([{"data_as_of": "20260724"}])
             if "FROM factor_combination_experiments" in normalized:
                 return _Cursor([experiment])
-            if "SELECT id,factor_key FROM factor_definitions" in normalized:
-                return _Cursor([
-                    {"id": 1, "factor_key": "alpha_a"},
-                    {"id": 2, "factor_key": "alpha_b"},
-                    {"id": 3, "factor_key": "alpha_c"},
-                ])
             return _Cursor()
 
     @contextmanager
@@ -130,5 +145,91 @@ def test_confirmed_continuous_research_winner_is_distilled(monkeypatch):
     assert len(result["accepted"]) == 1
     assert result["accepted"][0]["status"] == "research_confirmed"
     assert result["accepted"][0]["frozen_after"] == "20260724"
+    assert result["accepted"][0]["research_spec"]["research_package_hash"] == "package-hash-1"
+    assert captured["combinations"][0]["research_spec"]["model_bindings"]["medium_horizon_lambdarank_v1"]["id"] == 21
     assert captured["combinations"][0]["members"][0]["factor_key"] == "alpha_a"
+    assert captured["combinations"][0]["members"][0]["definition_id"] == 101
     assert any(sql.startswith("INSERT INTO factor_combinations") for sql, _ in calls)
+    insert_params = next(
+        params for sql, params in calls
+        if sql.startswith("INSERT INTO factor_combinations")
+    )
+    lineage = json.loads(insert_params[6])
+    assert lineage["source"] == evolution.CONTINUOUS_RESEARCH_CONFIRMATION_SOURCE
+    assert lineage["identity"]["source"] == evolution.CONTINUOUS_RESEARCH_CONFIRMATION_SOURCE
+
+
+def test_strategy_distillation_preserves_frozen_factor_bindings(monkeypatch):
+    monkeypatch.setattr(evolution, "_ensure_tables", lambda: None)
+    monkeypatch.setattr(evolution, "resolve_production_strategy_champion", lambda: {
+        "champion_id": 50,
+        "champion_version": "champion-v50",
+        "strategy": {"content": {"score": {"factors": {"old": 1.0}}}},
+    })
+    monkeypatch.setattr(evolution, "list_model_versions", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(evolution, "list_strategies", lambda: [])
+    monkeypatch.setattr(evolution, "create_strategy", lambda name, type_, content: {
+        "id": 7, "name": name, "type": type_, "content": content,
+    })
+    frozen_keys = {
+        "alpha_a", "alpha_b", "alpha_c",
+        "momentum_20", "momentum_60", "volatility_20",
+    }
+    frozen_bindings = {
+        key: {
+            "definition_id": index,
+            "factor_key": key,
+            "version": "frozen-v1",
+            "formula": {"engine": "alis_factor_dsl_v1", "expression": {"op": "field", "name": "close"}},
+            "leakage_status": "passed",
+        }
+        for index, key in enumerate(sorted(frozen_keys), start=1)
+    }
+    captured = {}
+    monkeypatch.setattr(
+        evolution,
+        "create_model_version",
+        lambda **kwargs: captured.update(kwargs) or 99,
+    )
+
+    @contextmanager
+    def fake_conn():
+        class Connection:
+            def execute(self, _sql, _params=None):
+                return _Cursor()
+        yield Connection()
+
+    monkeypatch.setattr(evolution, "_conn", fake_conn)
+    monkeypatch.setattr(
+        evolution,
+        "_frozen_factor_bindings",
+        lambda _keys: (_ for _ in ()).throw(
+            AssertionError("continuous research bindings must not be rebound from the current registry")
+        ),
+    )
+
+    result = evolution.distill_factor_combinations_to_strategies({
+        "combinations": [{
+            "combination_key": "factor-combination-frozen",
+            "version": "v-frozen",
+            "status": "research_confirmed",
+            "frozen_after": "20260724",
+            "members": [
+                {"factor_key": "alpha_a", "weight": 0.4},
+                {"factor_key": "alpha_b", "weight": 0.35},
+                {"factor_key": "alpha_c", "weight": 0.25},
+            ],
+            "research_spec": {
+                "schema_version": "alis_factor_model_strategy_candidate_v1",
+                "factor_bindings": frozen_bindings,
+                "model_bindings": {},
+                "market_state_binding": {"production_model": "transparent_four_state_v1"},
+                "strategy_controller_version_id": 31,
+                "portfolio_method": "cvar",
+                "research_package_hash": "package-hash-frozen",
+            },
+        }],
+    })
+
+    assert result["generated"][0]["model_version_id"] == 99
+    assert captured["config"]["factor_bindings"] == frozen_bindings

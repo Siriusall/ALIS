@@ -5,6 +5,7 @@ from app.services import factor_platform
 from app.services.factor_platform import (
     CORE_ACTIVE_KEYS,
     SPEC_BY_KEY,
+    compute_bound_factor,
     compute_registered_factor,
     is_factor_governance_eligible,
 )
@@ -100,6 +101,46 @@ def test_industry_candidate_factor_uses_only_supplied_point_in_time_value():
     assert "industry_demand_proxy" in SPEC_BY_KEY
     assert "industry_inventory_proxy" in SPEC_BY_KEY
     assert "beta_60" in SPEC_BY_KEY
+
+
+def test_bound_factor_uses_frozen_dsl_formula_without_registry_lookup():
+    value = compute_bound_factor(
+        "frozen_alpha",
+        {
+            "factor_key": "frozen_alpha",
+            "definition_id": 900,
+            "version": "v3",
+            "formula": {
+                "engine": "alis_factor_dsl_v1",
+                "expression": {"op": "constant", "value": 7.0, "args": []},
+            },
+            "leakage_status": "passed",
+        },
+        _row(),
+        _bars(5),
+        {},
+    )
+
+    assert value == 7.0
+
+
+def test_registered_bindings_can_freeze_candidate_model_inputs(monkeypatch):
+    monkeypatch.setattr(factor_platform, "ensure_factor_registry", lambda: [
+        {
+            "id": 1, "factor_key": "momentum_20", "version": "v1", "status": "active",
+            "formula": {}, "available_time_rule": "T_close", "leakage_status": "passed",
+        },
+        {
+            "id": 2, "factor_key": "momentum_60", "version": "v1", "status": "candidate",
+            "formula": {}, "available_time_rule": "T_close", "leakage_status": "passed",
+        },
+    ])
+
+    frozen = factor_platform.registered_factor_bindings({"momentum_20", "momentum_60"})
+
+    assert set(frozen) == {"momentum_20", "momentum_60"}
+    assert frozen["momentum_60"]["status"] == "candidate"
+    assert set(factor_platform.active_factor_bindings()) == {"momentum_20"}
 
 
 def test_daily_selection_registry_covers_every_versioned_factor():

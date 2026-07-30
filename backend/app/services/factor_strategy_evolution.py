@@ -14,12 +14,16 @@ from app.db.store import (
     list_model_versions,
     list_strategies,
 )
-from app.services.factor_platform import active_factor_bindings, ensure_factor_registry
+from app.services.factor_platform import ensure_factor_registry
 from app.services.production_strategy import resolve_production_strategy_champion
+from app.services.strategy_config import get_strategy_factor_names
 
 
 FACTOR_COMBINATION_SCHEMA = "alis_factor_combination_v1"
 FACTOR_STRATEGY_LINK_SCHEMA = "alis_factor_strategy_distillation_v1"
+CONTINUOUS_RESEARCH_CONFIRMATION_SOURCE = (
+    "continuous_factor_model_strategy_research_v9_confirmation"
+)
 MIN_FACTOR_EVALUATIONS = 20
 MAX_COMBINATION_FACTORS = 8
 CONTINUOUS_RESEARCH_COMBINATION_STATUS = "research_confirmed"
@@ -361,11 +365,49 @@ def distill_factor_combinations_to_strategies(
         }
         if len(score) < 3:
             continue
-        content = deepcopy(base_content)
+        research_spec = combination.get("research_spec") if isinstance(combination.get("research_spec"), dict) else {}
+        frozen_selection = (
+            research_spec.get("selection_strategy")
+            if isinstance(research_spec.get("selection_strategy"), dict) else {}
+        )
+        content = deepcopy(
+            frozen_selection.get("content")
+            if isinstance(frozen_selection.get("content"), dict) else base_content
+        )
         content["schema_version"] = "alis_factor_distilled_strategy_v1"
         content["score"] = {"normalization": "rank_percentile", "factors": score}
         content["rebalance"] = {**(content.get("rebalance") or {}), "freq": "weekly", "top_n": 30}
         content["lookback_days"] = max(120, int(content.get("lookback_days") or 0))
+        content["portfolio_method"] = str(
+            research_spec.get("portfolio_method") or content.get("portfolio_method") or "cvar"
+        )
+        consumed_factor_keys = (
+            get_strategy_factor_names(content, "formula")
+            | {"momentum_20", "momentum_60", "volatility_20"}
+        )
+        universe = content.get("universe") if isinstance(content.get("universe"), dict) else {}
+        if float(universe.get("exclude_smallest_float_mv_pct") or 0.0) > 0:
+            consumed_factor_keys.add("float_mv")
+        research_factor_bindings = (
+            research_spec.get("factor_bindings")
+            if isinstance(research_spec.get("factor_bindings"), dict) else {}
+        )
+        if research_factor_bindings:
+            missing_factor_bindings = sorted(
+                key for key in consumed_factor_keys
+                if not isinstance(research_factor_bindings.get(key), dict)
+            )
+            if missing_factor_bindings:
+                raise ValueError(
+                    "连续研究包缺少冻结因子绑定："
+                    + ",".join(missing_factor_bindings)
+                )
+            factor_bindings = {
+                key: deepcopy(research_factor_bindings[key])
+                for key in sorted(consumed_factor_keys)
+            }
+        else:
+            factor_bindings = _frozen_factor_bindings(consumed_factor_keys)
         content["factor_combination"] = {
             "combination_key": combination_key,
             "version": combination.get("version"),
@@ -379,8 +421,21 @@ def distill_factor_combinations_to_strategies(
         evidence = {
             "schema_version": FACTOR_STRATEGY_LINK_SCHEMA,
             "combination": combination,
-            "champion_reference": champion.get("champion_version"),
-            "changed_fields": ["score", "rebalance.freq", "rebalance.top_n", "lookback_days"],
+            "champion_reference": (
+                research_spec.get("champion_reference")
+                or champion.get("champion_version")
+            ),
+            "changed_fields": [
+                "score", "model_bindings", "market_state_binding",
+                "strategy_controller_version_id", "portfolio_method",
+            ],
+            "research_package": {
+                "research_package_hash": research_spec.get("research_package_hash"),
+                "model_bindings": research_spec.get("model_bindings") or {},
+                "market_state_binding": research_spec.get("market_state_binding") or {},
+                "strategy_controller_version_id": research_spec.get("strategy_controller_version_id"),
+                "portfolio_method": research_spec.get("portfolio_method") or "cvar",
+            },
             "safety": {
                 "production_eligible": False,
                 "next_gate": "quick_diagnostic",
@@ -397,24 +452,37 @@ def distill_factor_combinations_to_strategies(
                 "role": "challenger",
                 "generation": "automatic_factor_combination_distillation",
                 "strategy_id": int(strategy["id"]),
-                "champion_reference": champion.get("champion_version"),
+                "champion_reference": (
+                    research_spec.get("champion_reference")
+                    or champion.get("champion_version")
+                ),
                 "selection_strategy": content,
                 "factor_combination": {
                     "combination_key": combination_key,
                     "version": combination.get("version"),
                 },
-                "factor_bindings": (
-                    _frozen_factor_bindings(score.keys())
-                    if str(combination.get("status") or "")
-                    == CONTINUOUS_RESEARCH_COMBINATION_STATUS
-                    else active_factor_bindings(score.keys())
-                ),
+                "factor_bindings": factor_bindings,
+                "model_bindings": research_spec.get("model_bindings") or {},
+                "market_state_binding": research_spec.get("market_state_binding") or {},
+                "strategy_controller_version_id": research_spec.get("strategy_controller_version_id"),
+                "research_package_hash": research_spec.get("research_package_hash"),
+                "research_spec": research_spec,
+                "portfolio_optimizer": research_spec.get("portfolio_optimizer") or {},
+                "execution_contract": research_spec.get("execution_contract") or {},
                 "lineage": {
-                    "root_model_version_id": int(champion.get("champion_id") or 0),
-                    "parent_model_version_id": int(champion.get("champion_id") or 0),
+                    "root_model_version_id": int(
+                        research_spec.get("champion_version_id")
+                        or champion.get("champion_id") or 0
+                    ),
+                    "parent_model_version_id": int(
+                        research_spec.get("champion_version_id")
+                        or champion.get("champion_id") or 0
+                    ),
                     "generation_index": 1,
-                    "hypothesis_family": "factor_combination_distillation",
-                    "applied_mutations": ["replace_score_with_validated_factor_combination"],
+                    "hypothesis_family": "factor_model_strategy_package_distillation",
+                    "applied_mutations": [
+                        str(research_spec.get("optimization_lane") or "factor")
+                    ],
                 },
                 "evidence_contract": evidence,
             },
@@ -488,16 +556,11 @@ def distill_confirmed_research_experiments(
                 (str(snapshot_id), max(1, int(limit))),
             ).fetchall()
         ]
-        definitions = {
-            str(row["factor_key"]): int(row["id"])
-            for row in conn.execute(
-                "SELECT id,factor_key FROM factor_definitions"
-            ).fetchall()
-        }
     accepted: list[dict[str, Any]] = []
     rejected: list[dict[str, Any]] = []
     for row in rows:
         metrics = json.loads(row.get("metrics_json") or "{}")
+        research_spec = metrics.get("research_spec") if isinstance(metrics.get("research_spec"), dict) else {}
         aggregate = metrics.get("aggregate") if isinstance(metrics.get("aggregate"), dict) else {}
         folds = metrics.get("folds") if isinstance(metrics.get("folds"), list) else []
         gates = {
@@ -518,9 +581,28 @@ def distill_confirmed_research_experiments(
             })
             continue
         weights = json.loads(row.get("factor_weights_json") or "{}")
+        frozen_bindings = (
+            research_spec.get("factor_bindings")
+            if isinstance(research_spec.get("factor_bindings"), dict) else {}
+        )
+        missing_frozen_bindings = sorted(
+            key for key, weight in weights.items()
+            if abs(float(weight)) > 1e-12
+            and not int((frozen_bindings.get(key) or {}).get("definition_id") or 0)
+        )
+        if missing_frozen_bindings:
+            rejected.append({
+                "experiment_id": str(row["experiment_id"]),
+                "gates": {
+                    **gates,
+                    "frozen_factor_bindings_complete": False,
+                },
+                "missing_factor_bindings": missing_frozen_bindings,
+            })
+            continue
         members = [
             {
-                "definition_id": definitions[key],
+                "definition_id": int(frozen_bindings[key]["definition_id"]),
                 "factor_key": key,
                 "weight": float(weight),
                 "research_evidence": {
@@ -531,7 +613,7 @@ def distill_confirmed_research_experiments(
                 },
             }
             for key, weight in sorted(weights.items())
-            if key in definitions and abs(float(weight)) > 1e-12
+            if abs(float(weight)) > 1e-12
         ]
         if len(members) < 3:
             rejected.append({
@@ -541,9 +623,10 @@ def distill_confirmed_research_experiments(
             continue
         identity = {
             "schema": FACTOR_COMBINATION_SCHEMA,
-            "source": "continuous_factor_research_v2_confirmation",
+            "source": CONTINUOUS_RESEARCH_CONFIRMATION_SOURCE,
             "snapshot_id": str(snapshot_id),
             "strategy_hash": str(row["strategy_hash"]),
+            "research_package_hash": str(research_spec.get("research_package_hash") or row["strategy_hash"]),
             "members": [
                 {"definition_id": item["definition_id"], "factor_key": item["factor_key"], "weight": item["weight"]}
                 for item in members
@@ -562,6 +645,7 @@ def distill_confirmed_research_experiments(
                 "confirmation_fold_count": len(folds),
             },
             "members": members,
+            "research_spec": research_spec,
         }
         now = _now()
         with _conn() as conn:
@@ -583,13 +667,14 @@ def distill_confirmed_research_experiments(
                         digest,
                         json.dumps(combination["metrics"], ensure_ascii=False),
                         json.dumps({
-                            "source": "continuous_factor_research_v2_confirmation",
+                            "source": CONTINUOUS_RESEARCH_CONFIRMATION_SOURCE,
                             "snapshot_id": str(snapshot_id),
                             "experiment_id": str(row["experiment_id"]),
                             "parent_experiment_id": row.get("parent_experiment_id"),
                             "generation": int(row.get("generation") or 0),
                             "gates": gates,
                             "identity": identity,
+                            "research_spec": research_spec,
                         }, ensure_ascii=False),
                         now,
                         now,

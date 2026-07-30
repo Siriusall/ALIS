@@ -301,12 +301,12 @@ def _factor_industry_candidate(symbol: str, hist: List[DailyBar], today: Optiona
 def _ensure_snapshot(symbol: str, context: FactorContext):
     """
     工具函数：按当前自然日从 TuShare 获取快照（带缓存），并返回该 symbol 对应记录（可能为 None）。
-    cache_only 时若请求的交易日无缓存，则回退到「磁盘快照缓存中最新一日」，避免日历已推进导致整批 float_mv=0 被过滤光。
+    cache_only 时若请求的交易日无缓存，只允许回退到该日或更早的快照。
     """
     trade_date = get_last_trade_date(for_data_availability=True).strftime("%Y%m%d")
     snapshot_map = get_daily_snapshot(trade_date, cache_only=True)
     if not snapshot_map:
-        fallback_date = get_latest_cached_snapshot_date()
+        fallback_date = get_latest_cached_snapshot_date(on_or_before=trade_date)
         if fallback_date:
             snapshot_map = get_daily_snapshot(fallback_date, cache_only=True)
         if not snapshot_map:
@@ -716,7 +716,7 @@ def score_factors_with_strategy(
             snap = get_daily_snapshot(trade_date, cache_only=True)
             used_fallback = False
             if not snap:
-                fallback = get_latest_cached_snapshot_date()
+                fallback = get_latest_cached_snapshot_date(on_or_before=trade_date)
                 if fallback:
                     snap = get_daily_snapshot(fallback, cache_only=True)
                     used_fallback = True
@@ -733,12 +733,13 @@ def score_factors_with_strategy(
             logger.warning("[选股] strategy_id=%s 快照异常: %s", strategy.get("id"), e)
     if snapshot_needed and not snapshot_available:
         snapshot_warn = (
-            "TuShare 快照不可用（daily_basic 超时或无数据），已跳过市值/估值类预筛；"
-            "策略结果可能与预期有偏差。"
+            "选股所需的点时截面快照不可用，已阻断本次选股；"
+            "不得跳过市值、估值或交易状态过滤。"
         )
         logger.warning(snapshot_warn)
         if out_warnings is not None:
             out_warnings.append(snapshot_warn)
+        return []
 
     need_hist = any(
         f in FACTORS_NEED_HISTORY and f in FACTOR_REGISTRY and f not in consolidated_fields
@@ -750,7 +751,7 @@ def score_factors_with_strategy(
         trade_date = get_last_trade_date(for_data_availability=True).strftime("%Y%m%d")
         snapshot_map = get_daily_snapshot(trade_date, cache_only=True)
         if not snapshot_map:
-            fallback_date = get_latest_cached_snapshot_date()
+            fallback_date = get_latest_cached_snapshot_date(on_or_before=trade_date)
             if fallback_date:
                 snapshot_map = get_daily_snapshot(fallback_date, cache_only=True)
         if snapshot_map:
