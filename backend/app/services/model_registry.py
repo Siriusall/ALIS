@@ -22,7 +22,7 @@ MODEL_KEY = "main"
 MODEL_CONSTITUTION: dict[str, dict[str, Any]] = {
     "regime": {"model": "HSMM+BOCPD", "status": "hsmm_duration_bocpd_v1"},
     "dynamic_factors": {"model": "Kalman/state-space", "status": "local_level_kalman_v1"},
-    "cross_section": {"model": "LightGBM", "status": "legacy_hgbr_fallback"},
+    "cross_section": {"model": "LightGBM", "status": "retired_generic_main_model"},
     "volatility": {"model": "GARCH", "status": "garch11_v1"},
     "portfolio_risk": {"model": "CVaR", "status": "empirical_cvar_v1"},
 }
@@ -58,33 +58,16 @@ def evaluate_model_drift(expected: dict[str, list[float]], actual: dict[str, lis
 
 
 def compare_champion_challenger(champion: dict[str, Any], challenger: dict[str, Any]) -> dict[str, Any]:
-    """Compare versions without allowing a noisy single metric to win."""
-    cm, xm = champion.get("metrics") or {}, challenger.get("metrics") or {}
-    keys = ("lift", "walk_forward_lift", "hit_rate", "walk_forward_hit_rate")
-    deltas = {key: round(float(xm.get(key, 0) or 0) - float(cm.get(key, 0) or 0), 6) for key in keys}
-    validation = challenger.get("validation") or {}
-    from app.services.review_learning import model_feedback_gate
-    feedback = model_feedback_gate(str(challenger.get("version") or ""))
-    gates = {
-        "validation_passed": str(validation.get("status")) == "passed",
-        "holdout_lift_positive": float(xm.get("lift", 0) or 0) > 0,
-        "walk_forward_lift_positive": float(xm.get("walk_forward_lift", 0) or 0) > 0,
-        "lift_not_lower_than_champion": deltas["lift"] >= 0,
-        "walk_forward_lift_not_lower_than_champion": deltas["walk_forward_lift"] >= 0,
-        "hit_rate_not_materially_lower": deltas["hit_rate"] >= -0.02,
-        "walk_forward_hit_rate_not_materially_lower": deltas["walk_forward_hit_rate"] >= -0.02,
-        "review_feedback_passed": bool(feedback.get("passed")),
-    }
-    config_a, config_b = champion.get("config") or {}, challenger.get("config") or {}
-    config_keys = sorted(set(config_a) | set(config_b))
-    config_diff = {key: {"champion": config_a.get(key), "challenger": config_b.get(key)} for key in config_keys if config_a.get(key) != config_b.get(key)}
-    reasons = [key for key, passed in gates.items() if not passed]
+    """Keep the old API read-only after retiring the generic score protocol."""
+
     return {
-        "champion_id": champion.get("id"), "challenger_id": challenger.get("id"),
-        "champion_version": champion.get("version"), "challenger_version": challenger.get("version"),
-        "deltas": deltas, "config_diff": config_diff, "gates": gates, "review_feedback": feedback,
-        "decision": "promote_challenger" if not reasons else "keep_champion",
-        "blocked_reasons": reasons,
+        "ok": False,
+        "status": "retired_legacy_generic_model_protocol",
+        "champion_id": champion.get("id"),
+        "challenger_id": challenger.get("id"),
+        "decision": "no_action",
+        "replacement_contract": "alis_task_native_model_evaluation_v1",
+        "production_change_forbidden": True,
     }
 
 

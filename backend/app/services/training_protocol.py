@@ -5,9 +5,14 @@ import math
 from datetime import datetime
 from typing import Any
 
+from app.services.model_evaluation_contracts import (
+    SCHEMA_VERSION as MODEL_EVALUATION_CONTRACT,
+    evaluation_contract,
+)
+
 
 TRAINING_PROTOCOL_V1: dict[str, Any] = {
-    "schema_version": "plan_book_training_protocol_v1",
+    "schema_version": "alis_task_native_training_protocol_v1",
     "calendar": {
         "minimum_train_sessions": 756,
         "validation_sessions": 126,
@@ -21,13 +26,6 @@ TRAINING_PROTOCOL_V1: dict[str, Any] = {
         "required_fields": ["available_time", "source_as_of_time"],
         "decision_lag": "signal_t_trade_t_plus_1",
         "future_data_forbidden": True,
-    },
-    "costs": {
-        "commission": "included",
-        "transfer_fee": "included",
-        "stamp_tax": "included",
-        "slippage": "included",
-        "limit_suspend_fillability": "included",
     },
     "feature_quality": {
         "minimum_coverage": 0.80,
@@ -43,8 +41,18 @@ TRAINING_PROTOCOL_V1: dict[str, Any] = {
     },
     "baseline": {
         "required": True,
-        "families": ["logistic_regression_or_linear", "simple_momentum_rule"],
-        "promotion_rule": "complex_model_must_improve_cost_after_return_or_drawdown_ratio_in_majority_oos_windows",
+        "selection": "task_native_per_model",
+        "promotion_rule": (
+            "model_must_beat_same_task_baseline_in_majority_purged_oos_windows"
+        ),
+        "generic_momentum_baseline_for_all_models_forbidden": True,
+    },
+    "model_evaluation": {
+        "contract": MODEL_EVALUATION_CONTRACT,
+        "task_native_metrics_required": True,
+        "purged_walk_forward_required": True,
+        "controlled_strategy_ab_required": True,
+        "task_and_strategy_evidence_separate": True,
     },
 }
 
@@ -126,6 +134,9 @@ def training_protocol_contract(model_key: str | None = None) -> dict[str, Any]:
     return {
         **TRAINING_PROTOCOL_V1,
         "model_key": model_key,
+        "model_task_evaluation": (
+            evaluation_contract(model_key) if model_key else None
+        ),
         "generated_at": datetime.now().isoformat(timespec="seconds"),
     }
 
@@ -139,15 +150,29 @@ def validate_training_run_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
         "minimum_oos_windows": int(manifest.get("oos_windows") or 0) >= TRAINING_PROTOCOL_V1["calendar"]["minimum_oos_windows"],
         "purge_sessions": int(calendar.get("purge_sessions") or 0) >= TRAINING_PROTOCOL_V1["calendar"]["purge_sessions"],
         "embargo_sessions": int(calendar.get("embargo_sessions") or 0) >= TRAINING_PROTOCOL_V1["calendar"]["embargo_sessions"],
-        "cost_after_labels": bool(manifest.get("cost_after_labels")),
-        "baseline_compared": bool(manifest.get("baseline_compared")),
+        "current_model_evaluation_contract": (
+            str(manifest.get("model_evaluation_contract") or "")
+            == MODEL_EVALUATION_CONTRACT
+        ),
+        "task_native_metrics_recorded": bool(
+            manifest.get("task_native_metrics_recorded")
+        ),
+        "task_baseline_comparison_executed": bool(
+            manifest.get("task_baseline_comparison_executed")
+        ),
         "calibration_checked": bool(manifest.get("calibration_checked", True)),
     }
     blocked = [key for key, passed in gates.items() if not passed]
     return {
         "ok": not blocked,
-        "schema_version": "training_manifest_gate_v1",
+        "schema_version": "task_native_training_manifest_gate_v1",
         "gates": gates,
         "blocked_reasons": blocked,
+        "task_outcome_observations": {
+            "task_baseline_outperformed": bool(
+                manifest.get("task_baseline_outperformed")
+            ),
+            "strategy_impact_evaluated_separately": True,
+        },
         "protocol": training_protocol_contract(str(manifest.get("model_key") or "")),
     }
