@@ -109,6 +109,14 @@ def _skip_experimental_step(name: str, gate: dict[str, Any]) -> dict[str, Any]:
     return step
 
 
+def _skip_decision_step(name: str, gate: dict[str, Any]) -> dict[str, Any]:
+    """Record a safe no-op when production decision data is not ready."""
+    step = _skip_experimental_step(name, gate)
+    step["result"]["reason"] = "skipped_decision_data_gate"
+    step["result"]["data_gate"]["decision_ready"] = bool(gate.get("decision_ready"))
+    return step
+
+
 def _owner_summary(steps: list[dict[str, Any]]) -> dict[str, Any]:
     from app.services.production_strategy import champion_execution_gate
 
@@ -299,8 +307,11 @@ def run_system_autonomy_cycle() -> dict[str, Any]:
     decision_data_step = _run_step("decision_data_gate", assess_latest_decision_data_health)
     decision_data = decision_data_step.get("result") if isinstance(decision_data_step.get("result"), dict) else {}
     experiments_allowed = bool(decision_data.get("experiment_ready")) and str((hard_data_step.get("result") or {}).get("status") or "") == "ready"
+    decisions_allowed = bool(decision_data.get("decision_ready"))
     def experimental_step(name: str, fn: Callable[[], dict[str, Any]]) -> dict[str, Any]:
         return _run_step(name, fn) if experiments_allowed else _skip_experimental_step(name, decision_data)
+    def decision_step(name: str, fn: Callable[[], dict[str, Any]]) -> dict[str, Any]:
+        return _run_step(name, fn) if decisions_allowed else _skip_decision_step(name, decision_data)
 
     steps = [
         hard_data_step,
@@ -318,7 +329,7 @@ def run_system_autonomy_cycle() -> dict[str, Any]:
             lambda: run_corporate_action_cycle(as_of_date=_latest_trade_date()),
         ),
         _run_step("simulation_ledger_audit", audit_simulation_ledger),
-        experimental_step("profit_and_portfolio", build_profit_loop),
+        decision_step("profit_and_portfolio", build_profit_loop),
         _run_step("research_maintenance", lambda: run_daily_maintenance(max_candidates=50)),
         _run_step("free_industry_financials", lambda: materialize_financial_industry_series(max_periods=1)),
         _run_step("pmi_demand_proxies", sync_pmi_industry_proxies),

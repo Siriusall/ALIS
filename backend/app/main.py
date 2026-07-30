@@ -36,7 +36,6 @@ from app.services.quant_task_runner import (
     start_auto_simulation_scheduler,
 )
 from app.data_platform.services.daily_update import start_daily_update_scheduler
-from app.services.model_governance_scheduler import start_model_governance_scheduler
 from app.services.manual_review_triage import start_manual_review_triage_scheduler
 from app.services.evolution_orchestrator import (
     evolution_runtime_status,
@@ -46,6 +45,7 @@ from app.services.evolution_orchestrator import (
     start_evolution_worker,
 )
 from app.services.production_strategy import ensure_production_strategy_champion
+from app.services.plan_model_control import reconcile_plan_model_production_gates
 from app.services.profit_loop import recover_interrupted_daily_rebalance_plans
 from app.services.runtime_boundary import BackgroundRuntimeLease, acquire_background_runtime_lease
 from app.data_platform.db import database_health as data_platform_database_health
@@ -57,6 +57,7 @@ from app.data_platform.services.backfill import process_stream_task, recover_int
 from app.data_platform.services.stream_admin import auto_heal_stream
 from app.data_platform.services.data_center import recover_orphaned_ingestion_runs
 from app.data_platform.services.runtime_logs import write_runtime_log
+from app.services.runtime_heartbeat import status as runtime_heartbeat_status
 
 logging.basicConfig(
     level=logging.INFO,
@@ -118,6 +119,10 @@ def startup() -> None:
         logger.info("Web API startup completed in %.3fs.", time.perf_counter() - startup_t0)
         return
 
+    _start_component(
+        "plan_model_production_gate_reconciliation",
+        reconcile_plan_model_production_gates,
+    )
     champion = ensure_production_strategy_champion()
     logger.info("Active ALIS production Champion: %s", champion.get("version"))
     autonomous_task = _start_component("autonomous_simulation_task", ensure_autonomous_simulation_task)
@@ -133,7 +138,14 @@ def startup() -> None:
     _start_component("rebalance_execution_recovery", recover_interrupted_daily_rebalance_plans)
     _start_component("auto_simulation_scheduler", start_auto_simulation_scheduler)
     _start_component("daily_update_scheduler", start_daily_update_scheduler)
-    _start_component("model_governance_scheduler", start_model_governance_scheduler)
+    _startup_components["legacy_model_governance_scheduler"] = {
+        "status": "retired",
+        "error": "",
+        "result": {
+            "reason": "replaced_by_task_native_five_model_governance",
+            "production_change_forbidden": True,
+        },
+    }
     _start_component("manual_review_scheduler", start_manual_review_triage_scheduler)
     recovered_evolution = _start_component("evolution_recovery", recover_evolution_tasks)
     if _env_enabled("ALIS_EVOLUTION_WORKER_ENABLED"):
@@ -236,9 +248,10 @@ for protected_router in (
 def health() -> dict:
     primary = primary_database_health()
     data_platform = data_platform_database_health()
-    ready = primary.get("status") == "ok" and data_platform.get("status") == "ok"
+    databases_ready = primary.get("status") == "ok" and data_platform.get("status") == "ok"
     redis = redis_health()
     evolution = evolution_runtime_status()
+    runtime_heartbeats = runtime_heartbeat_status()
     runtime_boundary = (
         _background_runtime_lease.status()
         if _background_runtime_lease is not None
@@ -249,11 +262,20 @@ def health() -> dict:
     runtime_issues = [f"Startup component failed: {name}" for name in failed_components]
     if background_owner and not evolution.get("ok"):
         runtime_issues.append("Evolution worker or scheduler heartbeat is unhealthy")
+    unhealthy_heartbeats = [name for name, state in runtime_heartbeats.items() if not state.get("healthy", True)]
+    if background_owner and unhealthy_heartbeats:
+        runtime_issues.append(f"Background component errors: {', '.join(unhealthy_heartbeats)}")
     issues = ([] if redis.get("available", False) else ["Redis unavailable: durable stream tasks are disabled"]) + runtime_issues
+    runtime_ready = (
+        not failed_components
+        and (not background_owner or evolution.get("ok"))
+        and (not background_owner or not unhealthy_heartbeats)
+    )
+    ready = databases_ready and bool(redis.get("available", False)) and runtime_ready
     return {
-        "status": "ok" if ready and not failed_components and (not background_owner or evolution.get("ok")) else "error",
-        "ready": ready and not failed_components and bool(not background_owner or evolution.get("ok")),
-        "degraded": ready and bool(issues),
+        "status": "ok" if ready else "error",
+        "ready": ready,
+        "degraded": databases_ready and bool(issues),
         "issues": issues,
         "dependencies": {
             "primary_database": primary,
@@ -262,5 +284,6 @@ def health() -> dict:
             "startup_components": _startup_components,
             "background_runtime": runtime_boundary,
             "evolution_runtime": evolution,
+            "runtime_heartbeats": runtime_heartbeats,
         },
     }

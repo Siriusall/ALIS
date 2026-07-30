@@ -1,3 +1,5 @@
+import pytest
+
 from app.services import production_strategy
 from app.services import quant_task_runner as runner
 
@@ -69,7 +71,7 @@ def test_ensure_autonomous_simulation_task_starts_from_latest_data(monkeypatch):
     }
 
 
-def test_autonomous_plan_uses_next_due_formal_plan(monkeypatch):
+def test_autonomous_plan_uses_only_plan_due_on_latest_session(monkeypatch):
     monkeypatch.setattr(
         "app.services.profit_loop.list_pending_daily_rebalance_execution_inputs",
         lambda: [
@@ -83,8 +85,21 @@ def test_autonomous_plan_uses_next_due_formal_plan(monkeypatch):
     ])
 
     assert plan["ok"] is True
-    assert plan["start_idx"] == 0
-    assert plan["current_execute_date"] == "2026-07-24"
+    assert plan["start_idx"] == 1
+    assert plan["current_execute_date"] == "2026-07-27"
+
+
+def test_autonomous_plan_never_executes_stale_plan_late(monkeypatch):
+    monkeypatch.setattr(
+        "app.services.profit_loop.list_pending_daily_rebalance_execution_inputs",
+        lambda: [{"signal_date": "20260723", "execute_date": "20260724"}],
+    )
+
+    plan = runner._build_autonomous_plan_context([
+        "2026-07-23", "2026-07-24", "2026-07-27",
+    ])
+
+    assert plan == {"ok": False, "reason": "no_due_formal_plan"}
 
 
 def test_autonomous_plan_waits_when_no_due_formal_plan(monkeypatch):
@@ -96,6 +111,36 @@ def test_autonomous_plan_waits_when_no_due_formal_plan(monkeypatch):
     plan = runner._build_autonomous_plan_context(["2026-07-24"])
 
     assert plan == {"ok": False, "reason": "no_due_formal_plan"}
+
+
+@pytest.mark.parametrize(
+    "materialization",
+    [
+        {"status": "compatibility_preview_only", "persisted": False},
+        {"status": "blocked_by_decision_data", "persisted": True},
+    ],
+)
+def test_due_prior_plan_is_independent_of_today_materialization(
+    monkeypatch,
+    materialization,
+):
+    monkeypatch.setattr(
+        "app.services.profit_loop.materialize_daily_rebalance_plan",
+        lambda: materialization,
+    )
+    monkeypatch.setattr(
+        "app.services.profit_loop.list_pending_daily_rebalance_execution_inputs",
+        lambda: [{"signal_date": "20260724", "execute_date": "20260727"}],
+    )
+
+    context = runner._materialize_current_plan_and_find_due_context([
+        "2026-07-24", "2026-07-25", "2026-07-27",
+    ])
+
+    assert context["ok"] is True
+    assert context["start_idx"] == 0
+    assert context["current_execute_date"] == "2026-07-27"
+    assert context["today_materialization"] == materialization
 
 
 def test_autonomous_daily_mode_is_not_downgraded_to_replay():

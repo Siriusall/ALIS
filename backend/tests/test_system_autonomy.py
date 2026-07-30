@@ -2,7 +2,7 @@ import threading
 import time
 
 from app.services import system_autonomy
-from app.services.system_autonomy import _owner_summary, _skip_experimental_step
+from app.services.system_autonomy import _owner_summary, _skip_decision_step, _skip_experimental_step
 
 
 def test_owner_summary_uses_current_profit_and_autonomy_contracts():
@@ -166,6 +166,58 @@ def test_data_gate_skip_keeps_research_mutation_out_of_the_cycle():
     assert step["ok"] is True
     assert step["health"]["status"] == "observing"
     assert step["result"]["reason"] == "skipped_latest_decision_data_gate"
+
+
+def test_decision_gate_is_independent_from_experiment_gate():
+    gate = {
+        "status": "decision_ready_experiment_blocked",
+        "decision_ready": True,
+        "experiment_ready": False,
+        "issues": [{"code": "long_history_not_ready"}],
+    }
+    decision_skip = _skip_decision_step("profit_and_portfolio", {**gate, "decision_ready": False})
+    experiment_skip = _skip_experimental_step("factor_daily_cycle", gate)
+
+    assert decision_skip["result"]["data_gate"]["decision_ready"] is False
+    assert decision_skip["result"]["reason"] == "skipped_decision_data_gate"
+    assert experiment_skip["result"]["data_gate"]["experiment_ready"] is False
+
+
+def test_autonomy_runs_production_decision_when_experiments_are_not_ready(monkeypatch):
+    invoked = []
+
+    def controlled_run_step(name, fn):
+        invoked.append(name)
+        if name == "hard_data_gate":
+            result = {"ok": True, "status": "ready"}
+        elif name == "decision_data_gate":
+            result = {
+                "ok": True,
+                "status": "decision_ready_experiment_blocked",
+                "decision_ready": True,
+                "experiment_ready": False,
+            }
+        elif name == "autonomous_self_healing":
+            result = {"ok": True, "status": "completed", "components": {}}
+        elif name == "llm_incident_supervisor":
+            result = {"ok": True, "status": "self_managed", "owner_action_required_count": 0}
+        else:
+            result = {"ok": True, "status": "completed"}
+        return {"name": name, "ok": True, "result": result, "health": {"status": "healthy"}}
+
+    monkeypatch.setattr(system_autonomy, "_run_step", controlled_run_step)
+    monkeypatch.setattr(
+        "app.services.production_strategy.champion_execution_gate",
+        lambda: {"status": "allowed", "mode": "normal"},
+    )
+
+    result = system_autonomy.run_system_autonomy_cycle()
+    steps = {step["name"]: step for step in result["steps"]}
+
+    assert "profit_and_portfolio" in invoked
+    assert steps["profit_and_portfolio"]["result"]["status"] == "completed"
+    assert "factor_daily_cycle" not in invoked
+    assert steps["factor_daily_cycle"]["result"]["status"] == "observing"
 
 
 def _slo_task(task_id: int, trade_date: str, *, status: str = "completed", cash_drift: float = 0.0) -> dict:

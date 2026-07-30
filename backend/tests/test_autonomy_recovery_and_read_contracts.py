@@ -69,7 +69,12 @@ def test_latest_ready_date_does_not_duplicate_successful_cycle(monkeypatch):
             {"name": "decision_data_gate", "result": {
                 "decision_ready": True, "readiness": {"target_trade_date": "20260724"},
             }},
-            {"name": "profit_and_portfolio", "result": {"rebalance_plan": {"status": "planned"}}},
+            {"name": "profit_and_portfolio", "result": {"rebalance_plan": {
+                "id": 9,
+                "status": "planned",
+                "persisted": True,
+                "decision_contract_schema_version": "alis_unified_daily_decision_v1",
+            }}},
         ]},
     }])
     result = evolution_orchestrator.ensure_latest_ready_system_cycle()

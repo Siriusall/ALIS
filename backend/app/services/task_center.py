@@ -5,10 +5,12 @@ from typing import Any
 
 from app.data_platform.db import _conn as data_conn
 from app.data_platform.services.daily_update import daily_update_status
+from app.data_platform.services.backfill import get_plan_model_data_backfill_status
 from app.data_platform.services.runtime_logs import list_runtime_logs
 from app.db.store import list_quant_run_tasks
 from app.services.evolution_orchestrator import evolution_runtime_status, evolution_schedule_status, list_evolution_tasks
 from app.data_platform.services.daily_update import simple_health
+from app.services.runtime_heartbeat import status as runtime_heartbeat_status
 
 
 MODULES = [
@@ -62,12 +64,20 @@ STEP_LABELS = {
 TASK_TYPE_MODULE = {
     "factor_daily_cycle": "factor", "strategy_shadow_cycle": "strategy",
     "strategy_evolution_cycle": "strategy", "strategy_controller_oos": "strategy",
+    "model_candidate_research": "model",
+    "model_strategy_impact_validation": "model",
+    "model_shadow_observation": "model",
+    "plan_model_autonomy": "model",
     "system_autonomy_cycle": "autonomy", "sealed_holdout_adj_factor_backfill": "data",
 }
 
 TASK_TYPE_LABEL = {
     "factor_daily_cycle": "因子日评价", "strategy_shadow_cycle": "策略影子观察",
     "strategy_evolution_cycle": "正式策略演化", "strategy_controller_oos": "策略控制器 OOS",
+    "model_candidate_research": "模型候选分层筛选",
+    "model_strategy_impact_validation": "模型完整策略影响验证",
+    "model_shadow_observation": "模型未来影子观察",
+    "plan_model_autonomy": "任务原生模型自治调度",
     "system_autonomy_cycle": "每日自治循环", "sealed_holdout_adj_factor_backfill": "密封验证集批量补全",
 }
 
@@ -154,6 +164,10 @@ def _evolution_next_step(task: dict[str, Any]) -> str:
             "formal_oos": "完成当前窗口并持久化检查点", "shadow_observation": "积累下一未来交易日影子证据",
             "factor_materialization": "完成因子截面后运行评价与治理", "system_autonomy": "继续执行下一自治步骤",
             "sealed_holdout_adj_factor_backfill": "继续下一批 adj_factor 补全，完成后自动复核 126/126",
+            "model_candidate_quick_diagnostic": "快速淘汰后仅将排名第一的合格候选送入正式五窗口",
+            "model_strategy_impact_validation": "完成固定策略包五窗口 A/B 后决定是否进入未来观察",
+            "model_shadow_observation": "累计真实未来收益日并写回模型生产资格门",
+            "plan_model_autonomy": "按资源预算启动下一模型训练或等待数据",
         }.get(phase, "继续当前步骤并写入检查点")
     if status == "retry_wait":
         return "到达重试时间后从检查点恢复"
@@ -288,6 +302,78 @@ def _daily_task(status: dict[str, Any], generated_at: datetime) -> dict[str, Any
     }
 
 
+def _model_data_backfill_task() -> dict[str, Any] | None:
+    try:
+        payload = get_plan_model_data_backfill_status()
+    except Exception:
+        return None
+    raw_status = str(payload.get("status") or "not_started")
+    if raw_status == "not_started":
+        return None
+    checklist = [
+        item
+        for item in (payload.get("checklist") or [])
+        if isinstance(item, dict)
+    ]
+    current = next(
+        (
+            item
+            for item in checklist
+            if str(item.get("status") or "") in {"running", "pending"}
+        ),
+        checklist[-1] if checklist else {},
+    )
+    current_label = str(current.get("label") or payload.get("phase") or "模型历史数据补全")
+    if current.get("covered_raw_sessions") is not None:
+        current_label += (
+            f"；资金原始覆盖 {int(current.get('covered_raw_sessions') or 0):,}/"
+            f"{int(current.get('target_raw_sessions') or 0):,} 日"
+        )
+    elif current.get("processed_calendar_days") is not None:
+        current_label += (
+            f"；新闻源已检查 {int(current.get('processed_calendar_days') or 0):,}/"
+            f"{int(current.get('target_calendar_days') or 0):,} 日"
+        )
+    normalized = _status(raw_status)
+    intervention = payload.get("intervention") if isinstance(payload.get("intervention"), dict) else {}
+    return {
+        "id": f"model-data-backfill:{payload.get('work_order_id') or 'current'}",
+        "source": "data_work_order",
+        "source_id": 0,
+        "module": "data",
+        "task_type": "plan_model_data_backfill",
+        "name": "资金与事件模型历史数据补全",
+        "status": normalized,
+        "raw_status": str(payload.get("raw_status") or raw_status),
+        "phase": str(payload.get("phase") or ""),
+        "progress": float(payload.get("progress") or 0.0),
+        "message": str(
+            payload.get("error")
+            or intervention.get("current")
+            or "系统按登记清单自动补数"
+        ),
+        "error": _iso(payload.get("error")),
+        "current_step": current_label,
+        "next_step": (
+            str(intervention.get("current") or "检查异常并保持模型 N/A")
+            if normalized == "failed"
+            else "完成当前清单项后自动推进下一项并重新计算模型数据门"
+        ),
+        "next_run_at": None,
+        "created_at": None,
+        "started_at": None,
+        "heartbeat_at": _iso(payload.get("updated_at")),
+        "updated_at": _iso(payload.get("updated_at")),
+        "finished_at": (
+            _iso(payload.get("updated_at")) if normalized == "completed" else None
+        ),
+        "attempt": int(payload.get("attempt") or 0),
+        "max_attempts": int(payload.get("max_attempts") or 0),
+        "checkpoint": payload,
+        "activity_scope": "current",
+    }
+
+
 def _decision_data_task(health: dict[str, Any], daily: dict[str, Any], generated_at: datetime) -> dict[str, Any]:
     ready = bool(health.get("ok"))
     retry_seconds = max(0, int(daily.get("retry_after_seconds") or 0))
@@ -399,6 +485,43 @@ def _evolution_runtime_tasks() -> list[dict[str, Any]]:
     return items
 
 
+def _background_runtime_tasks() -> list[dict[str, Any]]:
+    """Expose non-Evolution resident components using the same runtime contract."""
+    labels = {
+        "redis_stream_worker": ("Redis 数据流 Worker", "持续领取并确认数据中台任务"),
+        "manual_review_scheduler": ("人工复核 Scheduler", "持续执行复核队列预审"),
+        "model_governance_scheduler": ("旧模型治理 Scheduler（已退休）", "不再训练、比较或晋升任何模型"),
+        "auto_simulation_scheduler": ("自动模拟 Scheduler", "等待收盘数据并执行模拟任务"),
+        "daily_update_scheduler": ("收盘日更 Scheduler", "检查并启动收盘数据更新"),
+    }
+    items = []
+    observed_at = datetime.now().astimezone().isoformat()
+    runtime = runtime_heartbeat_status()
+    for key, (label, current_step) in labels.items():
+        state = runtime.get(key)
+        if not state:
+            continue
+        healthy = bool(state.get("healthy"))
+        heartbeat = _iso(state.get("heartbeat_at"))
+        items.append({
+            "id": f"runtime:{key}", "source": "runtime", "source_id": 0,
+            "module": "autonomy", "task_type": f"{key}_runtime", "name": label,
+            "status": "running" if healthy else "failed",
+            "raw_status": "alive" if healthy else "unhealthy", "phase": "runtime_health",
+            "progress": 1.0 if healthy else 0.0,
+            "message": "心跳正常" if healthy else str(state.get("last_error") or state.get("health_reason") or "心跳超时"),
+            "error": None if healthy else str(state.get("last_error") or state.get("health_reason") or "runtime_heartbeat_unhealthy"),
+            "current_step": current_step,
+            "next_step": "保持心跳" if healthy else "服务重启后恢复并重新检查",
+            "next_run_at": None, "created_at": _iso(state.get("started")),
+            "started_at": _iso(state.get("started")), "heartbeat_at": heartbeat,
+            "updated_at": heartbeat or observed_at, "finished_at": None,
+            "attempt": 1, "max_attempts": 1, "activity_scope": "current",
+            "checkpoint": {"heartbeat_age_seconds": state.get("heartbeat_age_seconds"), "errors": state.get("errors", 0)},
+        })
+    return items
+
+
 def build_task_center(*, limit: int = 50, log_limit: int = 200) -> dict[str, Any]:
     generated = datetime.now().astimezone()
     schedule = evolution_schedule_status()
@@ -410,7 +533,11 @@ def build_task_center(*, limit: int = 50, log_limit: int = 200) -> dict[str, Any
     daily = daily_update_status()
     tasks.append(_daily_task(daily, generated))
     tasks.append(_decision_data_task(simple_health(), daily, generated))
+    model_data_backfill = _model_data_backfill_task()
+    if model_data_backfill:
+        tasks.append(model_data_backfill)
     tasks.extend(_evolution_runtime_tasks())
+    tasks.extend(_background_runtime_tasks())
     tasks.extend(_data_runs(min(limit, 50)))
     tasks.extend(_quant_tasks(min(limit, 30)))
     tasks.sort(key=lambda item: str(item.get("updated_at") or item.get("created_at") or ""), reverse=True)

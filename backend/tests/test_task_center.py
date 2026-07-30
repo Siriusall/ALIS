@@ -28,6 +28,11 @@ def test_task_center_unifies_modules_tasks_next_time_and_logs(monkeypatch):
     })
     monkeypatch.setattr(task_center, "_data_runs", lambda limit: [])
     monkeypatch.setattr(task_center, "_quant_tasks", lambda limit: [])
+    monkeypatch.setattr(
+        task_center,
+        "get_plan_model_data_backfill_status",
+        lambda: {"status": "not_started"},
+    )
     monkeypatch.setattr(task_center, "list_runtime_logs", lambda limit=200: [{
         "id": 1, "level": "INFO", "logger": "strategy", "message": "window completed",
         "context": {"window": 1}, "created_at": "2026-07-24T23:02:00+08:00",
@@ -128,3 +133,56 @@ def test_evolution_runtime_tasks_expose_healthy_and_failed_components(monkeypatc
     assert scheduler["error"] == "database unavailable"
     assert scheduler["checkpoint"]["heartbeat_age_seconds"] == 1203
     assert scheduler["updated_at"] is not None
+
+
+def test_background_runtime_tasks_expose_shared_heartbeat_contract(monkeypatch):
+    monkeypatch.setattr(task_center, "runtime_heartbeat_status", lambda: {
+        "redis_stream_worker": {
+            "healthy": True, "heartbeat_at": "2026-07-25T10:00:00+08:00",
+            "heartbeat_age_seconds": 2, "errors": 1, "started": "2026-07-25T09:00:00+08:00",
+        },
+        "daily_update_scheduler": {
+            "healthy": False, "heartbeat_at": "2026-07-25T09:00:00+08:00",
+            "heartbeat_age_seconds": 1200, "health_reason": "heartbeat_timeout", "started": "2026-07-24T09:00:00+08:00",
+        },
+    })
+    items = task_center._background_runtime_tasks()
+    worker = next(item for item in items if item["task_type"] == "redis_stream_worker_runtime")
+    daily = next(item for item in items if item["task_type"] == "daily_update_scheduler_runtime")
+    assert worker["status"] == "running"
+    assert worker["checkpoint"]["errors"] == 1
+    assert daily["status"] == "failed"
+    assert daily["error"] == "heartbeat_timeout"
+
+
+def test_model_data_backfill_is_visible_as_registered_checklist(monkeypatch):
+    monkeypatch.setattr(
+        task_center,
+        "get_plan_model_data_backfill_status",
+        lambda: {
+            "status": "running",
+            "raw_status": "running",
+            "work_order_id": "work-1",
+            "phase": "moneyflow",
+            "progress": 0.75,
+            "attempt": 1,
+            "max_attempts": 5,
+            "updated_at": "2026-07-29T20:13:23",
+            "checklist": [{
+                "label": "资金持续模型",
+                "status": "running",
+                "covered_raw_sessions": 1559,
+                "target_raw_sessions": 1607,
+            }],
+            "intervention": {"current": "系统自行处理，无需人工操作"},
+        },
+    )
+
+    result = task_center._model_data_backfill_task()
+
+    assert result is not None
+    assert result["task_type"] == "plan_model_data_backfill"
+    assert result["status"] == "running"
+    assert result["progress"] == 0.75
+    assert "1,559/1,607" in result["current_step"]
+    assert result["checkpoint"]["work_order_id"] == "work-1"
