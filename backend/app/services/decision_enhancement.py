@@ -153,13 +153,12 @@ def candidate_shadow_ab_status() -> dict[str, Any]:
         latest = item.get("latest_version") or {}
         active = item.get("active_version") or {}
         latest_metrics = latest.get("metrics") or {}
-        active_metrics = active.get("metrics") or {}
         sessions = int(_num((latest.get("validation") or {}).get("live_observation_sessions"), _num((latest.get("validation") or {}).get("history_sessions"), 0)))
-        challenger_wf = _num(latest_metrics.get("walk_forward_lift"), _num(latest_metrics.get("lift"), 0))
-        champion_wf = _num(active_metrics.get("walk_forward_lift"), _num(active_metrics.get("lift"), 0))
+        strategy_impact = latest_metrics.get("strategy_impact_ab")
+        strategy_impact = strategy_impact if isinstance(strategy_impact, dict) else {}
         ready = sessions >= 20
-        delta = round(challenger_wf - champion_wf, 6)
-        recommendation = "approve_review" if ready and delta >= 0 else "reject_or_retrain" if ready else "observe"
+        strategy_passed = str(strategy_impact.get("status") or "") == "passed"
+        recommendation = "ready_for_governance" if ready and strategy_passed else "observe"
         items.append({
             "model_key": item.get("model_key"),
             "name": item.get("name"),
@@ -167,13 +166,21 @@ def candidate_shadow_ab_status() -> dict[str, Any]:
             "challenger_version": latest.get("version"),
             "observation_sessions": sessions,
             "minimum_sessions": 20,
-            "challenger_walk_forward_lift": challenger_wf,
-            "champion_walk_forward_lift": champion_wf,
-            "delta": delta,
+            "controlled_strategy_ab_status": str(
+                strategy_impact.get("status") or "not_run"
+            ),
+            "mean_return_delta": strategy_impact.get("mean_return_delta"),
             "recommendation": recommendation,
             "status": "review_ready" if ready else "shadow_running",
         })
-    return {"ok": True, "policy": "候选模型每天影子打分，满 20 个交易日且不弱于生产模型才建议人工替换。", "items": items}
+    return {
+        "ok": True,
+        "policy": (
+            "候选模型先通过任务原生 OOS 和冻结策略 A/B，再累计至少 "
+            "20 个交易日影子证据。"
+        ),
+        "items": items,
+    }
 
 
 def revenue_target_dashboard(

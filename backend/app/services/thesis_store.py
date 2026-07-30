@@ -110,14 +110,17 @@ def update_hypothesis(hypothesis_id: int, *, status: str, evidence: list[dict[st
     return result
 
 
-def review_thesis(thesis_id: int) -> dict[str, Any] | None:
+def review_thesis(thesis_id: int, *, as_of_time: str | None = None) -> dict[str, Any] | None:
     """Re-evaluate machine-checkable hypotheses from point-in-time research facts."""
     thesis = get_thesis(thesis_id)
     if not thesis:
         return None
     from app.services.research_engine import build_stock_research
 
-    research = build_stock_research(str(thesis["ts_code"]), persist=True)
+    research_kwargs: dict[str, Any] = {"persist": True}
+    if as_of_time is not None:
+        research_kwargs["as_of_time"] = as_of_time
+    research = build_stock_research(str(thesis["ts_code"]), **research_kwargs)
     metrics = research.get("raw_metrics") or {}
     evidence_base = research.get("evidence") or []
     for hypothesis in thesis.get("hypotheses") or []:
@@ -144,7 +147,15 @@ def review_thesis(thesis_id: int) -> dict[str, Any] | None:
         update_hypothesis(
             int(hypothesis["id"]),
             status=status,
-            evidence=(prior_evidence[-19:] + [{"metric": metric, "value": value, "expected": expected, "reason": reason, "sources": evidence_base, "checked_at": _now()}]),
+            evidence=(prior_evidence[-19:] + [{
+                "metric": metric,
+                "value": value,
+                "expected": expected,
+                "reason": reason,
+                "sources": evidence_base,
+                "checked_at": _now(),
+                "evidence_as_of_time": as_of_time,
+            }]),
         )
     return get_thesis(thesis_id)
 
@@ -180,12 +191,17 @@ def review_due_theses(*, limit: int = 100, review_interval_days: int = 30) -> di
     return {"ok": not failed, "due": len(rows), "reviewed": reviewed, "failed": failed, "next_review_interval_days": max(1, int(review_interval_days))}
 
 
-def generate_thesis_for_stock(ts_code: str, *, force: bool = False) -> dict[str, Any]:
+def generate_thesis_for_stock(
+    ts_code: str, *, force: bool = False, as_of_time: str | None = None,
+) -> dict[str, Any]:
     """Create or refresh a falsifiable system thesis from authoritative research facts."""
     from app.services.research_engine import build_stock_research
 
     code = str(ts_code).strip().upper()
-    research = build_stock_research(code, persist=True)
+    research_kwargs: dict[str, Any] = {"persist": True}
+    if as_of_time is not None:
+        research_kwargs["as_of_time"] = as_of_time
+    research = build_stock_research(code, **research_kwargs)
     if not research.get("ok"):
         return {"ok": False, "ts_code": code, "status": "blocked", "reason": research.get("reason") or "research_unavailable"}
     if not research.get("risk", {}).get("eligible"):
@@ -203,7 +219,10 @@ def generate_thesis_for_stock(ts_code: str, *, force: bool = False) -> dict[str,
         }
     existing = [item for item in all_existing if item.get("derived_status") != "invalidated"]
     if existing and not force:
-        reviewed = review_thesis(int(existing[0]["id"]))
+        reviewed = (
+            review_thesis(int(existing[0]["id"]), as_of_time=as_of_time)
+            if as_of_time is not None else review_thesis(int(existing[0]["id"]))
+        )
         return {"ok": True, "ts_code": code, "status": "reviewed_existing", "created": False, "item": reviewed}
 
     metrics = research.get("raw_metrics") or {}
@@ -235,8 +254,19 @@ def generate_thesis_for_stock(ts_code: str, *, force: bool = False) -> dict[str,
         "next_review_at": datetime.now().isoformat(timespec="seconds"),
         "hypotheses": hypotheses,
     })
-    reviewed = review_thesis(int(item["id"]))
-    return {"ok": True, "ts_code": code, "status": "created_and_reviewed", "created": True, "item": reviewed, "ready_dimensions": ready}
+    reviewed = (
+        review_thesis(int(item["id"]), as_of_time=as_of_time)
+        if as_of_time is not None else review_thesis(int(item["id"]))
+    )
+    return {
+        "ok": True,
+        "ts_code": code,
+        "status": "created_and_reviewed",
+        "created": True,
+        "item": reviewed,
+        "ready_dimensions": ready,
+        "evidence_as_of_time": as_of_time,
+    }
 
 
 def generate_watch_pool_theses(*, limit: int = 100) -> dict[str, Any]:

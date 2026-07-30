@@ -8,13 +8,37 @@ def test_training_protocol_blocks_missing_purge_and_embargo():
         "model_key": "medium_horizon_lambdarank_v1",
         "calendar": {"train_sessions": 756, "validation_sessions": 126, "test_sessions": 126},
         "oos_windows": 5,
-        "cost_after_labels": True,
-        "baseline_compared": True,
+        "model_evaluation_contract": "alis_task_native_model_evaluation_v1",
+        "task_native_metrics_recorded": True,
+        "task_baseline_comparison_executed": True,
     })
 
     assert result["ok"] is False
     assert "purge_sessions" in result["blocked_reasons"]
     assert "embargo_sessions" in result["blocked_reasons"]
+
+
+def test_training_protocol_does_not_confuse_baseline_loss_with_protocol_failure():
+    result = validate_training_run_manifest({
+        "model_key": "medium_horizon_lambdarank_v1",
+        "calendar": {
+            "train_sessions": 756,
+            "validation_sessions": 126,
+            "test_sessions": 126,
+            "purge_sessions": 60,
+            "embargo_sessions": 5,
+        },
+        "oos_windows": 5,
+        "model_evaluation_contract": "alis_task_native_model_evaluation_v1",
+        "task_native_metrics_recorded": True,
+        "task_baseline_comparison_executed": True,
+        "task_baseline_outperformed": False,
+        "calibration_checked": True,
+    })
+
+    assert result["ok"] is True
+    assert result["task_outcome_observations"]["task_baseline_outperformed"] is False
+    assert "task_baseline_outperformed" not in result["blocked_reasons"]
 
 
 def test_feature_contract_requires_source_time_and_blocks_low_coverage():
@@ -42,13 +66,12 @@ def test_evidence_binding_registry_maps_contract_fields_to_models():
 
 def test_model_output_normalization_enforces_required_fields():
     result = normalize_model_output("capital_persistence_multitask_v1", {
-        "direction_probability_3d": .62,
-        "direction_probability_5d": .60,
-        "flow_ratio_p50": .03,
+        "direction_probability": .62,
+        "strength_p50": .03,
     })
 
     assert result["ok"] is False
-    assert "flow_ratio_p10" in result["missing_fields"]
+    assert "strength_p10" in result["missing_fields"]
     assert result["fallback"] == "capital_persistence_proxy_v1"
 
 

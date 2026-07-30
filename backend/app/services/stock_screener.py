@@ -17,24 +17,29 @@ from app.services.research_engine import build_stock_research, score_dimension
 from app.services.decision_store import upsert_pool_member, list_pool_members, transition_pool_member
 from app.services.thesis_store import generate_thesis_for_stock
 from app.services.operations_overview import build_live_portfolio_risk
+from app.core.trade_calendar import get_last_trade_date
+from app.services.point_in_time import signal_available_time
 
 
-def _get_stock_universe() -> list[dict[str, Any]]:
+def _get_stock_universe(trade_date: str) -> list[dict[str, Any]]:
     """Get all investable stocks with financial data, excluding ST."""
+    cutoff = signal_available_time(trade_date)
+    compact_date = str(trade_date).replace("-", "")[:8]
     with data_conn() as c:
         rows = [dict(row) for row in c.execute("""
             SELECT m.ts_code, m.name, m.industry,
                    s.close, s.pe_ttm, s.pb, s.total_mv, s.turnover
             FROM dc_stock_master m
             LEFT JOIN dc_stock_daily_snapshot s ON s.ts_code = m.ts_code
-                AND s.trade_date = (SELECT MAX(trade_date) FROM dc_stock_daily_snapshot)
+                AND s.trade_date = ? AND s.available_time <= ?
             WHERE m.industry IS NOT NULL AND m.industry != ''
               AND position('ST' in m.name) = 0
               AND position('退市' in m.name) = 0
               AND EXISTS (SELECT 1 FROM dc_tushare_raw_records fin
-                          WHERE fin.ts_code = m.ts_code AND fin.api_name='income')
+                          WHERE fin.ts_code = m.ts_code AND fin.api_name='income'
+                            AND fin.available_time <= ?)
             ORDER BY COALESCE(s.total_mv, 0) DESC
-        """).fetchall()]
+        """, (compact_date, cutoff, cutoff)).fetchall()]
     return rows
 
 
@@ -82,13 +87,23 @@ def _prefilter(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return sorted(scored, key=lambda x: x["pre_score"], reverse=True)
 
 
-def run_daily_screener(*, top_n: int = 300, research_limit: int = 100) -> dict[str, Any]:
+def run_daily_screener(
+    *,
+    top_n: int = 300,
+    research_limit: int = 100,
+    trade_date: str | None = None,
+) -> dict[str, Any]:
     """Full daily stock selection pipeline."""
     now = datetime.now().isoformat(timespec="seconds")
+    target_date = str(
+        trade_date
+        or get_last_trade_date(for_data_availability=True).strftime("%Y%m%d")
+    ).replace("-", "")[:8]
+    cutoff = signal_available_time(target_date)
     errors = []
 
     # Step 1: Get all stocks
-    universe = _get_stock_universe()
+    universe = _get_stock_universe(target_date)
     print(f"  总股票池: {len(universe)} 只")
 
     # Step 2: Pre-filter
@@ -103,7 +118,7 @@ def run_daily_screener(*, top_n: int = 300, research_limit: int = 100) -> dict[s
         stock = candidate["stock"]
         code = stock["ts_code"]
         try:
-            result = build_stock_research(code, persist=True)
+            result = build_stock_research(code, persist=True, as_of_time=cutoff)
             if not result.get("ok"):
                 continue
             rs = result.get("research_state", {})
@@ -176,4 +191,6 @@ def run_daily_screener(*, top_n: int = 300, research_limit: int = 100) -> dict[s
         },
         "errors": errors[:10],
         "timestamp": now,
+        "trade_date": target_date,
+        "data_cutoff": cutoff,
     }

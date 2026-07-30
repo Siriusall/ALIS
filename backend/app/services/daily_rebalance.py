@@ -25,11 +25,14 @@ from app.services.thesis_store import list_theses
 from app.services.decision_store import list_pool_members
 from app.core.a_share_fees import is_exchange_etf
 from app.services.defensive_assets import defensive_asset_bar
+from app.services.point_in_time import signal_available_time
 
 
 def _current_price(symbol: str, trade_date: str | None = None) -> float | None:
     """Get latest close price from snapshot."""
     code = symbol.strip().upper()
+    compact_date = str(trade_date or "").replace("-", "")[:8]
+    cutoff = signal_available_time(compact_date) if compact_date else ""
     if is_exchange_etf(code):
         ts_code = code if code.endswith((".SH", ".SZ")) else f"{code}.SH"
         bar = defensive_asset_bar(ts_code, trade_date or datetime.now().strftime("%Y%m%d"))
@@ -48,18 +51,22 @@ def _current_price(symbol: str, trade_date: str | None = None) -> float | None:
     if not code.endswith(".SH") and not code.endswith(".SZ"):
         for suffix in (".SH", ".SZ"):
             with data_conn() as c:
-                row = c.execute(
-                    "SELECT close FROM dc_stock_daily_snapshot WHERE ts_code=? ORDER BY trade_date DESC LIMIT 1",
-                    (f"{code}{suffix}",)
-                ).fetchone()
+                sql = "SELECT close FROM dc_stock_daily_snapshot WHERE ts_code=?"
+                params: tuple[Any, ...] = (f"{code}{suffix}",)
+                if compact_date:
+                    sql += " AND trade_date<=? AND available_time<=?"
+                    params += (compact_date, cutoff)
+                row = c.execute(sql + " ORDER BY trade_date DESC LIMIT 1", params).fetchone()
                 if row:
                     return float(dict(row).get("close") or 0) or None
         return None
     with data_conn() as c:
-        row = c.execute(
-            "SELECT close FROM dc_stock_daily_snapshot WHERE ts_code=? ORDER BY trade_date DESC LIMIT 1",
-            (code,)
-        ).fetchone()
+        sql = "SELECT close FROM dc_stock_daily_snapshot WHERE ts_code=?"
+        params = (code,)
+        if compact_date:
+            sql += " AND trade_date<=? AND available_time<=?"
+            params += (compact_date, cutoff)
+        row = c.execute(sql + " ORDER BY trade_date DESC LIMIT 1", params).fetchone()
         return float(dict(row).get("close") or 0) if row else None
 
 

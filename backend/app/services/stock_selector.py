@@ -15,6 +15,8 @@ def select_affordable_stocks(
     limit: Optional[int] = None,
     max_one_lot_cost: Optional[float] = None,
     exchange: Optional[str] = None,
+    *,
+    allow_realtime_fallback: bool = False,
 ) -> List[StockQuote]:
     """
     获取可参与筛选的 A 股（真实行情）。
@@ -44,7 +46,7 @@ def select_affordable_stocks(
                 )
     except Exception:
         quotes = []
-    if not quotes:
+    if not quotes and allow_realtime_fallback:
         quotes = fetch_a_share_spot(limit=limit)
 
     out = [q for q in quotes if q.price > 1.0]

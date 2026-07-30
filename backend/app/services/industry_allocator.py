@@ -101,7 +101,10 @@ def build_industry_allocation(
         narrative = narrative_by_industry.get(industry) or {}
         narrative_score = float(narrative.get("score") or 0)
         narrative_lifecycle = str(narrative.get("lifecycle") or "无主线")
-        narrative_promotable = bool(narrative.get("promotable")) and narrative_lifecycle not in {"退潮", "沉寂"}
+        narrative_promotable = (
+            bool(narrative.get("promotable"))
+            and narrative_lifecycle not in {"衰退", "退潮", "沉寂"}
+        )
         members = candidates_by_industry.get(industry, [])
         member_scores = [score_by_symbol.get(item["symbol"], 0.0) for item in members if item["symbol"] in score_by_symbol]
         selection_score = sum(member_scores) / len(member_scores) if member_scores else 0.0
@@ -141,6 +144,7 @@ def build_industry_allocation(
     allocated = round(sum(targets.values()), 6)
     return {
         "ok": bool(rows),
+        "schema_version": "alis_industry_allocation_v1",
         "as_of_time": as_of_time or "",
         "market_state": market_state,
         "weak_market": weak_market,

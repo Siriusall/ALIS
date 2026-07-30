@@ -44,7 +44,7 @@ def test_decision_gate_can_continue_after_latest_trade_day_contract_is_ready():
     assert gate["reason_code"] == "ready"
 
 
-def test_decision_gate_and_worker_contract_block_rule_fallback_without_active_model():
+def test_retired_generic_model_gate_cannot_block_unified_decision_chain():
     gate = decision._build_gate_decision(
         data_health={"issues": []},
         latest_data_contract={"ok": True, "latest_trade_date": "20260717", "missing_apis": [], "snapshot_ready": True},
@@ -53,11 +53,11 @@ def test_decision_gate_and_worker_contract_block_rule_fallback_without_active_mo
         market_overview={"ok": True, "position_gate": {"allow_new_exposure": True}, "market_state": {"state": "S1"}},
     )
 
-    assert gate["tone"] == "hold"
-    assert gate["reason_code"] == "paused_model_not_ready"
+    assert gate["tone"] == "go"
+    assert gate["reason_code"] == "ready"
 
 
-def test_bootstrap_production_model_unblocks_selection_chain():
+def test_retired_generic_model_gate_delegates_to_unified_contract():
     pause = decision.evaluate_model_readiness_gate({"active_version": {
         "id": 5, "is_active": True,
         "validation": {
@@ -69,6 +69,8 @@ def test_bootstrap_production_model_unblocks_selection_chain():
     }})
 
     assert pause.should_pause is False
+    assert pause.code == "unified_model_contract_delegated"
+    assert pause.evidence["legacy_main_model_authority"] is False
 
 
 def test_decision_gate_blocks_new_exposure_when_equity_exceeds_effective_budget():

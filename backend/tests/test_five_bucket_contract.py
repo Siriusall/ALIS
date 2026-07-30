@@ -12,11 +12,13 @@ def test_target_weight_contract_contains_plan_required_fields():
         evidence={"narrative_lifecycle": "扩散", "capital_persistence": .62},
     )
 
-    assert contract["schema_version"] == "five_bucket_target_weight_contract_v1"
+    assert contract["schema_version"] == "function_bucket_attribution_contract_v2"
     assert contract["function_bucket"] == "leader"
     assert contract["return_source"]
     assert contract["holding_period"]
-    assert contract["funding_confirmation"] == "已确认"
+    assert contract["funding_confirmation"] == "规则代理偏强"
+    assert "bucket_target_weight" not in contract
+    assert "bucket_range" not in contract
     assert contract["exit_conditions"]
     assert contract["data_status"] == "ready"
     assert contract["evidence_quality"] in {"proxy_backed", "hybrid", "model_backed"}
@@ -33,6 +35,7 @@ def test_bucket_summary_groups_stable_and_offensive_budget():
 
     assert summary["risk_groups"]["stable"] == .2
     assert summary["risk_groups"]["offensive"] == .1
+    assert all("target" not in item and "range" not in item and "status" not in item for item in summary["buckets"].values())
 
 
 def test_allocator_attaches_contract_to_planned_buy_order():
@@ -44,5 +47,5 @@ def test_allocator_attaches_contract_to_planned_buy_order():
     )
 
     assert not blocked
-    assert planned[0].target_weight_contract["schema_version"] == "five_bucket_target_weight_contract_v1"
+    assert planned[0].target_weight_contract["schema_version"] == "function_bucket_attribution_contract_v2"
     assert planned[0].target_weight_contract["target_weight"] > 0

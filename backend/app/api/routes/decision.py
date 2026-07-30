@@ -418,11 +418,6 @@ def _risk_gate_explanation(
         constraints.append("不根据不完整收盘数据新增仓位")
         plan.append({"step": "等待数据", "detail": "日更任务会继续复核最新交易日行情、估值和涨跌停数据"})
         release.append("最新交易日 daily/daily_basic/stk_limit 和快照全部入库")
-    if not model_status.get("active_version"):
-        reasons.append({"level": "block", "title": "生产模型未接管", "detail": "当前没有可用于正式决策的 active 模型版本"})
-        constraints.append("不允许生产模型缺位时自动新增风险敞口")
-        plan.append({"step": "模型治理", "detail": "等待候选模型完成验证并通过上线控制"})
-        release.append("模型治理页存在 active production 版本")
     if not bool(position_gate.get("allow_new_exposure", True)):
         breaches = [str(item.get("message") or item.get("code") or "") for item in (portfolio_risk.get("breaches") or []) if item]
         reasons.append({
