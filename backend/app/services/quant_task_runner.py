@@ -56,6 +56,12 @@ _AUTO_SIMULATION_CLOSE_TIME = dtime(
 _auto_scheduler_started = False
 
 
+def _trade_date_key(value: object) -> str:
+    """Normalize supported trade-date representations for identity checks."""
+    normalized = str(value or "").strip().replace("-", "")[:8]
+    return normalized if len(normalized) == 8 and normalized.isdigit() else ""
+
+
 def _refresh_performance_reports(task_id: int) -> None:
     """Refresh persisted period reports after a batch is durably written.
 
@@ -253,6 +259,15 @@ def start_auto_simulation_scheduler() -> bool:
                 close_time = effective_rebalance_clock()
                 if now.weekday() < 5 and now.time() >= close_time:
                     target, data_ready = _ensure_close_data_ready()
+                    from app.services.profit_loop import mark_missed_daily_rebalance_execution_inputs
+
+                    missed_count = mark_missed_daily_rebalance_execution_inputs(target)
+                    if missed_count:
+                        logger.error(
+                            "正式调仓计划错过冻结执行日，已转审计终态 target=%s count=%s",
+                            target,
+                            missed_count,
+                        )
                     if not data_ready:
                         # Do not execute against the latest *old* slice while
                         # the target-day market bundle is still being fetched.
@@ -260,7 +275,8 @@ def start_auto_simulation_scheduler() -> bool:
                         continue
                     dates = list_consolidated_trade_dates()
                     latest = str(dates[-1]) if dates else ""
-                    if latest != target:
+                    target_key = _trade_date_key(target)
+                    if not target_key or _trade_date_key(latest) != target_key:
                         logger.warning("收盘日更已通过但合并行情尚未就绪 target=%s latest=%s", target, latest)
                         threading.Event().wait(_AUTO_SIMULATION_INTERVAL_SEC)
                         continue

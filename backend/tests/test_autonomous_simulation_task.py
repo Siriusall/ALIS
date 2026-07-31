@@ -89,6 +89,12 @@ def test_autonomous_plan_uses_only_plan_due_on_latest_session(monkeypatch):
     assert plan["current_execute_date"] == "2026-07-27"
 
 
+def test_trade_date_identity_accepts_compact_and_hyphenated_values():
+    assert runner._trade_date_key("20260730") == "20260730"
+    assert runner._trade_date_key("2026-07-30") == "20260730"
+    assert runner._trade_date_key("not-a-date") == ""
+
+
 def test_autonomous_plan_never_executes_stale_plan_late(monkeypatch):
     monkeypatch.setattr(
         "app.services.profit_loop.list_pending_daily_rebalance_execution_inputs",

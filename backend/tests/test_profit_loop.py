@@ -253,6 +253,42 @@ def test_formal_plan_can_only_be_claimed_once(monkeypatch):
     assert state == {"status": "executing", "token": "task-1"}
 
 
+def test_missed_formal_plans_leave_pending_state_and_cannot_execute_late(monkeypatch):
+    captured = {}
+    state = {"status": "planned"}
+
+    class Result(_Rows):
+        rowcount = 1
+
+    @contextmanager
+    def fake_conn():
+        class Conn:
+            def execute(self, sql, params=()):
+                captured["sql"] = sql
+                captured["params"] = params
+                if "SET status='missed_execution_window'" in sql:
+                    state["status"] = "missed_execution_window"
+                if sql.lstrip().startswith("SELECT * FROM daily_rebalance_plans"):
+                    return Result([] if state["status"] != "planned" else [{"id": 1}])
+                return Result([])
+
+        yield Conn()
+
+    monkeypatch.setattr(profit_loop, "_ensure_tables", lambda: None)
+    monkeypatch.setattr(profit_loop, "business_conn", fake_conn)
+
+    changed = profit_loop.mark_missed_daily_rebalance_execution_inputs("2026-07-30")
+    claimed = profit_loop.claim_daily_rebalance_execution_input(
+        "20260728",
+        "20260729",
+        claim_token="late-task",
+    )
+
+    assert changed == 1
+    assert state["status"] == "missed_execution_window"
+    assert claimed is None
+
+
 def test_invalid_unified_contract_never_transitions_plan_to_executing(monkeypatch):
     state = {"status": "planned", "update_attempted": False}
     contract = {

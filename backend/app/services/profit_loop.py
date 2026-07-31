@@ -1333,6 +1333,7 @@ def materialize_daily_rebalance_plan(portfolio: dict[str, Any] | None = None) ->
     row_blocked_reason = {
         "executing": "正式调仓计划已被执行器领取，正在原子落账",
         "blocked_by_execution_recovery": "上次执行中断；为防止重复成交，已隔离并等待账本复核",
+        "missed_execution_window": "已错过冻结的 T+1 执行日；仅保留审计证据，禁止跨日补成交",
     }.get(row_status, "" if execution_authorized else blocked_reason)
     return {
         "id": int(row["id"]),
@@ -1503,6 +1504,30 @@ def list_pending_daily_rebalance_execution_inputs() -> list[dict[str, str]]:
     return list(latest_by_signal.values())
 
 
+def mark_missed_daily_rebalance_execution_inputs(current_execute_date: str) -> int:
+    """Close plans whose exact frozen execution session has already passed.
+
+    A missed T+1 plan is audit evidence, not a catch-up order. Keeping it in
+    ``planned`` would falsely advertise an executable action and lets stale
+    rows accumulate indefinitely.
+    """
+    _ensure_tables()
+    current = str(current_execute_date or "").replace("-", "")[:8]
+    if len(current) != 8 or not current.isdigit():
+        return 0
+    with business_conn() as c:
+        changed = c.execute(
+            """UPDATE daily_rebalance_plans
+               SET status='missed_execution_window',
+                   execution_claim_token='',execution_claimed_at=NULL
+               WHERE status='planned'
+                 AND COALESCE(planned_execute_date,'')<>''
+                 AND replace(planned_execute_date,'-','')<?""",
+            (current,),
+        )
+    return int(getattr(changed, "rowcount", 0) or 0)
+
+
 def release_daily_rebalance_execution_claim(signal_date: str, *, claim_token: str, reason: str) -> bool:
     signal = str(signal_date or "").replace("-", "")[:8]
     with business_conn() as c:
@@ -1564,6 +1589,7 @@ def get_latest_daily_rebalance_plan(trade_date: str = "") -> dict[str, Any]:
             "blocked_by_optimizer": "组合优化没有形成安全可执行解",
             "blocked_by_execution_checks": "执行前置检查未全部通过",
             "blocked_by_execution_recovery": "上次执行在成交与任务确认之间中断；为防止重复成交，已隔离并等待账本复核",
+            "missed_execution_window": "已错过冻结的 T+1 执行日；仅保留审计证据，禁止跨日补成交",
         }.get(str(item.get("status") or ""), ""),
         "proposal": contract.get("proposal") or [],
         "risk_budget": contract.get("risk_budget") or {},
