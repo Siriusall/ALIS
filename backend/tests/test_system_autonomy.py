@@ -220,6 +220,43 @@ def test_autonomy_runs_production_decision_when_experiments_are_not_ready(monkey
     assert steps["factor_daily_cycle"]["result"]["status"] == "observing"
 
 
+def test_autonomy_freezes_production_plan_before_long_experiments(monkeypatch):
+    invoked = []
+
+    def controlled_run_step(name, fn):
+        invoked.append(name)
+        if name == "hard_data_gate":
+            result = {"ok": True, "status": "ready"}
+        elif name == "decision_data_gate":
+            result = {
+                "ok": True,
+                "status": "ready",
+                "decision_ready": True,
+                "experiment_ready": True,
+            }
+        elif name == "autonomous_self_healing":
+            result = {"ok": True, "status": "completed", "components": {}}
+        elif name == "llm_incident_supervisor":
+            result = {"ok": True, "status": "self_managed", "owner_action_required_count": 0}
+        else:
+            result = {"ok": True, "status": "completed"}
+        return {"name": name, "ok": True, "result": result, "health": {"status": "healthy"}}
+
+    monkeypatch.setattr(system_autonomy, "_run_step", controlled_run_step)
+    monkeypatch.setattr(
+        "app.services.production_strategy.champion_execution_gate",
+        lambda: {"status": "allowed", "mode": "normal"},
+    )
+
+    system_autonomy.run_system_autonomy_cycle()
+
+    assert invoked.index("execution_cost_calibration") < invoked.index("profit_and_portfolio")
+    assert invoked.index("simulation_corporate_actions") < invoked.index("profit_and_portfolio")
+    assert invoked.index("simulation_ledger_audit") < invoked.index("profit_and_portfolio")
+    assert invoked.index("profit_and_portfolio") < invoked.index("factor_daily_cycle")
+    assert invoked.index("profit_and_portfolio") < invoked.index("plan_model_autonomy")
+
+
 def _slo_task(task_id: int, trade_date: str, *, status: str = "completed", cash_drift: float = 0.0) -> dict:
     return {
         "id": task_id, "task_type": "system_autonomy_cycle", "status": status,
