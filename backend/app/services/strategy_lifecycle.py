@@ -42,6 +42,58 @@ def _date_key(value: Any) -> str:
     return str(value or "").replace("-", "")[:8]
 
 
+def _formal_reference_controller_key(
+    item: dict[str, Any] | None,
+    reference: dict[str, Any],
+) -> str:
+    item = item if isinstance(item, dict) else {}
+    controller_id = int(
+        item.get("controller_version_id")
+        or reference.get("strategy_controller_version_id")
+        or 0
+    )
+    controller_name = str(reference.get("strategy_controller_version") or "")
+    numeric_name_id = int(controller_name) if controller_name.isdigit() else 0
+    lookup_id = controller_id or numeric_name_id
+    if lookup_id:
+        version = get_model_version(lookup_id) or {}
+        if str(version.get("model_key") or "") == "strategy_controller":
+            resolved_name = str(version.get("version") or "")
+            if resolved_name:
+                return f"version:{resolved_name}"
+        if controller_name and not controller_name.isdigit():
+            return f"version:{controller_name}"
+        return f"id:{lookup_id}"
+    return f"version:{controller_name}" if controller_name else ""
+
+
+def _formal_references_compatible(
+    left_item: dict[str, Any] | None,
+    left_reference: dict[str, Any] | None,
+    right_item: dict[str, Any] | None,
+    right_reference: dict[str, Any] | None,
+) -> bool:
+    if not isinstance(left_reference, dict) or not isinstance(right_reference, dict):
+        return False
+    controller_fields = {
+        "strategy_controller_version_id",
+        "strategy_controller_version",
+    }
+    left_core = {
+        key: value for key, value in left_reference.items()
+        if key not in controller_fields
+    }
+    right_core = {
+        key: value for key, value in right_reference.items()
+        if key not in controller_fields
+    }
+    if left_core != right_core:
+        return False
+    left_controller = _formal_reference_controller_key(left_item, left_reference)
+    right_controller = _formal_reference_controller_key(right_item, right_reference)
+    return bool(left_controller and left_controller == right_controller)
+
+
 def _merge_validation(model_version_id: int, **updates: Any) -> dict[str, Any]:
     version = get_model_version(int(model_version_id)) or {}
     current = version.get("validation") if isinstance(version.get("validation"), dict) else {}
@@ -114,7 +166,12 @@ def formal_candidate_gate(
     champion_summary = champion.get("summary") if champion and isinstance(champion.get("summary"), dict) else {}
     candidate_reference = candidate.get("reference_contract") if isinstance(candidate.get("reference_contract"), dict) else None
     champion_reference = champion.get("reference_contract") if champion and isinstance(champion.get("reference_contract"), dict) else None
-    reference_compatible = bool(candidate_reference and champion_reference and candidate_reference == champion_reference)
+    reference_compatible = _formal_references_compatible(
+        candidate,
+        candidate_reference,
+        champion,
+        champion_reference,
+    )
 
     def metric(summary: dict[str, Any], key: str) -> float | None:
         if key not in summary or summary.get(key) is None:
@@ -143,7 +200,12 @@ def formal_candidate_gate(
     compatible_baselines = [
         item for item in baseline_rows
         if isinstance(item, dict)
-        and item.get("reference_contract") == candidate_reference
+        and _formal_references_compatible(
+            candidate,
+            candidate_reference,
+            item,
+            item.get("reference_contract"),
+        )
         and metric(item.get("summary") if isinstance(item.get("summary"), dict) else {}, "aggregate_cost_after_return") is not None
     ]
     required_baseline_keys = {"multifactor_equal_weight", "simple_momentum"}
@@ -199,7 +261,9 @@ def formal_candidate_gate(
             and (champion_fees <= 0 or candidate_fees <= max(champion_fees * 1.5, champion_fees + 500.0))
         ),
     }
-    if not reference_ready or not opportunity_cost_reference_ready:
+    if str(candidate.get("status") or "") == "failed":
+        decision = "rejected"
+    elif not reference_ready or not opportunity_cost_reference_ready:
         decision = "blocked_by_reference"
     elif str(candidate.get("status") or "") != "passed" or not candidate_metrics_complete:
         decision = "rejected"

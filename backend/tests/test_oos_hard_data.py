@@ -11,6 +11,16 @@ class FakeConn:
         return False
 
     def execute(self, sql, params=()):
+        if "api_name='index_daily'" in sql:
+            return FakeRows([
+                {
+                    "trade_date": value,
+                    "max_available_time": (
+                        f"{value[:4]}-{value[4:6]}-{value[6:]}T15:00:00"
+                    ),
+                }
+                for value in ("20260721", "20260722")
+            ])
         if "FROM dc_tushare_raw_records" in sql or "FROM dc_tushare_request_coverage" in sql:
             api = params[0] if params[0] in oos_hard_data.HARD_APIS else params[-1]
             dates = ["20260721", "20260722"] if api != "adj_factor" else ["20260721"]
@@ -90,6 +100,11 @@ def test_default_audit_keeps_last_complete_frozen_window_when_today_is_pending(m
         oos_hard_data,
         "_date_api_sets",
         lambda start, end: {api: set(complete) for api in oos_hard_data.HARD_APIS},
+    )
+    monkeypatch.setattr(
+        oos_hard_data,
+        "_benchmark_date_set",
+        lambda start, end: set(complete),
     )
     result = oos_hard_data.audit_oos_hard_data(include_dates=False)
     assert result["status"] == "ready"

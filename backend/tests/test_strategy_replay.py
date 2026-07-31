@@ -88,10 +88,54 @@ def test_strategy_replay_uses_t_plus_one_and_isolated_ledger(monkeypatch):
     assert result["summary"]["total_fees"] > 0
     assert result["decisions"][0]["data_cutoff"] == "2026-07-01T15:00:00"
     assert result["data_quality"]["point_in_time"]["passed"] is True
+    assert result["data_quality"]["benchmark"]["passed"] is True
+    assert result["data_quality"]["benchmark"]["observed_sessions"] == 3
     assert result["data_quality"]["point_in_time"]["audits"][0]["decision_cutoff"] == "2026-07-01T15:00:00"
     assert events[0]["completed_days"] == 0
     assert events[-1]["completed_days"] == 3
     assert events[-1]["progress"] == 1.0
+
+
+def test_strategy_replay_marks_carried_benchmark_as_incomplete(monkeypatch):
+    class MissingBenchmarkSource(FakeReplayDataSource):
+        def get_price_on_date(
+            self, symbol: str, date: str, field: str = "close"
+        ) -> float | None:
+            if symbol == "000300.SH" and date == "2026-07-03":
+                return None
+            return super().get_price_on_date(symbol, date, field)
+
+    monkeypatch.setattr(strategy_replay, "resolve_production_strategy_champion", lambda: {
+        "champion_id": 99,
+        "champion_version": "alis-champion-test",
+        "strategy_id": 1,
+        "strategy_controller_version_id": 31,
+        "strategy_controller_version": "controller-test",
+        "strategy_policy": {},
+    })
+    monkeypatch.setattr(strategy_replay, "get_strategy", lambda strategy_id: {
+        "id": strategy_id,
+        "name": "基准缺口测试策略",
+        "type": "formula",
+        "content": {
+            "score": {"factors": {"momentum_20": 1.0}},
+            "rebalance": {"freq": "daily", "top_n": 2},
+            "lookback_days": 30,
+        },
+    })
+
+    result = strategy_replay.run_strategy_replay(
+        strategy_id=1,
+        start_date="2026-07-01",
+        end_date="2026-07-03",
+        data_source=MissingBenchmarkSource(),
+    )
+
+    quality = result["data_quality"]["benchmark"]
+    assert quality["passed"] is False
+    assert quality["missing_sessions"] == 1
+    assert quality["missing_dates"] == ["2026-07-03"]
+    assert quality["carry_forward_for_display_only"] is True
 
 
 def test_replay_consumes_full_frozen_package_and_routes_model_evidence(monkeypatch):

@@ -107,7 +107,7 @@ def test_walk_forward_binds_champion_and_applies_promotion_gates(monkeypatch):
             "production_strategy_version": "champion-v1",
             "metrics": {"total_return": .02, "benchmark_return": .01, "excess_return": .01, "max_drawdown": -.03},
             "summary": {"total_fees": 20, "trading_days": len(test_dates), "decision_count": max(1, len(test_dates) - 1)}, "equity_series": equity,
-            "data_quality": {"point_in_time": {"passed": True}},
+            "data_quality": {"point_in_time": {"passed": True}, "benchmark": {"passed": True}},
         }
 
     state_cycle = ("S0", "S1", "S2", "S3")
@@ -120,6 +120,69 @@ def test_walk_forward_binds_champion_and_applies_promotion_gates(monkeypatch):
     assert result["status"] == "passed"
     assert result["production_strategy_version"] == "champion-v1"
     assert all(result["promotion_gates"].values())
+
+
+def test_walk_forward_blocks_any_window_with_incomplete_benchmark(monkeypatch):
+    dates = _dates(90)
+    monkeypatch.setattr(wf, "resolve_production_strategy_champion", lambda: {
+        "champion_id": 42,
+        "champion_version": "champion-v1",
+        "strategy_controller_version": "controller-v1",
+    })
+    calls = 0
+
+    def replay_runner(**kwargs):
+        nonlocal calls
+        calls += 1
+        test_dates = [
+            value for value in dates
+            if kwargs["start_date"] <= value <= kwargs["end_date"]
+        ]
+        return {
+            "production_strategy_version": "champion-v1",
+            "metrics": {
+                "total_return": .02,
+                "benchmark_return": .01,
+                "excess_return": .01,
+                "max_drawdown": -.03,
+            },
+            "summary": {
+                "total_fees": 20,
+                "trading_days": len(test_dates),
+                "decision_count": max(1, len(test_dates) - 1),
+            },
+            "equity_series": [
+                {"date": value, "total_value": 100_000 + index * 100}
+                for index, value in enumerate(test_dates)
+            ],
+            "data_quality": {
+                "point_in_time": {"passed": True},
+                "benchmark": {
+                    "passed": calls != 1,
+                    "missing_dates": [test_dates[-1]] if calls == 1 else [],
+                },
+            },
+        }
+
+    result = wf.run_purged_walk_forward_validation(
+        config=wf.WalkForwardConfig(
+            train_sessions=20,
+            validation_sessions=5,
+            test_sessions=8,
+            purge_sessions=2,
+            embargo_sessions=1,
+            step_sessions=8,
+            minimum_windows=5,
+        ),
+        data_source=FakeDates(dates),
+        replay_runner=replay_runner,
+        state_loader=lambda values: {},
+    )
+
+    assert result["status"] == "insufficient_data"
+    assert result["promotion_gates"]["benchmark_data_all_windows"] is False
+    assert result["windows"][0]["benchmark_data_complete"] is False
+    assert "benchmark_data_all_windows" in result["blocking_reasons"]
 
 
 def test_default_protocol_reports_insufficient_history_for_fewer_than_five_windows(monkeypatch):
@@ -145,7 +208,7 @@ def test_walk_forward_rejects_positive_but_economically_thin_excess(monkeypatch)
             "metrics": {"total_return": .0101, "benchmark_return": .01, "excess_return": .0001, "max_drawdown": -.01},
             "summary": {"total_fees": 1, "trading_days": len(test_dates), "decision_count": 1},
             "equity_series": [{"date": value, "total_value": 100_000 + index} for index, value in enumerate(test_dates)],
-            "data_quality": {"point_in_time": {"passed": True}},
+            "data_quality": {"point_in_time": {"passed": True}, "benchmark": {"passed": True}},
         }
 
     result = wf.run_purged_walk_forward_validation(
@@ -174,7 +237,14 @@ def test_preview_identifies_explicit_challenger(monkeypatch):
 def test_walk_forward_forwards_controller_candidate_without_rebinding_champion(monkeypatch):
     dates = _dates(90)
     monkeypatch.setattr(wf, "resolve_production_strategy_champion", lambda: {
-        "champion_id": 42, "champion_version": "champion-v1", "strategy_controller_version": "controller-v1", "strategy_id": 1,
+        "champion_id": 42, "champion_version": "champion-v1",
+        "strategy_controller_version_id": 31,
+        "strategy_controller_version": "controller-v1", "strategy_id": 1,
+    })
+    monkeypatch.setattr(wf, "get_model_version", lambda version_id: {
+        "id": version_id,
+        "model_key": "strategy_controller",
+        "version": "controller-candidate-v55",
     })
     seen: list[int | None] = []
 
@@ -185,7 +255,7 @@ def test_walk_forward_forwards_controller_candidate_without_rebinding_champion(m
             "production_strategy_version": "champion-v1", "metrics": {"total_return": .01, "benchmark_return": 0, "excess_return": .01, "max_drawdown": -.01},
             "summary": {"total_fees": 1, "trading_days": len(test_dates), "decision_count": 1},
             "equity_series": [{"date": value, "total_value": 100_000 + index} for index, value in enumerate(test_dates)],
-            "data_quality": {"point_in_time": {"passed": True}},
+            "data_quality": {"point_in_time": {"passed": True}, "benchmark": {"passed": True}},
         }
 
     result = wf.run_purged_walk_forward_validation(
@@ -195,14 +265,22 @@ def test_walk_forward_forwards_controller_candidate_without_rebinding_champion(m
     )
     assert seen == [55, 55]
     assert result["production_strategy_version"] == "champion-v1"
+    assert result["strategy_controller_version_id"] == 55
+    assert result["strategy_controller_version"] == "controller-candidate-v55"
 
 
 def test_walk_forward_forwards_complete_frozen_research_package(monkeypatch):
     dates = _dates(90)
     monkeypatch.setattr(wf, "resolve_production_strategy_champion", lambda: {
         "champion_id": 42, "champion_version": "champion-v1",
+        "strategy_controller_version_id": 31,
         "strategy_controller_version": "controller-v1", "strategy_id": 1,
         "factor_bindings": {}, "model_bindings": {}, "market_state_binding": {},
+    })
+    monkeypatch.setattr(wf, "get_model_version", lambda version_id: {
+        "id": version_id,
+        "model_key": "strategy_controller",
+        "version": "controller-candidate-v55",
     })
     seen: list[dict] = []
 
@@ -222,7 +300,7 @@ def test_walk_forward_forwards_complete_frozen_research_package(monkeypatch):
                 {"date": value, "total_value": 100_000 + index}
                 for index, value in enumerate(test_dates)
             ],
-            "data_quality": {"point_in_time": {"passed": True}},
+            "data_quality": {"point_in_time": {"passed": True}, "benchmark": {"passed": True}},
         }
 
     factor_bindings = {"momentum_20": {"definition_id": 1, "version": "v1"}}
@@ -278,7 +356,7 @@ def test_walk_forward_emits_window_progress_and_resumes_checkpoint(monkeypatch):
             "metrics": {"total_return": .01, "benchmark_return": 0, "excess_return": .01, "max_drawdown": -.01},
             "summary": {"total_fees": 1, "trading_days": len(test_dates), "decision_count": 1},
             "equity_series": [{"date": value, "total_value": 100_000 + index} for index, value in enumerate(test_dates)],
-            "data_quality": {"point_in_time": {"passed": True}},
+            "data_quality": {"point_in_time": {"passed": True}, "benchmark": {"passed": True}},
         }
 
     config = wf.WalkForwardConfig(

@@ -452,6 +452,8 @@ def run_strategy_replay(
     decisions: list[dict[str, Any]] = []
     equity_series: list[dict[str, Any]] = []
     benchmark_series: list[dict[str, Any]] = []
+    benchmark_observed_dates: list[str] = []
+    benchmark_missing_dates: list[str] = []
     pending: dict[str, Any] | None = None
     previous_rebalance: str | None = None
     benchmark_base: float | None = None
@@ -654,9 +656,11 @@ def run_strategy_replay(
         equity_series.append({"date": date, "total_value": round(total_value, 2), "cash": round(cash, 2), "stock_value": round(stock_value, 2), "by_symbol": by_symbol})
         benchmark_close = ds.get_price_on_date(benchmark_symbol, date, field="close")
         if benchmark_close and benchmark_close > 0:
+            benchmark_observed_dates.append(date)
             benchmark_base = benchmark_base or benchmark_close
             benchmark_value = initial_cash * benchmark_close / benchmark_base
         else:
+            benchmark_missing_dates.append(date)
             benchmark_value = benchmark_series[-1]["total_value"] if benchmark_series else initial_cash
         benchmark_series.append({"date": date, "total_value": round(float(benchmark_value), 2)})
         if (index + 1) % 10 == 0 or index + 1 == len(dates):
@@ -1047,6 +1051,16 @@ def run_strategy_replay(
         "data_quality": {
             "warnings": list(getattr(ds, "data_warnings", []))[:100],
             "fallback_events": list(getattr(ds, "fallback_events", []))[:100],
+            "benchmark": {
+                "schema_version": "strategy_replay_benchmark_coverage_v1",
+                "symbol": benchmark_symbol,
+                "required_sessions": len(dates),
+                "observed_sessions": len(benchmark_observed_dates),
+                "missing_sessions": len(benchmark_missing_dates),
+                "missing_dates": benchmark_missing_dates,
+                "passed": not benchmark_missing_dates,
+                "carry_forward_for_display_only": True,
+            },
             "point_in_time": {
                 "schema_version": "strategy_replay_point_in_time_audit_v1",
                 "passed": all(item.get("passed") for item in pit_audits),

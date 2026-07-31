@@ -130,6 +130,75 @@ def test_formal_gate_blocks_missing_or_mismatched_champion_reference():
     assert mismatched["decision"] == "blocked_by_reference"
 
 
+def test_formal_gate_accepts_legacy_controller_id_and_version_name_equivalence(
+    monkeypatch,
+):
+    monkeypatch.setattr(lifecycle, "get_model_version", lambda version_id: {
+        "id": version_id,
+        "model_key": "strategy_controller",
+        "version": "controller-v1",
+    })
+    candidate_reference = {
+        **_formal_reference(),
+        "strategy_controller_version": "31",
+    }
+    candidate = {
+        "status": "passed",
+        "controller_version_id": 31,
+        "reference_contract": candidate_reference,
+        "statistics": _formal_statistics(),
+        "summary": _candidate_summary(),
+    }
+    champion = {
+        "reference_contract": _formal_reference(),
+        "summary": {
+            "aggregate_cost_after_return": .08,
+            "worst_window_drawdown": -.10,
+            "total_fees": 700,
+        },
+    }
+
+    gate = lifecycle.formal_candidate_gate(
+        candidate,
+        champion,
+        opportunity_cost_baselines=_opportunity_cost_baselines(),
+        sealed_holdout=_passed_holdout(),
+    )
+
+    assert gate["decision"] == "eligible"
+    assert gate["gates"]["same_run_window_cost_reference"] is True
+    assert gate["gates"]["opportunity_cost_references_complete"] is True
+
+
+def test_formal_gate_rejects_failed_oos_before_reference_rerun():
+    candidate = {
+        "status": "failed",
+        "reference_contract": _formal_reference(cycle_task_id=2),
+        "summary": {
+            **_candidate_summary(),
+            "aggregate_cost_after_return": -.20,
+        },
+    }
+    champion = {
+        "reference_contract": _formal_reference(),
+        "summary": {
+            "aggregate_cost_after_return": .08,
+            "worst_window_drawdown": -.10,
+            "total_fees": 700,
+        },
+    }
+
+    gate = lifecycle.formal_candidate_gate(
+        candidate,
+        champion,
+        opportunity_cost_baselines=_opportunity_cost_baselines(),
+        sealed_holdout=_passed_holdout(),
+    )
+
+    assert gate["decision"] == "rejected"
+    assert gate["passed"] is False
+
+
 def test_formal_gate_preserves_candidate_when_multiple_testing_support_is_weak():
     candidate = {
         "status": "passed", "reference_contract": _formal_reference(),

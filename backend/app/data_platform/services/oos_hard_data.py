@@ -8,7 +8,7 @@ from typing import Any
 from app.data_platform.db import _conn
 from app.data_platform.services.market_calendar import target_trade_date
 
-CONTRACT_VERSION = "alis_oos_hard_data_v1"
+CONTRACT_VERSION = "alis_oos_hard_data_v2"
 TRAIN_SESSIONS = 756
 PURGE_SESSIONS = 20
 VALIDATION_SESSIONS = 126
@@ -21,6 +21,8 @@ MINIMUM_HARD_API_ROWS = 500
 MINIMUM_MARKET_FIELD_RATIO = 0.80
 PENDING_TRADE_DAY_BUFFER = 30
 HARD_APIS = ("daily", "daily_basic", "stk_limit", "adj_factor")
+BENCHMARK_INDEX_CODE = "000300.SH"
+BENCHMARK_API_KEY = f"index_daily:{BENCHMARK_INDEX_CODE}"
 REQUIRED_SESSIONS = (
     TRAIN_SESSIONS + PURGE_SESSIONS + VALIDATION_SESSIONS + EMBARGO_SESSIONS
     + TEST_SESSIONS + (MINIMUM_WINDOWS - 1) * STEP_SESSIONS
@@ -73,6 +75,26 @@ def _date_api_sets(start_date: str, end_date: str) -> dict[str, set[str]]:
     return result
 
 
+def _benchmark_date_set(start_date: str, end_date: str) -> set[str]:
+    with _conn() as conn:
+        rows = conn.execute(
+            """SELECT trade_date,MAX(available_time) AS max_available_time
+               FROM dc_tushare_raw_records
+               WHERE api_name='index_daily' AND ts_code=?
+                 AND trade_date BETWEEN ? AND ?
+               GROUP BY trade_date""",
+            (BENCHMARK_INDEX_CODE, start_date, end_date),
+        ).fetchall()
+    valid: set[str] = set()
+    for row in rows:
+        item = dict(row)
+        trade_date = str(item.get("trade_date") or "")
+        cutoff = f"{trade_date[:4]}-{trade_date[4:6]}-{trade_date[6:]}T15:00:00"
+        if trade_date and str(item.get("max_available_time") or "") <= cutoff:
+            valid.add(trade_date)
+    return valid
+
+
 def audit_oos_hard_data(*, end_date: str | None = None, include_dates: bool = True) -> dict[str, Any]:
     """Audit the latest contiguous protocol-sized calendar window.
 
@@ -92,6 +114,7 @@ def audit_oos_hard_data(*, end_date: str | None = None, include_dates: bool = Tr
         calendar_dates = list(reversed([str(dict(row).get("cal_date") or "") for row in calendar_rows]))
     start = calendar_dates[0] if calendar_dates else end
     api_dates = _date_api_sets(start, end)
+    benchmark_dates = _benchmark_date_set(start, end)
     with _conn() as conn:
         snapshot_rows = conn.execute(
             """SELECT trade_date,COUNT(*) AS rows_total,
@@ -110,6 +133,8 @@ def audit_oos_hard_data(*, end_date: str | None = None, include_dates: bool = Tr
         ratio = market_rows / rows_total if rows_total else 0.0
         cutoff = f"{trade_date[:4]}-{trade_date[4:6]}-{trade_date[6:]}T15:00:00"
         missing_apis = [api for api in HARD_APIS if trade_date not in api_dates[api]]
+        if trade_date not in benchmark_dates:
+            missing_apis.append(BENCHMARK_API_KEY)
         pit_ok = bool(snapshot.get("max_available_time")) and str(snapshot.get("max_available_time")) <= cutoff
         eligible = rows_total >= MINIMUM_DAILY_ROWS and ratio >= MINIMUM_MARKET_FIELD_RATIO and not missing_apis and pit_ok
         reasons = []
@@ -119,6 +144,8 @@ def audit_oos_hard_data(*, end_date: str | None = None, include_dates: bool = Tr
             reasons.append("market_fields_incomplete")
         if missing_apis:
             reasons.append("missing_hard_api_slices")
+        if BENCHMARK_API_KEY in missing_apis:
+            reasons.append("benchmark_index_missing")
         if not pit_ok:
             reasons.append("point_in_time_invalid")
         details.append({
@@ -159,8 +186,9 @@ def audit_oos_hard_data(*, end_date: str | None = None, include_dates: bool = Tr
         "required_sessions": REQUIRED_SESSIONS, "calendar_sessions": len(required_dates),
         "eligible_sessions": len(eligible_dates), "missing_sessions": REQUIRED_SESSIONS - len(eligible_dates),
         "calendar_missing_sessions": calendar_missing, "coverage": round(min(1.0, coverage), 6),
-        "window_start": start, "window_end": effective_end, "hard_apis": list(HARD_APIS),
-        "hard_fields": ["close", "volume", "turnover", "total_mv", "circ_mv", "pe_ttm", "pb", "turnover_rate", "up_limit", "down_limit", "available_time"],
+        "window_start": start, "window_end": effective_end,
+        "hard_apis": [*HARD_APIS, BENCHMARK_API_KEY],
+        "hard_fields": ["close", "volume", "turnover", "total_mv", "circ_mv", "pe_ttm", "pb", "turnover_rate", "up_limit", "down_limit", "benchmark_close", "available_time"],
         "thresholds": {"minimum_daily_rows": MINIMUM_DAILY_ROWS, "minimum_hard_api_rows": MINIMUM_HARD_API_ROWS, "minimum_market_field_ratio": MINIMUM_MARKET_FIELD_RATIO},
         "repair_dates": missing_dates,
         "trailing_pending_dates": list(reversed(trailing_pending_dates)),
@@ -189,11 +217,19 @@ def oos_hard_data_asset() -> dict[str, Any]:
 
 
 def repair_oos_hard_data_batch(trade_dates: list[str], *, date_gaps: dict[str, dict[str, Any]] | None = None) -> dict[str, Any]:
-    from app.data_platform.services.data_center import sync_market_bundle, sync_tushare_date_batch
+    from app.data_platform.services.data_center import (
+        sync_market_bundle,
+        sync_tushare_api_raw,
+        sync_tushare_date_batch,
+    )
 
     gaps = date_gaps or {}
     market_results: dict[str, dict[str, Any]] = {}
     adj_dates = [value for value in trade_dates if "adj_factor" in set((gaps.get(value) or {}).get("missing_apis") or [])]
+    benchmark_dates = [
+        value for value in trade_dates
+        if BENCHMARK_API_KEY in set((gaps.get(value) or {}).get("missing_apis") or [])
+    ]
     for trade_date in trade_dates:
         gap = gaps.get(trade_date) or {}
         missing = set(gap.get("missing_apis") or [])
@@ -208,9 +244,43 @@ def repair_oos_hard_data_batch(trade_dates: list[str], *, date_gaps: dict[str, d
         minimum_rows=MINIMUM_HARD_API_ROWS, require_point_in_time=True,
     ) if adj_dates else {"ok": True, "skipped": True, "results": []}
     adj_by_date = {str(item.get("trade_date") or ""): item for item in adj_batch.get("results") or [] if isinstance(item, dict)}
+    benchmark_batch = (
+        sync_tushare_api_raw(
+            "index_daily",
+            {
+                "ts_code": BENCHMARK_INDEX_CODE,
+                "start_date": min(benchmark_dates),
+                "end_date": max(benchmark_dates),
+            },
+        )
+        if benchmark_dates
+        else {"ok": True, "skipped": True}
+    )
+    benchmark_available = (
+        _benchmark_date_set(min(benchmark_dates), max(benchmark_dates))
+        if benchmark_dates else set()
+    )
     results = []
     for trade_date in trade_dates:
         adj = adj_by_date.get(trade_date) or ({"ok": bool(adj_batch.get("ok")), "batch": True} if trade_date in adj_dates else {"ok": True, "skipped": True})
         market = market_results[trade_date]
-        results.append({"trade_date": trade_date, "ok": bool(market.get("ok")) and bool(adj.get("ok")), "market": market, "adj_factor": adj})
-    return {"ok": all(item.get("ok") for item in results), "results": results, "dates": trade_dates, "adj_factor_batch": adj_batch, "contract": CONTRACT_VERSION}
+        benchmark = (
+            {"ok": trade_date in benchmark_available, "batch": True}
+            if trade_date in benchmark_dates
+            else {"ok": True, "skipped": True}
+        )
+        results.append({
+            "trade_date": trade_date,
+            "ok": bool(market.get("ok")) and bool(adj.get("ok")) and bool(benchmark.get("ok")),
+            "market": market,
+            "adj_factor": adj,
+            "benchmark_index": benchmark,
+        })
+    return {
+        "ok": all(item.get("ok") for item in results),
+        "results": results,
+        "dates": trade_dates,
+        "adj_factor_batch": adj_batch,
+        "benchmark_batch": benchmark_batch,
+        "contract": CONTRACT_VERSION,
+    }

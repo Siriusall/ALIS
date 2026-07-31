@@ -65,6 +65,7 @@ def test_audit_blocks_when_retained_hard_api_slices_are_missing(monkeypatch):
     monkeypatch.setattr(holdout, "MINIMUM_DAILY_ROWS", 1)
     monkeypatch.setattr(holdout, "MINIMUM_MARKET_FIELD_RATIO", 1.0)
     monkeypatch.setattr(holdout, "_date_api_sets", lambda *_args: {api: {"20190910"} for api in holdout.HARD_APIS})
+    monkeypatch.setattr(holdout, "_benchmark_date_set", lambda *_args: {"20190910"})
     monkeypatch.setattr(holdout, "audit_trade_calendar_range", lambda *_args, **_kwargs: {
         "present_dates": ["20190910", "20190911"],
         "present_sessions": 2,
@@ -77,7 +78,11 @@ def test_audit_blocks_when_retained_hard_api_slices_are_missing(monkeypatch):
     assert result["status"] == "blocked"
     assert result["eligible_sessions"] == 1
     assert result["repair_dates"] == ["20190911"]
-    assert result["dates"][1]["reasons"] == ["missing_hard_api_slices"]
+    assert result["dates"][1]["reasons"] == [
+        "missing_hard_api_slices",
+        "benchmark_index_missing",
+    ]
+    assert holdout.BENCHMARK_API_KEY in result["dates"][1]["missing_apis"]
 
 
 def test_repair_is_bounded_and_passes_exact_gap_details(monkeypatch):
@@ -120,6 +125,7 @@ def test_calendar_gap_is_separate_from_retained_api_gap(monkeypatch):
     monkeypatch.setattr(holdout, "MINIMUM_DAILY_ROWS", 1)
     monkeypatch.setattr(holdout, "MINIMUM_MARKET_FIELD_RATIO", 1.0)
     monkeypatch.setattr(holdout, "_date_api_sets", lambda *_args: {api: {"20190910"} for api in holdout.HARD_APIS})
+    monkeypatch.setattr(holdout, "_benchmark_date_set", lambda *_args: {"20190910"})
     monkeypatch.setattr(holdout, "audit_trade_calendar_range", lambda *_args, **_kwargs: {
         "present_dates": [], "present_sessions": 0, "missing_sessions": 1, "missing_dates": ["20190910"],
     })

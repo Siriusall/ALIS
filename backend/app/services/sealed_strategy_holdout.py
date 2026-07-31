@@ -10,11 +10,13 @@ from typing import Any, Callable
 
 from app.data_platform.db import _conn as _data_conn
 from app.data_platform.services.oos_hard_data import (
+    BENCHMARK_API_KEY,
     HARD_APIS,
     MINIMUM_DAILY_ROWS,
     MINIMUM_HARD_API_ROWS,
     MINIMUM_MARKET_FIELD_RATIO,
     _date_api_sets,
+    _benchmark_date_set,
     repair_oos_hard_data_batch,
 )
 from app.data_platform.services.trade_calendar_contract import (
@@ -26,7 +28,7 @@ from app.services.production_strategy import resolve_production_strategy_champio
 from app.services.strategy_replay import run_strategy_replay
 
 
-SEALED_HOLDOUT_CONTRACT = "alis_sealed_strategy_holdout_v1"
+SEALED_HOLDOUT_CONTRACT = "alis_sealed_strategy_holdout_v2"
 SEALED_HOLDOUT_START = "20190910"
 SEALED_HOLDOUT_END = "20200320"
 SEALED_HOLDOUT_SESSIONS = 126
@@ -116,6 +118,10 @@ def audit_sealed_strategy_holdout(*, include_dates: bool = False) -> dict[str, A
         ).fetchall()
     compact = list(SEALED_HOLDOUT_DATES)
     api_dates = _date_api_sets(SEALED_HOLDOUT_START, SEALED_HOLDOUT_END)
+    benchmark_dates = _benchmark_date_set(
+        SEALED_HOLDOUT_START,
+        SEALED_HOLDOUT_END,
+    )
     snapshots = {str(dict(row).get("trade_date") or ""): dict(row) for row in rows}
     details: list[dict[str, Any]] = []
     for trade_date in compact:
@@ -125,6 +131,8 @@ def audit_sealed_strategy_holdout(*, include_dates: bool = False) -> dict[str, A
         ratio = market_rows / rows_total if rows_total else 0.0
         cutoff = f"{trade_date[:4]}-{trade_date[4:6]}-{trade_date[6:]}T15:00:00"
         missing_apis = [api for api in HARD_APIS if trade_date not in api_dates[api]]
+        if trade_date not in benchmark_dates:
+            missing_apis.append(BENCHMARK_API_KEY)
         calendar_ok = trade_date in calendar_dates
         pit_ok = bool(snapshot.get("max_available_time")) and str(snapshot.get("max_available_time")) <= cutoff
         eligible = (
@@ -144,6 +152,8 @@ def audit_sealed_strategy_holdout(*, include_dates: bool = False) -> dict[str, A
             reasons.append("market_fields_incomplete")
         if missing_apis:
             reasons.append("missing_hard_api_slices")
+        if BENCHMARK_API_KEY in missing_apis:
+            reasons.append("benchmark_index_missing")
         if not pit_ok:
             reasons.append("point_in_time_invalid")
         details.append({
@@ -172,7 +182,7 @@ def audit_sealed_strategy_holdout(*, include_dates: bool = False) -> dict[str, A
         "eligible_sessions": len(eligible_dates),
         "missing_sessions": max(0, SEALED_HOLDOUT_SESSIONS - len(eligible_dates)),
         "repair_dates": repair_dates,
-        "hard_apis": list(HARD_APIS),
+        "hard_apis": [*HARD_APIS, BENCHMARK_API_KEY],
         "thresholds": {
             "minimum_daily_rows": MINIMUM_DAILY_ROWS,
             "minimum_hard_api_rows": MINIMUM_HARD_API_ROWS,

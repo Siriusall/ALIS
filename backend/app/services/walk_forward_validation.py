@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from app.data_platform.db import _conn
+from app.db.store import get_model_version
 from app.services.backtest_data_source import BacktestDataSource
 from app.services.market_context import _transparent_regime, score_market_sentiment
 from app.services.production_strategy import resolve_production_strategy_champion
@@ -313,6 +314,25 @@ def run_purged_walk_forward_validation(
 ) -> dict[str, Any]:
     cfg = config or WalkForwardConfig()
     champion = resolve_production_strategy_champion()
+    controller_version_id = int(
+        strategy_controller_version_id
+        or champion.get("strategy_controller_version_id")
+        or 0
+    )
+    controller_version_name = str(
+        champion.get("strategy_controller_version") or ""
+    )
+    if strategy_controller_version_id is not None:
+        controller_version = get_model_version(controller_version_id)
+        if (
+            not controller_version
+            or str(controller_version.get("model_key") or "")
+            != "strategy_controller"
+        ):
+            raise ValueError(
+                "strategy_controller_version_id 不存在或不是策略控制器候选"
+            )
+        controller_version_name = str(controller_version.get("version") or "")
     ds = data_source or BacktestDataSource()
     dates = ds.get_available_trade_dates(start_date or "1900-01-01", end_date or "2999-12-31")
     windows = build_purged_walk_forward_windows(dates, cfg)
@@ -323,7 +343,8 @@ def run_purged_walk_forward_validation(
         "production_strategy_version": champion["champion_version"],
         "evaluated_strategy_id": int(strategy_id or champion.get("strategy_id") or 0),
         "evaluation_role": "challenger" if strategy_id and int(strategy_id) != int(champion.get("strategy_id") or 0) else "champion",
-        "strategy_controller_version": str(strategy_controller_version_id or champion["strategy_controller_version"]),
+        "strategy_controller_version_id": controller_version_id,
+        "strategy_controller_version": controller_version_name,
         "factor_bindings": (
             factor_bindings if factor_bindings is not None
             else champion.get("factor_bindings") or {}
@@ -385,11 +406,27 @@ def run_purged_walk_forward_validation(
         )
         replay_dates = [str(item.get("date") or "") for item in replay.get("equity_series") or []]
         states = state_loader(replay_dates)
+        benchmark_quality = (
+            (replay.get("data_quality") or {}).get("benchmark")
+            if isinstance(replay.get("data_quality"), dict)
+            else {}
+        )
+        benchmark_data_complete = bool(
+            isinstance(benchmark_quality, dict)
+            and benchmark_quality.get("passed") is True
+        )
         window_result = {
             **window,
             "metrics": replay.get("metrics") or {},
             "summary": replay.get("summary") or {},
-            "data_complete": int((replay.get("summary") or {}).get("trading_days") or 0) >= int(test["sessions"]) and int((replay.get("summary") or {}).get("decision_count") or 0) > 0,
+            "data_complete": (
+                int((replay.get("summary") or {}).get("trading_days") or 0)
+                >= int(test["sessions"])
+                and int((replay.get("summary") or {}).get("decision_count") or 0) > 0
+                and benchmark_data_complete
+            ),
+            "benchmark_data_complete": benchmark_data_complete,
+            "benchmark_data_quality": benchmark_quality,
             "point_in_time_passed": bool(((replay.get("data_quality") or {}).get("point_in_time") or {}).get("passed")),
             "production_strategy_version": replay.get("production_strategy_version"),
             "market_state_attribution": _state_attribution(replay, states),
@@ -435,6 +472,9 @@ def run_purged_walk_forward_validation(
         "point_in_time_all_passed": all(item["point_in_time_passed"] for item in results),
         "same_champion_all_windows": all(item["production_strategy_version"] == champion["champion_version"] for item in results),
         "complete_test_data_all_windows": all(item["data_complete"] for item in results),
+        "benchmark_data_all_windows": all(
+            item.get("benchmark_data_complete") is True for item in results
+        ),
     }
     statistics = compare_strategy_windows(valid)
     failure_attribution = _aggregate_failure_attribution(valid)
