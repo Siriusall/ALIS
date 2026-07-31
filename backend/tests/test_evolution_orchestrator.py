@@ -252,6 +252,82 @@ def test_direct_experiment_tasks_continue_when_current_data_is_ready(monkeypatch
     assert result == {"status": "completed"}
 
 
+def test_worker_defers_data_block_without_creating_lineage_tasks(monkeypatch):
+    task = {
+        "id": 91,
+        "task_type": "strategy_evolution_cycle",
+        "status": "running",
+        "attempt": 1,
+    }
+    deferred = []
+    monkeypatch.setattr(evolution, "_claim_next_task", lambda: task)
+    monkeypatch.setattr(
+        evolution,
+        "execute_evolution_task",
+        lambda _task: {
+            "status": "blocked_by_decision_data",
+            "reason": "latest_decision_data_not_safe_for_research",
+        },
+    )
+    monkeypatch.setattr(
+        evolution,
+        "_defer_for_decision_data",
+        lambda pending, result: deferred.append((pending, result)) or True,
+    )
+    monkeypatch.setattr(
+        evolution,
+        "_finish_success",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("a data-blocked task must not complete")
+        ),
+    )
+    monkeypatch.setattr(
+        evolution,
+        "_schedule_strategy_continuation",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("a data-blocked task must not clone its lineage")
+        ),
+    )
+    monkeypatch.setattr(
+        evolution,
+        "get_evolution_task",
+        lambda task_id: {"id": task_id, "status": "retry_wait"},
+    )
+
+    result = evolution.run_worker_once()
+
+    assert result == {"id": 91, "status": "retry_wait"}
+    assert deferred[0][0] == task
+    assert deferred[0][1]["status"] == "blocked_by_decision_data"
+
+
+def test_data_gate_deferral_reuses_task_id_and_does_not_consume_attempt(monkeypatch):
+    transition = {}
+    monkeypatch.setattr(
+        evolution,
+        "_update_active_task",
+        lambda task_id, **fields: transition.update(
+            {"task_id": task_id, **fields}
+        ) or True,
+    )
+    blocked = {
+        "status": "blocked_by_decision_data",
+        "reason": "latest_decision_data_not_safe_for_research",
+    }
+
+    assert evolution._defer_for_decision_data(
+        {"id": 91, "attempt": 1}, blocked
+    ) is True
+
+    assert transition["task_id"] == 91
+    assert transition["status"] == "retry_wait"
+    assert transition["phase"] == "waiting_for_decision_data"
+    assert transition["attempt"] == 0
+    assert transition["result"] == blocked
+    assert transition["lease_owner"] is None
+    assert transition["deadline_at"] is None
+
+
 def test_cycle_uses_checkpoint_and_reports_overall_progress(monkeypatch):
     monkeypatch.setattr(evolution, "audit_oos_hard_data", lambda **kwargs: {
         "status": "ready", "window_start": "20200101", "window_end": "20261231",
@@ -267,9 +343,11 @@ def test_cycle_uses_checkpoint_and_reports_overall_progress(monkeypatch):
     heartbeats: list[dict] = []
     monkeypatch.setattr(evolution, "_heartbeat", lambda task_id, **fields: heartbeats.append(fields))
     received_checkpoints: list[list[dict]] = []
+    received_ranges: list[tuple[str, str]] = []
 
     def runner(**kwargs):
         received_checkpoints.append(kwargs["checkpoint_results"])
+        received_ranges.append((kwargs["start_date"], kwargs["end_date"]))
         windows = list(kwargs["checkpoint_results"])
         while len(windows) < 2:
             index = len(windows) + 1
@@ -296,12 +374,66 @@ def test_cycle_uses_checkpoint_and_reports_overall_progress(monkeypatch):
         {"id": 7, "payload": {"max_windows": 2}, "checkpoint": {
             "completed": [{"role": "champion", "strategy_id": 1, "summary": {}}],
             "current": {"strategy_id": 2, "windows": [{"index": 1}]},
+            "hard_data_window": {"start": "20200102", "end": "20261230"},
         }},
         validation_runner=runner,
     )
     assert received_checkpoints == [[{"index": 1}]]
+    assert received_ranges == [("20200102", "20261230")]
     assert len(result["strategies"]) == 2
     assert heartbeats[-1]["progress"] == 1.0
+    assert heartbeats[-1]["checkpoint"]["schema_version"] == "alis_formal_oos_checkpoint_v2"
+    assert [item["strategy_id"] for item in heartbeats[-1]["checkpoint"]["targets"]] == [1, 2]
+
+
+def test_cycle_resume_uses_frozen_targets_instead_of_new_database_candidates(monkeypatch):
+    monkeypatch.setattr(evolution, "audit_oos_hard_data", lambda **_kwargs: {
+        "status": "ready", "window_start": "20200101", "window_end": "20261231",
+    })
+    monkeypatch.setattr(
+        evolution,
+        "_strategy_targets",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("resume must not resolve a new target set")
+        ),
+    )
+    monkeypatch.setattr(evolution, "_ensure_task_active", lambda *_args: None)
+    monkeypatch.setattr(evolution, "_heartbeat", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(evolution, "_persist_candidate_result", lambda *_args: None)
+    monkeypatch.setattr(evolution, "list_model_versions", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(evolution, "advance_formal_candidate_lifecycle", lambda *_args, **_kwargs: [])
+    seen = []
+
+    def runner(**kwargs):
+        seen.append(kwargs["strategy_id"])
+        return {
+            "status": "failed",
+            "windows": [],
+            "summary": {},
+            "promotion_gates": {},
+            "blocking_reasons": ["test"],
+        }
+
+    result = evolution._execute_strategy_cycle(
+        {
+            "id": 92,
+            "payload": {"max_candidates": 1, "max_windows": 1},
+            "checkpoint": {
+                "targets": [
+                    {"role": "champion", "strategy_id": 1, "model_version_id": 50, "name": "Champion"},
+                    {"role": "challenger", "strategy_id": 8, "model_version_id": 88, "name": "Frozen"},
+                ],
+                "completed": [{"role": "champion", "strategy_id": 1, "status": "failed"}],
+                "current": {"target_identity": "strategy:8", "strategy_id": 8, "windows": []},
+                "hard_data_window": {"start": "20200102", "end": "20261230"},
+            },
+        },
+        validation_runner=runner,
+    )
+
+    assert seen == [8]
+    assert [item["strategy_id"] for item in result["strategies"]] == [1, 8]
+    assert result["hard_data_window"] == {"start": "20200102", "end": "20261230"}
 
 
 def test_direct_challenger_cycle_injects_same_run_champion_reference(monkeypatch):
@@ -523,6 +655,91 @@ def test_late_worker_failure_cannot_overwrite_cancelled_terminal_state(monkeypat
     )
 
     evolution._finish_failure({"id": 25}, RuntimeError("late failure"))
+
+
+def test_formal_oos_resource_budget_requeues_same_task_with_checkpoint(monkeypatch):
+    task = {
+        "id": 1860,
+        "task_type": "strategy_evolution_cycle",
+        "status": "running",
+        "stop_requested": 0,
+        "lease_owner": evolution.WORKER_ID,
+        "attempt": 1,
+        "checkpoint": {
+            "completed": [
+                {"strategy_id": 1, "role": "champion", "status": "failed"},
+                {"strategy_id": 3, "role": "baseline", "status": "failed"},
+            ],
+            "current": {
+                "target_identity": "strategy:4",
+                "strategy_id": 4,
+                "windows": [{"index": 1}],
+            },
+            "hard_data_window": {"start": "20200327", "end": "20260729"},
+        },
+    }
+    transition = {}
+    monkeypatch.setattr(evolution, "get_evolution_task", lambda _task_id: task)
+    monkeypatch.setattr(
+        evolution,
+        "_update_active_task",
+        lambda task_id, **fields: transition.update(
+            {"task_id": task_id, **fields}
+        ) or True,
+    )
+
+    evolution._finish_failure(
+        task, evolution.EvolutionTaskBudgetExceeded("任务超过资源预算时限")
+    )
+
+    assert transition["task_id"] == 1860
+    assert transition["status"] == "retry_wait"
+    assert transition["phase"] == "resource_budget_checkpoint"
+    assert transition["attempt"] == 0
+    assert transition["lease_owner"] is None
+    assert transition["deadline_at"] is None
+    assert len(transition["checkpoint"]["completed"]) == 2
+    assert transition["checkpoint"]["current"]["windows"] == [{"index": 1}]
+    assert transition["checkpoint"]["resource_budget_resume"]["resume_count"] == 1
+    assert transition["checkpoint"]["resource_budget_resume"]["stalled_resumes"] == 0
+
+
+def test_budget_edge_heartbeat_persists_completed_window_before_yield(monkeypatch):
+    transition = {}
+    monkeypatch.setattr(
+        evolution,
+        "_ensure_task_active",
+        lambda _task_id: (_ for _ in ()).throw(
+            evolution.EvolutionTaskBudgetExceeded("任务超过资源预算时限")
+        ),
+    )
+    monkeypatch.setattr(
+        evolution,
+        "_update_active_task",
+        lambda task_id, **fields: transition.update(
+            {"task_id": task_id, **fields}
+        ) or True,
+    )
+    checkpoint = {
+        "current": {"strategy_id": 1, "windows": [{"index": 1}]},
+    }
+
+    try:
+        evolution._heartbeat(
+            2239,
+            phase="formal_oos",
+            progress=0.2,
+            message="窗口 1 已完成",
+            checkpoint=checkpoint,
+        )
+    except evolution.EvolutionTaskBudgetExceeded:
+        pass
+    else:
+        raise AssertionError("budget edge must yield after persisting checkpoint")
+
+    assert transition["checkpoint"] == checkpoint
+    assert transition["progress"] == 0.2
+    assert transition["expected_lease_owner"] == evolution.WORKER_ID
 
 
 def test_local_lease_owner_liveness_distinguishes_dead_and_live_processes(monkeypatch):

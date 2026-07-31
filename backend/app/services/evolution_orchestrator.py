@@ -44,6 +44,15 @@ MAX_CANDIDATES_PER_CYCLE = max(1, min(int(os.getenv("EVOLUTION_MAX_CANDIDATES", 
 MAX_WINDOWS_PER_CANDIDATE = max(1, min(int(os.getenv("EVOLUTION_MAX_WINDOWS", "5")), 20))
 REQUIRED_OPPORTUNITY_COST_BASELINES = ("multifactor_equal_weight", "simple_momentum")
 TASK_TIMEOUT_MINUTES = max(30, min(int(os.getenv("EVOLUTION_TASK_TIMEOUT_MINUTES", "240")), 1440))
+DECISION_DATA_RETRY_SECONDS = max(
+    60, min(int(os.getenv("EVOLUTION_DECISION_DATA_RETRY_SECONDS", "300")), 3600)
+)
+RESOURCE_BUDGET_RETRY_SECONDS = max(
+    2, min(int(os.getenv("EVOLUTION_RESOURCE_BUDGET_RETRY_SECONDS", "5")), 300)
+)
+RESOURCE_BUDGET_MAX_STALLED_RESUMES = max(
+    1, min(int(os.getenv("EVOLUTION_RESOURCE_BUDGET_MAX_STALLED_RESUMES", "2")), 10)
+)
 WORKER_ID = f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
 SYSTEM_AUTONOMY_RECOVERY_POLICY_VERSION = "v2"
 _worker_started = False
@@ -57,6 +66,10 @@ _runtime_status: dict[str, dict[str, Any]] = {
 
 
 class EvolutionTaskCancelled(RuntimeError):
+    pass
+
+
+class EvolutionTaskBudgetExceeded(EvolutionTaskCancelled):
     pass
 
 
@@ -545,7 +558,25 @@ def _update_active_task(
 
 
 def _heartbeat(task_id: int, *, phase: str, progress: float, message: str, checkpoint: dict[str, Any]) -> None:
-    _ensure_task_active(task_id)
+    try:
+        _ensure_task_active(task_id)
+    except EvolutionTaskBudgetExceeded:
+        # The validation callback may carry a just-completed window. Preserve
+        # that business checkpoint before yielding the task at the budget edge.
+        now = _now()
+        _update_active_task(
+            int(task_id),
+            statuses=("running",),
+            require_not_stopped=True,
+            expected_lease_owner=WORKER_ID,
+            phase=phase,
+            progress=max(0.0, min(0.999, float(progress))),
+            message=message,
+            checkpoint=checkpoint,
+            heartbeat_at=now.isoformat(),
+            lease_expires_at=(now + timedelta(minutes=LEASE_MINUTES)).isoformat(),
+        )
+        raise
     now = _now()
     _update_task(
         task_id,
@@ -674,7 +705,7 @@ def _ensure_task_active(task_id: int) -> None:
     if deadline:
         try:
             if _now() >= datetime.fromisoformat(str(deadline)):
-                raise EvolutionTaskCancelled("任务超过资源预算时限")
+                raise EvolutionTaskBudgetExceeded("任务超过资源预算时限")
         except ValueError:
             pass
 
@@ -1028,6 +1059,9 @@ def _formal_reference_contract(
         "protocol": result.get("protocol") if isinstance(result.get("protocol"), dict) else {},
         "production_strategy_version_id": int(result.get("production_strategy_version_id") or 0),
         "production_strategy_version": str(result.get("production_strategy_version") or ""),
+        "strategy_controller_version_id": int(
+            result.get("strategy_controller_version_id") or 0
+        ),
         "strategy_controller_version": str(result.get("strategy_controller_version") or ""),
         "test_windows": [
             {
@@ -1112,7 +1146,17 @@ def _execute_strategy_cycle(
     if audit.get("status") != "ready":
         raise RuntimeError("OOS 永久硬数据未就绪")
     payload = task.get("payload") if isinstance(task.get("payload"), dict) else {}
-    targets = payload.get("targets") if isinstance(payload.get("targets"), list) else _strategy_targets()
+    checkpoint = task.get("checkpoint") if isinstance(task.get("checkpoint"), dict) else {}
+    checkpoint_targets = (
+        checkpoint.get("targets") if isinstance(checkpoint.get("targets"), list) else None
+    )
+    targets = (
+        checkpoint_targets
+        if checkpoint_targets is not None
+        else payload.get("targets")
+        if isinstance(payload.get("targets"), list)
+        else _strategy_targets()
+    )
     if any(item.get("role") == "challenger" for item in targets) and not any(item.get("role") == "champion" for item in targets):
         champion = resolve_production_strategy_champion()
         targets = [{
@@ -1133,11 +1177,40 @@ def _execute_strategy_cycle(
     research_targets = [item for item in targets if item.get("role") not in {"champion", "baseline"}][:max_candidates]
     targets = champion_targets + baseline_targets + research_targets
     max_windows = max(1, min(int(payload.get("max_windows") or MAX_WINDOWS_PER_CANDIDATE), MAX_WINDOWS_PER_CANDIDATE))
-    checkpoint = task.get("checkpoint") if isinstance(task.get("checkpoint"), dict) else {}
     completed = checkpoint.get("completed") if isinstance(checkpoint.get("completed"), list) else []
+    frozen_window = (
+        checkpoint.get("hard_data_window")
+        if isinstance(checkpoint.get("hard_data_window"), dict)
+        else payload.get("hard_data_window")
+        if isinstance(payload.get("hard_data_window"), dict)
+        else {}
+    )
+    window_start = str(frozen_window.get("start") or audit["window_start"])
+    window_end = str(frozen_window.get("end") or audit["window_end"])
+    resume_state = (
+        checkpoint.get("resource_budget_resume")
+        if isinstance(checkpoint.get("resource_budget_resume"), dict)
+        else None
+    )
+
     def target_identity(item: dict[str, Any]) -> str:
         controller_id = int(item.get("controller_version_id") or 0)
         return f"controller:{controller_id}" if controller_id else f"strategy:{int(item.get('strategy_id') or 0)}"
+
+    def checkpoint_state(
+        *,
+        current_target: dict[str, Any],
+    ) -> dict[str, Any]:
+        state = {
+            "schema_version": "alis_formal_oos_checkpoint_v2",
+            "targets": targets,
+            "completed": completed,
+            "current": current_target,
+            "hard_data_window": {"start": window_start, "end": window_end},
+        }
+        if resume_state:
+            state["resource_budget_resume"] = resume_state
+        return state
 
     completed_ids = {target_identity(item) for item in completed}
     current = checkpoint.get("current") if isinstance(checkpoint.get("current"), dict) else {}
@@ -1158,9 +1231,12 @@ def _execute_strategy_cycle(
                 int(task["id"]), phase="quick_diagnostic",
                 progress=(target_index * max_windows) / total_units,
                 message=f"{target.get('name')}：运行快速淘汰门",
-                checkpoint={"completed": completed, "current": {}, "hard_data_window": {"start": audit["window_start"], "end": audit["window_end"]}},
+                checkpoint=checkpoint_state(current_target={}),
             )
-            quick = _run_quick_gate(target, audit)
+            quick = _run_quick_gate(
+                target,
+                {**audit, "window_start": window_start, "window_end": window_end},
+            )
             if quick["status"] != "passed":
                 completed.append({
                     "strategy_id": strategy_id,
@@ -1176,7 +1252,7 @@ def _execute_strategy_cycle(
                     int(task["id"]), phase="quick_diagnostic",
                     progress=(target_index + 1) / max(1, len(targets)),
                     message=f"{target.get('name')} 快速诊断未通过，已自动淘汰",
-                    checkpoint={"completed": completed, "current": {}, "hard_data_window": {"start": audit["window_start"], "end": audit["window_end"]}},
+                    checkpoint=checkpoint_state(current_target={}),
                 )
                 continue
         prior_windows = (
@@ -1190,11 +1266,12 @@ def _execute_strategy_cycle(
         def progress(event: dict[str, Any]) -> None:
             windows = event.get("checkpoint_results") or []
             overall_units = target_index * max_windows + len(windows)
-            next_checkpoint = {
-                "completed": completed,
-                "current": {"target_identity": identity, "strategy_id": strategy_id, "controller_version_id": target.get("controller_version_id"), "windows": windows},
-                "hard_data_window": {"start": audit["window_start"], "end": audit["window_end"]},
-            }
+            next_checkpoint = checkpoint_state(current_target={
+                "target_identity": identity,
+                "strategy_id": strategy_id,
+                "controller_version_id": target.get("controller_version_id"),
+                "windows": windows,
+            })
             _heartbeat(
                 int(task["id"]),
                 phase="formal_oos",
@@ -1205,8 +1282,8 @@ def _execute_strategy_cycle(
 
         result = validation_runner(
             strategy_id=strategy_id,
-            start_date=str(audit["window_start"]),
-            end_date=str(audit["window_end"]),
+            start_date=window_start,
+            end_date=window_end,
             max_windows=max_windows,
             strategy_controller_version_id=target.get("controller_version_id"),
             factor_bindings=target.get("factor_bindings"),
@@ -1239,8 +1316,8 @@ def _execute_strategy_cycle(
         reference_contract = _formal_reference_contract(
             result,
             task_id=int(task["id"]),
-            window_start=str(audit["window_start"]),
-            window_end=str(audit["window_end"]),
+            window_start=window_start,
+            window_end=window_end,
         )
         completed.append({
             "strategy_id": strategy_id,
@@ -1263,10 +1340,12 @@ def _execute_strategy_cycle(
             phase="formal_oos",
             progress=len(completed) / max(1, len(targets)),
             message=f"{target.get('name')} 正式验证完成",
-            checkpoint={"completed": completed, "current": {}, "hard_data_window": {"start": audit["window_start"], "end": audit["window_end"]}},
+            checkpoint=checkpoint_state(current_target={}),
         )
     lifecycle_targets = [item for item in completed if item.get("role") != "strategy_controller_candidate"]
-    lifecycle = advance_formal_candidate_lifecycle(lifecycle_targets, shadow_start_date=str(audit["window_end"])) if lifecycle_targets else []
+    lifecycle = advance_formal_candidate_lifecycle(
+        lifecycle_targets, shadow_start_date=window_end
+    ) if lifecycle_targets else []
     lifecycle_by_id = {int(item.get("model_version_id") or 0): item for item in lifecycle}
     for item in completed:
         lifecycle_item = lifecycle_by_id.get(int(item.get("model_version_id") or 0))
@@ -1275,7 +1354,7 @@ def _execute_strategy_cycle(
     return {
         "schema_version": "alis_evolution_cycle_v1",
         "status": "completed",
-        "hard_data_window": {"start": audit["window_start"], "end": audit["window_end"]},
+        "hard_data_window": {"start": window_start, "end": window_end},
         "strategies": completed,
         "diagnosis": diagnose_strategy_results(completed),
         "lifecycle": lifecycle,
@@ -1751,6 +1830,139 @@ def _finish_success(task_id: int, result: dict[str, Any]) -> None:
     )
 
 
+def _defer_for_decision_data(
+    task: dict[str, Any], result: dict[str, Any]
+) -> bool:
+    """Keep one blocked task pending instead of creating an empty lineage chain."""
+    now = _now()
+    return _update_active_task(
+        int(task["id"]),
+        statuses=("running",),
+        require_not_stopped=True,
+        expected_lease_owner=WORKER_ID,
+        status="retry_wait",
+        phase="waiting_for_decision_data",
+        message=(
+            "决策数据尚未达到研究门，保留原任务并等待数据恢复后续跑"
+        ),
+        result=result,
+        error=None,
+        attempt=max(0, int(task.get("attempt") or 1) - 1),
+        next_run_at=(
+            now + timedelta(seconds=DECISION_DATA_RETRY_SECONDS)
+        ).isoformat(),
+        lease_owner=None,
+        lease_expires_at=None,
+        deadline_at=None,
+        heartbeat_at=now.isoformat(),
+    )
+
+
+def _checkpoint_progress_marker(checkpoint: dict[str, Any]) -> str:
+    completed = checkpoint.get("completed") if isinstance(
+        checkpoint.get("completed"), list
+    ) else []
+    current = checkpoint.get("current") if isinstance(
+        checkpoint.get("current"), dict
+    ) else {}
+    windows = current.get("windows") if isinstance(
+        current.get("windows"), list
+    ) else []
+    evidence = {
+        "completed": [
+            {
+                "strategy_id": int(item.get("strategy_id") or 0),
+                "controller_version_id": int(item.get("controller_version_id") or 0),
+                "status": str(item.get("status") or ""),
+            }
+            for item in completed
+            if isinstance(item, dict)
+        ],
+        "current_target": str(
+            current.get("target_identity")
+            or current.get("strategy_id")
+            or ""
+        ),
+        "completed_windows": sorted(
+            int(item.get("index") or 0)
+            for item in windows
+            if isinstance(item, dict)
+        ),
+        "hard_data_window": checkpoint.get("hard_data_window") or {},
+    }
+    return hashlib.sha256(_json(evidence).encode("utf-8")).hexdigest()[:20]
+
+
+def _defer_for_resource_budget(
+    task: dict[str, Any], exc: EvolutionTaskBudgetExceeded
+) -> bool:
+    """Resume formal OOS in the same task while detecting a genuinely stuck chunk."""
+    checkpoint = (
+        deepcopy(task.get("checkpoint"))
+        if isinstance(task.get("checkpoint"), dict)
+        else {}
+    )
+    previous = checkpoint.get("resource_budget_resume") if isinstance(
+        checkpoint.get("resource_budget_resume"), dict
+    ) else {}
+    marker = _checkpoint_progress_marker(checkpoint)
+    prior_marker = str(previous.get("progress_marker") or "")
+    stalled_resumes = (
+        int(previous.get("stalled_resumes") or 0) + 1
+        if prior_marker and prior_marker == marker
+        else 0
+    )
+    resume_count = int(previous.get("resume_count") or 0) + 1
+    now = _now()
+    resume_evidence = {
+        "schema_version": "alis_formal_oos_resource_resume_v1",
+        "resume_count": resume_count,
+        "stalled_resumes": stalled_resumes,
+        "progress_marker": marker,
+        "deferred_at": now.isoformat(),
+    }
+    checkpoint["resource_budget_resume"] = resume_evidence
+    if stalled_resumes >= RESOURCE_BUDGET_MAX_STALLED_RESUMES:
+        return _update_active_task(
+            int(task["id"]),
+            statuses=("running",),
+            require_not_stopped=True,
+            expected_lease_owner=WORKER_ID,
+            status="failed",
+            phase="failed",
+            progress=1.0,
+            message="正式 OOS 连续耗尽资源预算且检查点没有进展",
+            checkpoint=checkpoint,
+            error=str(exc),
+            lease_owner=None,
+            lease_expires_at=None,
+            deadline_at=None,
+            heartbeat_at=now.isoformat(),
+            finished_at=now.isoformat(),
+        )
+    return _update_active_task(
+        int(task["id"]),
+        statuses=("running",),
+        require_not_stopped=True,
+        expected_lease_owner=WORKER_ID,
+        status="retry_wait",
+        phase="resource_budget_checkpoint",
+        message=(
+            "本段资源预算已用完，已保存正式 OOS 检查点并等待续跑"
+        ),
+        checkpoint=checkpoint,
+        error=None,
+        attempt=max(0, int(task.get("attempt") or 1) - 1),
+        next_run_at=(
+            now + timedelta(seconds=RESOURCE_BUDGET_RETRY_SECONDS)
+        ).isoformat(),
+        lease_owner=None,
+        lease_expires_at=None,
+        deadline_at=None,
+        heartbeat_at=now.isoformat(),
+    )
+
+
 def _schedule_strategy_continuation(*, completed_task_id: int) -> dict[str, Any] | None:
     """Keep draining and extending the candidate lineage without waiting for next Friday."""
     targets = _strategy_targets()
@@ -1931,6 +2143,14 @@ def _finish_failure(task: dict[str, Any], exc: Exception) -> None:
     if not latest or str(latest.get("status") or "") in TERMINAL_STATES:
         return
     task = latest
+    if (
+        isinstance(exc, EvolutionTaskBudgetExceeded)
+        and str(task.get("task_type") or "") in {
+            "strategy_evolution_cycle", "strategy_controller_oos"
+        }
+    ):
+        _defer_for_resource_budget(task, exc)
+        return
     if isinstance(exc, EvolutionTaskCancelled):
         _update_active_task(
             task_id, statuses=ACTIVE_STATES, expected_lease_owner=WORKER_ID,
@@ -1975,6 +2195,9 @@ def run_worker_once() -> dict[str, Any] | None:
         return None
     try:
         result = execute_evolution_task(task)
+        if str(result.get("status") or "") == "blocked_by_decision_data":
+            _defer_for_decision_data(task, result)
+            return get_evolution_task(int(task["id"]))
         _finish_success(int(task["id"]), result)
         if str(task.get("task_type") or "").startswith("strategy_"):
             try:
