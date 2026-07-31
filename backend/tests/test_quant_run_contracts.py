@@ -267,3 +267,34 @@ def test_unified_t1_execution_does_not_rerun_investment_opinion(monkeypatch):
     assert execution_kwargs["max_correlated_industry_pct"] == 1.0
     assert execution_kwargs["high_risk_symbols"] == set()
     assert execution_kwargs["residual_sweep_symbol"] is None
+
+
+def test_defensive_execution_row_never_relabels_stale_bar(monkeypatch):
+    captured = {}
+
+    def stale_bar(ts_code, trade_date, *, exact_date=False):
+        captured.update(ts_code=ts_code, trade_date=trade_date, exact_date=exact_date)
+        return {
+            "trade_date": "20260730",
+            "open": 3.2,
+            "pre_close": 3.1,
+            "close": 3.2,
+            "vol": 1000,
+        }
+
+    monkeypatch.setattr("app.services.defensive_assets.defensive_asset_bar", stale_bar)
+
+    row = quant_run_engine._defensive_execution_row(
+        "510880",
+        ts_code="510880.SH",
+        name="红利ETF",
+        execute_date="20260731",
+        require_exact_date=True,
+    )
+
+    assert row is None
+    assert captured == {
+        "ts_code": "510880.SH",
+        "trade_date": "20260731",
+        "exact_date": True,
+    }

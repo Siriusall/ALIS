@@ -53,7 +53,13 @@ _AUTO_SIMULATION_CLOSE_TIME = dtime(
     max(0, min(int(os.getenv("QUANT_AUTO_SIMULATION_CLOSE_HOUR", "16")), 23)),
     max(0, min(int(os.getenv("QUANT_AUTO_SIMULATION_CLOSE_MINUTE", "5")), 59)),
 )
+_DEFENSIVE_EXECUTION_REFRESH_INTERVAL_SEC = max(
+    60,
+    min(int(os.getenv("QUANT_DEFENSIVE_EXECUTION_REFRESH_INTERVAL_SEC", "300")), 3600),
+)
 _auto_scheduler_started = False
+_defensive_execution_refresh_lock = threading.Lock()
+_defensive_execution_refresh_attempts: dict[str, float] = {}
 
 
 def _trade_date_key(value: object) -> str:
@@ -234,28 +240,78 @@ def _requires_replay_opinion_gates(mode: str) -> bool:
     return str(mode or "") != "autonomous_daily"
 
 
-def _evaluate_frozen_execution_data_gate(execute_date: str) -> RiskPauseDecision:
+def _evaluate_frozen_execution_data_gate(
+    execute_date: str,
+    required_defensive_ts_codes: list[str] | tuple[str, ...] | None = None,
+) -> RiskPauseDecision:
     """Validate only the exact-date market fields allowed by the T+1 contract."""
     target, counts = _snapshot_data_status(execute_date)
-    if target == _trade_date_key(execute_date) and _execution_slice_ready(
+    from app.services.defensive_assets import defensive_asset_execution_status
+
+    defensive_status = defensive_asset_execution_status(
+        execute_date,
+        required_defensive_ts_codes or (),
+    )
+    stock_ready = target == _trade_date_key(execute_date) and _execution_slice_ready(
         int(counts.get("stock_count") or 0), counts,
-    ):
+    )
+    if stock_ready and defensive_status.get("ok"):
         return no_pause()
+    missing_defensive = list(defensive_status.get("missing") or [])
+    missing_detail = f"；防御ETF缺失 {','.join(missing_defensive)}" if missing_defensive else ""
     return pause_decision(
         code="paused_frozen_execution_data_not_ready",
-        message=f"执行日 {target or execute_date} 的行情或涨跌停安全切片未就绪。",
-        recovery_condition="补齐冻结执行日的 daily 与 stk_limit 后由调度器自动重试。",
+        message=f"执行日 {target or execute_date} 的股票或ETF交易安全切片未就绪{missing_detail}。",
+        recovery_condition="补齐冻结执行日的 daily、stk_limit 与所需 fund_daily 后由调度器自动重试。",
         exit_condition="当日仍无法取得安全切片时记录漏跑，不得跨日补成交。",
         severity="error",
         evidence={
-            "schema_version": "alis_frozen_t1_execution_data_gate_v1",
+            "schema_version": "alis_frozen_t1_execution_data_gate_v2",
             "execute_date": _trade_date_key(execute_date),
             "target_trade_date": target,
             "counts": counts,
             "required_fields": ["daily.open", "daily.pre_close", "stk_limit"],
+            "defensive_asset_required_fields": [
+                "fund_daily.trade_date=execute_date",
+                "fund_daily.open",
+                "fund_daily.pre_close",
+                "fund_daily.vol",
+            ],
+            "defensive_assets": defensive_status,
             "daily_basic_required": False,
         },
     )
+
+
+def _refresh_missing_frozen_defensive_assets(
+    execute_date: str,
+    required_defensive_ts_codes: list[str] | tuple[str, ...] | None,
+) -> dict[str, Any]:
+    """Bound exact-date ETF refreshes so an unpublished slice is not hammered."""
+    from app.services.defensive_assets import (
+        defensive_asset_execution_status,
+        materialize_defensive_asset_history,
+    )
+
+    required = sorted({str(value or "").strip().upper() for value in required_defensive_ts_codes or () if str(value or "").strip()})
+    status = defensive_asset_execution_status(execute_date, required)
+    missing = list(status.get("missing") or [])
+    if not missing:
+        return {**status, "refresh": "not_needed"}
+    refresh_key = f"{_trade_date_key(execute_date)}:{','.join(missing)}"
+    now = perf_counter()
+    with _defensive_execution_refresh_lock:
+        last_attempt = float(_defensive_execution_refresh_attempts.get(refresh_key) or 0.0)
+        if last_attempt and now - last_attempt < _DEFENSIVE_EXECUTION_REFRESH_INTERVAL_SEC:
+            return {**status, "refresh": "throttled"}
+        _defensive_execution_refresh_attempts[refresh_key] = now
+    result = materialize_defensive_asset_history(
+        start_date=execute_date,
+        end_date=execute_date,
+        ts_codes=missing,
+    )
+    refreshed = defensive_asset_execution_status(execute_date, required)
+    return {**refreshed, "refresh": "attempted", "refresh_result": result}
 
 
 def _ensure_close_data_ready() -> tuple[str, bool]:
@@ -329,9 +385,25 @@ def start_auto_simulation_scheduler() -> bool:
                         # Execution eligibility belongs to the immutable plan
                         # whose execute-date slice is now available. It must not
                         # depend on whether today's new T-day plan was generated.
-                        formal_plan_claimable = bool(
-                            _materialize_current_plan_and_find_due_context(dates).get("ok")
-                        )
+                        due_context = _materialize_current_plan_and_find_due_context(dates)
+                        formal_plan_claimable = bool(due_context.get("ok"))
+                        if formal_plan_claimable:
+                            execution_gate = _evaluate_frozen_execution_data_gate(
+                                str(due_context.get("current_execute_date") or ""),
+                                due_context.get("required_defensive_ts_codes") or [],
+                            )
+                            if execution_gate.should_pause:
+                                refresh = _refresh_missing_frozen_defensive_assets(
+                                    str(due_context.get("current_execute_date") or ""),
+                                    due_context.get("required_defensive_ts_codes") or [],
+                                )
+                                logger.warning(
+                                    "冻结计划执行数据尚未就绪 execute_date=%s defensive=%s",
+                                    due_context.get("current_execute_date"),
+                                    refresh,
+                                )
+                                threading.Event().wait(_AUTO_SIMULATION_INTERVAL_SEC)
+                                continue
                         if formal_plan_claimable:
                             active_tasks = list_active_quant_run_tasks()
                             autonomous_tasks = [
@@ -687,8 +759,10 @@ def _build_autonomous_plan_context(dates: list[str]) -> dict:
                 "target_end_idx": dates.index(signal_date),
                 "gap_days": 1,
                 "batch_steps": 1,
+                "signal_date": signal_date,
                 "current_execute_date": execute_date,
                 "target_execute_date": execute_date,
+                "required_defensive_ts_codes": list(item.get("required_defensive_ts_codes") or []),
             }
     return {"ok": False, "reason": "no_due_formal_plan"}
 
@@ -989,12 +1063,20 @@ def run_quant_task_async(task_id: int) -> bool:
             if enable_data_health_gate and mode == "autonomous_daily":
                 execution_data_decision = _evaluate_frozen_execution_data_gate(
                     str(plan.get("current_execute_date") or ""),
+                    plan.get("required_defensive_ts_codes") or [],
                 )
                 if execution_data_decision.should_pause:
                     try:
                         _ensure_close_data_ready()
                     except Exception as exc:  # noqa: BLE001
                         logger.warning("frozen execution gate tried to start daily update but failed: %s", str(exc)[:160])
+                    try:
+                        _refresh_missing_frozen_defensive_assets(
+                            str(plan.get("current_execute_date") or ""),
+                            plan.get("required_defensive_ts_codes") or [],
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("frozen execution gate ETF refresh failed: %s", str(exc)[:160])
                     _handle_pause(
                         task_id,
                         replay_status=execution_data_decision.code,

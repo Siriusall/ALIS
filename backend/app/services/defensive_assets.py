@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from datetime import date, timedelta
-from typing import Any
+from typing import Any, Iterable
 
 from app.data_platform.db import _conn
 from app.data_platform.services.data_center import sync_tushare_api_raw
@@ -17,11 +17,27 @@ DEFENSIVE_ASSETS: tuple[dict[str, str], ...] = (
 )
 
 
-def materialize_defensive_asset_history(*, start_date: str | None = None, end_date: str | None = None) -> dict[str, Any]:
+def _registered_assets(ts_codes: Iterable[str] | None = None) -> list[dict[str, str]]:
+    if ts_codes is None:
+        return list(DEFENSIVE_ASSETS)
+    requested = {str(value or "").strip().upper() for value in ts_codes if str(value or "").strip()}
+    requested_symbols = {value.split(".")[0] for value in requested}
+    return [
+        asset for asset in DEFENSIVE_ASSETS
+        if asset["ts_code"] in requested or asset["ts_code"].split(".")[0] in requested_symbols
+    ]
+
+
+def materialize_defensive_asset_history(
+    *,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    ts_codes: Iterable[str] | None = None,
+) -> dict[str, Any]:
     end = str(end_date or date.today().strftime("%Y%m%d")).replace("-", "")
     start = str(start_date or (date.today() - timedelta(days=800)).strftime("%Y%m%d")).replace("-", "")
     results = []
-    for asset in DEFENSIVE_ASSETS:
+    for asset in _registered_assets(ts_codes):
         try:
             result = sync_tushare_api_raw("fund_daily", {"ts_code": asset["ts_code"], "start_date": start, "end_date": end})
             results.append({**asset, "ok": True, "rows": int(result.get("rows_written") or 0)})
@@ -131,17 +147,23 @@ def defensive_allocation_for_state(
     }
 
 
-def defensive_asset_bar(ts_code: str, trade_date: str) -> dict[str, Any] | None:
+def defensive_asset_bar(
+    ts_code: str,
+    trade_date: str,
+    *,
+    exact_date: bool = False,
+) -> dict[str, Any] | None:
     cutoff = str(trade_date).replace("-", "")
     available_cutoff = (
         f"{cutoff[:4]}-{cutoff[4:6]}-{cutoff[6:8]}T15:00:00"
         if len(cutoff) == 8 and cutoff.isdigit()
         else "9999-12-31T23:59:59"
     )
+    date_operator = "=" if exact_date else "<="
     with _conn() as c:
         row = c.execute(
-            """SELECT payload_json,available_time FROM dc_tushare_raw_records
-               WHERE api_name='fund_daily' AND ts_code=? AND trade_date<=? AND available_time<=?
+            f"""SELECT trade_date,payload_json,available_time FROM dc_tushare_raw_records
+               WHERE api_name='fund_daily' AND ts_code=? AND trade_date{date_operator}? AND available_time<=?
                ORDER BY trade_date DESC, available_time DESC LIMIT 1""",
             (str(ts_code), cutoff, available_cutoff),
         ).fetchone()
@@ -152,7 +174,46 @@ def defensive_asset_bar(ts_code: str, trade_date: str) -> dict[str, Any] | None:
         payload = json.loads(item.get("payload_json") or "{}")
     except (TypeError, json.JSONDecodeError):
         return None
-    return {**payload, "available_time": item.get("available_time")}
+    return {
+        **payload,
+        "trade_date": str(item.get("trade_date") or ""),
+        "available_time": item.get("available_time"),
+    }
+
+
+def defensive_asset_execution_status(
+    trade_date: str,
+    ts_codes: Iterable[str],
+) -> dict[str, Any]:
+    """Audit exact-session ETF fields needed by a frozen T+1 execution."""
+    target = str(trade_date or "").replace("-", "")[:8]
+    assets = _registered_assets(ts_codes)
+    items: list[dict[str, Any]] = []
+    for asset in assets:
+        bar = defensive_asset_bar(asset["ts_code"], target, exact_date=True)
+        actual_date = str((bar or {}).get("trade_date") or "").replace("-", "")[:8]
+        missing_fields = [
+            field for field in ("open", "pre_close", "vol")
+            if float((bar or {}).get(field) or 0) <= 0
+        ]
+        ready = actual_date == target and not missing_fields
+        items.append({
+            "ts_code": asset["ts_code"],
+            "name": asset["name"],
+            "ready": ready,
+            "trade_date": actual_date,
+            "missing_fields": missing_fields,
+        })
+    missing = [item["ts_code"] for item in items if not item["ready"]]
+    return {
+        "schema_version": "alis_defensive_asset_execution_slice_v1",
+        "trade_date": target,
+        "required": [asset["ts_code"] for asset in assets],
+        "ready": [item["ts_code"] for item in items if item["ready"]],
+        "missing": missing,
+        "items": items,
+        "ok": not missing,
+    }
 
 
 def defensive_asset_returns(ts_code: str, as_of_date: str, *, limit: int = 60) -> list[float]:

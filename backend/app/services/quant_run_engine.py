@@ -314,6 +314,44 @@ def _execution_volume(row: Any) -> float:
         return 0.0
 
 
+def _defensive_execution_row(
+    symbol: str,
+    *,
+    ts_code: str,
+    name: str,
+    execute_date: str,
+    require_exact_date: bool,
+) -> Any | None:
+    """Build an ETF execution row without relabeling a stale market record."""
+    from app.services.defensive_assets import defensive_asset_bar
+
+    bar = defensive_asset_bar(ts_code, execute_date, exact_date=require_exact_date)
+    if not bar:
+        return None
+    actual_date = str(bar.get("trade_date") or "").replace("-", "")[:8]
+    target_date = str(execute_date or "").replace("-", "")[:8]
+    open_price = float(bar.get("open") or 0)
+    previous_close = float(bar.get("pre_close") or 0)
+    volume = float(bar.get("vol") or 0)
+    if require_exact_date and (
+        actual_date != target_date
+        or open_price <= 0
+        or previous_close <= 0
+        or volume <= 0
+    ):
+        return None
+    return SimpleNamespace(
+        symbol=symbol,
+        name=name or symbol,
+        date=actual_date,
+        open=open_price,
+        close=float(bar.get("close") or open_price),
+        prev_close=previous_close,
+        change_pct=float(bar.get("pct_chg") or 0),
+        volume=volume,
+    )
+
+
 def _load_validated_signal_rows(
     ds: BacktestDataSource,
     signal_date: str,
@@ -1137,19 +1175,52 @@ def run_for_trade_date(
                 code="future_guard_execute_snapshot",
             )
     exec_map = {x.symbol: x for x in exec_rows}
-    if defensive_weights:
-        from app.services.defensive_assets import DEFENSIVE_ASSETS, defensive_asset_bar
+    frozen_action_by_symbol = {
+        str(item.get("symbol") or ""): item
+        for item in (frozen_controller.get("actions") or [])
+        if isinstance(item, dict) and str(item.get("symbol") or "")
+    }
+    if defensive_weights or frozen_unified_plan:
+        from app.services.defensive_assets import DEFENSIVE_ASSETS
+
         defensive_meta = {item["ts_code"].split(".")[0]: item for item in DEFENSIVE_ASSETS}
-        for symbol in defensive_weights:
+        execution_defensive_symbols = set(defensive_weights)
+        if frozen_unified_plan:
+            execution_defensive_symbols.update(
+                symbol for symbol in frozen_action_by_symbol if symbol in defensive_meta
+            )
+            execution_defensive_symbols.update(
+                str(position.get("symbol") or "").split(".")[0]
+                for position in get_positions()
+                if str(position.get("symbol") or "").split(".")[0] in defensive_meta
+                and int(position.get("quantity") or 0) > 0
+            )
+        missing_defensive_execution_rows: list[str] = []
+        for symbol in sorted(execution_defensive_symbols):
             meta = defensive_meta.get(symbol) or {}
-            bar = defensive_asset_bar(str(meta.get("ts_code") or _ts_code(symbol)), execute_date)
-            if not bar:
-                blocked_events.append({"date": execute_date, "symbol": symbol, "side": "BUY", "code": "defensive_asset_price_missing", "message": "防御ETF执行日行情缺失"})
+            row = _defensive_execution_row(
+                symbol,
+                ts_code=str(meta.get("ts_code") or _ts_code(symbol)),
+                name=str(meta.get("name") or symbol),
+                execute_date=execute_date,
+                require_exact_date=frozen_unified_plan,
+            )
+            if row is None:
+                missing_defensive_execution_rows.append(symbol)
+                action = str((frozen_action_by_symbol.get(symbol) or {}).get("action") or "")
+                blocked_events.append({
+                    "date": execute_date,
+                    "symbol": symbol,
+                    "side": "SELL" if action in {"reduce_position", "sell_exit"} else "BUY",
+                    "code": "defensive_asset_price_missing",
+                    "message": "防御ETF执行日精确行情缺失" if frozen_unified_plan else "防御ETF执行日行情缺失",
+                })
                 continue
-            exec_map[symbol] = SimpleNamespace(
-                symbol=symbol, name=meta.get("name") or symbol, date=execute_date,
-                open=float(bar.get("open") or 0), close=float(bar.get("close") or 0),
-                change_pct=float(bar.get("pct_chg") or 0), volume=float(bar.get("vol") or 0),
+            exec_map[symbol] = row
+        if frozen_unified_plan and missing_defensive_execution_rows:
+            raise ReplayRiskGateError(
+                "冻结计划所需防御ETF缺少执行日精确行情：" + ",".join(missing_defensive_execution_rows),
+                code="paused_frozen_execution_data_not_ready",
             )
     executed_at = f"{execute_date}T09:30:00"
     pretrade_portfolio = _portfolio_state(ds, execute_date, execution_rows=exec_map)
@@ -1168,11 +1239,6 @@ def run_for_trade_date(
     else:
         turnover_budget = _monthly_turnover_budget(execute_date, pretrade_portfolio["total_equity"])
         turnover_remaining = float(turnover_budget["remaining"])
-    frozen_action_by_symbol = {
-        str(item.get("symbol") or ""): item
-        for item in (frozen_controller.get("actions") or [])
-        if isinstance(item, dict) and str(item.get("symbol") or "")
-    }
     if frozen_unified_plan:
         thesis_status_by_symbol = {}
     else:

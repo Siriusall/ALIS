@@ -75,7 +75,11 @@ def test_autonomous_plan_uses_only_plan_due_on_latest_session(monkeypatch):
     monkeypatch.setattr(
         "app.services.profit_loop.list_pending_daily_rebalance_execution_inputs",
         lambda: [
-            {"signal_date": "20260724", "execute_date": "20260727"},
+            {
+                "signal_date": "20260724",
+                "execute_date": "20260727",
+                "required_defensive_ts_codes": ["510880.SH"],
+            },
             {"signal_date": "20260723", "execute_date": "20260724"},
         ],
     )
@@ -87,6 +91,7 @@ def test_autonomous_plan_uses_only_plan_due_on_latest_session(monkeypatch):
     assert plan["ok"] is True
     assert plan["start_idx"] == 1
     assert plan["current_execute_date"] == "2026-07-27"
+    assert plan["required_defensive_ts_codes"] == ["510880.SH"]
 
 
 def test_trade_date_identity_accepts_compact_and_hyphenated_values():

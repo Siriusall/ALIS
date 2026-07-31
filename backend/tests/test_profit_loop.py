@@ -253,6 +253,47 @@ def test_formal_plan_can_only_be_claimed_once(monkeypatch):
     assert state == {"status": "executing", "token": "task-1"}
 
 
+def test_pending_plan_lists_defensive_assets_needed_by_plan_and_holdings(monkeypatch):
+    contract = {
+        "target_symbols": ["000001", "510880"],
+        "proposal": [
+            {"symbol": "000001", "action": "hold"},
+            {"symbol": "511010", "action": "reduce_position"},
+        ],
+    }
+
+    @contextmanager
+    def fake_conn():
+        class Conn:
+            def execute(self, _sql, _params=()):
+                return _Rows([{
+                    "id": 21,
+                    "trade_date": "20260730",
+                    "planned_execute_date": "20260731",
+                    "version": 2,
+                    "proposal_json": json.dumps(contract),
+                }])
+
+        yield Conn()
+
+    monkeypatch.setattr(profit_loop, "_ensure_tables", lambda: None)
+    monkeypatch.setattr(profit_loop, "business_conn", fake_conn)
+    monkeypatch.setattr(
+        profit_loop,
+        "get_positions",
+        lambda: [{"symbol": "511880", "quantity": 100}],
+    )
+
+    pending = profit_loop.list_pending_daily_rebalance_execution_inputs()
+
+    assert pending == [{
+        "plan_id": 21,
+        "signal_date": "20260730",
+        "execute_date": "20260731",
+        "required_defensive_ts_codes": ["510880.SH", "511010.SH", "511880.SH"],
+    }]
+
+
 def test_missed_formal_plans_leave_pending_state_and_cannot_execute_late(monkeypatch):
     captured = {}
     state = {"status": "planned"}

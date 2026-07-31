@@ -91,6 +91,108 @@ def test_frozen_t1_worker_requires_open_and_previous_close(monkeypatch) -> None:
     ]
 
 
+def test_frozen_t1_worker_blocks_stale_defensive_asset_slice(monkeypatch) -> None:
+    monkeypatch.setattr(
+        quant_task_runner,
+        "_snapshot_data_status",
+        lambda trade_date="": (
+            "20260731",
+            {
+                "stock_count": 1_000,
+                "daily_n": 996,
+                "execution_price_n": 996,
+                "valuation_n": 0,
+                "limit_n": 990,
+            },
+        ),
+    )
+    monkeypatch.setattr(
+        "app.services.defensive_assets.defensive_asset_execution_status",
+        lambda trade_date, ts_codes: {
+            "ok": False,
+            "trade_date": "20260731",
+            "required": list(ts_codes),
+            "ready": [],
+            "missing": ["510880.SH"],
+            "items": [],
+        },
+    )
+
+    decision = quant_task_runner._evaluate_frozen_execution_data_gate(
+        "20260731",
+        ["510880.SH"],
+    )
+
+    assert decision.should_pause is True
+    assert decision.evidence["schema_version"] == "alis_frozen_t1_execution_data_gate_v2"
+    assert decision.evidence["defensive_assets"]["missing"] == ["510880.SH"]
+
+
+def test_frozen_t1_worker_accepts_complete_defensive_asset_slice(monkeypatch) -> None:
+    monkeypatch.setattr(
+        quant_task_runner,
+        "_snapshot_data_status",
+        lambda trade_date="": (
+            "20260731",
+            {
+                "stock_count": 1_000,
+                "daily_n": 996,
+                "execution_price_n": 996,
+                "valuation_n": 0,
+                "limit_n": 990,
+            },
+        ),
+    )
+    monkeypatch.setattr(
+        "app.services.defensive_assets.defensive_asset_execution_status",
+        lambda trade_date, ts_codes: {
+            "ok": True,
+            "trade_date": "20260731",
+            "required": list(ts_codes),
+            "ready": list(ts_codes),
+            "missing": [],
+            "items": [],
+        },
+    )
+
+    decision = quant_task_runner._evaluate_frozen_execution_data_gate(
+        "20260731",
+        ["510880.SH", "511010.SH", "511880.SH", "512890.SH", "518880.SH"],
+    )
+
+    assert decision.should_pause is False
+
+
+def test_frozen_t1_refresh_only_requests_missing_defensive_assets(monkeypatch) -> None:
+    statuses = iter([
+        {"ok": False, "missing": ["510880.SH"], "required": ["510880.SH", "511010.SH"]},
+        {"ok": True, "missing": [], "required": ["510880.SH", "511010.SH"]},
+    ])
+    captured = {}
+    quant_task_runner._defensive_execution_refresh_attempts.clear()
+    monkeypatch.setattr(
+        "app.services.defensive_assets.defensive_asset_execution_status",
+        lambda *_args, **_kwargs: next(statuses),
+    )
+    monkeypatch.setattr(
+        "app.services.defensive_assets.materialize_defensive_asset_history",
+        lambda **kwargs: captured.update(kwargs) or {"ok": True},
+    )
+
+    result = quant_task_runner._refresh_missing_frozen_defensive_assets(
+        "20260731",
+        ["510880.SH", "511010.SH"],
+    )
+
+    assert result["ok"] is True
+    assert result["refresh"] == "attempted"
+    assert captured == {
+        "start_date": "20260731",
+        "end_date": "20260731",
+        "ts_codes": ["510880.SH"],
+    }
+
+
 def test_scheduler_refreshes_missing_decision_data_without_blocking_due_t1_plan(
     monkeypatch,
 ) -> None:

@@ -1475,7 +1475,7 @@ def claim_daily_rebalance_execution_input(
     }
 
 
-def list_pending_daily_rebalance_execution_inputs() -> list[dict[str, str]]:
+def list_pending_daily_rebalance_execution_inputs() -> list[dict[str, Any]]:
     """List the latest unclaimed formal plan for each signal date.
 
     This is intentionally read-only.  The simulator still acquires the plan
@@ -1485,21 +1485,51 @@ def list_pending_daily_rebalance_execution_inputs() -> list[dict[str, str]]:
     _ensure_tables()
     with business_conn() as c:
         rows = c.execute(
-            """SELECT trade_date, planned_execute_date, version
+            """SELECT id,trade_date,planned_execute_date,version,proposal_json
                FROM daily_rebalance_plans
                WHERE status='planned'
                ORDER BY trade_date ASC, version DESC"""
         ).fetchall()
-    latest_by_signal: dict[str, dict[str, str]] = {}
+    from app.services.defensive_assets import DEFENSIVE_ASSETS
+
+    registered = {
+        str(asset["ts_code"]).split(".")[0]: str(asset["ts_code"])
+        for asset in DEFENSIVE_ASSETS
+    }
+    held_defensive_symbols = {
+        str(position.get("symbol") or "").split(".")[0]
+        for position in get_positions()
+        if str(position.get("symbol") or "").split(".")[0] in registered
+        and int(position.get("quantity") or 0) > 0
+    }
+    latest_by_signal: dict[str, dict[str, Any]] = {}
     for row in rows:
         item = dict(row)
         signal_date = str(item.get("trade_date") or "").replace("-", "")[:8]
         execute_date = str(item.get("planned_execute_date") or "").replace("-", "")[:8]
         if len(signal_date) != 8 or len(execute_date) != 8:
             continue
+        try:
+            contract = json.loads(item.get("proposal_json") or "{}")
+        except (TypeError, json.JSONDecodeError):
+            contract = {}
+        plan_symbols = {
+            str(value or "").split(".")[0]
+            for value in contract.get("target_symbols") or []
+            if str(value or "").split(".")[0] in registered
+        }
+        proposal_symbols = {
+            str(proposal.get("symbol") or "").split(".")[0]
+            for proposal in contract.get("proposal") or []
+            if isinstance(proposal, dict)
+            and str(proposal.get("symbol") or "").split(".")[0] in registered
+        }
+        required_symbols = held_defensive_symbols | plan_symbols | proposal_symbols
         latest_by_signal.setdefault(signal_date, {
+            "plan_id": int(item.get("id") or 0),
             "signal_date": signal_date,
             "execute_date": execute_date,
+            "required_defensive_ts_codes": sorted(registered[symbol] for symbol in required_symbols),
         })
     return list(latest_by_signal.values())
 
