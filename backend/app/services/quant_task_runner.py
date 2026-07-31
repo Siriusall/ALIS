@@ -180,37 +180,82 @@ def _market_slice_ready(stock_count: int, counts: dict[str, int]) -> bool:
 
 def _execution_slice_ready(stock_count: int, counts: dict[str, int]) -> bool:
     """Require only market and limit data needed by a frozen T+1 plan."""
+    execution_price_n = int(counts.get("execution_price_n", counts.get("daily_n", 0)) or 0)
     return bool(stock_count) and (
-        counts["daily_n"] / stock_count >= 0.995
+        execution_price_n / stock_count >= 0.995
         and counts["limit_n"] / stock_count >= 0.99
     )
 
 
+def _snapshot_data_status(trade_date: str = "") -> tuple[str, dict[str, int]]:
+    """Return exact-date market coverage without applying a decision policy."""
+    requested = _trade_date_key(trade_date)
+    from app.data_platform.db import _conn
+    from app.data_platform.services.market_calendar import target_trade_date
+
+    with _conn() as c:
+        target = requested or target_trade_date(c)
+        stock_count = int(dict(c.execute("SELECT COUNT(*) n FROM dc_stock_master").fetchone()).get("n") or 0)
+        row = c.execute(
+            """SELECT
+                 SUM(CASE WHEN s.close IS NOT NULL THEN 1 ELSE 0 END) AS daily_n,
+                 SUM(CASE WHEN EXISTS (
+                     SELECT 1 FROM dc_tushare_raw_records r
+                     WHERE r.api_name='daily' AND r.trade_date=s.trade_date AND r.ts_code=s.ts_code
+                       AND NULLIF(r.payload_json::jsonb->>'open','') IS NOT NULL
+                       AND NULLIF(r.payload_json::jsonb->>'pre_close','') IS NOT NULL
+                 ) THEN 1 ELSE 0 END) AS execution_price_n,
+                 SUM(CASE WHEN s.total_mv IS NOT NULL THEN 1 ELSE 0 END) AS valuation_n,
+                 SUM(CASE WHEN s.up_limit IS NOT NULL AND s.down_limit IS NOT NULL THEN 1 ELSE 0 END) AS limit_n
+               FROM dc_stock_daily_snapshot s WHERE s.trade_date=?""",
+            (target,),
+        ).fetchone()
+    counts = {
+        key: int((dict(row).get(key) if row else 0) or 0)
+        for key in ("daily_n", "execution_price_n", "valuation_n", "limit_n")
+    }
+    return target, {"stock_count": stock_count, **counts}
+
+
 def _close_data_status() -> tuple[str, bool, dict[str, int]]:
-    """Return the close-of-day market slice status for the execution target.
+    """Return the close-of-day decision slice status for the current target.
 
     The simulator must never silently fall back to yesterday merely because
     today's market bundle has not been ingested yet.  Keep this check close to
     the scheduler instead of relying on the short-lived readiness cache.
     """
-    from app.data_platform.db import _conn
-    from app.data_platform.services.market_calendar import target_trade_date
+    target, counts = _snapshot_data_status()
+    ready = _market_slice_ready(int(counts.get("stock_count") or 0), counts)
+    return target, ready, counts
 
-    with _conn() as c:
-        target = target_trade_date(c)
-        stock_count = int(dict(c.execute("SELECT COUNT(*) n FROM dc_stock_master").fetchone()).get("n") or 0)
-        row = c.execute(
-            """SELECT
-                 SUM(CASE WHEN close IS NOT NULL THEN 1 ELSE 0 END) AS daily_n,
-                 SUM(CASE WHEN total_mv IS NOT NULL THEN 1 ELSE 0 END) AS valuation_n,
-                 SUM(CASE WHEN up_limit IS NOT NULL AND down_limit IS NOT NULL THEN 1 ELSE 0 END) AS limit_n
-               FROM dc_stock_daily_snapshot WHERE trade_date=?""",
-            (target,),
-        ).fetchone()
-    counts = {key: int((dict(row).get(key) if row else 0) or 0) for key in ("daily_n", "valuation_n", "limit_n")}
-    # Keep the same thresholds as the data-contract used by trade decisions.
-    ready = _market_slice_ready(stock_count, counts)
-    return target, ready, {"stock_count": stock_count, **counts}
+
+def _requires_replay_opinion_gates(mode: str) -> bool:
+    """Only research replay may reconsider data, drawdown, loss or cash opinions."""
+    return str(mode or "") != "autonomous_daily"
+
+
+def _evaluate_frozen_execution_data_gate(execute_date: str) -> RiskPauseDecision:
+    """Validate only the exact-date market fields allowed by the T+1 contract."""
+    target, counts = _snapshot_data_status(execute_date)
+    if target == _trade_date_key(execute_date) and _execution_slice_ready(
+        int(counts.get("stock_count") or 0), counts,
+    ):
+        return no_pause()
+    return pause_decision(
+        code="paused_frozen_execution_data_not_ready",
+        message=f"执行日 {target or execute_date} 的行情或涨跌停安全切片未就绪。",
+        recovery_condition="补齐冻结执行日的 daily 与 stk_limit 后由调度器自动重试。",
+        exit_condition="当日仍无法取得安全切片时记录漏跑，不得跨日补成交。",
+        severity="error",
+        evidence={
+            "schema_version": "alis_frozen_t1_execution_data_gate_v1",
+            "execute_date": _trade_date_key(execute_date),
+            "target_trade_date": target,
+            "counts": counts,
+            "required_fields": ["daily.open", "daily.pre_close", "stk_limit"],
+            "daily_basic_required": False,
+        },
+    )
 
 
 def _ensure_close_data_ready() -> tuple[str, bool]:
@@ -406,6 +451,7 @@ def _preflight_check_step(
     execute_date: str,
     min_account_balance: float,
     enforce_session_gate: bool,
+    require_min_account_balance: bool = True,
 ) -> RiskPauseDecision:
     if enforce_session_gate and (not _is_trading_session_now()):
         return pause_decision(
@@ -416,7 +462,7 @@ def _preflight_check_step(
             evidence={"signal_date": signal_date, "execute_date": execute_date},
         )
     bal = float(get_account_balance() or 0)
-    if bal <= float(min_account_balance):
+    if require_min_account_balance and bal <= float(min_account_balance):
         return pause_decision(
             code="paused_funds_not_ready",
             message=f"可用资金不足（当前 {bal:.2f}），暂停任务执行。",
@@ -759,6 +805,8 @@ def run_quant_task_async(task_id: int) -> bool:
             min_account_balance = max(0.0, _as_float(runtime_cfg.get("min_account_balance"), _DEFAULT_MIN_ACCOUNT_BALANCE))
             max_consecutive_losses = max(0, min(_as_int(runtime_cfg.get("max_consecutive_losses"), _DEFAULT_MAX_CONSECUTIVE_LOSSES), 30))
             mode = _normalized_replay_mode(task0.get("replay_mode"))
+            replay_opinion_gates = _requires_replay_opinion_gates(mode)
+            frozen_autonomous_execution = not replay_opinion_gates
             health0 = {
                 "heartbeat_at": now,
                 "last_step_latency_ms": 0,
@@ -781,7 +829,7 @@ def run_quant_task_async(task_id: int) -> bool:
                 error=None,
             )
 
-            if enable_data_health_gate:
+            if enable_data_health_gate and replay_opinion_gates:
                 data_decision = evaluate_data_health_gate(limit_days=5)
                 if data_decision.should_pause:
                     _handle_pause(
@@ -854,11 +902,19 @@ def run_quant_task_async(task_id: int) -> bool:
             done_signals = {str(x.get("signal_date") or "") for x in records if x.get("signal_date")}
             processed_total = 0
 
-            loss_decision = evaluate_consecutive_loss_gate(
-                task_id=task_id,
-                max_consecutive_losses=max_consecutive_losses,
+            loss_decision = (
+                no_pause()
+                if frozen_autonomous_execution
+                else evaluate_consecutive_loss_gate(
+                    task_id=task_id,
+                    max_consecutive_losses=max_consecutive_losses,
+                )
             )
-            drawdown_decision = evaluate_account_drawdown_gate(max_drawdown=0.10)
+            drawdown_decision = (
+                no_pause()
+                if frozen_autonomous_execution
+                else evaluate_account_drawdown_gate(max_drawdown=0.10)
+            )
             if drawdown_decision.should_pause:
                 _handle_pause(
                     task_id,
@@ -930,6 +986,34 @@ def run_quant_task_async(task_id: int) -> bool:
                 )
                 return
 
+            if enable_data_health_gate and mode == "autonomous_daily":
+                execution_data_decision = _evaluate_frozen_execution_data_gate(
+                    str(plan.get("current_execute_date") or ""),
+                )
+                if execution_data_decision.should_pause:
+                    try:
+                        _ensure_close_data_ready()
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("frozen execution gate tried to start daily update but failed: %s", str(exc)[:160])
+                    _handle_pause(
+                        task_id,
+                        replay_status=execution_data_decision.code,
+                        message=execution_data_decision.message,
+                        decision=execution_data_decision,
+                    )
+                    h = get_quant_run_task_health(task_id)
+                    upsert_quant_run_task_health(
+                        task_id,
+                        heartbeat_at=_utc_now_iso(),
+                        last_step_latency_ms=int(h.get("last_step_latency_ms") or 0),
+                        avg_step_latency_ms=int(h.get("avg_step_latency_ms") or 0),
+                        step_count=int(h.get("step_count") or 0),
+                        risk_hit_count=int(h.get("risk_hit_count") or 0) + 1,
+                        consecutive_pause_count=int(h.get("consecutive_pause_count") or 0) + 1,
+                        last_risk_code=execution_data_decision.code,
+                    )
+                    return
+
             start_idx = int(plan["start_idx"])
             batch_end_idx = int(plan["batch_end_idx"])
             target_end_idx = int(plan["target_end_idx"])
@@ -950,7 +1034,7 @@ def run_quant_task_async(task_id: int) -> bool:
             )
 
             # 时段门（可选）：默认不限制；仅在显式开启后，非交易时段只生成计划不执行。
-            if enforce_session_gate and (not _is_trading_session_now()):
+            if enforce_session_gate and not frozen_autonomous_execution and (not _is_trading_session_now()):
                 session_decision = pause_decision(
                     code="planned_waiting_session",
                     message="已生成补跑计划，但当前非交易时段，等待交易时段执行。",
@@ -989,7 +1073,7 @@ def run_quant_task_async(task_id: int) -> bool:
 
             # 资金门：资金不足时暂停补跑，避免盲目执行。
             account_balance = float(get_account_balance() or 0)
-            if account_balance <= min_account_balance:
+            if not frozen_autonomous_execution and account_balance <= min_account_balance:
                 funds_decision = pause_decision(
                     code="paused_funds_not_ready",
                     message=f"可用资金不足（当前 {account_balance:.2f}），暂停补跑。",
@@ -1048,7 +1132,8 @@ def run_quant_task_async(task_id: int) -> bool:
                     signal_date=signal_date,
                     execute_date=execute_date,
                     min_account_balance=min_account_balance,
-                    enforce_session_gate=enforce_session_gate,
+                    enforce_session_gate=enforce_session_gate and not frozen_autonomous_execution,
+                    require_min_account_balance=not frozen_autonomous_execution,
                 )
                 if pre_decision.should_pause:
                     _handle_pause(
