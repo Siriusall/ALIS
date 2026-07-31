@@ -264,6 +264,19 @@ def test_step_timeout_records_failure_without_blocking_bus(monkeypatch):
     assert step["result"]["status"] == "timed_out"
 
 
+def test_known_long_step_uses_independent_timeout_budget(monkeypatch):
+    monkeypatch.setattr(system_autonomy, "_STEP_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(system_autonomy, "_LONG_STEP_TIMEOUT_SECONDS", 0.2)
+
+    step = system_autonomy._run_step(
+        "factor_daily_cycle",
+        lambda: (time.sleep(0.04), {"ok": True, "status": "completed"})[1],
+    )
+
+    assert step["ok"] is True
+    assert step["result"]["status"] == "completed"
+
+
 def test_timed_out_step_blocks_same_name_reentry_until_original_worker_finishes(monkeypatch):
     release = threading.Event()
     monkeypatch.setattr(system_autonomy, "_STEP_TIMEOUT_SECONDS", 0.02)

@@ -1,7 +1,39 @@
 from contextlib import contextmanager
 from datetime import timedelta
+import time
 
 from app.services import evolution_orchestrator as evolution
+
+
+def test_long_task_pulse_renews_lease_without_rewriting_checkpoint(monkeypatch):
+    updates = []
+    runtime_beats = []
+    monkeypatch.setattr(evolution, "HEARTBEAT_PULSE_SECONDS", 0.01)
+    monkeypatch.setattr(evolution, "_runtime_heartbeat", lambda component: runtime_beats.append(component))
+    monkeypatch.setattr(evolution, "_ensure_task_active", lambda _task_id: None)
+    monkeypatch.setattr(evolution, "get_evolution_task", lambda _task_id: {
+        "phase": "formal_oos",
+        "message": "窗口重放",
+        "checkpoint": {"windows": [{"index": 1}]},
+    })
+    monkeypatch.setattr(
+        evolution,
+        "_update_active_task",
+        lambda task_id, **fields: updates.append({"task_id": task_id, **fields}) or True,
+    )
+
+    result = evolution._run_with_heartbeat_pulse(
+        9,
+        phase="formal_oos",
+        message="窗口重放",
+        runner=lambda: (time.sleep(0.04), {"ok": True})[1],
+    )
+
+    assert result == {"ok": True}
+    assert runtime_beats
+    assert updates
+    assert all("checkpoint" not in item and "progress" not in item for item in updates)
+    assert all(item["expected_lease_owner"] == evolution.WORKER_ID for item in updates)
 
 
 def test_plan_model_autonomy_holds_worker_until_training_is_terminal(monkeypatch):

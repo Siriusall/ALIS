@@ -11,6 +11,11 @@ from app.db.store import _conn
 
 
 _STEP_TIMEOUT_SECONDS = max(15, min(int(os.getenv("ALIS_AUTONOMY_STEP_TIMEOUT_SECONDS", "120")), 900))
+_LONG_STEP_TIMEOUT_SECONDS = max(
+    _STEP_TIMEOUT_SECONDS,
+    min(int(os.getenv("ALIS_AUTONOMY_LONG_STEP_TIMEOUT_SECONDS", "3600")), 7200),
+)
+_LONG_RUNNING_STEPS = frozenset({"factor_daily_cycle", "plan_model_autonomy"})
 _running_steps: set[str] = set()
 _running_steps_lock = threading.Lock()
 
@@ -39,14 +44,19 @@ def _run_step(name: str, fn: Callable[[], dict[str, Any]]) -> dict[str, Any]:
 
     worker = threading.Thread(target=invoke, daemon=True, name=f"autonomy-step:{name}")
     worker.start()
-    worker.join(_STEP_TIMEOUT_SECONDS)
+    timeout_seconds = (
+        _LONG_STEP_TIMEOUT_SECONDS
+        if name in _LONG_RUNNING_STEPS
+        else _STEP_TIMEOUT_SECONDS
+    )
+    worker.join(timeout_seconds)
     if worker.is_alive():
         step = {
             "name": name, "ok": False,
             "duration_seconds": round((datetime.now().astimezone() - started).total_seconds(), 3),
             "started_at": started.isoformat(), "finished_at": datetime.now().astimezone().isoformat(),
-            "error": f"step_timeout_after_{_STEP_TIMEOUT_SECONDS}s",
-            "result": {"status": "timed_out", "timeout_seconds": _STEP_TIMEOUT_SECONDS},
+            "error": f"step_timeout_after_{timeout_seconds}s",
+            "result": {"status": "timed_out", "timeout_seconds": timeout_seconds},
         }
         from app.services.autonomous_healing import classify_step_health
 

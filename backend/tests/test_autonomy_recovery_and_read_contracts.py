@@ -20,7 +20,7 @@ def test_ready_data_contract_enqueues_distinct_recovery_cycle(monkeypatch):
     result = evolution_orchestrator.enqueue_system_autonomy_recovery("20260724", contract)
 
     assert result["task_type"] == "system_autonomy_cycle"
-    assert result["dedupe_key"].startswith("system_autonomy_recovery:v2:20260724:")
+    assert result["dedupe_key"].startswith("system_autonomy_recovery:v3:20260724:")
     assert result["payload"]["trigger"] == "decision_data_recovered"
     assert result["priority"] == 85
 
@@ -51,11 +51,64 @@ def test_latest_ready_date_is_recovered_when_prior_cycle_stopped_at_data_gate(mo
     monkeypatch.setattr(
         evolution_orchestrator,
         "enqueue_system_autonomy_recovery",
-        lambda trade_date, contract: {"ok": True, "status": "queued", "trade_date": trade_date, "contract": contract},
+        lambda trade_date, contract, **kwargs: {
+            "ok": True,
+            "status": "queued",
+            "trade_date": trade_date,
+            "contract": contract,
+            **kwargs,
+        },
     )
     result = evolution_orchestrator.ensure_latest_ready_system_cycle()
     assert result["status"] == "queued"
     assert result["trade_date"] == "20260724"
+    assert result["continuation_after"] is None
+
+
+def test_latest_ready_date_continues_cycle_that_failed_to_persist_plan(monkeypatch):
+    monkeypatch.setattr(
+        "app.services.data_health.assess_latest_decision_data_health",
+        lambda: {
+            "decision_ready": True,
+            "readiness": {
+                "target_trade_date": "20260724",
+                "decision_contract": {"ok": True},
+            },
+        },
+    )
+    monkeypatch.setattr(evolution_orchestrator, "list_evolution_tasks", lambda limit=200: [{
+        "id": 39,
+        "task_type": "system_autonomy_cycle",
+        "status": "completed",
+        "result": {"steps": [
+            {
+                "name": "decision_data_gate",
+                "result": {
+                    "decision_ready": True,
+                    "readiness": {"target_trade_date": "20260724"},
+                },
+            },
+            {
+                "name": "profit_and_portfolio",
+                "ok": False,
+                "error": "invalid_authoritative_plan",
+            },
+        ]},
+    }])
+    monkeypatch.setattr(
+        evolution_orchestrator,
+        "enqueue_system_autonomy_recovery",
+        lambda trade_date, contract, **kwargs: {
+            "ok": True,
+            "status": "queued",
+            "trade_date": trade_date,
+            **kwargs,
+        },
+    )
+
+    result = evolution_orchestrator.ensure_latest_ready_system_cycle()
+
+    assert result["continuation_after"] == 39
 
 
 def test_latest_ready_date_does_not_duplicate_successful_cycle(monkeypatch):
@@ -79,6 +132,91 @@ def test_latest_ready_date_does_not_duplicate_successful_cycle(monkeypatch):
     }])
     result = evolution_orchestrator.ensure_latest_ready_system_cycle()
     assert result == {"ok": True, "status": "already_completed", "trade_date": "20260724", "task_id": 44}
+
+
+def test_latest_ready_date_reuses_active_continuation(monkeypatch):
+    monkeypatch.setattr(
+        "app.services.data_health.assess_latest_decision_data_health",
+        lambda: {
+            "decision_ready": True,
+            "readiness": {"target_trade_date": "20260724"},
+        },
+    )
+    monkeypatch.setattr(evolution_orchestrator, "list_evolution_tasks", lambda limit=200: [{
+        "id": 45,
+        "task_type": "system_autonomy_cycle",
+        "status": "queued",
+        "payload": {"trade_date": "20260724"},
+    }])
+
+    result = evolution_orchestrator.ensure_latest_ready_system_cycle()
+
+    assert result == {
+        "ok": True,
+        "status": "queued",
+        "trade_date": "20260724",
+        "task_id": 45,
+    }
+
+
+def test_latest_ready_date_reuses_legacy_active_daily_key_without_payload_date(monkeypatch):
+    monkeypatch.setattr(
+        "app.services.data_health.assess_latest_decision_data_health",
+        lambda: {
+            "decision_ready": True,
+            "readiness": {"target_trade_date": "20260724"},
+        },
+    )
+    monkeypatch.setattr(evolution_orchestrator, "list_evolution_tasks", lambda limit=200: [{
+        "id": 48,
+        "task_type": "system_autonomy_cycle",
+        "dedupe_key": "system_autonomy_cycle:2026-07-24",
+        "status": "running",
+        "payload": {"trigger": "daily_scheduler"},
+    }])
+
+    result = evolution_orchestrator.ensure_latest_ready_system_cycle()
+
+    assert result["status"] == "running"
+    assert result["task_id"] == 48
+
+
+def test_latest_ready_date_stops_after_bounded_incomplete_continuations(monkeypatch):
+    monkeypatch.setattr(
+        "app.services.data_health.assess_latest_decision_data_health",
+        lambda: {
+            "decision_ready": True,
+            "readiness": {"target_trade_date": "20260724"},
+        },
+    )
+    failed_step = {
+        "name": "decision_data_gate",
+        "result": {
+            "decision_ready": True,
+            "readiness": {"target_trade_date": "20260724"},
+        },
+    }
+    monkeypatch.setattr(evolution_orchestrator, "list_evolution_tasks", lambda limit=200: [
+        {
+            "id": 47,
+            "task_type": "system_autonomy_cycle",
+            "status": "completed",
+            "payload": {"trade_date": "20260724", "continuation_after_task_id": 46},
+            "result": {"steps": [failed_step]},
+        },
+        {
+            "id": 46,
+            "task_type": "system_autonomy_cycle",
+            "status": "completed",
+            "payload": {"trade_date": "20260724", "continuation_after_task_id": 38},
+            "result": {"steps": [failed_step]},
+        },
+    ])
+
+    result = evolution_orchestrator.ensure_latest_ready_system_cycle()
+
+    assert result["status"] == "recovery_retry_exhausted"
+    assert result["last_task_id"] == 47
 
 
 def test_existing_risk_breach_does_not_block_sell_reduce_only_plan():

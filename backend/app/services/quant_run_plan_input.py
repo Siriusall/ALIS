@@ -713,7 +713,12 @@ def validate_unified_decision_contract(contract: dict[str, Any]) -> None:
         for key, item in manifest_models.items()
         if isinstance(item, dict)
     }
-    if not fusion_models or manifest_model_identity != fusion_models:
+    # A fully quarantined model family is a valid production state: every
+    # model slot remains frozen in the signal snapshot as unavailable, while
+    # the version manifest is intentionally empty and ranking falls back to
+    # factors and deterministic rules.  Equality still rejects any missing,
+    # stale or extra consumed model binding.
+    if manifest_model_identity != fusion_models:
         raise ReplayRiskGateError("统一计划模型版本清单与实际融合不一致", code="invalid_authoritative_plan")
     manifest_portfolio = manifest.get("portfolio") if isinstance(manifest.get("portfolio"), dict) else {}
     if (

@@ -53,8 +53,12 @@ RESOURCE_BUDGET_RETRY_SECONDS = max(
 RESOURCE_BUDGET_MAX_STALLED_RESUMES = max(
     1, min(int(os.getenv("EVOLUTION_RESOURCE_BUDGET_MAX_STALLED_RESUMES", "2")), 10)
 )
+HEARTBEAT_PULSE_SECONDS = max(
+    1, min(int(os.getenv("EVOLUTION_HEARTBEAT_PULSE_SECONDS", "5")), 60)
+)
 WORKER_ID = f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
-SYSTEM_AUTONOMY_RECOVERY_POLICY_VERSION = "v2"
+SYSTEM_AUTONOMY_RECOVERY_POLICY_VERSION = "v3"
+SYSTEM_AUTONOMY_MAX_RECOVERY_CONTINUATIONS = 2
 _worker_started = False
 _scheduler_started = False
 _start_lock = threading.Lock()
@@ -404,7 +408,12 @@ def evolution_schedule_status() -> dict[str, Any]:
     }
 
 
-def enqueue_system_autonomy_recovery(trade_date: str, data_contract: dict[str, Any]) -> dict[str, Any]:
+def enqueue_system_autonomy_recovery(
+    trade_date: str,
+    data_contract: dict[str, Any],
+    *,
+    continuation_after: int | None = None,
+) -> dict[str, Any]:
     """Create one same-date catch-up cycle for each newly ready data contract.
 
     The normal daily key may already belong to a cycle that safely stopped at
@@ -422,13 +431,22 @@ def enqueue_system_autonomy_recovery(trade_date: str, data_contract: dict[str, A
     fingerprint = hashlib.sha256(
         json.dumps(fingerprint_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()[:16]
+    continuation_suffix = (
+        f":after-{int(continuation_after)}"
+        if int(continuation_after or 0) > 0
+        else ""
+    )
     return create_evolution_task(
         task_type="system_autonomy_cycle",
-        dedupe_key=f"system_autonomy_recovery:{SYSTEM_AUTONOMY_RECOVERY_POLICY_VERSION}:{trade_date}:{fingerprint}",
+        dedupe_key=(
+            f"system_autonomy_recovery:{SYSTEM_AUTONOMY_RECOVERY_POLICY_VERSION}:"
+            f"{trade_date}:{fingerprint}{continuation_suffix}"
+        ),
         payload={
             "trigger": "decision_data_recovered",
             "trade_date": trade_date,
             "data_contract_fingerprint": fingerprint,
+            "continuation_after_task_id": int(continuation_after or 0) or None,
         },
         priority=85,
     )
@@ -443,8 +461,33 @@ def ensure_latest_ready_system_cycle() -> dict[str, Any]:
     trade_date = str(readiness.get("target_trade_date") or "")
     if not trade_date or not bool(health.get("decision_ready")):
         return {"ok": False, "reason": "decision_data_not_ready", "trade_date": trade_date}
-    for task in list_evolution_tasks(limit=30):
-        if str(task.get("task_type") or "") != "system_autonomy_cycle" or str(task.get("status") or "") != "completed":
+    tasks = [
+        task for task in list_evolution_tasks(limit=200)
+        if str(task.get("task_type") or "") == "system_autonomy_cycle"
+    ]
+    active = next(
+        (
+            task for task in tasks
+            if str(task.get("status") or "") in {"queued", "running", "retry_wait"}
+            and (
+                str((task.get("payload") or {}).get("trade_date") or "").replace("-", "")[:8]
+                == trade_date
+                or f":{trade_date}" in str(task.get("dedupe_key") or "").replace("-", "")
+            )
+        ),
+        None,
+    )
+    if active:
+        return {
+            "ok": True,
+            "status": str(active.get("status") or "queued"),
+            "trade_date": trade_date,
+            "task_id": int(active.get("id") or 0),
+        }
+    latest_incomplete_task_id = 0
+    continuation_count = 0
+    for task in tasks:
+        if str(task.get("status") or "") != "completed":
             continue
         result = task.get("result") if isinstance(task.get("result"), dict) else {}
         decision_ready_for_date = False
@@ -466,11 +509,30 @@ def ensure_latest_ready_system_cycle() -> dict[str, Any]:
             decision_ready_for_date = bool(gate.get("decision_ready")) and str(gate_readiness.get("target_trade_date") or "") == trade_date
         if decision_ready_for_date and plan_is_unified_persisted and plan_status != "compatibility_preview_only":
             return {"ok": True, "status": "already_completed", "trade_date": trade_date, "task_id": task.get("id")}
+        if decision_ready_for_date:
+            latest_incomplete_task_id = max(
+                latest_incomplete_task_id,
+                int(task.get("id") or 0),
+            )
+            if int((task.get("payload") or {}).get("continuation_after_task_id") or 0) > 0:
+                continuation_count += 1
+    if continuation_count >= SYSTEM_AUTONOMY_MAX_RECOVERY_CONTINUATIONS:
+        return {
+            "ok": False,
+            "status": "recovery_retry_exhausted",
+            "trade_date": trade_date,
+            "last_task_id": latest_incomplete_task_id or None,
+            "maximum_continuations": SYSTEM_AUTONOMY_MAX_RECOVERY_CONTINUATIONS,
+        }
     contract = readiness.get("decision_contract") if isinstance(readiness.get("decision_contract"), dict) else {}
     if not contract:
         from app.data_platform.services.decision_data_contract import decision_data_contract
         contract = decision_data_contract(trade_date)
-    return enqueue_system_autonomy_recovery(trade_date, contract)
+    return enqueue_system_autonomy_recovery(
+        trade_date,
+        contract,
+        continuation_after=latest_incomplete_task_id or None,
+    )
 
 
 def _claim_next_task() -> dict[str, Any] | None:
@@ -602,36 +664,25 @@ def _run_with_heartbeat_pulse(
     started = time.monotonic()
 
     def pulse() -> None:
-        while not stopped.wait(5):
+        while not stopped.wait(HEARTBEAT_PULSE_SECONDS):
             elapsed = max(1, int(time.monotonic() - started))
             try:
                 _runtime_heartbeat("worker")
+                _ensure_task_active(int(task_id))
                 latest = get_evolution_task(int(task_id)) or {}
-                latest_checkpoint = (
-                    latest.get("checkpoint")
-                    if isinstance(latest.get("checkpoint"), dict)
-                    else {}
-                )
-                business_checkpoint = any(
-                    key not in {"elapsed_seconds", "heartbeat_only"}
-                    for key in latest_checkpoint
-                )
-                _heartbeat(
-                    task_id,
+                now = _now()
+                _update_active_task(
+                    int(task_id),
+                    statuses=("running",),
+                    require_not_stopped=True,
+                    expected_lease_owner=WORKER_ID,
                     phase=str(latest.get("phase") or phase),
-                    progress=max(
-                        0.1,
-                        float(latest.get("progress") or 0.0),
-                    ),
                     message=(
                         f"{str(latest.get('message') or message).split(' · 已运行', 1)[0]}"
                         f" · 已运行 {elapsed} 秒"
                     ),
-                    checkpoint={
-                        **latest_checkpoint,
-                        "elapsed_seconds": elapsed,
-                        "heartbeat_only": not business_checkpoint,
-                    },
+                    heartbeat_at=now.isoformat(),
+                    lease_expires_at=(now + timedelta(minutes=LEASE_MINUTES)).isoformat(),
                 )
             except EvolutionTaskCancelled:
                 return
@@ -1446,9 +1497,25 @@ def execute_evolution_task(
         if not bool(gate.get("experiment_ready")):
             return _blocked_by_decision_data(task, gate)
     if task_type == "strategy_evolution_cycle":
-        return _execute_strategy_cycle(task, validation_runner=validation_runner)
+        return _run_with_heartbeat_pulse(
+            int(task["id"]),
+            phase="formal_oos",
+            message="正在运行逐窗口正式 OOS",
+            runner=lambda: _execute_strategy_cycle(
+                task,
+                validation_runner=validation_runner,
+            ),
+        )
     if task_type == "strategy_controller_oos":
-        return _execute_strategy_cycle(task, validation_runner=validation_runner)
+        return _run_with_heartbeat_pulse(
+            int(task["id"]),
+            phase="formal_oos",
+            message="正在运行 StrategyController 逐窗口正式 OOS",
+            runner=lambda: _execute_strategy_cycle(
+                task,
+                validation_runner=validation_runner,
+            ),
+        )
     if task_type == "strategy_shadow_cycle":
         from app.services.strategy_lifecycle import run_strategy_shadow_cycle
 
@@ -1470,7 +1537,12 @@ def execute_evolution_task(
             message="正在生产统一版本因子截面",
             checkpoint=task.get("checkpoint") if isinstance(task.get("checkpoint"), dict) else {},
         )
-        return run_factor_daily_cycle()
+        return _run_with_heartbeat_pulse(
+            int(task["id"]),
+            phase="factor_materialization",
+            message="正在生产统一版本因子截面",
+            runner=run_factor_daily_cycle,
+        )
     if task_type == "factor_research_cycle":
         from app.services.continuous_factor_research import (
             run_continuous_factor_research_cycle,
@@ -1746,13 +1818,20 @@ def execute_evolution_task(
             ),
             checkpoint=task.get("checkpoint") if isinstance(task.get("checkpoint"), dict) else {},
         )
-        result = (
-            run_auto_optimization_once(
-                force=False,
-                training_failure_recovery=failure_recovery,
-            )
-            if failure_recovery
-            else run_auto_optimization_once(force=False)
+        if failure_recovery:
+            def model_runner() -> dict[str, Any]:
+                return run_auto_optimization_once(
+                    force=False,
+                    training_failure_recovery=failure_recovery,
+                )
+        else:
+            def model_runner() -> dict[str, Any]:
+                return run_auto_optimization_once(force=False)
+        result = _run_with_heartbeat_pulse(
+            int(task["id"]),
+            phase="plan_model_autonomy",
+            message="正在执行任务原生模型自治",
+            runner=model_runner,
         )
         run_ids = [
             int(item.get("run_id") or 0)
@@ -1793,7 +1872,12 @@ def execute_evolution_task(
             message="正在运行模型、策略、组合、复盘与研究自治周期",
             checkpoint=task.get("checkpoint") if isinstance(task.get("checkpoint"), dict) else {},
         )
-        return run_system_autonomy_cycle()
+        return _run_with_heartbeat_pulse(
+            int(task["id"]),
+            phase="system_autonomy",
+            message="正在运行模型、策略、组合、复盘与研究自治周期",
+            runner=run_system_autonomy_cycle,
+        )
     raise ValueError(f"unsupported evolution task type: {task.get('task_type')}")
 
 
@@ -2374,7 +2458,10 @@ def start_evolution_scheduler() -> bool:
                     create_evolution_task(
                         task_type="system_autonomy_cycle",
                         dedupe_key=f"system_autonomy_cycle:{now.date().isoformat()}",
-                        payload={"trigger": "daily_scheduler"},
+                        payload={
+                            "trigger": "daily_scheduler",
+                            "trade_date": now.date().strftime("%Y%m%d"),
+                        },
                         priority=70,
                     )
                 if _is_scheduled_trade_day(now) and now.weekday() == AUTO_WEEKDAY and now.hour >= AUTO_HOUR:
