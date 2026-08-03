@@ -9,6 +9,9 @@ httpx>=0.27.0
 pandas>=2.0.0
 # Local Parquet cold archive: zstd-compressed files plus a durable manifest.
 pyarrow>=17.0.0,<20
+# Candidate-only extraction of point-in-time operating KPIs from official
+# CNINFO annual-report PDFs. Parsed values remain non-production until review.
+pypdf>=6.0,<7
 tushare==1.4.24
 pymysql>=1.1.0
 psycopg[binary]>=3.2.0

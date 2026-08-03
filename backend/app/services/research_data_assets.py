@@ -11,7 +11,13 @@ from typing import Any
 
 from app.data_platform.db import _conn
 from app.services.industry_event_engine import _metric_component
-from app.services.announcement_label_benchmark import announcement_label_benchmark
+from app.services.announcement_label_benchmark import (
+    CNINFO_CATEGORY_HOLDOUT_CONTRACT,
+    announcement_label_benchmark,
+    announcement_manual_review_queue_status,
+    announcement_provider_reference_benchmark,
+)
+from app.services.professional_metric_documents import audit_professional_metric_candidates
 
 
 def _value(row: Any, key: str, default: Any = 0) -> Any:
@@ -30,15 +36,34 @@ def audit_research_data_assets() -> dict[str, Any]:
                                       MAX(available_time) latest_available_time,
                                       SUM(CASE WHEN COALESCE(available_time,'')='' THEN 1 ELSE 0 END) missing_pit
                                FROM dc_tushare_raw_records WHERE api_name='report_rc'""").fetchone()
-        theme = conn.execute("""SELECT COUNT(*) mappings,COUNT(DISTINCT as_of_date) snapshot_dates,
-                                     MAX(as_of_date) latest_date
-                              FROM dc_theme_company_mapping""").fetchone()
+        # The mapping table contains millions of point-in-time rows.  A daily
+        # audit must not rescan the whole history merely to display an
+        # informational total.  PostgreSQL's labelled live-row estimate is
+        # sufficient for depth reporting, while snapshot-date coverage remains
+        # exact on the much smaller canonical theme snapshot table.
+        theme_mapping = conn.execute(
+            """SELECT COALESCE(n_live_tup,0) mappings
+                 FROM pg_stat_user_tables
+                WHERE relname='dc_theme_company_mapping'"""
+        ).fetchone()
+        theme_snapshot = conn.execute(
+            """SELECT COUNT(DISTINCT as_of_date) snapshot_dates,
+                      MAX(as_of_date) latest_date
+                 FROM dc_theme_snapshot"""
+        ).fetchone()
         revenue_theme = conn.execute("""SELECT COUNT(*) exposures,COUNT(DISTINCT ts_code) companies,
                                              COUNT(DISTINCT theme_code) themes,MAX(as_of_date) latest_date
                                       FROM dc_theme_revenue_exposure""").fetchone()
         announcements = conn.execute("""SELECT COUNT(*) raw_records,MAX(available_time) latest_available_time
                                         FROM dc_announcement_raw""").fetchone()
         events = conn.execute("SELECT COUNT(*) events,AVG(confidence) avg_confidence FROM dc_announcement_event").fetchone()
+        ocr = conn.execute(
+            """SELECT (SELECT COUNT(*) FROM dc_research_ocr_observation) observations,
+                      (SELECT COUNT(*) FROM dc_research_ocr_document) documents,
+                      (SELECT COUNT(*) FROM dc_research_ocr_observation
+                        WHERE validation_status='structured_reconciled') reconciled,
+                      (SELECT MAX(available_time) FROM dc_research_ocr_observation) latest_available_time"""
+        ).fetchone()
 
     components = {key: [] for key in ("demand_orders_sales", "product_price", "inventory_cycle", "capacity_utilization", "profit_diffusion", "policy_supply", "industry_valuation")}
     for row in metric_rows:
@@ -59,9 +84,33 @@ def audit_research_data_assets() -> dict[str, Any]:
             "sources": sources,
         }
     report_data = {"records": int(_value(report, "records")), "symbols": int(_value(report, "symbols")), "latest_available_time": str(_value(report, "latest_available_time", "")), "missing_point_in_time_records": int(_value(report, "missing_pit"))}
-    theme_data = {"mappings": int(_value(theme, "mappings")), "snapshot_dates": int(_value(theme, "snapshot_dates")), "latest_date": str(_value(theme, "latest_date", "")), "revenue_exposures": int(_value(revenue_theme, "exposures")), "revenue_companies": int(_value(revenue_theme, "companies")), "revenue_themes": int(_value(revenue_theme, "themes")), "revenue_latest_date": str(_value(revenue_theme, "latest_date", ""))}
+    theme_data = {"mappings": int(_value(theme_mapping, "mappings")), "mappings_count_method": "postgres_live_row_estimate", "snapshot_dates": int(_value(theme_snapshot, "snapshot_dates")), "latest_date": str(_value(theme_snapshot, "latest_date", "")), "revenue_exposures": int(_value(revenue_theme, "exposures")), "revenue_companies": int(_value(revenue_theme, "companies")), "revenue_themes": int(_value(revenue_theme, "themes")), "revenue_latest_date": str(_value(revenue_theme, "latest_date", ""))}
     benchmark = announcement_label_benchmark()
-    announcement_data = {"raw_records": int(_value(announcements, "raw_records")), "events": int(_value(events, "events")), "latest_available_time": str(_value(announcements, "latest_available_time", "")), "avg_rule_confidence": round(float(_value(events, "avg_confidence", 0) or 0), 4), **benchmark}
+    provider_reference = announcement_provider_reference_benchmark(
+        reference_contract=CNINFO_CATEGORY_HOLDOUT_CONTRACT,
+        benchmark_role="frozen_holdout",
+    )
+    manual_review_queue = announcement_manual_review_queue_status(include_items=False)
+    professional_metrics = audit_professional_metric_candidates()
+    announcement_data = {
+        "raw_records": int(_value(announcements, "raw_records")),
+        "events": int(_value(events, "events")),
+        "latest_available_time": str(_value(announcements, "latest_available_time", "")),
+        "avg_rule_confidence": round(float(_value(events, "avg_confidence", 0) or 0), 4),
+        "manual_gold_benchmark": benchmark,
+        "manual_review_queue": manual_review_queue,
+        "provider_category_reference": provider_reference,
+    }
+    ocr_data = {
+        "observations": int(_value(ocr, "observations")),
+        "documents": int(_value(ocr, "documents")),
+        "reconciled": int(_value(ocr, "reconciled")),
+        "pending_reconciliation": max(0, int(_value(ocr, "observations")) - int(_value(ocr, "reconciled"))),
+        "latest_available_time": str(_value(ocr, "latest_available_time", "")),
+        "status": "reconciled" if int(_value(ocr, "observations")) and int(_value(ocr, "observations")) == int(_value(ocr, "reconciled")) else "candidate_only" if int(_value(ocr, "observations")) else "missing",
+        "production_eligible": False,
+        "contract": "alis_caam_macos_vision_ocr_candidate_v1",
+    }
     gaps = []
     for key, item in industry.items():
         if item["status"] in {"missing", "configured"}: gaps.append(f"industry:{key}")
@@ -72,13 +121,26 @@ def audit_research_data_assets() -> dict[str, Any]:
     # revenue-segment dataset; retain that distinction in the contract.
     if not theme_data["revenue_exposures"]:
         gaps.append("theme_revenue_exposure:source_not_materialized")
-    if benchmark["status"] != "ready": gaps.append("announcement_extraction_accuracy:labelled_benchmark_not_integrated")
+    if provider_reference["status"] != "covered_type_holdout_ready":
+        gaps.append("announcement_classification:provider_category_reference_not_ready")
+    if benchmark["status"] != "ready":
+        gaps.append("announcement_extraction_accuracy:manual_gold_not_ready")
+    if ocr_data["pending_reconciliation"]:
+        gaps.append("industry_ocr:structured_reconciliation_pending")
+    if professional_metrics["candidates"]:
+        gaps.append("professional_operating_metrics:manual_verification_pending")
     return {
         "ok": True, "schema_version": "alis_research_data_assets_v1", "status": "ready" if not gaps else "partial",
         "industry_components": industry,
         "analyst_consensus_pit": {**report_data, "status": "ready" if report_data["records"] and not report_data["missing_point_in_time_records"] else "partial"},
         "theme_exposure": {**theme_data, "status": "ready" if theme_data["revenue_exposures"] else "proxy_only", "limitation": "价格/新闻主题映射与主营业务收入暴露分开保存；收入暴露只使用点时主营业务分部。"},
-        "announcement_extraction": {**announcement_data, "status": benchmark["status"], "limitation": "规则分类置信度不等于抽取准确率；需以人工标注基准验收。"},
+        "announcement_extraction": {
+            **announcement_data,
+            "status": "ready" if benchmark["status"] == "ready" else "partial",
+            "limitation": "官方分类参考集只验证其覆盖类型；规则置信度不等于准确率，完整误报、漏检和正文数值字段仍需分层人工金标准。",
+        },
+        "industry_ocr_candidates": ocr_data,
+        "professional_operating_metric_candidates": professional_metrics,
         "gaps": gaps,
         "policy": "only_point_in_time_sources_are_production_eligible; proxies_and_unmeasured_extraction_cannot_satisfy_research_depth_gate",
     }

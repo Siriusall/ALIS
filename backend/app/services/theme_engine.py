@@ -6,15 +6,16 @@ from typing import Any
 
 from app.data_platform.db import _conn
 from app.services.market_context import score_theme_narratives
+from app.services.narrative_lifecycle_contract import (
+    ALLOWED_TRANSITIONS as NARRATIVE_LIFECYCLE_ALLOWED_TRANSITIONS,
+    SCHEMA_VERSION as NARRATIVE_LIFECYCLE_SCHEMA_VERSION,
+    STATES as NARRATIVE_LIFECYCLE_STATES,
+    candidate_state as _candidate_lifecycle_state,
+    contract_payload as _lifecycle_contract_payload,
+    crowding_risk as _crowding_risk,
+    transition_state as _transition_lifecycle_state,
+)
 
-
-NARRATIVE_LIFECYCLE_STATES = ("形成", "扩散", "成熟/拥挤", "衰退")
-NARRATIVE_LIFECYCLE_ALLOWED_TRANSITIONS = {
-    "形成": ("形成", "扩散", "衰退"),
-    "扩散": ("形成", "扩散", "成熟/拥挤", "衰退"),
-    "成熟/拥挤": ("扩散", "成熟/拥挤", "衰退"),
-    "衰退": ("形成", "衰退"),
-}
 
 
 def _clip(value: float, low: float = 0.0, high: float = 1.0) -> float:
@@ -29,21 +30,25 @@ def _lifecycle(
     breadth: float,
     crowding: float,
     price_confirmation: float,
+    persistence: float = 0.0,
+    breadth_slope: float = 0.0,
+    score_slope: float = 0.0,
 ) -> str:
-    """Map observable theme evidence to a four-state lifecycle.
+    """Compatibility wrapper around the v3 observable label contract.
 
-    ``score`` already contains the crowding penalty, so using
-    ``score >= 80 and crowding >= .65`` made the old crowded state
-    mathematically unreachable.  Maturity therefore uses the pre-penalty
-    evidence score and an independently observed turnover concentration.
+    ``crowding`` is passed only as an additional maturity observation for old
+    callers. It is never a required class-defining condition when real
+    persistence/breadth evidence is available.
     """
-    if momentum < -.01 or (score < 40 and price_confirmation < .42):
-        return "衰退"
-    if base_score >= 55 and crowding >= .60 and price_confirmation >= .50:
-        return "成熟/拥挤"
-    if base_score >= 55 and breadth >= .55 and price_confirmation >= .50:
-        return "扩散"
-    return "形成"
+    return _candidate_lifecycle_state(
+        base_score=base_score,
+        momentum=momentum,
+        breadth=breadth,
+        persistence=max(float(persistence), 1.0 if float(crowding) >= .60 else 0.0),
+        price_confirmation=price_confirmation,
+        breadth_slope=breadth_slope,
+        score_slope=score_slope,
+    )
 
 
 def materialize_theme_snapshots(*, as_of_time: str | None = None, lookback: int = 20) -> dict[str, Any]:
@@ -142,14 +147,22 @@ def materialize_theme_snapshots(*, as_of_time: str | None = None, lookback: int 
                 "sessions": len(sessions),
             }
             candidates.append(item)
-            raw_by_name[item["theme"]] = {"industry": industry, "companies": companies, "momentum": momentum, "breadth": breadth, "crowding": crowding, "state": state}
+            raw_by_name[item["theme"]] = {
+                "industry": industry,
+                "companies": companies,
+                "momentum": momentum,
+                "breadth": breadth,
+                "crowding": crowding,
+                "persistence": (persistence + liquidity) / 2,
+                "state": state,
+            }
 
         scored = score_theme_narratives(candidates)
         now = datetime.now().isoformat(timespec="seconds")
         written = mappings = 0
         for item in scored:
             raw = raw_by_name[item["theme"]]
-            item["lifecycle"] = _lifecycle(
+            candidate_lifecycle = _lifecycle(
                 score=float(item["score"]),
                 base_score=float(item.get("base_score") or 0.0),
                 momentum=float(raw["momentum"]),
@@ -159,27 +172,50 @@ def materialize_theme_snapshots(*, as_of_time: str | None = None, lookback: int 
                     (item.get("components") or {}).get("price_confirmation")
                     or 0.0
                 ),
+                persistence=float(raw.get("persistence") or 0.0),
+            )
+            theme_code = f"industry:{raw['industry']}"
+            prior_rows = c.execute(
+                """SELECT lifecycle,payload_json FROM dc_theme_snapshot
+                   WHERE theme_code=? AND as_of_date<? ORDER BY as_of_date DESC LIMIT 12""",
+                (theme_code, dates[-1]),
+            ).fetchall()
+            prior = [dict(row) for row in prior_rows]
+            previous_lifecycle = str(prior[0].get("lifecycle") or "") if prior else None
+            previous_age = 0
+            for row in prior:
+                if str(row.get("lifecycle") or "") != previous_lifecycle:
+                    break
+                previous_age += 1
+            candidate_streak = 1
+            for row in prior:
+                if str(row.get("lifecycle") or "") != candidate_lifecycle:
+                    break
+                candidate_streak += 1
+            lifecycle, transition_meta = _transition_lifecycle_state(
+                previous_lifecycle,
+                candidate_lifecycle,
+                previous_age=previous_age,
+                candidate_streak=candidate_streak,
+            )
+            item["lifecycle"] = lifecycle
+            crowding_observation = _crowding_risk(
+                top_decile_concentration=float(raw["crowding"]),
+                company_count=len(raw["companies"]),
             )
             item["lifecycle_contract"] = {
-                "schema_version": "alis_narrative_lifecycle_observable_v2",
-                "states": list(NARRATIVE_LIFECYCLE_STATES),
-                "allowed_transitions": {
-                    state: list(destinations)
-                    for state, destinations
-                    in NARRATIVE_LIFECYCLE_ALLOWED_TRANSITIONS.items()
-                },
+                **_lifecycle_contract_payload(),
                 "observations": {
                     "score_after_crowding_penalty": round(float(item["score"]), 8),
-                    "base_score_before_crowding_penalty": round(
-                        float(item.get("base_score") or 0.0),
-                        8,
-                    ),
+                    "base_score_before_crowding_penalty": round(float(item.get("base_score") or 0.0), 8),
                     "momentum_5_session": round(float(raw["momentum"]), 8),
                     "breadth_5_session": round(float(raw["breadth"]), 8),
-                    "turnover_top_decile_concentration": round(
-                        float(raw["crowding"]),
-                        8,
-                    ),
+                    "persistence_5_session": round(float(raw.get("persistence") or 0.0), 8),
+                    "turnover_top_decile_concentration": round(float(raw["crowding"]), 8),
+                    "crowding_risk": crowding_observation,
+                    "candidate_lifecycle": candidate_lifecycle,
+                    "state_age": previous_age + 1 if lifecycle == previous_lifecycle else 1,
+                    "transition": transition_meta,
                 },
             }
             # A confirmed score is still not buyable once price has rolled
@@ -195,7 +231,6 @@ def materialize_theme_snapshots(*, as_of_time: str | None = None, lookback: int 
                 else "watch"
             )
             item["knowledge_graph"] = {"theme": item["theme"], "industry": raw["industry"], "company_count": len(raw["companies"]), "evidence_types": ["price_volume"] + (["company_financial_aggregate"] if raw["state"].get("status") == "ready" else [])}
-            theme_code = f"industry:{raw['industry']}"
             c.execute(
                 """INSERT INTO dc_theme_snapshot
                    (as_of_date,theme_code,theme_name,lifecycle,score,promotable,payload_json,model_version,available_time,created_at,updated_at)
@@ -204,7 +239,7 @@ def materialize_theme_snapshots(*, as_of_time: str | None = None, lookback: int 
                    promotable=excluded.promotable,payload_json=excluded.payload_json,
                    model_version=excluded.model_version,available_time=excluded.available_time,updated_at=excluded.updated_at""",
                 (dates[-1], theme_code, item["theme"], item["lifecycle"], item["score"], 1 if item["promotable"] else 0,
-                 json.dumps(item, ensure_ascii=False), "industry_price_fundamental_theme_v2", cutoff or now, now, now),
+                 json.dumps(item, ensure_ascii=False), "industry_price_fundamental_theme_v3", cutoff or now, now, now),
             )
             written += 1
             max_turnover = max((float(company.get("turnover") or 0) for company in raw["companies"]), default=1.0)
@@ -219,7 +254,7 @@ def materialize_theme_snapshots(*, as_of_time: str | None = None, lookback: int 
                     (dates[-1], theme_code, company.get("ts_code"), exposure, json.dumps(evidence, ensure_ascii=False), now),
                 )
                 mappings += 1
-    return {"ok": True, "as_of_date": dates[-1], "themes_written": written, "company_mappings_written": mappings, "promotable": sum(1 for item in scored if item["promotable"]), "model_version": "industry_price_fundamental_theme_v2"}
+    return {"ok": True, "as_of_date": dates[-1], "themes_written": written, "company_mappings_written": mappings, "promotable": sum(1 for item in scored if item["promotable"]), "model_version": "industry_price_fundamental_theme_v3"}
 
 
 def materialize_theme_snapshot_history(*, end_date: str = "", target_sessions: int = 250, limit_dates: int = 20) -> dict[str, Any]:
@@ -290,10 +325,14 @@ def materialize_theme_snapshot_history(*, end_date: str = "", target_sessions: i
                 and float(components.get("capital_persistence") or 0.0) == 0.0
                 and int(evidence.get("source_types") or 0) == 0
             )
-            quality_by_date.setdefault(
-                str(item.get("as_of_date") or ""),
-                [],
-            ).append(degenerate)
+            contract_version = str(
+                (payload.get("lifecycle_contract") or {}).get("schema_version")
+                if isinstance(payload, dict)
+                else ""
+            )
+            quality_by_date.setdefault(str(item.get("as_of_date") or ""), []).append(
+                degenerate or contract_version != NARRATIVE_LIFECYCLE_SCHEMA_VERSION
+            )
     missing = sorted(
         trade_date for trade_date in target_dates if trade_date not in existing
     )
