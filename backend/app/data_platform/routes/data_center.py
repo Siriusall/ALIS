@@ -59,7 +59,22 @@ from app.data_platform.services.stream_admin import bulk_handle_stream_messages,
 from app.services.theme_engine import materialize_theme_snapshot_history
 from app.services.free_research_data import materialize_cn_ppi_price_proxies, materialize_financial_industry_series, materialize_futures_price_proxies
 from app.services.official_policy_data import materialize_official_capacity_utilization, materialize_official_policy_supply, sync_official_policy_documents
-from app.services.announcement_label_benchmark import import_announcement_labels
+from app.services.caam_ocr_data import audit_caam_ocr_candidates, reconcile_caam_ocr_with_miit, sync_caam_ocr_candidates
+from app.services.professional_metric_documents import (
+    audit_professional_metric_candidates,
+    reprocess_professional_metric_document,
+    sync_professional_metric_candidates,
+)
+from app.services.announcement_label_benchmark import (
+    CNINFO_CATEGORY_HOLDOUT_CONTRACT,
+    CNINFO_CATEGORY_REFERENCE_CONTRACT,
+    announcement_label_benchmark,
+    announcement_manual_review_queue_status,
+    announcement_provider_reference_benchmark,
+    import_announcement_labels,
+    materialize_announcement_manual_review_queue,
+    sync_cninfo_category_reference_labels,
+)
 from app.data_platform.services.exchange_etf_pcf import backfill_exchange_etf_pcf, sync_exchange_etf_pcf
 from app.data_platform.services.oos_hard_data import audit_oos_hard_data
 from app.services.sealed_strategy_holdout import audit_sealed_strategy_holdout
@@ -675,6 +690,65 @@ def data_center_import_announcement_labels(path: str = Query(..., description="L
         ) from exc
 
 
+@router.get("/data-center/announcement-label-benchmark")
+def data_center_announcement_label_benchmark() -> dict[str, Any]:
+    """Return manual-gold and provider-category evidence without conflating them."""
+
+    return {
+        "manual_gold": announcement_label_benchmark(),
+        "provider_category_development": announcement_provider_reference_benchmark(),
+        "provider_category_holdout": announcement_provider_reference_benchmark(
+            reference_contract=CNINFO_CATEGORY_HOLDOUT_CONTRACT,
+            benchmark_role="frozen_holdout",
+        ),
+    }
+
+
+@router.post("/data-center/announcement-category-reference/sync")
+def data_center_sync_announcement_category_reference(
+    start_date: str = Query(..., description="YYYYMMDD or YYYY-MM-DD"),
+    end_date: str = Query(..., description="YYYYMMDD or YYYY-MM-DD"),
+    target_per_type: int = Query(default=100, ge=50, le=500),
+    reference_role: str = Query(default="development_non_promotable", pattern="^(development_non_promotable|frozen_holdout)$"),
+) -> dict[str, Any]:
+    """Persist CNINFO official-category references for covered event types."""
+
+    try:
+        return sync_cninfo_category_reference_labels(
+            start_date=start_date,
+            end_date=end_date,
+            target_per_type=target_per_type,
+            reference_contract=(
+                CNINFO_CATEGORY_HOLDOUT_CONTRACT
+                if reference_role == "frozen_holdout"
+                else CNINFO_CATEGORY_REFERENCE_CONTRACT
+            ),
+            benchmark_role=reference_role,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail={"code": "announcement_category_reference_sync_failed", "message": str(exc)[:500]},
+        ) from exc
+
+
+@router.post("/data-center/announcement-manual-review-queue/materialize")
+def data_center_materialize_announcement_manual_review_queue(
+    target_size: int = Query(default=320, ge=200, le=1000),
+) -> dict[str, Any]:
+    """Freeze a stratified review queue; predicted labels remain non-gold hints."""
+
+    return materialize_announcement_manual_review_queue(target_size=target_size)
+
+
+@router.get("/data-center/announcement-manual-review-queue")
+def data_center_announcement_manual_review_queue(
+    include_items: bool = Query(default=False),
+    limit: int = Query(default=50, ge=1, le=500),
+) -> dict[str, Any]:
+    return announcement_manual_review_queue_status(include_items=include_items, limit=limit)
+
+
 @router.post("/data-center/materialize/free-industry-financials")
 def data_center_materialize_free_industry_financials(max_periods: int = Query(default=12, ge=1, le=32)) -> dict[str, Any]:
     """Materialise point-in-time industry demand, inventory, profit and valuation proxies from retained facts."""
@@ -720,6 +794,54 @@ def data_center_materialize_official_capacity_utilization() -> dict[str, Any]:
     """Materialise retained NBS releases as a clearly labelled capacity proxy."""
 
     return materialize_official_capacity_utilization()
+
+
+@router.post("/data-center/sync/caam-ocr-candidates")
+def data_center_sync_caam_ocr_candidates(
+    max_documents: int = Query(default=1, ge=1, le=5),
+) -> dict[str, Any]:
+    """Retain isolated CAAM image OCR candidates pending structured reconciliation."""
+
+    return sync_caam_ocr_candidates(max_documents=max_documents)
+
+
+@router.post("/data-center/audit/caam-ocr-candidates")
+def data_center_audit_caam_ocr_candidates() -> dict[str, Any]:
+    """Cross-check duplicate CAAM OCR fields without production promotion."""
+
+    return audit_caam_ocr_candidates()
+
+
+@router.post("/data-center/reconcile/caam-ocr-miit")
+def data_center_reconcile_caam_ocr_miit(
+    max_documents: int = Query(default=5, ge=1, le=12),
+) -> dict[str, Any]:
+    """Reconcile isolated CAAM OCR fields with official MIIT text when reachable."""
+
+    return reconcile_caam_ocr_with_miit(max_documents=max_documents)
+
+
+@router.post("/data-center/sync/professional-metric-candidates")
+def data_center_sync_professional_metric_candidates(
+    max_documents: int = Query(default=1, ge=1, le=5),
+) -> dict[str, Any]:
+    """Extract isolated operating-metric candidates from official annual-report PDFs."""
+
+    return sync_professional_metric_candidates(limit=max_documents)
+
+
+@router.post("/data-center/audit/professional-metric-candidates")
+def data_center_audit_professional_metric_candidates() -> dict[str, Any]:
+    """Audit candidate PDF evidence without granting production authority."""
+
+    return audit_professional_metric_candidates()
+
+
+@router.post("/data-center/reprocess/professional-metric-candidate/{document_id}")
+def data_center_reprocess_professional_metric_candidate(document_id: str) -> dict[str, Any]:
+    """Re-extract one retained report after a versioned parser correction."""
+
+    return reprocess_professional_metric_document(document_id)
 
 
 @router.post("/data-center/materialize/cn-ppi-price-proxies")

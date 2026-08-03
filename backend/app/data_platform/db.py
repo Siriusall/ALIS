@@ -76,6 +76,34 @@ CREATE TABLE dc_announcement_label (
             updated_at TEXT NOT NULL,
             PRIMARY KEY (source_code, announcement_id, label_version)
         );
+CREATE TABLE dc_announcement_reference_label (
+            source_code TEXT NOT NULL,
+            announcement_id TEXT NOT NULL,
+            reference_contract TEXT NOT NULL,
+            reference_source TEXT NOT NULL,
+            official_category TEXT NOT NULL DEFAULT '',
+            is_event INTEGER NOT NULL DEFAULT 1,
+            event_type TEXT NOT NULL DEFAULT '',
+            ts_code TEXT NOT NULL DEFAULT '',
+            publish_time TEXT NOT NULL DEFAULT '',
+            evidence_json TEXT NOT NULL DEFAULT '{}',
+            available_time TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (source_code, announcement_id, reference_contract)
+        );
+CREATE TABLE dc_announcement_label_review_queue (
+            queue_contract TEXT NOT NULL,
+            source_code TEXT NOT NULL,
+            announcement_id TEXT NOT NULL,
+            stratum TEXT NOT NULL,
+            predicted_event_type TEXT NOT NULL DEFAULT '',
+            selection_rank INTEGER NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            selected_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (queue_contract, source_code, announcement_id)
+        );
 CREATE TABLE dc_data_quality_checks (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             check_name TEXT NOT NULL,
@@ -108,6 +136,82 @@ CREATE TABLE dc_industry_metric_value (
             available_time TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             PRIMARY KEY (metric_code, data_date)
+        );
+CREATE TABLE dc_research_ocr_document (
+            source_code TEXT NOT NULL,
+            document_id TEXT NOT NULL,
+            page_url TEXT NOT NULL,
+            title TEXT NOT NULL DEFAULT '',
+            publish_time TEXT NOT NULL DEFAULT '',
+            image_url TEXT NOT NULL DEFAULT '',
+            image_sha256 TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            observations_count INTEGER NOT NULL DEFAULT 0,
+            error TEXT NOT NULL DEFAULT '',
+            evidence_json TEXT NOT NULL DEFAULT '{}',
+            available_time TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (source_code, document_id)
+        );
+CREATE TABLE dc_research_ocr_observation (
+            source_code TEXT NOT NULL,
+            document_id TEXT NOT NULL,
+            field_code TEXT NOT NULL,
+            observation_date TEXT NOT NULL,
+            value REAL NOT NULL,
+            unit TEXT NOT NULL DEFAULT '',
+            confidence REAL NOT NULL DEFAULT 0,
+            validation_status TEXT NOT NULL DEFAULT 'pending_structured_reconciliation',
+            evidence_json TEXT NOT NULL DEFAULT '{}',
+            available_time TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (source_code, document_id, field_code, observation_date)
+        );
+CREATE TABLE dc_professional_metric_document (
+            source_code TEXT NOT NULL,
+            document_id TEXT NOT NULL,
+            ts_code TEXT NOT NULL DEFAULT '',
+            title TEXT NOT NULL DEFAULT '',
+            publish_time TEXT NOT NULL DEFAULT '',
+            source_url TEXT NOT NULL DEFAULT '',
+            local_file_path TEXT NOT NULL DEFAULT '',
+            file_sha256 TEXT NOT NULL DEFAULT '',
+            page_count INTEGER NOT NULL DEFAULT 0,
+            text_sha256 TEXT NOT NULL DEFAULT '',
+            template_kind TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL,
+            candidates_count INTEGER NOT NULL DEFAULT 0,
+            error TEXT NOT NULL DEFAULT '',
+            available_time TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (source_code, document_id)
+        );
+CREATE TABLE dc_professional_metric_candidate (
+            source_code TEXT NOT NULL,
+            document_id TEXT NOT NULL,
+            metric_key TEXT NOT NULL,
+            report_period TEXT NOT NULL DEFAULT '',
+            evidence_hash TEXT NOT NULL,
+            ts_code TEXT NOT NULL DEFAULT '',
+            template_kind TEXT NOT NULL DEFAULT '',
+            value REAL NOT NULL,
+            unit TEXT NOT NULL DEFAULT '',
+            raw_value_text TEXT NOT NULL DEFAULT '',
+            evidence_text TEXT NOT NULL DEFAULT '',
+            page_number INTEGER NOT NULL DEFAULT 0,
+            confidence REAL NOT NULL DEFAULT 0,
+            extraction_method TEXT NOT NULL,
+            validation_status TEXT NOT NULL DEFAULT 'pending_manual_verification',
+            production_eligible INTEGER NOT NULL DEFAULT 0,
+            evidence_json TEXT NOT NULL DEFAULT '{}',
+            available_time TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (source_code, document_id, metric_key, report_period, evidence_hash)
         );
 CREATE TABLE dc_stock_daily_snapshot (
             ts_code TEXT NOT NULL,
@@ -339,6 +443,10 @@ CREATE INDEX idx_dc_event_date ON dc_announcement_event (event_date);
 CREATE INDEX idx_dc_event_type ON dc_announcement_event (event_type);
 CREATE INDEX idx_dc_industry_metric_date ON dc_industry_metric_value (data_date);
 CREATE INDEX idx_dc_industry_metric_industry ON dc_industry_metric_definition (industry_code);
+CREATE INDEX idx_dc_research_ocr_status ON dc_research_ocr_observation (validation_status, observation_date);
+CREATE INDEX idx_dc_research_ocr_document_status ON dc_research_ocr_document (status, updated_at);
+CREATE INDEX idx_dc_professional_metric_document_status ON dc_professional_metric_document (status, updated_at);
+CREATE INDEX idx_dc_professional_metric_candidate_status ON dc_professional_metric_candidate (validation_status, template_kind, metric_key);
 CREATE INDEX idx_dc_quality_checked ON dc_data_quality_checks (checked_at);
 CREATE INDEX idx_dc_quality_status ON dc_data_quality_checks (status);
 CREATE INDEX idx_dc_raw_api_date ON dc_tushare_raw_records (api_name, trade_date);
@@ -372,6 +480,8 @@ CREATE INDEX idx_dc_runs_started ON data_ingestion_runs (started_at);
 CREATE INDEX idx_dc_runs_job_started ON data_ingestion_runs (job_name, started_at);
 CREATE INDEX idx_dc_announcement_publish ON dc_announcement_raw (publish_time);
 CREATE INDEX idx_dc_announcement_label_version ON dc_announcement_label (label_version, labelled_at);
+CREATE INDEX idx_dc_announcement_reference_contract ON dc_announcement_reference_label (reference_contract, event_type);
+CREATE INDEX idx_dc_announcement_review_status ON dc_announcement_label_review_queue (queue_contract, status, stratum);
 """
 
 class Connection:

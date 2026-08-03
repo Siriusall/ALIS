@@ -36,6 +36,10 @@ TUSHARE_RATE_LIMIT_COOLDOWN_SECONDS = int(os.getenv("TUSHARE_RATE_LIMIT_COOLDOWN
 STK_LIMIT_PAGE_SIZE = max(500, min(int(os.getenv("TUSHARE_STK_LIMIT_PAGE_SIZE", "5800") or 5800), 5800))
 STK_LIMIT_MAX_PAGES = max(2, min(int(os.getenv("TUSHARE_STK_LIMIT_MAX_PAGES", "4") or 4), 10))
 STK_LIMIT_GAP_BATCH_SIZE = max(3, min(int(os.getenv("TUSHARE_STK_LIMIT_GAP_BATCH_SIZE", "25") or 25), 100))
+DATE_RAW_COVERAGE_CHUNK_SIZE = max(
+    5,
+    min(int(os.getenv("DATE_RAW_COVERAGE_CHUNK_SIZE", "20") or 20), 60),
+)
 STK_LIMIT_MIN_STOCK_COVERAGE = max(
     0.5,
     min(float(os.getenv("TUSHARE_STK_LIMIT_MIN_STOCK_COVERAGE", "0.8") or 0.8), 1.0),
@@ -162,6 +166,7 @@ TUSHARE_CATALOG: list[TushareCatalogItem] = [
     TushareCatalogItem("top_list", "席位", "龙虎榜每日明细", "异动强度、资金结构和事件响应", "daily", "trade_date,ts_code,name,close,pct_change,turnover_rate,amount,l_sell,l_buy,l_amount,net_amount,net_rate,amount_rate,float_values,reason", {"trade_date": ""}),
     TushareCatalogItem("top_inst", "席位", "龙虎榜机构交易明细", "机构与营业部结构、龙头质量", "daily", "trade_date,ts_code,exalter,buy,sell,net_buy", {"trade_date": ""}),
     TushareCatalogItem("major_news", "资讯", "长篇财经新闻", "主线叙事聚类、催化新鲜度与事件识别", "hourly", "title,content,pub_time,src", {"start_date": "", "end_date": ""}),
+    TushareCatalogItem("report_rc", "预期", "券商盈利预测", "点时独立机构一致预期、盈利预期差和目标价修正", "daily_incremental", "ts_code,name,report_date,report_title,report_type,classify,org_name,author_name,quarter,op_rt,op_pr,tp,np,eps,pe,rd,roe,ev_ebitda,rating,max_price,min_price", {"start_date": "", "end_date": ""}),
     TushareCatalogItem("income", "财务", "利润表", "营收、利润、成长能力", "quarterly", "ts_code,ann_date,f_ann_date,end_date,report_type,revenue,total_revenue,operate_profit,total_profit,n_income,n_income_attr_p,basic_eps,diluted_eps", {"ts_code": "", "period": ""}),
     TushareCatalogItem("balancesheet", "财务", "资产负债表", "资产质量、负债、安全性", "quarterly", "ts_code,ann_date,f_ann_date,end_date,total_assets,total_liab,total_hldr_eqy_exc_min_int,money_cap,accounts_receiv,inventories,goodwill,st_borr,lt_borr,bond_payable,non_cur_liab_due_1y", {"ts_code": "", "period": ""}),
     TushareCatalogItem("cashflow", "财务", "现金流量表", "经营现金流、自由现金流质量", "quarterly", "ts_code,ann_date,f_ann_date,end_date,n_cashflow_act,n_cash_flows_inv_act,n_cash_flows_fnc_act,c_pay_acq_const_fiolta", {"ts_code": "", "period": ""}),
@@ -171,6 +176,8 @@ TUSHARE_CATALOG: list[TushareCatalogItem] = [
     TushareCatalogItem("forecast", "业绩", "业绩预告", "预期变化和业绩风险", "daily_incremental", "ts_code,ann_date,end_date,type,p_change_min,p_change_max,net_profit_min,net_profit_max,summary", {"ann_date": ""}),
     TushareCatalogItem("express", "业绩", "业绩快报", "财报前业绩验证", "daily_incremental", "ts_code,ann_date,end_date,revenue,total_profit,n_income,total_assets", {"ts_code": "", "period": ""}),
     TushareCatalogItem("dividend", "分红", "分红送股", "股东回报、股息率验证", "quarterly", "ts_code,end_date,ann_date,div_proc,stk_div,cash_div_tax,record_date,ex_date,pay_date", {"ts_code": ""}),
+    TushareCatalogItem("repurchase", "资本动作", "股票回购", "回购进度、规模和金额/市值重要性", "daily_incremental", "ts_code,ann_date,end_date,proc,exp_date,vol,amount,high_limit,low_limit", {"start_date": "", "end_date": ""}),
+    TushareCatalogItem("stk_holdertrade", "资本动作", "股东增减持", "增减持方向、股数、比例和交易价格", "daily_incremental", "ts_code,ann_date,holder_name,holder_type,in_de,change_vol,change_ratio,after_share,after_ratio,avg_price,total_share", {"start_date": "", "end_date": ""}),
     TushareCatalogItem("top10_holders", "股东", "十大股东", "机构/大股东结构", "quarterly", "ts_code,ann_date,end_date,holder_name,hold_amount,hold_ratio", {"ts_code": "", "period": ""}),
     TushareCatalogItem("top10_floatholders", "股东", "十大流通股东", "流通股东结构", "quarterly", "ts_code,ann_date,end_date,holder_name,hold_amount,hold_ratio", {"ts_code": "", "period": ""}),
     TushareCatalogItem("stk_holdernumber", "股东", "股东人数", "筹码集中度变化", "quarterly", "ts_code,ann_date,end_date,holder_num", {"ts_code": "", "enddate": ""}),
@@ -768,7 +775,7 @@ VALID_EMPTY_TUSHARE_APIS = {
     "dividend", "fund_div",
     # Dragon-Tiger and long-form news are event datasets. A successful query
     # with no rows is evidence that no event occurred in the requested window.
-    "top_list", "top_inst", "major_news",
+    "top_list", "top_inst", "major_news", "report_rc", "repurchase", "stk_holdertrade",
 }
 
 PERIOD_FALLBACK_APIS = {
@@ -1113,7 +1120,7 @@ def _upsert_raw_records(api_name: str, df: pd.DataFrame) -> int:
                 payload["_returned_fields"] = returned_fields
                 payload["_field_contract_version"] = "financial_research_fields_v1"
             ts_code = str(payload.get("ts_code") or payload.get("con_code") or "").strip()
-            trade_date = str(payload.get("trade_date") or payload.get("nav_date") or payload.get("date") or payload.get("month") or payload.get("MONTH") or payload.get("quarter") or "").strip()
+            trade_date = str(payload.get("trade_date") or payload.get("report_date") or payload.get("nav_date") or payload.get("date") or payload.get("month") or payload.get("MONTH") or payload.get("quarter") or "").strip()
             period = str(payload.get("period") or payload.get("end_date") or "").strip()
             ann_date = str(payload.get("ann_date") or "").strip()
             available_time = _point_in_time_available_time(api_name, payload, fallback=now)
@@ -1200,6 +1207,11 @@ def _upsert_raw_records(api_name: str, df: pd.DataFrame) -> int:
 _DISCLOSURE_APIS = {
     "income", "balancesheet", "cashflow", "fina_indicator", "fina_audit", "forecast", "express",
     "dividend", "fund_div", "top10_holders", "top10_floatholders", "stk_holdernumber", "pledge_detail", "disclosure_date",
+    "repurchase", "stk_holdertrade",
+    # Analyst research is point-in-time at the publication/trade date.  It is
+    # not a financial statement, but treating it as ingestion-time data would
+    # make every historical expectation feature silently unavailable.
+    "report_rc",
 }
 
 
@@ -1223,7 +1235,13 @@ def _point_in_time_available_time(api_name: str, payload: dict[str, Any], *, fal
         except ValueError:
             return fallback
     if api_name in _DISCLOSURE_APIS:
-        disclosed = payload.get("actual_date") or payload.get("f_ann_date") or payload.get("ann_date")
+        disclosed = (
+            payload.get("actual_date")
+            or payload.get("f_ann_date")
+            or payload.get("ann_date")
+            or payload.get("report_date")
+            or payload.get("trade_date")
+        )
         return _iso_available_on_date(disclosed) or fallback
     trade_date = payload.get("trade_date") or payload.get("date")
     return _iso_available_on_date(trade_date, hour=15, minute=0, second=0) or fallback
@@ -1253,21 +1271,43 @@ def _record_key(api_name: str, payload: dict[str, Any], idx: Any) -> str:
     if api_name == "major_news":
         raw = "|".join(str(payload.get(key) or "").strip() for key in ("src", "pub_time", "title", "content"))
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    if api_name == "report_rc":
+        raw = "|".join(
+            str(payload.get(key) or "").strip()
+            for key in (
+                "ts_code",
+                "report_date",
+                "org_name",
+                "author_name",
+                "report_title",
+                "report_type",
+                "quarter",
+            )
+        )
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
     preferred = [
         "ts_code",
         "con_code",
         "index_code",
         "trade_date",
+        "report_date",
         "ann_date",
         "end_date",
         "period",
         "holder_name",
         "bz_item",
         "report_type",
+        "report_title",
+        "org_name",
+        "author_name",
+        "quarter",
         "comp_type",
         "update_flag",
         "div_proc",
         "pledge_amount",
+        "proc",
+        "in_de",
+        "change_vol",
         "cal_date",
         "exchange",
         "exchange_id",
@@ -1283,6 +1323,71 @@ def _record_key(api_name: str, payload: dict[str, Any], idx: Any) -> str:
     if not parts:
         parts = [str(idx)]
     return "|".join(parts)[:240]
+
+
+def normalize_report_rc_record_keys(*, limit: int = 200_000) -> dict[str, int]:
+    """Migrate legacy analyst-report keys before historical backfill.
+
+    Older imports used process-dependent keys and could not distinguish two
+    brokers, report dates, or forecast quarters. The migration is idempotent;
+    collisions are merged field-wise and never create a second logical report.
+    """
+    cap = max(1, min(int(limit), 500_000))
+    scanned = changed = merged = 0
+    with _conn() as c:
+        rows = c.execute(
+            """SELECT id,record_key,payload_json,available_time,updated_at
+               FROM dc_tushare_raw_records
+               WHERE api_name='report_rc' ORDER BY id LIMIT ?""",
+            (cap,),
+        ).fetchall()
+        for raw in rows:
+            row = dict(raw)
+            scanned += 1
+            try:
+                payload = json.loads(row.get("payload_json") or "{}")
+            except (TypeError, json.JSONDecodeError):
+                payload = {}
+            if not isinstance(payload, dict) or not payload:
+                continue
+            new_key = _record_key("report_rc", payload, row.get("id"))
+            if new_key == str(row.get("record_key") or ""):
+                continue
+            existing = c.execute(
+                """SELECT id,payload_json,available_time,updated_at
+                   FROM dc_tushare_raw_records
+                   WHERE api_name='report_rc' AND record_key=? AND id<>?""",
+                (new_key, row.get("id")),
+            ).fetchone()
+            if existing is not None:
+                target = dict(existing)
+                try:
+                    target_payload = json.loads(target.get("payload_json") or "{}")
+                except (TypeError, json.JSONDecodeError):
+                    target_payload = {}
+                if not isinstance(target_payload, dict):
+                    target_payload = {}
+                merged_payload = {**target_payload, **payload}
+                c.execute(
+                    """UPDATE dc_tushare_raw_records
+                       SET payload_json=?,available_time=?,updated_at=?
+                       WHERE id=?""",
+                    (
+                        _strict_json(merged_payload),
+                        min(str(target.get("available_time") or ""), str(row.get("available_time") or "")) or str(target.get("available_time") or row.get("available_time") or ""),
+                        max(str(target.get("updated_at") or ""), str(row.get("updated_at") or "")),
+                        target.get("id"),
+                    ),
+                )
+                c.execute("DELETE FROM dc_tushare_raw_records WHERE id=?", (row.get("id"),))
+                merged += 1
+            else:
+                c.execute(
+                    "UPDATE dc_tushare_raw_records SET record_key=? WHERE id=?",
+                    (new_key, row.get("id")),
+                )
+                changed += 1
+    return {"scanned": scanned, "changed": changed, "merged": merged}
 
 
 def _stk_limit_stock_coverage(trade_date: str) -> dict[str, Any]:
@@ -2039,6 +2144,77 @@ def backfill_major_news_history(
         "rows_written": sum(int(item.get("rows_written") or 0) for item in source_results),
         "failed": sum(1 for item in source_results if not item.get("ok")),
         "source_results": source_results,
+        "results": results,
+    }
+
+
+EVENT_RESEARCH_APIS = ("report_rc", "repurchase", "stk_holdertrade")
+
+
+def backfill_event_research_history(
+    *,
+    start_date: str,
+    end_date: str,
+    cursor: str = "",
+    limit_months: int = 1,
+) -> dict[str, Any]:
+    """Backfill point-in-time consensus and quantitative event disclosures.
+
+    Calendar-month slices keep requests resumable and independently audited.
+    The upstream may return many forecast-quarter rows for one report, so the
+    deterministic report key includes broker, report identity, and quarter.
+    """
+    try:
+        start = datetime.strptime(start_date, "%Y%m%d").date()
+        end = datetime.strptime(end_date, "%Y%m%d").date()
+        after = datetime.strptime(cursor, "%Y%m%d").date() if cursor else start - timedelta(days=1)
+    except ValueError as exc:
+        raise ValueError("start_date/end_date/cursor must be YYYYMMDD") from exc
+    if start > end:
+        raise ValueError("start_date must not be after end_date")
+    current = max(start, after + timedelta(days=1))
+    month_limit = max(1, min(int(limit_months), 6))
+    windows: list[tuple[date, date]] = []
+    for _ in range(month_limit):
+        if current > end:
+            break
+        next_month = (
+            date(current.year + 1, 1, 1)
+            if current.month == 12
+            else date(current.year, current.month + 1, 1)
+        )
+        window_end = min(end, next_month - timedelta(days=1))
+        windows.append((current, window_end))
+        current = window_end + timedelta(days=1)
+    results: list[dict[str, Any]] = []
+    skipped = 0
+    for window_start, window_end in windows:
+        params = {
+            "start_date": window_start.strftime("%Y%m%d"),
+            "end_date": window_end.strftime("%Y%m%d"),
+        }
+        for api_name in EVENT_RESEARCH_APIS:
+            if _request_is_complete(api_name, params):
+                skipped += 1
+                continue
+            results.append({
+                "api_name": api_name,
+                "request": params,
+                **_safe_sync_raw(api_name, params),
+            })
+    next_cursor = windows[-1][1].strftime("%Y%m%d") if windows else cursor
+    return {
+        "ok": all(bool(item.get("ok")) for item in results),
+        "start_date": start_date,
+        "end_date": end_date,
+        "cursor": next_cursor,
+        "months_processed": len(windows),
+        "has_more": bool(windows) and windows[-1][1] < end,
+        "apis": list(EVENT_RESEARCH_APIS),
+        "requests_executed": len(results),
+        "requests_skipped": skipped,
+        "rows_written": sum(int(item.get("rows_written") or 0) for item in results),
+        "failed": sum(1 for item in results if not item.get("ok")),
         "results": results,
     }
 
@@ -2825,6 +3001,113 @@ def sync_tushare_stock_batch(
     }
 
 
+def _pending_raw_coverage_dates(
+    api_name: str,
+    wanted: list[str],
+    *,
+    pending_limit: int,
+    minimum_rows: int,
+    require_point_in_time: bool,
+    chunk_size: int = DATE_RAW_COVERAGE_CHUNK_SIZE,
+    verified_rows: dict[str, int] | None = None,
+) -> list[str]:
+    """Return the next incomplete dates using bounded aggregate queries."""
+    pending: list[str] = []
+    size = max(1, min(int(chunk_size), 60))
+    cap = max(1, min(int(pending_limit), 60))
+    for offset in range(0, len(wanted), size):
+        batch = wanted[offset:offset + size]
+        if not batch:
+            continue
+        having = "HAVING COUNT(*)>=?"
+        if require_point_in_time:
+            having += (
+                " AND MAX(available_time)<=(SUBSTRING(trade_date,1,4)||'-'||"
+                "SUBSTRING(trade_date,5,2)||'-'||SUBSTRING(trade_date,7,2)||'T15:00:00')"
+            )
+        placeholders = ",".join("?" for _ in batch)
+        # Use a fresh transaction for every bounded slice. A PostgreSQL
+        # statement timeout aborts its transaction, so reusing one connection
+        # would make later slices fail even when they are small enough.
+        with _conn() as c:
+            rows = c.execute(
+                f"""SELECT trade_date,COUNT(*) row_count FROM dc_tushare_raw_records
+                    WHERE api_name=? AND trade_date IN ({placeholders})
+                    GROUP BY trade_date {having}""",
+                (api_name, *batch, max(1, int(minimum_rows))),
+            ).fetchall()
+        checked: set[str] = set()
+        for row in rows:
+            item = dict(row)
+            trade_date = str(item.get("trade_date") or "")
+            if not trade_date:
+                continue
+            checked.add(trade_date)
+            if verified_rows is not None:
+                verified_rows[trade_date] = int(item.get("row_count") or 0)
+        pending.extend(trade_date for trade_date in batch if trade_date not in checked)
+        if len(pending) >= cap:
+            break
+    return pending[:cap]
+
+
+def _reconcile_verified_date_coverage(
+    api_name: str,
+    verified_rows: dict[str, int],
+    *,
+    chunk_size: int = 200,
+) -> int:
+    """Backfill the request ledger from raw slices that pass the full contract."""
+    dates = sorted(trade_date for trade_date in verified_rows if trade_date)
+    if not dates:
+        return 0
+    terminal = {"success", "not_applicable", "valid_empty", "deferred_empty"}
+    recorded: set[str] = set()
+    size = max(1, min(int(chunk_size), 500))
+    for offset in range(0, len(dates), size):
+        batch = dates[offset:offset + size]
+        placeholders = ",".join("?" for _ in batch)
+        with _conn() as c:
+            rows = c.execute(
+                f"""SELECT trade_date,result_status FROM dc_tushare_request_coverage
+                    WHERE api_name=? AND trade_date IN ({placeholders})""",
+                (api_name, *batch),
+            ).fetchall()
+        recorded.update(
+            str(dict(row).get("trade_date") or "")
+            for row in rows
+            if str(dict(row).get("result_status") or "") in terminal
+        )
+    missing = [trade_date for trade_date in dates if trade_date not in recorded]
+    if not missing:
+        return 0
+    now = _now()
+    with _conn() as c:
+        for trade_date in missing:
+            params = {"trade_date": trade_date}
+            c.execute(
+                """INSERT INTO dc_tushare_request_coverage
+                   (request_key,api_name,ts_code,trade_date,period,params_json,rows_read,result_status,result_reason,checked_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?)
+                   ON CONFLICT(request_key) DO UPDATE SET rows_read=excluded.rows_read,
+                       result_status=excluded.result_status,result_reason=excluded.result_reason,
+                       checked_at=excluded.checked_at""",
+                (
+                    _request_key(api_name, params, None),
+                    api_name,
+                    "",
+                    trade_date,
+                    "",
+                    json.dumps(params, ensure_ascii=False, sort_keys=True),
+                    max(0, int(verified_rows.get(trade_date) or 0)),
+                    "success",
+                    "verified_existing_raw_contract",
+                    now,
+                ),
+            )
+    return len(missing)
+
+
 def sync_tushare_date_batch(
     api_name: str, *, trade_dates: list[str], limit: int = 10, require_rows: bool = False,
     minimum_rows: int = 1, require_point_in_time: bool = False,
@@ -2832,26 +3115,51 @@ def sync_tushare_date_batch(
     """Progress a date-based API without letting retryable empty rows block forever."""
     _catalog_item(api_name)
     wanted = list(dict.fromkeys(str(x) for x in trade_dates if str(x)))
-    with _conn() as c:
+    cap = max(1, min(int(limit), 60))
+    try:
         if require_rows:
-            having = "HAVING COUNT(*)>=?"
-            query_params: tuple[Any, ...] = (api_name, *wanted, max(1, int(minimum_rows)))
-            if require_point_in_time:
-                having += " AND MAX(available_time)<=(SUBSTRING(trade_date,1,4)||'-'||SUBSTRING(trade_date,5,2)||'-'||SUBSTRING(trade_date,7,2)||'T15:00:00')"
-            checked = {str(dict(row).get("trade_date") or "") for row in c.execute(
-                f"""SELECT trade_date FROM dc_tushare_raw_records
-                    WHERE api_name=? AND trade_date IN ({','.join('?' for _ in wanted)})
-                    GROUP BY trade_date {having}""",
-                query_params,
-            ).fetchall()} if wanted else set()
+            verified_rows: dict[str, int] = {}
+            pending = _pending_raw_coverage_dates(
+                api_name,
+                wanted,
+                pending_limit=cap,
+                minimum_rows=minimum_rows,
+                require_point_in_time=require_point_in_time,
+                verified_rows=verified_rows,
+            )
+            _reconcile_verified_date_coverage(api_name, verified_rows)
         else:
-            checked = {str(dict(row).get("trade_date") or "") for row in c.execute(
-                f"""SELECT trade_date FROM dc_tushare_request_coverage
-                    WHERE api_name=? AND trade_date IN ({','.join('?' for _ in wanted)})
-                      AND result_status IN ('success','not_applicable','valid_empty','deferred_empty')""",
-                (api_name, *wanted),
-            ).fetchall()} if wanted else set()
-    pending = [d for d in wanted if d not in checked][:max(1, min(int(limit), 60))]
+            with _conn() as c:
+                checked = {str(dict(row).get("trade_date") or "") for row in c.execute(
+                    f"""SELECT trade_date FROM dc_tushare_request_coverage
+                        WHERE api_name=? AND trade_date IN ({','.join('?' for _ in wanted)})
+                          AND result_status IN ('success','not_applicable','valid_empty','deferred_empty')""",
+                    (api_name, *wanted),
+                ).fetchall()} if wanted else set()
+            pending = [d for d in wanted if d not in checked][:cap]
+    except Exception as exc:  # noqa: BLE001 - the resumable worker must retain its checkpoint
+        error = str(exc)[:1000]
+        timed_out = "statement timeout" in error.lower()
+        return {
+            "ok": False,
+            "api": api_name,
+            "require_rows": require_rows,
+            "minimum_rows": max(1, int(minimum_rows)),
+            "require_point_in_time": require_point_in_time,
+            "total": 0,
+            "success": 0,
+            "failed": 1,
+            "concurrency": 0,
+            "cooldown": False,
+            "cooldown_seconds": 0,
+            "deferred": True,
+            "error_category": (
+                "coverage_query_timeout" if timed_out else "coverage_query_failed"
+            ),
+            "error": f"{api_name} coverage query failed: {error}",
+            "failed_items": [],
+            "results": [],
+        }
     results, workers = _parallel_tushare_map(
         pending, lambda d: _safe_sync_raw(api_name, {"trade_date": d}), prefix=f"tushare-{api_name}"
     )
@@ -3341,15 +3649,18 @@ def sync_cninfo_announcements(
     ts_code: str | None = None,
     page_size: int = 30,
     max_pages: int = 1,
+    category: str = "",
 ) -> dict[str, Any]:
     """Sync announcement metadata from CNINFO and create coarse rule-based events."""
 
     ensure_data_center_seeded()
-    page_size = max(1, min(int(page_size), 50))
+    # CNINFO's history endpoint silently repeats page one when pageSize > 30.
+    # Keep the provider's effective page size so pageNum advances correctly.
+    page_size = max(1, min(int(page_size), 30))
     max_pages = max(1, min(int(max_pages), 20))
     run_id = start_ingestion_run(
         "cninfo.announcements",
-        {"start_date": start_date, "end_date": end_date, "ts_code": ts_code or "", "page_size": page_size, "max_pages": max_pages},
+        {"start_date": start_date, "end_date": end_date, "ts_code": ts_code or "", "page_size": page_size, "max_pages": max_pages, "category": category},
     )
     try:
         rows: list[dict[str, Any]] = []
@@ -3360,19 +3671,18 @@ def sync_cninfo_announcements(
                 ts_code=ts_code,
                 page_num=page_num,
                 page_size=page_size,
+                category=category,
             )
             if not page_rows:
                 break
             rows.extend(page_rows)
-            if len(page_rows) < page_size:
-                break
         written, events = _upsert_announcements(rows)
         finish_ingestion_run(
             run_id,
             status="completed",
             rows_read=len(rows),
             rows_written=written,
-            meta={"events_created": events, "start_date": start_date, "end_date": end_date, "ts_code": ts_code or ""},
+            meta={"events_created": events, "start_date": start_date, "end_date": end_date, "ts_code": ts_code or "", "category": category},
         )
         return {"ok": True, "run_id": run_id, "rows_read": len(rows), "rows_written": written, "events_created": events}
     except Exception as exc:  # noqa: BLE001
@@ -3387,6 +3697,7 @@ def _fetch_cninfo_announcement_page(
     ts_code: str | None,
     page_num: int,
     page_size: int,
+    category: str = "",
 ) -> list[dict[str, Any]]:
     url = "http://www.cninfo.com.cn/new/hisAnnouncement/query"
     se_date = f"{_fmt_cninfo_date(start_date)}~{_fmt_cninfo_date(end_date)}"
@@ -3399,7 +3710,7 @@ def _fetch_cninfo_announcement_page(
         "stock": _cninfo_stock_param(ts_code),
         "searchkey": "",
         "secid": "",
-        "category": "",
+        "category": str(category or ""),
         "trade": "",
         "seDate": se_date,
         "sortName": "",
@@ -3411,9 +3722,24 @@ def _fetch_cninfo_announcement_page(
         "Referer": "http://www.cninfo.com.cn/new/commonUrl/pageOfSearch?url=disclosure/list/search",
         "Accept": "application/json, text/plain, */*",
     }
-    resp = requests.post(url, data=payload, headers=headers, timeout=20)
-    resp.raise_for_status()
-    data = resp.json()
+    data: dict[str, Any] | None = None
+    last_error: Exception | None = None
+    for attempt in range(3):
+        try:
+            resp = requests.post(url, data=payload, headers=headers, timeout=20)
+            resp.raise_for_status()
+            parsed = resp.json()
+            if not isinstance(parsed, dict):
+                raise ValueError("CNINFO response is not a JSON object")
+            data = parsed
+            break
+        except (requests.RequestException, ValueError) as exc:
+            last_error = exc
+            if attempt >= 2:
+                break
+            time.sleep(0.5 * (attempt + 1))
+    if data is None:
+        raise RuntimeError(f"CNINFO announcement request failed after 3 attempts: {last_error}") from last_error
     announcements = data.get("announcements") or []
     out: list[dict[str, Any]] = []
     for item in announcements:
@@ -3434,6 +3760,8 @@ def _fetch_cninfo_announcement_page(
                 "url": url_full,
                 "raw_text": "",
                 "content_hash": _hash_text(f"{sec_code}|{title}|{publish_time}|{url_full}"),
+                "provider_type_codes": str(item.get("announcementType") or ""),
+                "provider_type_name": str(item.get("announcementTypeName") or ""),
             }
         )
     return out
@@ -3548,8 +3876,12 @@ def _upsert_announcements(rows: list[dict[str, Any]]) -> tuple[int, int]:
             written += 1
             ann_id = int(_row_to_dict(ann_row).get("id") or 0)
             event = classify_announcement_event(str(row.get("title") or ""), str(row.get("publish_time") or ""))
-            if ann_id and event:
+            if ann_id:
+                # A changed title may no longer match the current contract.
+                # Delete the previous derived label first so stale rule events
+                # cannot survive a source refresh.
                 c.execute("DELETE FROM dc_announcement_event WHERE announcement_id = ?", (ann_id,))
+            if ann_id and event:
                 c.execute(
                     """
                     INSERT INTO dc_announcement_event
@@ -3588,12 +3920,17 @@ def classify_announcement_event(title: str, publish_time: str = "") -> dict[str,
         ("减持|减持计划", "shareholder_reduction", "negative", "high"),
         ("解除质押", "pledge", "positive", "low"),
         ("质押", "pledge", "negative", "medium"),
-        ("业绩预告", "earnings_forecast", "neutral", "medium"),
+        ("业绩预告|业绩预增|业绩预盈|业绩预亏|业绩预减", "earnings_forecast", "neutral", "medium"),
         ("业绩快报", "earnings_flash", "neutral", "medium"),
-        ("年度报告|季度报告|半年度报告", "earnings", "neutral", "medium"),
+        (
+            "年度报告|季度报告|半年度报告|一季报|三季报|Annual Report|Half[- ]Year Report|First Quarterly Report|Third Quarterly Report",
+            "earnings",
+            "neutral",
+            "medium",
+        ),
         ("回购", "repurchase", "positive", "medium"),
         ("增持", "shareholder_increase", "positive", "medium"),
-        ("分红|权益分派|利润分配", "dividend", "positive", "low"),
+        ("分红|权益分派|利润分配|股息", "dividend", "positive", "low"),
         ("重大合同|中标|订单", "major_contract", "positive", "medium"),
         ("定增|非公开发行", "private_placement", "neutral", "medium"),
         ("并购|重组|收购|资产购买", "ma_restructuring", "neutral", "medium"),
@@ -3614,43 +3951,76 @@ def classify_announcement_event(title: str, publish_time: str = "") -> dict[str,
 
 
 def reclassify_announcement_events(*, limit: int = 50_000) -> dict[str, Any]:
-    """Rebuild existing rule-based event labels from retained announcement titles.
+    """Rebuild rule-based event labels from all retained announcement titles.
 
-    The migration is deterministic and only touches records whose standard
-    type/direction/severity differs from the current classifier.  It does not
-    invent event data or modify the source announcement itself.
+    The migration updates changed labels, creates labels for previously missed
+    announcements and removes stale labels that no longer match the current
+    contract.  It does not modify source announcements or invent source facts.
     """
     ensure_data_center_seeded()
     cap = max(1, min(int(limit), 200_000))
     with _conn() as c:
         rows = c.execute(
-            """SELECT e.id,e.event_type,e.impact_direction,e.severity,e.confidence,e.event_date,e.summary,
-                      a.title,a.publish_time
-                 FROM dc_announcement_event e
-                 JOIN dc_announcement_raw a ON a.id=e.announcement_id
-                 ORDER BY e.id ASC LIMIT ?""",
+            """SELECT a.id AS announcement_row_id,a.ts_code,a.title,a.publish_time,
+                      e.id AS event_id,e.event_type,e.impact_direction,e.severity,e.confidence,e.event_date,e.summary
+                 FROM dc_announcement_raw a
+                 LEFT JOIN dc_announcement_event e
+                   ON e.id=(SELECT MIN(e2.id) FROM dc_announcement_event e2 WHERE e2.announcement_id=a.id)
+                 ORDER BY a.id ASC LIMIT ?""",
             (cap,),
         ).fetchall()
-        changed = 0
-        skipped = 0
+        created = 0
+        updated = 0
+        removed = 0
+        unchanged = 0
+        now = _now()
         for raw in rows:
             row = _row_to_dict(raw)
             event = classify_announcement_event(str(row.get("title") or ""), str(row.get("publish_time") or ""))
             if not event:
-                skipped += 1
+                if row.get("event_id") is not None:
+                    c.execute("DELETE FROM dc_announcement_event WHERE announcement_id=?", (row["announcement_row_id"],))
+                    removed += 1
+                else:
+                    unchanged += 1
                 continue
             expected = (event["event_type"], event["impact_direction"], event["severity"], event["event_date"], event["summary"])
             actual = (row.get("event_type"), row.get("impact_direction"), row.get("severity"), row.get("event_date"), row.get("summary"))
             if expected == actual:
+                unchanged += 1
                 continue
+            c.execute("DELETE FROM dc_announcement_event WHERE announcement_id=?", (row["announcement_row_id"],))
             c.execute(
-                """UPDATE dc_announcement_event
-                      SET event_type=?,impact_direction=?,severity=?,confidence=?,event_date=?,summary=?
-                    WHERE id=?""",
-                (event["event_type"], event["impact_direction"], event["severity"], event["confidence"], event["event_date"], event["summary"], row["id"]),
+                """INSERT INTO dc_announcement_event
+                   (announcement_id,event_type,impact_direction,severity,confidence,event_date,
+                    entities_json,metrics_json,summary,created_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    row["announcement_row_id"],
+                    event["event_type"],
+                    event["impact_direction"],
+                    event["severity"],
+                    event["confidence"],
+                    event["event_date"],
+                    json.dumps({"ts_code": row.get("ts_code") or "", "title": row.get("title") or ""}, ensure_ascii=False),
+                    "{}",
+                    event["summary"],
+                    now,
+                ),
             )
-            changed += 1
-    return {"ok": True, "examined": len(rows), "changed": changed, "skipped_unclassified": skipped, "contract": "announcement_event_v1_reclassification"}
+            if row.get("event_id") is None:
+                created += 1
+            else:
+                updated += 1
+    return {
+        "ok": True,
+        "examined": len(rows),
+        "created": created,
+        "updated": updated,
+        "removed": removed,
+        "unchanged": unchanged,
+        "contract": "announcement_event_v2_full_reclassification",
+    }
 
 
 def import_industry_metrics(path: str) -> dict[str, Any]:

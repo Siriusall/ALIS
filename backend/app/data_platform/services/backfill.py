@@ -23,6 +23,8 @@ from app.data_platform.services.assets import (
 PLAN_MODEL_REQUIRED_LABELED_SESSIONS = 1577
 MODEL_DATA_BACKFILL_TASK = "data_platform.plan_model_data_backfill"
 MODEL_DATA_BACKFILL_STATE_KEY = "alis:data-platform:plan-model-data-backfill:state"
+MODEL_DATA_BACKFILL_CONTRACT = "alis_plan_model_data_backfill_v3_event_financial_disclosures"
+PREVIOUS_MODEL_DATA_BACKFILL_CONTRACT = "alis_plan_model_data_backfill_v2_event_research"
 from app.data_platform.services.asset_watermarks import mark_asset_terminal
 from app.data_platform.services.data_center import (
     enrich_financial_research_batch,
@@ -41,7 +43,9 @@ from app.data_platform.services.data_center import (
     backfill_capital_structure_history,
     backfill_etf_daily_incremental,
     backfill_etf_price_history,
+    backfill_event_research_history,
     backfill_major_news_history,
+    normalize_report_rc_record_keys,
     DEFER_EMPTY_AFTER_ATTEMPTS,
     get_vip_backfill_status,
 )
@@ -186,6 +190,18 @@ def _theme_snapshot_dates(dates: list[str]) -> set[str]:
         rows = c.execute(
             f"SELECT DISTINCT as_of_date FROM dc_theme_snapshot WHERE as_of_date IN ({placeholders})",
             tuple(dates),
+        ).fetchall()
+    return {str(dict(row).get("as_of_date") or "") for row in rows}
+
+
+def _theme_snapshot_dates_for_version(dates: list[str], model_version: str) -> set[str]:
+    if not dates:
+        return set()
+    placeholders = ",".join("?" for _ in dates)
+    with _conn() as c:
+        rows = c.execute(
+            f"SELECT DISTINCT as_of_date FROM dc_theme_snapshot WHERE model_version=? AND as_of_date IN ({placeholders})",
+            (model_version, *dates),
         ).fetchall()
     return {str(dict(row).get("as_of_date") or "") for row in rows}
 
@@ -461,6 +477,50 @@ def build_backfill_plan(*, market_batch_days: int = 30, financial_batch_size: in
             "need_dates": min(250, len(target_theme_dates) or 250),
             "missing_dates": missing_theme_dates[:60],
             "batch": min(30, market_batch_days),
+        },
+    })
+
+    # V3 labels are versioned separately from the ordinary 250-day readiness
+    # cache. Formal five-window narrative training must never mix v1/v2 labels.
+    narrative_formal_labeled_sessions = 1577
+    narrative_label_horizon_sessions = 3
+    narrative_required_snapshot_sessions = (
+        narrative_formal_labeled_sessions + narrative_label_horizon_sessions
+    )
+    with _conn() as c:
+        v3_calendar_rows = c.execute(
+            "SELECT cal_date FROM dc_trade_calendar WHERE is_open=1 AND cal_date<=? ORDER BY cal_date DESC LIMIT ?",
+            (theme_end_s, narrative_required_snapshot_sessions),
+        ).fetchall()
+    v3_open_days = [str(dict(row).get("cal_date") or "") for row in v3_calendar_rows if dict(row).get("cal_date")]
+    v3_target_dates = list(reversed(v3_open_days)) if v3_open_days else []
+    v3_model_version = "industry_price_fundamental_theme_v3"
+    have_v3_dates = _theme_snapshot_dates_for_version(v3_target_dates, v3_model_version)
+    missing_v3_dates = [trade_date for trade_date in reversed(v3_target_dates) if trade_date not in have_v3_dates]
+    add({
+        "priority": 2,
+        "key": "theme_snapshots_lifecycle_v3",
+        "title": "补全叙事生命周期 V3 历史标签",
+        "why": (
+            "正式叙事五窗口只允许 V3 标签；3日预测周期需要额外3个快照日，"
+            f"当前 {len(have_v3_dates)}/{len(v3_target_dates) or narrative_required_snapshot_sessions} 个快照日，禁止混入旧版标签"
+        ),
+        "action": "materialize_theme_snapshots_batch",
+        "params": {
+            "end_date": theme_end_s,
+            "target_sessions": narrative_required_snapshot_sessions,
+            "limit_dates": min(20, market_batch_days),
+        },
+        "estimated_calls": max(0, len(missing_v3_dates)),
+        "estimated_minutes": round(max(0, len(missing_v3_dates)) * 0.05, 1),
+        "status": "done" if v3_target_dates and len(have_v3_dates) >= len(v3_target_dates) else "needed",
+        "gap": {
+            "have_dates": len(have_v3_dates),
+            "need_dates": len(v3_target_dates) or narrative_required_snapshot_sessions,
+            "required_labeled_dates": narrative_formal_labeled_sessions,
+            "label_horizon_sessions": narrative_label_horizon_sessions,
+            "missing_dates": missing_v3_dates[:60],
+            "model_version": v3_model_version,
         },
     })
 
@@ -1327,6 +1387,24 @@ def _run_step(step: dict[str, Any]) -> dict[str, Any]:
     return {"ok": False, "error": f"unsupported action: {action}"}
 
 
+def _run_step_resumable(step: dict[str, Any]) -> dict[str, Any]:
+    """Convert only database statement timeouts into a deferred step result."""
+    try:
+        return _run_step(step)
+    except Exception as exc:  # noqa: BLE001 - unknown exceptions still escalate
+        detail = str(exc)[:1000]
+        if "statement timeout" not in detail.lower():
+            raise
+        return {
+            "ok": False,
+            "failed": 1,
+            "deferred": True,
+            "error_category": "database_statement_timeout",
+            "error": detail,
+            "results": [],
+        }
+
+
 def _worker(plan: dict[str, Any], *, max_steps: int, stream_id: str | None = None, auto_resume_attempt: int = 0) -> None:
     run_id = int(_state.get("run_id") or 0)
     executed: list[dict[str, Any]] = []
@@ -1387,7 +1465,7 @@ def _worker(plan: dict[str, Any], *, max_steps: int, stream_id: str | None = Non
                 )),
                 current_step=step,
             )
-            result = _run_step(step)
+            result = _run_step_resumable(step)
             executed.append({"step": {k: step.get(k) for k in ("id", "key", "title", "action")}, "result": _result_summary(result)})
             if result.get("ok") or result.get("skipped"):
                 _set(failure_detail=None)
@@ -1418,6 +1496,19 @@ def _worker(plan: dict[str, Any], *, max_steps: int, stream_id: str | None = Non
                         deferred.append({
                             "step": {k: step.get(k) for k in ("id", "key", "title", "action")},
                             "reason": (detail or "质量检查失败")[:1000],
+                            "summary": _result_summary(result),
+                        })
+                    elif int(result.get("failed") or result.get("subtasks_failed") or 0) > 0:
+                        # A hard/permission/upstream gap must not starve later
+                        # executable assets (notably V3 lifecycle labels). Keep
+                        # the failed step in the persisted deferred list and
+                        # let the bounded auto-resume retry it after the rest
+                        # of the plan has advanced.
+                        step_key = str(step.get("key") or step.get("id") or "")
+                        deferred_keys.add(step_key)
+                        deferred.append({
+                            "step": {k: step.get(k) for k in ("id", "key", "title", "action")},
+                            "reason": (detail or "本批存在未解决缺口，已让其他数据资产先继续")[:1000],
                             "summary": _result_summary(result),
                         })
                     _set(
@@ -1855,6 +1946,8 @@ def _model_data_backfill_result_summary(result: dict[str, Any]) -> dict[str, Any
             "failed",
             "rows_written",
             "days_processed",
+            "months_processed",
+            "periods_processed",
             "requests_executed",
             "requests_skipped",
             "normalized_available_time_rows",
@@ -1883,6 +1976,8 @@ def enqueue_plan_model_data_backfill(
     )
     state = _set_model_data_backfill_state(
         status="queued" if message_id else "queue_unavailable",
+        contract=MODEL_DATA_BACKFILL_CONTRACT,
+        post_backfill_audit={},
         phase=phase,
         cursor=cursor,
         message_id=message_id or "",
@@ -1963,14 +2058,14 @@ def _news_source_progress(*, phase: str, cursor: str, status: str) -> dict[str, 
             processed_days = max(0, min(total_days, (cursor_date - start).days + 1))
         except ValueError:
             processed_days = 0
-    elif status == "completed":
+    elif phase in {"event_research", "event_financial_disclosures"} or status == "completed":
         processed_days = total_days
     return {
         "id": "event_major_news_history",
-        "label": "事件预期差模型：重大新闻历史源检查",
+        "label": "事件影响评估：重大新闻历史源检查",
         "status": (
             "completed"
-            if status == "completed"
+            if status == "completed" or phase in {"event_research", "event_financial_disclosures"}
             else "running"
             if phase == "major_news"
             else "pending"
@@ -1988,6 +2083,87 @@ def _news_source_progress(*, phase: str, cursor: str, status: str) -> dict[str, 
     }
 
 
+def _event_research_progress(*, phase: str, cursor: str, status: str) -> dict[str, Any]:
+    start = date(2019, 1, 1)
+    end = datetime.now().date()
+    total_days = max(1, (end - start).days + 1)
+    processed_days = 0
+    if phase == "event_research":
+        try:
+            cursor_date = datetime.strptime(cursor, "%Y%m%d").date()
+            processed_days = max(0, min(total_days, (cursor_date - start).days + 1))
+        except ValueError:
+            processed_days = 0
+    elif phase == "event_financial_disclosures" or status == "completed":
+        processed_days = total_days
+    return {
+        "id": "event_research_history",
+        "label": "事件影响评估：一致预期与量化事件字段",
+        "status": (
+            "completed" if status == "completed" or phase == "event_financial_disclosures" else
+            "running" if phase == "event_research" else "pending"
+        ),
+        "source_window_start": start.strftime("%Y%m%d"),
+        "source_window_end": end.strftime("%Y%m%d"),
+        "cursor": cursor if phase == "event_research" else "",
+        "processed_calendar_days": processed_days,
+        "target_calendar_days": total_days,
+        "progress": round(processed_days / max(1, total_days), 6),
+        "acceptance": (
+            "report_rc 按机构/报告期/发布日保留点时预测；repurchase 与 stk_holdertrade "
+            "按月切片补全；空结果留证，不伪造一致预期或事件金额"
+        ),
+    }
+
+
+def _event_financial_periods() -> list[str]:
+    periods: list[str] = []
+    today = datetime.now().date()
+    for year in range(2019, today.year + 1):
+        for month, day in ((3, 31), (6, 30), (9, 30), (12, 31)):
+            end = date(year, month, day)
+            if end <= today:
+                periods.append(end.strftime("%Y%m%d"))
+    return periods
+
+
+def _event_financial_period_complete(api_name: str, period: str) -> bool:
+    with _conn() as c:
+        row = c.execute(
+            """SELECT 1 FROM dc_tushare_request_coverage
+               WHERE api_name=? AND period=?
+                 AND result_status IN ('success','valid_empty','not_applicable','deferred_empty')
+               LIMIT 1""",
+            (api_name, period),
+        ).fetchone()
+    return row is not None
+
+
+def _event_financial_progress(*, phase: str, cursor: str, status: str) -> dict[str, Any]:
+    periods = _event_financial_periods()
+    processed = 0
+    if phase == "event_financial_disclosures" and cursor:
+        processed = sum(1 for period in periods if period <= cursor)
+    elif status == "completed":
+        processed = len(periods)
+    return {
+        "id": "event_financial_disclosures",
+        "label": "事件影响评估：业绩预告与快报历史",
+        "status": (
+            "completed" if status == "completed" else
+            "running" if phase == "event_financial_disclosures" else "pending"
+        ),
+        "cursor": cursor if phase == "event_financial_disclosures" else "",
+        "processed_periods": processed,
+        "target_periods": len(periods),
+        "progress": round(processed / max(1, len(periods)), 6),
+        "acceptance": (
+            "forecast_vip 与 express_vip 按已结束报告期全市场批量拉取；"
+            "预期差只允许同一规范化报告期与至少三家独立机构点时共识比较"
+        ),
+    }
+
+
 def audit_plan_model_data_contract() -> dict[str, Any]:
     """Recompute real model-domain coverage after source backfill completes."""
 
@@ -2001,7 +2177,7 @@ def audit_plan_model_data_contract() -> dict[str, Any]:
         model_key: _coverage_snapshot(model_key, base)
         for model_key in (
             "capital_persistence_multitask_v1",
-            "event_surprise_lgbm_v1",
+            "event_impact_assessor_v2",
         )
     }
     return {
@@ -2038,7 +2214,7 @@ def get_plan_model_data_backfill_status(*, cache_seconds: int = 15) -> dict[str,
     if not isinstance(state, dict) or not state:
         result = {
             "ok": True,
-            "schema_version": "alis_model_data_backfill_work_order_v1",
+            "schema_version": "alis_model_data_backfill_work_order_v3",
             "status": "not_started",
             "phase": "idle",
             "progress": 0.0,
@@ -2059,6 +2235,12 @@ def get_plan_model_data_backfill_status(*, cache_seconds: int = 15) -> dict[str,
     attempts = task_attempts(message_id)
     moneyflow = _model_moneyflow_checklist()
     news = _news_source_progress(phase=phase, cursor=cursor, status=raw_status)
+    event_research = _event_research_progress(
+        phase=phase, cursor=cursor, status=raw_status
+    )
+    event_financial = _event_financial_progress(
+        phase=phase, cursor=cursor, status=raw_status
+    )
     trade_start = str(moneyflow.get("window_start") or "")
     trade_end = str(moneyflow.get("window_end") or "")
     processed_trade_dates = 0
@@ -2073,7 +2255,7 @@ def get_plan_model_data_backfill_status(*, cache_seconds: int = 15) -> dict[str,
                 (trade_start, trade_end, cursor),
             ).fetchone()
         processed_trade_dates = int(dict(row).get("n") or 0)
-    elif phase in {"moneyflow_residual", "major_news"} or raw_status == "completed":
+    elif phase in {"moneyflow_residual", "major_news", "event_research", "event_financial_disclosures"} or raw_status == "completed":
         processed_trade_dates = target_raw
     moneyflow["cursor"] = cursor if phase == "moneyflow" else trade_end
     moneyflow["processed_trade_dates"] = min(target_raw, processed_trade_dates)
@@ -2081,7 +2263,10 @@ def get_plan_model_data_backfill_status(*, cache_seconds: int = 15) -> dict[str,
         min(target_raw, processed_trade_dates) / max(1, target_raw),
         6,
     )
-    if raw_status == "completed":
+    contract_current = str(state.get("contract") or "") == MODEL_DATA_BACKFILL_CONTRACT
+    if raw_status == "completed" and not contract_current:
+        normalized_status = "upgrade_required"
+    elif raw_status == "completed":
         normalized_status = "completed"
     elif raw_status in {"failed", "queue_unavailable"}:
         normalized_status = "failed"
@@ -2097,18 +2282,22 @@ def get_plan_model_data_backfill_status(*, cache_seconds: int = 15) -> dict[str,
         (
             float(moneyflow.get("progress") or 0.0)
             + float(news.get("progress") or 0.0)
+            + float(event_research.get("progress") or 0.0)
+            + float(event_financial.get("progress") or 0.0)
         )
-        / 2.0,
+        / 4.0,
         6,
     )
     result = {
         "ok": True,
-        "schema_version": "alis_model_data_backfill_work_order_v1",
-        "work_order_id": "plan-model-history-20260729-v1",
+        "schema_version": "alis_model_data_backfill_work_order_v3",
+        "work_order_id": "plan-model-history-20260731-v3",
         "task_type": MODEL_DATA_BACKFILL_TASK,
         "status": normalized_status,
         "raw_status": raw_status,
         "phase": phase,
+        "contract": str(state.get("contract") or ""),
+        "contract_current": contract_current,
         "cursor": cursor,
         "progress": 1.0 if normalized_status == "completed" else progress,
         "message_id": message_id,
@@ -2120,6 +2309,8 @@ def get_plan_model_data_backfill_status(*, cache_seconds: int = 15) -> dict[str,
         "checklist": [
             moneyflow,
             news,
+            event_research,
+            event_financial,
             {
                 "id": "post_backfill_contract_audit",
                 "label": "补数后重新计算模型数据门",
@@ -2161,6 +2352,23 @@ def ensure_plan_model_data_backfill() -> dict[str, Any]:
     current = str(status.get("status") or "not_started")
     if current in {"queued", "running", "retry_wait"}:
         return {"ok": True, "created": False, "reason": "already_active", "task": status}
+    if current == "upgrade_required":
+        previous_contract = str(status.get("contract") or "")
+        upgrade_phase = (
+            "event_financial_disclosures"
+            if previous_contract == PREVIOUS_MODEL_DATA_BACKFILL_CONTRACT
+            else "event_research"
+        )
+        queued = enqueue_plan_model_data_backfill(
+            phase=upgrade_phase, cursor="20181231"
+        )
+        _model_backfill_status_cache.update({"at": 0.0, "value": None})
+        return {
+            "ok": bool(queued.get("ok")),
+            "created": bool(queued.get("ok")),
+            "reason": "contract_upgrade",
+            "task": queued,
+        }
     if current == "completed":
         return {"ok": True, "created": False, "reason": "work_order_completed", "task": status}
     if current == "failed":
@@ -2205,10 +2413,67 @@ def _normalize_moneyflow_available_time(
     return normalized
 
 
+def _normalize_event_disclosure_available_time(*, chunk_size: int = 50_000) -> int:
+    """Repair legacy analyst-report rows written with ingestion-time availability.
+
+    ``report_rc`` is published on its ``trade_date``.  Older ingestion code did
+    not classify it as a disclosure API, so historical rows carried the fetch
+    timestamp and became unusable to point-in-time event training.  The update
+    is monotonic to the source publication date and leaves raw payloads intact.
+    """
+    normalized = 0
+    size = max(1_000, min(int(chunk_size), 100_000))
+    last_id = 0
+    while True:
+        with _conn() as c:
+            date_clause = (
+                "trade_date ~ '^[0-9]{8}$'"
+                if getattr(c, "_is_postgres", False)
+                else "trade_date GLOB '[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]'"
+            )
+            target_time = (
+                "SUBSTRING(trade_date,1,4)||'-'||"
+                "SUBSTRING(trade_date,5,2)||'-'||"
+                "SUBSTRING(trade_date,7,2)||'T23:59:59'"
+            )
+            ids = c.execute(
+                """SELECT id FROM dc_tushare_raw_records
+                   WHERE api_name='report_rc' AND id>?
+                   ORDER BY id LIMIT ?""",
+                (last_id, size),
+            ).fetchall()
+            values = [
+                int(dict(row).get("id") or 0)
+                for row in ids
+                if int(dict(row).get("id") or 0) > last_id
+            ]
+            if not values:
+                return normalized
+            upper_id = values[-1]
+            if upper_id <= last_id:
+                return normalized
+            result = c.execute(
+                f"""UPDATE dc_tushare_raw_records
+                    SET available_time={target_time}
+                    WHERE api_name='report_rc'
+                      AND id>? AND id<=? AND {date_clause}
+                      AND available_time<>{target_time}""",
+                (last_id, upper_id),
+            )
+            changed = max(0, int(getattr(result, "rowcount", 0) or 0))
+            normalized += changed
+            last_id = upper_id
+
+
 def _process_plan_model_data_backfill(payload: dict[str, Any]) -> dict[str, Any]:
     phase = str(payload.get("phase") or "moneyflow")
     cursor = str(payload.get("cursor") or "")
     _set_model_data_backfill_state(status="running", phase=phase, cursor=cursor, error="")
+    legacy_event_rows = (
+        _normalize_event_disclosure_available_time()
+        if phase == "moneyflow" and not cursor
+        else 0
+    )
     if phase == "moneyflow":
         with _conn() as c:
             rows = c.execute(
@@ -2270,6 +2535,7 @@ def _process_plan_model_data_backfill(payload: dict[str, Any]) -> dict[str, Any]
             require_point_in_time=True,
         )
         result["normalized_available_time_rows"] = normalized_rows
+        result["normalized_event_disclosure_rows"] = legacy_event_rows
         if not result.get("ok"):
             _set_model_data_backfill_state(
                 status="failed",
@@ -2420,11 +2686,148 @@ def _process_plan_model_data_backfill(payload: dict[str, Any]) -> dict[str, Any]
                 last_result=_model_data_backfill_result_summary(result),
             )
         else:
+            next_task = enqueue_plan_model_data_backfill(
+                phase="event_research", cursor="20181231"
+            )
+            _set_model_data_backfill_state(
+                status="running",
+                phase="event_research",
+                cursor="20181231",
+                last_result=_model_data_backfill_result_summary(result),
+                next_message_id=next_task.get("message_id") or "",
+            )
+        return {
+            "ok": True,
+            "phase": phase,
+            "result": result,
+            "post_backfill_audit": {},
+        }
+    if phase == "event_research":
+        normalized_keys = (
+            normalize_report_rc_record_keys()
+            if cursor == "20181231" else {}
+        )
+        result = backfill_event_research_history(
+            start_date="20190101",
+            end_date=datetime.now().strftime("%Y%m%d"),
+            cursor=cursor,
+            limit_months=1,
+        )
+        result["normalized_report_rc_keys"] = normalized_keys
+        result["normalized_available_time_rows"] = (
+            _normalize_event_disclosure_available_time()
+        )
+        if not result.get("ok"):
+            _set_model_data_backfill_state(
+                status="failed",
+                phase=phase,
+                cursor=cursor,
+                error="event_research_backfill_failed",
+                last_result=_model_data_backfill_result_summary(result),
+            )
+            return result
+        next_cursor = str(result.get("cursor") or cursor)
+        if result.get("has_more"):
+            next_task = enqueue_plan_model_data_backfill(
+                phase="event_research", cursor=next_cursor
+            )
+            _set_model_data_backfill_state(
+                status="running",
+                phase=phase,
+                cursor=next_cursor,
+                next_message_id=next_task.get("message_id") or "",
+                last_result=_model_data_backfill_result_summary(result),
+            )
+            post_backfill_audit: dict[str, Any] = {}
+        else:
+            next_task = enqueue_plan_model_data_backfill(
+                phase="event_financial_disclosures", cursor="20181231"
+            )
+            _set_model_data_backfill_state(
+                status="running",
+                phase="event_financial_disclosures",
+                cursor="20181231",
+                last_result=_model_data_backfill_result_summary(result),
+                next_message_id=next_task.get("message_id") or "",
+            )
+            post_backfill_audit = {}
+        return {
+            "ok": True,
+            "phase": phase,
+            "result": result,
+            "post_backfill_audit": post_backfill_audit,
+        }
+    if phase == "event_financial_disclosures":
+        remaining = [
+            period for period in _event_financial_periods()
+            if not cursor or period > cursor
+        ]
+        if not remaining:
             post_backfill_audit = audit_plan_model_data_contract()
             _set_model_data_backfill_state(
                 status="completed",
                 phase=phase,
-                cursor=next_cursor,
+                cursor=cursor,
+                post_backfill_audit=post_backfill_audit,
+            )
+            return {
+                "ok": True,
+                "phase": phase,
+                "completed": True,
+                "post_backfill_audit": post_backfill_audit,
+            }
+        period = remaining[0]
+        results: list[dict[str, Any]] = []
+        for api_name in ("forecast", "express"):
+            if _event_financial_period_complete(api_name, period):
+                results.append({
+                    "ok": True,
+                    "api": api_name,
+                    "period": period,
+                    "skipped": True,
+                    "rows_written": 0,
+                })
+            else:
+                results.append(
+                    sync_tushare_stock_batch(api_name, period=period, limit=1)
+                )
+        result = {
+            "ok": all(bool(item.get("ok")) for item in results),
+            "period": period,
+            "cursor": period,
+            "periods_processed": 1,
+            "has_more": len(remaining) > 1,
+            "rows_written": sum(int(item.get("rows_written") or 0) for item in results),
+            "failed": sum(1 for item in results if not item.get("ok")),
+            "results": results,
+        }
+        if not result["ok"]:
+            _set_model_data_backfill_state(
+                status="failed",
+                phase=phase,
+                cursor=cursor,
+                error="event_financial_disclosures_backfill_failed",
+                last_result=_model_data_backfill_result_summary(result),
+            )
+            return result
+        if result["has_more"]:
+            next_task = enqueue_plan_model_data_backfill(
+                phase=phase, cursor=period
+            )
+            _set_model_data_backfill_state(
+                status="running",
+                phase=phase,
+                cursor=period,
+                next_message_id=next_task.get("message_id") or "",
+                last_result=_model_data_backfill_result_summary(result),
+            )
+            post_backfill_audit = {}
+        else:
+            post_backfill_audit = audit_plan_model_data_contract()
+            _set_model_data_backfill_state(
+                status="completed",
+                phase=phase,
+                cursor=period,
                 last_result=_model_data_backfill_result_summary(result),
                 post_backfill_audit=post_backfill_audit,
             )
@@ -2432,9 +2835,7 @@ def _process_plan_model_data_backfill(payload: dict[str, Any]) -> dict[str, Any]
             "ok": True,
             "phase": phase,
             "result": result,
-            "post_backfill_audit": (
-                post_backfill_audit if not result.get("has_more") else {}
-            ),
+            "post_backfill_audit": post_backfill_audit,
         }
     result = {"ok": False, "error": f"unknown_plan_model_data_backfill_phase:{phase}"}
     _set_model_data_backfill_state(status="failed", phase=phase, error=result["error"])
