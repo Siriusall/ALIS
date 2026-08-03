@@ -31,7 +31,7 @@ from app.api.routes import (
 )
 from app.core.config import settings
 from app.core.error_evidence import error_evidence
-from app.db.store import database_health as primary_database_health, init_db
+from app.db.store import database_health as primary_database_health
 from app.services.quant_task_runner import (
     ensure_autonomous_simulation_task,
     resume_quant_tasks_on_startup,
@@ -51,7 +51,6 @@ from app.services.plan_model_control import reconcile_plan_model_production_gate
 from app.services.profit_loop import recover_interrupted_daily_rebalance_plans
 from app.services.runtime_boundary import BackgroundRuntimeLease, acquire_background_runtime_lease
 from app.data_platform.db import database_health as data_platform_database_health
-from app.data_platform.db import init_db as init_data_platform_db
 from app.data_platform.redis_store import start_task_worker
 from app.data_platform.redis_store import health as redis_health
 from app.data_platform.routes.data_center import router as data_center_router
@@ -117,6 +116,21 @@ def _start_component(name: str, fn, *, required: bool = True) -> object | None:
         logger.exception("Startup component failed: %s", name)
         return None
 
+
+def _verify_database_connections() -> None:
+    """Fail fast on unavailable shared databases without performing migrations."""
+
+    primary = primary_database_health()
+    data_platform = data_platform_database_health()
+    unavailable = []
+    if primary.get("status") != "ok":
+        unavailable.append("primary")
+    if data_platform.get("status") != "ok":
+        unavailable.append("data-platform")
+    if unavailable:
+        raise RuntimeError(f"database connectivity check failed: {', '.join(unavailable)}")
+
+
 def startup() -> None:
     """Keep service startup light.
 
@@ -127,9 +141,8 @@ def startup() -> None:
     global _background_runtime_lease
     startup_t0 = time.perf_counter()
     _startup_components.clear()
-    logger.info("Starting service: initializing database schema only.")
-    init_db()
-    init_data_platform_db()
+    logger.info("Starting service: verifying database connectivity.")
+    _verify_database_connections()
     _background_runtime_lease = acquire_background_runtime_lease()
     _startup_components["background_runtime_boundary"] = {
         "status": (
