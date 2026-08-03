@@ -3,13 +3,17 @@ import os
 from pydantic import BaseModel
 
 from app.core.project_env import load_project_env
+from app.core.runtime_guard import assert_database_boundary
 
 load_project_env()
+
+_ALLOWED_ENVIRONMENTS = {"dev", "development", "test", "testing", "prod", "production"}
 
 
 class Settings(BaseModel):
     app_name: str = "Quantification Server"
-    env: str = os.getenv("APP_ENV", "dev")
+    # Do not silently treat an omitted deployment mode as development.
+    env: str = os.getenv("APP_ENV", "").strip().lower()
     local_debug_auth_bypass: bool = os.getenv("LOCAL_DEBUG_AUTH_BYPASS", "false").strip().lower() in {
         "1",
         "true",
@@ -38,11 +42,24 @@ class Settings(BaseModel):
 
 settings = Settings()
 
+if not settings.env:
+    raise RuntimeError("APP_ENV must be explicitly configured; use production for the formal runtime.")
+
+if settings.env not in _ALLOWED_ENVIRONMENTS:
+    raise RuntimeError(
+        "APP_ENV must be one of: dev, development, test, testing, prod, production."
+    )
+
 if settings.background_runtime_mode not in {"enabled", "disabled"}:
     raise RuntimeError("ALIS_BACKGROUND_RUNTIME must be either 'enabled' or 'disabled'.")
 
 if not settings.database_url.lower().startswith(("postgresql://", "postgres://", "postgresql+psycopg://")):
     raise RuntimeError("DATABASE_URL must use PostgreSQL; other runtime databases are not supported.")
 
-if settings.env.lower() in {"prod", "production"} and settings.jwt_secret == "quant-dev-secret-change-before-production":
-    raise RuntimeError("JWT_SECRET must be explicitly configured in production.")
+assert_database_boundary(settings.database_url, role="business")
+
+if settings.env in {"prod", "production"}:
+    if settings.jwt_secret == "quant-dev-secret-change-before-production":
+        raise RuntimeError("JWT_SECRET must be explicitly configured in production.")
+    if settings.local_debug_auth_bypass:
+        raise RuntimeError("LOCAL_DEBUG_AUTH_BYPASS must be false in production.")

@@ -6,6 +6,7 @@ import socket
 import threading
 import time
 from typing import Any
+from urllib.parse import urlparse
 
 try:
     import redis
@@ -17,6 +18,36 @@ _last_connection_failure_at = 0.0
 _CLIENT_RETRY_SECONDS = 5.0
 _client_lock = threading.Lock()
 _worker_started = False
+
+
+def _assert_redis_boundary(url: str) -> None:
+    parsed = urlparse(str(url or ""))
+    db = str(parsed.path or "").lstrip("/") or "0"
+    test_mode = str(os.getenv("ALIS_TEST_MODE", "")).strip().lower() in {"1", "true", "yes", "on"}
+    if test_mode:
+        if db == "0":
+            raise RuntimeError("test process refused Redis database 0")
+        if not str(os.getenv("ALIS_REDIS_NAMESPACE", "")).strip().startswith("alis:test:"):
+            raise RuntimeError("test process requires an isolated Redis namespace")
+    if not test_mode and db != "0":
+        raise RuntimeError("non-test process refused non-production Redis database")
+
+
+def _redis_endpoint_summary(url: str) -> dict[str, Any]:
+    """Return connection metadata without exposing credentials."""
+    parsed = urlparse(str(url or ""))
+    try:
+        port = parsed.port
+    except ValueError:
+        port = None
+    return {
+        "scheme": parsed.scheme or "redis",
+        "host": parsed.hostname or "",
+        "port": port,
+        "db": str(parsed.path or "").lstrip("/") or "0",
+        "tls": parsed.scheme == "rediss",
+        "credentials_configured": bool(parsed.username or parsed.password),
+    }
 
 
 def client():
@@ -31,8 +62,10 @@ def client():
         if time.monotonic() - _last_connection_failure_at < _CLIENT_RETRY_SECONDS:
             return None
         try:
+            redis_url = os.getenv("REDIS_URL", "redis://127.0.0.1:6379/0")
+            _assert_redis_boundary(redis_url)
             value = redis.Redis.from_url(
-                os.getenv("REDIS_URL", "redis://127.0.0.1:6379/0"),
+                redis_url,
                 socket_connect_timeout=0.5,
                 socket_timeout=1.0,
                 decode_responses=True,
@@ -95,13 +128,14 @@ def set_remove(key: str, member: str) -> None:
 
 
 def health() -> dict[str, Any]:
+    endpoint = _redis_endpoint_summary(os.getenv("REDIS_URL", "redis://127.0.0.1:6379/0"))
     value = client()
     if value is None:
-        return {"available": False, "url": os.getenv("REDIS_URL", "redis://127.0.0.1:6379/0")}
+        return {"available": False, "endpoint": endpoint}
     try:
-        return {"available": bool(value.ping()), "url": os.getenv("REDIS_URL", "redis://127.0.0.1:6379/0")}
+        return {"available": bool(value.ping()), "endpoint": endpoint}
     except Exception:
-        return {"available": False, "url": os.getenv("REDIS_URL", "redis://127.0.0.1:6379/0")}
+        return {"available": False, "endpoint": endpoint}
 
 
 STREAM_KEY = os.getenv("ALIS_TASK_STREAM", "alis:data-platform:tasks")

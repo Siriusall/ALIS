@@ -12,6 +12,7 @@ from app.db.store import (
     list_model_versions,
     update_model_version_status,
 )
+from app.core.runtime_paths import backend_cache_root
 
 
 MODEL_KEY = "main"
@@ -72,7 +73,7 @@ def compare_champion_challenger(champion: dict[str, Any], challenger: dict[str, 
 
 
 def models_root() -> Path:
-    root = Path(__file__).resolve().parents[2] / ".cache" / "models"
+    root = backend_cache_root() / "models"
     root.mkdir(parents=True, exist_ok=True)
     return root
 

@@ -721,11 +721,13 @@ function CompactTable({rows,columns,fallback="未记录"}:{rows:Json[],columns:s
 
 export function AdminOverview({ data }: { data: ConsoleData }) {
   const health = data.health || {};
+  const [liveReadiness, setLiveReadiness] = useState<Json | undefined>(data.tradingReady);
   const dependencies = pick(health, ["dependencies"], {}) as Json;
   const [liveTaskPayload, setLiveTaskPayload] = useState<Json | undefined>(data.tasks);
   useEffect(() => {
+    setLiveReadiness(data.tradingReady);
     setLiveTaskPayload(data.tasks);
-  }, [data.tasks]);
+  }, [data.tasks, data.tradingReady]);
   useEffect(() => {
     let active = true;
     let inFlight = false;
@@ -744,6 +746,42 @@ export function AdminOverview({ data }: { data: ConsoleData }) {
     const timer = window.setInterval(refreshLiveTasks, 5_000);
     return () => { active = false; controller.abort(); window.clearInterval(timer); };
   }, []);
+  useEffect(() => {
+    let active = true;
+    let inFlight = false;
+    const controller = new AbortController();
+    const refreshReadiness = async () => {
+      if (inFlight) return;
+      inFlight = true;
+      try {
+        const payload = await readApi("/api/trading-ready", controller.signal, 30_000);
+        if (active) setLiveReadiness(payload);
+      } catch {
+      } finally {
+        inFlight = false;
+      }
+    };
+    const timer = window.setInterval(refreshReadiness, 15_000);
+    return () => { active = false; controller.abort(); window.clearInterval(timer); };
+  }, []);
+  const readiness = liveReadiness || {};
+  const readinessStatus = String(pick(readiness, ["status"], "unknown"));
+  const readinessLabels: Record<string, string> = {
+    alive: "存活", ready: "就绪", waiting: "等待", blocked: "阻断", running: "运行中",
+    passed: "通过", observing: "观察中", failed: "失败", not_generated: "未生成", unknown: "未知",
+  };
+  const readinessLabel = (value: unknown) => readinessLabels[String(value || "unknown")] || String(value || "未知");
+  const readinessTone = (value: unknown) => {
+    const state = String(value || "");
+    return state === "ready" || state === "alive" || state === "passed" || state === "ok" || state === "healthy" || state === "normal" || state === "completed" ? "good" : state === "blocked" || state === "failed" ? "danger" : "watch";
+  };
+  const layerRows = [
+    { key: "process", label: "进程存活", status: pick(readiness, ["layers.process.status"], "unknown"), detail: pick(readiness, ["layers.process.detail"], "等待进程证据") },
+    { key: "infrastructure", label: "基础设施就绪", status: pick(readiness, ["layers.infrastructure.status"], pick(health, ["status"], "unknown")), detail: "双库、Redis、后台组件和心跳" },
+    { key: "trading", label: "交易业务就绪", status: readinessStatus, detail: pick(readiness, ["summary"], "等待业务门聚合") },
+  ];
+  const readinessGates = firstArray(readiness, ["gates"]);
+  const blockers = Array.isArray(readiness.hard_blockers) ? readiness.hard_blockers.map((item: unknown) => String(item)) : [];
   const tasks = firstArray(liveTaskPayload, ["tasks", "items"]);
   const running = tasks.filter((row) => /running|leased|active/.test(String(pick(row, ["status", "state"], ""))));
   const failed = tasks.filter((row) => /failed|error|blocked/.test(String(pick(row, ["status", "state"], ""))));
@@ -798,9 +836,13 @@ export function AdminOverview({ data }: { data: ConsoleData }) {
     { name: "OOS 硬数据", status: pick(data.oos, ["status"], "unknown"), detail: pick(data.oos, ["eligible_sessions"], "未记录") + "/" + pick(data.oos, ["required_sessions"], 1537) + " 个交易日" },
     { name: "密封保留集", status: pick(data.sealed, ["status"], "unknown"), detail: pick(data.sealed, ["eligible_sessions"], "未记录") + "/" + pick(data.sealed, ["required_sessions"], 126) + " 个交易日" },
   ];
-  return <><PageHeader eyebrow="ADMIN CONSOLE" title="系统管理后台" summary="检查基础服务、日更、任务、数据、账本和研究链路；页面保持只读。"/>
-    <div className="metric-grid headline-metrics"><Metric label="全局健康" value={<Status>{pick(health, ["status"], "unknown")}</Status>} note={pick(health, ["ready"], false) ? "关键依赖已就绪" : "存在未就绪依赖"}/><Metric label="运行任务" value={running.length}/><Metric label="异常任务" value={failed.length} tone={failed.length ? "danger" : "good"}/><Metric label="异常数据资产" value={staleAssets.length} tone={staleAssets.length ? "watch" : "good"}/></div>
-    <Section title="核心链路" detail="ready 表示合同满足，observing 表示正常等待样本，degraded/blocked/failed 需要下钻。"><div className="health-chain">{chain.map((item) => <article key={item.name}><Status>{item.status}</Status><strong>{item.name}</strong><p>{item.detail}</p></article>)}</div></Section>
+  return <><PageHeader eyebrow="ADMIN CONSOLE" title="系统管理后台" summary="先看系统是否活着、基础服务是否就绪，再看当前是否允许自动运行；页面保持只读。"/>
+    <section className={`readiness-hero readiness-${readinessStatus}`}><div><p className="eyebrow">TRADING READINESS</p><h2>{readinessStatus === "ready" ? "当前可运行" : readinessStatus === "waiting" ? "健康，等待条件" : readinessStatus === "blocked" ? "自动运行已阻断" : "正在读取业务状态"}</h2><p>{pick(readiness, ["summary"], "业务就绪聚合尚未返回")}</p></div><div className="readiness-hero-meta"><Status tone={readinessTone(readinessStatus)}>{readinessLabel(readinessStatus)}</Status><small>检查于 {pick(readiness, ["checked_at"], "未记录")}</small></div></section>
+    <div className="health-layer-grid">{layerRows.map((row) => <article key={row.key} className={`health-layer health-layer-${String(row.status)}`}><div><span>{row.label}</span><Status tone={readinessTone(row.status)}>{readinessLabel(row.status)}</Status></div><strong>{row.detail}</strong><small>{row.key === "trading" ? "业务硬门聚合" : row.key === "infrastructure" ? "运行依赖" : "服务进程"}</small></article>)}</div>
+    {blockers.length > 0 && <section className="readiness-blockers"><Status tone="danger">阻断原因 {blockers.length}</Status><div>{blockers.slice(0, 4).map((item, index) => <p key={index}>{item}</p>)}</div></section>}
+    <Section title="业务就绪门" detail="只有数据、账本、冻结计划和执行边界同时满足，才会进入 ready；waiting 不是故障。"><div className="readiness-gates">{readinessGates.length ? readinessGates.map((gate) => <article key={String(gate.key)} className={`readiness-gate readiness-gate-${String(gate.status)}`}><div><span>{String(gate.label || gate.key || "业务门")}</span><Status tone={readinessTone(gate.status)}>{readinessLabel(gate.status)}</Status></div><strong>{String(gate.summary || "状态证据已记录")}</strong><small>{gate.key === "execution_lease" ? "防重复执行" : gate.key === "pending_plan" ? "自然交易日" : "只读审计"}</small></article>) : <Empty title="业务就绪证据尚未返回" detail="管理页不会用推测值替代后端状态。"/>}</div></Section>
+    <div className="metric-grid headline-metrics"><Metric label="基础健康" value={<Status tone={readinessTone(pick(health, ["status"], "unknown"))}>{readinessLabel(pick(health, ["status"], "unknown"))}</Status>} note={pick(health, ["ready"], false) ? "关键依赖已就绪" : "存在未就绪依赖"}/><Metric label="运行任务" value={running.length}/><Metric label="异常任务" value={failed.length} tone={failed.length ? "danger" : "good"}/><Metric label="异常数据资产" value={staleAssets.length} tone={staleAssets.length ? "watch" : "good"}/></div>
+    <Section title="运行链路" detail="这是全链路观测，不替代上方的交易业务就绪结论。"><div className="health-chain">{chain.map((item) => <article key={item.name}><Status>{readinessLabel(item.status)}</Status><strong>{item.name}</strong><p>{item.detail}</p></article>)}</div></Section>
     <div className="two-column"><Section title="基础依赖" detail="来自现有 /api/health，不触发刷新或修复。"><div className="dependency-list">{dependencyRows.map((row) => <article key={row.key}><div><strong>{row.key}</strong><p>{String(row.detail)}</p></div><Status>{row.status}</Status></article>)}</div></Section><Section title="当前处置建议" detail="管理后台不提供绕过硬门的操作。"><dl className="fact-list"><div><dt>页面权限</dt><dd>只读</dd></div><div><dt>日更异常</dt><dd>{/failed|blocked|error/.test(dailyStatus) ? "进入数据与日更查看证据" : "无需人工处理"}</dd></div><div><dt>任务异常</dt><dd>{failed.length ? "进入任务与链路定位失败步骤" : "无需人工处理"}</dd></div><div><dt>账本异常</dt><dd>{/failed|blocked|error|drift/.test(ledgerStatus) ? "执行门应保持阻断" : "无漂移证据"}</dd></div></dl></Section></div>
     <Section title="持续运行" detail="Worker 与 Scheduler 每 5 秒刷新一次心跳和当前步骤。"><TaskCategory rows={continuousTasks}/></Section>
     <div className="two-column"><Section title="日更任务" detail="交易日收盘更新、决策数据门、自治循环、因子日评价和 Shadow 观察。"><TaskCategory rows={dailyTasks}/></Section><Section title="周更任务" detail="正式策略演化与策略控制器 OOS；按周调度或自然窗口前移运行。"><TaskCategory rows={weeklyTasks}/></Section></div>

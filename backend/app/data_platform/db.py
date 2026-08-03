@@ -6,6 +6,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from app.core.project_env import load_project_env
+from app.core.runtime_guard import assert_data_platform_path_boundary, assert_database_boundary
 
 load_project_env()
 
@@ -543,6 +544,7 @@ def _conn():
             "DATA_PLATFORM_DATABASE_URL",
             "postgresql://alis_app@127.0.0.1:5432/alis_data",
         )
+        assert_database_boundary(url, role="data-platform")
         if url.startswith("postgresql+psycopg://"):
             url = url.replace("postgresql+psycopg://", "postgresql://", 1)
         raw = psycopg.connect(
@@ -561,7 +563,9 @@ def _conn():
         finally:
             raw.close()
         return
-    if DB_PATH == Path(__file__).resolve().parents[1] / "data" / "data-platform.db":
+    default_path = Path(__file__).resolve().parents[1] / "data" / "data-platform.db"
+    assert_data_platform_path_boundary(DB_PATH, default_path=default_path)
+    if DB_PATH == default_path:
         raise RuntimeError(
             "DATA_PLATFORM_DATABASE_URL 未配置为 PostgreSQL；SQLite 已禁用。"
         )

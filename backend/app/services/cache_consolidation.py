@@ -10,6 +10,7 @@ from datetime import datetime
 from math import sqrt
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from app.core.runtime_paths import backend_cache_root
 
 logger = logging.getLogger("quant.cache_consolidation")
 
@@ -38,8 +39,7 @@ FACTOR_KEYS_FOR_COVERAGE = (
 
 
 def _cache_root() -> Path:
-    # backend/app/services -> backend
-    return Path(__file__).resolve().parents[2] / ".cache"
+    return backend_cache_root()
 
 
 def _daily_dir() -> Path:

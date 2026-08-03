@@ -33,7 +33,12 @@ export async function readApi(path: string, signal?: AbortSignal, timeoutMs = AP
       if (path === "/api/auth/me") window.dispatchEvent(new CustomEvent("alis:session-expired"));
       else void confirmSessionExpired(token);
     }
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    if (!response.ok) {
+      // /api/health deliberately uses HTTP 503 for readiness failures, but
+      // its diagnostic payload is still useful to the read-only admin page.
+      if ((path === "/api/health" || path === "/api/trading-ready") && response.status === 503) return response.json();
+      throw new Error(`HTTP ${response.status}`);
+    }
     return response.json();
   } finally {
     if (timer !== undefined) window.clearTimeout(timer);
@@ -56,6 +61,7 @@ export async function writeApi(path: string, body?: unknown): Promise<Json> {
 
 export const endpoints = {
   health: "/api/health",
+  tradingReady: "/api/trading-ready",
   apiCatalog: "/api/openapi.json",
   owner: "/api/model-strategy/evolution/owner-summary",
   decision: "/api/decision/summary",

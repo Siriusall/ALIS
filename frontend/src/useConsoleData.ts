@@ -11,7 +11,7 @@ const routeKeys: Record<string, Array<keyof typeof endpoints>> = {
   "/evolution/factors": ["factors", "researchAnalytics", "researchFactorAnalytics"],
   "/evolution/metrics": ["researchAnalytics", "researchTimeseries", "evolutionTasks"],
   "/evolution/waves": ["researchAnalytics", "factorResearch", "researchExpertHistory", "researchEnvironmentSimilarity", "researchArchive"],
-  "/admin": ["health", "tasks", "dailyUpdateStatus", "watermarks", "ledgerAudit", "oos", "sealed"],
+  "/admin": ["health", "tradingReady", "tasks", "dailyUpdateStatus", "watermarks", "ledgerAudit", "oos", "sealed"],
   "/admin/operations": ["health", "owner", "tasks", "evolutionTasks", "evolutionSchedule", "quantTasks", "quantStatus", "quantRecent", "executions", "operations", "ledgerAudit", "oos", "sealed", "apiCatalog"],
   "/factors": ["owner", "strategy", "sealed", "factors", "factorStatus", "factorResearch", "factorLineage", "evolutionTasks"],
   "/admin/models": ["modelOperations"],

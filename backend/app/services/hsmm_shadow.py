@@ -15,6 +15,7 @@ from scipy.stats import multivariate_t
 from app.data_platform.db import _conn as data_conn
 from app.db.store import create_model_version, list_model_versions
 from app.services.model_artifacts import resolve_model_artifact_path
+from app.core.runtime_paths import backend_cache_root
 
 
 _HSMM_TRAINING_LOCK = threading.Lock()
@@ -1231,7 +1232,7 @@ def _train_hsmm_shadow_sync(
         ),
     }
     version = f"hsmm-shadow-{datetime.now().strftime('%Y%m%d%H%M%S')}"
-    artifact_dir = Path(__file__).resolve().parents[2] / ".cache" / "models" / "market_regime"
+    artifact_dir = backend_cache_root() / "models" / "market_regime"
     artifact_dir.mkdir(parents=True, exist_ok=True)
     artifact_path = artifact_dir / f"{version}.json"
     profile_layer = {

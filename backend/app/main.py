@@ -6,6 +6,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from app.api.routes import (
     account,
@@ -17,6 +18,7 @@ from app.api.routes import (
     equity,
     factors,
     execute,
+    health,
     init_routes,
     logs,
     model_strategy,
@@ -69,6 +71,12 @@ logging.basicConfig(
 logger = logging.getLogger("quant")
 _startup_components: dict[str, dict] = {}
 _background_runtime_lease: BackgroundRuntimeLease | None = None
+_REQUIRED_BACKGROUND_COMPONENTS = {
+    "autonomous_simulation_task",
+    "auto_simulation_scheduler",
+    "daily_update_scheduler",
+    "data_platform_worker",
+}
 
 
 def _env_enabled(name: str, default: bool = True) -> bool:
@@ -76,10 +84,23 @@ def _env_enabled(name: str, default: bool = True) -> bool:
     return str(os.getenv(name, fallback)).strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _start_component(name: str, fn) -> object | None:
+def _start_component(name: str, fn, *, required: bool = True) -> object | None:
     try:
         result = fn()
-        _startup_components[name] = {"status": "started", "error": "", "result": result}
+        if result is False or result is None:
+            _startup_components[name] = {
+                "status": "not_started" if required else "disabled",
+                "required": required,
+                "error": f"startup function returned {result!r}",
+                "result": result,
+            }
+        else:
+            _startup_components[name] = {
+                "status": "started",
+                "required": required,
+                "error": "",
+                "result": result,
+            }
         return result
     except Exception as exc:  # noqa: BLE001 - one subsystem must not suppress the rest
         evidence = error_evidence(
@@ -89,6 +110,7 @@ def _start_component(name: str, fn) -> object | None:
         )
         _startup_components[name] = {
             "status": "failed",
+            "required": required,
             "error": evidence["message"],
             "error_evidence": evidence,
         }
@@ -110,7 +132,14 @@ def startup() -> None:
     init_data_platform_db()
     _background_runtime_lease = acquire_background_runtime_lease()
     _startup_components["background_runtime_boundary"] = {
-        "status": "started",
+        "status": (
+            "started"
+            if _background_runtime_lease.should_start
+            else "disabled"
+            if _background_runtime_lease.mode == "disabled"
+            else "not_owner"
+        ),
+        "required": False,
         "error": "",
         "result": _background_runtime_lease.status(),
     }
@@ -146,25 +175,32 @@ def startup() -> None:
             "production_change_forbidden": True,
         },
     }
-    _start_component("manual_review_scheduler", start_manual_review_triage_scheduler)
+    _start_component("manual_review_scheduler", start_manual_review_triage_scheduler, required=False)
     recovered_evolution = _start_component("evolution_recovery", recover_evolution_tasks)
     if _env_enabled("ALIS_EVOLUTION_WORKER_ENABLED"):
-        _start_component("evolution_worker", start_evolution_worker)
+        _start_component("evolution_worker", start_evolution_worker, required=False)
     else:
         mark_evolution_component_disabled("worker", reason="external_worker")
         _startup_components["evolution_worker"] = {
             "status": "disabled",
+            "required": False,
             "error": "",
             "result": {"reason": "external_worker"},
         }
-    _start_component("evolution_scheduler", start_evolution_scheduler)
+    _start_component("evolution_scheduler", start_evolution_scheduler, required=False)
     if isinstance(recovered_evolution, int) and recovered_evolution:
         logger.info("Recovered interrupted evolution tasks: %d", recovered_evolution)
     try:
         recovery = recover_interrupted_backfill()
         orphaned = recover_orphaned_ingestion_runs()
         cleaned = auto_heal_stream(limit=1000)
-        start_task_worker(process_stream_task)
+        worker_started = start_task_worker(process_stream_task)
+        _startup_components["data_platform_worker"] = {
+            "status": "started" if worker_started else "not_started",
+            "required": True,
+            "error": "" if worker_started else "Redis stream worker did not start",
+            "result": {"started": bool(worker_started)},
+        }
         if recovery.get("recovered"):
             write_runtime_log("WARNING", "backfill", "检测到服务重启中断的补数任务，已转换为可续跑状态", recovery)
         if orphaned.get("recovered"):
@@ -181,6 +217,7 @@ def startup() -> None:
         )
         _startup_components["data_platform_worker"] = {
             "status": "failed",
+            "required": True,
             "error": evidence["message"],
             "error_evidence": evidence,
         }
@@ -236,6 +273,7 @@ for protected_router in (
     quant_runs.router,
     model_strategy.router,
     research.router,
+    health.router,
 ):
     app.include_router(
         protected_router,
@@ -244,8 +282,7 @@ for protected_router in (
     )
 
 
-@app.get("/api/health")
-def health() -> dict:
+def _health_payload() -> dict:
     primary = primary_database_health()
     data_platform = data_platform_database_health()
     databases_ready = primary.get("status") == "ok" and data_platform.get("status") == "ok"
@@ -258,16 +295,27 @@ def health() -> dict:
         else {"mode": settings.background_runtime_mode, "should_start": False, "reason": "not_started"}
     )
     background_owner = bool(runtime_boundary.get("should_start"))
-    failed_components = [name for name, item in _startup_components.items() if item.get("status") == "failed"]
-    runtime_issues = [f"Startup component failed: {name}" for name in failed_components]
+    component_issues = []
+    for name, item in _startup_components.items():
+        status = str(item.get("status") or "unknown")
+        required = bool(item.get("required", name in _REQUIRED_BACKGROUND_COMPONENTS))
+        if status == "failed" or (required and status in {"not_started", "disabled"}):
+            component_issues.append(
+                f"Startup component {status}: {name}"
+            )
+    runtime_issues = []
     if background_owner and not evolution.get("ok"):
         runtime_issues.append("Evolution worker or scheduler heartbeat is unhealthy")
     unhealthy_heartbeats = [name for name, state in runtime_heartbeats.items() if not state.get("healthy", True)]
     if background_owner and unhealthy_heartbeats:
         runtime_issues.append(f"Background component errors: {', '.join(unhealthy_heartbeats)}")
-    issues = ([] if redis.get("available", False) else ["Redis unavailable: durable stream tasks are disabled"]) + runtime_issues
+    issues = (
+        ([] if redis.get("available", False) else ["Redis unavailable: durable stream tasks are disabled"])
+        + component_issues
+        + runtime_issues
+    )
     runtime_ready = (
-        not failed_components
+        not component_issues
         and (not background_owner or evolution.get("ok"))
         and (not background_owner or not unhealthy_heartbeats)
     )
@@ -287,3 +335,23 @@ def health() -> dict:
             "runtime_heartbeats": runtime_heartbeats,
         },
     }
+
+
+@app.get("/api/health")
+def health() -> JSONResponse:
+    """Return detailed readiness evidence; use /api/live for liveness only."""
+    payload = _health_payload()
+    return JSONResponse(status_code=200 if payload["ready"] else 503, content=payload)
+
+
+@app.get("/api/ready")
+def readiness() -> JSONResponse:
+    """Kubernetes/systemd-compatible readiness probe."""
+    payload = _health_payload()
+    return JSONResponse(status_code=200 if payload["ready"] else 503, content=payload)
+
+
+@app.get("/api/live")
+def liveness() -> dict:
+    """Process liveness probe that does not depend on external services."""
+    return {"status": "ok", "alive": True}

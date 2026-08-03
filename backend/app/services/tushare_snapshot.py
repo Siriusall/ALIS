@@ -27,6 +27,7 @@ except Exception:  # pragma: no cover - 运行环境未安装 redis 时兜底
     redis = None
 
 from app.core.trade_calendar import get_last_trade_date, get_last_trade_date_str
+from app.core.runtime_paths import backend_cache_root
 from app.data_platform.db import _conn
 from app.integrations.tushare_client import get_tushare_client
 
@@ -68,7 +69,7 @@ class DailySnapshotRow:
 
 _snapshot_cache: Dict[str, Dict[str, DailySnapshotRow]] = {}
 _snapshot_lock = threading.Lock()
-_SNAPSHOT_DISK_CACHE_DIR = Path(__file__).resolve().parents[2] / ".cache" / "tushare_snapshot"
+_SNAPSHOT_DISK_CACHE_DIR = backend_cache_root() / "tushare_snapshot"
 _LOCK_WAIT_SEC = 20.0
 _LOCK_STALE_SEC = 60.0
 _LOCK_POLL_SEC = 0.2

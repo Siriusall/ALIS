@@ -17,6 +17,7 @@ from pypdf import PdfReader
 import requests
 
 from app.data_platform.db import _conn
+from app.core.runtime_paths import backend_cache_root
 
 
 SOURCE_CODE = "cninfo"
@@ -27,7 +28,7 @@ MAX_CANDIDATES_PER_METRIC = 5
 CACHE_ROOT = Path(
     os.getenv(
         "ALIS_PROFESSIONAL_METRIC_CACHE_DIR",
-        str(Path(__file__).resolve().parents[2] / ".cache" / "professional_metric_documents"),
+        str(backend_cache_root() / "professional_metric_documents"),
     )
 )
 

@@ -16,6 +16,7 @@ import time
 from typing import Any, Dict, List, Tuple
 
 from app.core.trade_calendar import get_last_trade_date_str
+from app.core.runtime_paths import backend_cache_root
 from app.data_platform.db import _conn
 from app.integrations.market_data_client import fetch_daily_by_trade_date, fetch_stock_zh_a_hist, hist_concurrency_scope
 
@@ -140,7 +141,7 @@ def _normalize_symbol(s: str) -> str:
 
 
 def _cache_dir() -> Path:
-    d = Path(__file__).resolve().parent.parent.parent / ".cache" / "daily"
+    d = backend_cache_root() / "daily"
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -164,7 +165,7 @@ def roll_forward_daily_cache() -> None:
     遍历 .cache/daily 下 end_date < 今日 的文件，读入后去掉第一条（最早日），
     拉取该标的从 end_date 下一日到今日的日线并追加，写回新文件并删除旧文件。
     """
-    cache_dir = Path(__file__).resolve().parent.parent.parent / ".cache" / "daily"
+    cache_dir = backend_cache_root() / "daily"
     if not cache_dir.exists():
         return
     today_str = get_last_trade_date_str(for_data_availability=True)
@@ -729,7 +730,7 @@ def _symbols_with_daily_cache_for_today() -> set:
         if len(end) == 8 and end >= today_str:
             out.add(s)
     # 文件缓存：一次遍历所有文件
-    cache_dir = Path(__file__).resolve().parent.parent.parent / ".cache" / "daily"
+    cache_dir = backend_cache_root() / "daily"
     if cache_dir.exists():
         for path in cache_dir.glob("*_*_*.json"):
             parts = path.stem.split("_")

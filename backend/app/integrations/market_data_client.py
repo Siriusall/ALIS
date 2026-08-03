@@ -13,6 +13,7 @@ from typing import Any, Dict, List, Optional
 import pandas as pd
 
 from app.core.trade_calendar import get_last_trade_date, get_last_trade_date_str
+from app.core.runtime_paths import backend_cache_root
 from app.data_platform.db import _conn
 from app.integrations.tushare_client import get_tushare_client
 from app.services.tushare_universe import get_basic_info_map
@@ -94,7 +95,7 @@ def _as_of_iso() -> str:
 
 
 def _cache_dir() -> Path:
-    d = Path(__file__).resolve().parent.parent.parent / ".cache" / "tushare_spot"
+    d = backend_cache_root() / "tushare_spot"
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -516,4 +517,3 @@ def fetch_daily_by_trade_date(trade_date: str) -> Dict[str, Dict[str, Any]]:
         _daily_by_trade_date_cache.pop(next(iter(_daily_by_trade_date_cache)))
     _daily_by_trade_date_cache[ymd] = out
     return out
-

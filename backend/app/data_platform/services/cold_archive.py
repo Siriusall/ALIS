@@ -20,13 +20,14 @@ from typing import Any
 import pandas as pd
 
 from app.data_platform.db import _conn
+from app.core.runtime_paths import backend_cache_root
 
 
 def _archive_root() -> Path:
     configured = os.getenv("ALIS_COLD_ARCHIVE_ROOT", "").strip()
     if configured:
         return Path(configured).expanduser()
-    return Path(__file__).resolve().parents[3] / ".cache" / "cold-archive"
+    return backend_cache_root() / "cold-archive"
 
 
 def _normalise_date(value: str, name: str) -> str:

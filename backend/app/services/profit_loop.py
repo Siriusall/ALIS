@@ -1892,6 +1892,9 @@ def get_latest_daily_rebalance_plan(trade_date: str = "") -> dict[str, Any]:
         "persisted": True,
         "is_executed": str(item.get("status") or "") == "executed",
         "execution_authorized": str(item.get("status") or "") in {"planned", "executed"},
+        "execution_id": item.get("execution_id"),
+        "execution_claim_token_present": bool(str(item.get("execution_claim_token") or "")),
+        "execution_claimed_at": item.get("execution_claimed_at"),
         "blocked_reason": {
             "executing": "正式计划已被唯一执行器领取，正在原子落账",
             "blocked_by_decision_data": "最新交易日决策数据门未通过",

@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from app.core.runtime_paths import backend_cache_root
 
-MODEL_CACHE_ROOT = Path(__file__).resolve().parents[2] / ".cache" / "models"
+
+MODEL_CACHE_ROOT = backend_cache_root() / "models"
 
 
 def resolve_model_artifact_path(

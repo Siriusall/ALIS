@@ -10,6 +10,7 @@ from typing import Dict, List, Optional
 
 from app.integrations.tushare_client import get_tushare_client
 from app.data_platform.db import _conn, _is_postgres
+from app.core.runtime_paths import backend_cache_root
 
 logger = logging.getLogger("quant.backtest_data_source")
 
@@ -45,15 +46,16 @@ class BacktestDataSource:
     def __init__(self) -> None:
         # backend/app/services -> backend/app -> backend -> repo
         self._repo_root = Path(__file__).resolve().parents[3]
-        self._data_root = self._repo_root / ".cache" / "data"
+        cache_root = backend_cache_root()
+        self._data_root = cache_root / "data"
         self._daily_snapshot_dir = self._data_root / "daily_basic" / "2026"
         self._full_k_dir = self._data_root / "全部日k" / "全部日k"
         # 用户可长期沉淀的本地日截面目录（优先级高于 .cache）
         self._daily_basic_data_dir = self._data_root / "daily_basic"
         self._daily_basic_data_dir.mkdir(parents=True, exist_ok=True)
-        self._cache_dir = self._repo_root / "backend" / ".cache" / "backtest"
+        self._cache_dir = cache_root / "backtest"
         self._cache_dir.mkdir(parents=True, exist_ok=True)
-        self._all_in_one_dir = self._repo_root / "backend" / ".cache" / "all_in_one"
+        self._all_in_one_dir = cache_root / "all_in_one"
 
         self._symbol_file_index: Dict[str, Path] = {}
         self._hist_cache: Dict[str, List[HistBar]] = {}

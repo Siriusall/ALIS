@@ -28,6 +28,7 @@ from app.core.a_share_fees import (
 )
 from app.core.config import settings
 from app.core.trade_calendar import get_last_trade_date
+from app.core.runtime_guard import assert_database_boundary
 
 logger = logging.getLogger("quant")
 
@@ -180,6 +181,7 @@ def _conn():
         import psycopg
         from psycopg.rows import dict_row
         url = (settings.database_url or "").strip()
+        assert_database_boundary(url, role="business")
         if url.startswith("postgresql+psycopg://"):
             url = url.replace("postgresql+psycopg://", "postgresql://", 1)
         logger.debug("PostgreSQL 连接: %s", url.split("@")[-1])
