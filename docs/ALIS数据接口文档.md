@@ -85,11 +85,17 @@
 | `POST` | `/api/data-center/materialize/futures-price-proxies?start_date=YYYYMMDD&end_date=YYYYMMDD` | 从交易所主力连续期货映射物化产品价格代理。首次历史回填一律以本次物化时刻作为 `available_time`，禁止写入此前 OOS；不等同于现货价格。 |
 | `POST` | `/api/data-center/sync/official-policy-documents` | 从发改委、工信部、能源局、海关总署、国家统计局，以及汽车、工程机械、钢铁协会的公开目录抓取文件；每个来源单独报告失败，保留原文 URL、发布时间、正文摘录和抓取可用时间。网络失败不能当作有效空集。 |
 | `POST` | `/api/data-center/materialize/official-policy-supply` | 仅对已留痕的官方文件按行业关键词、方向和发布日期物化 `policy_supply` 事件分数；不代表政策执行效果或实际供给量。 |
-| `POST` | `/api/data-center/materialize/official-capacity-utilization` | 从已留痕的国家统计局发布中抽取工业产能利用率，映射为制造业宏观代理；不等同于细分行业开工率。 |
+| `POST` | `/api/data-center/materialize/official-capacity-utilization` | 从已留痕的国家统计局季度发布中按官方行业分别抽取产能利用率，以报告季度末作为数据日期并保留映射质量；宽口径映射仍不等同于细分行业开工率。 |
+| `POST` | `/api/data-center/sync/caam-ocr-candidates?max_documents=1` | 有界抓取中国汽车工业协会月度产销图片并用本机 macOS Vision 形成隔离 OCR 候选；单轮默认1篇、最多5篇。保存页面、图片、哈希、逐行置信度和对账状态，不写行业指标。非 macOS 或 OCR 不可用时明确失败。 |
+| `POST` | `/api/data-center/audit/caam-ocr-candidates` | 对同月份总报告与分车型报告的重复 OCR 字段做跨图片一致性审计；一致只标记 `cross_document_consistent_pending_structured`，冲突标记异常，两者都不能替代结构化来源对账或取得生产资格。 |
+| `POST` | `/api/data-center/reconcile/caam-ocr-miit?max_documents=5` | 抓取工信部汽车工业经济运行文本并与同月份协会 OCR 逐字段对账；官网不可达时返回 `external_source_unavailable`，一致和冲突分别留痕，均不自动写行业指标或取得生产资格。 |
+| `POST` | `/api/data-center/sync/professional-metric-candidates?max_documents=1` | 从巨潮官方年度报告 PDF 有界抽取周期、资产型、平台和消费企业的外部经营指标候选；仅接受官方静态域名、报告全文、明确表头或同句关键词/数值/单位。单轮默认1份、最多5份，保存PDF、文件/文本哈希、页码和原句，候选固定不可生产。 |
+| `POST` | `/api/data-center/audit/professional-metric-candidates` | 汇总年报文档、候选、拒绝和人工核验状态；待审批候选不能进入选股、Controller 或组合权重。 |
+| `POST` | `/api/data-center/reprocess/professional-metric-candidate/{document_id}` | 解析合同修订后对已留存PDF做确定性重抽取；旧候选标记 `superseded_by_reextraction` 或明确拒绝，不静默伪装为新证据。 |
 | `POST` | `/api/data-center/materialize/cn-ppi-price-proxies` | 从已留存的 TuShare `cn_ppi` 分项同比物化采矿、原材料、加工和耐用品行业产品价格代理；保留原始 `available_time`，不等同于现货价格。 |
 | `GET` | `/api/model-strategy/evolution/research-data-assets` | 只读审计行业七类组件、来源、覆盖、最新可用时间及缺口。`proxy_ready` 不能满足直接源研究深度门。 |
 
-截至 2026-07-23，行业需求/销量与库存周期均已使用点时代理物化；产品价格已有交易所期货和工业 PPI 两类代理。政策和产能的官方公开连接器已配置，只有取到原文与数值后才会变为可用，定义存在但值为零显示为 `configured`。直接现货价格仍为缺口。任何后续国家统计局、行业协会或主管部门数据必须保留原始文件、来源 URL、数据日期、发布日期和 `available_time`，再通过 `dc_industry_metric_definition/value` 进入研究层。
+截至 2026-08-01，行业需求/销量与库存周期均已有点时代理，产品价格已有交易所期货和工业 PPI 两类代理。汽车协会真实原文已形成12条严格正文级政策/供给值；政府站点的本机 TLS 故障仍如实保留，国家统计局产能观察仍为0。汽车协会图片另有22个 OCR 候选字段，但全部在独立候选表等待结构化对账，行业指标中的 OCR 值仍为0。专业企业年报链已处理当前可识别的12份巨潮PDF，形成6条产销量待审批候选、2条单位错配拒绝记录、0解析失败；9份没有相应披露或未形成合格候选。直接现货价格、结构化细分产能、平台用户留存、消费渠道/同店和资产NAV等仍是缺口。任何后续国家统计局、行业协会、主管部门或上市公司数据必须保留原始文件、来源 URL、数据日期、发布日期和 `available_time`，再通过质量门进入研究层。
 
 ## 模拟账本审计接口
 
