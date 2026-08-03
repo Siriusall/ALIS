@@ -18,7 +18,10 @@ from app.services.model_artifacts import resolve_model_artifact_path
 
 
 _HSMM_TRAINING_LOCK = threading.Lock()
-HSMM_EVALUATION_CONTRACT = "alis_task_native_model_evaluation_v1"
+HSMM_EVALUATION_CONTRACT = "alis_hsmm_task_native_evaluation_v3"
+HSMM_TRAINING_ALGORITHM = "explicit_duration_forward_backward_em_v3"
+HSMM_MIN_DURATION_WEEKS = 1
+HSMM_MAX_DURATION_WEEKS = 52
 
 
 def refresh_market_regime_training_history(*, years: int = 10) -> dict[str, Any]:
@@ -171,12 +174,14 @@ def _duration_parameters(labels: np.ndarray) -> list[dict[str, float]]:
     start = 0
     for index in range(1, len(labels) + 1):
         if index == len(labels) or labels[index] != labels[start]:
-            runs[int(labels[start])].append(max(2, min(52, index - start)))
+            runs[int(labels[start])].append(
+                max(HSMM_MIN_DURATION_WEEKS, min(HSMM_MAX_DURATION_WEEKS, index - start))
+            )
             start = index
     output = []
     for state in range(4):
         durations = runs[state] or [4]
-        shifted = np.asarray(durations, dtype=float) - 2.0
+        shifted = np.asarray(durations, dtype=float) - HSMM_MIN_DURATION_WEEKS
         mean_shifted = max(1e-3, float(np.mean(shifted)))
         variance_shifted = (
             float(np.var(shifted, ddof=1))
@@ -192,25 +197,34 @@ def _duration_parameters(labels: np.ndarray) -> list[dict[str, float]]:
         output.append({
             "r": r,
             "p": p,
-            "mean": mean_shifted + 2.0,
+            "mean": mean_shifted + HSMM_MIN_DURATION_WEEKS,
         })
     return output
 
 
 def _duration_logpmf(duration: int, params: dict[str, float]) -> float:
-    k = max(0, duration - 2)
+    k = max(0, duration - HSMM_MIN_DURATION_WEEKS)
     r, p = params["r"], params["p"]
     raw = gammaln(k + r) - gammaln(r) - gammaln(k + 1) + r * math.log(p) + k * math.log(1 - p)
-    normalizer = sum(math.exp(gammaln(d - 2 + r) - gammaln(r) - gammaln(d - 1) + r * math.log(p) + (d - 2) * math.log(1 - p)) for d in range(2, 53))
+    normalizer = sum(
+        math.exp(
+            gammaln(d - HSMM_MIN_DURATION_WEEKS + r)
+            - gammaln(r)
+            - gammaln(d - HSMM_MIN_DURATION_WEEKS + 1)
+            + r * math.log(p)
+            + (d - HSMM_MIN_DURATION_WEEKS) * math.log(1 - p)
+        )
+        for d in range(HSMM_MIN_DURATION_WEEKS, HSMM_MAX_DURATION_WEEKS + 1)
+    )
     return float(raw - math.log(max(normalizer, 1e-300)))
 
 
 def _duration_log_probabilities(model: dict[str, Any]) -> np.ndarray:
     result = np.full((len(model["durations"]), 53), -np.inf, dtype=float)
     for state, params in enumerate(model["durations"]):
-        result[state, 2:53] = [
+        result[state, HSMM_MIN_DURATION_WEEKS:HSMM_MAX_DURATION_WEEKS + 1] = [
             _duration_logpmf(duration, params)
-            for duration in range(2, 53)
+            for duration in range(HSMM_MIN_DURATION_WEEKS, HSMM_MAX_DURATION_WEEKS + 1)
         ]
     return result
 
@@ -265,14 +279,14 @@ def _hsmm_expected_statistics(
         dtype=float,
     )
     backward[observation_count] = 0.0
-    for begin in range(observation_count - 2, -1, -1):
-        maximum_duration = min(52, observation_count - begin)
+    for begin in range(observation_count - HSMM_MIN_DURATION_WEEKS, -1, -1):
+        maximum_duration = min(HSMM_MAX_DURATION_WEEKS, observation_count - begin)
         for previous_state in range(state_count):
             candidates: list[float] = []
             for state in range(state_count):
                 if state == previous_state:
                     continue
-                for duration in range(2, maximum_duration + 1):
+                for duration in range(HSMM_MIN_DURATION_WEEKS, maximum_duration + 1):
                     end = begin + duration
                     segment = (
                         cumulative[end, state]
@@ -294,9 +308,12 @@ def _hsmm_expected_statistics(
         (state_count, observation_count + 1),
         dtype=float,
     )
-    for end in range(2, observation_count + 1):
+    for end in range(HSMM_MIN_DURATION_WEEKS, observation_count + 1):
         for state in range(state_count):
-            for duration in range(2, min(52, end) + 1):
+            for duration in range(
+                HSMM_MIN_DURATION_WEEKS,
+                min(HSMM_MAX_DURATION_WEEKS, end) + 1,
+            ):
                 begin = end - duration
                 segment = (
                     cumulative[end, state]
@@ -351,10 +368,19 @@ def _weighted_duration_parameters(
     duration_counts: np.ndarray,
 ) -> list[dict[str, float]]:
     output: list[dict[str, float]] = []
-    durations = np.arange(2, 53, dtype=float)
-    shifted = durations - 2.0
+    durations = np.arange(
+        HSMM_MIN_DURATION_WEEKS,
+        HSMM_MAX_DURATION_WEEKS + 1,
+        dtype=float,
+    )
+    shifted = durations - HSMM_MIN_DURATION_WEEKS
     for state_counts in duration_counts:
-        weights = np.asarray(state_counts[2:53], dtype=float) + 1e-6
+        weights = np.asarray(
+            state_counts[
+                HSMM_MIN_DURATION_WEEKS:HSMM_MAX_DURATION_WEEKS + 1
+            ],
+            dtype=float,
+        ) + 1e-6
         weights /= weights.sum()
         mean_shifted = max(1e-3, float(np.sum(weights * shifted)))
         variance_shifted = float(
@@ -366,7 +392,11 @@ def _weighted_duration_parameters(
             r = mean_shifted ** 2 / (variance_shifted - mean_shifted)
         r = max(.1, min(500.0, r))
         p = max(.02, min(.98, r / (r + mean_shifted)))
-        output.append({"r": r, "p": p, "mean": mean_shifted + 2.0})
+        output.append({
+            "r": r,
+            "p": p,
+            "mean": mean_shifted + HSMM_MIN_DURATION_WEEKS,
+        })
     return output
 
 
@@ -475,7 +505,7 @@ def _fit(
                 converged = True
                 break
         model["training"] = {
-            "algorithm": "explicit_duration_forward_backward_em_v2",
+            "algorithm": HSMM_TRAINING_ALGORITHM,
             "initialization": initialization,
             "accepted_iterations": accepted_iterations,
             "converged": converged,
@@ -497,9 +527,12 @@ def _decode(values: np.ndarray, model: dict[str, Any]) -> tuple[list[int], float
     transitions = np.log(np.maximum(np.asarray(model["transitions"]), 1e-300))
     starts = np.log(np.maximum(np.asarray(model["start"]), 1e-300))
     duration_logs = _duration_log_probabilities(model)
-    for end in range(2, n + 1):
+    for end in range(HSMM_MIN_DURATION_WEEKS, n + 1):
         for state in range(state_count):
-            for duration in range(2, min(52, end) + 1):
+            for duration in range(
+                HSMM_MIN_DURATION_WEEKS,
+                min(HSMM_MAX_DURATION_WEEKS, end) + 1,
+            ):
                 begin = end - duration
                 segment = cumulative[end, state] - cumulative[begin, state] + duration_logs[state, duration]
                 if begin == 0:
@@ -555,10 +588,13 @@ def _hsmm_forward_scores(
     )
     starts = np.log(np.maximum(np.asarray(model["start"], dtype=float), 1e-300))
     duration_logs = _duration_log_probabilities(model)
-    for end in range(2, observation_count + 1):
+    for end in range(HSMM_MIN_DURATION_WEEKS, observation_count + 1):
         for state in range(state_count):
             candidates: list[float] = []
-            for duration in range(2, min(52, end) + 1):
+            for duration in range(
+                HSMM_MIN_DURATION_WEEKS,
+                min(HSMM_MAX_DURATION_WEEKS, end) + 1,
+            ):
                 begin = end - duration
                 segment_score = (
                     cumulative[end, state]
@@ -714,10 +750,12 @@ def _truncated_geometric_duration_logpmf(
     probability = min(1 - 1e-9, max(1e-9, self_transition_probability))
     values = np.asarray([
         (probability ** (value - 1)) * (1.0 - probability)
-        for value in range(2, 53)
+        for value in range(HSMM_MIN_DURATION_WEEKS, HSMM_MAX_DURATION_WEEKS + 1)
     ])
     normalized = values / max(float(values.sum()), 1e-300)
-    return float(np.log(max(float(normalized[duration - 2]), 1e-300)))
+    return float(np.log(max(float(
+        normalized[duration - HSMM_MIN_DURATION_WEEKS]
+    ), 1e-300)))
 
 
 def _duration_log_scores(
@@ -728,7 +766,7 @@ def _duration_log_scores(
     runs = [
         (state, duration)
         for state, duration in _decoded_run_durations(decoded)
-        if 2 <= duration <= 52
+        if HSMM_MIN_DURATION_WEEKS <= duration <= HSMM_MAX_DURATION_WEEKS
     ]
     if not runs:
         return {
@@ -963,6 +1001,37 @@ def train_hsmm_shadow(
         _HSMM_TRAINING_LOCK.release()
 
 
+def _enqueue_hsmm_research_trigger(
+    *,
+    model_version_id: int,
+    version: str,
+    validation: dict[str, Any],
+) -> dict[str, Any]:
+    if str(validation.get("status") or "") != "passed":
+        return {
+            "status": "not_enqueued",
+            "reason": "hsmm_task_native_evaluation_failed",
+        }
+    try:
+        from app.services.evolution_orchestrator import (
+            enqueue_factor_strategy_research_event,
+        )
+
+        task = enqueue_factor_strategy_research_event(
+            trigger="hsmm_shadow_training_completed",
+            evidence_type="market_state_model_version",
+            evidence_id=int(model_version_id),
+            evidence={"model_key": "market_regime", "version": version},
+            priority=75,
+        )
+        return {
+            "status": str(task.get("status") or "queued"),
+            "task_id": int(task.get("id") or 0),
+        }
+    except Exception as exc:  # Preserve the trained Shadow if the queue is temporarily unavailable.
+        return {"status": "enqueue_failed", "error": str(exc)[:300]}
+
+
 def _train_hsmm_shadow_sync(
     *,
     refresh_api: bool,
@@ -1107,7 +1176,7 @@ def _train_hsmm_shadow_sync(
         ),
         "explicit_duration_em_fitted_all_windows": all(
             str((item.get("hsmm_training") or {}).get("algorithm") or "")
-            == "explicit_duration_forward_backward_em_v2"
+            == HSMM_TRAINING_ALGORITHM
             and int(
                 (item.get("hsmm_training") or {}).get(
                     "accepted_iterations",
@@ -1129,8 +1198,8 @@ def _train_hsmm_shadow_sync(
     states = np.asarray(decoded)
     marginal_log_likelihood = _hsmm_forward_log_likelihood(full_scaled, model)
     validation = {
-        "schema_version": "alis_hsmm_task_native_evaluation_v2",
-        "evaluation_contract": "alis_task_native_model_evaluation_v1",
+        "schema_version": "alis_hsmm_task_native_evaluation_v3",
+        "evaluation_contract": HSMM_EVALUATION_CONTRACT,
         "status": "passed" if all(task_gates.values()) else "shadow_failed",
         "task_native": {
             "task": "explicit_duration_latent_market_regime_model",
@@ -1195,25 +1264,12 @@ def _train_hsmm_shadow_sync(
         },
     }
     artifact_path.write_text(json.dumps(artifact, ensure_ascii=False), encoding="utf-8")
-    model_version_id = create_model_version(model_key="market_regime", version=version, status="shadow_validated" if validation["status"] == "passed" else "shadow_failed", artifact_path=str(artifact_path), config={"family": "hierarchical_four_state_hsmm_with_12_profiles", "feature_set": "market_regime_full_market_v2", "feature_transform": "broad_index_axis_aggregation_v1", "model_features": list(MODEL_FEATURES), "training_algorithm": "explicit_duration_forward_backward_em_v2", "data_contract": "full_market_daily_aggregates_plus_broad_index_anchors_v2", "observation": "multivariate_student_t_diagonal_covariance", "duration": "truncated_negative_binomial", "min_weeks": 2, "max_weeks": 52, "profile_layer": profile_layer}, metrics={"marginal_log_likelihood": marginal_log_likelihood, "viterbi_best_path_log_probability": viterbi_log_probability, **validation}, validation=validation, is_active=False)
-    try:
-        from app.services.evolution_orchestrator import (
-            enqueue_factor_strategy_research_event,
-        )
-
-        task = enqueue_factor_strategy_research_event(
-            trigger="hsmm_shadow_training_completed",
-            evidence_type="market_state_model_version",
-            evidence_id=int(model_version_id),
-            evidence={"model_key": "market_regime", "version": version},
-            priority=75,
-        )
-        research_trigger = {
-            "status": str(task.get("status") or "queued"),
-            "task_id": int(task.get("id") or 0),
-        }
-    except Exception as exc:  # Preserve the trained Shadow if the queue is temporarily unavailable.
-        research_trigger = {"status": "enqueue_failed", "error": str(exc)[:300]}
+    model_version_id = create_model_version(model_key="market_regime", version=version, status="shadow_validated" if validation["status"] == "passed" else "shadow_failed", artifact_path=str(artifact_path), config={"family": "hierarchical_four_state_hsmm_with_12_profiles", "feature_set": "market_regime_full_market_v2", "feature_transform": "broad_index_axis_aggregation_v1", "model_features": list(MODEL_FEATURES), "training_algorithm": HSMM_TRAINING_ALGORITHM, "data_contract": "full_market_daily_aggregates_plus_broad_index_anchors_v2", "observation": "multivariate_student_t_diagonal_covariance", "duration": "truncated_negative_binomial", "min_weeks": HSMM_MIN_DURATION_WEEKS, "max_weeks": HSMM_MAX_DURATION_WEEKS, "profile_layer": profile_layer}, metrics={"marginal_log_likelihood": marginal_log_likelihood, "viterbi_best_path_log_probability": viterbi_log_probability, **validation}, validation=validation, is_active=False)
+    research_trigger = _enqueue_hsmm_research_trigger(
+        model_version_id=int(model_version_id),
+        version=version,
+        validation=validation,
+    )
     return {
         "ok": True,
         "model_version_id": model_version_id,

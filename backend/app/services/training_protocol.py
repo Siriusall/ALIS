@@ -56,6 +56,17 @@ TRAINING_PROTOCOL_V1: dict[str, Any] = {
     },
 }
 
+EVENT_STUDY_CALENDAR_V1: dict[str, Any] = {
+    "minimum_train_sessions": 200,
+    "validation_sessions": 10,
+    "test_sessions": 10,
+    "roll_step_sessions": 10,
+    "minimum_oos_windows": 5,
+    "purge_sessions": 5,
+    "embargo_sessions": 5,
+    "calendar_unit": "event_observation_trade_date",
+}
+
 
 def strict_json_dumps(payload: Any) -> str:
     return json.dumps(payload, ensure_ascii=False, sort_keys=True, allow_nan=False)
@@ -131,7 +142,7 @@ def validate_feature_frame_contract(
 
 
 def training_protocol_contract(model_key: str | None = None) -> dict[str, Any]:
-    return {
+    protocol = {
         **TRAINING_PROTOCOL_V1,
         "model_key": model_key,
         "model_task_evaluation": (
@@ -139,17 +150,27 @@ def training_protocol_contract(model_key: str | None = None) -> dict[str, Any]:
         ),
         "generated_at": datetime.now().isoformat(timespec="seconds"),
     }
+    if model_key == "event_impact_assessor_v2":
+        protocol["schema_version"] = "alis_event_impact_training_protocol_v4"
+        protocol["calendar"] = {
+            **protocol["calendar"],
+            **EVENT_STUDY_CALENDAR_V1,
+        }
+    return protocol
 
 
 def validate_training_run_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
     calendar = dict((manifest.get("calendar") or {}))
+    expected_calendar = dict(
+        (training_protocol_contract(str(manifest.get("model_key") or "")).get("calendar") or {})
+    )
     gates = {
-        "minimum_train_sessions": int(calendar.get("train_sessions") or 0) >= TRAINING_PROTOCOL_V1["calendar"]["minimum_train_sessions"],
-        "validation_sessions": int(calendar.get("validation_sessions") or 0) >= TRAINING_PROTOCOL_V1["calendar"]["validation_sessions"],
-        "test_sessions": int(calendar.get("test_sessions") or 0) >= TRAINING_PROTOCOL_V1["calendar"]["test_sessions"],
-        "minimum_oos_windows": int(manifest.get("oos_windows") or 0) >= TRAINING_PROTOCOL_V1["calendar"]["minimum_oos_windows"],
-        "purge_sessions": int(calendar.get("purge_sessions") or 0) >= TRAINING_PROTOCOL_V1["calendar"]["purge_sessions"],
-        "embargo_sessions": int(calendar.get("embargo_sessions") or 0) >= TRAINING_PROTOCOL_V1["calendar"]["embargo_sessions"],
+        "minimum_train_sessions": int(calendar.get("train_sessions") or 0) >= expected_calendar["minimum_train_sessions"],
+        "validation_sessions": int(calendar.get("validation_sessions") or 0) >= expected_calendar["validation_sessions"],
+        "test_sessions": int(calendar.get("test_sessions") or 0) >= expected_calendar["test_sessions"],
+        "minimum_oos_windows": int(manifest.get("oos_windows") or 0) >= expected_calendar["minimum_oos_windows"],
+        "purge_sessions": int(calendar.get("purge_sessions") or 0) >= expected_calendar["purge_sessions"],
+        "embargo_sessions": int(calendar.get("embargo_sessions") or 0) >= expected_calendar["embargo_sessions"],
         "current_model_evaluation_contract": (
             str(manifest.get("model_evaluation_contract") or "")
             == MODEL_EVALUATION_CONTRACT
