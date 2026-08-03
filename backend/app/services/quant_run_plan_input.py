@@ -9,12 +9,16 @@ from typing import Any
 
 from app.services.quant_run_contracts import ReplayRiskGateError
 
-UNIFIED_DAILY_DECISION_SCHEMA_VERSION = "alis_unified_daily_decision_v1"
+UNIFIED_DAILY_DECISION_SCHEMA_VERSION = "alis_unified_daily_decision_v2"
+LEGACY_UNIFIED_DAILY_DECISION_SCHEMA_VERSION = "alis_unified_daily_decision_v1"
 UNIFIED_SELECTION_SCHEMA_VERSION = "alis_unified_stock_selection_v1"
-UNIFIED_EXECUTION_SAFETY_SCHEMA_VERSION = "alis_t1_execution_safety_v1"
-PRETRADE_CONTROLLER_SCHEMA_VERSION = "alis_strategy_controller_pretrade_v1"
+UNIFIED_EXECUTION_SAFETY_SCHEMA_VERSION = "alis_t1_execution_safety_v2"
+LEGACY_UNIFIED_EXECUTION_SAFETY_SCHEMA_VERSION = "alis_t1_execution_safety_v1"
+PRETRADE_CONTROLLER_SCHEMA_VERSION = "alis_strategy_controller_pretrade_v2"
+LEGACY_PRETRADE_CONTROLLER_SCHEMA_VERSION = "alis_strategy_controller_pretrade_v1"
 INDUSTRY_ALLOCATION_SCHEMA_VERSION = "alis_industry_allocation_v1"
-PORTFOLIO_COMPETITION_SCHEMA_VERSION = "portfolio_method_competition_v2"
+PORTFOLIO_COMPETITION_SCHEMA_VERSION = "portfolio_method_competition_v3"
+LEGACY_PORTFOLIO_COMPETITION_SCHEMA_VERSION = "portfolio_method_competition_v2"
 EXPECTED_RETURN_SCHEMA_VERSION = "alis_a_share_expected_return_20d_v1"
 DECISION_MANIFEST_SCHEMA_VERSION = "alis_decision_version_manifest_v1"
 UNIFIED_T1_ALLOWED_VETOES = {
@@ -362,8 +366,25 @@ def _validate_selection_snapshot(snapshot: dict[str, Any]) -> None:
 
 def validate_unified_decision_contract(contract: dict[str, Any]) -> None:
     """Validate the only contract allowed to create a new formal plan."""
-    if not isinstance(contract, dict) or str(contract.get("schema_version") or "") != UNIFIED_DAILY_DECISION_SCHEMA_VERSION:
+    schema_version = str(contract.get("schema_version") or "") if isinstance(contract, dict) else ""
+    if schema_version not in {
+        UNIFIED_DAILY_DECISION_SCHEMA_VERSION,
+        LEGACY_UNIFIED_DAILY_DECISION_SCHEMA_VERSION,
+    }:
         raise ReplayRiskGateError("新正式计划必须使用统一日决策合同", code="invalid_authoritative_plan")
+    legacy = schema_version == LEGACY_UNIFIED_DAILY_DECISION_SCHEMA_VERSION
+    expected_safety_schema = (
+        LEGACY_UNIFIED_EXECUTION_SAFETY_SCHEMA_VERSION if legacy
+        else UNIFIED_EXECUTION_SAFETY_SCHEMA_VERSION
+    )
+    expected_controller_schema = (
+        LEGACY_PRETRADE_CONTROLLER_SCHEMA_VERSION if legacy
+        else PRETRADE_CONTROLLER_SCHEMA_VERSION
+    )
+    expected_competition_schema = (
+        LEGACY_PORTFOLIO_COMPETITION_SCHEMA_VERSION if legacy
+        else PORTFOLIO_COMPETITION_SCHEMA_VERSION
+    )
     required_dicts = (
         "selection_snapshot",
         "pretrade_controller",
@@ -396,13 +417,15 @@ def validate_unified_decision_contract(contract: dict[str, Any]) -> None:
         raise ReplayRiskGateError("统一计划数据截止时间与选股快照不一致", code="invalid_authoritative_plan")
     safety = contract["execution_safety_contract"]
     if (
-        str(safety.get("schema_version") or "") != UNIFIED_EXECUTION_SAFETY_SCHEMA_VERSION
+        str(safety.get("schema_version") or "") != expected_safety_schema
         or not safety.get("investment_opinion_frozen_on_signal_date")
         or not safety.get("t1_rerank_forbidden")
         or not safety.get("t1_research_refresh_forbidden")
         or not safety.get("t1_industry_reallocation_forbidden")
         or not safety.get("t1_controller_regeneration_forbidden")
         or not safety.get("t1_portfolio_reoptimization_forbidden")
+        or (not legacy and not safety.get("t1_quantity_recalculation_forbidden"))
+        or (not legacy and not safety.get("frozen_quantity_must_execute_exactly_or_be_vetoed"))
         or set(str(value or "") for value in (safety.get("allowed_vetoes") or []))
         != UNIFIED_T1_ALLOWED_VETOES
     ):
@@ -417,7 +440,7 @@ def validate_unified_decision_contract(contract: dict[str, Any]) -> None:
         raise ReplayRiskGateError("统一计划预期收益合同版本无效", code="invalid_authoritative_plan")
     controller = contract["pretrade_controller"]
     if (
-        str(controller.get("schema_version") or "") != PRETRADE_CONTROLLER_SCHEMA_VERSION
+        str(controller.get("schema_version") or "") != expected_controller_schema
         or str(controller.get("generated_at") or "") != str(selection.get("data_as_of_time") or "")
         or int(controller.get("strategy_policy_version_id") or 0) <= 0
         or not str(controller.get("strategy_policy_version") or "")
@@ -454,6 +477,16 @@ def validate_unified_decision_contract(contract: dict[str, Any]) -> None:
             raise ReplayRiskGateError(f"统一计划 Controller 动作无效：{symbol}", code="invalid_authoritative_plan")
         if not isinstance(item.get("permission_allowed"), bool) or not isinstance(bound.get("permission_allowed"), bool):
             raise ReplayRiskGateError(f"统一计划 Controller 权限格式无效：{symbol}", code="invalid_authoritative_plan")
+        if not legacy and (
+            not isinstance(item.get("permission"), dict)
+            or not isinstance(item.get("obligation"), dict)
+            or not isinstance(bound.get("permission"), dict)
+            or not isinstance(bound.get("obligation"), dict)
+            or str(item.get("intent") or "") != str(bound.get("intent") or "")
+            or item.get("permission") != bound.get("permission")
+            or item.get("obligation") != bound.get("obligation")
+        ):
+            raise ReplayRiskGateError(f"统一计划 Controller V2 权限或义务不完整：{symbol}", code="invalid_authoritative_plan")
         if (
             str(bound.get("action") or "") != str(item.get("action") or "")
             or bool(bound.get("permission_allowed")) != bool(item.get("permission_allowed"))
@@ -599,10 +632,13 @@ def validate_unified_decision_contract(contract: dict[str, Any]) -> None:
     ):
         raise ReplayRiskGateError("统一计划预期收益环境与冻结切片不一致", code="invalid_authoritative_plan")
     competition = contract["portfolio_method_competition"]
-    if str(competition.get("schema_version") or "") != PORTFOLIO_COMPETITION_SCHEMA_VERSION or competition.get("ok") is not True:
+    if str(competition.get("schema_version") or "") != expected_competition_schema or competition.get("ok") is not True:
         raise ReplayRiskGateError("统一计划组合竞赛合同版本或状态无效", code="invalid_authoritative_plan")
     selected_method = str(competition.get("selected_method") or "")
-    if selected_method not in {"empirical_cvar", "equal_weight", "hrp", "hold_current"}:
+    allowed_methods = {"empirical_cvar", "equal_weight", "hrp", "hold_current"} if legacy else {
+        "empirical_cvar", "equal_weight", "hrp", "minimum_turnover_feasible",
+    }
+    if selected_method not in allowed_methods:
         raise ReplayRiskGateError("统一计划组合竞赛赢家方法无效", code="invalid_authoritative_plan")
     winner = competition.get("winner")
     winner_weights = winner.get("weights") if isinstance(winner, dict) and isinstance(winner.get("weights"), dict) else {}
@@ -623,6 +659,81 @@ def validate_unified_decision_contract(contract: dict[str, Any]) -> None:
             or abs(_finite_weight(candidate.get("max_weight"), field=f"{symbol}.competition.max") - _finite_weight(bound.get("max_weight"), field=f"{symbol}.controller.max")) > 1e-10
         ):
             raise ReplayRiskGateError(f"统一计划竞赛没有使用 Controller 边界：{symbol}", code="invalid_authoritative_plan")
+    if not legacy:
+        execution_orders = [
+            item for item in (contract.get("execution_orders") or [])
+            if isinstance(item, dict)
+        ]
+        order_symbols = [str(item.get("symbol") or "") for item in execution_orders]
+        if any(not symbol for symbol in order_symbols) or len(order_symbols) != len(set(order_symbols)):
+            raise ReplayRiskGateError("统一计划冻结订单标的为空或重复", code="invalid_authoritative_plan")
+        if execution_orders != competition.get("execution_orders") or execution_orders != (winner or {}).get("execution_orders"):
+            raise ReplayRiskGateError("统一计划冻结订单与竞赛赢家不一致", code="invalid_authoritative_plan")
+        constraint_hash = str(competition.get("constraint_hash") or "")
+        evaluations = [item for item in (competition.get("evaluations") or []) if isinstance(item, dict)]
+        if (
+            not constraint_hash
+            or len(evaluations) != 4
+            or any(str(item.get("constraint_hash") or "") != constraint_hash for item in evaluations)
+        ):
+            raise ReplayRiskGateError("组合竞赛四种方法没有共享同一约束合同", code="invalid_authoritative_plan")
+        cost_contract = contract.get("execution_cost_contract") if isinstance(contract.get("execution_cost_contract"), dict) else {}
+        if (
+            cost_contract.get("includes_fees_and_slippage") is not True
+            or not isinstance(cost_contract.get("component_policy"), dict)
+            or cost_contract != competition.get("execution_cost_contract")
+            or cost_contract != (contract.get("decision_version_manifest") or {}).get("execution_cost")
+        ):
+            raise ReplayRiskGateError("统一计划未冻结完整手续费与滑点合同", code="invalid_authoritative_plan")
+        orders_by_symbol = {str(item.get("symbol") or ""): item for item in execution_orders}
+        for item in execution_orders:
+            symbol = str(item.get("symbol") or "")
+            side = str(item.get("side") or "").upper()
+            try:
+                quantity = int(item.get("planned_quantity"))
+            except (TypeError, ValueError):
+                quantity = 0
+            if quantity <= 0 or side not in {"BUY", "SELL"}:
+                raise ReplayRiskGateError(f"冻结订单方向或数量无效：{symbol}", code="invalid_authoritative_plan")
+            if side == "BUY" and quantity % 100 != 0:
+                raise ReplayRiskGateError(f"冻结买单不是整手：{symbol}", code="invalid_authoritative_plan")
+            if side == "SELL" and quantity % 100 != 0 and item.get("full_position_exit") is not True:
+                raise ReplayRiskGateError(f"冻结卖单零股数量仅允许完整退出：{symbol}", code="invalid_authoritative_plan")
+            allowed_sides = set(str(value or "").upper() for value in ((action_by_symbol[symbol].get("permission") or {}).get("allowed_sides") or []))
+            if side not in allowed_sides:
+                raise ReplayRiskGateError(f"冻结订单违反 Controller 方向权限：{symbol}", code="invalid_authoritative_plan")
+            post_weight = _finite_weight(item.get("post_lot_target_weight"), field=f"order.{symbol}.post_weight")
+            if abs(post_weight - final_weights.get(symbol, 0.0)) > 1e-8:
+                raise ReplayRiskGateError(f"冻结订单与整手后目标权重不一致：{symbol}", code="invalid_authoritative_plan")
+            cost = item.get("cost") if isinstance(item.get("cost"), dict) else {}
+            for key in (
+                "gross_amount", "commission", "transfer_fee", "stamp_tax",
+                "slippage_cost", "calibration_buffer", "total_cost",
+            ):
+                if _finite_number(cost.get(key), field=f"order.{symbol}.cost.{key}") < 0:
+                    raise ReplayRiskGateError(f"冻结订单成本为负：{symbol}", code="invalid_authoritative_plan")
+        for symbol, action_item in action_by_symbol.items():
+            current = _finite_weight(action_item.get("current_weight"), field=f"controller.{symbol}.current_weight")
+            changed = abs(final_weights.get(symbol, 0.0) - current) > 1e-8
+            if changed != (symbol in orders_by_symbol):
+                raise ReplayRiskGateError(f"冻结订单没有完整覆盖权重变化：{symbol}", code="invalid_authoritative_plan")
+            obligation = action_item.get("obligation") if isinstance(action_item.get("obligation"), dict) else {}
+            if obligation.get("required"):
+                target_max = _finite_weight(obligation.get("target_max_weight"), field=f"controller.{symbol}.obligation.target")
+                order = orders_by_symbol.get(symbol) or {}
+                if (
+                    str(order.get("side") or "").upper() != "SELL"
+                    or int(order.get("planned_quantity") or 0) <= 0
+                    or final_weights.get(symbol, 0.0) > target_max + 1e-8
+                ):
+                    raise ReplayRiskGateError(f"冻结订单未完成 Controller 强制义务：{symbol}", code="invalid_authoritative_plan")
+        for symbol, proposal_item in proposal_by_symbol.items():
+            order = orders_by_symbol.get(symbol) or {}
+            planned_quantity = int(proposal_item.get("planned_quantity") or 0)
+            if planned_quantity != int(order.get("planned_quantity") or 0):
+                raise ReplayRiskGateError(f"页面提案数量与冻结订单不一致：{symbol}", code="invalid_authoritative_plan")
+            if planned_quantity <= 0 and str(proposal_item.get("action") or "") not in {"hold", "observe"}:
+                raise ReplayRiskGateError(f"零数量提案不得显示交易动作：{symbol}", code="invalid_authoritative_plan")
     industry = contract["industry_allocation"]
     if (
         str(industry.get("schema_version") or "") != INDUSTRY_ALLOCATION_SCHEMA_VERSION
@@ -672,7 +783,7 @@ def validate_unified_decision_contract(contract: dict[str, Any]) -> None:
         or int(manifest_strategy.get("model_version_id") or 0) != champion_id
         or str(manifest_strategy.get("version") or "") != str(selection.get("champion_version") or "")
         or int(manifest_strategy.get("strategy_id") or 0) != int(selection.get("strategy_id") or 0)
-        or str(manifest_strategy.get("pretrade_controller_schema") or "") != PRETRADE_CONTROLLER_SCHEMA_VERSION
+        or str(manifest_strategy.get("pretrade_controller_schema") or "") != expected_controller_schema
         or int(manifest_strategy.get("strategy_controller_version_id") or 0)
         != int(controller.get("strategy_policy_version_id") or 0)
         or str(manifest_strategy.get("strategy_controller_version") or "")
@@ -684,6 +795,13 @@ def validate_unified_decision_contract(contract: dict[str, Any]) -> None:
         raise ReplayRiskGateError("统一计划决策版本清单版本无效", code="invalid_authoritative_plan")
     if str(manifest.get("trade_date") or "").replace("-", "")[:8] != signal_date:
         raise ReplayRiskGateError("统一计划版本清单日期与信号日不一致", code="invalid_authoritative_plan")
+    if not legacy and (
+        (manifest.get("execution_contract") or {}).get("decision_schema") != UNIFIED_DAILY_DECISION_SCHEMA_VERSION
+        or (manifest.get("execution_contract") or {}).get("t1_safety_schema") != UNIFIED_EXECUTION_SAFETY_SCHEMA_VERSION
+        or (manifest.get("execution_contract") or {}).get("quantity_policy")
+        != "t_day_frozen_exact_quantity_or_t1_safety_veto"
+    ):
+        raise ReplayRiskGateError("统一计划执行版本清单不完整", code="invalid_authoritative_plan")
     manifest_selection = manifest.get("selection") if isinstance(manifest.get("selection"), dict) else {}
     if (
         str(manifest_selection.get("schema_version") or "") != UNIFIED_SELECTION_SCHEMA_VERSION
@@ -723,7 +841,7 @@ def validate_unified_decision_contract(contract: dict[str, Any]) -> None:
     manifest_portfolio = manifest.get("portfolio") if isinstance(manifest.get("portfolio"), dict) else {}
     if (
         str(manifest_portfolio.get("selected_method") or "") != selected_method
-        or str(manifest_portfolio.get("competition_schema") or "") != PORTFOLIO_COMPETITION_SCHEMA_VERSION
+        or str(manifest_portfolio.get("competition_schema") or "") != expected_competition_schema
     ):
         raise ReplayRiskGateError("统一计划组合竞赛与版本清单不一致", code="invalid_authoritative_plan")
     manifest_hash = str(manifest.get("manifest_hash") or "")
@@ -746,7 +864,10 @@ def normalize_authoritative_plan(plan: dict[str, Any]) -> dict[str, Any]:
         )
     decision_contract = plan.get("decision_contract") if isinstance(plan.get("decision_contract"), dict) else {}
     contract_schema = str(decision_contract.get("schema_version") or "")
-    unified = contract_schema == UNIFIED_DAILY_DECISION_SCHEMA_VERSION
+    unified = contract_schema in {
+        UNIFIED_DAILY_DECISION_SCHEMA_VERSION,
+        LEGACY_UNIFIED_DAILY_DECISION_SCHEMA_VERSION,
+    }
     if contract_schema.startswith("alis_unified_") and not unified:
         raise ReplayRiskGateError("统一正式计划合同版本不受支持", code="invalid_authoritative_plan")
     if unified:

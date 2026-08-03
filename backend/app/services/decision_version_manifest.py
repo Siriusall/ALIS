@@ -105,7 +105,17 @@ def build_decision_version_manifest(
             "competition_schema": ((optimizer.get("method_competition") or {}).get("schema_version")),
             "risk_budget": (portfolio or {}).get("risk_budget") or {},
         },
-        "execution_cost": active_execution_cost_contract(),
+        "execution_cost": (
+            (portfolio or {}).get("execution_cost_contract")
+            if isinstance((portfolio or {}).get("execution_cost_contract"), dict)
+            and (portfolio or {}).get("execution_cost_contract")
+            else active_execution_cost_contract()
+        ),
+        "execution_contract": {
+            "decision_schema": "alis_unified_daily_decision_v2",
+            "t1_safety_schema": "alis_t1_execution_safety_v2",
+            "quantity_policy": "t_day_frozen_exact_quantity_or_t1_safety_veto",
+        },
         "simulation_only": True,
     }
     manifest["manifest_hash"] = hashlib.sha256(

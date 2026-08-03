@@ -16,6 +16,10 @@ from statistics import median
 
 from app.data_platform.db import _conn
 from app.data_platform.redis_store import get_json, set_json
+from app.services.hsmm_shadow import (
+    HSMM_MAX_DURATION_WEEKS,
+    HSMM_MIN_DURATION_WEEKS,
+)
 
 
 def _clip(value: float, low: float = -1.0, high: float = 1.0) -> float:
@@ -327,7 +331,7 @@ def market_state_model_governance() -> dict[str, Any]:
         # Having enough history only opens the shadow-validation gate.  It must
         # never silently promote a regime model without persisted OOS evidence.
         "production_model": "transparent_four_state_v1",
-        "hsmm": {"status": live_status, "history_years": round(index_years, 3), "breadth_history_years": round(years, 3), "minimum_years": 6, "state_count": 4, "profile_state_count": len(MARKET_PROFILE_LABELS), "profile_model": "hierarchical_market_profile_v1", "observation_distribution": "multivariate_student_t", "duration_distribution": "truncated_negative_binomial", "duration_weeks": [2, 52], "production_eligible": production_eligible, "blocking_reason": blocking_reason, "latest_shadow_version": (latest_shadow or {}).get("version"), "validation": shadow_validation, "review_required": review_required, "review_completed": review_completed, "review": review, "live_observation_start": live_observation_start, "live_observation_end": live_observation_end, "live_observation_weeks": round(live_observation_weeks, 3), "live_observation_sessions": live_observation_sessions, "minimum_live_observation_weeks": HSMM_MINIMUM_LIVE_OBSERVATION_WEEKS},
+        "hsmm": {"status": live_status, "history_years": round(index_years, 3), "breadth_history_years": round(years, 3), "minimum_years": 6, "state_count": 4, "profile_state_count": len(MARKET_PROFILE_LABELS), "profile_model": "hierarchical_market_profile_v1", "observation_distribution": "multivariate_student_t", "duration_distribution": "truncated_negative_binomial", "duration_weeks": [HSMM_MIN_DURATION_WEEKS, HSMM_MAX_DURATION_WEEKS], "production_eligible": production_eligible, "blocking_reason": blocking_reason, "latest_shadow_version": (latest_shadow or {}).get("version"), "validation": shadow_validation, "review_required": review_required, "review_completed": review_completed, "review": review, "live_observation_start": live_observation_start, "live_observation_end": live_observation_end, "live_observation_weeks": round(live_observation_weeks, 3), "live_observation_sessions": live_observation_sessions, "minimum_live_observation_weeks": HSMM_MINIMUM_LIVE_OBSERVATION_WEEKS},
         "bocpd": {"status": "active", "model": "bocpd_gaussian_v1"},
         "history": {"first_date": first, "last_date": last, "sessions": int(item.get("sessions") or 0)},
         "market_training_history": {"feature_set": "market_regime_full_market_v2", "first_date": training.get("first_date"), "last_date": training.get("last_date"), "observations": int(training.get("observations") or 0), "history_years": round(index_years, 3), "status": "ready" if index_years >= 6 else "insufficient"},

@@ -9,7 +9,7 @@ from app.db.store import _conn as business_conn, create_model_version, get_activ
 from app.services.review_learning import materialize_decision_outcomes
 
 STRATEGY_CONTROLLER_VERSION = "strategy_controller_v1"
-PRETRADE_CONTROLLER_SCHEMA_VERSION = "alis_strategy_controller_pretrade_v1"
+PRETRADE_CONTROLLER_SCHEMA_VERSION = "alis_strategy_controller_pretrade_v2"
 STRATEGY_MODEL_KEY = "strategy_controller"
 MINIMUM_CANDIDATE_SHADOW_SESSIONS = 20
 
@@ -311,6 +311,8 @@ def build_pretrade_strategy_controller(
     thesis_status_by_symbol: dict[str, str] | None = None,
     position_pnl_by_symbol: dict[str, float] | None = None,
     defensive_weights: dict[str, float] | None = None,
+    position_weight_caps: dict[str, float] | None = None,
+    hard_risk_breaches: list[dict[str, Any]] | None = None,
     max_single_position: float = 0.15,
     execution_guard: dict[str, Any] | None = None,
     context: dict[str, Any] | None = None,
@@ -326,6 +328,17 @@ def build_pretrade_strategy_controller(
     thesis = {str(key): str(value or "") for key, value in (thesis_status_by_symbol or {}).items()}
     position_pnl = {str(key): float(value or 0.0) for key, value in (position_pnl_by_symbol or {}).items()}
     defensive = {str(key): max(0.0, float(value or 0.0)) for key, value in (defensive_weights or {}).items()}
+    position_caps = {
+        str(key): max(0.0, min(1.0, float(value or 0.0)))
+        for key, value in (position_weight_caps or {}).items()
+    }
+    hard_breach_by_symbol: dict[str, list[dict[str, Any]]] = {}
+    for breach in hard_risk_breaches or []:
+        if str(breach.get("severity") or "") != "error":
+            continue
+        symbol = str(breach.get("symbol") or "")
+        if symbol:
+            hard_breach_by_symbol.setdefault(symbol, []).append(dict(breach))
     candidates = list(dict.fromkeys(str(value or "").strip() for value in candidate_symbols if str(value or "").strip()))
     holdings = list(dict.fromkeys(str(value or "").strip() for value in holding_symbols if str(value or "").strip()))
     candidate_set = set(candidates)
@@ -345,6 +358,9 @@ def build_pretrade_strategy_controller(
         is_holding = symbol in holding_set and current_weight > 1e-9
         is_candidate = symbol in candidate_set
         is_defensive = symbol in defensive
+        symbol_cap = min(single_cap, position_caps.get(symbol, single_cap))
+        hard_breaches = hard_breach_by_symbol.get(symbol) or []
+        hard_weight_breach = bool(hard_breaches) and symbol_cap < current_weight - 1e-8
         thesis_invalid = thesis.get(symbol) in {"invalidated", "failed"}
         research_error = str(research.get("evaluation_status") or "") == "error"
         research_eligible = bool(research.get("eligible_for_core", is_candidate or is_defensive))
@@ -355,44 +371,103 @@ def build_pretrade_strategy_controller(
         reason = "继续持有；未触发退出、减仓或加仓条件"
         min_weight = current_weight
         max_weight = current_weight
+        intent = "hold"
+        permission = {
+            "allowed_sides": ["HOLD"],
+            "can_buy": False,
+            "can_sell": False,
+        }
+        obligation: dict[str, Any] = {
+            "type": "none",
+            "required": False,
+            "target_max_weight": None,
+            "reason_codes": [],
+        }
 
-        if is_defensive:
-            proposed_action = action = "defensive_switch"
-            desired = defensive.get(symbol, 0.0)
+        if is_holding and hard_weight_breach:
+            proposed_action = action = "reduce_position"
             min_weight = 0.0
-            max_weight = desired
-            reason = "市场环境冻结的防御资产预算"
+            max_weight = min(current_weight, symbol_cap)
+            intent = "reduce_position"
+            permission = {"allowed_sides": ["SELL"], "can_buy": False, "can_sell": True}
+            obligation = {
+                "type": "mandatory_reduce",
+                "required": True,
+                "target_max_weight": round(max_weight, 8),
+                "reason_codes": sorted({str(item.get("code") or "hard_risk") for item in hard_breaches}),
+            }
+            reason = f"当前权重违反组合硬上限，必须以可执行数量降至 {symbol_cap:.2%} 以内"
+        elif is_defensive:
+            proposed_action = action = "defensive_switch"
+            desired = min(defensive.get(symbol, 0.0), symbol_cap)
+            min_weight = 0.0
+            max_weight = max(current_weight, desired) if current_weight <= symbol_cap else symbol_cap
+            intent = "defensive_switch"
+            permission = {"allowed_sides": ["BUY", "SELL", "HOLD"], "can_buy": True, "can_sell": True}
+            reason = "市场环境冻结的防御资产目标；仅硬风险上限形成强制义务"
         elif is_holding and research_error:
             allowed = False
+            permission = {"allowed_sides": ["HOLD"], "can_buy": False, "can_sell": False}
             reason = "持仓研究刷新异常；缺少可证伪证据时冻结持有，禁止把系统错误解释为卖出信号"
         elif is_holding and (thesis_invalid or not research_eligible or not is_candidate):
             proposed_action = action = "sell_exit"
             min_weight = max_weight = 0.0
+            intent = "sell_exit"
+            permission = {"allowed_sides": ["SELL"], "can_buy": False, "can_sell": True}
+            obligation = {
+                "type": "mandatory_exit",
+                "required": True,
+                "target_max_weight": 0.0,
+                "reason_codes": ["thesis_invalidated" if thesis_invalid else "research_admission_failed"],
+            }
             reason = "持仓 Thesis 已失效，冻结退出" if thesis_invalid else "持仓未通过当日统一研究准入，冻结退出"
         elif is_holding and position_pnl.get(symbol, 0.0) <= -0.06 and expected <= -0.05:
             proposed_action = action = "sell_exit"
             min_weight = max_weight = 0.0
+            intent = "sell_exit"
+            permission = {"allowed_sides": ["SELL"], "can_buy": False, "can_sell": True}
+            obligation = {
+                "type": "mandatory_exit",
+                "required": True,
+                "target_max_weight": 0.0,
+                "reason_codes": ["loss_and_negative_expected_return"],
+            }
             reason = "浮亏超过6%且20日预期低于-5%，冻结完整退出"
         elif is_holding and expected < 0:
             proposed_action = action = "reduce_position"
             min_weight = 0.0
             max_weight = current_weight
-            reason = "20日预期收益为负，只允许降权"
+            intent = "advisory_reduce"
+            permission = {"allowed_sides": ["SELL", "HOLD"], "can_buy": False, "can_sell": True}
+            reason = "20日预期收益为负，禁止加仓并建议降权；组合可因整手和成本约束保持"
         elif is_holding and is_candidate and add_eligible and expected > minimum_change:
             proposed_action = action = "add_position"
             min_weight = current_weight
-            max_weight = max(current_weight, single_cap)
+            max_weight = max(current_weight, symbol_cap)
+            intent = "advisory_add"
+            permission = {"allowed_sides": ["BUY", "HOLD"], "can_buy": True, "can_sell": False}
             reason = "持仓继续通过准入且预期收益覆盖最小改善门，允许加仓"
-        elif not is_holding and is_candidate:
+        elif not is_holding and is_candidate and expected > 0:
             proposed_action = action = "buy_candidate"
             min_weight = 0.0
-            max_weight = min(single_cap, 0.10)
+            max_weight = min(symbol_cap, 0.10)
+            intent = "advisory_entry"
+            permission = {"allowed_sides": ["BUY", "HOLD"], "can_buy": True, "can_sell": False}
             reason = "统一 Top K、研究与动态准入均通过，允许初始建仓"
+        elif not is_holding and is_candidate:
+            proposed_action = "research_only"
+            action = "hold"
+            min_weight = max_weight = 0.0
+            intent = "research_only"
+            permission = {"allowed_sides": ["HOLD"], "can_buy": False, "can_sell": False}
+            reason = "研究与动态准入通过，但20日预期收益不为正，只记录研究观察并禁止建仓"
 
         if quarantined and not is_defensive and action in {"buy_candidate", "add_position"}:
             allowed = False
             min_weight = current_weight if is_holding else 0.0
             max_weight = current_weight if is_holding else 0.0
+            intent = "research_only" if not is_holding else "hold"
+            permission = {"allowed_sides": ["HOLD"], "can_buy": False, "can_sell": False}
             reason = "当前 Champion 正式 OOS 失败；冻结个股买入和加仓权限"
 
         source_row = {
@@ -420,6 +495,10 @@ def build_pretrade_strategy_controller(
             "expected_20d_return_before_trade_cost": round(expected, 8),
             "research_eligible": research_eligible,
             "is_defensive_asset": is_defensive,
+            "permission": permission,
+            "intent": intent,
+            "obligation": obligation,
+            "position_weight_cap": round(symbol_cap, 8),
         })
 
     bounds = {
@@ -428,6 +507,9 @@ def build_pretrade_strategy_controller(
             "max_weight": item["max_weight"],
             "action": item["action"],
             "permission_allowed": item["permission_allowed"],
+            "permission": item["permission"],
+            "intent": item["intent"],
+            "obligation": item["obligation"],
         }
         for item in rows
     }
@@ -443,6 +525,8 @@ def build_pretrade_strategy_controller(
         "policy": {
             "controller_precedes_optimizer": True,
             "optimizer_may_not_change_action_direction": True,
+            "mandatory_obligations_precede_objective": True,
+            "negative_expected_return_new_entry_forbidden": True,
             "quarantine_equity_buy_add_forbidden": quarantined,
         },
     }

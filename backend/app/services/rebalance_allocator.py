@@ -148,6 +148,7 @@ def allocate_buy_orders(
     max_high_risk_total_pct: float = 0.05,
     max_order_value_by_symbol: Dict[str, float] | None = None,
     residual_sweep_symbol: str | None = None,
+    fixed_quantities: Dict[str, int] | None = None,
 ) -> tuple[List[PlannedBuyOrder], List[OrderResult], List[str]]:
     """
     等权 + 单票上限 + 二次分配剩余资金。
@@ -164,12 +165,16 @@ def allocate_buy_orders(
     }
     high_risk_symbols = {str(symbol) for symbol in (high_risk_symbols or set())}
     max_order_value_by_symbol = {str(symbol): max(0.0, float(value or 0)) for symbol, value in (max_order_value_by_symbol or {}).items()}
+    fixed_quantities = {
+        str(symbol): max(0, int(quantity or 0))
+        for symbol, quantity in (fixed_quantities or {}).items()
+    }
     if budget <= 0 or not candidates:
         return [], [], []
 
     tradable, blocked = _build_tradable_orders(candidates)
     pruned: List[str] = []
-    if tradable and not target_weights:
+    if tradable and not target_weights and not fixed_quantities:
         tradable, pruned = _prune_candidates_for_budget(
             tradable,
             budget=budget,
@@ -181,6 +186,67 @@ def allocate_buy_orders(
 
     if not tradable:
         return [], blocked, pruned
+
+    if fixed_quantities:
+        planned: List[PlannedBuyOrder] = []
+        remaining = round(max(0.0, float(budget or 0.0)), 2)
+        for order in tradable:
+            sym = str(order.symbol)
+            quantity = int(fixed_quantities.get(sym) or 0)
+            raw_price = max(float(order.price or 0), 0.01)
+            exec_price = apply_slippage_buy(raw_price, sym)
+            block_code = ""
+            message = ""
+            if quantity <= 0 or quantity % LOT_SIZE != 0:
+                block_code, message = "lot_size", "冻结买入数量不是正整数手"
+            elif sym in max_order_value_by_symbol and exec_price * quantity > max_order_value_by_symbol[sym] + 1e-6:
+                block_code, message = "liquidity_capacity", "冻结买入数量超过执行日流动性容量"
+            else:
+                amount, comm, trans = cost_buy(exec_price, quantity, sym)
+                total_cost = round(amount + comm + trans, 2)
+                if total_cost > remaining + 1e-6:
+                    block_code, message = "cash_no_overdraft", "执行日现金不足以完成冻结数量"
+            if block_code:
+                blocked.append(OrderResult(
+                    symbol=sym,
+                    side="BUY",
+                    price=round(exec_price, 4),
+                    quantity=0,
+                    status="blocked",
+                    message=message,
+                    block_code=block_code,
+                ))
+                continue
+            remaining = round(remaining - total_cost, 2)
+            planned.append(PlannedBuyOrder(
+                symbol=sym,
+                name=str(order.name or ""),
+                request_price=round(raw_price, 4),
+                exec_price=round(exec_price, 4),
+                quantity=quantity,
+                amount=round(amount, 2),
+                commission=round(comm, 2),
+                transfer_fee=round(trans, 2),
+                total_cost=total_cost,
+                position_pct=round(amount / total_equity * 100.0, 2) if total_equity > 0 else 0.0,
+                score=float(symbol_scores.get(sym, 0) or 0),
+                status="simulated",
+                message="模拟成交（T日冻结数量，T+1开盘价与费用）",
+                block_code="",
+                target_weight_contract=build_target_weight_contract(
+                    symbol=sym,
+                    current_weight=round(float(existing_position_value.get(sym, 0) or 0) / total_equity, 6) if total_equity > 0 else 0.0,
+                    target_weight=round((float(existing_position_value.get(sym, 0) or 0) + amount) / total_equity, 6) if total_equity > 0 else 0.0,
+                    score=float(symbol_scores.get(sym, 0) or 0),
+                    evidence={
+                        "return_source": "T日冻结整手订单",
+                        "holding_period": "按冻结Controller合同执行",
+                        "exit_conditions": ["后续冻结计划改变目标", "T+1安全否决"],
+                    },
+                    data_status="ready",
+                ),
+            ))
+        return planned, blocked, pruned
 
     max_single = max(0.0, min(1.0, float(max_single_position_pct or 1.0)))
     max_industry = max(0.0, min(1.0, float(max_industry_position_pct or 1.0)))

@@ -29,6 +29,14 @@ FALLBACK_COSTS = {
     "sell_rate": 0.0025,
     "round_trip_rate": 0.0040,
     "source": "conservative_builtin_fallback",
+    "includes_fees_and_slippage": True,
+    "component_policy": {
+        "commission": "actual_fee_schedule_with_cny5_minimum",
+        "transfer_fee": "stocks_only",
+        "stamp_tax": "stock_sell_only",
+        "slippage": "0.10%_stock_0.05%_etf_each_side",
+        "calibration_buffer": "rate_minus_explicit_components_if_positive",
+    },
 }
 
 
@@ -119,6 +127,8 @@ def active_execution_cost_contract() -> dict[str, Any]:
         "sell_rate": _safe(rates.get("sell_rate")) or FALLBACK_COSTS["sell_rate"],
         "round_trip_rate": _safe(rates.get("round_trip_rate")) or FALLBACK_COSTS["round_trip_rate"],
         "source": "active_simulation_cost_calibration",
+        "includes_fees_and_slippage": True,
+        "component_policy": FALLBACK_COSTS["component_policy"],
         "model_version_id": int(active.get("id") or 0),
         "version": str(active.get("version") or ""),
         "sample_count": int(((active.get("metrics") or {}).get("operation_count")) or 0),

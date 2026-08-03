@@ -35,11 +35,11 @@ MODEL_ROLE_CONTRACTS = {
         "must_not_own": ["市场总仓位", "指数风险"],
         "output": "leader_score / theme_rank",
     },
-    "event_surprise_lgbm_v1": {
-        "decision_role": "事件预期差",
-        "owns": ["事件收益概率", "预期差方向", "事件仓资格"],
+    "event_impact_assessor_v2": {
+        "decision_role": "事件条件影响与可交易性",
+        "owns": ["事件相关性", "成本后正向概率", "已定价/延续/反转概率", "事件方向兑现概率", "负面尾部硬否决"],
         "must_not_own": ["常规底仓排序", "组合风险预算"],
-        "output": "surprise_score / event_win_prob",
+        "output": "positive_impact_probability / priced_in_probability / continuation_probability / reversal_probability / direction_realization_probability / abnormal_return_q10_q50_q90 / event_hard_veto",
     },
     "narrative_transition_multitask_v1": {
         "decision_role": "叙事生命周期",

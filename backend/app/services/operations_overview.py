@@ -23,10 +23,10 @@ from app.services.quant_risk import (
     hrp_fallback_weights,
     ledoit_wolf_covariance,
 )
-from app.services.advanced_controls import black_litterman_weights
 from app.services.quant_run_engine import list_consolidated_trade_dates
 from app.services.rebalance_allocator import correlated_industry_group
 from app.services.five_bucket_contract import build_target_weight_contract, summarize_bucket_contracts
+from app.services.position_valuation import point_in_time_position_market_series
 from app.services.research_engine import capability_registry
 from app.services.thesis_store import list_theses
 
@@ -68,6 +68,26 @@ def _cached_readiness_overview() -> dict[str, Any]:
             "unknown": "尚无足够证据",
         },
     }
+
+
+def _is_actionable_paused_task(task: dict[str, Any]) -> bool:
+    """Exclude normal autonomous waiting states from the exception queue."""
+
+    if str(task.get("status") or "") != "paused":
+        return False
+    if str(task.get("error") or "").strip():
+        return True
+    replay_status = str(task.get("replay_status") or "")
+    if replay_status in {"completed", "waiting_formal_plan", "no_gap"}:
+        return False
+    if str(task.get("replay_mode") or "") == "autonomous_daily":
+        message = str(task.get("last_message") or "")
+        if message in {
+            "自动任务参数已与当前 Champion 同步",
+            "自治任务等待下一份到期正式调仓计划",
+        }:
+            return False
+    return True
 
 
 def _stress_tests(exposures: list[dict[str, Any]], equity: float) -> list[dict[str, Any]]:
@@ -117,15 +137,28 @@ def build_live_portfolio_risk(lookback: int = 120) -> dict[str, Any]:
     market_value = 0.0
     for item in positions:
         symbol = str(item.get("symbol") or "").strip()
-        bars = ds.get_hist_window(symbol, as_of, max(20, min(252, lookback))) if as_of else []
-        closes = [_f(x.close) for x in bars if _f(x.close) > 0]
-        returns = [closes[i] / closes[i - 1] - 1 for i in range(1, len(closes)) if closes[i - 1] > 0]
+        valuation = point_in_time_position_market_series(
+            symbol=symbol,
+            as_of=as_of,
+            fallback_price=_f(item.get("price")),
+            lookback=lookback,
+            data_source=ds,
+        )
+        price = _f(valuation.get("price"))
+        returns = list(valuation.get("returns") or [])
+        price_source = str(valuation.get("price_source") or "")
         if returns:
             returns_by_symbol[symbol] = returns
-        price = closes[-1] if closes else _f(item.get("price"))
         value = price * int(item.get("quantity") or 0)
         market_value += value
-        exposures.append({"symbol": symbol, "name": str(item.get("name") or ""), "market_value": round(value, 2), "observations": len(returns)})
+        exposures.append({
+            "symbol": symbol,
+            "name": str(item.get("name") or ""),
+            "market_price": round(price, 6),
+            "market_value": round(value, 2),
+            "price_source": price_source,
+            "observations": len(returns),
+        })
     equity = cash + market_value
     for item in exposures:
         item["weight"] = round(item["market_value"] / equity, 6) if equity > 0 else 0.0
@@ -154,12 +187,15 @@ def build_live_portfolio_risk(lookback: int = 120) -> dict[str, Any]:
     if returns_by_symbol and not weights:
         weights = hrp_fallback_weights(returns_by_symbol, max_single=.25)
         optimizer = "hrp_inverse_volatility_fallback_v1"
-    prior_weights = {item["symbol"]: _f(item.get("weight")) for item in exposures}
-    views = {symbol: _f(weights.get(symbol)) - prior_weights.get(symbol, 0.0) for symbol in set(prior_weights) | set(weights)}
-    confidences = {item["symbol"]: min(1.0, _f(item.get("observations")) / 60.0) for item in exposures}
-    bl = black_litterman_weights(prior_weights, views, confidences, max_weight=.25) if exposures else {"weights": {}, "adjustments": {}, "method": "black_litterman_diagonal_v1"}
-    weights = bl.get("weights") or weights
-    optimizer = f"{optimizer}+{bl.get('method', 'black_litterman_diagonal_v1')}"
+    black_litterman = {
+        "status": "research_only_not_applied",
+        "production_eligible": False,
+        "method": "black_litterman_diagonal_v1",
+        "reason": (
+            "当前实现缺少完整P/Q/Omega与后验分布；正式目标权重只读取"
+            "统一组合方法竞赛赢家，不再叠加第二次观点倾斜。"
+        ),
+    }
     min_len = min((len(x) for x in returns_by_symbol.values()), default=0)
     portfolio_returns = []
     if min_len:
@@ -278,6 +314,7 @@ def build_live_portfolio_risk(lookback: int = 120) -> dict[str, Any]:
         "account": {"cash": round(cash, 2), "market_value": round(market_value, 2), "equity": round(equity, 2), "high_water_mark": round(peak, 2), "drawdown": round(drawdown, 6)},
         "tail_risk": tail,
         "optimizer": optimizer if returns_by_symbol else "unavailable",
+        "black_litterman": black_litterman,
         "target_weights": weights,
         "target_weight_contracts": target_weight_contracts,
         "five_bucket_summary": summarize_bucket_contracts(target_weight_contracts),
@@ -306,10 +343,7 @@ def build_governance_overview() -> dict[str, Any]:
     failed_tasks = [
         x for x in tasks
         if str(x.get("status") or "") == "failed"
-        or (
-            str(x.get("status") or "") == "paused"
-            and str(x.get("replay_status") or "") != "completed"
-        )
+        or _is_actionable_paused_task(x)
     ]
     unresolved_data = [x for x in observability.get("logs", []) if str(x.get("status") or "") == "failed"]
     readiness_states = [str(x.get("status") or "unknown") for x in readiness.get("consumers", [])]

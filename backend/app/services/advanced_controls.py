@@ -22,8 +22,21 @@ def black_litterman_weights(
     layered on later without changing the contract.
     """
     keys = sorted(set(prior_weights) | set(views))
+    governance = {
+        "production_eligible": False,
+        "scope": "legacy_research_compatibility_only",
+        "limitation": (
+            "对角权重空间观点倾斜不是完整Black-Litterman；缺少协方差、"
+            "P/Q/Omega和后验收益分布，禁止进入统一生产组合竞赛。"
+        ),
+    }
     if not keys:
-        return {"weights": {}, "adjustments": {}, "method": "black_litterman_diagonal_v1"}
+        return {
+            "weights": {},
+            "adjustments": {},
+            "method": "black_litterman_diagonal_v1",
+            **governance,
+        }
     prior = {k: max(0.0, float(prior_weights.get(k, 0) or 0)) for k in keys}
     total = sum(prior.values()) or 1.0
     prior = {k: v / total for k, v in prior.items()}
@@ -57,7 +70,15 @@ def black_litterman_weights(
             eligible = next_eligible
     weights = {k: round(v, 8) for k, v in weights.items()}
     cash_weight = round(max(0.0, 1.0 - sum(weights.values())), 8)
-    return {"weights": weights, "cash_weight": cash_weight, "prior_weights": prior, "adjustments": {k: round(weights[k] - prior[k], 8) for k in keys}, "method": "black_litterman_diagonal_v1", "max_weight": max_weight}
+    return {
+        "weights": weights,
+        "cash_weight": cash_weight,
+        "prior_weights": prior,
+        "adjustments": {k: round(weights[k] - prior[k], 8) for k in keys},
+        "method": "black_litterman_diagonal_v1",
+        "max_weight": max_weight,
+        **governance,
+    }
 
 
 def bayesian_update(prior: float, evidence: list[dict[str, Any]]) -> dict[str, Any]:

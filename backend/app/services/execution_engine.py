@@ -35,6 +35,7 @@ def simulate_open_execution(
     max_order_value_by_symbol: dict[str, float] | None = None,
     initial_entry_fraction: float = 0.5,
     residual_sweep_symbol: str | None = None,
+    fixed_quantities: dict[str, int] | None = None,
 ) -> ExecutionState:
     """
     按真实 A 股规则模拟买入：1手=100股、滑点、佣金、过户费。
@@ -58,6 +59,7 @@ def simulate_open_execution(
         max_order_value_by_symbol=max_order_value_by_symbol,
         initial_entry_fraction=initial_entry_fraction,
         residual_sweep_symbol=residual_sweep_symbol,
+        fixed_quantities=fixed_quantities,
     )
     orders = planned_to_order_results(planned) + blocked
     return ExecutionState(executed_at=executed_at or datetime.now().isoformat(), orders=orders)

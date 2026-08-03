@@ -54,6 +54,8 @@ def _equity_budget_breach(ledger: dict[str, Any], position_gate: dict[str, Any])
 
 
 def _ledger_summary() -> dict[str, Any]:
+    from app.services.position_valuation import point_in_time_position_market_series
+
     cash_balance = float(get_account_balance() or 0)
     baseline = float(get_account_baseline() or 0)
     positions = get_positions()
@@ -67,9 +69,13 @@ def _ledger_summary() -> dict[str, Any]:
         qty = int(p.get("quantity") or 0)
         if not sym or qty <= 0:
             continue
-        px = float(ds.get_price_on_date(sym, latest_date, field="close") or 0) if latest_date else 0.0
-        if px <= 0:
-            px = float(p.get("price") or 0)
+        valuation = point_in_time_position_market_series(
+            symbol=sym,
+            as_of=latest_date,
+            fallback_price=float(p.get("price") or 0),
+            data_source=ds,
+        )
+        px = float(valuation.get("price") or 0)
         mv = round(px * qty, 2)
         market_value += mv
         by_symbol_value[sym] = mv

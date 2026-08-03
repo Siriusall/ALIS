@@ -1,9 +1,17 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 from statistics import mean
 from typing import Any
 
+from app.core.a_share_fees import (
+    LOT_SIZE,
+    apply_slippage_buy,
+    cost_buy,
+    sell_cost_breakdown,
+)
 from app.services.quant_risk import hrp_fallback_weights
 
 
@@ -64,22 +72,206 @@ def _apply_weight_bounds(
     return {symbol: value for symbol, value in result.items() if value > 1e-12}
 
 
-def _apply_hold_bounds(
-    current_weights: dict[str, float],
+def _planned_cost(
     *,
-    symbols: list[str],
-    bounds: dict[str, dict[str, Any]],
+    symbol: str,
+    side: str,
+    quantity: int,
+    reference_price: float,
+    execution_cost_contract: dict[str, Any],
 ) -> dict[str, float]:
-    """Apply mandatory Controller reductions without creating a rebalance."""
-    result: dict[str, float] = {}
+    qty = max(0, int(quantity or 0))
+    price = max(0.0, _safe(reference_price))
+    if qty <= 0 or price <= 0:
+        return {
+            "planned_execution_price": price,
+            "gross_amount": 0.0,
+            "commission": 0.0,
+            "transfer_fee": 0.0,
+            "stamp_tax": 0.0,
+            "slippage_cost": 0.0,
+            "calibration_buffer": 0.0,
+            "total_cost": 0.0,
+        }
+    side = str(side or "").upper()
+    if side == "SELL":
+        breakdown = sell_cost_breakdown(price, qty, symbol)
+        execution_price = _safe(breakdown.get("executed_price"))
+        gross = _safe(breakdown.get("gross_amount"))
+        commission = _safe(breakdown.get("commission"))
+        transfer = _safe(breakdown.get("transfer_fee"))
+        stamp = _safe(breakdown.get("stamp_tax"))
+        slippage = max(0.0, (price - execution_price) * qty)
+        rate = max(0.0, _safe(execution_cost_contract.get("sell_rate")))
+    else:
+        execution_price = apply_slippage_buy(price, symbol)
+        gross, commission, transfer = cost_buy(execution_price, qty, symbol)
+        stamp = 0.0
+        slippage = max(0.0, (execution_price - price) * qty)
+        rate = max(0.0, _safe(execution_cost_contract.get("buy_rate")))
+    explicit = commission + transfer + stamp + slippage
+    conservative = max(explicit, price * qty * rate)
+    return {
+        "planned_execution_price": round(execution_price, 4),
+        "gross_amount": round(gross, 2),
+        "commission": round(commission, 2),
+        "transfer_fee": round(transfer, 2),
+        "stamp_tax": round(stamp, 2),
+        "slippage_cost": round(slippage, 2),
+        "calibration_buffer": round(max(0.0, conservative - explicit), 2),
+        "total_cost": round(conservative, 2),
+    }
+
+
+def _project_to_executable_lots(
+    desired_weights: dict[str, float],
+    *,
+    current_weights: dict[str, float],
+    current_quantities: dict[str, int],
+    reference_prices: dict[str, float],
+    account_equity: float,
+    bounds: dict[str, dict[str, Any]],
+    execution_cost_contract: dict[str, Any],
+) -> dict[str, Any]:
+    equity = max(0.0, _safe(account_equity))
+    symbols = sorted(set(desired_weights) | set(current_weights) | set(bounds))
+    projected = {
+        symbol: max(0.0, _safe(current_weights.get(symbol)))
+        for symbol in symbols
+        if _safe(current_weights.get(symbol)) > 1e-12
+    }
+    orders: list[dict[str, Any]] = []
+    residuals: dict[str, float] = {}
+    blocked: list[str] = []
+    cash_available = max(0.0, equity * (1.0 - sum(projected.values())))
+
+    def _append_order(symbol: str, side: str, quantity: int, desired: float) -> None:
+        current = max(0.0, _safe(current_weights.get(symbol)))
+        price = max(0.0, _safe(reference_prices.get(symbol)))
+        bound = bounds.get(symbol) if isinstance(bounds.get(symbol), dict) else {}
+        obligation = bound.get("obligation") if isinstance(bound.get("obligation"), dict) else {}
+        held_quantity = max(0, int(current_quantities.get(symbol) or 0))
+        signed_weight = quantity * price / equity
+        actual = current + signed_weight if side == "BUY" else max(0.0, current - signed_weight)
+        if str(obligation.get("type") or "") == "mandatory_exit" and quantity >= held_quantity:
+                actual = 0.0
+        cost = _planned_cost(
+            symbol=symbol,
+            side=side,
+            quantity=quantity,
+            reference_price=price,
+            execution_cost_contract=execution_cost_contract,
+        )
+        if actual > 1e-12:
+            projected[symbol] = round(actual, 8)
+        else:
+            projected.pop(symbol, None)
+        orders.append({
+            "symbol": symbol,
+            "side": side,
+            "planned_quantity": quantity,
+            "planned_lots": round(quantity / LOT_SIZE, 4),
+            "whole_lot_quantity": quantity % LOT_SIZE == 0,
+            "full_position_exit": side == "SELL" and quantity == held_quantity,
+            "reference_close": round(price, 4),
+            "estimated_execution_amount": round(_safe(cost.get("gross_amount")), 2),
+            "post_lot_target_weight": round(actual, 8),
+            "lot_rounding_residual": round(desired - actual, 8),
+            "intent": str(bound.get("intent") or ""),
+            "permission": bound.get("permission") or {},
+            "obligation": obligation,
+            "cost": cost,
+        })
+
+    # Sells are frozen first so their conservative net proceeds can fund buys.
     for symbol in symbols:
         current = max(0.0, _safe(current_weights.get(symbol)))
-        lower = max(0.0, _safe((bounds.get(symbol) or {}).get("min_weight")))
-        upper = max(lower, _safe((bounds.get(symbol) or {}).get("max_weight")))
-        value = max(lower, min(upper, current))
-        if value > 1e-12:
-            result[symbol] = value
-    return result
+        desired = max(0.0, _safe(desired_weights.get(symbol)))
+        if desired >= current - 1e-12:
+            continue
+        price = max(0.0, _safe(reference_prices.get(symbol)))
+        held_quantity = max(0, int(current_quantities.get(symbol) or 0))
+        obligation = ((bounds.get(symbol) or {}).get("obligation") or {})
+        obligation_type = str(obligation.get("type") or "none")
+        if equity <= 0 or price <= 0 or held_quantity <= 0:
+            blocked.append(f"reference_price_equity_or_position:{symbol}")
+            continue
+        excess_value = (current - desired) * equity
+        if obligation_type == "mandatory_exit":
+            quantity = held_quantity
+        elif obligation_type == "mandatory_reduce":
+            quantity = int(math.ceil(excess_value / (price * LOT_SIZE) - 1e-12)) * LOT_SIZE
+        else:
+            quantity = int(excess_value // (price * LOT_SIZE)) * LOT_SIZE
+        quantity = min(held_quantity, quantity)
+        if quantity <= 0:
+            if obligation.get("required"):
+                blocked.append(f"mandatory_obligation_not_executable:{symbol}")
+            continue
+        _append_order(symbol, "SELL", quantity, desired)
+        sell_cost = orders[-1]["cost"]
+        cash_available += max(
+            0.0,
+            _safe(sell_cost.get("gross_amount"))
+            - _safe(sell_cost.get("commission"))
+            - _safe(sell_cost.get("transfer_fee"))
+            - _safe(sell_cost.get("stamp_tax"))
+            - _safe(sell_cost.get("calibration_buffer")),
+        )
+
+    # Buys use the remaining cash exactly once; rejected quantities are never
+    # redistributed to another method or symbol after this projection.
+    for symbol in symbols:
+        current = max(0.0, _safe(current_weights.get(symbol)))
+        desired = max(0.0, _safe(desired_weights.get(symbol)))
+        if desired <= current + 1e-12:
+            continue
+        price = max(0.0, _safe(reference_prices.get(symbol)))
+        if equity <= 0 or price <= 0:
+            blocked.append(f"reference_price_or_equity:{symbol}")
+            continue
+        execution_price = apply_slippage_buy(price, symbol)
+        quantity = int(((desired - current) * equity) // (execution_price * LOT_SIZE)) * LOT_SIZE
+        while quantity > 0:
+            cost = _planned_cost(
+                symbol=symbol,
+                side="BUY",
+                quantity=quantity,
+                reference_price=price,
+                execution_cost_contract=execution_cost_contract,
+            )
+            cash_required = (
+                _safe(cost.get("gross_amount"))
+                + _safe(cost.get("commission"))
+                + _safe(cost.get("transfer_fee"))
+                + _safe(cost.get("calibration_buffer"))
+            )
+            if cash_required <= cash_available + 1e-6:
+                break
+            quantity -= LOT_SIZE
+        if quantity <= 0:
+            continue
+        _append_order(symbol, "BUY", quantity, desired)
+        buy_cost = orders[-1]["cost"]
+        cash_available -= (
+            _safe(buy_cost.get("gross_amount"))
+            + _safe(buy_cost.get("commission"))
+            + _safe(buy_cost.get("transfer_fee"))
+            + _safe(buy_cost.get("calibration_buffer"))
+        )
+
+    for symbol in symbols:
+        residuals[symbol] = round(
+            max(0.0, _safe(desired_weights.get(symbol))) - max(0.0, _safe(projected.get(symbol))),
+            8,
+        )
+    return {
+        "weights": projected,
+        "orders": orders,
+        "residuals": residuals,
+        "blocked": blocked,
+        "projected_cash_cny": round(max(0.0, cash_available), 2),
+    }
 
 
 def _portfolio_returns(weights: dict[str, float], returns: dict[str, list[float]]) -> list[float]:
@@ -131,13 +323,15 @@ def _evaluate(
     returns: dict[str, list[float]],
     expected_returns: dict[str, float],
     current_weights: dict[str, float],
-    trading_costs: dict[str, float],
+    execution_projection: dict[str, Any],
+    account_equity: float,
     equity_budget: float,
     weight_bounds: dict[str, dict[str, Any]],
     symbol_industries: dict[str, str],
     industry_targets: dict[str, float],
     industry_penalty_rate: float,
 ) -> dict[str, Any]:
+    weights = dict(execution_projection.get("weights") or {})
     series = _portfolio_returns(weights, returns)
     ordered = sorted(series)
     tail_n = max(1, math.ceil(len(ordered) * 0.05)) if ordered else 1
@@ -147,11 +341,16 @@ def _evaluate(
         abs(_safe(weights.get(symbol)) - _safe(current_weights.get(symbol)))
         for symbol in set(weights) | set(current_weights)
     )
-    cost = sum(
-        abs(_safe(weights.get(symbol)) - _safe(current_weights.get(symbol)))
-        * (_safe(trading_costs.get(symbol)) or 0.0015)
-        for symbol in set(weights) | set(current_weights)
+    orders = [item for item in (execution_projection.get("orders") or []) if isinstance(item, dict)]
+    cost_amount = sum(_safe((item.get("cost") or {}).get("total_cost")) for item in orders)
+    fee_amount = sum(
+        _safe((item.get("cost") or {}).get("commission"))
+        + _safe((item.get("cost") or {}).get("transfer_fee"))
+        + _safe((item.get("cost") or {}).get("stamp_tax"))
+        for item in orders
     )
+    slippage_amount = sum(_safe((item.get("cost") or {}).get("slippage_cost")) for item in orders)
+    cost = cost_amount / max(1.0, _safe(account_equity))
     volatility_daily = (
         math.sqrt(sum((value - mean(series)) ** 2 for value in series) / len(series))
         if series else 1.0
@@ -173,19 +372,34 @@ def _evaluate(
     breaches: list[str] = []
     if any(value < -1e-12 for value in weights.values()):
         breaches.append("negative_weight")
-    # Holding an existing position is a no-trade safety baseline.  A newly
-    # reduced risk budget may make the existing book larger than the desired
-    # budget, but it must not silently turn "hold current" into liquidation.
-    if method != "hold_current" and sum(weights.values()) > equity_budget + 1e-6:
+    if sum(weights.values()) > equity_budget + 1e-6:
         breaches.append("equity_budget")
-    if method != "hold_current" and max(weights.values(), default=0.0) > min(0.25, equity_budget) + 1e-6:
-        breaches.append("single_position")
     for symbol in weight_bounds:
         value = _safe(weights.get(symbol))
         lower = _safe((weight_bounds.get(symbol) or {}).get("min_weight"))
         upper = _safe((weight_bounds.get(symbol) or {}).get("max_weight"))
         if value < lower - 1e-8 or value > upper + 1e-8:
             breaches.append(f"controller_bound:{symbol}")
+        obligation = (
+            (weight_bounds.get(symbol) or {}).get("obligation")
+            if isinstance((weight_bounds.get(symbol) or {}).get("obligation"), dict) else {}
+        )
+        if obligation.get("required"):
+            obligation_type = str(obligation.get("type") or "")
+            current = _safe(current_weights.get(symbol))
+            has_sell = any(
+                str(item.get("symbol") or "") == symbol
+                and str(item.get("side") or "") == "SELL"
+                and int(item.get("planned_quantity") or 0) > 0
+                for item in orders
+            )
+            if obligation_type == "mandatory_exit" and value > 1e-8:
+                breaches.append(f"mandatory_exit:{symbol}")
+            if obligation_type == "mandatory_reduce" and (
+                value >= current - 1e-8 or value > upper + 1e-8 or not has_sell
+            ):
+                breaches.append(f"mandatory_reduce:{symbol}")
+    breaches.extend(str(item) for item in execution_projection.get("blocked") or [])
     if len(series) < 20:
         breaches.append("return_history_lt_20")
     return {
@@ -199,6 +413,12 @@ def _evaluate(
         "max_drawdown_history": round(_max_drawdown(series), 8),
         "turnover": round(turnover, 8),
         "estimated_one_way_cost": round(cost, 8),
+        "estimated_total_cost_cny": round(cost_amount, 2),
+        "estimated_fees_cny": round(fee_amount, 2),
+        "estimated_slippage_cny": round(slippage_amount, 2),
+        "execution_orders": orders,
+        "executable_order_count": len(orders),
+        "lot_rounding_residuals": execution_projection.get("residuals") or {},
         "industry_weights": industry_weights,
         "industry_budget_penalty": round(industry_penalty, 8),
         "objective": round(objective, 8),
@@ -212,6 +432,10 @@ def compete_portfolio_methods(
     expected_returns: dict[str, float],
     current_weights: dict[str, float],
     trading_costs: dict[str, float],
+    current_quantities: dict[str, int] | None = None,
+    reference_prices: dict[str, float] | None = None,
+    account_equity: float = 0.0,
+    execution_cost_contract: dict[str, Any] | None = None,
     equity_budget: float,
     cvar_weights: dict[str, float],
     weight_bounds: dict[str, dict[str, Any]] | None = None,
@@ -219,8 +443,12 @@ def compete_portfolio_methods(
     industry_targets: dict[str, float] | None = None,
     industry_penalty_rate: float = 0.01,
 ) -> dict[str, Any]:
-    """Choose among CVaR, equal weight, HRP and holding current positions."""
-    symbols = sorted(symbol for symbol, values in returns_by_symbol.items() if values)
+    """Choose among four lot-executable portfolios under one frozen contract."""
+    symbols = sorted(
+        set(symbol for symbol, values in returns_by_symbol.items() if values)
+        | set(current_weights)
+        | set((weight_bounds or {}).keys())
+    )
     bounds_enabled = weight_bounds is not None
     raw_bounds = dict(weight_bounds or {})
     frozen_symbol_industries = {
@@ -236,6 +464,11 @@ def compete_portfolio_methods(
             "min_weight": max(0.0, _safe((raw_bounds.get(symbol) or {}).get("min_weight"))),
             "max_weight": max(0.0, _safe((raw_bounds.get(symbol) or {}).get("max_weight", 1.0))),
             "action": str((raw_bounds.get(symbol) or {}).get("action") or ""),
+            "permission": (raw_bounds.get(symbol) or {}).get("permission") or {},
+            "intent": str((raw_bounds.get(symbol) or {}).get("intent") or ""),
+            "obligation": (raw_bounds.get(symbol) or {}).get("obligation") or {
+                "type": "none", "required": False, "target_max_weight": None, "reason_codes": [],
+            },
         }
         for symbol in symbols
     }
@@ -249,7 +482,7 @@ def compete_portfolio_methods(
         "empirical_cvar": _normalise_to_budget(cvar_weights, budget),
         "equal_weight": _normalise_to_budget(equal, budget),
         "hrp": _normalise_to_budget(hrp, budget),
-        "hold_current": {
+        "minimum_turnover_feasible": {
             str(symbol): max(0.0, _safe(value))
             for symbol, value in current_weights.items()
             if _safe(value) > 0
@@ -258,19 +491,45 @@ def compete_portfolio_methods(
     if bounds_enabled:
         candidates = {
             method: (
-                _apply_hold_bounds(weights, symbols=symbols, bounds=bounds)
-                if method == "hold_current"
-                else _apply_weight_bounds(
-                    weights,
-                    symbols=symbols,
-                    bounds=bounds,
-                    budget=budget,
-                )
+                _apply_weight_bounds(weights, symbols=symbols, bounds=bounds, budget=budget)
             )
             for method, weights in raw_candidates.items()
         }
     else:
         candidates = raw_candidates
+    cost_contract = dict(execution_cost_contract or {})
+    if not cost_contract:
+        fallback = max(0.0003, mean([_safe(value) for value in trading_costs.values()]) if trading_costs else 0.0015)
+        cost_contract = {
+            "buy_rate": fallback,
+            "sell_rate": fallback,
+            "round_trip_rate": fallback * 2.0,
+            "source": "legacy_symbol_cost_fallback",
+            "includes_fees_and_slippage": True,
+        }
+    constraint_payload = {
+        "budget": round(budget, 8),
+        "bounds": bounds,
+        "industry_targets": frozen_industry_targets,
+        "industry_penalty_rate": round(max(0.0, float(industry_penalty_rate)), 8),
+        "execution_cost_contract": cost_contract,
+        "lot_size": LOT_SIZE,
+    }
+    constraint_hash = hashlib.sha256(
+        json.dumps(constraint_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    projections = {
+        method: _project_to_executable_lots(
+            weights,
+            current_weights=current_weights,
+            current_quantities={str(k): int(v or 0) for k, v in (current_quantities or {}).items()},
+            reference_prices={str(k): _safe(v) for k, v in (reference_prices or {}).items()},
+            account_equity=account_equity,
+            bounds=bounds,
+            execution_cost_contract=cost_contract,
+        )
+        for method, weights in candidates.items()
+    }
     evaluations = [
         _evaluate(
             method=method,
@@ -278,30 +537,34 @@ def compete_portfolio_methods(
             returns=returns_by_symbol,
             expected_returns=expected_returns,
             current_weights=current_weights,
-            trading_costs=trading_costs,
+            execution_projection=projections[method],
+            account_equity=account_equity,
             equity_budget=budget,
             weight_bounds=bounds if bounds_enabled else {},
             symbol_industries=frozen_symbol_industries,
             industry_targets=frozen_industry_targets,
             industry_penalty_rate=industry_penalty_rate,
-        )
+        ) | {"constraint_hash": constraint_hash}
         for method, weights in candidates.items()
     ]
     eligible = [item for item in evaluations if item["eligible"]]
-    hold = next((item for item in evaluations if item["method"] == "hold_current"), None)
+    hold = next((item for item in evaluations if item["method"] == "minimum_turnover_feasible"), None)
     winner = max(eligible, key=lambda item: (item["objective"], -item["turnover"], item["method"])) if eligible else hold
-    if winner and hold and hold["eligible"] and winner["method"] != "hold_current":
+    if winner and hold and hold["eligible"] and winner["method"] != "minimum_turnover_feasible":
         required_edge = max(0.001, float(winner["estimated_one_way_cost"]))
         if float(winner["objective"]) - float(hold["objective"]) <= required_edge:
             winner = hold
     return {
         "ok": bool(winner),
-        "schema_version": "portfolio_method_competition_v2",
+        "schema_version": "portfolio_method_competition_v3",
         "winner": winner,
         "selected_method": str((winner or {}).get("method") or ""),
         "weights": dict((winner or {}).get("weights") or {}),
         "evaluations": evaluations,
         "weight_bounds": bounds,
+        "constraint_hash": constraint_hash,
+        "execution_orders": list((winner or {}).get("execution_orders") or []),
+        "execution_cost_contract": cost_contract,
         "industry_budget": {
             "schema_version": "alis_portfolio_industry_budget_v1",
             "symbol_industries": frozen_symbol_industries,
@@ -313,9 +576,11 @@ def compete_portfolio_methods(
         },
         "target_budget": round(budget, 8),
         "policy": {
-            "methods": ["empirical_cvar", "equal_weight", "hrp", "hold_current"],
+            "methods": ["empirical_cvar", "equal_weight", "hrp", "minimum_turnover_feasible"],
             "risk_penalty": "1.25 * CVaR20",
             "cost_gate": "winner objective edge must exceed max(0.10%, estimated cost)",
+            "constraint_policy": "all methods share the same budget, Controller bounds, obligations, lot size and cost contract",
+            "cost_policy": "commission, transfer fee, stamp tax, slippage and conservative calibration buffer are charged after lot projection",
             "industry_budget": "every method pays the same frozen industry-budget deviation penalty",
             "simulation_only": True,
         },
