@@ -9,7 +9,7 @@ MODEL_COMPONENT_SCALES = {
     "medium_horizon_lambdarank_v1": 0.040,
     "capital_persistence_multitask_v1": 0.020,
     "leader_lambdarank_v1": 0.015,
-    "event_surprise_lgbm_v1": 0.012,
+    "event_impact_assessor_v2": 0.012,
 }
 ENVIRONMENT_PRIORS = {
     "S0": 0.015,

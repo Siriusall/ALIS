@@ -20,10 +20,12 @@ MODEL_KEYS = (
     "medium_horizon_lambdarank_v1",
     "capital_persistence_multitask_v1",
     "leader_lambdarank_v1",
+    "event_impact_assessor_v2",
     "event_surprise_lgbm_v1",
     "narrative_transition_multitask_v1",
     "market_regime",
 )
+RETIRED_MODEL_KEYS = {"event_surprise_lgbm_v1"}
 RETIRED_CONTRACTS = {
     "daily_cross_sectional_task_metric_and_strategy_ab_v3",
     "non_promotional_top_k_return_diagnostic_v1",
@@ -399,7 +401,12 @@ def _raw_audit() -> dict[str, Any]:
     for row in versions:
         metrics = _loads(row.get("metrics_json"))
         validation = _loads(row.get("validation_json"))
-        target = current_versions if _uses_current_contract(metrics, validation) else old_versions
+        target = (
+            current_versions
+            if str(row.get("model_key") or "") not in RETIRED_MODEL_KEYS
+            and _uses_current_contract(metrics, validation)
+            else old_versions
+        )
         target.append(row)
     old_runs = []
     current_runs = []
@@ -407,7 +414,8 @@ def _raw_audit() -> dict[str, Any]:
         metrics = _loads(row.get("metrics_json"))
         target = (
             current_runs
-            if str(metrics.get("model_evaluation_contract") or "")
+            if str(metrics.get("model_key") or "") not in RETIRED_MODEL_KEYS
+            and str(metrics.get("model_evaluation_contract") or "")
             == SCHEMA_VERSION
             else old_runs
         )

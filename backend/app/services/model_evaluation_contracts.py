@@ -17,6 +17,7 @@ from typing import Any, Iterable
 import numpy as np
 from scipy.stats import spearmanr
 from sklearn.metrics import (
+    average_precision_score,
     balanced_accuracy_score,
     confusion_matrix,
     f1_score,
@@ -78,6 +79,15 @@ SOURCE_REFERENCES: dict[str, dict[str, str]] = {
         "title": "scikit-learn: mean pinball loss",
         "url": "https://scikit-learn.org/stable/modules/generated/sklearn.metrics.mean_pinball_loss.html",
     },
+    "news_market_response": {
+        "title": "Glasserman, Li and Mamaysky: Time Variation in the News-Returns Relationship",
+        "doi": "10.1017/S0022109023001369",
+        "url": "https://www.cambridge.org/core/journals/journal-of-financial-and-quantitative-analysis/article/time-variation-in-the-newsreturns-relationship/01300E364B37863AC469C6D3FA85FBC8",
+    },
+    "event_trading_market_response": {
+        "title": "RavenPack: Event Trading Using Market Response",
+        "url": "https://www.ravenpack.com/research/event-trading-using-market-response",
+    },
 }
 
 
@@ -112,12 +122,20 @@ MODEL_EVALUATION_CONTRACTS: dict[str, dict[str, Any]] = {
             "time_series_split",
         ],
     },
-    "event_surprise_lgbm_v1": {
-        "task": "market_adjusted_event_abnormal_return_regression",
-        "primary_metrics": ["mae", "rmse", "spearman_rank_ic", "sign_balanced_accuracy"],
-        "task_baseline": "zero_abnormal_return_and_training_mean",
+    "event_impact_assessor_v2": {
+        "task": "conditional_event_impact_actionability_interval_and_market_response",
+        "primary_metrics": [
+            "actionability_brier", "actionability_log_loss", "actionability_pr_auc",
+            "priced_in_brier", "continuation_brier", "reversal_brier",
+            "direction_realization_brier",
+            "quantile_pinball_q10_q50_q90", "q10_q90_interval_coverage",
+        ],
+        "task_baseline": "train_only_source_x_event_type_x_market_response_priors_and_quantiles",
         "downstream_gate": "frozen_strategy_ab_after_costs",
-        "sources": ["event_study", "sklearn_metrics", "scipy_spearman"],
+        "sources": [
+            "event_study", "news_market_response", "event_trading_market_response",
+            "sklearn_metrics", "sklearn_calibration", "quantile_pinball",
+        ],
     },
     "narrative_transition_multitask_v1": {
         "task": "two_stage_observable_lifecycle_transition_and_destination",
@@ -127,7 +145,7 @@ MODEL_EVALUATION_CONTRACTS: dict[str, dict[str, Any]] = {
             "final_state_macro_f1", "final_state_log_loss",
             "final_state_multiclass_brier", "per_class_recall",
         ],
-        "task_baseline": "state_persistence_plus_train_only_transition_hazard_and_conditional_destination",
+        "task_baseline": "strongest_of_state_persistence_and_train_only_transition_hazard_and_conditional_destination",
         "downstream_gate": "deterministic_lifecycle_rule_vs_rule_plus_model_shadow_ab",
         "sources": ["sklearn_metrics", "sklearn_calibration", "time_series_split"],
     },
@@ -402,9 +420,14 @@ def evaluate_narrative_transition(
             float(destination_model["macro_f1"])
             > float(destination_baseline["macro_f1"])
         ),
-        # Persistence is already the explicit no-transition baseline for
-        # stage one. Requiring the joint argmax to beat it again would
-        # double-count the same baseline and reward suppressing transitions.
+        # Stage-one event detection and the final four-state decision are
+        # different tasks.  A model may detect transitions while mapping
+        # them to the wrong destination often enough to lose to the
+        # deployable "keep the current state" baseline.  That stronger
+        # baseline must therefore remain a final-state gate as well.
+        "final_state_macro_f1_beats_state_persistence": (
+            float(model["macro_f1"]) > float(persistence["macro_f1"])
+        ),
         "final_state_macro_f1_beats_empirical_transition": (
             float(model["macro_f1"]) > float(markov["macro_f1"])
         ),
@@ -417,7 +440,7 @@ def evaluate_narrative_transition(
     }
     return {
         "schema_version": SCHEMA_VERSION,
-        "contract": "narrative_two_stage_lifecycle_task_native_v2",
+        "contract": "narrative_two_stage_lifecycle_task_native_v3",
         "state_count": class_count,
         "model": model,
         "baselines": {
@@ -450,6 +473,7 @@ def evaluate_narrative_transition(
         "baseline_outperformed": (
             gates["transition_brier_beats_train_only_hazard"]
             and gates["conditional_destination_macro_f1_beats_empirical"]
+            and gates["final_state_macro_f1_beats_state_persistence"]
             and gates["final_state_macro_f1_beats_empirical_transition"]
             and gates["final_state_log_loss_beats_empirical_transition"]
             and gates["final_state_brier_beats_empirical_transition"]
@@ -680,69 +704,548 @@ def evaluate_learning_to_rank(
     }
 
 
-def evaluate_event_abnormal_return(
+def _event_response_group_keys(
+    sources: Iterable[str],
+    reactions: Any,
+    direction_signals: Any,
+    event_types: Iterable[str] | None = None,
+) -> list[str]:
+    reaction_values = _finite(reactions)
+    direction_values = _finite(direction_signals)
+    type_values = (
+        [str(value or "other") for value in event_types]
+        if event_types is not None
+        else ["other"] * len(reaction_values)
+    )
+    keys: list[str] = []
+    for source, event_type, reaction, direction in zip(
+        sources,
+        type_values,
+        reaction_values,
+        direction_values,
+    ):
+        reference = reaction if abs(float(reaction)) > 1e-12 else direction
+        response = "positive" if reference > 0 else "negative" if reference < 0 else "flat"
+        keys.append(
+            f"{str(source or 'unknown')}:{str(event_type or 'other')}:{response}"
+        )
+    return keys
+
+
+def event_response_group_keys(
+    sources: Iterable[str],
+    reactions: Any,
+    direction_signals: Any,
+    event_types: Iterable[str] | None = None,
+) -> list[str]:
+    """Public training/inference form of the formal event baseline groups."""
+
+    return _event_response_group_keys(
+        sources, reactions, direction_signals, event_types,
+    )
+
+
+def fit_event_probability_baseline(
+    train_labels: Any,
+    train_groups: list[str],
+) -> dict[str, Any]:
+    labels = np.asarray(train_labels, dtype=float).reshape(-1)
+    if len(labels) != len(train_groups) or not len(labels):
+        raise ValueError("event probability baseline training vectors are invalid")
+    global_positive = float(np.sum(labels))
+    groups: dict[str, list[float]] = {}
+    for group, label in zip(train_groups, labels):
+        current = groups.setdefault(str(group), [0.0, 0.0])
+        current[0] += float(label)
+        current[1] += 1.0
+    return {
+        "contract": "train_only_laplace_event_group_probability_v1",
+        "global_probability": (global_positive + 1.0) / (len(labels) + 2.0),
+        "group_probabilities": {
+            group: (counts[0] + 1.0) / (counts[1] + 2.0)
+            for group, counts in groups.items()
+        },
+        "group_counts": {group: int(counts[1]) for group, counts in groups.items()},
+    }
+
+
+def apply_event_probability_baseline(
+    baseline: dict[str, Any],
+    evaluation_groups: list[str],
+) -> np.ndarray:
+    global_probability = float(baseline["global_probability"])
+    group_probabilities = dict(baseline.get("group_probabilities") or {})
+    return np.asarray([
+        float(group_probabilities.get(str(group), global_probability))
+        for group in evaluation_groups
+    ], dtype=float)
+
+
+def fit_event_quantile_baseline(
+    train_values: Any,
+    train_groups: list[str],
+    alpha: float,
+) -> dict[str, Any]:
+    values = np.asarray(train_values, dtype=float).reshape(-1)
+    if len(values) != len(train_groups) or not len(values):
+        raise ValueError("event quantile baseline training vectors are invalid")
+    grouped: dict[str, list[float]] = {}
+    for group, value in zip(train_groups, values):
+        grouped.setdefault(str(group), []).append(float(value))
+    return {
+        "contract": "train_only_event_group_quantile_v1",
+        "alpha": float(alpha),
+        "global_quantile": float(np.quantile(values, alpha)),
+        "group_quantiles": {
+            group: float(np.quantile(items, alpha))
+            for group, items in grouped.items()
+            if len(items) >= 10
+        },
+        "group_counts": {group: len(items) for group, items in grouped.items()},
+    }
+
+
+def apply_event_quantile_baseline(
+    baseline: dict[str, Any],
+    evaluation_groups: list[str],
+) -> np.ndarray:
+    global_quantile = float(baseline["global_quantile"])
+    group_quantiles = dict(baseline.get("group_quantiles") or {})
+    return np.asarray([
+        float(group_quantiles.get(str(group), global_quantile))
+        for group in evaluation_groups
+    ], dtype=float)
+
+
+def _event_numeric_vector(name: str, values: Any) -> np.ndarray:
+    vector = np.asarray(values, dtype=float).reshape(-1)
+    if not len(vector):
+        raise ValueError(f"{name} must not be empty")
+    if not np.all(np.isfinite(vector)):
+        raise ValueError(f"{name} contains NaN or infinity")
+    return vector
+
+
+def _require_event_vector_lengths(
+    expected: int,
     *,
-    predictions: Any,
+    group: str,
+    values: dict[str, Any],
+) -> None:
+    mismatched = {
+        name: len(value)
+        for name, value in values.items()
+        if len(value) != expected
+    }
+    if mismatched:
+        detail = ", ".join(
+            f"{name}={length}" for name, length in sorted(mismatched.items())
+        )
+        raise ValueError(
+            f"{group} event vectors must all have length {expected}: {detail}"
+        )
+
+
+def _train_only_group_probabilities(
+    train_labels: np.ndarray,
+    train_groups: list[str],
+    evaluation_groups: list[str],
+) -> np.ndarray:
+    return apply_event_probability_baseline(
+        fit_event_probability_baseline(train_labels, train_groups),
+        evaluation_groups,
+    )
+
+
+def _binary_probability_metrics(
+    actual: np.ndarray,
+    probability: np.ndarray,
+    baseline_probability: np.ndarray,
+) -> dict[str, float]:
+    actual = np.asarray(actual, dtype=int)
+    probability = np.clip(_finite(probability), 1e-12, 1 - 1e-12)
+    baseline_probability = np.clip(
+        _finite(baseline_probability), 1e-12, 1 - 1e-12,
+    )
+    brier = float(np.mean((probability - actual) ** 2))
+    baseline_brier = float(np.mean((baseline_probability - actual) ** 2))
+    model_log_loss = float(log_loss(actual, probability, labels=[0, 1]))
+    baseline_log_loss = float(
+        log_loss(actual, baseline_probability, labels=[0, 1])
+    )
+    prevalence = float(np.mean(actual))
+    pr_auc = (
+        float(average_precision_score(actual, probability))
+        if int(np.sum(actual)) and int(np.sum(actual)) < len(actual)
+        else prevalence
+    )
+    return {
+        "brier": round(brier, 8),
+        "baseline_brier": round(baseline_brier, 8),
+        "brier_improvement": round(baseline_brier - brier, 8),
+        "log_loss": round(model_log_loss, 8),
+        "baseline_log_loss": round(baseline_log_loss, 8),
+        "log_loss_improvement": round(baseline_log_loss - model_log_loss, 8),
+        "pr_auc": round(pr_auc, 8),
+        "prevalence": round(prevalence, 8),
+    }
+
+
+def _train_only_group_quantile_baseline(
+    train_values: np.ndarray,
+    train_groups: list[str],
+    evaluation_groups: list[str],
+    alpha: float,
+) -> np.ndarray:
+    return apply_event_quantile_baseline(
+        fit_event_quantile_baseline(train_values, train_groups, alpha),
+        evaluation_groups,
+    )
+
+
+def event_impact_target_labels(
+    *,
+    abnormal_return: Any,
+    event_reaction: Any,
+    event_direction_signal: Any,
+    transaction_cost_rate: float,
+) -> dict[str, Any]:
+    """Build dimensionally valid event labels and explicit observability masks.
+
+    Direction magnitudes are never multiplied by future returns.  Only their
+    sign is used, so every comparison remains a return versus a return-cost
+    threshold.  Missing/flat directions are excluded rather than labeled zero.
+    """
+
+    returns = np.asarray(abnormal_return, dtype=float).reshape(-1)
+    reaction = np.asarray(event_reaction, dtype=float).reshape(-1)
+    direction = np.asarray(event_direction_signal, dtype=float).reshape(-1)
+    if not (len(returns) == len(reaction) == len(direction)):
+        raise ValueError("event target vectors must have equal lengths")
+    if not all(np.all(np.isfinite(values)) for values in (returns, reaction, direction)):
+        raise ValueError("event target vectors contain NaN or infinity")
+    cost = max(0.0, float(transaction_cost_rate))
+    reaction_observed = np.abs(reaction) > 1e-12
+    direction_observed = np.abs(direction) > 1e-12
+    all_observed = np.ones(len(returns), dtype=bool)
+    reaction_aligned_return = np.sign(reaction) * returns
+    direction_aligned_return = np.sign(direction) * returns
+    return {
+        "contract": "dimensionally_valid_event_direction_targets_v1",
+        "labels": {
+            "actionability": (returns > cost).astype(int),
+            "priced_in": (np.abs(returns) <= cost).astype(int),
+            "continuation": (reaction_aligned_return > cost).astype(int),
+            "reversal": (reaction_aligned_return < -cost).astype(int),
+            "direction_realization": (
+                direction_aligned_return > cost
+            ).astype(int),
+        },
+        "observable_masks": {
+            "actionability": all_observed,
+            "priced_in": all_observed,
+            "continuation": reaction_observed,
+            "reversal": reaction_observed,
+            "direction_realization": direction_observed,
+        },
+        "definitions": {
+            "actionability": "future_market_adjusted_return > transaction_cost_rate",
+            "priced_in": "abs(future_market_adjusted_return) <= transaction_cost_rate",
+            "continuation": (
+                "sign(same_day_market_adjusted_reaction) * "
+                "future_market_adjusted_return > transaction_cost_rate"
+            ),
+            "reversal": (
+                "sign(same_day_market_adjusted_reaction) * "
+                "future_market_adjusted_return < -transaction_cost_rate"
+            ),
+            "direction_realization": (
+                "sign(observable_structured_event_direction) * "
+                "future_market_adjusted_return > transaction_cost_rate"
+            ),
+        },
+        "transaction_cost_rate": cost,
+        "direction_magnitude_multiplication_forbidden": True,
+        "unobservable_direction_excluded": True,
+    }
+
+
+def evaluate_event_impact(
+    *,
+    positive_impact_probability: Any,
+    priced_in_probability: Any,
+    continuation_probability: Any,
+    reversal_probability: Any,
+    direction_realization_probability: Any,
+    q10: Any,
+    q50: Any,
+    q90: Any,
     actual_abnormal_return: Any,
     train_abnormal_return: Any,
+    event_reaction: Any,
+    train_event_reaction: Any,
+    event_direction_signal: Any,
+    train_event_direction_signal: Any,
+    event_sources: Iterable[str],
+    train_event_sources: Iterable[str],
+    transaction_cost_rate: float,
     target_contract: str,
+    event_types: Iterable[str] | None = None,
+    train_event_types: Iterable[str] | None = None,
 ) -> dict[str, Any]:
-    actual = _finite(actual_abnormal_return)
-    predicted = _finite(predictions)
-    train = _finite(train_abnormal_return)
-    zero = np.zeros(len(actual), dtype=float)
-    train_mean = np.full(len(actual), float(np.mean(train)), dtype=float)
-    model_mae = float(mean_absolute_error(actual, predicted))
-    zero_mae = float(mean_absolute_error(actual, zero))
-    mean_mae = float(mean_absolute_error(actual, train_mean))
-    model_rmse = float(np.sqrt(mean_squared_error(actual, predicted)))
-    zero_rmse = float(np.sqrt(mean_squared_error(actual, zero)))
-    correlation = spearmanr(predicted, actual)
-    rank_ic = float(correlation.statistic)
-    if not np.isfinite(rank_ic):
-        rank_ic = 0.0
-    actual_sign = (actual > 0).astype(int)
-    predicted_sign = (predicted > 0).astype(int)
-    sign_balanced_accuracy = (
-        float(balanced_accuracy_score(actual_sign, predicted_sign))
-        if len(set(actual_sign.tolist())) == 2 else 0.5
+    actual = _event_numeric_vector(
+        "actual_abnormal_return", actual_abnormal_return,
     )
-    gates = {
-        "market_adjusted_abnormal_return_target": (
-            target_contract == "market_adjusted_abnormal_return_v1"
+    train = _event_numeric_vector(
+        "train_abnormal_return", train_abnormal_return,
+    )
+    reaction = _event_numeric_vector("event_reaction", event_reaction)
+    train_reaction = _event_numeric_vector(
+        "train_event_reaction", train_event_reaction,
+    )
+    direction = _event_numeric_vector(
+        "event_direction_signal", event_direction_signal,
+    )
+    train_direction = _event_numeric_vector(
+        "train_event_direction_signal", train_event_direction_signal,
+    )
+    evaluation_sources = [str(value or "unknown") for value in event_sources]
+    training_sources = [
+        str(value or "unknown") for value in train_event_sources
+    ]
+    evaluation_types = (
+        [str(value or "other") for value in event_types]
+        if event_types is not None else ["other"] * len(actual)
+    )
+    training_types = (
+        [str(value or "other") for value in train_event_types]
+        if train_event_types is not None else ["other"] * len(train)
+    )
+    probability_vectors = {
+        "positive_impact_probability": _event_numeric_vector(
+            "positive_impact_probability", positive_impact_probability,
         ),
-        "mae_beats_zero_and_training_mean": model_mae < min(zero_mae, mean_mae),
-        "rmse_beats_zero": model_rmse < zero_rmse,
-        "spearman_rank_ic_positive": rank_ic > 0,
-        "sign_balanced_accuracy_above_chance": sign_balanced_accuracy > 0.5,
+        "priced_in_probability": _event_numeric_vector(
+            "priced_in_probability", priced_in_probability,
+        ),
+        "continuation_probability": _event_numeric_vector(
+            "continuation_probability", continuation_probability,
+        ),
+        "reversal_probability": _event_numeric_vector(
+            "reversal_probability", reversal_probability,
+        ),
+        "direction_realization_probability": _event_numeric_vector(
+            "direction_realization_probability",
+            direction_realization_probability,
+        ),
+    }
+    quantile_vectors = {
+        "q10": _event_numeric_vector("q10", q10),
+        "q50": _event_numeric_vector("q50", q50),
+        "q90": _event_numeric_vector("q90", q90),
+    }
+    _require_event_vector_lengths(
+        len(actual),
+        group="evaluation",
+        values={
+            "event_reaction": reaction,
+            "event_direction_signal": direction,
+            "event_sources": evaluation_sources,
+            "event_types": evaluation_types,
+            **probability_vectors,
+            **quantile_vectors,
+        },
+    )
+    _require_event_vector_lengths(
+        len(train),
+        group="training",
+        values={
+            "train_event_reaction": train_reaction,
+            "train_event_direction_signal": train_direction,
+            "train_event_sources": training_sources,
+            "train_event_types": training_types,
+        },
+    )
+    cost = max(0.0, float(transaction_cost_rate))
+    evaluation_groups = _event_response_group_keys(
+        evaluation_sources, reaction, direction, evaluation_types,
+    )
+    training_groups = _event_response_group_keys(
+        training_sources, train_reaction, train_direction, training_types,
+    )
+    evaluation_targets = event_impact_target_labels(
+        abnormal_return=actual,
+        event_reaction=reaction,
+        event_direction_signal=direction,
+        transaction_cost_rate=cost,
+    )
+    training_targets = event_impact_target_labels(
+        abnormal_return=train,
+        event_reaction=train_reaction,
+        event_direction_signal=train_direction,
+        transaction_cost_rate=cost,
+    )
+    labels = evaluation_targets["labels"]
+    train_labels = training_targets["labels"]
+    evaluation_masks = evaluation_targets["observable_masks"]
+    training_masks = training_targets["observable_masks"]
+    probabilities = {
+        "actionability": probability_vectors["positive_impact_probability"],
+        "priced_in": probability_vectors["priced_in_probability"],
+        "continuation": probability_vectors["continuation_probability"],
+        "reversal": probability_vectors["reversal_probability"],
+        "direction_realization": probability_vectors[
+            "direction_realization_probability"
+        ],
+    }
+    heads: dict[str, dict[str, float]] = {}
+    for key in labels:
+        evaluation_mask = np.asarray(evaluation_masks[key], dtype=bool)
+        training_mask = np.asarray(training_masks[key], dtype=bool)
+        if not bool(np.any(evaluation_mask)) or not bool(np.any(training_mask)):
+            heads[key] = {
+                "observed_rows": int(evaluation_mask.sum()),
+                "train_observed_rows": int(training_mask.sum()),
+                "positive_count": int(np.sum(labels[key][evaluation_mask])),
+                "train_positive_count": int(np.sum(train_labels[key][training_mask])),
+                "brier": 1.0,
+                "baseline_brier": 1.0,
+                "brier_improvement": 0.0,
+                "log_loss": 100.0,
+                "baseline_log_loss": 100.0,
+                "log_loss_improvement": 0.0,
+                "pr_auc": 0.0,
+                "prevalence": 0.0,
+            }
+            continue
+        baseline = _train_only_group_probabilities(
+            train_labels[key][training_mask],
+            np.asarray(training_groups, dtype=object)[training_mask].tolist(),
+            np.asarray(evaluation_groups, dtype=object)[evaluation_mask].tolist(),
+        )
+        metrics = _binary_probability_metrics(
+            labels[key][evaluation_mask],
+            probabilities[key][evaluation_mask],
+            baseline,
+        )
+        heads[key] = {
+            **metrics,
+            "observed_rows": int(evaluation_mask.sum()),
+            "train_observed_rows": int(training_mask.sum()),
+            "positive_count": int(np.sum(labels[key][evaluation_mask])),
+            "train_positive_count": int(np.sum(train_labels[key][training_mask])),
+        }
+
+    quantile_predictions = {
+        "q10": (0.10, quantile_vectors["q10"]),
+        "q50": (0.50, quantile_vectors["q50"]),
+        "q90": (0.90, quantile_vectors["q90"]),
+    }
+    pinball: dict[str, dict[str, float]] = {}
+    baseline_quantiles: dict[str, np.ndarray] = {}
+    for key, (alpha, prediction) in quantile_predictions.items():
+        baseline = _train_only_group_quantile_baseline(
+            train, training_groups, evaluation_groups, alpha,
+        )
+        baseline_quantiles[key] = baseline
+        model_loss = float(mean_pinball_loss(actual, prediction, alpha=alpha))
+        baseline_loss = float(mean_pinball_loss(actual, baseline, alpha=alpha))
+        pinball[key] = {
+            "alpha": alpha,
+            "model": round(model_loss, 8),
+            "event_family_response_baseline": round(baseline_loss, 8),
+            "improvement": round(baseline_loss - model_loss, 8),
+        }
+    lower = quantile_predictions["q10"][1]
+    upper = quantile_predictions["q90"][1]
+    baseline_lower = baseline_quantiles["q10"]
+    baseline_upper = baseline_quantiles["q90"]
+    coverage = float(np.mean((actual >= lower) & (actual <= upper)))
+    baseline_coverage = float(
+        np.mean((actual >= baseline_lower) & (actual <= baseline_upper))
+    )
+    crossing_rate = float(np.mean(lower > upper))
+    coverage_error = abs(coverage - 0.8)
+    baseline_coverage_error = abs(baseline_coverage - 0.8)
+    gates = {
+        "conditional_market_adjusted_event_impact_target": (
+            target_contract == "conditional_market_adjusted_event_impact_v3"
+        ),
+        "dimensionally_valid_direction_targets": (
+            evaluation_targets["contract"]
+            == "dimensionally_valid_event_direction_targets_v1"
+            and bool(
+                evaluation_targets.get(
+                    "direction_magnitude_multiplication_forbidden"
+                )
+            )
+        ),
+        "cost_threshold_recorded": cost > 0.0,
+        "actionability_brier_improves": heads["actionability"]["brier_improvement"] > 0,
+        "actionability_log_loss_improves": heads["actionability"]["log_loss_improvement"] > 0,
+        "actionability_pr_auc_beats_prevalence": (
+            heads["actionability"]["pr_auc"] > heads["actionability"]["prevalence"]
+        ),
+        "priced_in_brier_improves": heads["priced_in"]["brier_improvement"] > 0,
+        "continuation_brier_improves": heads["continuation"]["brier_improvement"] > 0,
+        "reversal_brier_improves": heads["reversal"]["brier_improvement"] > 0,
+        "direction_realization_brier_improves": (
+            heads["direction_realization"]["brier_improvement"] > 0
+        ),
+        "directional_test_support_minimum_20": all(
+            int(heads[name]["observed_rows"]) >= 20
+            for name in ("continuation", "reversal", "direction_realization")
+        ),
+        "all_quantile_pinball_losses_improve": all(
+            float(item["improvement"]) > 0 for item in pinball.values()
+        ),
+        "quantiles_do_not_cross": crossing_rate == 0.0,
+        "interval_coverage_not_worse_than_baseline": (
+            coverage_error <= baseline_coverage_error
+        ),
+        "event_source_type_and_response_recorded": all(
+            group.split(":", 2)[0] != "unknown"
+            and bool(group.split(":", 2)[1])
+            for group in evaluation_groups
+        ),
     }
     return {
         "schema_version": SCHEMA_VERSION,
-        "contract": "event_abnormal_return_task_native_v1",
+        "contract": "conditional_event_impact_task_native_v3",
         "target_contract": target_contract,
-        "model": {
-            "mae": round(model_mae, 8),
-            "rmse": round(model_rmse, 8),
-            "spearman_rank_ic": round(rank_ic, 8),
-            "sign_balanced_accuracy": round(sign_balanced_accuracy, 8),
+        "target_definition": {
+            "contract": evaluation_targets["contract"],
+            "definitions": evaluation_targets["definitions"],
+            "direction_magnitude_multiplication_forbidden": True,
+            "unobservable_direction_excluded": True,
+        },
+        "transaction_cost_rate": round(cost, 8),
+        "probability_heads": heads,
+        "quantiles": {
+            "pinball": pinball,
+            "q10_q90_interval_coverage": round(coverage, 8),
+            "baseline_interval_coverage": round(baseline_coverage, 8),
+            "nominal_interval_coverage": 0.8,
+            "coverage_error": round(coverage_error, 8),
+            "baseline_coverage_error": round(baseline_coverage_error, 8),
+            "crossing_rate": round(crossing_rate, 8),
         },
         "baselines": {
-            "zero_abnormal_return": {
-                "mae": round(zero_mae, 8),
-                "rmse": round(zero_rmse, 8),
-            },
-            "training_mean": {
-                "value": round(float(np.mean(train)), 8),
-                "mae": round(mean_mae, 8),
-            },
+            "contract": "train_only_source_x_event_type_x_market_response_priors_and_quantiles_v3",
+            "groups": sorted(set(training_groups)),
         },
         "gates": gates,
         "passed": all(gates.values()),
         "baseline_outperformed": (
-            gates["mae_beats_zero_and_training_mean"]
-            and gates["rmse_beats_zero"]
+            gates["actionability_brier_improves"]
+            and gates["actionability_log_loss_improves"]
+            and gates["priced_in_brier_improves"]
+            and gates["continuation_brier_improves"]
+            and gates["reversal_brier_improves"]
+            and gates["direction_realization_brier_improves"]
+            and gates["all_quantile_pinball_losses_improve"]
         ),
-        "evaluation_contract": evaluation_contract("event_surprise_lgbm_v1"),
+        "evaluation_contract": evaluation_contract("event_impact_assessor_v2"),
     }
 
 

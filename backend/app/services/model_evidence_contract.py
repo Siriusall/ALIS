@@ -26,14 +26,27 @@ MODEL_OUTPUT_CONTRACTS: dict[str, dict[str, Any]] = {
         "consumers": ["function_bucket", "return_source", "position_cap"],
         "fallback": "leader_strength_rule_v1",
     },
-    "event_surprise_lgbm_v1": {
+    "event_impact_assessor_v2": {
         "output_schema": {
-            "expected_abnormal_return_5d": "number",
-            "event_text_sentiment": "number",
-            "event_text_confidence": "number",
+            "impact_contract": "string",
+            "event_relevance": "number",
+            "positive_impact_probability": "number",
+            "priced_in_probability": "number",
+            "continuation_probability": "number",
+            "reversal_probability": "number",
+            "direction_realization_probability": "number",
+            "abnormal_return_q10": "number",
+            "abnormal_return_q50": "number",
+            "abnormal_return_q90": "number",
+            "crowding_risk": "number",
+            "recommended_holding_horizon_sessions": "number",
+            "event_hard_veto": "boolean",
         },
-        "consumers": ["return_source", "holding_period", "exit_conditions"],
-        "fallback": "event_surprise_rule_v1",
+        "consumers": [
+            "return_source", "holding_period", "exit_conditions",
+            "add_reduce_gate", "event_risk_veto",
+        ],
+        "fallback": "event_impact_deterministic_rule_v1",
     },
     "narrative_transition_multitask_v1": {
         "output_schema": {
@@ -68,15 +81,15 @@ MODEL_OUTPUT_CONTRACTS: dict[str, dict[str, Any]] = {
 
 EVIDENCE_BINDINGS: dict[str, dict[str, str]] = {
     "function_bucket": {
-        "primary": "medium_horizon_lambdarank_v1|leader_lambdarank_v1|event_surprise_lgbm_v1|narrative_bertopic_v1",
+        "primary": "medium_horizon_lambdarank_v1|leader_lambdarank_v1|event_impact_assessor_v2|narrative_bertopic_v1",
         "fallback": "five_bucket_rule_v1",
     },
     "return_source": {
-        "primary": "medium_horizon_lambdarank_v1|leader_lambdarank_v1|event_surprise_lgbm_v1",
+        "primary": "medium_horizon_lambdarank_v1|leader_lambdarank_v1|event_impact_assessor_v2",
         "fallback": "thesis_proxy_v1",
     },
     "holding_period": {
-        "primary": "event_surprise_lgbm_v1|narrative_transition_multitask_v1",
+        "primary": "event_impact_assessor_v2|narrative_transition_multitask_v1",
         "fallback": "bucket_policy_v1",
     },
     "narrative_lifecycle": {
@@ -88,7 +101,7 @@ EVIDENCE_BINDINGS: dict[str, dict[str, str]] = {
         "fallback": "capital_persistence_proxy_v1",
     },
     "exit_conditions": {
-        "primary": "narrative_transition_multitask_v1|event_surprise_lgbm_v1|risk_policy_v1",
+        "primary": "narrative_transition_multitask_v1|event_impact_assessor_v2|risk_policy_v1",
         "fallback": "risk_exit_policy_v1",
     },
     "data_status": {
