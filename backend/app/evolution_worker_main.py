@@ -6,8 +6,8 @@ import logging
 import signal
 import threading
 
-from app.data_platform.db import init_db as init_data_platform_db
-from app.db.store import init_db
+from app.data_platform.db import _conn as data_platform_conn
+from app.db.store import _conn as business_conn
 from app.services.evolution_orchestrator import (
     recover_evolution_tasks,
     start_evolution_worker,
@@ -17,12 +17,20 @@ from app.services.evolution_orchestrator import (
 logger = logging.getLogger("quant.evolution_worker")
 
 
+def _verify_database_connections() -> None:
+    """Verify the API-owned schemas are reachable without performing migrations."""
+
+    with business_conn() as conn:
+        conn.execute("SELECT 1").fetchone()
+    with data_platform_conn() as conn:
+        conn.execute("SELECT 1").fetchone()
+
+
 def run_forever(stop_event: threading.Event | None = None) -> None:
-    """Initialize shared schemas, recover expired leases, and serve until stopped."""
+    """Verify shared schemas, recover expired leases, and serve until stopped."""
 
     stopper = stop_event or threading.Event()
-    init_db()
-    init_data_platform_db()
+    _verify_database_connections()
     recovered = recover_evolution_tasks()
     started = start_evolution_worker()
     logger.info(
