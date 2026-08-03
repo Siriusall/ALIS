@@ -68,22 +68,22 @@ export function EvidenceDetails({ title = "查看证据", children }: { title?: 
 }
 
 export function fmtMoney(value: unknown) {
-  if (value === null || value === undefined || value === "") return "--";
+  if (value === null || value === undefined || value === "") return "未记录金额";
   const number = Number(value);
-  return Number.isFinite(number) ? new Intl.NumberFormat("zh-CN", { style: "currency", currency: "CNY", maximumFractionDigits: 0 }).format(number) : "--";
+  return Number.isFinite(number) ? new Intl.NumberFormat("zh-CN", { style: "currency", currency: "CNY", maximumFractionDigits: 0 }).format(number) : "金额不可用";
 }
 
 export function fmtPct(value: unknown, signed = true) {
-  if (value === null || value === undefined || value === "") return "--";
+  if (value === null || value === undefined || value === "") return "未记录比例";
   const number = Number(value);
-  if (!Number.isFinite(number)) return "--";
+  if (!Number.isFinite(number)) return "比例不可用";
   const pct = Math.abs(number) <= 1 ? number * 100 : number;
   return `${signed && pct > 0 ? "+" : ""}${pct.toFixed(2)}%`;
 }
 
 export function fmtPoints(value: unknown, signed = true) {
-  if (value === null || value === undefined || value === "") return "--";
+  if (value === null || value === undefined || value === "") return "未记录百分点";
   const number = Number(value);
-  if (!Number.isFinite(number)) return "--";
+  if (!Number.isFinite(number)) return "百分点不可用";
   return `${signed && number > 0 ? "+" : ""}${number.toFixed(2)}%`;
 }

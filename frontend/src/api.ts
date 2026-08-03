@@ -3,9 +3,22 @@ export type Json = Record<string, any>;
 const API_BASE = String(import.meta.env.VITE_API_BASE || "").replace(/\/$/, "");
 const API_READ_TIMEOUT_MS = Number(import.meta.env.VITE_API_READ_TIMEOUT_MS || 60_000);
 const TOKEN_KEY = "alis_access_token";
+let sessionProbe: Promise<void> | null = null;
 
 export function getToken() { return window.localStorage.getItem(TOKEN_KEY); }
 export function setToken(token: string | null) { if (token) window.localStorage.setItem(TOKEN_KEY, token); else window.localStorage.removeItem(TOKEN_KEY); }
+
+async function confirmSessionExpired(token: string | null) {
+  if (!token || sessionProbe) return sessionProbe;
+  sessionProbe = fetch(`${API_BASE}/api/auth/me`, {
+    headers: { Accept: "application/json", Authorization: `Bearer ${token}` },
+  }).then((response) => {
+    if (response.status === 401) window.dispatchEvent(new CustomEvent("alis:session-expired"));
+  }).catch(() => {
+    // A network failure is not evidence that the seven-day local session expired.
+  }).finally(() => { sessionProbe = null; });
+  return sessionProbe;
+}
 
 export async function readApi(path: string, signal?: AbortSignal, timeoutMs = API_READ_TIMEOUT_MS): Promise<Json> {
   const timeout = new AbortController();
@@ -16,7 +29,10 @@ export async function readApi(path: string, signal?: AbortSignal, timeoutMs = AP
   try {
     const token = getToken();
     const response = await fetch(`${API_BASE}${path}`, { signal: timeout.signal, headers: { Accept: "application/json", ...(token ? { Authorization: `Bearer ${token}` } : {}) } });
-    if (response.status === 401) window.dispatchEvent(new CustomEvent("alis:session-expired"));
+    if (response.status === 401) {
+      if (path === "/api/auth/me") window.dispatchEvent(new CustomEvent("alis:session-expired"));
+      else void confirmSessionExpired(token);
+    }
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     return response.json();
   } finally {

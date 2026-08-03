@@ -7,7 +7,7 @@ const routeKeys: Record<string, Array<keyof typeof endpoints>> = {
   "/overview": ["owner", "ledger"],
   "/decision": ["owner", "decision"],
   "/portfolio": ["owner", "ledger", "positions", "portfolio", "performance", "risk", "research"],
-  "/evolution": ["factors", "evolutionTasks"],
+  "/evolution": ["factors", "factorStatus", "factorResearch", "factorLineage", "evolutionTasks"],
   "/evolution/factors": ["factors", "researchAnalytics", "researchFactorAnalytics"],
   "/evolution/metrics": ["researchAnalytics", "researchTimeseries", "evolutionTasks"],
   "/evolution/waves": ["researchAnalytics", "factorResearch", "researchExpertHistory", "researchEnvironmentSimilarity", "researchArchive"],
@@ -81,16 +81,27 @@ export function useConsoleData(pathname: string) {
     controller.current = new AbortController();
     const hasRouteCache = keys.every((key) => cache.has(key));
     setLoading(!hasRouteCache);
-    setRefreshing(hasRouteCache);
+    setRefreshing(force);
     const entries = keys;
     const activeController = controller.current;
     setProgress({ completed: 0, total: entries.length });
     setErrors({});
+    let routeRevealed = hasRouteCache;
+    const revealRoute = () => {
+      if (routeRevealed || controller.current !== activeController) return;
+      routeRevealed = true;
+      setLoading(false);
+    };
+    const revealTimer = window.setTimeout(revealRoute, 1_500);
+    const releaseRefreshTimer = window.setTimeout(() => {
+      if (controller.current === activeController) setRefreshing(false);
+    }, 600);
     const requests = entries.map(async (key) => {
       try {
         const value = await loadEndpoint(key, force);
         if (controller.current !== activeController) return;
         setData((current) => ({ ...current, [key]: value }));
+        revealRoute();
       } catch (error: any) {
         if (activeController.signal.aborted || controller.current !== activeController) return;
         const message = error?.name === "AbortError" ? "读取超时" : String(error?.message || "读取失败");
@@ -105,6 +116,8 @@ export function useConsoleData(pathname: string) {
     const remainingMs = Math.max(0, minimumVisibleMs - (Date.now() - startedAt));
     if (remainingMs) await new Promise((resolve) => window.setTimeout(resolve, remainingMs));
     await Promise.allSettled(requests);
+    window.clearTimeout(revealTimer);
+    window.clearTimeout(releaseRefreshTimer);
     if (controller.current === activeController) { setLoading(false); setRefreshing(false); }
   }, [keys]);
 
