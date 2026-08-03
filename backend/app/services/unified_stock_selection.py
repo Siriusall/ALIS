@@ -39,6 +39,7 @@ def _rank_full_market(
         exchange_group=exchange_group,
         scoring_timeout_sec=scoring_timeout_sec,
         explain_symbols=explain_symbols,
+        model_inference_mode="online_limited_live",
     )
 
 
@@ -308,11 +309,46 @@ def build_unified_stock_selection(
     }
     model_signal_snapshot = {
         "schema_version": "alis_model_signal_snapshot_v1",
+        "authorization_policy": {
+            "schema_version": "alis_model_online_tiered_authority_v1",
+            "all_models_score_daily": True,
+            "formal_promotion_requires_fresh_oos": True,
+            "first_live_review_after_future_sessions": 20,
+            "champion_failure_quarantine_preserved": True,
+            "tiers": {
+                "limited_rank": [
+                    "medium_horizon_lambdarank_v1",
+                    "capital_persistence_multitask_v1",
+                    "leader_lambdarank_v1",
+                ],
+                "risk_only": ["event_impact_assessor_v2"],
+                "observation_only": [
+                    "narrative_transition_multitask_v1",
+                    "market_regime_hsmm_v1",
+                ],
+            },
+        },
         "fusion": (
             ranking_detail.get("model_signal_fusion")
             if isinstance(ranking_detail.get("model_signal_fusion"), dict) else {}
         ),
         "symbols": signal_snapshots,
+        "daily_ab": {
+            "schema_version": "alis_daily_model_ab_snapshot_v1",
+            "with_models": {
+                "ranked_symbols": ranked_symbols,
+                "admitted_symbols": admitted_symbols,
+            },
+            "without_models": (
+                ranking_detail.get("model_disabled_baseline")
+                if isinstance(ranking_detail.get("model_disabled_baseline"), dict) else {}
+            ),
+            "evaluation_policy": {
+                "minimum_future_sessions": 20,
+                "bad_result": "auto_deweight_or_shadow_only",
+                "good_result": "increase_authority_gradually_but_do_not_promote_without_fresh_oos",
+            },
+        },
     }
 
     contract_base = {

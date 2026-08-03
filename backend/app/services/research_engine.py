@@ -273,7 +273,7 @@ def capability_registry() -> list[dict[str, Any]]:
     return [
         {"key": "market", "name": "市场总览", "status": "ready", "api": "/api/decision/summary", "missing": ["HSMM已通过历史OOS，当前处于真实影子观察期；观察期达标后才进入上线评审"]},
         {"key": "data", "name": "数据中台", "status": "ready", "api": "/api/data-center/status", "missing": []},
-        {"key": "stock_research", "name": "股票研究中心", "status": "ready", "api": "/api/research/evaluate", "missing": []},
+        {"key": "stock_research", "name": "股票研究中心", "status": "ready", "api": "/api/research/evaluate", "missing": ["周期公司产品价格/产销量/产能、资产型NAV/特许期、平台用户留存、消费渠道库存/同店等外部经营指标尚无可靠结构化源"]},
         {"key": "industry", "name": "行业研究中心", "status": "ready", "api": "/api/research/industries", "missing": ["产品价格、产能、政策供给等行业专属序列（使用PMI+公司财务聚合代理）"]},
         {"key": "events", "name": "公告事件中心", "status": "ready", "api": "/api/research/events", "missing": ["回购、合同、重组和定增的文本抽取需人工抽检验收"]},
         {"key": "sentiment", "name": "市场情绪中心", "status": "ready", "api": "/api/model-strategy/market-context/live", "missing": []},
@@ -660,6 +660,31 @@ def build_stock_research(ts_code: str, *, persist: bool = True, as_of_time: str 
             dimensions_input[dimension].update(patch)
         template_facts = nonfinancial_inputs["facts"]
         template_limitations = nonfinancial_inputs["limitations"]
+    from app.services.research_template_metrics import build_professional_template_data
+    professional_template_data = build_professional_template_data(
+        template_kind,
+        income=latest_income,
+        balance=latest_balance,
+        cashflow=latest_cashflow,
+        indicator=latest_indicator,
+        derived={
+            "revenue_growth": revenue_growth,
+            "core_profit_growth": profit_growth,
+            "cash_conversion": cash_conversion,
+            "debt_to_assets": debt_ratio,
+        },
+        industry_observations=dimensions_input["industry"],
+        source_rows={
+            "income": income[0] if income else {},
+            "balancesheet": balance[0] if balance else {},
+            "cashflow": cashflow[0] if cashflow else {},
+            "fina_indicator": indicator[0] if indicator else {},
+        },
+    )
+    from app.services.professional_metric_documents import list_professional_metric_candidates
+    professional_template_data["external_operating_metric_candidates"] = (
+        list_professional_metric_candidates(code, as_of_time=as_of_time)
+    )
     name = str(master.get("name") or "")
     latest_audit = audit[0]["payload"] if audit else {}
     audit_result = str(latest_audit.get("audit_result") or "").strip()
@@ -733,6 +758,24 @@ def build_stock_research(ts_code: str, *, persist: bool = True, as_of_time: str 
         {"api": api, "period": rows[0]["period"], "available_time": rows[0]["available_time"]}
         for api, rows in (("income", income), ("balancesheet", balance), ("cashflow", cashflow), ("fina_indicator", indicator), ("fina_audit", audit), ("pledge_stat", pledge)) if rows
     ]
+    professional_available_time = max(
+        (
+            str(item.get("available_time") or "")
+            for item in professional_template_data.get("point_in_time_evidence") or []
+        ),
+        default="",
+    )
+    if professional_template_data.get("total_metrics"):
+        evidence.append({
+            "api": "derived_professional_template_data",
+            "period": income[0]["period"] if income else None,
+            "available_time": professional_available_time or None,
+            "schema_version": professional_template_data.get("schema_version"),
+            "template_kind": template_kind,
+            "coverage": professional_template_data.get("coverage"),
+            "metrics": professional_template_data.get("metrics"),
+            "production_score_consumed": False,
+        })
     result = {
         "ok": True,
         "ts_code": code,
@@ -742,6 +785,7 @@ def build_stock_research(ts_code: str, *, persist: bool = True, as_of_time: str 
             "kind": template_kind,
             "facts": template_facts,
             "limitations": template_limitations,
+            "professional_data": professional_template_data,
         },
         "classification": classify_company(industry=str(master.get("industry") or ""), metrics=raw_metrics),
         "risk": risk,

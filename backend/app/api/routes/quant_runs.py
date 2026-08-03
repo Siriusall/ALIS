@@ -769,6 +769,8 @@ def quant_run_task_create(req: QuantTaskCreateRequest) -> dict:
 
 @router.get("/quant-runs/ledger-summary")
 def quant_run_ledger_summary() -> dict:
+    from app.services.position_valuation import point_in_time_position_market_series
+
     cash_balance = float(get_account_balance() or 0)
     baseline = float(get_account_baseline() or 0)
     positions = get_positions()
@@ -781,9 +783,13 @@ def quant_run_ledger_summary() -> dict:
         qty = int(p.get("quantity") or 0)
         if not sym or qty <= 0:
             continue
-        px = _safe_float(ds.get_price_on_date(sym, latest_date, field="close"))
-        if px <= 0:
-            px = _safe_float(p.get("price"))
+        valuation = point_in_time_position_market_series(
+            symbol=sym,
+            as_of=latest_date,
+            fallback_price=_safe_float(p.get("price")),
+            data_source=ds,
+        )
+        px = _safe_float(valuation.get("price"))
         market_value += px * qty
     market_value = round(market_value, 2)
     total_equity = round(cash_balance + market_value, 2)
