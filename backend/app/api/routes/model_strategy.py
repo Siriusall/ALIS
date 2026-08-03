@@ -562,7 +562,6 @@ def model_strategy_portfolio_risk(req: PortfolioRiskRequest) -> dict:
     }
 
 
-@router.post("/model-strategy/black-litterman")
 @router.get("/model-strategy/performance-reports")
 def model_strategy_performance_reports(period_type: str | None = None, limit: int = 12) -> dict:
     return list_performance_reports(period_type=period_type, limit=limit)
@@ -606,6 +605,7 @@ def model_strategy_daily_maintenance() -> dict:
 
 
 
+@router.post("/model-strategy/black-litterman")
 def model_strategy_black_litterman(req: BlackLittermanRequest) -> dict:
     return black_litterman_weights(req.prior_weights, req.views, req.confidences, max_weight=req.max_weight)
 

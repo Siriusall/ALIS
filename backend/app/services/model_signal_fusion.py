@@ -4,16 +4,40 @@ import hashlib
 import json
 import math
 import pickle
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
-from app.db.store import _conn as business_conn, get_active_model_version, get_model_version
+import numpy as np
+
+from app.db.store import (
+    _conn as business_conn,
+    get_active_model_version,
+    get_model_version,
+    list_model_versions,
+)
+from app.data_platform.db import _conn as data_conn
 from app.services.backtest_data_source import HistBar, SnapshotRow
 from app.services.model_artifacts import resolve_model_artifact_path
+from app.services.event_impact_features import (
+    STRUCTURED_DISCLOSURE_APIS,
+    build_analyst_consensus_index,
+    disclosure_expectation_gap,
+    materialize_event_features,
+    merge_event_candidates,
+    payload_dict,
+    point_in_time_analyst_consensus,
+    report_period_key,
+    structured_event_candidate,
+)
 from app.services.plan_model_control import (
+    EVENT_STRUCTURED_SOURCES,
     NARRATIVE_MODEL_LIFECYCLE_EFFECT_CONTRACT,
     PLAN_MODELS,
+    _event_news_direction,
+    _event_usable_trade_date,
+    _payload_dict,
     audit_plan_model_production_eligibility,
+    controlled_strategy_ab_passed_current_contract,
     score_plan_model_feature_batch,
     score_plan_model_features,
 )
@@ -26,9 +50,19 @@ MODEL_WEIGHTS = {
     "medium_horizon_lambdarank_v1": 0.25,
     "capital_persistence_multitask_v1": 0.10,
     "leader_lambdarank_v1": 0.15,
-    "event_surprise_lgbm_v1": 0.05,
+    "event_impact_assessor_v2": 0.05,
     "narrative_transition_multitask_v1": 0.0,
 }
+LIMITED_LIVE_MODEL_KEYS = frozenset({
+    "medium_horizon_lambdarank_v1",
+    "capital_persistence_multitask_v1",
+    "leader_lambdarank_v1",
+})
+LIMITED_LIVE_WEIGHT_SCALE = 0.40  # 0.50 base model mass -> at most 0.20 live impact
+LIMITED_LIVE_PASSED_SCALE = 0.60
+LIMITED_LIVE_WATCH_SCALE = 0.20
+LIMITED_LIVE_AGGREGATE_CAP = 0.20
+MAX_EVENT_RISK_PENALTY = 0.03
 MAX_THEME_RANK_BONUS = 0.08
 MAX_NARRATIVE_MODEL_RANK_ADJUSTMENT = 0.06
 NARRATIVE_MODEL_MIN_CONFIDENCE = 0.55
@@ -37,16 +71,16 @@ NARRATIVE_MODEL_HARD_VETO_RISK = 0.80
 ENVIRONMENT_MODEL_MULTIPLIERS = {
     "S0": {
         "medium_horizon_lambdarank_v1": 1.15, "capital_persistence_multitask_v1": 0.90,
-        "leader_lambdarank_v1": 1.20, "event_surprise_lgbm_v1": 1.00,
+        "leader_lambdarank_v1": 1.20, "event_impact_assessor_v2": 1.00,
     },
     "S1": {key: 1.0 for key in MODEL_KEYS},
     "S2": {
         "medium_horizon_lambdarank_v1": 1.10, "capital_persistence_multitask_v1": 1.20,
-        "leader_lambdarank_v1": 0.85, "event_surprise_lgbm_v1": 0.80,
+        "leader_lambdarank_v1": 0.85, "event_impact_assessor_v2": 0.80,
     },
     "S3": {
         "medium_horizon_lambdarank_v1": 0.80, "capital_persistence_multitask_v1": 1.25,
-        "leader_lambdarank_v1": 0.60, "event_surprise_lgbm_v1": 0.60,
+        "leader_lambdarank_v1": 0.60, "event_impact_assessor_v2": 0.60,
     },
 }
 _ARTIFACT_CACHE: dict[
@@ -59,6 +93,11 @@ _FROZEN_BINDING_CACHE: dict[
     dict[str, dict[str, Any] | None],
 ] = {}
 _FROZEN_BINDING_CACHE_LIMIT = 64
+_EVENT_FEATURE_CACHE: dict[
+    tuple[str, str, str],
+    dict[str, dict[str, Any]],
+] = {}
+_EVENT_FEATURE_CACHE_LIMIT = 32
 
 
 def _safe(value: Any) -> float:
@@ -67,6 +106,375 @@ def _safe(value: Any) -> float:
         return number if math.isfinite(number) else 0.0
     except (TypeError, ValueError):
         return 0.0
+
+
+def _point_in_time_event_features(
+    symbols: list[str],
+    *,
+    trade_date: str,
+    as_of_time: str | None,
+) -> dict[str, dict[str, Any]]:
+    unique_symbols = sorted({str(value) for value in symbols if str(value)})
+    compact_date = str(trade_date or "").replace("-", "")[:8]
+    if not unique_symbols or len(compact_date) != 8:
+        return {}
+    cutoff = str(as_of_time or "").strip()
+    if not cutoff:
+        cutoff = (
+            f"{compact_date[:4]}-{compact_date[4:6]}-{compact_date[6:]}"
+            "T15:00:00+08:00"
+        )
+    symbol_hash = hashlib.sha256(
+        "|".join(unique_symbols).encode("utf-8")
+    ).hexdigest()
+    cache_key = (compact_date, cutoff, symbol_hash)
+    cached = _EVENT_FEATURE_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    start_date = (
+        datetime.strptime(compact_date, "%Y%m%d") - timedelta(days=14)
+    ).strftime("%Y%m%d")
+    placeholders = ",".join("?" for _ in unique_symbols)
+    with data_conn() as conn:
+        trade_rows = conn.execute(
+            """SELECT trade_date FROM dc_available_trade_dates
+               WHERE trade_date>=? AND trade_date<=?
+               ORDER BY trade_date""",
+            (start_date, compact_date),
+        ).fetchall()
+        trade_dates = [
+            str(dict(row).get("trade_date") or "")
+            for row in trade_rows
+            if dict(row).get("trade_date")
+        ]
+        if compact_date not in trade_dates:
+            trade_dates.append(compact_date)
+            trade_dates.sort()
+        try:
+            announcement_rows = conn.execute(
+                f"""SELECT r.ts_code,r.publish_time AS event_time,
+                           r.available_time,r.title,r.raw_text,e.event_type,
+                           e.impact_direction,e.severity,e.confidence,e.metrics_json
+                    FROM dc_announcement_event e
+                    JOIN dc_announcement_raw r
+                      ON r.source_code=e.source_code
+                     AND r.announcement_id=e.announcement_id
+                    WHERE r.ts_code IN ({placeholders})
+                      AND r.available_time<=?
+                      AND REPLACE(SUBSTRING(r.publish_time,1,10),'-','')>=?""",
+                (*unique_symbols, cutoff, start_date),
+            ).fetchall()
+        except Exception:
+            announcement_rows = []
+        structured_event_rows: list[Any] = []
+        try:
+            structured_start = (
+                datetime.strptime(compact_date, "%Y%m%d") - timedelta(days=400)
+            ).strftime("%Y-%m-%d")
+            for api_name in STRUCTURED_DISCLOSURE_APIS:
+                structured_event_rows.extend(
+                    conn.execute(
+                        f"""SELECT api_name,ts_code,ann_date,period,available_time,payload_json
+                            FROM dc_tushare_raw_records
+                            WHERE api_name=?
+                              AND ts_code IN ({placeholders})
+                              AND available_time>=? AND available_time<=?
+                            ORDER BY available_time,id""",
+                        (api_name, *unique_symbols, structured_start, cutoff),
+                    ).fetchall()
+                )
+        except Exception:
+            structured_event_rows = []
+        try:
+            news_rows = conn.execute(
+                """SELECT available_time,payload_json
+                   FROM dc_tushare_raw_records
+                   WHERE api_name='major_news'
+                     AND available_time<=?
+                     AND available_time>=?
+                   ORDER BY available_time""",
+                (
+                    cutoff,
+                    f"{start_date[:4]}-{start_date[4:6]}-{start_date[6:]}",
+                ),
+            ).fetchall()
+        except Exception:
+            news_rows = []
+        try:
+            top_list_rows = conn.execute(
+                f"""SELECT ts_code,trade_date,available_time,payload_json
+                    FROM dc_tushare_raw_records
+                    WHERE api_name='top_list'
+                      AND ts_code IN ({placeholders})
+                      AND trade_date>=? AND trade_date<=?
+                      AND available_time<=?
+                    ORDER BY trade_date,ts_code""",
+                (*unique_symbols, start_date, compact_date, cutoff),
+            ).fetchall()
+        except Exception:
+            top_list_rows = []
+        try:
+            benchmark_rows = conn.execute(
+                """SELECT trade_date,payload_json
+                   FROM dc_tushare_raw_records
+                   WHERE api_name='index_daily'
+                     AND ts_code IN ('000300.SH','000300')
+                     AND trade_date<=?
+                   ORDER BY trade_date DESC LIMIT 2""",
+                (compact_date,),
+            ).fetchall()
+        except Exception:
+            benchmark_rows = []
+        try:
+            report_start = (
+                datetime.strptime(compact_date, "%Y%m%d") - timedelta(days=200)
+            ).strftime("%Y%m%d")
+            analyst_report_rows = conn.execute(
+                f"""SELECT ts_code,trade_date,available_time,payload_json
+                    FROM dc_tushare_raw_records
+                    WHERE api_name='report_rc'
+                      AND ts_code IN ({placeholders})
+                      AND trade_date>=? AND trade_date<=?
+                      AND available_time<=?
+                    ORDER BY ts_code,trade_date,id""",
+                (*unique_symbols, report_start, compact_date, cutoff),
+            ).fetchall()
+        except Exception:
+            analyst_report_rows = []
+
+    observations: dict[str, dict[str, Any]] = {}
+
+    def record(symbol: str, candidate: dict[str, Any]) -> None:
+        symbol = str(symbol or "")
+        if symbol not in unique_symbols:
+            return
+        observations[symbol] = merge_event_candidates(
+            observations.get(symbol),
+            candidate,
+        )
+
+    for row in announcement_rows:
+        item = dict(row)
+        usable = _event_usable_trade_date(
+            str(item.get("event_time") or ""),
+            str(item.get("available_time") or ""),
+            trade_dates,
+        )
+        if usable != compact_date:
+            continue
+        record(
+            str(item.get("ts_code") or ""),
+            structured_event_candidate(
+                source="announcement",
+                event_type=str(item.get("event_type") or ""),
+                direction=str(item.get("impact_direction") or "neutral"),
+                severity=str(item.get("severity") or "medium"),
+                confidence=_safe(item.get("confidence")),
+                title=str(item.get("title") or ""),
+                text=str(item.get("raw_text") or ""),
+                metrics=item.get("metrics_json"),
+            ),
+        )
+
+    analyst_consensus_index = build_analyst_consensus_index(analyst_report_rows)
+
+    guidance_by_symbol_period: dict[tuple[str, str], dict[str, float | None]] = {}
+    for row in sorted(
+        structured_event_rows,
+        key=lambda value: (
+            str(dict(value).get("available_time") or ""),
+            str(dict(value).get("ts_code") or ""),
+        ),
+    ):
+        item = dict(row)
+        payload = payload_dict(item.get("payload_json"))
+        api_name = str(item.get("api_name") or "")
+        symbol = str(item.get("ts_code") or payload.get("ts_code") or "")
+        available_time = str(item.get("available_time") or "")
+        usable = _event_usable_trade_date(
+            str(item.get("ann_date") or payload.get("ann_date") or available_time),
+            available_time,
+            trade_dates,
+        )
+        period = str(item.get("period") or payload.get("end_date") or "")
+        period_key = report_period_key(period)
+        prior = guidance_by_symbol_period.get((symbol, period_key))
+        analyst_consensus = point_in_time_analyst_consensus(
+            analyst_consensus_index,
+            symbol=symbol,
+            period=period_key,
+            as_of_date=usable,
+        )
+        expectation_gap, expectation_basis, current_guidance = (
+            disclosure_expectation_gap(
+                api_name=api_name,
+                payload=payload,
+                consensus=analyst_consensus,
+                prior_guidance=prior,
+            )
+        )
+        if api_name == "forecast" and period_key:
+            guidance_by_symbol_period[(symbol, period_key)] = current_guidance
+        if usable == compact_date:
+            record(
+                symbol,
+                structured_event_candidate(
+                    source="structured_disclosure",
+                    api_name=api_name,
+                    confidence=0.98,
+                    title=api_name,
+                    payload=payload,
+                    expectation_gap=expectation_gap,
+                    expectation_basis=expectation_basis,
+                    analyst_consensus=analyst_consensus,
+                ),
+            )
+
+    if news_rows:
+        from app.services.news_theme_cluster import _match_companies
+
+        symbol_set = set(unique_symbols)
+        for row in news_rows:
+            item = dict(row)
+            payload = _payload_dict(item.get("payload_json"))
+            text = f"{payload.get('title') or ''} {payload.get('content') or ''}".strip()
+            if not text:
+                continue
+            event_time = str(payload.get("pub_time") or item.get("available_time") or "")
+            usable = _event_usable_trade_date(
+                event_time,
+                str(item.get("available_time") or event_time),
+                trade_dates,
+            )
+            if usable != compact_date:
+                continue
+            direction, severity, confidence = _event_news_direction(text)
+            for company in _match_companies(text):
+                symbol = str(company.get("ts_code") or "")
+                if symbol in symbol_set:
+                    record(
+                        symbol,
+                        structured_event_candidate(
+                            source="major_news",
+                            direction=direction,
+                            severity=severity,
+                            confidence=confidence,
+                            title=str(payload.get("title") or ""),
+                            text=str(payload.get("content") or ""),
+                        ),
+                    )
+
+    analyst_by_symbol: dict[str, list[dict[str, Any]]] = {}
+    rating_scores = {"买入": 5.0, "增持": 4.0, "中性": 3.0, "减持": 2.0, "卖出": 1.0}
+    for row in analyst_report_rows:
+        item = dict(row)
+        payload = payload_dict(item.get("payload_json"))
+        symbol = str(item.get("ts_code") or payload.get("ts_code") or "")
+        targets = [
+            float(payload[key])
+            for key in ("min_price", "max_price")
+            if payload.get(key) is not None
+        ]
+        if symbol:
+            analyst_by_symbol.setdefault(symbol, []).append({
+                "trade_date": str(item.get("trade_date") or "")[:8],
+                "rating": rating_scores.get(str(payload.get("rating") or "")),
+                "target": sum(targets) / len(targets) if targets else None,
+            })
+    current_date = datetime.strptime(compact_date, "%Y%m%d").date()
+    recent_start = (current_date - timedelta(days=27)).strftime("%Y%m%d")
+    prior_start = (current_date - timedelta(days=55)).strftime("%Y%m%d")
+    for symbol, rows in analyst_by_symbol.items():
+        if symbol not in observations:
+            continue
+        recent = [
+            float(item["rating"])
+            for item in rows
+            if item.get("rating") is not None
+            and recent_start <= str(item["trade_date"]) <= compact_date
+        ]
+        prior = [
+            float(item["rating"])
+            for item in rows
+            if item.get("rating") is not None
+            and prior_start <= str(item["trade_date"]) < recent_start
+        ]
+        targets = [
+            float(item["target"])
+            for item in rows
+            if item.get("target") is not None
+            and prior_start <= str(item["trade_date"]) <= compact_date
+        ]
+        observations[symbol]["event_analyst_revision_raw"] = (
+            sum(recent) / len(recent) - sum(prior) / len(prior)
+            if recent and prior else None
+        )
+        observations[symbol]["event_analyst_target_price_raw"] = (
+            sum(targets) / len(targets) if targets else None
+        )
+
+    for row in top_list_rows:
+        item = dict(row)
+        payload = _payload_dict(item.get("payload_json"))
+        usable = _event_usable_trade_date(
+            str(item.get("trade_date") or payload.get("trade_date") or ""),
+            str(item.get("available_time") or ""),
+            trade_dates,
+        )
+        if usable != compact_date:
+            continue
+        net_rate = _safe(payload.get("net_rate"))
+        pct_change = _safe(payload.get("pct_change"))
+        sentiment = max(
+            -1.0,
+            min(
+                1.0,
+                0.7 * math.tanh(net_rate / 10.0)
+                + 0.3 * math.tanh(pct_change / 10.0),
+            ),
+        )
+        confidence = min(0.95, 0.70 + 0.25 * abs(math.tanh(net_rate / 10.0)))
+        symbol = str(item.get("ts_code") or payload.get("ts_code") or "")
+        if symbol not in observations:
+            continue
+        observations[symbol].update({
+            "event_source_top_list": 1.0,
+            "event_top_list_signal": sentiment,
+            "event_top_list_confidence": confidence,
+        })
+
+    benchmark_closes: list[tuple[str, float]] = []
+    for row in benchmark_rows:
+        item = dict(row)
+        close = _safe(_payload_dict(item.get("payload_json")).get("close"))
+        if close > 0:
+            benchmark_closes.append((str(item.get("trade_date") or ""), close))
+    benchmark_closes.sort()
+    benchmark_return = 0.0
+    if len(benchmark_closes) >= 2 and benchmark_closes[-2][1] > 0:
+        benchmark_return = benchmark_closes[-1][1] / benchmark_closes[-2][1] - 1.0
+    for observation in observations.values():
+        sentiment = float(observation.get("sentiment") or 0.0)
+        confidence = float(observation.get("confidence") or 0.0)
+        source = str(observation.get("source") or "unknown")
+        observed_sources = set(observation.get("observed_sources") or [source])
+        observation.update({
+            "event_text_sentiment": sentiment,
+            "event_text_confidence": confidence,
+            "event_surprise": sentiment * confidence,
+            "event_source_type": source,
+            **{
+                f"event_source_{item}": float(
+                    item == source or item in observed_sources
+                )
+                for item in EVENT_STRUCTURED_SOURCES
+            },
+        })
+        observation["event_benchmark_return"] = benchmark_return
+    if len(_EVENT_FEATURE_CACHE) >= _EVENT_FEATURE_CACHE_LIMIT:
+        _EVENT_FEATURE_CACHE.pop(next(iter(_EVENT_FEATURE_CACHE)))
+    _EVENT_FEATURE_CACHE[cache_key] = observations
+    return observations
 
 
 def _artifact(version: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -222,6 +630,129 @@ def _resolve_model_versions(
         for key, value in versions.items()
     }
     return versions
+
+
+def _resolve_online_inference_versions(
+    authorized_versions: dict[str, dict[str, Any] | None],
+    model_bindings: dict[str, Any] | None,
+) -> dict[str, dict[str, Any] | None]:
+    """Resolve versions allowed to score live data, separately from trade authority.
+
+    Frozen research replays must remain exact and never discover newer candidates.
+    Live decisions may score the newest artifact-bearing version for observation,
+    while the authorized bundle below still controls weights and hard gates.
+    """
+    if model_bindings is not None:
+        return dict(authorized_versions)
+    online: dict[str, dict[str, Any] | None] = {}
+    for key in MODEL_KEYS:
+        authorized = authorized_versions.get(key)
+        if authorized:
+            online[key] = authorized
+            continue
+        try:
+            candidates = list_model_versions(key, limit=20)
+        except Exception:
+            candidates = []
+        online[key] = next(
+            (
+                version for version in candidates
+                if str(version.get("artifact_path") or "")
+                and str(version.get("status") or "")
+                not in {"superseded", "rolled_back"}
+            ),
+            None,
+        )
+    return online
+
+
+def _limited_live_authorization(version: dict[str, Any] | None) -> dict[str, Any]:
+    """Resolve capped live authority without confusing it with production status."""
+    if not version or str(version.get("model_key") or "") not in LIMITED_LIVE_MODEL_KEYS:
+        return {
+            "authorized": False,
+            "tier": "shadow_only",
+            "weight_scale": 0.0,
+            "reason": "model_family_not_limited_rank_eligible",
+            "observed_return_sessions": 0,
+        }
+    metrics = version.get("metrics") if isinstance(version.get("metrics"), dict) else {}
+    impact = metrics.get("strategy_impact_ab")
+    if not isinstance(impact, dict) or not controlled_strategy_ab_passed_current_contract(
+        str(version.get("model_key") or ""), impact
+    ):
+        return {
+            "authorized": False,
+            "tier": "shadow_only",
+            "weight_scale": 0.0,
+            "reason": "current_controlled_strategy_ab_not_passed",
+            "observed_return_sessions": 0,
+        }
+    task_oos = metrics.get("task_native_oos") if isinstance(metrics.get("task_native_oos"), dict) else {}
+    prerequisites_passed = bool(
+        metrics.get("task_metric_passed")
+        and bool(task_oos.get("passed", True))
+        and int(metrics.get("walk_forward_windows") or metrics.get("oos_windows") or 0) >= 5
+    )
+    if not prerequisites_passed:
+        return {
+            "authorized": False,
+            "tier": "shadow_only",
+            "weight_scale": 0.0,
+            "reason": "task_native_oos_not_complete",
+            "observed_return_sessions": 0,
+        }
+    validation = version.get("validation") if isinstance(version.get("validation"), dict) else {}
+    shadow = validation.get("model_shadow") if isinstance(validation.get("model_shadow"), dict) else {}
+    shadow_status = str(shadow.get("status") or "not_started")
+    observed_sessions = int(shadow.get("observed_return_sessions") or 0)
+    latest = shadow.get("latest_evidence") if isinstance(shadow.get("latest_evidence"), dict) else {}
+    gates = latest.get("gates") if isinstance(latest.get("gates"), dict) else {}
+    if shadow_status == "failed":
+        return {
+            "authorized": False,
+            "tier": "shadow_only",
+            "weight_scale": 0.0,
+            "reason": "future_shadow_failed",
+            "observed_return_sessions": observed_sessions,
+        }
+    if shadow_status == "passed":
+        return {
+            "authorized": True,
+            "tier": "limited_rank_increased",
+            "weight_scale": LIMITED_LIVE_PASSED_SCALE,
+            "reason": "future_shadow_passed_formal_promotion_still_required",
+            "observed_return_sessions": observed_sessions,
+        }
+    if observed_sessions >= 20:
+        positive = bool(gates.get("cumulative_return_delta_positive"))
+        mean_positive = bool(gates.get("mean_daily_return_delta_positive"))
+        if not positive and not mean_positive:
+            return {
+                "authorized": False,
+                "tier": "shadow_only",
+                "weight_scale": 0.0,
+                "reason": "first_20_session_review_negative",
+                "observed_return_sessions": observed_sessions,
+            }
+        return {
+            "authorized": True,
+            "tier": "limited_rank_deweighted",
+            "weight_scale": LIMITED_LIVE_WATCH_SCALE,
+            "reason": "first_20_session_review_inconclusive",
+            "observed_return_sessions": observed_sessions,
+        }
+    return {
+        "authorized": True,
+        "tier": "limited_rank_initial",
+        "weight_scale": LIMITED_LIVE_WEIGHT_SCALE,
+        "reason": "awaiting_first_20_session_review",
+        "observed_return_sessions": observed_sessions,
+    }
+
+
+def _limited_live_authorized(version: dict[str, Any] | None) -> bool:
+    return bool(_limited_live_authorization(version)["authorized"])
 
 
 def freeze_model_bindings(
@@ -398,7 +929,10 @@ def _features(
     factors: dict[str, float],
     history: list[HistBar],
     theme: dict[str, Any],
+    event: dict[str, Any] | None = None,
+    market_state: str = "S1",
 ) -> dict[str, float]:
+    event = event or {}
     recent = history[-21:]
     amounts = [_safe(item.turnover) for item in recent if _safe(item.turnover) > 0]
     short = sum(amounts[-5:]) / max(1, len(amounts[-5:])) if amounts else 0.0
@@ -409,10 +943,38 @@ def _features(
     volatility_20 = _safe(factors.get("volatility_20"))
     capital_persistence = max(-3.0, min(3.0, turnover_slope + momentum_20))
     narrative_strength = max(-3.0, min(3.0, _safe(theme.get("score")) * 2.0 - 1.0))
-    event_surprise = max(
-        -3.0,
-        min(3.0, _safe(row.change_pct) / 100.0 - volatility_20),
+    event_market_reaction = (
+        _safe(row.change_pct) / 100.0
+        - _safe(event.get("event_benchmark_return"))
     )
+    top_list_confirmed = bool(
+        _safe(event.get("event_source_top_list")) > 0.0
+    )
+    event_crowding = (
+        max(
+            0.0,
+            min(
+                3.0,
+                abs(event_market_reaction) / max(0.005, volatility_20)
+                + max(0.0, turnover_slope)
+                + abs(_safe(event.get("event_top_list_signal"))),
+            ),
+        )
+        if top_list_confirmed
+        else max(0.0, min(3.0, max(0.0, turnover_slope)))
+    )
+    structured_features = materialize_event_features(
+        event,
+        total_mv=factors.get("total_mv"),
+        close=row.close,
+        momentum_20=momentum_20,
+        volatility_20=volatility_20,
+        market_reaction=event_market_reaction,
+        crowding=event_crowding,
+        analyst_revision=event.get("event_analyst_revision_raw"),
+        analyst_target_price=event.get("event_analyst_target_price_raw"),
+    )
+    normalized_market_state = str(market_state or "S1").upper()
     return {
         "momentum_20": momentum_20,
         "momentum_60": momentum_60,
@@ -420,7 +982,24 @@ def _features(
         "turnover_slope": turnover_slope,
         "capital_persistence": capital_persistence,
         "narrative_strength": narrative_strength,
-        "event_surprise": event_surprise,
+        "event_surprise": _safe(event.get("event_surprise")),
+        "event_source_type": str(event.get("event_source_type") or "unknown"),
+        "event_type_group": str(event.get("event_type_group") or "other"),
+        "event_text_sentiment": _safe(event.get("event_text_sentiment")),
+        "event_text_confidence": _safe(event.get("event_text_confidence")),
+        "event_market_reaction": event_market_reaction,
+        "event_crowding": event_crowding,
+        "event_source_announcement": _safe(event.get("event_source_announcement")),
+        "event_source_structured_disclosure": _safe(
+            event.get("event_source_structured_disclosure")
+        ),
+        "event_source_major_news": _safe(event.get("event_source_major_news")),
+        "event_source_top_list": _safe(event.get("event_source_top_list")),
+        **{
+            f"market_state_s{state}": float(normalized_market_state == f"S{state}")
+            for state in range(4)
+        },
+        **structured_features,
     }
 
 
@@ -438,17 +1017,39 @@ def apply_model_signals(
     """Fuse the existing model families using live or explicitly frozen versions."""
     explicit_bundle = model_bindings is not None
     versions = _resolve_model_versions(model_bindings)
-    artifacts = {key: _artifact(version) for key, version in versions.items()}
+    online_versions = _resolve_online_inference_versions(versions, model_bindings)
+    artifacts = {key: _artifact(version) for key, version in online_versions.items()}
     availability = {
         key: _point_in_time_model_availability(
-            versions.get(key), artifacts.get(key), as_of_time=as_of_time,
+            online_versions.get(key), artifacts.get(key), as_of_time=as_of_time,
         )
+        for key in MODEL_KEYS
+    }
+    authorized_availability = {
+        key: _point_in_time_model_availability(
+            versions.get(key), _artifact(versions.get(key)), as_of_time=as_of_time,
+        )
+        for key in MODEL_KEYS
+    }
+    limited_authorization = {
+        key: _limited_live_authorization(online_versions.get(key))
+        if (
+            not authorized_availability[key]["available"]
+            and availability[key]["available"]
+        )
+        else {
+            "authorized": False,
+            "tier": "not_applicable",
+            "weight_scale": 0.0,
+            "reason": "production_authorized_or_unavailable",
+            "observed_return_sessions": 0,
+        }
         for key in MODEL_KEYS
     }
     health_enabled = not explicit_bundle if use_live_health is None else bool(use_live_health)
     health_controls = (
-        _live_model_controls(versions)
-        if health_enabled else _live_model_controls(versions, enabled=False)
+        _live_model_controls(online_versions)
+        if health_enabled else _live_model_controls(online_versions, enabled=False)
     )
     environment_key = str(market_state or "S1")
     environment_multipliers = ENVIRONMENT_MODEL_MULTIPLIERS.get(environment_key, ENVIRONMENT_MODEL_MULTIPLIERS["S1"])
@@ -462,11 +1063,32 @@ def apply_model_signals(
             * float(environment_multipliers.get(key, 1.0))
             * float(health_controls[key]["weight_multiplier"])
             * float(maturity_multipliers[key])
-            if availability[key]["available"]
+            if authorized_availability[key]["available"] or limited_authorization[key]["authorized"]
             else 0.0
         )
         for key, weight in MODEL_WEIGHTS.items()
     }
+    raw_effective_weights = {
+        key: value * (
+            float(limited_authorization[key]["weight_scale"])
+            if limited_authorization[key]["authorized"]
+            and not authorized_availability[key]["available"]
+            else 1.0
+        )
+        for key, value in raw_effective_weights.items()
+    }
+    limited_total = sum(
+        value for key, value in raw_effective_weights.items()
+        if limited_authorization[key]["authorized"] and not authorized_availability[key]["available"]
+    )
+    if limited_total > LIMITED_LIVE_AGGREGATE_CAP:
+        limited_scale = LIMITED_LIVE_AGGREGATE_CAP / limited_total
+        raw_effective_weights = {
+            key: value * limited_scale
+            if limited_authorization[key]["authorized"] and not authorized_availability[key]["available"]
+            else value
+            for key, value in raw_effective_weights.items()
+        }
     raw_total = sum(raw_effective_weights.values())
     scale = min(1.0, 0.55 / raw_total) if raw_total > 0 else 1.0
     effective_weights = {key: value * scale for key, value in raw_effective_weights.items()}
@@ -475,6 +1097,16 @@ def apply_model_signals(
     raw_scores: dict[str, dict[str, float]] = {key: {} for key in MODEL_KEYS}
     raw_outputs: dict[str, dict[str, dict[str, Any]]] = {key: {} for key in MODEL_KEYS}
     features_by_symbol: dict[str, dict[str, float]] = {}
+    event_features: dict[str, dict[str, Any]] = {}
+    if availability.get("event_impact_assessor_v2", {}).get("available"):
+        try:
+            event_features = _point_in_time_event_features(
+                [str(row.symbol) for row, _base in ranked],
+                trade_date=str(ranked[0][0].date) if ranked else "",
+                as_of_time=as_of_time,
+            )
+        except Exception:
+            event_features = {}
     for row, _base in ranked:
         symbol = str(row.symbol)
         features = _features(
@@ -482,15 +1114,28 @@ def apply_model_signals(
             factor_values.get(symbol) or {},
             histories.get(symbol) or [],
             theme_by_symbol.get(symbol) or {},
+            event_features.get(symbol) or {},
+            market_state=environment_key,
         )
         features_by_symbol[symbol] = features
     for key in MODEL_KEYS:
         if not availability[key]["available"]:
             continue
+        scoring_features = (
+            {
+                symbol: features
+                for symbol, features in features_by_symbol.items()
+                if float(features.get("event_text_confidence") or 0.0) > 0.0
+            }
+            if key == "event_impact_assessor_v2"
+            else features_by_symbol
+        )
+        if not scoring_features:
+            continue
         if score_plan_model_features is _DEFAULT_SCORE_PLAN_MODEL_FEATURES:
             results = score_plan_model_feature_batch(
                 key,
-                features_by_symbol,
+                scoring_features,
                 artifact=artifacts[key],
             )
         else:
@@ -502,7 +1147,7 @@ def apply_model_signals(
                     features,
                     artifact=artifacts[key],
                 )
-                for symbol, features in features_by_symbol.items()
+                for symbol, features in scoring_features.items()
             }
         for symbol, result in results.items():
             raw_scores[key][symbol] = _safe(result.get("score"))
@@ -524,8 +1169,8 @@ def apply_model_signals(
             key: {
                 "raw_score": raw_scores[key].get(symbol),
                 "percentile": percentiles[key].get(symbol),
-                "version_id": (versions.get(key) or {}).get("id"),
-                "version": (versions.get(key) or {}).get("version"),
+                "version_id": (online_versions.get(key) or {}).get("id"),
+                "version": (online_versions.get(key) or {}).get("version"),
                 "status": (
                     health_controls[key]["status"]
                     if availability[key]["available"] else "proxy_or_unavailable"
@@ -534,6 +1179,21 @@ def apply_model_signals(
                 "health_reason": health_controls[key]["reason"],
                 "point_in_time_available": bool(availability[key]["available"]),
                 "availability_reason": str(availability[key]["reason"]),
+                "online": bool(availability[key]["available"]),
+                "trade_authorized": bool(
+                    authorized_availability[key]["available"]
+                    or limited_authorization[key]["authorized"]
+                ),
+                "authorization_scope": (
+                    "full_production"
+                    if authorized_availability[key]["available"]
+                    else str(limited_authorization[key]["tier"])
+                    if limited_authorization[key]["authorized"]
+                    else "risk_only"
+                    if key == "event_impact_assessor_v2"
+                    and availability[key]["available"]
+                    else "observation_only"
+                ),
                 "outputs": raw_outputs[key].get(symbol) or {},
             }
             for key in MODEL_KEYS
@@ -560,13 +1220,23 @@ def apply_model_signals(
             _safe(narrative_probabilities.get(key))
             for key in ("形成", "扩散", "发现", "启动", "加速")
         )
-        narrative_model_available = bool(
-            versions.get("narrative_transition_multitask_v1")
+        narrative_model_online = bool(
+            online_versions.get("narrative_transition_multitask_v1")
             and availability["narrative_transition_multitask_v1"]["available"]
+        )
+        narrative_model_available = bool(
+            narrative_model_online
+            and authorized_availability["narrative_transition_multitask_v1"]["available"]
+        )
+        narrative_effect_authorized = bool(
+            narrative_outputs.get("lifecycle_effect_authorized")
+            and str(narrative_outputs.get("lifecycle_effect_contract") or "")
+            == NARRATIVE_MODEL_LIFECYCLE_EFFECT_CONTRACT
         )
         narrative_model_adjustment = 0.0
         if (
             narrative_model_available
+            and narrative_effect_authorized
             and theme
             and narrative_confidence >= NARRATIVE_MODEL_MIN_CONFIDENCE
         ):
@@ -582,6 +1252,7 @@ def apply_model_signals(
                 fused += narrative_model_adjustment
         narrative_model_hard_veto = bool(
             narrative_model_available
+            and narrative_effect_authorized
             and theme
             and narrative_confidence >= NARRATIVE_MODEL_EXIT_CONFIDENCE
             and narrative_exit_risk >= NARRATIVE_MODEL_HARD_VETO_RISK
@@ -596,7 +1267,7 @@ def apply_model_signals(
         )
         capital_gate_active = bool(
             versions.get("capital_persistence_multitask_v1")
-            and availability["capital_persistence_multitask_v1"]["available"]
+            and authorized_availability["capital_persistence_multitask_v1"]["available"]
             and health_controls["capital_persistence_multitask_v1"]["status"] in {"healthy", "production"}
             and capital_multihead_ready
         )
@@ -609,7 +1280,41 @@ def apply_model_signals(
             and float(capital_outputs.get("strength_p10") or 0.0) < 0.0
             and float(capital_outputs.get("failure_hazard") or 0.0) > 0.65
         )
-        if capital_block or narrative_exit:
+        event_outputs = raw_outputs["event_impact_assessor_v2"].get(symbol) or {}
+        event_model_online = bool(
+            online_versions.get("event_impact_assessor_v2")
+            and availability["event_impact_assessor_v2"]["available"]
+        )
+        event_model_available = bool(
+            event_model_online
+            and authorized_availability["event_impact_assessor_v2"]["available"]
+        )
+        event_contract_ready = bool(
+            event_outputs.get("impact_contract") in {
+                "alis_conditional_event_impact_assessment_v2",
+                "alis_conditional_event_impact_assessment_v3",
+                "alis_conditional_event_impact_assessment_v4",
+            }
+        )
+        event_block = bool(
+            event_model_available
+            and event_contract_ready
+            and event_outputs.get("event_hard_veto") is True
+        )
+        event_risk_penalty = 0.0
+        if event_model_online and event_contract_ready and not event_model_available:
+            positive = _safe(event_outputs.get("positive_impact_probability"))
+            reversal = _safe(event_outputs.get("reversal_probability"))
+            q10 = _safe(event_outputs.get("abnormal_return_q10"))
+            negative_strength = max(
+                0.0,
+                0.50 - positive,
+                reversal - 0.50,
+                min(0.50, -q10 * 5.0),
+            )
+            event_risk_penalty = min(MAX_EVENT_RISK_PENALTY, negative_strength * 0.06)
+            fused -= event_risk_penalty
+        if capital_block or narrative_exit or event_block:
             blocked.append({
                 "symbol": symbol,
                 "ts_code": symbol,
@@ -617,6 +1322,8 @@ def apply_model_signals(
                 "code": (
                     "capital_persistence_gate_failed"
                     if capital_block
+                    else "event_impact_hard_veto"
+                    if event_block
                     else "narrative_model_exit_gate"
                     if narrative_model_hard_veto
                     and not bool(theme.get("hard_veto"))
@@ -625,6 +1332,8 @@ def apply_model_signals(
                 "message": (
                     "生产资金持续模型位于截面后10%，禁止新增"
                     if capital_block
+                    else "事件影响评估器识别到成本后高置信负面尾部，禁止新增"
+                    if event_block
                     else "监督叙事模型识别到高置信生命周期退出风险，禁止新增"
                     if narrative_model_hard_veto
                     and not bool(theme.get("hard_veto"))
@@ -632,7 +1341,7 @@ def apply_model_signals(
                 ),
             })
             continue
-        event_pct = percentiles["event_surprise_lgbm_v1"].get(symbol)
+        event_pct = percentiles["event_impact_assessor_v2"].get(symbol)
         leader_pct = percentiles["leader_lambdarank_v1"].get(symbol)
         evidence[symbol] = {
             "schema_version": "model_signal_fusion_v2",
@@ -653,12 +1362,37 @@ def apply_model_signals(
                     )
                 ),
             "leader_eligible": leader_pct is not None and leader_pct >= 0.70,
-            "event_eligible": event_pct is not None and event_pct >= 0.70,
+            "event_eligible": bool(
+                event_model_available
+                and
+                event_contract_ready
+                and float(
+                    event_outputs.get("positive_impact_probability") or 0.0
+                ) >= 0.55
+                and float(event_outputs.get("priced_in_probability") or 1.0) <= 0.60
+                and float(event_outputs.get("abnormal_return_q10") or -1.0) > -0.02
+            ),
+            "event_impact": {
+                "online": event_model_online,
+                "available": event_model_available,
+                "authorization_scope": (
+                    "full_production" if event_model_available else "risk_only"
+                    if event_model_online else "unavailable"
+                ),
+                "contract_ready": event_contract_ready,
+                "rank_percentile": event_pct,
+                "risk_penalty": round(event_risk_penalty * 100.0, 6),
+                "positive_rank_uplift_forbidden": not event_model_available,
+                "hard_veto_authorized": event_model_available,
+                "outputs": event_outputs,
+            },
             "narrative": theme or {"lifecycle": "未识别", "score": 0.0},
             "theme_rank_bonus": round(theme_bonus * 100.0, 6),
             "narrative_model": {
                 "effect_contract": NARRATIVE_MODEL_LIFECYCLE_EFFECT_CONTRACT,
+                "online": narrative_model_online,
                 "available": narrative_model_available,
+                "effect_authorized": narrative_effect_authorized,
                 "confidence": round(narrative_confidence, 8),
                 "growth_probability": round(
                     narrative_growth_probability,
@@ -685,9 +1419,14 @@ def apply_model_signals(
         "production_models": [
             {
                 "model_key": key,
-                "version_id": (versions.get(key) or {}).get("id"),
-                "version": (versions.get(key) or {}).get("version"),
+                "version_id": (online_versions.get(key) or {}).get("id"),
+                "version": (online_versions.get(key) or {}).get("version"),
                 "consumed": bool(availability[key]["available"]),
+                "online": bool(availability[key]["available"]),
+                "trade_authorized": bool(
+                    authorized_availability[key]["available"]
+                    or limited_authorization[key]["authorized"]
+                ),
                 "effective": bool(
                     availability[key]["available"]
                     and (
@@ -700,6 +1439,29 @@ def apply_model_signals(
                 ),
                 "point_in_time_available": bool(availability[key]["available"]),
                 "availability_reason": str(availability[key]["reason"]),
+                "authorization_reason": (
+                    "production_contract_passed"
+                    if authorized_availability[key]["available"]
+                    else str(limited_authorization[key]["reason"])
+                    if limited_authorization[key]["authorized"]
+                    else "risk_only_online_observation"
+                    if key == "event_impact_assessor_v2"
+                    and availability[key]["available"]
+                    else "online_observation_only"
+                ),
+                "authorization_tier": (
+                    "production"
+                    if authorized_availability[key]["available"]
+                    else str(limited_authorization[key]["tier"])
+                    if limited_authorization[key]["authorized"]
+                    else "risk_only"
+                    if key == "event_impact_assessor_v2"
+                    and availability[key]["available"]
+                    else "shadow_only"
+                ),
+                "future_observed_sessions": int(
+                    limited_authorization[key]["observed_return_sessions"]
+                ),
                 "health_status": health_controls[key]["status"],
                 "weight_multiplier": health_controls[key]["weight_multiplier"],
                 "effect_contract": (
@@ -715,6 +1477,8 @@ def apply_model_signals(
         "blocked_count": len(blocked),
         "policy": {
             "base_rank_weight": round(base_rank_weight, 6),
+            "online_inference_enabled": True,
+            "trade_authority_separate_from_inference": True,
             "model_weights": MODEL_WEIGHTS,
             "environment": environment_key,
             "environment_multipliers": environment_multipliers,
@@ -730,10 +1494,31 @@ def apply_model_signals(
                     NARRATIVE_MODEL_EXIT_CONFIDENCE
                 ),
                 "hard_veto_exit_risk": NARRATIVE_MODEL_HARD_VETO_RISK,
+                "validation_final_state_must_beat_persistence": True,
                 "unthemed_candidates_remain_eligible": True,
             },
             "maturity_multipliers": maturity_multipliers,
             "effective_model_weights": {key: round(weight, 6) for key, weight in effective_weights.items()},
+            "limited_live_authorization": {
+                "enabled": True,
+                "model_keys": sorted(LIMITED_LIVE_MODEL_KEYS),
+                "initial_weight_scale": LIMITED_LIVE_WEIGHT_SCALE,
+                "passed_weight_scale": LIMITED_LIVE_PASSED_SCALE,
+                "inconclusive_weight_scale": LIMITED_LIVE_WATCH_SCALE,
+                "aggregate_cap": LIMITED_LIVE_AGGREGATE_CAP,
+                "first_review_sessions": 20,
+                "authorized_models": [
+                    key for key, value in limited_authorization.items()
+                    if value["authorized"]
+                ],
+                "model_tiers": limited_authorization,
+            },
+            "event_risk_only": {
+                "online": bool(availability["event_impact_assessor_v2"]["available"]),
+                "maximum_rank_penalty": MAX_EVENT_RISK_PENALTY,
+                "positive_rank_uplift_forbidden": True,
+                "hard_veto_requires_full_production_authority": True,
+            },
             "theme_policy": {
                 "maximum_rank_bonus": MAX_THEME_RANK_BONUS,
                 "high_confidence_theme_is_bonus_only": True,

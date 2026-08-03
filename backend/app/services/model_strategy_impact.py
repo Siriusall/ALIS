@@ -17,10 +17,25 @@ from app.db.store import (
 from app.services.backtest_data_source import BacktestDataSource
 from app.services.factor_platform import registered_factor_bindings
 from app.services.plan_model_control import (
+    CONTROLLED_STRATEGY_AB_COMPARISON_CONTRACT,
+    CONTROLLED_STRATEGY_AB_CONTRACT,
+    CONTROLLED_STRATEGY_AB_COST_CONTRACT,
     MODEL_EVALUATION_CONTRACT,
     NARRATIVE_MODEL_LIFECYCLE_EFFECT_CONTRACT,
     PLAN_MODELS,
     active_production_plan_model_bindings,
+    controlled_strategy_ab_passed_current_contract,
+)
+from app.core.a_share_fees import (
+    COMMISSION_MIN_CNY,
+    COMMISSION_RATE,
+    ETF_FEE_SCHEDULE_VERSION,
+    ETF_SLIPPAGE_RATE,
+    FEE_SCHEDULE_VERSION,
+    SLIPPAGE_BUY_RATE,
+    SLIPPAGE_SELL_RATE,
+    STAMP_TAX_RATE,
+    TRANSFER_FEE_RATE,
 )
 from app.services.production_strategy import resolve_production_strategy_champion
 
@@ -39,8 +54,30 @@ def _compact_replay_result(result: dict[str, Any]) -> dict[str, Any]:
     return {
         "status": result.get("status"),
         "metrics": result.get("metrics") or {},
+        "summary": result.get("summary") or {},
+        "component_contract": result.get("component_contract") or {},
         "equity_series": result.get("equity_series") or [],
         "model_fusion_history": result.get("model_fusion_history") or [],
+    }
+
+
+def _shared_execution_cost_contract() -> dict[str, Any]:
+    """Freeze the exact cost schedule consumed by both replay arms."""
+    return {
+        "schema_version": CONTROLLED_STRATEGY_AB_COST_CONTRACT,
+        "stock_fee_schedule_version": FEE_SCHEDULE_VERSION,
+        "etf_fee_schedule_version": ETF_FEE_SCHEDULE_VERSION,
+        "commission_rate": COMMISSION_RATE,
+        "commission_min_cny": COMMISSION_MIN_CNY,
+        "stock_buy_slippage_rate": SLIPPAGE_BUY_RATE,
+        "stock_sell_slippage_rate": SLIPPAGE_SELL_RATE,
+        "etf_slippage_rate": ETF_SLIPPAGE_RATE,
+        "stock_sell_stamp_tax_rate": STAMP_TAX_RATE,
+        "stock_transfer_fee_rate": TRANSFER_FEE_RATE,
+        "return_definition": (
+            "ending_equity_after_slippage_commission_transfer_fee_and_stamp_tax"
+        ),
+        "comparison_policy": "same_frozen_cost_schedule_for_reference_and_candidate",
     }
 
 
@@ -177,6 +214,10 @@ def _fold_evidence(
     challenger = pair["challenger"]
     ref_metrics = dict(reference.get("metrics") or {})
     cand_metrics = dict(challenger.get("metrics") or {})
+    ref_summary = dict(reference.get("summary") or {})
+    cand_summary = dict(challenger.get("summary") or {})
+    ref_components = dict(reference.get("component_contract") or {})
+    cand_components = dict(challenger.get("component_contract") or {})
     ref_daily = _daily_returns(reference)
     cand_daily = _daily_returns(challenger)
     common_dates = sorted(set(ref_daily) & set(cand_daily))
@@ -235,6 +276,20 @@ def _fold_evidence(
         "candidate_max_drawdown": float(cand_metrics.get("max_drawdown") or 0.0),
         "reference_turnover": float(ref_metrics.get("turnover_rate") or 0.0),
         "candidate_turnover": float(cand_metrics.get("turnover_rate") or 0.0),
+        "reference_total_fees": float(ref_summary.get("total_fees") or 0.0),
+        "candidate_total_fees": float(cand_summary.get("total_fees") or 0.0),
+        "reference_trade_count": int(ref_summary.get("trade_count") or 0),
+        "candidate_trade_count": int(cand_summary.get("trade_count") or 0),
+        "reference_cost_contract_observed": (
+            str(ref_components.get("execution") or "")
+            == "A-share open constraints + shared fee/slippage rules"
+            and "total_fees" in ref_summary
+        ),
+        "candidate_cost_contract_observed": (
+            str(cand_components.get("execution") or "")
+            == "A-share open constraints + shared fee/slippage rules"
+            and "total_fees" in cand_summary
+        ),
         "paired_trade_dates": len(common_dates),
         "reference_replay_status": str(reference.get("status") or ""),
         "candidate_replay_status": str(challenger.get("status") or ""),
@@ -319,6 +374,7 @@ def run_controlled_model_strategy_ab(
         "market_state_binding": champion.get("market_state_binding") or {},
         "portfolio_optimizer": champion.get("portfolio_optimizer") or {},
         "execution_contract": champion.get("execution_contract") or {},
+        "execution_cost_contract": _shared_execution_cost_contract(),
         "model_effect_contract": _model_effect_contract(model_key),
     }
     frozen_contract["contract_hash"] = hashlib.sha256(
@@ -533,6 +589,22 @@ def run_controlled_model_strategy_ab(
             )
             for item in evidence
         ),
+        "shared_fee_slippage_contract_frozen": (
+            str(
+                (frozen_contract.get("execution_cost_contract") or {}).get(
+                    "schema_version"
+                )
+                or ""
+            )
+            == CONTROLLED_STRATEGY_AB_COST_CONTRACT
+        ),
+        "strategy_returns_are_cost_after": all(
+            bool(item.get("reference_cost_contract_observed"))
+            and bool(item.get("candidate_cost_contract_observed"))
+            and float(item.get("reference_total_fees") or 0.0) >= 0
+            and float(item.get("candidate_total_fees") or 0.0) >= 0
+            for item in evidence
+        ),
         "majority_windows_improved": sum(value > 0 for value in deltas) >= 3,
         "mean_return_delta_positive": float(np.mean(deltas)) > 0,
         "paired_daily_bootstrap_lower_positive": (
@@ -552,8 +624,8 @@ def run_controlled_model_strategy_ab(
     blocked = [key for key, passed in gates.items() if not passed]
     result = {
         "ok": True,
-        "schema_version": "alis_controlled_model_strategy_ab_v3",
-        "comparison_contract": "point_in_time_fold_model_vs_disabled_ablation_v1",
+        "schema_version": CONTROLLED_STRATEGY_AB_CONTRACT,
+        "comparison_contract": CONTROLLED_STRATEGY_AB_COMPARISON_CONTRACT,
         "status": "passed" if not blocked else "failed",
         "model_version_id": int(model_version_id),
         "model_key": model_key,
@@ -620,6 +692,137 @@ def run_controlled_model_strategy_ab(
     return result
 
 
+def reconcile_plan_model_strategy_impact_contracts() -> dict[str, Any]:
+    """Requeue task-valid candidates whose strategy proof predates V4.
+
+    Old evidence is retained as a compact reconciliation record but cannot
+    satisfy production eligibility.  Future Shadow is reset because it must
+    start only after the current frozen cost-after A/B reference has passed.
+    """
+    from app.services.evolution_orchestrator import create_evolution_task
+
+    changed: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    for model_key in PLAN_MODELS:
+        candidate = next(
+            (
+                version
+                for version in list_model_versions(model_key, limit=10)
+                if str(version.get("status") or "") == "candidate"
+                and str(
+                    (((version.get("validation") or {}).get("review") or {}).get("status"))
+                    or ""
+                )
+                != "rejected"
+            ),
+            None,
+        )
+        if not candidate:
+            continue
+        metrics = dict(candidate.get("metrics") or {})
+        task_oos = metrics.get("task_native_oos") if isinstance(
+            metrics.get("task_native_oos"), dict
+        ) else {}
+        impact = metrics.get("strategy_impact_ab")
+        if not (
+            bool(metrics.get("task_metric_passed"))
+            and bool(task_oos.get("passed"))
+            and bool(task_oos.get("baseline_outperformed"))
+            and isinstance(impact, dict)
+        ):
+            continue
+        if controlled_strategy_ab_passed_current_contract(model_key, impact):
+            skipped.append({
+                "model_key": model_key,
+                "model_version_id": int(candidate["id"]),
+                "reason": "current_contract_already_passed",
+            })
+            continue
+        if str(impact.get("schema_version") or "") == CONTROLLED_STRATEGY_AB_CONTRACT:
+            # A current-contract failure is a real investment result, not a
+            # reason to rerun the same windows.
+            skipped.append({
+                "model_key": model_key,
+                "model_version_id": int(candidate["id"]),
+                "reason": "current_contract_already_evaluated",
+                "status": str(impact.get("status") or ""),
+            })
+            continue
+
+        validation = dict(candidate.get("validation") or {})
+        eligibility = dict(validation.get("production_eligibility") or {})
+        gates = dict(eligibility.get("gates") or {})
+        gates["controlled_strategy_ab"] = False
+        gates["live_observation_20_sessions"] = False
+        eligibility.update({
+            "gates": gates,
+            "eligible": False,
+            "blocked_reasons": [
+                key
+                for key, passed in gates.items()
+                if key not in {
+                    "human_review",
+                    "live_observation_20_sessions",
+                    "simulation_only_live_observation_waived",
+                }
+                and not bool(passed)
+            ],
+        })
+        validation.update({
+            "status": "pending_strategy_ab",
+            "production_eligible": False,
+            "production_eligibility": eligibility,
+            "strategy_ab_contract_reconciliation": {
+                "status": "legacy_evidence_invalidated_and_requeued",
+                "previous_schema_version": str(impact.get("schema_version") or ""),
+                "previous_comparison_contract": str(
+                    impact.get("comparison_contract") or ""
+                ),
+                "previous_status": str(impact.get("status") or ""),
+                "required_schema_version": CONTROLLED_STRATEGY_AB_CONTRACT,
+                "required_comparison_contract": (
+                    CONTROLLED_STRATEGY_AB_COMPARISON_CONTRACT
+                ),
+                "reason": "strategy_cost_after_evidence_must_be_explicit_and_recomputed",
+                "invalidated_at": datetime.now().astimezone().isoformat(),
+            },
+        })
+        validation.pop("model_shadow", None)
+        metrics.pop("strategy_impact_ab", None)
+        update_model_version_metrics(int(candidate["id"]), metrics=metrics)
+        update_model_version_validation(int(candidate["id"]), validation=validation)
+        task = create_evolution_task(
+            task_type="model_strategy_impact_validation",
+            payload={
+                "model_key": model_key,
+                "model_version_id": int(candidate["id"]),
+                "version": str(candidate.get("version") or ""),
+                "strategy_ab_contract": CONTROLLED_STRATEGY_AB_CONTRACT,
+                "production_change_forbidden": True,
+            },
+            dedupe_key=(
+                f"model-strategy-impact:{int(candidate['id'])}:"
+                f"{CONTROLLED_STRATEGY_AB_CONTRACT}"
+            ),
+            priority=45,
+        )
+        changed.append({
+            "model_key": model_key,
+            "model_version_id": int(candidate["id"]),
+            "task_id": int(task.get("id") or 0),
+            "task_status": str(task.get("status") or ""),
+        })
+    return {
+        "ok": True,
+        "schema_version": "alis_plan_model_strategy_ab_contract_reconciliation_v1",
+        "required_strategy_ab_contract": CONTROLLED_STRATEGY_AB_CONTRACT,
+        "changed": changed,
+        "changed_count": len(changed),
+        "skipped": skipped,
+        "production_change_forbidden": True,
+    }
+
+
 def reconcile_narrative_strategy_impact_contract() -> dict[str, Any]:
     """Requeue only narrative A/B evidence produced before lifecycle effects existed."""
 
@@ -659,16 +862,9 @@ def reconcile_narrative_strategy_impact_contract() -> dict[str, Any]:
     validation = dict(candidate.get("validation") or {})
     reconciliation = validation.get("strategy_ab_contract_reconciliation")
     reconciliation = reconciliation if isinstance(reconciliation, dict) else {}
-    current_contract = (
-        str(impact.get("model_effect_contract") or "")
-        == NARRATIVE_MODEL_LIFECYCLE_EFFECT_CONTRACT
-        and "candidate_fold_model_actually_effective"
-        in (impact.get("gates") or {})
-        and bool(
-            (impact.get("gates") or {}).get(
-                "candidate_fold_model_effect_contract_current"
-            )
-        )
+    current_contract = controlled_strategy_ab_passed_current_contract(
+        NARRATIVE_MODEL_KEY,
+        impact,
     )
     already_invalidated = (
         not impact

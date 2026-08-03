@@ -121,6 +121,18 @@ def _binding_ids(bindings: dict[str, Any]) -> dict[str, int | None]:
     }
 
 
+def _research_shadow_only(version: dict[str, Any]) -> bool:
+    context = (version.get("metrics") or {}).get("targeted_training_context")
+    return bool(
+        str(version.get("model_key") or "")
+        == "narrative_transition_multitask_v1"
+        and isinstance(context, dict)
+        and str(context.get("evaluation_scope") or "")
+        == "research_shadow_only"
+        and bool(context.get("formal_promotion_forbidden"))
+    )
+
+
 def _reference_bindings(model_key: str) -> dict[str, Any]:
     bindings = active_production_plan_model_bindings()
     bindings[model_key] = None
@@ -177,8 +189,17 @@ def _persist_shadow(
     validation = dict(latest.get("validation") or {})
     eligibility = dict(validation.get("production_eligibility") or {})
     gates = dict(eligibility.get("gates") or {})
-    gates["live_observation_20_sessions"] = bool(live_gate)
+    research_only = _research_shadow_only(latest)
+    gates["live_observation_20_sessions"] = bool(live_gate and not research_only)
     gates["simulation_only_live_observation_waived"] = False
+    if research_only:
+        gates["fresh_unconsumed_narrative_formal_oos_cohort"] = False
+        gates["research_shadow_not_production_evidence"] = False
+        blocked_reasons = list(dict.fromkeys([
+            *blocked_reasons,
+            "waiting_for_complete_new_126_session_oos_cohort",
+            "research_shadow_not_production_evidence",
+        ]))
     eligibility.update({
         "eligible": False,
         "gates": gates,
@@ -208,8 +229,12 @@ def enroll_model_shadow_candidate(
     model_key = str(version.get("model_key") or "")
     if model_key not in PLAN_MODELS:
         return {"ok": False, "status": "blocked_by_model_family"}
+    research_only = _research_shadow_only(version)
     impact = (version.get("metrics") or {}).get("strategy_impact_ab")
-    if not controlled_strategy_ab_passed_current_contract(model_key, impact):
+    if (
+        not research_only
+        and not controlled_strategy_ab_passed_current_contract(model_key, impact)
+    ):
         return {
             "ok": False,
             "status": "blocked_by_controlled_strategy_ab",
@@ -262,11 +287,26 @@ def enroll_model_shadow_candidate(
         },
         "reset_reason": "reference_model_bundle_changed" if force_reset else None,
         "production_change_forbidden": True,
+        "scope": (
+            "research_prediction_shadow"
+            if research_only
+            else "candidate_future_shadow"
+        ),
+        "formal_promotion_forbidden": research_only,
+        "formal_promotion_block_reason": (
+            "waiting_for_complete_new_126_session_oos_cohort"
+            if research_only
+            else None
+        ),
     }
     _persist_shadow(
         version,
         shadow,
-        status="pending_live_observation",
+        status=(
+            "research_shadow_observing"
+            if research_only
+            else "pending_live_observation"
+        ),
         live_gate=False,
         blocked_reasons=["live_observation_20_sessions"],
     )
@@ -366,6 +406,7 @@ def advance_model_shadow_candidate(
     if not version:
         return {"ok": False, "status": "blocked_by_missing_model_version"}
     validation = dict(version.get("validation") or {})
+    research_only = _research_shadow_only(version)
     shadow = validation.get("model_shadow") if isinstance(
         validation.get("model_shadow"), dict
     ) else {}
@@ -546,13 +587,17 @@ def advance_model_shadow_candidate(
         version,
         shadow,
         status=(
-            "shadow_passed"
+            "research_shadow_complete"
+            if research_only and status in {"passed", "failed"}
+            else "research_shadow_observing"
+            if research_only
+            else "shadow_passed"
             if status == "passed"
             else "shadow_failed"
             if status == "failed"
             else "pending_live_observation"
         ),
-        live_gate=status == "passed",
+        live_gate=status == "passed" and not research_only,
         blocked_reasons=blocked,
     )
     if progress_callback:
@@ -601,14 +646,17 @@ def ensure_model_shadow_tasks() -> dict[str, Any]:
             (
                 item for item in versions
                 if str(item.get("status") or "") == "candidate"
-                and str(
-                    (
-                        (item.get("metrics") or {}).get("strategy_impact_ab")
-                        or {}
-                    ).get("status")
-                    or ""
+                and (
+                    _research_shadow_only(item)
+                    or str(
+                        (
+                            (item.get("metrics") or {}).get("strategy_impact_ab")
+                            or {}
+                        ).get("status")
+                        or ""
+                    )
+                    == "passed"
                 )
-                == "passed"
                 and str(
                     (
                         (item.get("validation") or {}).get("review")
@@ -624,9 +672,12 @@ def ensure_model_shadow_tasks() -> dict[str, Any]:
         if (
             not version
             or str(version.get("status") or "") != "candidate"
-            or not controlled_strategy_ab_passed_current_contract(
-                model_key,
-                impact,
+            or (
+                not _research_shadow_only(version)
+                and not controlled_strategy_ab_passed_current_contract(
+                    model_key,
+                    impact,
+                )
             )
         ):
             skipped.append({"model_key": model_key, "reason": "no_ab_passed_candidate"})
@@ -659,7 +710,11 @@ def ensure_model_shadow_tasks() -> dict[str, Any]:
                 "model_key": model_key,
                 "model_version_id": int(version["id"]),
                 "status": result.get("status"),
-                "reason": "ab_passed_candidate_enrolled",
+                "reason": (
+                    "research_shadow_candidate_enrolled"
+                    if _research_shadow_only(version)
+                    else "ab_passed_candidate_enrolled"
+                ),
             })
         if str(shadow.get("status") or "") in {"passed", "failed"}:
             skipped.append({"model_key": model_key, "reason": shadow["status"]})

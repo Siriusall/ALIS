@@ -13,6 +13,11 @@ from app.services.plan_model_control import (
     request_plan_model_training,
     review_plan_model_version,
 )
+from app.services.narrative_lifecycle_contract import SCHEMA_VERSION as NARRATIVE_LABEL_CONTRACT
+
+
+NARRATIVE_RESEARCH_REFRESH_SESSIONS = 20
+NARRATIVE_FORMAL_COHORT_SESSIONS = 126
 
 
 def _metric(metrics: dict[str, Any] | None, key: str) -> float | None:
@@ -52,8 +57,113 @@ def _training_data_advanced(item: dict[str, Any]) -> bool:
         prior_sessions = _metric(latest.get("metrics") or {}, "effective_sessions")
         current_sessions = _metric(current, "effective_sessions")
         return prior_sessions is None or current_sessions is None or current_sessions > prior_sessions
+    current_labeled = _metric(current, "latest_training_sessions")
+    prior_labeled = _metric(run, "labeled_trade_date_count")
+    if prior_labeled is None:
+        prior_labeled = _metric(run.get("metrics") or {}, "labeled_trade_date_count")
+    if (
+        current_labeled is not None
+        and prior_labeled is not None
+        and current_labeled > prior_labeled
+    ):
+        return True
     keys = ("trade_sessions", "theme_snapshot_sessions", "event_rows", "capital_coverage_slices", "effective_sessions")
     return any(float(current.get(key) or 0) > float(prior.get(key) or 0) for key in keys)
+
+
+def _model_training_date_advance(item: dict[str, Any]) -> int:
+    current = item.get("coverage") or {}
+    latest = item.get("latest_version") or {}
+    latest_metrics = latest.get("metrics") or {}
+    run = item.get("latest_train_run") or {}
+    current_sessions = int(
+        current.get("latest_training_sessions")
+        or current.get("effective_sessions")
+        or 0
+    )
+    prior_sessions = int(
+        latest_metrics.get("effective_sessions")
+        or run.get("labeled_trade_date_count")
+        or ((run.get("metrics") or {}).get("labeled_trade_date_count") or 0)
+    )
+    return max(0, current_sessions - prior_sessions)
+
+
+def _event_training_date_advance(item: dict[str, Any]) -> int:
+    return _model_training_date_advance(item)
+
+
+def _training_request_context(
+    item: dict[str, Any],
+    *,
+    trigger: str,
+) -> dict[str, Any]:
+    context: dict[str, Any] = {
+        "trigger_reason": item.get("reason") or trigger,
+        "requested_by": "auto_optimizer",
+        "trigger": trigger,
+    }
+    if (
+        str(item.get("model_key") or "")
+        == "narrative_transition_multitask_v1"
+        and trigger == "train_research_shadow"
+    ):
+        context.update({
+            "evaluation_scope": "research_shadow_only",
+            "production_change_forbidden": True,
+            "formal_promotion_forbidden": True,
+            "formal_promotion_block_reason": (
+                "waiting_for_complete_new_126_session_oos_cohort"
+            ),
+            "research_refresh_sessions": NARRATIVE_RESEARCH_REFRESH_SESSIONS,
+            "formal_cohort_sessions": NARRATIVE_FORMAL_COHORT_SESSIONS,
+        })
+    if str(item.get("model_key") or "") != "event_impact_assessor_v2":
+        return context
+    latest = item.get("latest_version") or {}
+    latest_metrics = latest.get("metrics") or {}
+    candidate_spec = latest_metrics.get("candidate_spec")
+    if int(latest.get("id") or 0) > 0 and isinstance(candidate_spec, dict) and candidate_spec:
+        context.update({
+            "source_model_version_id": int(latest["id"]),
+            "model_candidate_spec": candidate_spec,
+            "event_research_resume_contract": (
+                "inherit_frozen_candidate_after_complete_new_event_test_window_v1"
+            ),
+        })
+    return context
+
+
+def _narrative_research_shadow_only(item: dict[str, Any]) -> bool:
+    latest = item.get("latest_version") or {}
+    context = (latest.get("metrics") or {}).get("targeted_training_context")
+    return bool(
+        isinstance(context, dict)
+        and str(context.get("evaluation_scope") or "")
+        == "research_shadow_only"
+    )
+
+
+def _narrative_research_shadow_due(item: dict[str, Any]) -> bool:
+    coverage = item.get("coverage") if isinstance(item.get("coverage"), dict) else {}
+    if not bool(coverage.get("data_ready")):
+        return False
+    latest = item.get("latest_version") or {}
+    metrics = latest.get("metrics") or {}
+    feature_contract = metrics.get("feature_computation_contract")
+    trained_label_contract = (
+        str(feature_contract.get("narrative_lifecycle") or "")
+        if isinstance(feature_contract, dict)
+        else ""
+    )
+    if trained_label_contract != NARRATIVE_LABEL_CONTRACT:
+        return True
+    return bool(
+        _narrative_research_shadow_only(item)
+        and _model_training_date_advance(item)
+        >= NARRATIVE_RESEARCH_REFRESH_SESSIONS
+        and _periodic_retrain_due(item)
+    )
 
 
 def _periodic_retrain_due(item: dict[str, Any], *, require_rejected: bool = False) -> bool:
@@ -86,8 +196,13 @@ def _recommendation(item: dict[str, Any]) -> dict[str, Any]:
     latest_metrics = latest.get("metrics") or {}
     latest_is_challenger = bool(latest.get("id")) and int(latest.get("id") or 0) != int(active.get("id") or 0) and str(latest.get("status") or "") == "candidate"
     latest_review = ((latest.get("validation") or {}).get("review") or {}) if isinstance(latest.get("validation"), dict) else {}
+    training_protocol_status = str(
+        item.get("latest_training_protocol_status") or ""
+    )
     current_contract = (
-        str(latest_metrics.get("model_evaluation_contract") or "")
+        training_protocol_status == "current"
+        if training_protocol_status
+        else str(latest_metrics.get("model_evaluation_contract") or "")
         == MODEL_EVALUATION_CONTRACT
     )
     if not current_contract:
@@ -95,12 +210,59 @@ def _recommendation(item: dict[str, Any]) -> dict[str, Any]:
         if bool(coverage.get("data_ready")):
             return {
                 "action": "retrain_challenger",
-                "reason": "现有版本属于历史评价协议，当前点时数据已满足，按任务原生评价协议重训。",
+                "reason": "现有版本不满足当前训练、评价或特征协议；点时数据已满足，按当前完整协议重训。",
                 "requires_human": False,
             }
         return {
             "action": "wait_for_data",
-            "reason": "现有版本属于历史评价协议，但当前真实点时训练数据不足。",
+            "reason": "现有版本不满足当前训练、评价或特征协议，但真实点时训练数据不足。",
+            "requires_human": False,
+        }
+
+    event_cohort_governance = latest_metrics.get(
+        "event_research_cohort_governance"
+    )
+    if (
+        str(item.get("model_key") or "") == "event_impact_assessor_v2"
+        and isinstance(event_cohort_governance, dict)
+        and str(event_cohort_governance.get("status") or "")
+        == "adaptive_same_cohort_non_promotable"
+        and _event_training_date_advance(item) < 10
+    ):
+        return {
+            "action": "wait_for_oos_cohort_advance",
+            "reason": (
+                "当前正式五窗已被用于后继特征设计；至少形成10个全新有效事件日"
+                "的完整测试窗后，系统再继承冻结方案自动评价。"
+            ),
+            "requires_human": False,
+        }
+
+    if (
+        str(item.get("model_key") or "")
+        == "narrative_transition_multitask_v1"
+        and (
+            str(latest_review.get("status") or "") == "rejected"
+            or _narrative_research_shadow_only(item)
+        )
+        and _model_training_date_advance(item)
+        < NARRATIVE_FORMAL_COHORT_SESSIONS
+    ):
+        if _narrative_research_shadow_due(item):
+            return {
+                "action": "train_research_shadow",
+                "reason": (
+                    "叙事 V3 可立即训练研究候选并并行累计未来预测；"
+                    "该候选固定禁止生产晋升，正式评价仍等待全新126交易日测试窗。"
+                ),
+                "requires_human": False,
+            }
+        return {
+            "action": "observe_research_shadow",
+            "reason": (
+                "叙事研究候选继续并行观察；每新增20个交易日最多刷新一次，"
+                "正式晋升仍等待完整的126交易日新测试窗。"
+            ),
             "requires_human": False,
         }
 
@@ -145,6 +307,8 @@ def _recommendation(item: dict[str, Any]) -> dict[str, Any]:
 def _auto_reject_reason(item: dict[str, Any]) -> str:
     active = item.get("active_version") or {}
     latest = item.get("latest_version") or {}
+    if _narrative_research_shadow_only(item):
+        return ""
     if not latest.get("id") or int(latest.get("id") or 0) == int(active.get("id") or 0):
         return ""
     if str(latest.get("status") or "") != "candidate":
@@ -196,6 +360,8 @@ def _auto_promote_ready_candidates(family: dict[str, Any]) -> list[dict[str, Any
     """Promote only task-valid candidates with separate strategy and Shadow proof."""
     promoted: list[dict[str, Any]] = []
     for item in family.get("items") or []:
+        if _narrative_research_shadow_only(item):
+            continue
         latest = item.get("latest_version") or {}
         active = item.get("active_version") or {}
         if (
@@ -342,8 +508,10 @@ def run_auto_optimization_once(
     from app.services.model_shadow_observation import ensure_model_shadow_tasks
     from app.services.model_strategy_impact import (
         reconcile_narrative_strategy_impact_contract,
+        reconcile_plan_model_strategy_impact_contracts,
     )
 
+    strategy_ab_contracts = reconcile_plan_model_strategy_impact_contracts()
     narrative_strategy_ab = reconcile_narrative_strategy_impact_contract()
     model_shadow_tasks = ensure_model_shadow_tasks()
     if training_failure_recovery:
@@ -360,6 +528,7 @@ def run_auto_optimization_once(
             "skipped": [],
             "training_failure_recovery": recovery,
             "narrative_strategy_ab": narrative_strategy_ab,
+            "strategy_ab_contracts": strategy_ab_contracts,
             "model_shadow_tasks": model_shadow_tasks,
         }
     failure_reconciliation = reconcile_unhandled_plan_model_training_failures()
@@ -379,7 +548,7 @@ def run_auto_optimization_once(
     }
     if waiting_model_keys & {
         "capital_persistence_multitask_v1",
-        "event_surprise_lgbm_v1",
+        "event_impact_assessor_v2",
     }:
         from app.data_platform.services.backfill import (
             ensure_plan_model_data_backfill,
@@ -400,7 +569,9 @@ def run_auto_optimization_once(
         if item.get("running"):
             skipped.append({"model_key": item["model_key"], "reason": "training_running"})
             continue
-        if trigger in {"train_challenger", "retrain_challenger"} or (force and item.get("status") == "production"):
+        if trigger in {
+            "train_challenger", "retrain_challenger", "train_research_shadow",
+        } or (force and item.get("status") == "production"):
             if len(started) >= maximum_starts:
                 skipped.append({
                     "model_key": item["model_key"],
@@ -409,11 +580,10 @@ def run_auto_optimization_once(
                 continue
             result = request_plan_model_training(
                 str(item["model_key"]),
-                training_context={
-                    "trigger_reason": item.get("reason") or trigger,
-                    "requested_by": "auto_optimizer",
-                    "trigger": trigger,
-                },
+                training_context=_training_request_context(
+                    item,
+                    trigger=trigger,
+                ),
             )
             if result.get("started"):
                 started.append(result)
@@ -436,6 +606,7 @@ def run_auto_optimization_once(
         "model_data_backfill": model_data_backfill,
         "training_failure_reconciliation": failure_reconciliation,
         "narrative_strategy_ab": narrative_strategy_ab,
+        "strategy_ab_contracts": strategy_ab_contracts,
         "model_shadow_tasks": model_shadow_tasks,
         "status": after,
     }
