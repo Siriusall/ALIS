@@ -172,11 +172,8 @@ def _owner_summary(steps: list[dict[str, Any]]) -> dict[str, Any]:
     hard_data = ((by_name.get("hard_data_gate") or {}).get("result") or {})
     decision_data = ((by_name.get("decision_data_gate") or {}).get("result") or {})
     optimizer = portfolio.get("optimizer") if isinstance(portfolio.get("optimizer"), dict) else {}
-    rebalance_actions = [
-        action for action in (portfolio.get("rebalance_proposal") or portfolio.get("proposal") or [])
-        if str(action.get("action") or "") not in {"", "hold", "observe"}
-        and abs(float(action.get("weight_change") or 0)) > 1e-9
-    ]
+    rebalance_items = list(portfolio.get("rebalance_proposal") or portfolio.get("proposal") or [])
+    rebalance_actions = [action for action in rebalance_items if int(action.get("planned_quantity") or 0) > 0]
     champion_gate = champion_execution_gate()
     anomalies = [
         {
@@ -200,7 +197,7 @@ def _owner_summary(steps: list[dict[str, Any]]) -> dict[str, Any]:
                 "planned_execute_at": rebalance.get("planned_execute_at"),
                 "planned_execute_date": rebalance.get("planned_execute_date"),
                 "blocked_reason": rebalance.get("blocked_reason"),
-                "actions": rebalance_actions,
+                "actions": [_owner_rebalance_action(action) for action in rebalance_items],
             },
             "profit": {
                 "daily_return_pct": attribution.get("latest_daily_return_pct"),
@@ -300,6 +297,8 @@ def run_system_autonomy_cycle() -> dict[str, Any]:
     from app.services.free_research_data import materialize_cn_ppi_price_proxies, materialize_financial_industry_series, materialize_futures_price_proxies
     from app.data_platform.services.data_center import sync_tushare_api_raw
     from app.services.official_policy_data import materialize_official_capacity_utilization, materialize_official_policy_supply, sync_official_policy_documents
+    from app.services.caam_ocr_data import audit_caam_ocr_candidates, reconcile_caam_ocr_with_miit, sync_caam_ocr_candidates
+    from app.services.professional_metric_documents import audit_professional_metric_candidates, sync_professional_metric_candidates
     from app.data_platform.services.data_center import sync_pmi_industry_proxies
     from app.services.llm_research_agent import run_llm_research_agent
     from app.services.llm_research_governance import assess_llm_research_proposals
@@ -348,6 +347,11 @@ def run_system_autonomy_cycle() -> dict[str, Any]:
         _run_step("official_policy_documents", sync_official_policy_documents),
         _run_step("official_policy_supply", materialize_official_policy_supply),
         _run_step("official_capacity_utilization", materialize_official_capacity_utilization),
+        _run_step("caam_ocr_candidates", sync_caam_ocr_candidates),
+        _run_step("caam_ocr_candidate_audit", audit_caam_ocr_candidates),
+        _run_step("caam_ocr_miit_reconciliation", reconcile_caam_ocr_with_miit),
+        _run_step("professional_metric_pdf_candidates", sync_professional_metric_candidates),
+        _run_step("professional_metric_candidate_audit", audit_professional_metric_candidates),
         _run_step(
             "futures_price_proxies",
             lambda: materialize_futures_price_proxies(start_date=_latest_trade_date(), end_date=_latest_trade_date()),
@@ -376,6 +380,31 @@ def run_system_autonomy_cycle() -> dict[str, Any]:
         "status": "completed_owner_action_required" if not summary["healthy"] else "completed",
         "steps": steps,
         "owner_summary": summary,
+    }
+
+
+def _owner_rebalance_action(action: dict[str, Any]) -> dict[str, Any]:
+    """Keep the compact owner view without dropping portfolio values."""
+    return {
+        "symbol": str(action.get("symbol") or ""),
+        "name": str(action.get("name") or ""),
+        "action": str(action.get("action") or ""),
+        "reason": str(action.get("reason") or ""),
+        "current_weight": action.get("current_weight"),
+        "target_weight": action.get("target_weight"),
+        "weight_change": action.get("weight_change"),
+        "current_amount": action.get("current_amount"),
+        "target_amount": action.get("target_amount"),
+        "estimated_trade_amount": action.get("estimated_trade_amount"),
+        "planned_side": action.get("planned_side"),
+        "planned_quantity": action.get("planned_quantity"),
+        "planned_lots": action.get("planned_lots"),
+        "reference_close": action.get("reference_close"),
+        "estimated_execution_amount": action.get("estimated_execution_amount"),
+        "planned_cost": action.get("planned_cost") or {},
+        "controller_permission": action.get("controller_permission") or {},
+        "controller_intent": action.get("controller_intent"),
+        "controller_obligation": action.get("controller_obligation") or {},
     }
 
 
@@ -453,11 +482,7 @@ def latest_owner_summary() -> dict[str, Any]:
         from app.services.profit_loop import get_latest_daily_rebalance_plan
         latest_plan = get_latest_daily_rebalance_plan()
         proposal = latest_plan.get("proposal") if isinstance(latest_plan.get("proposal"), list) else []
-        actionable = [
-            action for action in proposal
-            if str(action.get("action") or "") not in {"", "hold", "observe"}
-            and abs(float(action.get("weight_change") or 0)) > 1e-9
-        ]
+        actionable = [action for action in proposal if int(action.get("planned_quantity") or 0) > 0]
         questions = summary.setdefault("questions", {})
         questions["today_rebalance"] = {
             "status": str(latest_plan.get("status") or "not_generated"),
@@ -467,15 +492,7 @@ def latest_owner_summary() -> dict[str, Any]:
             "planned_execute_at": latest_plan.get("planned_execute_at"),
             "planned_execute_date": latest_plan.get("planned_execute_date"),
             "blocked_reason": latest_plan.get("blocked_reason"),
-            "actions": [
-                {
-                    "symbol": str(action.get("symbol") or ""),
-                    "name": str(action.get("name") or ""),
-                    "action": str(action.get("action") or ""),
-                    "reason": str(action.get("reason") or ""),
-                }
-                for action in actionable
-            ],
+            "actions": [_owner_rebalance_action(action) for action in proposal],
         }
     except Exception as exc:
         append_read_error(exc, "owner_summary:latest_rebalance_plan")

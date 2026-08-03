@@ -86,6 +86,19 @@ def _industry_return(industry: str, entry_date: str, exit_date: str) -> float | 
     return float(value) if value is not None else None
 
 
+def _outcome_needs_benchmark_recompute(row: dict[str, Any] | None) -> bool:
+    """Allow one deterministic refresh after a previously missing benchmark is repaired."""
+
+    if not isinstance(row, dict) or row.get("benchmark_return") is not None:
+        return False
+    try:
+        details = json.loads(row.get("attribution_json") or "{}")
+    except (TypeError, json.JSONDecodeError):
+        details = {}
+    limitations = details.get("limitations") if isinstance(details, dict) else []
+    return "缺少沪深300同期收盘价" in (limitations if isinstance(limitations, list) else [])
+
+
 def materialize_decision_outcomes(limit: int = 1000) -> dict[str, Any]:
     """Persist point-in-time 5/20/60-session outcomes and market/industry/selection attribution."""
     _ensure_tables()
@@ -93,9 +106,13 @@ def materialize_decision_outcomes(limit: int = 1000) -> dict[str, Any]:
         decisions = [dict(row) for row in c.execute(
             "SELECT * FROM decision_snapshots ORDER BY decision_time DESC LIMIT ?", (limit,)
         ).fetchall()]
-        existing = {(int(row["decision_snapshot_id"]), int(row["horizon_sessions"])) for row in c.execute(
-            "SELECT decision_snapshot_id,horizon_sessions FROM decision_outcome_attributions"
-        ).fetchall()}
+        existing = {
+            (int(row["decision_snapshot_id"]), int(row["horizon_sessions"])): dict(row)
+            for row in c.execute(
+                "SELECT decision_snapshot_id,horizon_sessions,benchmark_return,attribution_json "
+                "FROM decision_outcome_attributions"
+            ).fetchall()
+        }
     created = 0
     pending = 0
     for decision in decisions:
@@ -112,7 +129,8 @@ def materialize_decision_outcomes(limit: int = 1000) -> dict[str, Any]:
             pending += len(HORIZONS)
             continue
         for horizon in HORIZONS:
-            if (decision_id, horizon) in existing:
+            existing_row = existing.get((decision_id, horizon))
+            if existing_row and not _outcome_needs_benchmark_recompute(existing_row):
                 continue
             if len(prices) <= horizon:
                 pending += 1
@@ -136,12 +154,22 @@ def materialize_decision_outcomes(limit: int = 1000) -> dict[str, Any]:
             if bm_return is None: details["limitations"].append("缺少沪深300同期收盘价")
             if ind_return is None: details["limitations"].append("缺少行业同期横截面")
             with _conn() as c:
-                c.execute("""INSERT INTO decision_outcome_attributions
+                statement = """INSERT INTO decision_outcome_attributions
                     (decision_snapshot_id,horizon_sessions,entry_date,exit_date,stock_return,directional_return,
                      benchmark_return,industry_return,market_contribution,industry_contribution,selection_contribution,
-                     correct,attribution_json,calculated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT DO NOTHING""",
-                    (decision_id,horizon,entry_date,exit_date,stock_return,directional,bm_return,ind_return,market,
-                     industry_component,selection,int(correct),json.dumps(details,ensure_ascii=False),_now()))
+                     correct,attribution_json,calculated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)"""
+                params = (decision_id,horizon,entry_date,exit_date,stock_return,directional,bm_return,ind_return,market,
+                          industry_component,selection,int(correct),json.dumps(details,ensure_ascii=False),_now())
+                if existing_row:
+                    statement += """ ON CONFLICT(decision_snapshot_id,horizon_sessions) DO UPDATE SET
+                        entry_date=excluded.entry_date,exit_date=excluded.exit_date,stock_return=excluded.stock_return,
+                        directional_return=excluded.directional_return,benchmark_return=excluded.benchmark_return,
+                        industry_return=excluded.industry_return,market_contribution=excluded.market_contribution,
+                        industry_contribution=excluded.industry_contribution,selection_contribution=excluded.selection_contribution,
+                        correct=excluded.correct,attribution_json=excluded.attribution_json,calculated_at=excluded.calculated_at"""
+                else:
+                    statement += " ON CONFLICT DO NOTHING"
+                c.execute(statement, params)
                 c.execute("DELETE FROM manual_review_triage WHERE review_key=? AND status IN ('escalated','awaiting_outcome')", (f"decision:{decision_id}",))
             created += 1
     feedback = materialize_training_feedback()

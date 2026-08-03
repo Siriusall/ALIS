@@ -1745,6 +1745,36 @@ def execute_evolution_task(
                 ),
             ),
         )
+    if task_type == "hsmm_shadow_training":
+        from app.services.hsmm_shadow import train_hsmm_shadow
+
+        payload = task.get("payload") if isinstance(
+            task.get("payload"), dict
+        ) else {}
+        _heartbeat(
+            int(task["id"]),
+            phase="hsmm_shadow_training",
+            progress=0.1,
+            message="正在按显式时长当前合同运行三窗 HSMM/HMM 对照",
+            checkpoint={
+                **(
+                    task.get("checkpoint")
+                    if isinstance(task.get("checkpoint"), dict)
+                    else {}
+                ),
+                "training_contract": "explicit_duration_forward_backward_em_v3",
+                "production_change_forbidden": True,
+            },
+        )
+        return _run_with_heartbeat_pulse(
+            int(task["id"]),
+            phase="hsmm_shadow_training",
+            message="正在执行 HSMM 三窗任务原生评价",
+            runner=lambda: train_hsmm_shadow(
+                refresh_api=bool(payload.get("refresh_api", False)),
+                force=bool(payload.get("force", False)),
+            ),
+        )
     if task_type == "model_shadow_observation":
         from app.services.model_shadow_observation import (
             advance_model_shadow_candidate,
@@ -1804,8 +1834,15 @@ def execute_evolution_task(
         )
     if task_type == "plan_model_autonomy":
         from app.services.plan_model_auto_optimizer import run_auto_optimization_once
+        from app.services.plan_model_control import request_plan_model_training
 
         payload = task.get("payload") if isinstance(task.get("payload"), dict) else {}
+        target_model_key = str(payload.get("target_model_key") or "")
+        model_candidate_spec = (
+            dict(payload.get("model_candidate_spec") or {})
+            if isinstance(payload.get("model_candidate_spec"), dict)
+            else {}
+        )
         failure_recovery = payload.get("training_failure_recovery") if isinstance(
             payload.get("training_failure_recovery"), dict
         ) else None
@@ -1824,6 +1861,32 @@ def execute_evolution_task(
                     force=False,
                     training_failure_recovery=failure_recovery,
                 )
+        elif target_model_key and model_candidate_spec:
+            def model_runner() -> dict[str, Any]:
+                training = request_plan_model_training(
+                    target_model_key,
+                    training_context={
+                        "requested_by": "evolution_targeted_model_candidate",
+                        "trigger": str(payload.get("trigger") or "targeted_candidate"),
+                        "source_model_version_id": int(
+                            payload.get("source_model_version_id") or 0
+                        ) or None,
+                        "source_audit_contract": str(
+                            payload.get("source_audit_contract") or ""
+                        ),
+                        "production_change_forbidden": True,
+                        "model_candidate_spec": model_candidate_spec,
+                    },
+                )
+                return {
+                    "ok": bool(training.get("ok")),
+                    "mode": "targeted_model_candidate",
+                    "started": [training] if training.get("started") else [],
+                    "started_count": 1 if training.get("started") else 0,
+                    "skipped": [] if training.get("started") else [training],
+                    "skipped_count": 0 if training.get("started") else 1,
+                    "production_change_forbidden": True,
+                }
         else:
             def model_runner() -> dict[str, Any]:
                 return run_auto_optimization_once(force=False)
@@ -1896,6 +1959,7 @@ def _finish_success(task_id: int, result: dict[str, Any]) -> None:
         "strategy_failure_model_training": "策略失败归因模型训练派发完成",
         "model_candidate_research": "模型最差窗口归因与候选分层筛选完成",
         "model_strategy_impact_validation": "新模型版本完整策略影响验证完成",
+        "hsmm_shadow_training": "HSMM 三窗任务原生评价完成",
         "model_shadow_observation": "模型未来影子观察完成",
         "plan_model_autonomy": "任务原生模型单模型自治调度完成",
         "strategy_portfolio_formal_queue": "多策略组合正式验证入队完成",

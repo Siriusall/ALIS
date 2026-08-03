@@ -3284,7 +3284,7 @@ FAILURE_MODEL_ROUTING: tuple[tuple[str, str], ...] = (
     ("capital", "capital_persistence_multitask_v1"),
     ("liquidity", "capital_persistence_multitask_v1"),
     ("leader", "leader_lambdarank_v1"),
-    ("event", "event_surprise_lgbm_v1"),
+    ("event", "event_impact_assessor_v2"),
     ("narrative", "narrative_transition_multitask_v1"),
 )
 

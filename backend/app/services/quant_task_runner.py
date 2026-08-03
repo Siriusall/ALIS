@@ -5,7 +5,7 @@ import threading
 from datetime import datetime, timezone, time as dtime, timedelta
 import os
 from time import perf_counter
-from typing import Any, Tuple
+from typing import Any, Callable, Tuple
 
 from app.integrations.tushare_client import reset_tushare_client
 from app.core.trade_calendar import is_trade_day
@@ -60,6 +60,15 @@ _DEFENSIVE_EXECUTION_REFRESH_INTERVAL_SEC = max(
 _auto_scheduler_started = False
 _defensive_execution_refresh_lock = threading.Lock()
 _defensive_execution_refresh_attempts: dict[str, float] = {}
+
+
+def _wait_for_auto_simulation_retry(
+    beat_fn: Callable[[str], Any],
+    wait_fn: Callable[[float], Any] | None = None,
+) -> None:
+    """Keep scheduler liveness current while an expected retry is deferred."""
+    beat_fn("auto_simulation_scheduler")
+    (wait_fn or threading.Event().wait)(_AUTO_SIMULATION_INTERVAL_SEC)
 
 
 def _trade_date_key(value: object) -> str:
@@ -311,7 +320,30 @@ def _refresh_missing_frozen_defensive_assets(
         ts_codes=missing,
     )
     refreshed = defensive_asset_execution_status(execute_date, required)
-    return {**refreshed, "refresh": "attempted", "refresh_result": result}
+    fallback_result: dict[str, Any] | None = None
+    if refreshed.get("missing"):
+        from app.data_platform.services.tencent_etf_daily_fallback import (
+            repair_fund_daily_from_tencent,
+        )
+
+        try:
+            # Pass the complete frozen defensive universe: existing same-day
+            # TuShare rows are the mandatory provider-mapping reference sample.
+            fallback_result = repair_fund_daily_from_tencent(execute_date, required)
+        except Exception as exc:  # noqa: BLE001
+            fallback_result = {
+                "ok": False,
+                "status": "fallback_request_failed",
+                "error": str(exc)[:500],
+                "rows_written": 0,
+            }
+        refreshed = defensive_asset_execution_status(execute_date, required)
+    return {
+        **refreshed,
+        "refresh": "attempted",
+        "refresh_result": result,
+        "fallback_result": fallback_result,
+    }
 
 
 def _ensure_close_data_ready() -> tuple[str, bool]:
@@ -336,6 +368,23 @@ def _ensure_close_data_ready() -> tuple[str, bool]:
     return target, execution_ready
 
 
+def _reconcile_missed_plans_by_wall_clock(now: datetime) -> int:
+    """Close prior-date plans even when the scheduler wakes on a weekend.
+
+    The latest available market date remains Friday throughout the weekend,
+    so it cannot by itself prove that Friday's exact execution window is still
+    open.  Natural-date reconciliation only closes strictly earlier dates and
+    therefore never pre-empts a plan due later on the same day.
+    """
+    from app.services.profit_loop import (
+        mark_missed_daily_rebalance_execution_inputs,
+    )
+
+    return mark_missed_daily_rebalance_execution_inputs(
+        now.strftime("%Y%m%d")
+    )
+
+
 def start_auto_simulation_scheduler() -> bool:
     """Start the close-of-day simulator trigger once per process.
 
@@ -356,30 +405,28 @@ def start_auto_simulation_scheduler() -> bool:
         while True:
             try:
                 now = datetime.now()
+                missed_count = _reconcile_missed_plans_by_wall_clock(now)
+                if missed_count:
+                    logger.error(
+                        "正式调仓计划已错过自然日冻结窗口，转为审计终态 date=%s count=%s",
+                        now.strftime("%Y%m%d"),
+                        missed_count,
+                    )
                 from app.services.profit_loop import effective_rebalance_clock
                 close_time = effective_rebalance_clock()
                 if now.weekday() < 5 and now.time() >= close_time:
                     target, data_ready = _ensure_close_data_ready()
-                    from app.services.profit_loop import mark_missed_daily_rebalance_execution_inputs
-
-                    missed_count = mark_missed_daily_rebalance_execution_inputs(target)
-                    if missed_count:
-                        logger.error(
-                            "正式调仓计划错过冻结执行日，已转审计终态 target=%s count=%s",
-                            target,
-                            missed_count,
-                        )
                     if not data_ready:
                         # Do not execute against the latest *old* slice while
                         # the target-day market bundle is still being fetched.
-                        threading.Event().wait(_AUTO_SIMULATION_INTERVAL_SEC)
+                        _wait_for_auto_simulation_retry(beat)
                         continue
                     dates = list_consolidated_trade_dates()
                     latest = str(dates[-1]) if dates else ""
                     target_key = _trade_date_key(target)
                     if not target_key or _trade_date_key(latest) != target_key:
                         logger.warning("收盘日更已通过但合并行情尚未就绪 target=%s latest=%s", target, latest)
-                        threading.Event().wait(_AUTO_SIMULATION_INTERVAL_SEC)
+                        _wait_for_auto_simulation_retry(beat)
                         continue
                     if latest:
                         # Execution eligibility belongs to the immutable plan
@@ -402,7 +449,7 @@ def start_auto_simulation_scheduler() -> bool:
                                     due_context.get("current_execute_date"),
                                     refresh,
                                 )
-                                threading.Event().wait(_AUTO_SIMULATION_INTERVAL_SEC)
+                                _wait_for_auto_simulation_retry(beat)
                                 continue
                         if formal_plan_claimable:
                             active_tasks = list_active_quant_run_tasks()

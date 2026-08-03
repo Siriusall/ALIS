@@ -19,8 +19,8 @@ _usage_lock = threading.Lock()
 
 
 def _token_limits() -> tuple[int, int]:
-    try: per_request = max(200, min(int(get_env_value("DEEPSEEK_MAX_TOKENS_PER_REQUEST", "1200")), 8000))
-    except ValueError: per_request = 1200
+    try: per_request = max(200, min(int(get_env_value("DEEPSEEK_MAX_TOKENS_PER_REQUEST", "2400")), 8000))
+    except ValueError: per_request = 2400
     try: daily = max(per_request, int(get_env_value("DEEPSEEK_DAILY_TOKEN_BUDGET", "10000000")))
     except ValueError: daily = 10_000_000
     return per_request, daily
@@ -84,13 +84,24 @@ def _call_deepseek_json_unlocked(*, system: str, user: str, purpose: str) -> tup
 
 def _extract_json(text: str) -> dict[str, Any]:
     cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", text.strip(), flags=re.I | re.S)
-    match = re.search(r"\{.*\}", cleaned, flags=re.S)
-    if not match:
+    if not cleaned:
         raise ValueError("llm_response_not_json")
-    payload = json.loads(match.group(0))
-    if not isinstance(payload, dict):
+    try:
+        payload = json.loads(cleaned)
+        if isinstance(payload, dict):
+            return payload
         raise ValueError("llm_response_not_object")
-    return payload
+    except json.JSONDecodeError:
+        pass
+    decoder = json.JSONDecoder()
+    for match in re.finditer(r"\{", cleaned):
+        try:
+            payload, _end = decoder.raw_decode(cleaned[match.start():])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            return payload
+    raise ValueError("llm_response_not_json")
 
 
 def generate_review_draft(decision_snapshot_id: int) -> dict[str, Any]:

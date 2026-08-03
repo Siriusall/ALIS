@@ -37,15 +37,34 @@ def _ensure_tables() -> None:
 
 def _routes() -> dict[str, tuple[str, Callable[[], dict[str, Any]]]]:
     # Imports stay lazy so the router remains cheap and testable in isolation.
-    from app.services.factor_platform import run_factor_daily_cycle
     from app.services.plan_model_auto_optimizer import run_auto_optimization_once
     from app.services.review_data_quality_governance import run_review_data_quality_governance
     from app.services.strategy_controller import run_strategy_policy_auto_optimization
     return {
-        "factor": ("factor_daily_evaluation", lambda: run_factor_daily_cycle()),
+        "factor": ("factor_daily_evaluation", _enqueue_factor_daily_evaluation),
         "model": ("model_challenger_cycle", lambda: run_auto_optimization_once(force=False)),
         "strategy": ("strategy_policy_whitelist", lambda: run_strategy_policy_auto_optimization(force=False)),
         "data": ("oos_data_quality_governance", lambda: run_review_data_quality_governance()),
+    }
+
+
+def _enqueue_factor_daily_evaluation() -> dict[str, Any]:
+    """Delegate the potentially long factor cycle to the persistent worker."""
+    from app.services.evolution_orchestrator import create_evolution_task
+
+    today = datetime.now().astimezone().date().isoformat()
+    task = create_evolution_task(
+        task_type="factor_daily_cycle",
+        dedupe_key=f"factor_daily_cycle:{today}",
+        payload={"trigger": "llm_proposal_router"},
+        priority=20,
+    )
+    return {
+        "ok": True,
+        "status": str(task.get("status") or "queued"),
+        "task_id": int(task.get("id") or 0),
+        "persistent": True,
+        "production_change_forbidden": True,
     }
 
 
@@ -67,14 +86,18 @@ def route_llm_research_proposals(*, max_proposals: int = MAX_PROPOSALS_PER_CYCLE
     governance = assess_llm_research_proposals()
     accepted_by_proposal = governance.get("accepted_by_proposal") or {}
     limit = max(1, min(int(max_proposals or MAX_PROPOSALS_PER_CYCLE), MAX_PROPOSALS_PER_CYCLE))
+    scan_limit = 200
     with _conn() as conn:
         rows = [dict(row) for row in conn.execute(
-            "SELECT * FROM llm_research_proposals WHERE status IN ('proposed','routed') ORDER BY id ASC LIMIT ?", (limit,)
+            "SELECT * FROM llm_research_proposals WHERE status IN ('proposed','routed') ORDER BY id ASC LIMIT ?", (scan_limit,)
         ).fetchall()]
     registered = _routes()
     routed: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
+    handled_proposal_ids: set[int] = set()
     for proposal in rows:
+        if len(handled_proposal_ids) >= limit:
+            break
         hypotheses = _payload(proposal).get("hypotheses") or []
         for index, hypothesis in enumerate(hypotheses[:3]):
             if not isinstance(hypothesis, dict):
@@ -104,13 +127,6 @@ def route_llm_research_proposals(*, max_proposals: int = MAX_PROPOSALS_PER_CYCLE
                 "confidence": confidence, "evidence_refs": hypothesis.get("evidence_refs") or [],
                 "policy": "llm_signal_only; fixed_template_only; no_production_write",
             }
-            upsert_experiment_memory(
-                target="llm_research",
-                hypothesis=memory_hypothesis,
-                status="routed",
-                outcome_stage="deterministic_route_started",
-                evidence={"proposal_id": proposal.get("id"), "hypothesis_index": index, "route_key": route_key},
-            )
             with _conn() as conn:
                 exists = conn.execute(
                     "SELECT id,status FROM llm_research_routes WHERE proposal_id=? AND hypothesis_index=? AND route_key=?",
@@ -119,11 +135,19 @@ def route_llm_research_proposals(*, max_proposals: int = MAX_PROPOSALS_PER_CYCLE
                 if exists:
                     skipped.append({"proposal_id": proposal["id"], "hypothesis_index": index, "reason": "already_routed"})
                     continue
+                handled_proposal_ids.add(int(proposal["id"]))
                 conn.execute(
                     """INSERT INTO llm_research_routes(proposal_id,hypothesis_index,route_key,status,evidence_json,result_json,created_at,updated_at)
                        VALUES(?,?,?,'running',?,?,?,?)""",
                     (int(proposal["id"]), index, route_key, json.dumps(evidence, ensure_ascii=False), "{}", now, now),
                 )
+            upsert_experiment_memory(
+                target="llm_research",
+                hypothesis=memory_hypothesis,
+                status="routed",
+                outcome_stage="deterministic_route_started",
+                evidence={"proposal_id": proposal.get("id"), "hypothesis_index": index, "route_key": route_key},
+            )
             try:
                 result = action()
                 status = "completed" if bool(result.get("ok", True)) else "failed"
@@ -139,6 +163,8 @@ def route_llm_research_proposals(*, max_proposals: int = MAX_PROPOSALS_PER_CYCLE
             routed.append({"proposal_id": proposal["id"], "hypothesis_index": index, "route_key": route_key, "status": status})
     return {
         "ok": True, "schema_version": "alis_llm_proposal_router_v1", "proposal_limit": limit,
+        "proposal_scan_limit": scan_limit,
+        "handled_proposal_count": len(handled_proposal_ids),
         "routed_count": len(routed), "routed": routed, "skipped": skipped,
         "governance": {"assessed_count": governance.get("assessed_count", 0)},
         "policy": "fixed_whitelist_templates_only; candidate_OOS_shadow_promotion_rollback_gates_unchanged",

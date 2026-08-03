@@ -11,6 +11,27 @@ from app.services.market_context import market_state_model_governance
 from app.services.operations_overview import build_governance_overview
 
 
+def _model_release_ready_for_manual_review(latest: dict[str, Any]) -> bool:
+    """Only expose a model to operators after strict strategy A/B has passed."""
+
+    validation = latest.get("validation") if isinstance(latest, dict) else None
+    if not isinstance(validation, dict):
+        return False
+    eligibility = validation.get("production_eligibility")
+    if not isinstance(eligibility, dict):
+        return False
+    gates = eligibility.get("gates")
+    if not isinstance(gates, dict):
+        return False
+    # A candidate with task-native OOS but unfinished A/B or future Shadow is
+    # still an automated research task, not an operator approval item. The
+    # current release contract forbids waiving the 20-session observation.
+    return (
+        gates.get("controlled_strategy_ab") is True
+        and gates.get("live_observation_20_sessions") is True
+    )
+
+
 def _ensure_action_table() -> None:
     with _conn() as c:
         c.execute("""CREATE TABLE IF NOT EXISTS manual_review_actions (
@@ -169,6 +190,8 @@ def build_manual_review_queue(limit: int = 200, *, human_only: bool = True) -> d
         for plan_item in model_family_status().get("items") or []:
             latest = plan_item.get("latest_version") or {}
             if not latest or str(plan_item.get("status") or "") != "candidate":
+                continue
+            if not _model_release_ready_for_manual_review(latest):
                 continue
             review = ((latest.get("validation") or {}).get("review") or {})
             if review.get("status"):
