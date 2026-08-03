@@ -12,6 +12,7 @@ except ImportError:  # lightweight contract-test store shim
     update_account_high_water_mark = lambda equity: equity
 from app.services.backtest_data_source import BacktestDataSource
 from app.services.data_health import build_data_health_report
+from app.services.risk_limit_contract import DEFAULT_GLOBAL_SINGLE_ASSET_LIMIT
 
 REQUIRED_MARKET_DAY_APIS = ("daily", "daily_basic", "stk_limit")
 
@@ -372,7 +373,7 @@ def ledoit_wolf_covariance(returns_by_symbol: dict[str, list[float]]) -> dict[st
     return {"symbols": symbols, "covariance": shrunk, "shrinkage": shrink}
 
 
-def constrained_cvar_weights(returns_by_symbol: dict[str, list[float]], *, max_single: float = 0.25) -> dict[str, float]:
+def constrained_cvar_weights(returns_by_symbol: dict[str, list[float]], *, max_single: float = DEFAULT_GLOBAL_SINGLE_ASSET_LIMIT) -> dict[str, float]:
     """Risk-budget weights with CVaR-aware scaling and hard single-name cap."""
     if not returns_by_symbol:
         return {}
@@ -430,7 +431,7 @@ def enforce_marginal_cvar_limit(
     }
 
 
-def hrp_fallback_weights(returns_by_symbol: dict[str, list[float]], *, max_single: float = 0.25) -> dict[str, float]:
+def hrp_fallback_weights(returns_by_symbol: dict[str, list[float]], *, max_single: float = DEFAULT_GLOBAL_SINGLE_ASSET_LIMIT) -> dict[str, float]:
     """Deterministic inverse-volatility HRP-style fallback.
 
     It is intentionally conservative and only used when the primary CVaR

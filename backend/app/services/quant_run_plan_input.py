@@ -8,6 +8,7 @@ import math
 from typing import Any
 
 from app.services.quant_run_contracts import ReplayRiskGateError
+from app.services.risk_limit_contract import RISK_LIMIT_CONTRACT_SCHEMA_VERSION
 
 UNIFIED_DAILY_DECISION_SCHEMA_VERSION = "alis_unified_daily_decision_v2"
 LEGACY_UNIFIED_DAILY_DECISION_SCHEMA_VERSION = "alis_unified_daily_decision_v1"
@@ -393,13 +394,25 @@ def validate_unified_decision_contract(contract: dict[str, Any]) -> None:
         "portfolio_method_competition",
         "execution_safety_contract",
         "decision_version_manifest",
-    )
+    ) + (() if legacy else ("risk_limit_contract",))
     missing = [key for key in required_dicts if not isinstance(contract.get(key), dict) or not contract.get(key)]
     if missing:
         raise ReplayRiskGateError(
             "统一计划缺少冻结合同：" + ",".join(missing),
             code="invalid_authoritative_plan",
         )
+    risk_limits = contract.get("risk_limit_contract") if isinstance(contract.get("risk_limit_contract"), dict) else {}
+    if not legacy:
+        if (
+            str(risk_limits.get("schema_version") or "") != RISK_LIMIT_CONTRACT_SCHEMA_VERSION
+            or not risk_limits.get("contract_hash")
+            or not risk_limits.get("tightening_only")
+            or abs(_finite_weight(risk_limits.get("global_single_asset_limit"), field="risk.global") - 0.15) > 1e-8
+        ):
+            raise ReplayRiskGateError("统一计划风险上限合同无效", code="invalid_authoritative_plan")
+        expected_risk_hash = _canonical_hash({key: value for key, value in risk_limits.items() if key != "contract_hash"})
+        if expected_risk_hash != str(risk_limits.get("contract_hash") or ""):
+            raise ReplayRiskGateError("统一计划风险上限合同哈希不一致", code="invalid_authoritative_plan")
     _validate_selection_snapshot(contract["selection_snapshot"])
     selection = contract["selection_snapshot"]
     signal_date = str(contract.get("signal_date") or "").replace("-", "")[:8]
@@ -446,6 +459,8 @@ def validate_unified_decision_contract(contract: dict[str, Any]) -> None:
         or not str(controller.get("strategy_policy_version") or "")
     ):
         raise ReplayRiskGateError("统一计划 StrategyController 合同版本无效", code="invalid_authoritative_plan")
+    if not legacy and controller.get("risk_limit_contract") != risk_limits:
+        raise ReplayRiskGateError("Controller 未使用冻结风险上限合同", code="invalid_authoritative_plan")
     actions = [item for item in controller.get("actions") or [] if isinstance(item, dict)]
     action_symbols = [str(item.get("symbol") or "") for item in actions]
     if not action_symbols or len(action_symbols) != len(set(action_symbols)):
@@ -495,6 +510,14 @@ def validate_unified_decision_contract(contract: dict[str, Any]) -> None:
         ):
             raise ReplayRiskGateError(f"统一计划 Controller 动作与边界内容不一致：{symbol}", code="invalid_authoritative_plan")
         _finite_weight(item.get("current_weight"), field=f"{symbol}.action.current_weight")
+        if not legacy:
+            risk_item = (risk_limits.get("items") or {}).get(symbol) or {}
+            final_limit = _finite_weight(risk_item.get("final_limit"), field=f"risk.{symbol}.final_limit")
+            if (
+                abs(_finite_weight(item.get("position_weight_cap"), field=f"{symbol}.position_weight_cap") - final_limit) > 1e-8
+                or _finite_weight(item.get("max_weight"), field=f"{symbol}.action.max") > final_limit + 1e-8
+            ):
+                raise ReplayRiskGateError(f"Controller 标的上限未绑定统一风险合同：{symbol}", code="invalid_authoritative_plan")
     proposal = [item for item in contract.get("proposal") or [] if isinstance(item, dict)]
     proposal_symbols = [str(item.get("symbol") or "") for item in proposal]
     if len(proposal_symbols) != len(set(proposal_symbols)):
@@ -529,7 +552,18 @@ def validate_unified_decision_contract(contract: dict[str, Any]) -> None:
         action_item = next(item for item in actions if str(item.get("symbol") or "") == symbol)
         action = str(action_item.get("action") or "")
         current = _finite_weight(action_item.get("current_weight"), field=f"{symbol}.current_weight")
-        if lower > upper + 1e-10 or weight < lower - 1e-8 or weight > upper + 1e-8:
+        proposal_item = next(
+            (item for item in (contract.get("proposal") or []) if isinstance(item, dict) and str(item.get("symbol") or "") == symbol),
+            {},
+        )
+        residual = proposal_item.get("residual_breach") if isinstance(proposal_item.get("residual_breach"), dict) else {}
+        residual_allowed = bool(residual.get("active")) and any(
+            str(order.get("symbol") or "") == symbol
+            and str(order.get("side") or "").upper() == "SELL"
+            and int(order.get("planned_quantity") or 0) >= 100
+            for order in (contract.get("execution_orders") or []) if isinstance(order, dict)
+        )
+        if lower > upper + 1e-10 or weight < lower - 1e-8 or (weight > upper + 1e-8 and not residual_allowed):
             raise ReplayRiskGateError(f"统一计划违反 Controller 权重边界：{symbol}", code="invalid_authoritative_plan")
         direction_invalid = (
             action == "buy_candidate" and current > 1e-8
@@ -635,6 +669,10 @@ def validate_unified_decision_contract(contract: dict[str, Any]) -> None:
     if str(competition.get("schema_version") or "") != expected_competition_schema or competition.get("ok") is not True:
         raise ReplayRiskGateError("统一计划组合竞赛合同版本或状态无效", code="invalid_authoritative_plan")
     selected_method = str(competition.get("selected_method") or "")
+    if not legacy and competition.get("risk_limit_contract") != risk_limits:
+        raise ReplayRiskGateError("组合竞赛未使用冻结风险上限合同", code="invalid_authoritative_plan")
+    if not legacy and (contract.get("decision_version_manifest") or {}).get("portfolio", {}).get("risk_limit_contract") != risk_limits:
+        raise ReplayRiskGateError("版本清单未冻结风险上限合同", code="invalid_authoritative_plan")
     allowed_methods = {"empirical_cvar", "equal_weight", "hrp", "hold_current"} if legacy else {
         "empirical_cvar", "equal_weight", "hrp", "minimum_turnover_feasible",
     }
@@ -721,10 +759,26 @@ def validate_unified_decision_contract(contract: dict[str, Any]) -> None:
             if obligation.get("required"):
                 target_max = _finite_weight(obligation.get("target_max_weight"), field=f"controller.{symbol}.obligation.target")
                 order = orders_by_symbol.get(symbol) or {}
+                residual = (proposal_by_symbol.get(symbol) or {}).get("residual_breach") or {}
+                residual_allowed = bool(residual.get("active")) and int(order.get("planned_quantity") or 0) >= 100
+                if residual_allowed:
+                    remaining = final_weights.get(symbol, 0.0) - target_max
+                    if (
+                        str(obligation.get("type") or "") != "mandatory_reduce"
+                        or residual.get("requires_next_day_review") is not True
+                        or not str(residual.get("reason_code") or "")
+                        or abs(_finite_weight(residual.get("required_max_weight"), field=f"residual.{symbol}.required") - target_max) > 1e-8
+                        or abs(_finite_weight(residual.get("projected_post_weight"), field=f"residual.{symbol}.projected") - final_weights.get(symbol, 0.0)) > 1e-8
+                        or abs(_finite_weight(residual.get("remaining_excess_weight"), field=f"residual.{symbol}.remaining") - remaining) > 1e-8
+                        or int(residual.get("planned_repair_quantity") or 0) != int(order.get("planned_quantity") or 0)
+                        or residual != (order.get("residual_breach") or {})
+                        or residual != (competition.get("residual_breaches") or {}).get(symbol)
+                    ):
+                        raise ReplayRiskGateError(f"剩余风险证据与冻结订单不一致：{symbol}", code="invalid_authoritative_plan")
                 if (
                     str(order.get("side") or "").upper() != "SELL"
                     or int(order.get("planned_quantity") or 0) <= 0
-                    or final_weights.get(symbol, 0.0) > target_max + 1e-8
+                    or (final_weights.get(symbol, 0.0) > target_max + 1e-8 and not residual_allowed)
                 ):
                     raise ReplayRiskGateError(f"冻结订单未完成 Controller 强制义务：{symbol}", code="invalid_authoritative_plan")
         for symbol, proposal_item in proposal_by_symbol.items():

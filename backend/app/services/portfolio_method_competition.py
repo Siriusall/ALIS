@@ -13,6 +13,7 @@ from app.core.a_share_fees import (
     sell_cost_breakdown,
 )
 from app.services.quant_risk import hrp_fallback_weights
+from app.services.risk_limit_contract import DEFAULT_GLOBAL_SINGLE_ASSET_LIMIT
 
 
 def _safe(value: Any) -> float:
@@ -180,6 +181,12 @@ def _project_to_executable_lots(
             "intent": str(bound.get("intent") or ""),
             "permission": bound.get("permission") or {},
             "obligation": obligation,
+            "residual_breach": {
+                "active": False,
+                "remaining_excess_weight": 0.0,
+                "remaining_excess_amount": 0.0,
+                "reason_code": "",
+            },
             "cost": cost,
         })
 
@@ -265,10 +272,35 @@ def _project_to_executable_lots(
             max(0.0, _safe(desired_weights.get(symbol))) - max(0.0, _safe(projected.get(symbol))),
             8,
         )
+    residual_breaches: dict[str, dict[str, Any]] = {}
+    for symbol, bound in bounds.items():
+        obligation = bound.get("obligation") if isinstance(bound.get("obligation"), dict) else {}
+        if str(obligation.get("type") or "") != "mandatory_reduce" or not obligation.get("required"):
+            continue
+        target_max = max(0.0, _safe(obligation.get("target_max_weight")))
+        projected_weight = max(0.0, _safe(projected.get(symbol)))
+        if projected_weight <= target_max + 1e-8:
+            continue
+        order = next((item for item in orders if str(item.get("symbol") or "") == symbol and item.get("side") == "SELL"), None)
+        residual = {
+            "active": True,
+            "breach_type": "single_position_limit",
+            "required_max_weight": round(target_max, 8),
+            "projected_post_weight": round(projected_weight, 8),
+            "remaining_excess_weight": round(projected_weight - target_max, 8),
+            "remaining_excess_amount": round((projected_weight - target_max) * equity, 2),
+            "reason_code": "mandatory_obligation_not_executable" if not order or int(order.get("planned_quantity") or 0) < LOT_SIZE else "lot_or_liquidity_residual",
+            "planned_repair_quantity": int((order or {}).get("planned_quantity") or 0),
+            "requires_next_day_review": True,
+        }
+        residual_breaches[symbol] = residual
+        if order:
+            order["residual_breach"] = residual
     return {
         "weights": projected,
         "orders": orders,
         "residuals": residuals,
+        "residual_breaches": residual_breaches,
         "blocked": blocked,
         "projected_cash_cny": round(max(0.0, cash_available), 2),
     }
@@ -378,7 +410,14 @@ def _evaluate(
         value = _safe(weights.get(symbol))
         lower = _safe((weight_bounds.get(symbol) or {}).get("min_weight"))
         upper = _safe((weight_bounds.get(symbol) or {}).get("max_weight"))
-        if value < lower - 1e-8 or value > upper + 1e-8:
+        residual = (execution_projection.get("residual_breaches") or {}).get(symbol) or {}
+        residual_allowed = bool(residual.get("active")) and any(
+            str(item.get("symbol") or "") == symbol
+            and str(item.get("side") or "").upper() == "SELL"
+            and int(item.get("planned_quantity") or 0) >= LOT_SIZE
+            for item in orders
+        )
+        if (value < lower - 1e-8 or value > upper + 1e-8) and not (value > upper + 1e-8 and residual_allowed):
             breaches.append(f"controller_bound:{symbol}")
         obligation = (
             (weight_bounds.get(symbol) or {}).get("obligation")
@@ -396,7 +435,7 @@ def _evaluate(
             if obligation_type == "mandatory_exit" and value > 1e-8:
                 breaches.append(f"mandatory_exit:{symbol}")
             if obligation_type == "mandatory_reduce" and (
-                value >= current - 1e-8 or value > upper + 1e-8 or not has_sell
+                value >= current - 1e-8 or (value > upper + 1e-8 and not residual_allowed) or not has_sell
             ):
                 breaches.append(f"mandatory_reduce:{symbol}")
     breaches.extend(str(item) for item in execution_projection.get("blocked") or [])
@@ -419,6 +458,7 @@ def _evaluate(
         "execution_orders": orders,
         "executable_order_count": len(orders),
         "lot_rounding_residuals": execution_projection.get("residuals") or {},
+        "residual_breaches": execution_projection.get("residual_breaches") or {},
         "industry_weights": industry_weights,
         "industry_budget_penalty": round(industry_penalty, 8),
         "objective": round(objective, 8),
@@ -436,6 +476,7 @@ def compete_portfolio_methods(
     reference_prices: dict[str, float] | None = None,
     account_equity: float = 0.0,
     execution_cost_contract: dict[str, Any] | None = None,
+    risk_limit_contract: dict[str, Any] | None = None,
     equity_budget: float,
     cvar_weights: dict[str, float],
     weight_bounds: dict[str, dict[str, Any]] | None = None,
@@ -477,7 +518,7 @@ def compete_portfolio_methods(
     requested_budget = max(0.0, min(1.0, _safe(equity_budget)))
     budget = max(minimum_budget, min(maximum_budget, requested_budget)) if bounds_enabled else requested_budget
     equal = {symbol: 1.0 / len(symbols) for symbol in symbols} if symbols else {}
-    hrp = hrp_fallback_weights({symbol: returns_by_symbol[symbol] for symbol in symbols}, max_single=0.25)
+    hrp = hrp_fallback_weights({symbol: returns_by_symbol[symbol] for symbol in symbols}, max_single=DEFAULT_GLOBAL_SINGLE_ASSET_LIMIT)
     raw_candidates = {
         "empirical_cvar": _normalise_to_budget(cvar_weights, budget),
         "equal_weight": _normalise_to_budget(equal, budget),
@@ -513,6 +554,7 @@ def compete_portfolio_methods(
         "industry_targets": frozen_industry_targets,
         "industry_penalty_rate": round(max(0.0, float(industry_penalty_rate)), 8),
         "execution_cost_contract": cost_contract,
+        "risk_limit_contract": risk_limit_contract or {},
         "lot_size": LOT_SIZE,
     }
     constraint_hash = hashlib.sha256(
@@ -565,6 +607,8 @@ def compete_portfolio_methods(
         "constraint_hash": constraint_hash,
         "execution_orders": list((winner or {}).get("execution_orders") or []),
         "execution_cost_contract": cost_contract,
+        "risk_limit_contract": risk_limit_contract or {},
+        "residual_breaches": dict((winner or {}).get("residual_breaches") or {}),
         "industry_budget": {
             "schema_version": "alis_portfolio_industry_budget_v1",
             "symbol_industries": frozen_symbol_industries,

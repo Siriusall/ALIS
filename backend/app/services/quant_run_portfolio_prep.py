@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any, Callable, Dict, List
 
+from app.services.risk_limit_contract import DEFAULT_GLOBAL_SINGLE_ASSET_LIMIT
+
 
 def compute_buy_budget(
     *,
@@ -52,14 +54,14 @@ def pretrade_symbol_limits(
     limits: Dict[str, float] = {}
     for symbol in symbols:
         if is_etf(symbol):
-            limits[symbol] = min(max_single, 0.25)
+            limits[symbol] = min(max_single, DEFAULT_GLOBAL_SINGLE_ASSET_LIMIT)
             continue
         thesis = thesis_by_symbol.get(str(symbol).split(".")[0]) or {}
         core = (
             float(thesis.get("derived_confidence") or 0) >= 75
             and str(thesis.get("derived_status") or "") in {"active", "confirmed", "valid"}
         )
-        limits[symbol] = min(max_single, 0.25 if core else 0.15)
+        limits[symbol] = min(max_single, DEFAULT_GLOBAL_SINGLE_ASSET_LIMIT)
     return limits
 
 

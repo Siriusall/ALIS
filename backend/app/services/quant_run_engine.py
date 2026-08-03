@@ -54,6 +54,11 @@ from app.services import quant_run_primitives as _primitives
 from app.services import quant_run_portfolio_prep as _portfolio_prep
 from app.services import quant_run_research_gates as _research_gates
 from app.services.quant_run_plan_input import build_authoritative_selection_detail, normalize_authoritative_plan
+from app.services.risk_limit_contract import (
+    DEFAULT_CORRELATED_INDUSTRY_LIMIT,
+    DEFAULT_GLOBAL_SINGLE_ASSET_LIMIT,
+    DEFAULT_INDUSTRY_LIMIT,
+)
 
 _SCORING_HEARTBEAT_EVERY = max(100, min(int(os.getenv("QUANT_SCORING_HEARTBEAT_EVERY", "300")), 2000))
 _SCORING_TIMEOUT_SEC = max(10, min(int(os.getenv("QUANT_SCORING_TIMEOUT_SEC", "90")), 1800))
@@ -1401,7 +1406,7 @@ def run_for_trade_date(
             [str(order.symbol) for order in order_requests], cutoff=signal_available_time(signal_date), max_single=max_single_position_pct,
         )
         for symbol in defensive_weights:
-            position_limits[symbol] = .45
+            position_limits[symbol] = DEFAULT_GLOBAL_SINGLE_ASSET_LIMIT
     defensive_only_target = bool(cvar_weights) and not any(symbol not in defensive_weights for symbol in cvar_weights)
     residual_sweep_symbol = None
     defensive_prices = {
@@ -1420,8 +1425,8 @@ def run_for_trade_date(
         symbol_scores=score_map,
         industry_by_symbol=industry_by_symbol,
         existing_industry_value=existing_industry_value,
-        max_industry_position_pct=1.0 if frozen_unified_plan else .45 if defensive_only_target else .25,
-        max_correlated_industry_pct=1.0 if frozen_unified_plan else .45 if defensive_only_target else .35,
+        max_industry_position_pct=DEFAULT_INDUSTRY_LIMIT,
+        max_correlated_industry_pct=DEFAULT_CORRELATED_INDUSTRY_LIMIT,
         target_weights=cvar_weights,
         symbol_position_limits=position_limits,
         high_risk_symbols=high_risk_symbols,
@@ -1606,8 +1611,8 @@ def run_for_trade_date(
         risk_budget=risk_budget,
         constraints={
             "max_single_position_pct": max_single_position_pct,
-            "max_industry_position_pct": .25,
-            "max_correlated_industry_pct": .35,
+            "max_industry_position_pct": DEFAULT_INDUSTRY_LIMIT,
+            "max_correlated_industry_pct": DEFAULT_CORRELATED_INDUSTRY_LIMIT,
             "max_marginal_cvar_contribution": round(adaptive_marginal_limit, 4),
             "monthly_turnover_remaining": round(turnover_remaining, 2),
         },
@@ -1721,8 +1726,8 @@ def run_for_trade_date(
             "covariance": covariance_snapshot,
             "hard_constraints": {
                 "max_single_position_pct": max_single_position_pct,
-                "max_industry_position_pct": 1.0 if frozen_unified_plan else .25,
-                "max_correlated_industry_pct": 1.0 if frozen_unified_plan else .35,
+                "max_industry_position_pct": DEFAULT_INDUSTRY_LIMIT,
+                "max_correlated_industry_pct": DEFAULT_CORRELATED_INDUSTRY_LIMIT,
                 "max_marginal_cvar_contribution": round(adaptive_marginal_limit, 4),
                 "t1_portfolio_redecision_disabled": frozen_unified_plan,
             },
@@ -2085,7 +2090,7 @@ def plan_analyze_rebalance(
             "data_status": "frozen",
             "risk_budget": {
                 "target_position_pct": target_position_pct if target_position_pct is not None else dynamic_gate.get("risk_budget_multiplier"),
-                "max_single_position_pct": max_single_position_pct if max_single_position_pct is not None else .25,
+                "max_single_position_pct": max_single_position_pct if max_single_position_pct is not None else DEFAULT_GLOBAL_SINGLE_ASSET_LIMIT,
             },
             "target_position_pct": target_position_pct if target_position_pct is not None else dynamic_gate.get("risk_budget_multiplier"),
             "optimizer": "strategy_controller_pretrade_v1",
@@ -2200,7 +2205,7 @@ def plan_analyze_rebalance(
             target_position_pct if target_position_pct is not None else 1.0,
             float(dynamic_gate.get("risk_budget_multiplier") or 0),
         ),
-        "max_single_position_pct": min(max_single_position_pct if max_single_position_pct is not None else .25, .25),
+        "max_single_position_pct": min(max_single_position_pct if max_single_position_pct is not None else DEFAULT_GLOBAL_SINGLE_ASSET_LIMIT, DEFAULT_GLOBAL_SINGLE_ASSET_LIMIT),
     }
     target_pct, max_single = _parse_risk_budget(risk_budget)
     buy_budget = _compute_buy_budget(
@@ -2279,8 +2284,8 @@ def plan_analyze_rebalance(
         symbol_scores=scores,
         industry_by_symbol=industry_by_symbol,
         existing_industry_value=existing_industry_value,
-        max_industry_position_pct=.25,
-        max_correlated_industry_pct=.35,
+        max_industry_position_pct=DEFAULT_INDUSTRY_LIMIT,
+        max_correlated_industry_pct=DEFAULT_CORRELATED_INDUSTRY_LIMIT,
         target_weights=target_weights,
         symbol_position_limits=symbol_position_limits,
         high_risk_symbols=high_risk_symbols,
@@ -2332,8 +2337,8 @@ def plan_analyze_rebalance(
         risk_budget=risk_budget,
         constraints={
             "max_single_position_pct": max_single,
-            "max_industry_position_pct": .25,
-            "max_correlated_industry_pct": .35,
+            "max_industry_position_pct": DEFAULT_INDUSTRY_LIMIT,
+            "max_correlated_industry_pct": DEFAULT_CORRELATED_INDUSTRY_LIMIT,
             "buy_budget": round(buy_budget, 2),
         },
     )
@@ -2539,7 +2544,7 @@ def plan_analyze_rebalance(
             "weights": target_weights,
             "weight_explanations": target_weight_explanations,
             "black_litterman": plan_bl,
-            "hard_constraints": {"max_single_position_pct": max_single, "max_industry_position_pct": .25, "max_correlated_industry_pct": .35},
+            "hard_constraints": {"max_single_position_pct": max_single, "max_industry_position_pct": DEFAULT_INDUSTRY_LIMIT, "max_correlated_industry_pct": DEFAULT_CORRELATED_INDUSTRY_LIMIT},
         },
     }
 

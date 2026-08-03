@@ -9,10 +9,12 @@ from datetime import datetime
 from statistics import quantiles
 from typing import Any
 
+from app.services.risk_limit_contract import DEFAULT_GLOBAL_SINGLE_ASSET_LIMIT
+
 
 def black_litterman_weights(
     prior_weights: dict[str, float], views: dict[str, float], confidences: dict[str, float] | None = None,
-    *, max_weight: float = 0.25,
+    *, max_weight: float = DEFAULT_GLOBAL_SINGLE_ASSET_LIMIT,
 ) -> dict[str, Any]:
     """A transparent diagonal BL posterior for portfolio views.
 

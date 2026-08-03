@@ -9,7 +9,9 @@ from app.services.theme_engine import list_themes
 
 
 WEAK_MARKET_STATES = {"S2", "S7", "S8", "S9", "S10", "bear", "stress"}
-MAX_INDUSTRY_WEIGHT = .25
+from app.services.risk_limit_contract import DEFAULT_INDUSTRY_LIMIT
+
+MAX_INDUSTRY_WEIGHT = DEFAULT_INDUSTRY_LIMIT
 MAX_WEAK_MARKET_OPPORTUNITY_WEIGHT = .10
 
 

@@ -28,6 +28,11 @@ from app.services.rebalance_allocator import correlated_industry_group
 from app.services.five_bucket_contract import build_target_weight_contract, summarize_bucket_contracts
 from app.services.position_valuation import point_in_time_position_market_series
 from app.services.research_engine import capability_registry
+from app.services.risk_limit_contract import (
+    DEFAULT_CORRELATED_INDUSTRY_LIMIT,
+    DEFAULT_GLOBAL_SINGLE_ASSET_LIMIT,
+    DEFAULT_INDUSTRY_LIMIT,
+)
 from app.services.thesis_store import list_theses
 
 
@@ -182,10 +187,10 @@ def build_live_portfolio_risk(lookback: int = 120) -> dict[str, Any]:
             pass
     for item in exposures:
         item["industry"] = industry_by_symbol.get(str(item["symbol"]), "unclassified")
-    weights = constrained_cvar_weights(returns_by_symbol, max_single=.25)
+    weights = constrained_cvar_weights(returns_by_symbol, max_single=DEFAULT_GLOBAL_SINGLE_ASSET_LIMIT)
     optimizer = "ledoit_wolf_shrinkage_plus_constrained_cvar_v1"
     if returns_by_symbol and not weights:
-        weights = hrp_fallback_weights(returns_by_symbol, max_single=.25)
+        weights = hrp_fallback_weights(returns_by_symbol, max_single=DEFAULT_GLOBAL_SINGLE_ASSET_LIMIT)
         optimizer = "hrp_inverse_volatility_fallback_v1"
     black_litterman = {
         "status": "research_only_not_applied",
@@ -221,7 +226,7 @@ def build_live_portfolio_risk(lookback: int = 120) -> dict[str, Any]:
             and item["thesis_status"] in {"active", "confirmed", "valid"}
         )
         item["position_class"] = "core" if is_core else "standard"
-        item["single_name_limit"] = .25 if is_core else .15
+        item["single_name_limit"] = DEFAULT_GLOBAL_SINGLE_ASSET_LIMIT
         if item["weight"] > item["single_name_limit"]:
             breaches.append({
                 "code": "single_name_limit",
@@ -236,7 +241,7 @@ def build_live_portfolio_risk(lookback: int = 120) -> dict[str, Any]:
     for item in exposures:
         industry = str(item.get("industry") or "unclassified")
         by_industry[industry] = by_industry.get(industry, 0.0) + _f(item.get("weight"))
-    industry_limit = 0.25
+    industry_limit = DEFAULT_INDUSTRY_LIMIT
     for industry, weight in sorted(by_industry.items(), key=lambda value: value[1], reverse=True):
         industry_exposures.append({"industry": industry, "weight": round(weight, 6), "limit": industry_limit, "status": "breach" if weight > industry_limit else "within_limit"})
         if weight > industry_limit:
@@ -247,10 +252,10 @@ def build_live_portfolio_risk(lookback: int = 120) -> dict[str, Any]:
         by_correlated_group[group] = by_correlated_group.get(group, 0.0) + weight
     correlated_industry_exposures = []
     for group, weight in sorted(by_correlated_group.items(), key=lambda value: value[1], reverse=True):
-        status = "breach" if weight > .35 else "within_limit"
-        correlated_industry_exposures.append({"group": group, "weight": round(weight, 6), "limit": .35, "status": status})
+        status = "breach" if weight > DEFAULT_CORRELATED_INDUSTRY_LIMIT else "within_limit"
+        correlated_industry_exposures.append({"group": group, "weight": round(weight, 6), "limit": DEFAULT_CORRELATED_INDUSTRY_LIMIT, "status": status})
         if status == "breach":
-            breaches.append({"code": "correlated_industry_limit", "group": group, "severity": "error", "limit": .35, "message": f"高度相关行业组权重 {weight:.1%} 超过 35% 上限"})
+            breaches.append({"code": "correlated_industry_limit", "group": group, "severity": "error", "limit": DEFAULT_CORRELATED_INDUSTRY_LIMIT, "message": f"高度相关行业组权重 {weight:.1%} 超过 {DEFAULT_CORRELATED_INDUSTRY_LIMIT:.0%} 上限"})
     weight_explanations = []
     target_weight_contracts = []
     for item in exposures:

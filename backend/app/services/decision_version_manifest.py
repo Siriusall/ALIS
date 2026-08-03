@@ -104,6 +104,7 @@ def build_decision_version_manifest(
             "selected_method": optimizer.get("selected_method") or optimizer.get("optimizer"),
             "competition_schema": ((optimizer.get("method_competition") or {}).get("schema_version")),
             "risk_budget": (portfolio or {}).get("risk_budget") or {},
+            "risk_limit_contract": (portfolio or {}).get("risk_limit_contract") or {},
         },
         "execution_cost": (
             (portfolio or {}).get("execution_cost_contract")

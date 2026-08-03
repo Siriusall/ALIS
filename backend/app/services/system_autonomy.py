@@ -405,6 +405,7 @@ def _owner_rebalance_action(action: dict[str, Any]) -> dict[str, Any]:
         "controller_permission": action.get("controller_permission") or {},
         "controller_intent": action.get("controller_intent"),
         "controller_obligation": action.get("controller_obligation") or {},
+        "residual_breach": action.get("residual_breach") or {},
     }
 
 
@@ -492,6 +493,9 @@ def latest_owner_summary() -> dict[str, Any]:
             "planned_execute_at": latest_plan.get("planned_execute_at"),
             "planned_execute_date": latest_plan.get("planned_execute_date"),
             "blocked_reason": latest_plan.get("blocked_reason"),
+            "validation_error_code": latest_plan.get("validation_error_code"),
+            "validation_errors": latest_plan.get("validation_errors") or [],
+            "risk_limit_contract": latest_plan.get("risk_limit_contract") or {},
             "actions": [_owner_rebalance_action(action) for action in proposal],
         }
     except Exception as exc:

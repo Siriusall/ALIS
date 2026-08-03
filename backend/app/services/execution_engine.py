@@ -8,6 +8,11 @@ from app.core.a_share_fees import apply_slippage_buy, cost_buy
 from app.core.trading_constraints import check_open_trade_constraints, normalize_lot_quantity
 from app.integrations.broker_adapter import OrderRequest, OrderResult
 from app.services.rebalance_allocator import allocate_buy_orders, planned_to_order_results
+from app.services.risk_limit_contract import (
+    DEFAULT_CORRELATED_INDUSTRY_LIMIT,
+    DEFAULT_GLOBAL_SINGLE_ASSET_LIMIT,
+    DEFAULT_INDUSTRY_LIMIT,
+)
 
 
 @dataclass
@@ -22,15 +27,15 @@ def simulate_open_execution(
     executed_at: str | None = None,
     *,
     total_equity: float | None = None,
-    max_single_position_pct: float = 1.0,
+    max_single_position_pct: float = DEFAULT_GLOBAL_SINGLE_ASSET_LIMIT,
     existing_position_value: dict[str, float] | None = None,
     symbol_scores: dict[str, float] | None = None,
     industry_by_symbol: dict[str, str] | None = None,
     existing_industry_value: dict[str, float] | None = None,
-    max_industry_position_pct: float = 1.0,
+    max_industry_position_pct: float = DEFAULT_INDUSTRY_LIMIT,
     target_weights: dict[str, float] | None = None,
     symbol_position_limits: dict[str, float] | None = None,
-    max_correlated_industry_pct: float = 1.0,
+    max_correlated_industry_pct: float = DEFAULT_CORRELATED_INDUSTRY_LIMIT,
     high_risk_symbols: set[str] | None = None,
     max_order_value_by_symbol: dict[str, float] | None = None,
     initial_entry_fraction: float = 0.5,

@@ -121,7 +121,8 @@ def defensive_allocation_for_state(
     total_score = sum(scores.values())
     weights = {code: defensive_target * score / total_score for code, score in scores.items()} if total_score > 0 else {}
     # Cap concentration, then redistribute the excess to names with room.
-    cap = .45
+    from app.services.risk_limit_contract import DEFAULT_GLOBAL_SINGLE_ASSET_LIMIT
+    cap = DEFAULT_GLOBAL_SINGLE_ASSET_LIMIT
     for _ in range(len(weights) + 1):
         excess = sum(max(0.0, weight - cap) for weight in weights.values())
         weights = {code: min(cap, weight) for code, weight in weights.items()}

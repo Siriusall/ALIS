@@ -7,6 +7,7 @@ from typing import Any
 
 from app.db.store import _conn as business_conn, create_model_version, get_active_model_version, get_model_version, list_model_versions, set_active_model_version, update_model_version_status, update_model_version_validation
 from app.services.review_learning import materialize_decision_outcomes
+from app.services.risk_limit_contract import DEFAULT_GLOBAL_SINGLE_ASSET_LIMIT, risk_limit_for
 
 STRATEGY_CONTROLLER_VERSION = "strategy_controller_v1"
 PRETRADE_CONTROLLER_SCHEMA_VERSION = "alis_strategy_controller_pretrade_v2"
@@ -16,7 +17,7 @@ MINIMUM_CANDIDATE_SHADOW_SESSIONS = 20
 DEFAULT_STRATEGY_POLICY = {
     "schema_version": "strategy_policy_v1",
     "market_state_policy": {
-        "risk_expansion": {"max_equity": 0.90, "max_single": 0.15},
+        "risk_expansion": {"max_equity": 0.90, "max_single": DEFAULT_GLOBAL_SINGLE_ASSET_LIMIT},
         "sideways": {"max_equity": 0.65, "max_single": 0.10},
         "risk_contraction": {"max_equity": 0.40, "max_single": 0.06},
         "stress": {"max_equity": 0.25, "max_single": 0.04},
@@ -313,7 +314,8 @@ def build_pretrade_strategy_controller(
     defensive_weights: dict[str, float] | None = None,
     position_weight_caps: dict[str, float] | None = None,
     hard_risk_breaches: list[dict[str, Any]] | None = None,
-    max_single_position: float = 0.15,
+    max_single_position: float = DEFAULT_GLOBAL_SINGLE_ASSET_LIMIT,
+    risk_limit_contract: dict[str, Any] | None = None,
     execution_guard: dict[str, Any] | None = None,
     context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -358,7 +360,8 @@ def build_pretrade_strategy_controller(
         is_holding = symbol in holding_set and current_weight > 1e-9
         is_candidate = symbol in candidate_set
         is_defensive = symbol in defensive
-        symbol_cap = min(single_cap, position_caps.get(symbol, single_cap))
+        contract_cap = risk_limit_for(risk_limit_contract, symbol, single_cap)
+        symbol_cap = min(single_cap, contract_cap, position_caps.get(symbol, single_cap))
         hard_breaches = hard_breach_by_symbol.get(symbol) or []
         hard_weight_breach = bool(hard_breaches) and symbol_cap < current_weight - 1e-8
         thesis_invalid = thesis.get(symbol) in {"invalidated", "failed"}
@@ -382,6 +385,12 @@ def build_pretrade_strategy_controller(
             "required": False,
             "target_max_weight": None,
             "reason_codes": [],
+            "residual_breach": {
+                "active": False,
+                "remaining_excess_weight": 0.0,
+                "remaining_excess_amount": 0.0,
+                "reason_code": "",
+            },
         }
 
         if is_holding and hard_weight_breach:
@@ -522,6 +531,7 @@ def build_pretrade_strategy_controller(
         "champion_execution_guard": guard,
         "actions": rows,
         "weight_bounds": bounds,
+        "risk_limit_contract": risk_limit_contract or {},
         "policy": {
             "controller_precedes_optimizer": True,
             "optimizer_may_not_change_action_direction": True,

@@ -7,6 +7,11 @@ from app.core.a_share_fees import LOT_SIZE, apply_slippage_buy, cost_buy
 from app.core.trading_constraints import check_open_trade_constraints, normalize_lot_quantity
 from app.integrations.broker_adapter import OrderRequest, OrderResult
 from app.services.five_bucket_contract import build_target_weight_contract
+from app.services.risk_limit_contract import (
+    DEFAULT_CORRELATED_INDUSTRY_LIMIT,
+    DEFAULT_GLOBAL_SINGLE_ASSET_LIMIT,
+    DEFAULT_INDUSTRY_LIMIT,
+)
 
 
 @dataclass
@@ -101,7 +106,7 @@ def _prune_candidates_for_budget(
     )
     kept: List[OrderRequest] = []
     pruned: List[str] = []
-    max_single = max(0.0, min(1.0, float(max_single_position_pct or 1.0)))
+    max_single = max(0.0, min(1.0, float(max_single_position_pct or DEFAULT_GLOBAL_SINGLE_ASSET_LIMIT)))
 
     def _trial_affordable(trial: List[OrderRequest]) -> bool:
         if not trial:
@@ -134,16 +139,16 @@ def allocate_buy_orders(
     *,
     budget: float,
     total_equity: float,
-    max_single_position_pct: float = 1.0,
+    max_single_position_pct: float = DEFAULT_GLOBAL_SINGLE_ASSET_LIMIT,
     existing_position_value: Dict[str, float] | None = None,
     symbol_scores: Dict[str, float] | None = None,
     industry_by_symbol: Dict[str, str] | None = None,
     existing_industry_value: Dict[str, float] | None = None,
-    max_industry_position_pct: float = 1.0,
+    max_industry_position_pct: float = DEFAULT_INDUSTRY_LIMIT,
     target_weights: Dict[str, float] | None = None,
     symbol_position_limits: Dict[str, float] | None = None,
     initial_entry_fraction: float = 0.5,
-    max_correlated_industry_pct: float = 1.0,
+    max_correlated_industry_pct: float = DEFAULT_CORRELATED_INDUSTRY_LIMIT,
     high_risk_symbols: set[str] | None = None,
     max_high_risk_total_pct: float = 0.05,
     max_order_value_by_symbol: Dict[str, float] | None = None,
@@ -248,9 +253,9 @@ def allocate_buy_orders(
             ))
         return planned, blocked, pruned
 
-    max_single = max(0.0, min(1.0, float(max_single_position_pct or 1.0)))
-    max_industry = max(0.0, min(1.0, float(max_industry_position_pct or 1.0)))
-    max_correlated = max(0.0, min(1.0, float(max_correlated_industry_pct or 1.0)))
+    max_single = max(0.0, min(1.0, float(max_single_position_pct or DEFAULT_GLOBAL_SINGLE_ASSET_LIMIT)))
+    max_industry = max(0.0, min(1.0, float(max_industry_position_pct or DEFAULT_INDUSTRY_LIMIT)))
+    max_correlated = max(0.0, min(1.0, float(max_correlated_industry_pct or DEFAULT_CORRELATED_INDUSTRY_LIMIT)))
     high_risk_limit = max(0.0, min(1.0, float(max_high_risk_total_pct)))
     existing_high_risk_value = sum(float(existing_position_value.get(symbol, 0) or 0) for symbol in high_risk_symbols)
     n = len(tradable)
