@@ -351,7 +351,9 @@ export function useConsoleData(pathname: string) {
     // Keep admin reads bounded: the API process and database are also serving
     // scheduled work, and a larger fan-out increases contention on the same
     // point-in-time diagnostics instead of reducing the page's total span.
-    const requestConcurrency = (pathname.startsWith("/admin") || ["/operations", "/models", "/data", "/evidence"].includes(pathname)) ? 2 : 3;
+    const requestConcurrency = pathname === "/models"
+      ? 3
+      : (pathname.startsWith("/admin") || ["/operations", "/data", "/evidence"].includes(pathname)) ? 2 : 3;
     const loadedData: ConsoleData = { ...cachedData };
     const loadWorker = async () => {
       while (cursor < entries.length) {
