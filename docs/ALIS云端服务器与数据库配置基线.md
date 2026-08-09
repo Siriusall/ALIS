@@ -1,6 +1,6 @@
 # ALIS 云端服务器与数据库配置基线
 
-> 基线时间：2026-07-27（UTC+8）  
+> 基线时间：2026-08-04（UTC+8）
 > 用途：记录当前生产服务器、云端数据库、网络、服务、目录、环境变量和验收命令。  
 > 安全规则：本文不保存密码、Token、JWT 密钥或私钥明文；只记录保管位置与轮换流程。
 
@@ -14,7 +14,7 @@
        - 日更、模拟交易、模型治理及 Evolution 调度器
        - 内置 Evolution Worker 已关闭
        |
-       | PostgreSQL TLS，固定公网 IP 白名单
+       | WireGuard `/29` 私网隧道（`10.44.0.2 -> 10.44.0.1`）；公网 TLS `/32` 保留为回滚
        v
      腾讯云 Kevin / 122.51.159.195
        - PostgreSQL 16
@@ -22,14 +22,14 @@
        - alis_data 数据平台库
        - 40GB 系统盘 + 100GB 数据盘
        ^
-       | PostgreSQL TLS，固定公网 IP 白名单
+       | WireGuard `/29` 私网隧道（`10.44.0.3 -> 10.44.0.1`）；公网 TLS `/32` 保留为回滚
        |
      阿里云 Evolution Worker / 47.119.146.111
        - 独立因子研究与策略迭代 Worker
        - 通过 evolution_tasks 的 PostgreSQL 租约领取任务
 ```
 
-腾讯云两台服务器当前虽分别使用 `10.0.0.4` 和 `10.0.0.12`，但私网 TCP 5432 实测不通，不能仅凭同一 CIDR 判断位于可互通 VPC。生产数据库连接暂时统一使用公网地址、TLS 和 `/32` 白名单。后续建立跨账号 VPC 对等连接或其他受控私网通道前，不切回私网 URL。
+腾讯云轻量实例的原生 `10.0.0.4`/`10.0.0.12` 私网 TCP 5432 不作为生产路径。当前通过直连 SSH 配置的 WireGuard `/29` 隧道提供受控跨云路径：数据库机为 `10.44.0.1`，应用机为 `10.44.0.2`，阿里 Worker 为 `10.44.0.3`。应用机和 Worker 的生产数据库 URL 均使用 `10.44.0.1`、PostgreSQL TLS 和 `pg_hba` 的 `/32` 隧道白名单；公网 TLS `/32` 规则仍保留作回滚和故障诊断，不开放 `0.0.0.0/0`。
 
 ## 2. 服务器清单
 
@@ -90,8 +90,8 @@
 
 ```dotenv
 APP_ENV=production
-DATABASE_URL=postgresql://alis_app:<redacted>@122.51.159.195:5432/alis_sim?sslmode=require
-DATA_PLATFORM_DATABASE_URL=postgresql://alis_app:<redacted>@122.51.159.195:5432/alis_data?sslmode=require
+DATABASE_URL=postgresql://alis_app:<redacted>@10.44.0.1:5432/alis_sim?sslmode=require
+DATA_PLATFORM_DATABASE_URL=postgresql://alis_app:<redacted>@10.44.0.1:5432/alis_data?sslmode=require
 DATABASE_CONNECT_TIMEOUT_SECONDS=<configured>
 REDIS_URL=redis://127.0.0.1:6379/0
 JWT_SECRET=<redacted>
@@ -142,7 +142,7 @@ sudo journalctl -u alis-api -n 80 --no-pager
 `listen_addresses` 当前应覆盖：
 
 ```text
-127.0.0.1,10.0.0.12
+127.0.0.1,10.0.0.12,10.44.0.1
 ```
 
 腾讯云公网 IP 通过 NAT 到服务器私网监听地址。不要因公网访问需求直接把 `5432` 放开给全网。
@@ -171,6 +171,8 @@ sudo -u postgres psql -Atqc "SELECT datname,pg_size_pretty(pg_database_size(datn
 ```text
 124.221.86.123/32  # kevin2
 47.119.146.111/32  # 阿里 Evolution Worker
+10.44.0.2/32        # WireGuard 应用机
+10.44.0.3/32        # WireGuard 阿里 Worker
 ```
 
 禁止：
@@ -186,6 +188,10 @@ hostssl alis_sim  alis_app 124.221.86.123/32 scram-sha-256
 hostssl alis_data alis_app 124.221.86.123/32 scram-sha-256
 hostssl alis_sim  alis_app 47.119.146.111/32 scram-sha-256
 hostssl alis_data alis_app 47.119.146.111/32 scram-sha-256
+hostssl alis_sim  alis_app 10.44.0.2/32 scram-sha-256
+hostssl alis_data alis_app 10.44.0.2/32 scram-sha-256
+hostssl alis_sim  alis_app 10.44.0.3/32 scram-sha-256
+hostssl alis_data alis_app 10.44.0.3/32 scram-sha-256
 ```
 
 检查命令：
@@ -194,7 +200,7 @@ hostssl alis_data alis_app 47.119.146.111/32 scram-sha-256
 sudo systemctl is-active postgresql
 sudo ss -ltnp | grep 5432
 sudo -u postgres psql -Atqc 'show ssl; show listen_addresses;'
-sudo grep -nE '124\.221\.86\.123|47\.119\.146\.111' /etc/postgresql/16/main/pg_hba.conf
+sudo grep -nE '124\.221\.86\.123|47\.119\.146\.111|10\.44\.0\.[23]' /etc/postgresql/16/main/pg_hba.conf
 ```
 
 ## 5. 阿里云 Evolution Worker
@@ -231,8 +237,8 @@ User=root
 ### 5.2 环境变量
 
 ```dotenv
-DATABASE_URL=postgresql://alis_app:<redacted>@122.51.159.195:5432/alis_sim?sslmode=require
-DATA_PLATFORM_DATABASE_URL=postgresql://alis_app:<redacted>@122.51.159.195:5432/alis_data?sslmode=require
+DATABASE_URL=postgresql://alis_app:<redacted>@10.44.0.1:5432/alis_sim?sslmode=require
+DATA_PLATFORM_DATABASE_URL=postgresql://alis_app:<redacted>@10.44.0.1:5432/alis_data?sslmode=require
 DATABASE_CONNECT_TIMEOUT_SECONDS=<configured>
 ALIS_EVOLUTION_WORKER_ENABLED=true
 TUSHARE_TOKEN=<redacted>
@@ -241,9 +247,37 @@ DEEPSEEK_BASE_URL=https://api.deepseek.com
 DEEPSEEK_MODEL=deepseek-v4-flash
 DEEPSEEK_TIMEOUT_SECONDS=60
 DEEPSEEK_DAILY_TOKEN_BUDGET=10000000
+ALIS_WORKER_PROFILE=2gb
+ALIS_V10_ENV_PARALLELISM=1
+ALIS_RESEARCH_MAX_REPLAY_SECONDS=300
+OMP_NUM_THREADS=1
+OPENBLAS_NUM_THREADS=1
+MKL_NUM_THREADS=1
+NUMEXPR_NUM_THREADS=1
+VECLIB_MAXIMUM_THREADS=1
 ```
 
 `/etc/alis/worker.env` 权限应为 `600`。Worker 不运行 Nginx、前端、API、Redis 或调度器。
+
+2GB Worker 的 systemd 资源保护：
+
+```ini
+# /etc/systemd/system/alis-evolution-worker.service.d/20-low-memory.conf
+[Service]
+Environment=ALIS_WORKER_PROFILE=2gb
+Environment=ALIS_V10_ENV_PARALLELISM=1
+Environment=ALIS_RESEARCH_MAX_REPLAY_SECONDS=300
+Environment=OMP_NUM_THREADS=1
+Environment=OPENBLAS_NUM_THREADS=1
+Environment=MKL_NUM_THREADS=1
+Environment=NUMEXPR_NUM_THREADS=1
+Environment=VECLIB_MAXIMUM_THREADS=1
+MemoryHigh=1200M
+MemoryMax=1600M
+TasksMax=128
+```
+
+应用后执行 `systemctl daemon-reload && systemctl restart alis-evolution-worker`。`MemoryMax` 是防止系统再次 OOM 的硬闸，任务应通过检查点恢复；2GB 实例建议配置 2GB swap 作为缓冲，但 swap 不能替代拆分任务或扩容。
 
 ### 5.3 租约和恢复合同
 
@@ -305,20 +339,23 @@ sudo certbot renew --dry-run
 
 ## 8. 当前已知问题
 
-### 8.1 腾讯云私网不通
+### 8.1 原生轻量私网不通与 WireGuard 收敛
 
-`10.0.0.4 -> 10.0.0.12:5432` 实测失败。当前使用公网 TLS `/32` 白名单，不影响正确性，但增加网络延迟并依赖公网链路。建立受控私网连接后，应先验证双库、延迟和回滚，再修改连接 URL。
+`10.0.0.4 -> 10.0.0.12:5432` 仍不作为生产路径；已建立 WireGuard `/29` 隧道，地址为数据库 `10.44.0.1`、应用 `10.44.0.2`、Worker `10.44.0.3`。三端配置持久化、`wg-quick@wg0` active，应用和 Worker 的双库连接均已通过连续只读探针，数据库观察到 Worker 客户端为 `10.44.0.3`。公网 TLS `/32` 白名单保留回滚，WireGuard UDP `51820` 仅允许固定节点来源。
 
 ### 8.2 只读聚合接口偏慢
 
-2026-07-27 在 kevin2 本机携带生产认证 Token 实测：
+历史基线（2026-07-27，在 kevin2 本机携带生产认证 Token）为：
 
 ```text
 /api/model-strategy/evolution/owner-summary  200，约 11.79 秒
 /api/decision/summary                        200，约 37.74 秒
 ```
 
-前端只读请求当前 20 秒超时，两个接口并行时可能同时显示“读取超时”。这不是数据缺失。短期可将只读超时提高到 60 秒，长期必须缓存或拆解重查询，使决策摘要回到秒级；不能用推测值填充页面。
+当时前端只读请求使用 20 秒超时，两个接口并行时可能同时显示“读取超时”。这不是数据缺失。2026-08-04 已发布
+`/opt/alis/releases/20260804-readonly-v23` 并切换 `/opt/alis/current`，将决策摘要的持仓估值改为批量点时读取、市场状态改读结构化快照、财务查询只取实际使用字段，且把深度候选 Shadow/A-B 审计移到策略实验室接口。现场实测决策摘要冷启动约 9.9 秒、热缓存约 5.1 秒，10 个持仓均有真实点时估值；总览、今日决策和管理后台均能完成渲染，浏览器控制台无错误。API `active`、`NRestarts=0`，近 30 分钟日志无新的 HTTP 500、Traceback 或 statement timeout。
+
+数据库当前没有等待锁，连接约 9/30；抽查可见的 `idle in transaction` 会话来自应用机 `10.44.0.2` 的短时只读处理，业务连接已设置 120 秒 `idle_in_transaction_session_timeout`，不能把瞬时会话误判为持续故障。管理后台仍可能展示历史任务/研究超时记录；它们属于运行证据，不代表本次页面请求失败。2026-08-05 研究资产审计另确认：`dc_research_asset_summary` 是受控摘要表，`alis_app` 已补齐只读权限；成功响应使用 `data_available=true`，只有当前查询异常才使用 `degraded/data_available=false`。回测、点时研究和后台长任务仍需独立优化，不能用前端页面已恢复来宣称所有查询均已秒级。
 
 ### 8.3 自动备份未落地
 
@@ -357,4 +394,3 @@ journalctl -u alis-evolution-worker -n 30 --no-pager
 3. 阿里 Worker 失败：检查 `/etc/alis/worker.env` 和双库 `SELECT 1`，再重启 Worker。
 4. 阿里 Worker 暂时不可恢复时，可在部署了当前切换代码的 kevin2 将 `ALIS_EVOLUTION_WORKER_ENABLED=true` 并重启 API，作为受控回退；恢复阿里 Worker 前不得保持两个 Worker 长期并行。
 5. 任一变更后都先验证 `/api/health`、Worker 最新日志和任务进度，再清理备份或临时凭据。
-

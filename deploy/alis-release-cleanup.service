@@ -1,0 +1,8 @@
+[Unit]
+Description=ALIS old release cleanup
+After=local-fs.target
+
+[Service]
+Type=oneshot
+Environment=ALIS_RELEASE_KEEP_COUNT=10
+ExecStart=/usr/local/sbin/cleanup-alis-releases

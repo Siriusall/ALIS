@@ -222,3 +222,19 @@ npm run build
 - `docs/ALIS数据接口文档.md`：数据接口调用维度、降级与完整性合同。
 - `docs/常态化运营与服务器迁移改造清单.md`：运维事项，按用户安排后置。
 - `docs/PostgreSQL原始表索引审计-2026-07-22.md`：数据库索引审计证据。
+
+## 12. 生产服务器直连
+
+三台生产机器均使用本机直连 SSH，端口均为 `22`，连接时显式使用 `-o ProxyCommand=none`，不走代理。私钥文件只保存在本机，不记录私钥内容、密码或前端登录凭据。
+
+| 角色 | 地址 | 用户 | 本机私钥 | 运行内容 |
+| --- | --- | --- | --- | --- |
+| 腾讯云应用机 | `124.221.86.123` | `ubuntu` | `/Users/sirius/Desktop/key/kevin2/default.pem` | API、前端、Redis |
+| 腾讯云数据库机 | `122.51.159.195` | `ubuntu` | `/Users/sirius/Desktop/key/kevin/defaultkevin.pem` | PostgreSQL `alis_sim`、`alis_data` |
+| 阿里云 Worker | `47.119.146.111` | `root` | `/Users/sirius/Desktop/key/阿里云/default-2.pem` | 独立 Evolution Worker |
+
+标准连接形式：
+
+```bash
+ssh -o BatchMode=yes -o ConnectTimeout=10 -o ProxyCommand=none -i "/path/to/key" user@host
+```
