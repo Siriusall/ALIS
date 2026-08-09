@@ -229,6 +229,7 @@ def build_decision_enhancement(
     market_overview: dict[str, Any],
     ledger: dict[str, Any],
     recent_execution: dict[str, Any] | None,
+    include_candidate_shadow_ab: bool = True,
 ) -> dict[str, Any]:
     position_policy = market_position_policy(market_overview, ledger)
     protection = extreme_market_protection(market_overview, ledger)
@@ -246,6 +247,11 @@ def build_decision_enhancement(
         ),
         "market_position_policy": position_policy,
         "model_role_contract": model_role_contract(),
-        "candidate_shadow_ab": candidate_shadow_ab_status(),
+        "candidate_shadow_ab": candidate_shadow_ab_status() if include_candidate_shadow_ab else {
+            "ok": True,
+            "status": "deferred_to_strategy_lab",
+            "items": [],
+            "reason": "决策摘要只读快速合同；候选影子 A/B 深度证据位于策略进化页。",
+        },
         "extreme_market_protection": protection,
     }

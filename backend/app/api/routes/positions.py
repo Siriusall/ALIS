@@ -9,6 +9,8 @@ from starlette.responses import Response
 
 from app.db.store import (
     add_position as add_position_store,
+    count_executions,
+    count_operations,
     delete_position,
     get_default_strategy_id,
     get_positions as get_positions_store,
@@ -27,7 +29,7 @@ from app.services.cache_consolidation import read_consolidated_cache
 from app.services.tushare_snapshot import get_daily_snapshot
 from app.services.strategy_config import parse_strategy_content
 from app.core.a_share_fees import is_exchange_etf
-from app.services.defensive_assets import defensive_asset_bar
+from app.services.defensive_assets import defensive_asset_bars
 
 router = APIRouter()
 
@@ -105,6 +107,7 @@ def get_positions() -> PositionsListResponse:
             pass
     data_source_time: Optional[str] = None
     prices_by_symbol: dict[str, float] = {}
+    trade_date = ""
 
     # 1) 优先使用 all_in_one（统一缓存入口）
     try:
@@ -153,18 +156,53 @@ def get_positions() -> PositionsListResponse:
 
     # 3) snapshot 不全时，缺失标的再回退到 spot
     missing_symbols = [s for s in symbols if s not in prices_by_symbol]
-    for s in list(missing_symbols):
-        if not is_exchange_etf(s):
-            continue
-        ts_code = s if str(s).upper().endswith((".SH", ".SZ")) else f"{s}.SH"
-        trade_date = (data_source_time or "")[:10].replace("-", "") or get_last_trade_date(for_data_availability=True).strftime("%Y%m%d")
-        bar = defensive_asset_bar(ts_code, trade_date)
-        if not bar:
-            continue
-        p = float(bar.get("close") or 0)
-        if p > 0:
-            prices_by_symbol[s] = p
-            missing_symbols.remove(s)
+    if missing_symbols:
+        try:
+            from app.services.position_console import resolve_position_prices
+
+            local_prices, local_time = resolve_position_prices(missing_symbols, trade_date)
+            prices_by_symbol.update(local_prices)
+            missing_symbols = [s for s in missing_symbols if s not in prices_by_symbol]
+            if local_time:
+                data_source_time = min(filter(None, [data_source_time, local_time]), default=local_time)
+        except Exception:
+            pass
+    fallback_etf_symbols = [s for s in missing_symbols if is_exchange_etf(s)]
+    still_missing: list[str] = [s for s in missing_symbols if s not in fallback_etf_symbols]
+    if fallback_etf_symbols:
+        trade_date = (
+            (data_source_time or "")[:10].replace("-", "")
+            or get_last_trade_date(for_data_availability=True).strftime("%Y%m%d")
+        )
+        fallback_codes = [
+            s if str(s).upper().endswith((".SH", ".SZ")) else f"{s}.SH"
+            for s in fallback_etf_symbols
+        ]
+        try:
+            fallback_bars = defensive_asset_bars(fallback_codes, trade_date)
+        except Exception:
+            # A stale/overloaded data connection must not turn the read-only
+            # positions page into HTTP 500; the spot fallback below remains.
+            fallback_bars = {}
+        for symbol, ts_code in zip(fallback_etf_symbols, fallback_codes):
+            bar = fallback_bars.get(ts_code.upper())
+            p = float((bar or {}).get("close") or 0)
+            if p > 0:
+                prices_by_symbol[symbol] = p
+            else:
+                still_missing.append(symbol)
+    missing_symbols = still_missing
+    if missing_symbols:
+        try:
+            from app.services.position_console import resolve_stock_position_prices
+
+            local_prices, local_time = resolve_stock_position_prices(missing_symbols, trade_date)
+            prices_by_symbol.update(local_prices)
+            missing_symbols = [s for s in missing_symbols if s not in prices_by_symbol]
+            if local_time:
+                data_source_time = min(filter(None, [data_source_time, local_time]), default=local_time)
+        except Exception:
+            pass
     if missing_symbols:
         try:
             spot_prices, spot_time = fetch_symbol_prices_with_time(missing_symbols)
@@ -240,6 +278,27 @@ def get_operations(
     return [OperationResponse(**r) for r in rows]
 
 
+@router.get("/operations/page")
+def get_operations_page(
+    execution_id: Optional[int] = Query(None),
+    limit: int = Query(20, ge=1, le=50),
+    offset: int = Query(0, ge=0, le=100_000),
+) -> dict:
+    """Read a bounded operation page without exposing an unbounded list read."""
+    total = count_operations(execution_id=execution_id)
+    rows = list_operations(execution_id=execution_id, limit=limit, offset=offset)
+    items = [OperationResponse(**r).model_dump() for r in rows]
+    return {
+        "ok": True,
+        "items": items,
+        "page": offset // limit + 1,
+        "page_size": limit,
+        "offset": offset,
+        "total": total,
+        "has_more": offset + len(items) < total,
+    }
+
+
 @router.get("/executions", response_model=list[ExecutionListItem])
 def get_executions(limit: int = Query(100, ge=1, le=200)) -> list[ExecutionListItem]:
     """List recent executions (for dropdown / equity curve selection)."""
@@ -255,3 +314,33 @@ def get_executions(limit: int = Query(100, ge=1, le=200)) -> list[ExecutionListI
         )
         for r in rows
     ]
+
+
+@router.get("/executions/page")
+def get_executions_page(
+    limit: int = Query(20, ge=1, le=50),
+    offset: int = Query(0, ge=0, le=100_000),
+) -> dict:
+    """Read a bounded execution page without exposing an unbounded list read."""
+    total = count_executions()
+    rows = list_executions(limit=limit, offset=offset)
+    items = [
+        ExecutionListItem(
+            id=r["id"],
+            strategy_id=r["strategy_id"],
+            executed_at=r["executed_at"],
+            budget=r["budget"],
+            top_n=r["top_n"],
+            orders=[ExecutionOrderItem(**o) for o in r.get("orders", [])],
+        ).model_dump()
+        for r in rows
+    ]
+    return {
+        "ok": True,
+        "items": items,
+        "page": offset // limit + 1,
+        "page_size": limit,
+        "offset": offset,
+        "total": total,
+        "has_more": offset + len(items) < total,
+    }

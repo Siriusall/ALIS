@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import time
+
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from app.core.security import create_access_token, decode_access_token, hash_password, verify_password
 from app.core.config import settings
+from app.core.db_connection_gate import DatabaseConnectionCapacity
+from app.core.error_evidence import classify_exception
 from app.db.store import create_user, get_user_by_id, get_user_by_username
 from app.schemas.user import TokenResponse, UserLogin, UserRegister, UserResponse
 
@@ -13,6 +17,19 @@ security = HTTPBearer(auto_error=False)
 
 _LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost", "testclient"}
 _DEBUG_USER = {"id": 0, "username": "本机调试", "created_at": None}
+_USER_CACHE_TTL_SECONDS = 30.0
+_user_cache: dict[int, tuple[float, dict]] = {}
+
+
+def _remember_user(user: dict) -> dict:
+    safe = {
+        "id": int(user.get("id") or 0),
+        "username": str(user.get("username") or ""),
+        "created_at": user.get("created_at"),
+    }
+    if safe["id"]:
+        _user_cache[safe["id"]] = (time.monotonic() + _USER_CACHE_TTL_SECONDS, safe)
+    return safe
 
 
 def _can_bypass_auth(request: Request) -> bool:
@@ -45,10 +62,18 @@ def require_current_user(
     uid = _current_user_id(credentials)
     if not uid:
         raise HTTPException(status_code=401, detail="登录状态无效或已过期")
-    user = get_user_by_id(uid)
+    cached = _user_cache.get(uid)
+    if cached and cached[0] > time.monotonic():
+        return cached[1].copy()
+    try:
+        user = get_user_by_id(uid)
+    except Exception as exc:  # noqa: BLE001 - authentication dependency must expose DB outage as 503
+        if isinstance(exc, DatabaseConnectionCapacity) or classify_exception(exc) in {"data_unavailable", "query_failed"}:
+            raise HTTPException(status_code=503, detail="认证服务暂时不可用") from exc
+        raise
     if not user:
         raise HTTPException(status_code=401, detail="用户不存在")
-    return user
+    return _remember_user(user)
 
 
 @router.post("/auth/register", response_model=TokenResponse)
@@ -57,6 +82,7 @@ def register(body: UserRegister) -> TokenResponse:
     if get_user_by_username(body.username):
         raise HTTPException(status_code=400, detail="用户名已存在")
     user = create_user(body.username, hash_password(body.password))
+    _remember_user(user)
     token = create_access_token(user["id"])
     return TokenResponse(
         access_token=token,
@@ -71,6 +97,7 @@ def login(body: UserLogin) -> TokenResponse:
     if not row or not verify_password(body.password, row["password_hash"]):
         raise HTTPException(status_code=401, detail="用户名或密码错误")
     token = create_access_token(row["id"])
+    _remember_user(row)
     return TokenResponse(
         access_token=token,
         user=UserResponse(id=row["id"], username=row["username"], created_at=row.get("created_at")),

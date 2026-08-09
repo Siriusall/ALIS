@@ -104,7 +104,11 @@ def materialize_decision_outcomes(limit: int = 1000) -> dict[str, Any]:
     _ensure_tables()
     with _conn() as c:
         decisions = [dict(row) for row in c.execute(
-            "SELECT * FROM decision_snapshots ORDER BY decision_time DESC LIMIT ?", (limit,)
+            # Outcome materialisation only needs the decision identity and
+            # direction.  Frozen evidence JSON is loaded by audit/detail paths,
+            # never by this batch job.
+            "SELECT id,ts_code,decision_type,decision_time FROM decision_snapshots "
+            "ORDER BY decision_time DESC,id DESC LIMIT ?", (limit,)
         ).fetchall()]
         existing = {
             (int(row["decision_snapshot_id"]), int(row["horizon_sessions"])): dict(row)

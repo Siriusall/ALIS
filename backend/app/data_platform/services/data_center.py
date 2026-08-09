@@ -688,7 +688,11 @@ def get_data_center_status(limit_runs: int = 10) -> dict[str, Any]:
             if c._is_postgres
             else c.execute("SELECT COUNT(*) AS cnt FROM dc_tushare_raw_records").fetchone()
         )
-        snapshot_count = c.execute("SELECT COUNT(*) AS cnt FROM dc_stock_daily_snapshot").fetchone()
+        snapshot_count = (
+            c.execute("SELECT COALESCE(reltuples, 0)::BIGINT AS cnt FROM pg_class WHERE relname='dc_stock_daily_snapshot'").fetchone()
+            if c._is_postgres
+            else c.execute("SELECT COUNT(*) AS cnt FROM dc_stock_daily_snapshot").fetchone()
+        )
         quality_count = c.execute("SELECT COUNT(*) AS cnt FROM dc_data_quality_checks").fetchone()
         announcement_count = c.execute("SELECT COUNT(*) AS cnt FROM dc_announcement_raw").fetchone()
         event_count = c.execute("SELECT COUNT(*) AS cnt FROM dc_announcement_event").fetchone()
@@ -750,6 +754,10 @@ def _row_to_dict(row: Any) -> dict[str, Any]:
 def _row_count(row: Any) -> int:
     data = _row_to_dict(row)
     return int(data.get("cnt") or 0)
+
+
+def _row_value(row: Any, key: str, default: Any = None) -> Any:
+    return _row_to_dict(row).get(key, default)
 
 
 def _period_not_applicable(ts_code: str, period: str) -> bool:
@@ -3429,12 +3437,13 @@ def build_stock_daily_snapshot(trade_date: str) -> dict[str, Any]:
             }
             daily_basic = _raw_payload_map(c, "daily_basic", trade_date, "ts_code")
             daily = _raw_payload_map(c, "daily", trade_date, "ts_code")
+            adj_factors = _raw_payload_map(c, "adj_factor", trade_date, "ts_code")
             limits = _raw_payload_map(c, "stk_limit", trade_date, "ts_code")
             suspended = set(_raw_payload_map(c, "suspend_d", trade_date, "ts_code").keys())
         now = _now()
         written = 0
         stock_codes = set(stocks.keys())
-        all_codes = sorted((set(daily_basic) | set(daily) | set(limits) | suspended) & stock_codes)
+        all_codes = sorted((set(daily_basic) | set(daily) | set(adj_factors) | set(limits) | suspended) & stock_codes)
         with _conn() as c:
             c.execute("DELETE FROM dc_stock_daily_snapshot WHERE trade_date = ?", (trade_date,))
             for ts_code in all_codes:
@@ -3461,6 +3470,11 @@ def build_stock_daily_snapshot(trade_date: str) -> dict[str, Any]:
                     str(info.get("name") or ""),
                     str(info.get("industry") or ""),
                     close,
+                    _float_or_none(price.get("open")),
+                    _float_or_none(price.get("high")),
+                    _float_or_none(price.get("low")),
+                    _float_or_none(price.get("pre_close")),
+                    _float_or_none(adj_factors.get(ts_code, {}).get("adj_factor")),
                     _float_or_none(price.get("pct_chg")),
                     _float_or_none(price.get("vol")),
                     _float_or_none(price.get("amount")),
@@ -3491,6 +3505,7 @@ def build_stock_daily_snapshot(trade_date: str) -> dict[str, Any]:
                          updated_at=excluded.updated_at""",
                     (trade_date, SOURCE_TUSHARE, available_time, now),
                 )
+            _refresh_snapshot_stats(c, trade_date, now)
         finish_ingestion_run(run_id, status="completed", rows_read=len(all_codes), rows_written=written, meta={"trade_date": trade_date})
         quality = run_data_quality_checks(trade_date=trade_date)
         return {"ok": True, "run_id": run_id, "trade_date": trade_date, "rows_written": written, "quality": quality}
@@ -3522,18 +3537,63 @@ def _float_or_none(value: Any) -> float | None:
         return None
 
 
+def _refresh_snapshot_stats(c: Any, trade_date: str, updated_at: str) -> None:
+    """Refresh one date only; never aggregate the full snapshot table on a read path."""
+    # The summary table is a read optimization. Some production databases
+    # create it with an administrative role and grant the app role SELECT
+    # only; that must not make the authoritative snapshot ingestion fail.
+    if bool(getattr(c, "_is_postgres", False)):
+        privilege = c.execute(
+            """SELECT has_table_privilege(current_user, ?, 'INSERT')
+                      AND has_table_privilege(current_user, ?, 'UPDATE') AS can_write""",
+            ("public.dc_stock_daily_snapshot_stats", "public.dc_stock_daily_snapshot_stats"),
+        ).fetchone()
+        if not bool(_row_value(privilege, "can_write", False)):
+            return
+    row = c.execute(
+        """SELECT COUNT(*) AS rows_total,
+                  SUM(CASE WHEN close IS NOT NULL AND volume IS NOT NULL AND turnover IS NOT NULL THEN 1 ELSE 0 END) AS market_rows,
+                  COALESCE(MIN(available_time), '') AS min_available_time,
+                  COALESCE(MAX(available_time), '') AS max_available_time
+             FROM dc_stock_daily_snapshot
+            WHERE trade_date=?""",
+        (trade_date,),
+    ).fetchone()
+    values = (
+        trade_date,
+        int(_row_value(row, "rows_total", 0) or 0),
+        int(_row_value(row, "market_rows", 0) or 0),
+        str(_row_value(row, "min_available_time", "") or ""),
+        str(_row_value(row, "max_available_time", "") or ""),
+        updated_at,
+    )
+    c.execute(
+        """INSERT INTO dc_stock_daily_snapshot_stats
+                  (trade_date,rows_total,market_rows,min_available_time,max_available_time,updated_at)
+           VALUES(?,?,?,?,?,?)
+           ON CONFLICT(trade_date) DO UPDATE SET
+                  rows_total=excluded.rows_total,
+                  market_rows=excluded.market_rows,
+                  min_available_time=excluded.min_available_time,
+                  max_available_time=excluded.max_available_time,
+                  updated_at=excluded.updated_at""",
+        values,
+    )
+
+
 def _upsert_snapshot_row(c: Any, values: tuple[Any, ...]) -> None:
     if c._is_mysql:
         c.execute(
             """
             INSERT INTO dc_stock_daily_snapshot
-                (ts_code, trade_date, symbol, name, industry, close, change_pct, volume, turnover, total_mv, circ_mv, pe_ttm, pb,
+                (ts_code, trade_date, symbol, name, industry, close, open, high, low, pre_close, adj_factor, change_pct, volume, turnover, total_mv, circ_mv, pe_ttm, pb,
                  turnover_rate, up_limit, down_limit, is_suspended, data_quality_score, quality_flags_json,
                  source_code, available_time, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON DUPLICATE KEY UPDATE
                 symbol = VALUES(symbol), name = VALUES(name), industry = VALUES(industry),
-                close = VALUES(close), change_pct = VALUES(change_pct), volume = VALUES(volume), turnover = VALUES(turnover), total_mv = VALUES(total_mv), circ_mv = VALUES(circ_mv),
+                close = VALUES(close), open = VALUES(open), high = VALUES(high), low = VALUES(low), pre_close = VALUES(pre_close), adj_factor = VALUES(adj_factor),
+                change_pct = VALUES(change_pct), volume = VALUES(volume), turnover = VALUES(turnover), total_mv = VALUES(total_mv), circ_mv = VALUES(circ_mv),
                 pe_ttm = VALUES(pe_ttm), pb = VALUES(pb), turnover_rate = VALUES(turnover_rate),
                 up_limit = VALUES(up_limit), down_limit = VALUES(down_limit), is_suspended = VALUES(is_suspended),
                 data_quality_score = VALUES(data_quality_score), quality_flags_json = VALUES(quality_flags_json),
@@ -3545,15 +3605,20 @@ def _upsert_snapshot_row(c: Any, values: tuple[Any, ...]) -> None:
         c.execute(
             """
             INSERT INTO dc_stock_daily_snapshot
-                (ts_code, trade_date, symbol, name, industry, close, change_pct, volume, turnover, total_mv, circ_mv, pe_ttm, pb,
+                (ts_code, trade_date, symbol, name, industry, close, open, high, low, pre_close, adj_factor, change_pct, volume, turnover, total_mv, circ_mv, pe_ttm, pb,
                  turnover_rate, up_limit, down_limit, is_suspended, data_quality_score, quality_flags_json,
                  source_code, available_time, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(ts_code, trade_date) DO UPDATE SET
                 symbol = excluded.symbol,
                 name = excluded.name,
                 industry = excluded.industry,
                 close = excluded.close,
+                open = excluded.open,
+                high = excluded.high,
+                low = excluded.low,
+                pre_close = excluded.pre_close,
+                adj_factor = excluded.adj_factor,
                 change_pct = excluded.change_pct,
                 volume = excluded.volume,
                 turnover = excluded.turnover,

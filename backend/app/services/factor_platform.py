@@ -394,23 +394,42 @@ def _industry_candidate_inputs(symbols: list[str], *, trade_date: str, cutoff: s
     from app.data_platform.db import _conn as data_conn
 
     date_key = str(trade_date).replace("-", "")[:8]
+    date_cutoff = (
+        f"{date_key[:4]}-{date_key[4:6]}-{date_key[6:8]}"
+        if len(date_key) == 8 and date_key.isdigit()
+        else str(trade_date)[:10]
+    )
     try:
         with data_conn() as conn:
             # Factor values store six-digit symbols while the data platform
             # master stores exchange-qualified codes (e.g. 000001.SZ).
-            # Read the compact master once and normalize at the boundary.
+            # Resolve only the industries represented by this factor slice;
+            # the full master is unnecessary for a point-in-time cross-section.
+            requested_codes = sorted({str(symbol).split(".", 1)[0] for symbol in symbols if symbol})
+            code_placeholders = ",".join("?" for _ in requested_codes)
             master = [dict(row) for row in conn.execute(
-                "SELECT ts_code,industry FROM dc_stock_master WHERE COALESCE(industry,'')<>''"
-            ).fetchall()] if symbols else []
+                f"""SELECT ts_code,industry FROM dc_stock_master
+                    WHERE COALESCE(industry,'')<>''
+                      AND (ts_code IN ({code_placeholders}) OR symbol IN ({code_placeholders}))""",
+                (*requested_codes, *requested_codes),
+            ).fetchall()] if requested_codes else []
+            industries = sorted({str(row.get("industry") or "").strip() for row in master if str(row.get("industry") or "").strip()})
+            industry_placeholders = ",".join("?" for _ in industries)
             rows = [dict(row) for row in conn.execute(
-                """SELECT d.metric_code,d.industry_name,d.metric_name,d.source_code,
+                f"""SELECT d.metric_code,d.industry_name,d.metric_name,d.source_code,
                           v.data_date,v.value,v.available_time
                      FROM dc_industry_metric_definition d
-                     JOIN dc_industry_metric_value v ON v.metric_code=d.metric_code
+                    JOIN dc_industry_metric_value v ON v.metric_code=d.metric_code
                     WHERE v.available_time<=?
-                      AND REPLACE(v.data_date,'-','')<=?""",
-                (cutoff, date_key),
-            ).fetchall()]
+                      AND ((v.data_date LIKE '____-__-__' AND v.data_date<=?)
+                           OR (v.data_date NOT LIKE '____-__-__' AND v.data_date<=?))
+                      AND d.industry_name IN ({industry_placeholders})
+                      AND (d.source_code='tushare.cn_ppi_proxy'
+                           OR d.metric_name LIKE ?
+                           OR d.metric_name LIKE ?
+                           OR d.metric_name LIKE ?)""",
+                (cutoff, date_cutoff, date_key, *industries, "%需求%", "%营收扩散%", "%库存%"),
+            ).fetchall()] if industries else []
     except Exception:
         return {}, {}
     requested = {str(symbol).split(".", 1)[0] for symbol in symbols}

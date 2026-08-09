@@ -7,6 +7,7 @@ limitation instead of being silently replaced by an optimistic proxy.
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any
 
 from app.data_platform.db import _conn
@@ -24,6 +25,43 @@ def _value(row: Any, key: str, default: Any = 0) -> Any:
     return dict(row).get(key, default) if row else default
 
 
+def _report_rc_summary(conn: Any) -> dict[str, Any]:
+    """Read the maintained analyst-report summary; never scan raw payloads on a read path."""
+    if not getattr(conn, "_is_postgres", False):
+        row = conn.execute(
+            """SELECT COUNT(*) records,COUNT(DISTINCT ts_code) symbols,
+                      MAX(available_time) latest_available_time,
+                      SUM(CASE WHEN COALESCE(available_time,'')='' THEN 1 ELSE 0 END) missing_pit
+               FROM dc_tushare_raw_records WHERE api_name='report_rc'"""
+        ).fetchone()
+        return {**(dict(row) if row else {}), "summary_status": "exact_fixture_fallback"}
+    table = conn.execute(
+        "SELECT to_regclass(?) AS table_name",
+        ("public.dc_research_asset_summary",),
+    ).fetchone()
+    if not _value(table, "table_name", ""):
+        return {
+            "records": 0, "symbols": 0, "latest_available_time": "",
+            "missing_pit": 0, "measurement": "summary_missing",
+            "summary_status": "unavailable",
+        }
+    row = conn.execute(
+        """SELECT records,symbols,latest_available_time,missing_pit,measurement
+             FROM dc_research_asset_summary WHERE asset_key=?""",
+        ("report_rc",),
+    ).fetchone()
+    if row is None:
+        return {
+            "records": 0, "symbols": 0, "latest_available_time": "",
+            "missing_pit": 0, "measurement": "summary_pending",
+            "summary_status": "pending",
+        }
+    return {
+        **dict(row),
+        "summary_status": "ready",
+    }
+
+
 def audit_research_data_assets() -> dict[str, Any]:
     with _conn() as conn:
         metric_rows = [dict(row) for row in conn.execute(
@@ -32,10 +70,7 @@ def audit_research_data_assets() -> dict[str, Any]:
                  FROM dc_industry_metric_definition d LEFT JOIN dc_industry_metric_value v ON v.metric_code=d.metric_code
                  GROUP BY d.metric_code,d.metric_name,d.description"""
         ).fetchall()]
-        report = conn.execute("""SELECT COUNT(*) records,COUNT(DISTINCT ts_code) symbols,
-                                      MAX(available_time) latest_available_time,
-                                      SUM(CASE WHEN COALESCE(available_time,'')='' THEN 1 ELSE 0 END) missing_pit
-                               FROM dc_tushare_raw_records WHERE api_name='report_rc'""").fetchone()
+        report = _report_rc_summary(conn)
         # The mapping table contains millions of point-in-time rows.  A daily
         # audit must not rescan the whole history merely to display an
         # informational total.  PostgreSQL's labelled live-row estimate is
@@ -83,14 +118,21 @@ def audit_research_data_assets() -> dict[str, Any]:
             "latest_available_time": max((str(item.get("latest_available_time") or "") for item in items), default=""),
             "sources": sources,
         }
-    report_data = {"records": int(_value(report, "records")), "symbols": int(_value(report, "symbols")), "latest_available_time": str(_value(report, "latest_available_time", "")), "missing_point_in_time_records": int(_value(report, "missing_pit"))}
+    report_data = {"records": int(_value(report, "records")), "symbols": int(_value(report, "symbols")), "latest_available_time": str(_value(report, "latest_available_time", "")), "missing_point_in_time_records": int(_value(report, "missing_pit")), "measurement": str(_value(report, "measurement", "summary_missing")), "summary_status": str(_value(report, "summary_status", "unavailable"))}
     theme_data = {"mappings": int(_value(theme_mapping, "mappings")), "mappings_count_method": "postgres_live_row_estimate", "snapshot_dates": int(_value(theme_snapshot, "snapshot_dates")), "latest_date": str(_value(theme_snapshot, "latest_date", "")), "revenue_exposures": int(_value(revenue_theme, "exposures")), "revenue_companies": int(_value(revenue_theme, "companies")), "revenue_themes": int(_value(revenue_theme, "themes")), "revenue_latest_date": str(_value(revenue_theme, "latest_date", ""))}
+    # Compute the manual benchmark once.  The queue status normally embeds the
+    # same benchmark, which previously caused this audit to repeat the join
+    # and open another database connection under load.
     benchmark = announcement_label_benchmark()
     provider_reference = announcement_provider_reference_benchmark(
         reference_contract=CNINFO_CATEGORY_HOLDOUT_CONTRACT,
         benchmark_role="frozen_holdout",
     )
-    manual_review_queue = announcement_manual_review_queue_status(include_items=False)
+    manual_review_queue = announcement_manual_review_queue_status(
+        include_items=False,
+        include_benchmark=False,
+    )
+    manual_review_queue["manual_gold"] = benchmark
     professional_metrics = audit_professional_metric_candidates()
     announcement_data = {
         "raw_records": int(_value(announcements, "raw_records")),
@@ -115,7 +157,9 @@ def audit_research_data_assets() -> dict[str, Any]:
     for key, item in industry.items():
         if item["status"] in {"missing", "configured"}: gaps.append(f"industry:{key}")
         if item["status"] == "proxy_ready": gaps.append(f"industry:{key}:direct_source_not_integrated")
-    if not report_data["records"] or report_data["missing_point_in_time_records"]:
+    if report_data["summary_status"] != "ready":
+        gaps.append(f"analyst_consensus:summary_{report_data['summary_status']}")
+    elif not report_data["records"] or report_data["missing_point_in_time_records"]:
         gaps.append("analyst_consensus:point_in_time_coverage")
     # Existing theme mappings are evidence-based narrative exposures, not a
     # revenue-segment dataset; retain that distinction in the contract.
@@ -130,7 +174,11 @@ def audit_research_data_assets() -> dict[str, Any]:
     if professional_metrics["candidates"]:
         gaps.append("professional_operating_metrics:manual_verification_pending")
     return {
-        "ok": True, "schema_version": "alis_research_data_assets_v1", "status": "ready" if not gaps else "partial",
+        "ok": True,
+        "data_available": True,
+        "checked_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "schema_version": "alis_research_data_assets_v1",
+        "status": "ready" if not gaps else "partial",
         "industry_components": industry,
         "analyst_consensus_pit": {**report_data, "status": "ready" if report_data["records"] and not report_data["missing_point_in_time_records"] else "partial"},
         "theme_exposure": {**theme_data, "status": "ready" if theme_data["revenue_exposures"] else "proxy_only", "limitation": "价格/新闻主题映射与主营业务收入暴露分开保存；收入暴露只使用点时主营业务分部。"},

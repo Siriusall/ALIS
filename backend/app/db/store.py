@@ -10,12 +10,13 @@ from __future__ import annotations
 import json
 import hashlib
 import logging
+import os
 import re
 import sqlite3
 from contextlib import contextmanager
 from datetime import date, datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 from urllib.parse import urlparse, unquote
 
 from app.core.a_share_fees import (
@@ -29,6 +30,8 @@ from app.core.a_share_fees import (
 from app.core.config import settings
 from app.core.trade_calendar import get_last_trade_date
 from app.core.runtime_guard import assert_database_boundary
+from app.core.db_connection_gate import DatabaseConnectionGate
+from app.core.db_connect import connect_postgres
 
 logger = logging.getLogger("quant")
 
@@ -59,6 +62,10 @@ _DEFAULT_STRATEGY_CONTENT = {
     "portfolio_optimizer": "empirical_cvar_slsqp_v2",
     "execution_contract": "t_close_signal_t_plus_1_open_v1",
 }
+
+_BUSINESS_DB_CONNECTION_GATE = DatabaseConnectionGate(
+    "ALIS_BUSINESS_DB_MAX_CONNECTIONS", default=10
+)
 
 
 def _json_load(s: Any, default: Any) -> Any:
@@ -169,6 +176,13 @@ class _ConnWrapper:
         self._conn.close()
 
 
+def _rounded_account_balance_expression(conn: _ConnWrapper, expression: str) -> str:
+    """Round a floating-point account expression on every supported SQL dialect."""
+    if getattr(conn, "_is_postgres", False):
+        return f"ROUND(({expression})::numeric, 2)::double precision"
+    return f"ROUND({expression}, 2)"
+
+
 def _split_sql_statements(sql: str) -> List[str]:
     """按分号拆分 SQL，忽略空段和仅注释。"""
     parts = re.split(r";\s*", sql)
@@ -185,18 +199,29 @@ def _conn():
         if url.startswith("postgresql+psycopg://"):
             url = url.replace("postgresql+psycopg://", "postgresql://", 1)
         logger.debug("PostgreSQL 连接: %s", url.split("@")[-1])
-        raw = psycopg.connect(
-            url,
-            row_factory=dict_row,
-            connect_timeout=settings.database_connect_timeout_seconds,
-        )
-        try:
-            raw.execute("SELECT set_config('statement_timeout', %s, false)", (str(settings.database_statement_timeout_ms),))
-            w = _ConnWrapper(raw, is_mysql=False, is_postgres=True)
-            yield w
-            w.commit()
-        finally:
-            w.close()
+        with _BUSINESS_DB_CONNECTION_GATE.slot(settings.database_connect_timeout_seconds):
+            raw = connect_postgres(
+                psycopg.connect,
+                url,
+                row_factory=dict_row,
+                timeout=settings.database_connect_timeout_seconds,
+                role="business",
+            )
+            w = None
+            try:
+                raw.execute("SELECT set_config('statement_timeout', %s, false)", (str(settings.database_statement_timeout_ms),))
+                raw.execute(
+                    "SELECT set_config('idle_in_transaction_session_timeout', %s, false)",
+                    (os.getenv("DATABASE_IDLE_IN_TRANSACTION_TIMEOUT_MS", "120000"),),
+                )
+                w = _ConnWrapper(raw, is_mysql=False, is_postgres=True)
+                yield w
+                w.commit()
+            finally:
+                if w is not None:
+                    w.close()
+                else:
+                    raw.close()
     elif _is_mysql():
         import pymysql
         kw = _mysql_connect_kwargs()
@@ -721,6 +746,8 @@ CREATE TABLE IF NOT EXISTS evolution_tasks (
 );
 CREATE INDEX IF NOT EXISTS idx_evolution_tasks_status_next
 ON evolution_tasks(status, next_run_at, priority, created_at);
+CREATE INDEX IF NOT EXISTS idx_evolution_tasks_type_id
+ON evolution_tasks(task_type, id DESC);
 CREATE TABLE IF NOT EXISTS strategy_shadow_observations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     model_version_id INTEGER NOT NULL,
@@ -1001,7 +1028,8 @@ CREATE TABLE IF NOT EXISTS evolution_tasks (
     finished_at VARCHAR(64) NULL,
     created_at VARCHAR(64) NOT NULL,
     updated_at VARCHAR(64) NOT NULL,
-    INDEX idx_evolution_tasks_status_next (status, next_run_at, priority, created_at)
+    INDEX idx_evolution_tasks_status_next (status, next_run_at, priority, created_at),
+    INDEX idx_evolution_tasks_type_id (task_type, id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 CREATE TABLE IF NOT EXISTS strategy_shadow_observations (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,
@@ -1284,6 +1312,7 @@ def init_db() -> None:
                     created_at VARCHAR(64) NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_decision_symbol_time ON decision_snapshots(ts_code,decision_time);
+                CREATE INDEX IF NOT EXISTS idx_decision_time ON decision_snapshots(decision_time DESC,id DESC);
                 CREATE TABLE IF NOT EXISTS review_records (
                     id BIGSERIAL PRIMARY KEY, decision_snapshot_id BIGINT REFERENCES decision_snapshots(id),
                     review_time VARCHAR(64) NOT NULL, outcome_json TEXT NOT NULL, attribution_json TEXT NOT NULL,
@@ -1329,6 +1358,7 @@ def init_db() -> None:
                 c.execute("ALTER TABLE decision_snapshots ADD COLUMN IF NOT EXISTS target_weight_contract_json TEXT NOT NULL DEFAULT '{}'")
                 c.execute("ALTER TABLE operations ADD COLUMN IF NOT EXISTS target_weight_contract_json TEXT NOT NULL DEFAULT '{}'")
                 c.execute("CREATE INDEX IF NOT EXISTS idx_decision_execution ON decision_snapshots(execution_id,operation_id)")
+                c.execute("CREATE INDEX IF NOT EXISTS idx_decision_time ON decision_snapshots(decision_time DESC,id DESC)")
                 c.execute("ALTER TABLE position_state_history ADD COLUMN IF NOT EXISTS rule_version VARCHAR(64) NOT NULL DEFAULT ''")
                 c.execute("ALTER TABLE position_state_history ADD COLUMN IF NOT EXISTS model_version VARCHAR(64) NOT NULL DEFAULT ''")
                 c.execute("ALTER TABLE position_state_history ADD COLUMN IF NOT EXISTS automatic_decision_json TEXT NOT NULL DEFAULT '{}'")
@@ -1629,7 +1659,7 @@ def create_and_apply_buy_execution(
                 bought_at=(executed_at or now)[:10],
             )
         debit = c.execute(
-            "UPDATE account SET balance=ROUND(balance-?, 2) WHERE id=1 AND balance>=?",
+            f"UPDATE account SET balance={_rounded_account_balance_expression(c, 'balance-?')} WHERE id=1 AND balance>=?",
             (total_cost, total_cost),
         )
         if int(getattr(debit, "rowcount", 1) or 0) != 1:
@@ -1681,13 +1711,21 @@ def get_execution(execution_id: int) -> Optional[Dict[str, Any]]:
     }
 
 
-def list_executions(limit: int = 100) -> List[Dict[str, Any]]:
+def count_executions() -> int:
+    with _conn() as c:
+        row = c.execute("SELECT COUNT(*) AS total FROM executions").fetchone()
+    return int(row["total"] or 0) if row else 0
+
+
+def list_executions(limit: int = 100, offset: int = 0) -> List[Dict[str, Any]]:
     """Return recent executions (newest first)."""
+    n = max(1, int(limit))
+    skip = max(0, int(offset))
     with _conn() as c:
         cur = c.execute(
             """SELECT id, strategy_id, executed_at, budget, top_n, orders_json
-               FROM executions ORDER BY id DESC LIMIT ?""",
-            (limit,),
+               FROM executions ORDER BY id DESC LIMIT ? OFFSET ?""",
+            (n, skip),
         )
         rows = cur.fetchall()
     out = []
@@ -1934,7 +1972,7 @@ def sell_position(
                 fee_tax = 0.0 if is_exchange_etf(sym) else round(stamp_tax(amount), 2)
             net = max(0.0, round(amount - fee_comm - fee_trans - fee_tax, 2))
             credited = c.execute(
-                "UPDATE account SET balance=ROUND(balance+?, 2) WHERE id=1",
+                f"UPDATE account SET balance={_rounded_account_balance_expression(c, 'balance+?')} WHERE id=1",
                 (net,),
             )
             if int(getattr(credited, "rowcount", 1) or 0) != 1:
@@ -1964,24 +2002,46 @@ def sell_position(
     return None
 
 
-def list_operations(execution_id: Optional[int] = None, limit: int = 500) -> List[Dict[str, Any]]:
+def count_operations(execution_id: Optional[int] = None) -> int:
+    with _conn() as c:
+        if execution_id is not None:
+            row = c.execute(
+                "SELECT COUNT(*) AS total FROM operations WHERE execution_id = ?",
+                (int(execution_id),),
+            ).fetchone()
+        else:
+            row = c.execute("SELECT COUNT(*) AS total FROM operations").fetchone()
+    return int(row["total"] or 0) if row else 0
+
+
+def list_operations(
+    execution_id: Optional[int] = None,
+    limit: int = 500,
+    offset: int = 0,
+) -> List[Dict[str, Any]]:
     """Return operations, optionally filtered by execution_id."""
+    n = max(1, int(limit))
+    skip = max(0, int(offset))
     with _conn() as c:
         if execution_id is not None:
             cur = c.execute(
                 """SELECT id, execution_id, symbol, side, price, quantity, at, remark, name,
                           commission, transfer_fee, stamp_tax, slippage_bps, fee_schedule_version, operation_uid, target_weight_contract_json
-                   FROM operations WHERE execution_id = ? ORDER BY id DESC LIMIT ?""",
-                (execution_id, limit),
+                   FROM operations WHERE execution_id = ? ORDER BY id DESC LIMIT ? OFFSET ?""",
+                (execution_id, n, skip),
             )
         else:
             cur = c.execute(
                 """SELECT id, execution_id, symbol, side, price, quantity, at, remark, name,
                           commission, transfer_fee, stamp_tax, slippage_bps, fee_schedule_version, operation_uid, target_weight_contract_json
-                   FROM operations ORDER BY id DESC LIMIT ?""",
-                (limit,),
+                   FROM operations ORDER BY id DESC LIMIT ? OFFSET ?""",
+                (n, skip),
             )
         rows = cur.fetchall()
+    return _operation_rows_to_dicts(rows)
+
+
+def _operation_rows_to_dicts(rows: Iterable[Any]) -> List[Dict[str, Any]]:
     return [
         {
             "id": r["id"],
@@ -2003,6 +2063,38 @@ def list_operations(execution_id: Optional[int] = None, limit: int = 500) -> Lis
         }
         for r in rows
     ]
+
+
+def list_operations_for_execution_ids(
+    execution_ids: Iterable[int],
+    *,
+    limit_per_execution: int = 5000,
+) -> List[Dict[str, Any]]:
+    """Read operations for several executions in one bounded SQL query."""
+    ids = sorted({int(value) for value in execution_ids if value is not None})
+    if not ids:
+        return []
+    per_execution = max(1, min(int(limit_per_execution or 5000), 5000))
+    placeholders = ",".join("?" for _ in ids)
+    with _conn() as c:
+        cur = c.execute(
+            f"""SELECT id, execution_id, symbol, side, price, quantity, at, remark, name,
+                          commission, transfer_fee, stamp_tax, slippage_bps, fee_schedule_version,
+                          operation_uid, target_weight_contract_json
+                   FROM (
+                       SELECT id, execution_id, symbol, side, price, quantity, at, remark, name,
+                              commission, transfer_fee, stamp_tax, slippage_bps, fee_schedule_version,
+                              operation_uid, target_weight_contract_json,
+                              ROW_NUMBER() OVER (PARTITION BY execution_id ORDER BY id DESC) AS row_num
+                       FROM operations
+                       WHERE execution_id IN ({placeholders})
+                   ) operation_rows
+                   WHERE row_num <= ?
+                   ORDER BY id DESC""",
+            (*ids, per_execution),
+        )
+        rows = cur.fetchall()
+    return _operation_rows_to_dicts(rows)
 
 
 def get_positions() -> List[Dict[str, Any]]:
@@ -2910,15 +3002,20 @@ def list_quant_run_task_records(task_id: int, limit: int = 200) -> List[Dict[str
     ]
 
 
-def list_recent_quant_run_task_records(limit: int = 20) -> List[Dict[str, Any]]:
+def list_recent_quant_run_task_records(
+    limit: int = 20,
+    *,
+    include_detail: bool = False,
+) -> List[Dict[str, Any]]:
     """
     返回跨任务的最近执行记录（按 id 倒序），用于量化看板“最近执行明细”。
     """
     n = max(1, min(int(limit or 20), 500))
     with _conn() as c:
+        detail_column = ", detail_json" if include_detail else ""
         cur = c.execute(
-            """SELECT id, task_id, signal_date, execute_date, sold_count, bought_count,
-                      total_buy_cost, execution_id, message, created_at
+            f"""SELECT id, task_id, signal_date, execute_date, sold_count, bought_count,
+                      total_buy_cost, execution_id, message, created_at{detail_column}
                FROM quant_run_task_runs
                ORDER BY id DESC
                LIMIT ?""",
@@ -2936,6 +3033,7 @@ def list_recent_quant_run_task_records(limit: int = 20) -> List[Dict[str, Any]]:
             "total_buy_cost": float(r["total_buy_cost"] or 0),
             "execution_id": int(r["execution_id"]) if r["execution_id"] is not None else None,
             "message": str(r["message"] or ""),
+            **({"detail": _json_load(r["detail_json"], {})} if include_detail else {}),
             "created_at": str(r["created_at"] or ""),
         }
         for r in rows
@@ -3262,11 +3360,12 @@ def save_performance_reports(task_id: int | None, reports: dict[str, list[dict[s
 
 def list_performance_reports(task_id: int | None = None, limit: int = 100) -> list[dict[str, Any]]:
     n = max(1, min(int(limit or 100), 500))
+    columns = "id,task_id,scope_key,period_type,period,payload_json,created_at"
     with _conn() as c:
         if task_id is None:
-            cur = c.execute("SELECT * FROM quant_performance_reports ORDER BY id DESC LIMIT ?", (n,))
+            cur = c.execute(f"SELECT {columns} FROM quant_performance_reports ORDER BY id DESC LIMIT ?", (n,))
         else:
-            cur = c.execute("SELECT * FROM quant_performance_reports WHERE task_id = ? ORDER BY id DESC LIMIT ?", (int(task_id), n))
+            cur = c.execute(f"SELECT {columns} FROM quant_performance_reports WHERE task_id = ? ORDER BY id DESC LIMIT ?", (int(task_id), n))
         rows = cur.fetchall()
     return [{
         "id": int(r["id"]),

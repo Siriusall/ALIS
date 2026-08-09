@@ -9,6 +9,7 @@ import httpx
 from datetime import datetime
 
 from app.core.project_env import get_env_value
+from app.core.read_only_diagnostics import degraded_read
 from app.services.decision_store import build_review_outcome_suggestion, list_decision_snapshots
 from app.services.review_learning import decision_outcomes
 from app.db.store import _conn
@@ -16,6 +17,8 @@ from app.db.store import _conn
 
 ALLOWED_ERROR_TYPES = {"无错误", "数据质量", "模型失效", "估值判断", "风险执行", "交易执行", "研究遗漏", "其他"}
 _usage_lock = threading.Lock()
+_usage_table_lock = threading.Lock()
+_usage_table_ready = False
 
 
 def _token_limits() -> tuple[int, int]:
@@ -27,21 +30,32 @@ def _token_limits() -> tuple[int, int]:
 
 
 def _ensure_usage_table() -> None:
-    with _conn() as c:
-        c.execute("""CREATE TABLE IF NOT EXISTS llm_token_usage (
-            id BIGSERIAL PRIMARY KEY, provider VARCHAR(32) NOT NULL, model VARCHAR(128) NOT NULL,
-            purpose VARCHAR(64) NOT NULL, prompt_tokens INTEGER NOT NULL DEFAULT 0,
-            completion_tokens INTEGER NOT NULL DEFAULT 0, total_tokens INTEGER NOT NULL DEFAULT 0,
-            created_at VARCHAR(64) NOT NULL
-        )""")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_llm_usage_created ON llm_token_usage(created_at)")
+    global _usage_table_ready
+    if _usage_table_ready:
+        return
+    with _usage_table_lock:
+        if _usage_table_ready:
+            return
+        with _conn() as c:
+            c.execute("""CREATE TABLE IF NOT EXISTS llm_token_usage (
+                id BIGSERIAL PRIMARY KEY, provider VARCHAR(32) NOT NULL, model VARCHAR(128) NOT NULL,
+                purpose VARCHAR(64) NOT NULL, prompt_tokens INTEGER NOT NULL DEFAULT 0,
+                completion_tokens INTEGER NOT NULL DEFAULT 0, total_tokens INTEGER NOT NULL DEFAULT 0,
+                created_at VARCHAR(64) NOT NULL
+            )""")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_llm_usage_created ON llm_token_usage(created_at)")
+        _usage_table_ready = True
 
 
 def llm_token_budget_status() -> dict[str, Any]:
-    _ensure_usage_table(); per_request, daily = _token_limits(); day = datetime.now().strftime("%Y-%m-%d")
-    with _conn() as c:
-        row = c.execute("""SELECT COALESCE(SUM(total_tokens),0) used,COUNT(*) requests
-            FROM llm_token_usage WHERE created_at>=? AND created_at<?""", (day, f"{day}T23:59:59.999999")).fetchone()
+    per_request, daily = _token_limits(); day = datetime.now().strftime("%Y-%m-%d")
+    try:
+        _ensure_usage_table()
+        with _conn() as c:
+            row = c.execute("""SELECT COALESCE(SUM(total_tokens),0) used,COUNT(*) requests
+                FROM llm_token_usage WHERE created_at>=? AND created_at<?""", (day, f"{day}T23:59:59.999999")).fetchone()
+    except Exception as exc:  # noqa: BLE001 - research-only status must degrade safely
+        return degraded_read("llm_token_budget", exc, date=day, per_request_limit=per_request, daily_budget=daily)
     used = int(dict(row).get("used") or 0); requests = int(dict(row).get("requests") or 0)
     return {"ok": True, "date": day, "used_tokens": used, "daily_budget": daily,
         "remaining_tokens": max(0,daily-used), "per_request_limit": per_request, "requests": requests,
@@ -63,7 +77,10 @@ def _call_deepseek_json_unlocked(*, system: str, user: str, purpose: str) -> tup
     if len(user) > max_input_chars:
         user = user[:max_input_chars] + "\n[输入已按Token预算截断]"
     estimated_prompt = max(1,(len(system)+len(user)+3)//4)
-    budget = llm_token_budget_status(); per_request = int(budget["per_request_limit"])
+    budget = llm_token_budget_status()
+    if not budget.get("ok"):
+        raise RuntimeError("llm_token_budget_unavailable")
+    per_request = int(budget["per_request_limit"])
     allowed = min(per_request, int(budget["remaining_tokens"])-estimated_prompt)
     if allowed < 200: raise RuntimeError("llm_token_budget_exhausted")
     base_url = get_env_value("DEEPSEEK_BASE_URL", "https://api.deepseek.com").rstrip("/")

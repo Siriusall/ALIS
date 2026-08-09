@@ -22,6 +22,7 @@ from app.api.state import (
 )
 from app.core.exchange_groups import normalize_exchange_group
 from app.core.a_share_fees import sell_cost_breakdown
+from app.core.read_only_diagnostics import degraded_read
 from app.db.store import (
     append_operations_to_execution,
     create_execution,
@@ -35,6 +36,7 @@ from app.db.store import (
     get_positions,
     get_strategy,
     list_operations,
+    list_operations_for_execution_ids,
     list_recent_quant_run_task_records,
     list_quant_run_task_records,
     list_quant_run_tasks,
@@ -325,8 +327,7 @@ def quant_run_curve(limit: int = 250, benchmark: str = "000300", task_id: int | 
     if task_id is not None:
         task_runs = list_quant_run_task_records(task_id, limit=5000)
         exec_ids = [int(x["execution_id"]) for x in task_runs if x.get("execution_id") is not None]
-        for eid in exec_ids:
-            ops.extend(list_operations(execution_id=eid, limit=5000))
+        ops = list_operations_for_execution_ids(exec_ids, limit_per_execution=5000)
     else:
         ops = list_operations(execution_id=None, limit=5000)
     if not ops:
@@ -769,39 +770,44 @@ def quant_run_task_create(req: QuantTaskCreateRequest) -> dict:
 
 @router.get("/quant-runs/ledger-summary")
 def quant_run_ledger_summary() -> dict:
-    from app.services.position_valuation import point_in_time_position_market_series
+    try:
+        from app.services.position_valuation import build_position_market_series_cache
 
-    cash_balance = float(get_account_balance() or 0)
-    baseline = float(get_account_baseline() or 0)
-    positions = get_positions()
-    latest_trade_dates = list_consolidated_trade_dates()
-    latest_date = latest_trade_dates[-1] if latest_trade_dates else datetime.now().astimezone().date().isoformat()
-    ds = BacktestDataSource()
-    market_value = 0.0
-    for p in positions:
-        sym = str(p.get("symbol") or "").strip()
-        qty = int(p.get("quantity") or 0)
-        if not sym or qty <= 0:
-            continue
-        valuation = point_in_time_position_market_series(
-            symbol=sym,
+        cash_balance = float(get_account_balance() or 0)
+        baseline = float(get_account_baseline() or 0)
+        positions = get_positions()
+        latest_trade_dates = list_consolidated_trade_dates()
+        latest_date = latest_trade_dates[-1] if latest_trade_dates else datetime.now().astimezone().date().isoformat()
+        valuation_cache = build_position_market_series_cache(
+            positions,
             as_of=latest_date,
-            fallback_price=_safe_float(p.get("price")),
-            data_source=ds,
         )
-        px = _safe_float(valuation.get("price"))
-        market_value += px * qty
-    market_value = round(market_value, 2)
-    total_equity = round(cash_balance + market_value, 2)
-    equity_delta = round(total_equity - baseline, 2)
-    return {
-        "cash_balance": round(cash_balance, 2),
-        "position_market_value": market_value,
-        "total_equity": total_equity,
-        "equity_delta": equity_delta,
-        "position_count": len(positions),
-        "valuation_date": latest_date,
-    }
+        market_value = 0.0
+        for p in positions:
+            sym = str(p.get("symbol") or "").strip()
+            qty = int(p.get("quantity") or 0)
+            if not sym or qty <= 0:
+                continue
+            valuation = valuation_cache.get(sym) or {
+                "price": _safe_float(p.get("price")),
+            }
+            px = _safe_float(valuation.get("price"))
+            market_value += px * qty
+        market_value = round(market_value, 2)
+        total_equity = round(cash_balance + market_value, 2)
+        equity_delta = round(total_equity - baseline, 2)
+        return {
+            "ok": True,
+            "status": "ready",
+            "cash_balance": round(cash_balance, 2),
+            "position_market_value": market_value,
+            "total_equity": total_equity,
+            "equity_delta": equity_delta,
+            "position_count": len(positions),
+            "valuation_date": latest_date,
+        }
+    except Exception as exc:  # noqa: BLE001 - read-only summary must not become a 500
+        return degraded_read("ledger_summary", exc, items=[], count=0)
 
 
 @router.get("/quant-runs/simulation-ledger")
@@ -809,7 +815,10 @@ def quant_run_simulation_ledger(
     execution_id: int | None = Query(None, ge=1),
     limit: int = Query(20, ge=1, le=100),
 ) -> dict:
-    return build_simulation_ledger(limit=limit, execution_id=execution_id)
+    try:
+        return build_simulation_ledger(limit=limit, execution_id=execution_id)
+    except Exception as exc:  # noqa: BLE001 - optional ledger detail must degrade safely
+        return degraded_read("simulation_ledger", exc, items=[], count=0)
 
 
 def build_quant_run_performance(
@@ -842,9 +851,10 @@ def build_quant_run_performance(
         previous_point = point
     task_runs = list_quant_run_task_records(task_id, limit=2000) if task_id is not None else []
     if task_id is not None:
-        operations = []
-        for execution_id in {int(x["execution_id"]) for x in task_runs if x.get("execution_id") is not None}:
-            operations.extend(list_operations(execution_id=execution_id, limit=5000))
+        operations = list_operations_for_execution_ids(
+            {int(x["execution_id"]) for x in task_runs if x.get("execution_id") is not None},
+            limit_per_execution=5000,
+        )
     else:
         operations = list_operations(execution_id=None, limit=5000)
     operations.sort(key=lambda item: (str(item.get("at") or ""), int(item.get("id") or 0)))
@@ -1130,24 +1140,27 @@ def quant_run_status() -> dict:
 
 
 @router.get("/quant-runs/recent")
-def quant_run_recent(limit: int = 10) -> dict:
-    task_rows = list_recent_quant_run_task_records(limit=limit)
-    if task_rows:
-        return {
-            "items": [
-                {
-                    "at": str(x.get("created_at") or ""),
-                    "signal_date": str(x.get("signal_date") or ""),
-                    "execute_date": str(x.get("execute_date") or ""),
-                    "sold_count": int(x.get("sold_count") or 0),
-                    "bought_count": int(x.get("bought_count") or 0),
-                    "total_buy_cost": float(x.get("total_buy_cost") or 0),
-                    "message": str(x.get("message") or ""),
-                }
-                for x in task_rows
-            ]
-        }
-    return {"items": get_quant_run_records(limit=limit)}
+def quant_run_recent(limit: int = Query(10, ge=1, le=100)) -> dict:
+    try:
+        task_rows = list_recent_quant_run_task_records(limit=limit)
+        if task_rows:
+            return {
+                "items": [
+                    {
+                        "at": str(x.get("created_at") or ""),
+                        "signal_date": str(x.get("signal_date") or ""),
+                        "execute_date": str(x.get("execute_date") or ""),
+                        "sold_count": int(x.get("sold_count") or 0),
+                        "bought_count": int(x.get("bought_count") or 0),
+                        "total_buy_cost": float(x.get("total_buy_cost") or 0),
+                        "message": str(x.get("message") or ""),
+                    }
+                    for x in task_rows
+                ]
+            }
+        return {"items": get_quant_run_records(limit=limit)}
+    except Exception as exc:  # noqa: BLE001 - optional quant evidence must degrade safely
+        return degraded_read("quant_recent", exc, items=[])
 
 
 @router.post("/quant-runs/start")

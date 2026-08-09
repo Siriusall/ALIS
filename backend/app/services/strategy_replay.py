@@ -22,7 +22,7 @@ from app.services.model_signal_fusion import MODEL_KEYS, apply_model_signals
 from app.services.hsmm_shadow import infer_hsmm_state_as_of
 from app.services.factor_platform import compute_bound_factor
 from app.services.strategy_config import (
-    get_strategy_factor_names,
+    get_replay_required_factor_names,
     get_strategy_expert_route,
     get_strategy_score_for_market_state,
     parse_strategy_content,
@@ -513,13 +513,11 @@ def run_strategy_replay(
     hsmm_binding = replay_market_state_binding.get("hsmm_shadow")
     if production_market_state_model == "market_regime_hsmm_v1" and not isinstance(hsmm_binding, dict):
         raise ValueError("HSMM 市场状态候选缺少冻结版本绑定")
-    required_factors = get_strategy_factor_names(raw_content, strategy.get("type", "formula"))
-    required_factors.update({"momentum_20", "momentum_60", "volatility_20"})
-    if float(config.universe.get("exclude_smallest_float_mv_pct") or 0.0) > 0:
-        required_factors.add("float_mv")
-    for item in config.filters:
-        if item.get("factor"):
-            required_factors.add(str(item["factor"]))
+    required_factors = get_replay_required_factor_names(
+        raw_content,
+        strategy.get("type", "formula"),
+        model_bindings=replay_model_bindings,
+    )
     if explicit_factor_bindings:
         missing_bindings = sorted(
             factor for factor in required_factors

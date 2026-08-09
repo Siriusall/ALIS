@@ -586,6 +586,7 @@ def materialize_announcement_manual_review_queue(*, target_size: int = 320) -> d
 def announcement_manual_review_queue_status(
     *,
     include_items: bool = False,
+    include_benchmark: bool = True,
     limit: int = 50,
 ) -> dict[str, Any]:
     cap = max(1, min(int(limit), 500))
@@ -613,9 +614,14 @@ def announcement_manual_review_queue_status(
         "reviewed": reviewed,
         "pending": len(rows) - reviewed,
         "strata": strata,
-        "manual_gold": announcement_label_benchmark(),
         "policy": "predictions_are_sampling_hints_only_and_never_become_gold_without_independent_review",
     }
+    # The research-assets audit already computes this benchmark once.  Keep
+    # the historical default for callers that need a standalone queue report,
+    # but allow aggregate readers to avoid opening a second connection and
+    # repeating the same join.
+    if include_benchmark:
+        result["manual_gold"] = announcement_label_benchmark()
     if include_items:
         result["items"] = rows[:cap]
     return result

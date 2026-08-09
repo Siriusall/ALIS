@@ -333,15 +333,16 @@ def materialize_formal_performance_reports() -> dict[str, Any]:
 
 def list_performance_reports(*, period_type: str | None = None, limit: int = 12) -> dict[str, Any]:
     """List performance reports with validation."""
+    columns = "id,task_id,period_type,scope_key,period,payload_json,created_at"
     with business_conn() as c:
         if period_type:
             rows = [dict(row) for row in c.execute(
-                "SELECT * FROM quant_performance_reports WHERE period_type=? ORDER BY period DESC LIMIT ?",
+                f"SELECT {columns} FROM quant_performance_reports WHERE period_type=? ORDER BY period DESC,id DESC LIMIT ?",
                 (period_type, limit)
             ).fetchall()]
         else:
             rows = [dict(row) for row in c.execute(
-                "SELECT * FROM quant_performance_reports ORDER BY period DESC LIMIT ?",
+                f"SELECT {columns} FROM quant_performance_reports ORDER BY period DESC,id DESC LIMIT ?",
                 (limit,)
             ).fetchall()]
 

@@ -13,15 +13,17 @@ def evaluate_core_pool_eligibility(
     *,
     as_of_time: str | None = None,
     prepared_thesis: dict[str, Any] | None = None,
+    prepared_research: dict[str, Any] | None = None,
+    prepared_valuation: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Evaluate all plan-defined evidence gates against one authoritative snapshot."""
     normalized = str(ts_code).strip().upper()
-    research = build_stock_research(normalized, as_of_time=as_of_time)
-    valuation = build_valuation_state(normalized, as_of_time=as_of_time)
+    research = prepared_research if isinstance(prepared_research, dict) else build_stock_research(normalized, as_of_time=as_of_time)
+    valuation = prepared_valuation if isinstance(prepared_valuation, dict) else build_valuation_state(normalized, as_of_time=as_of_time)
     theses = (
         [prepared_thesis]
         if isinstance(prepared_thesis, dict) and prepared_thesis
-        else list_theses(ts_code=normalized, limit=20)
+        else list_theses(ts_code=normalized, limit=20, include_hypotheses=False)
     )
     active_theses = [item for item in theses if item.get("derived_status") not in {"invalidated", "failed", "draft"}]
     financial_fields = financial_research_completeness(normalized, period_limit=5, as_of_time=as_of_time)
@@ -67,6 +69,34 @@ def evaluate_core_pool_eligibility(
         },
         "thesis_count": len(active_theses),
         "thesis_source": "prepared_point_in_time" if prepared_thesis else "persisted_compatibility",
+    }
+
+
+def build_console_stock_evidence(ts_code: str) -> dict[str, Any]:
+    """Build the default research-page stock panel from one authoritative read."""
+    normalized = str(ts_code).strip().upper()
+    research = build_stock_research(normalized)
+    linked_states = research.get("linked_states") or {}
+    expectation = linked_states.get("expectation") or {}
+    valuation = linked_states.get("valuation") or {}
+    eligibility = evaluate_core_pool_eligibility(
+        normalized,
+        prepared_research=research,
+        prepared_valuation=valuation,
+    )
+    # Eligibility already evaluates the same point-in-time financial contract.
+    # Reuse that evidence instead of issuing a second database read for the
+    # research console's summary panel.
+    financial_fields = eligibility.get("financial_field_completeness") or {}
+    return {
+        "ok": bool(research.get("ok")),
+        "ts_code": normalized,
+        "company": research,
+        "expectations": expectation,
+        "valuation": valuation,
+        "eligibility": eligibility,
+        "financialCompleteness": financial_fields,
+        "method": "single_authoritative_stock_read_v1",
     }
 
 

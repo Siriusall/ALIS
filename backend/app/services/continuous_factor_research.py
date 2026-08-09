@@ -36,7 +36,8 @@ QUICK_SCREEN_TARGET = 24
 CONFIRMATION_ELITE_COUNT = 3
 CONFIRMATION_FOLD_SESSIONS = 30
 CONFIRMATION_FOLD_COUNT = 3
-MAX_REPLAY_SECONDS = 900
+LOW_MEMORY_WORKER = str(os.getenv("ALIS_WORKER_PROFILE", "")).lower() in {"2gb", "low_memory", "low-memory"}
+MAX_REPLAY_SECONDS = max(120, min(int(os.getenv("ALIS_RESEARCH_MAX_REPLAY_SECONDS", "300" if LOW_MEMORY_WORKER else "900")), 3600))
 MIN_FACTOR_COMBINATION_SIZE = 3
 MAX_FACTOR_COMBINATION_SIZE = 8
 EXPLORATION_FACTOR_SET_SIMILARITY_LIMIT = 0.72
@@ -2235,7 +2236,7 @@ def run_continuous_factor_research_cycle(
     }
 
 
-def continuous_factor_research_status() -> dict[str, Any]:
+def continuous_factor_research_status(*, compact: bool = False, console: bool = False) -> dict[str, Any]:
     ensure_continuous_research_tables()
     with _conn() as conn:
         snapshot_row = conn.execute(
@@ -2252,6 +2253,95 @@ def continuous_factor_research_status() -> dict[str, Any]:
     snapshot = dict(snapshot_row)
     snapshot["research_windows"] = _loads(snapshot.pop("research_windows_json", "[]"), [])
     snapshot["contract"] = _loads(snapshot.pop("contract_json", "{}"), {})
+    if console:
+        # The database snapshot also carries the full factor and research
+        # contract payloads. The console only needs identity, cutoff and the
+        # small summary fields below; detailed contracts remain available to
+        # their dedicated read endpoints.
+        snapshot = {
+            key: snapshot.get(key)
+            for key in ("snapshot_id", "data_as_of", "factor_count", "created_at", "schema_version")
+            if snapshot.get(key) is not None
+        }
+        with _conn() as conn:
+            counts = conn.execute(
+                """SELECT COUNT(*) AS experiment_count,
+                          SUM(CASE WHEN research_stage='quick_screen' AND status='completed' THEN 1 ELSE 0 END) AS quick_completed,
+                          SUM(CASE WHEN research_stage='confirmation' AND status='completed' THEN 1 ELSE 0 END) AS confirmation_completed,
+                          SUM(CASE WHEN status='running' THEN 1 ELSE 0 END) AS running_count
+                     FROM factor_combination_experiments
+                    WHERE snapshot_id=?""",
+                (str(snapshot.get("snapshot_id") or ""),),
+            ).fetchone()
+            cluster_rows = [dict(row) for row in conn.execute(
+                """SELECT cluster_id,representative_experiment_id,member_count,
+                          factor_centroid_json,behavior_centroid_json,updated_at
+                     FROM factor_research_clusters
+                    WHERE snapshot_id=?
+                    ORDER BY updated_at DESC,representative_experiment_id
+                    LIMIT 100""",
+                (str(snapshot.get("snapshot_id") or ""),),
+            ).fetchall()]
+        summary = dict(counts or {})
+        quick_completed = int(summary.get("quick_completed") or 0)
+        confirmation_completed = int(summary.get("confirmation_completed") or 0)
+        clusters = []
+        for row in cluster_rows:
+            row["factor_centroid"] = _loads(row.pop("factor_centroid_json"), {})
+            row["behavior_centroid"] = _loads(row.pop("behavior_centroid_json"), {})
+            clusters.append(row)
+        return {
+            "ok": True,
+            "schema_version": RESEARCH_SCHEMA_VERSION,
+            "operating_model": "continuous_event_driven_research",
+            "status": "running" if int(summary.get("running_count") or 0) else "awaiting_new_data",
+            "console": True,
+            "deferred_sections": ["experiments", "population", "v10_raw"],
+            "current_stage": "confirmation" if quick_completed >= QUICK_SCREEN_TARGET else "quick_screen",
+            "snapshot": snapshot,
+            "experiment_count": int(summary.get("experiment_count") or 0),
+            "best_experiment": None,
+            "quick_screen_completed": quick_completed,
+            "quick_screen_target": QUICK_SCREEN_TARGET,
+            "confirmation_completed": confirmation_completed,
+            "confirmation_target": CONFIRMATION_ELITE_COUNT,
+            "experiments": [],
+            "population": [],
+            "clusters": clusters,
+        }
+    if compact:
+        with _conn() as conn:
+            counts = conn.execute(
+                """SELECT COUNT(*) AS experiment_count,
+                          SUM(CASE WHEN research_stage='quick_screen' AND status='completed' THEN 1 ELSE 0 END) AS quick_completed,
+                          SUM(CASE WHEN research_stage='confirmation' AND status='completed' THEN 1 ELSE 0 END) AS confirmation_completed,
+                          SUM(CASE WHEN status='running' THEN 1 ELSE 0 END) AS running_count
+                     FROM factor_combination_experiments
+                    WHERE snapshot_id=?""",
+                (str(snapshot.get("snapshot_id") or ""),),
+            ).fetchone()
+        summary = dict(counts or {})
+        quick_completed = int(summary.get("quick_completed") or 0)
+        confirmation_completed = int(summary.get("confirmation_completed") or 0)
+        return {
+            "ok": True,
+            "schema_version": RESEARCH_SCHEMA_VERSION,
+            "operating_model": "continuous_event_driven_research",
+            "status": "running" if int(summary.get("running_count") or 0) else "awaiting_new_data",
+            "compact": True,
+            "deferred_sections": ["experiments", "population", "clusters", "v10"],
+            "current_stage": "confirmation" if quick_completed >= QUICK_SCREEN_TARGET else "quick_screen",
+            "snapshot": snapshot,
+            "experiment_count": int(summary.get("experiment_count") or 0),
+            "best_experiment": None,
+            "quick_screen_completed": quick_completed,
+            "quick_screen_target": QUICK_SCREEN_TARGET,
+            "confirmation_completed": confirmation_completed,
+            "confirmation_target": CONFIRMATION_ELITE_COUNT,
+            "experiments": [],
+            "population": [],
+            "clusters": [],
+        }
     experiments = _experiment_rows(str(snapshot["snapshot_id"]))
     population = refresh_research_population(str(snapshot["snapshot_id"]))
     clusters = refresh_research_clusters(str(snapshot["snapshot_id"]))

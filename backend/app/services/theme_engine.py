@@ -367,8 +367,18 @@ def materialize_theme_snapshot_history(*, end_date: str = "", target_sessions: i
     }
 
 
-def list_themes(*, as_of_time: str | None = None, promotable_only: bool = False, limit: int = 100) -> dict[str, Any]:
+def list_themes(
+    *,
+    as_of_time: str | None = None,
+    promotable_only: bool = False,
+    limit: int = 100,
+    include_companies: bool = True,
+    compact: bool = False,
+    include_company_counts: bool | None = None,
+) -> dict[str, Any]:
     cutoff = str(as_of_time or "")[:10].replace("-", "")
+    if include_company_counts is None:
+        include_company_counts = bool(compact)
     with _conn() as c:
         clauses = []
         params: list[Any] = []
@@ -383,17 +393,68 @@ def list_themes(*, as_of_time: str | None = None, promotable_only: bool = False,
                    FROM dc_theme_snapshot s {where}
                ) ranked WHERE rn=1 ORDER BY promotable DESC,score DESC LIMIT ?""", tuple(params + [max(1, min(int(limit), 500))]),
         ).fetchall()]
+        company_counts: dict[tuple[str, str], int] = {}
+        if rows and include_company_counts:
+            count_where = " OR ".join("(as_of_date=? AND theme_code=?)" for _ in rows)
+            count_params = tuple(value for row in rows for value in (row.get("as_of_date"), row.get("theme_code")))
+            company_counts = {
+                (str(item.get("as_of_date") or ""), str(item.get("theme_code") or "")): int(item.get("company_count") or 0)
+                for item in c.execute(
+                    f"SELECT as_of_date,theme_code,COUNT(*) company_count FROM dc_theme_company_mapping WHERE {count_where} GROUP BY as_of_date,theme_code",
+                    count_params,
+                ).fetchall()
+            }
         for row in rows:
             row["payload"] = json.loads(row.pop("payload_json") or "{}")
-            mappings = [dict(item) for item in c.execute(
-                """SELECT ts_code,exposure_score,evidence_json FROM dc_theme_company_mapping
-                   WHERE as_of_date=? AND theme_code=? ORDER BY exposure_score DESC LIMIT 50""",
-                (row["as_of_date"], row["theme_code"]),
-            ).fetchall()]
-            for mapping in mappings:
-                mapping["evidence"] = json.loads(mapping.pop("evidence_json") or "{}")
-            row["companies"] = mappings
+            row["company_count"] = company_counts.get(
+                (str(row.get("as_of_date") or ""), str(row.get("theme_code") or "")),
+                0,
+            )
+            if compact:
+                payload = row["payload"] if isinstance(row["payload"], dict) else {}
+                row["payload"] = {"knowledge_graph": payload.get("knowledge_graph") or {}}
+            mappings = []
+            if include_companies:
+                mappings = [dict(item) for item in c.execute(
+                    """SELECT ts_code,exposure_score,evidence_json FROM dc_theme_company_mapping
+                       WHERE as_of_date=? AND theme_code=? ORDER BY exposure_score DESC LIMIT 50""",
+                    (row["as_of_date"], row["theme_code"]),
+                ).fetchall()]
+                for mapping in mappings:
+                    mapping["evidence"] = json.loads(mapping.pop("evidence_json") or "{}")
+            if include_companies:
+                row["companies"] = mappings
     return {"ok": True, "items": rows, "count": len(rows), "as_of_time": as_of_time}
+
+
+def get_theme(theme_code: str, *, as_of_date: str = "") -> dict[str, Any] | None:
+    """Return one theme snapshot with its full company evidence on demand."""
+    code = str(theme_code or "").strip()
+    cutoff = str(as_of_date or "")[:10].replace("-", "")
+    with _conn() as c:
+        if cutoff:
+            row = c.execute(
+                "SELECT * FROM dc_theme_snapshot WHERE theme_code=? AND as_of_date<=? ORDER BY as_of_date DESC LIMIT 1",
+                (code, cutoff),
+            ).fetchone()
+        else:
+            row = c.execute(
+                "SELECT * FROM dc_theme_snapshot WHERE theme_code=? ORDER BY as_of_date DESC LIMIT 1",
+                (code,),
+            ).fetchone()
+        if not row:
+            return None
+        item = dict(row)
+        item["payload"] = json.loads(item.pop("payload_json") or "{}")
+        mappings = [dict(mapping) for mapping in c.execute(
+            "SELECT ts_code,exposure_score,evidence_json FROM dc_theme_company_mapping WHERE as_of_date=? AND theme_code=? ORDER BY exposure_score DESC LIMIT 200",
+            (item.get("as_of_date"), code),
+        ).fetchall()]
+    for mapping in mappings:
+        mapping["evidence"] = json.loads(mapping.pop("evidence_json") or "{}")
+    item["company_count"] = len(mappings)
+    item["companies"] = mappings
+    return item
 
 
 def best_theme_for_stock(ts_code: str, *, as_of_time: str | None = None) -> dict[str, Any] | None:

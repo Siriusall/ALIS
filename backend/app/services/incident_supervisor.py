@@ -94,11 +94,38 @@ def _llm_data_operations_resolution(step: dict[str, Any]) -> tuple[str, dict[str
     }
 
 
+def _transient_read_failure(step: dict[str, Any]) -> str:
+    """Return a stable retry signature for a failed optional DB read."""
+    result = _result(step)
+    health = step.get("health") if isinstance(step.get("health"), dict) else {}
+    text = " ".join(
+        str(value or "")
+        for value in (
+            step.get("error"),
+            health.get("reason"),
+            result.get("error"),
+            result.get("reason"),
+        )
+    ).lower()
+    if "canceling statement" in text or "querycanceled" in text or "statement timeout" in text or "timeout" in text:
+        return "database_query_timeout"
+    if "connection" in text or "could not connect" in text or "server closed" in text:
+        return "database_unavailable"
+    return ""
+
+
 def _resolution(step: dict[str, Any], steps: list[dict[str, Any]]) -> tuple[str, dict[str, Any]]:
     name = str(step.get("name") or "")
     if name == "sealed_holdout_data_gate":
         return _sealed_holdout_resolution(step, steps)
     if name == "research_data_assets":
+        transient = _transient_read_failure(step)
+        if transient:
+            return "waiting_condition", {
+                "waiting_for": "研究数据资产只读查询恢复或完成下一次有界重试",
+                "failure_signature": transient,
+                "retry_policy": "只读查询按有限退避重试；连续失败时继续保留降级证据，不把空结果当作研究缺口",
+            }
         gaps = _result(step).get("gaps")
         return "internal_fault", {
             "failure_signature": "research_capability_not_integrated",

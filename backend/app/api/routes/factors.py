@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Query
 
 from fastapi import HTTPException
 
@@ -19,6 +19,7 @@ from app.services.factor_strategy_evolution import (
 from app.services.continuous_factor_research import continuous_factor_research_status
 from app.services.continuous_strategy_research import (
     continuous_strategy_research_status,
+    strategy_research_analytics_console,
     strategy_research_archive_status,
     strategy_research_analytics,
     strategy_research_expert_history,
@@ -28,6 +29,7 @@ from app.services.continuous_strategy_research import (
     strategy_research_enabled,
 )
 from app.services.evolution_orchestrator import create_evolution_task
+from app.core.read_only_diagnostics import degraded_read
 
 router = APIRouter()
 
@@ -75,38 +77,80 @@ def factor_strategy_evolution() -> dict:
 
 @router.get("/factors/strategy-lineage")
 def factor_strategy_lineage() -> dict:
-    return factor_strategy_lineage_status()
+    try:
+        return factor_strategy_lineage_status()
+    except Exception as exc:  # noqa: BLE001 - optional lineage evidence must degrade safely
+        return degraded_read("factor_strategy_lineage", exc, combinations=[], strategy_links=[])
 
 
 @router.get("/factors/research/status")
-def factor_research_status() -> dict:
-    legacy = continuous_factor_research_status()
-    return {**legacy, "v10": continuous_strategy_research_status()}
+def factor_research_status(compact: bool = Query(default=False), console: bool = Query(default=False)) -> dict:
+    try:
+        legacy = continuous_factor_research_status(compact=compact, console=console)
+        if compact:
+            return {
+                **legacy,
+                "v10": {
+                    "status": "deferred",
+                    "compact": True,
+                    "deferred": True,
+                    "reason": "模型治理首屏只需要当前研究快照与合同摘要",
+                },
+            }
+        return {
+            **legacy,
+            "v10": continuous_strategy_research_status(console=console),
+        }
+    except Exception as exc:  # noqa: BLE001 - research diagnostics must degrade safely
+        return degraded_read("factor_research_status", exc, v10={}, items=[])
 
 
 @router.get("/factors/research/analytics")
 def factor_research_analytics() -> dict:
-    return strategy_research_analytics()
+    try:
+        return strategy_research_analytics()
+    except Exception as exc:  # noqa: BLE001 - research diagnostics must degrade safely
+        return degraded_read("factor_research_analytics", exc, events=[], environments=[], factor_combinations=[])
+
+
+@router.get("/factors/research/analytics/console")
+def factor_research_analytics_console() -> dict:
+    try:
+        return strategy_research_analytics_console()
+    except Exception as exc:  # noqa: BLE001 - Wave diagnostics must degrade safely
+        return degraded_read("factor_research_analytics_console", exc, waves=[], expert_governance=[], environment_similarity=[])
 
 
 @router.get("/factors/research/analytics/summary")
 def factor_research_analytics_summary() -> dict:
-    return strategy_research_analytics()
+    try:
+        return strategy_research_analytics()
+    except Exception as exc:  # noqa: BLE001 - research diagnostics must degrade safely
+        return degraded_read("factor_research_analytics_summary", exc, events=[], environments=[], factor_combinations=[])
 
 
 @router.get("/factors/research/analytics/factors")
 def factor_research_analytics_factors(limit: int = 200) -> dict:
-    return strategy_research_factor_analytics(limit=limit)
+    try:
+        return strategy_research_factor_analytics(limit=limit)
+    except Exception as exc:  # noqa: BLE001 - research diagnostics must degrade safely
+        return degraded_read("factor_research_factor_analytics", exc, items=[])
 
 
 @router.get("/factors/research/analytics/factors/{factor_key}")
 def factor_research_analytics_factor(factor_key: str, limit: int = 200) -> dict:
-    return strategy_research_factor_analytics(factor_key=factor_key, limit=limit)
+    try:
+        return strategy_research_factor_analytics(factor_key=factor_key, limit=limit)
+    except Exception as exc:  # noqa: BLE001 - research diagnostics must degrade safely
+        return degraded_read("factor_research_factor", exc, factor_key=factor_key, items=[])
 
 
 @router.get("/factors/research/analytics/timeseries")
 def factor_research_analytics_timeseries(limit: int = 500) -> dict:
-    return strategy_research_timeseries(limit=limit)
+    try:
+        return strategy_research_timeseries(limit=limit)
+    except Exception as exc:  # noqa: BLE001 - research diagnostics must degrade safely
+        return degraded_read("factor_research_timeseries", exc, items=[])
 
 
 @router.get("/factors/research/analytics/waves/{wave_id}")
@@ -119,22 +163,31 @@ def factor_research_analytics_wave(wave_id: str) -> dict:
 
 @router.get("/factors/research/analytics/experts/history")
 def factor_research_analytics_experts(limit: int = 500) -> dict:
-    return strategy_research_expert_history(limit=limit)
+    try:
+        return strategy_research_expert_history(limit=limit)
+    except Exception as exc:  # noqa: BLE001 - research diagnostics must degrade safely
+        return degraded_read("factor_research_experts", exc, items=[])
 
 
 @router.get("/factors/research/analytics/environment-similarity")
 def factor_research_analytics_environment_similarity() -> dict:
-    analytics = strategy_research_analytics()
-    return {
-        "ok": True,
-        "schema_version": "alis_environment_similarity_v1",
-        "items": analytics.get("environment_similarity") or [],
-    }
+    try:
+        analytics = strategy_research_analytics()
+        return {
+            "ok": True,
+            "schema_version": "alis_environment_similarity_v1",
+            "items": analytics.get("environment_similarity") or [],
+        }
+    except Exception as exc:  # noqa: BLE001 - research diagnostics must degrade safely
+        return degraded_read("factor_research_environment_similarity", exc, items=[])
 
 
 @router.get("/factors/research/analytics/archive")
 def factor_research_analytics_archive() -> dict:
-    return strategy_research_archive_status()
+    try:
+        return strategy_research_archive_status()
+    except Exception as exc:  # noqa: BLE001 - research diagnostics must degrade safely
+        return degraded_read("factor_research_archive", exc, items=[])
 
 
 @router.post("/factors/research/start")

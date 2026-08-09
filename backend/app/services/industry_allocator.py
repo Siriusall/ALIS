@@ -83,9 +83,20 @@ def build_industry_allocation(
 ) -> dict[str, Any]:
     """Rank industries and allocate the equity sleeve before stock weighting."""
     score_by_symbol = {_symbol(key): float(value or 0) for key, value in (symbol_scores or {}).items()}
-    by_symbol, candidates_by_industry = _industry_members(symbols)
+    # A page-level allocation over all industries does not need the stock
+    # membership map. Only production calls with an explicit symbol universe
+    # need that table, so the read-only console path avoids scanning it.
+    by_symbol, candidates_by_industry = _industry_members(symbols) if symbols else ({}, {})
     research = list_industries(as_of_time=as_of_time).get("items") or []
-    themes = list_themes(as_of_time=as_of_time, limit=300).get("items") or []
+    # Allocation only needs the narrative score and lifecycle. Company mapping
+    # evidence is already exposed by the research page's themes endpoint.
+    themes = list_themes(
+        as_of_time=as_of_time,
+        limit=300,
+        include_companies=False,
+        compact=True,
+        include_company_counts=False,
+    ).get("items") or []
     narrative_by_industry = {
         str((item.get("payload") or {}).get("knowledge_graph", {}).get("industry") or str(item.get("theme_code") or "").removeprefix("industry:")): item
         for item in themes

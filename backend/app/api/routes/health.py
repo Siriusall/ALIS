@@ -2,21 +2,30 @@
 
 from __future__ import annotations
 
+import copy
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
+import threading
+import time
 from typing import Any, Callable
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Query
 from fastapi.responses import JSONResponse
 
 from app.services.data_health import assess_latest_decision_data_health
 from app.services.profit_loop import (
     build_execution_chain_slo,
+    count_pending_daily_rebalance_execution_inputs,
     get_latest_daily_rebalance_plan,
     list_pending_daily_rebalance_execution_inputs,
 )
 from app.services.simulation_ledger_audit import audit_simulation_ledger
 
 router = APIRouter()
+
+_READINESS_CACHE_TTL_SECONDS = 8.0
+_readiness_cache_lock = threading.Lock()
+_readiness_cache: dict[str, tuple[float, int, dict[str, Any]]] = {}
 
 
 def _read_gate(key: str, label: str, reader: Callable[[], dict[str, Any]]) -> dict[str, Any]:
@@ -39,27 +48,67 @@ def _today_ymd() -> str:
 
 
 @router.get("/trading-ready")
-def trading_readiness() -> JSONResponse:
+def trading_readiness(detail: str = Query("full", pattern="^(full|compact)$")) -> JSONResponse:
     """Aggregate the read-only gates that decide whether automation may act."""
+    global _readiness_cache
+    cache_key = str(detail or "full").strip().lower()
+    now = time.monotonic()
+    with _readiness_cache_lock:
+        cached = _readiness_cache.get(cache_key)
+    if cached and now - cached[0] < _READINESS_CACHE_TTL_SECONDS:
+        return JSONResponse(status_code=cached[1], content=copy.deepcopy(cached[2]))
+
     from app.main import _health_payload
 
     infrastructure = _health_payload()
-    gates = [
-        _read_gate("decision_data", "最新决策数据", assess_latest_decision_data_health),
-        _read_gate("ledger", "独立账本", lambda: audit_simulation_ledger(persist=False)),
-        _read_gate("execution_chain", "执行链完整性", lambda: build_execution_chain_slo(window_plans=20)),
-    ]
+    # These checks use independent short-lived connections. Running them
+    # concurrently keeps one slow diagnostic from serially blocking the
+    # whole readiness response, while the connection gate still bounds the
+    # total number of database sessions per process.
+    with ThreadPoolExecutor(max_workers=5, thread_name_prefix="trading-ready") as executor:
+        gate_futures = [
+            executor.submit(_read_gate, "decision_data", "最新决策数据", assess_latest_decision_data_health),
+            executor.submit(_read_gate, "ledger", "独立账本", lambda: audit_simulation_ledger(persist=False)),
+            executor.submit(
+                _read_gate,
+                "execution_chain",
+                "执行链完整性",
+                lambda: build_execution_chain_slo(window_plans=20, compact=cache_key == "compact"),
+            ),
+        ]
+        latest_plan_future = executor.submit(
+            _read_gate,
+            "frozen_plan",
+            "正式冻结计划",
+            lambda: get_latest_daily_rebalance_plan(compact=cache_key == "compact"),
+        )
+        pending_future = executor.submit(
+            _read_gate,
+            "pending_plans",
+            "待执行计划",
+            (
+                (lambda: {"count": count_pending_daily_rebalance_execution_inputs()})
+                if cache_key == "compact"
+                else (lambda: {"items": list_pending_daily_rebalance_execution_inputs()})
+            ),
+        )
+        gates = [future.result() for future in gate_futures]
+        latest_plan = latest_plan_future.result()
+        pending = pending_future.result()
+
     decision_gate = next(item for item in gates if item["key"] == "decision_data")
     ledger_gate = next(item for item in gates if item["key"] == "ledger")
     execution_chain_gate = next(item for item in gates if item["key"] == "execution_chain")
     decision = decision_gate["detail"]
     ledger = ledger_gate["detail"]
     execution_chain = execution_chain_gate["detail"]
-
-    latest_plan = _read_gate("frozen_plan", "正式冻结计划", lambda: get_latest_daily_rebalance_plan())
     plan = latest_plan["detail"]
-    pending = _read_gate("pending_plans", "待执行计划", lambda: {"items": list_pending_daily_rebalance_execution_inputs()})
     pending_items = (pending["detail"].get("items") or []) if pending["status"] == "ready" else []
+    pending_count = (
+        int(pending["detail"].get("count") or 0)
+        if pending["status"] == "ready" and cache_key == "compact"
+        else len(pending_items)
+    )
     today = _today_ymd()
     plan_status = str(plan.get("status") or "not_generated")
     execute_date = str(plan.get("planned_execute_date") or "").replace("-", "")[:8]
@@ -91,9 +140,16 @@ def trading_readiness() -> JSONResponse:
             item["summary"] = "独立重算与账户投影一致" if item["status"] == "ready" else "账本存在漂移或非法记录"
         else:
             status = str(detail.get("status") or "unknown")
-            stranded = bool(detail.get("metrics", {}).get("stranded_execution_count"))
-            item["status"] = "blocked" if status in {"failed", "error"} or stranded else "observing" if status == "observing" else "ready"
-            item["summary"] = "执行计划与成交绑定可审计" if item["status"] == "ready" else "样本仍在积累，不阻断当前运行" if item["status"] == "observing" else "执行链存在未解决异常"
+            current_blocking = bool(detail.get("current_blocking"))
+            item["status"] = "blocked" if current_blocking else "observing" if status in {"observing", "failed", "error"} else "ready"
+            if item["status"] == "ready":
+                item["summary"] = "执行计划与成交绑定可审计"
+            elif current_blocking:
+                item["summary"] = "执行链存在当前未解决异常"
+            elif status in {"failed", "error"}:
+                item["summary"] = "历史执行质量未达标，但当前没有卡住的执行，不阻断当前运行"
+            else:
+                item["summary"] = "样本仍在积累，不阻断当前运行"
 
     infrastructure_ready = bool(infrastructure.get("ready"))
     hard_blockers: list[str] = []
@@ -113,7 +169,7 @@ def trading_readiness() -> JSONResponse:
     if hard_blockers:
         status = "blocked"
         summary = "存在硬阻断，自动交易不得继续"
-    elif latest_plan["status"] in {"waiting", "running"} or not pending_items:
+    elif latest_plan["status"] in {"waiting", "running"} or pending_count == 0:
         status = "waiting"
         summary = "系统健康，等待下一份到期冻结计划"
     else:
@@ -164,9 +220,9 @@ def trading_readiness() -> JSONResponse:
             {
                 "key": "pending_plan",
                 "label": "待执行计划",
-                "status": "ready" if pending_items else "waiting",
-                "summary": f"{len(pending_items)} 份计划等待执行" if pending_items else "当前没有待执行计划，不视为故障",
-                "detail": {"count": len(pending_items), "items": pending_items},
+                "status": "ready" if pending_count else "waiting",
+                "summary": f"{pending_count} 份计划等待执行" if pending_count else "当前没有待执行计划，不视为故障",
+                "detail": {"count": pending_count, "items": pending_items},
             },
         ],
         "plan": plan,
@@ -178,4 +234,35 @@ def trading_readiness() -> JSONResponse:
             "blocked_status_is_fail_closed": True,
         },
     }
-    return JSONResponse(status_code=503 if status == "blocked" else 200, content=response)
+    status_code = 503 if status == "blocked" else 200
+    if cache_key == "compact":
+        response = {
+            "schema_version": response["schema_version"],
+            "detail": "compact",
+            "checked_at": response["checked_at"],
+            "status": response["status"],
+            "trading_ready": response["trading_ready"],
+            "summary": response["summary"],
+            "hard_blockers": response["hard_blockers"],
+            "today": response["today"],
+            "layers": {
+                key: {
+                    "status": value.get("status"),
+                    "detail": value.get("detail"),
+                }
+                for key, value in (response.get("layers") or {}).items()
+            },
+            "gates": [
+                {
+                    "key": item.get("key"),
+                    "label": item.get("label"),
+                    "status": item.get("status"),
+                    "summary": item.get("summary"),
+                }
+                for item in response.get("gates") or []
+            ],
+            "policy": response["policy"],
+        }
+    with _readiness_cache_lock:
+        _readiness_cache[cache_key] = (time.monotonic(), status_code, copy.deepcopy(response))
+    return JSONResponse(status_code=status_code, content=response)

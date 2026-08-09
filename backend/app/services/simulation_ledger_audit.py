@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import json
 import hashlib
+import copy
+import threading
+import time
 from datetime import datetime
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Any
@@ -10,6 +13,9 @@ from app.db.store import _conn as business_conn, get_account_baseline
 
 
 _CENT = Decimal("0.01")
+_READONLY_AUDIT_CACHE_TTL_SECONDS = 15.0
+_readonly_audit_cache_lock = threading.Lock()
+_readonly_audit_cache: tuple[float, dict[str, Any]] | None = None
 
 
 def _money(value: Any) -> Decimal:
@@ -258,6 +264,13 @@ def _ensure_table() -> None:
 
 def audit_simulation_ledger(*, persist: bool = True) -> dict[str, Any]:
     """Compare replayed ledger state with mutable account/position projections."""
+    global _readonly_audit_cache
+    if not persist:
+        now = time.monotonic()
+        with _readonly_audit_cache_lock:
+            cached = _readonly_audit_cache
+            if cached and now - cached[0] < _READONLY_AUDIT_CACHE_TTL_SECONDS:
+                return copy.deepcopy(cached[1])
     if persist:
         _ensure_table()
     with business_conn() as conn:
@@ -377,6 +390,8 @@ def audit_simulation_ledger(*, persist: bool = True) -> dict[str, Any]:
                     json.dumps(issues, ensure_ascii=False, sort_keys=True),
                 ),
             )
+    with _readonly_audit_cache_lock:
+        _readonly_audit_cache = (time.monotonic(), copy.deepcopy(result))
     return result
 
 

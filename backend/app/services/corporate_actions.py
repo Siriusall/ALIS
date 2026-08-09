@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from app.data_platform.db import _conn as data_conn
-from app.db.store import _conn as business_conn, get_positions
+from app.db.store import _conn as business_conn, get_positions, _rounded_account_balance_expression
 
 
 def _normalize_ts_code(symbol: str) -> str:
@@ -319,7 +319,7 @@ def materialize_simulation_corporate_actions(*, as_of_date: str) -> dict[str, An
                 )
                 if status == "applied" and action_type == "cash_dividend":
                     conn.execute(
-                        "UPDATE account SET balance=ROUND(balance+?,2) WHERE id=1",
+                        f"UPDATE account SET balance={_rounded_account_balance_expression(conn, 'balance+?')} WHERE id=1",
                         (cash_amount,),
                     )
                 elif status == "applied" and action_type == "stock_dividend":

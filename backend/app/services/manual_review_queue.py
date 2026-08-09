@@ -1,14 +1,19 @@
 from __future__ import annotations
 
 import json
+import threading
 from datetime import datetime
 from typing import Any
 
 from app.db.store import _conn
-from app.services.decision_store import create_review, list_decision_snapshots, list_reviews
+from app.services.decision_store import create_review, list_decision_snapshot_summaries, list_reviews
 from app.services.industry_event_engine import list_event_followups
 from app.services.market_context import market_state_model_governance
 from app.services.operations_overview import build_governance_overview
+
+_ACTION_TABLE_READY = False
+_TRIAGE_TABLE_READY = False
+_TABLE_INIT_LOCK = threading.Lock()
 
 
 def _model_release_ready_for_manual_review(latest: dict[str, Any]) -> bool:
@@ -33,25 +38,39 @@ def _model_release_ready_for_manual_review(latest: dict[str, Any]) -> bool:
 
 
 def _ensure_action_table() -> None:
-    with _conn() as c:
-        c.execute("""CREATE TABLE IF NOT EXISTS manual_review_actions (
-            id BIGSERIAL PRIMARY KEY, review_key VARCHAR(160) NOT NULL UNIQUE,
-            item_kind VARCHAR(64) NOT NULL, action VARCHAR(32) NOT NULL,
-            error_type VARCHAR(64), comment TEXT NOT NULL DEFAULT '',
-            llm_draft_json TEXT NOT NULL DEFAULT '{}', actor VARCHAR(128) NOT NULL DEFAULT '',
-            created_at VARCHAR(64) NOT NULL
-        )""")
+    global _ACTION_TABLE_READY
+    if _ACTION_TABLE_READY:
+        return
+    with _TABLE_INIT_LOCK:
+        if _ACTION_TABLE_READY:
+            return
+        with _conn() as c:
+            c.execute("""CREATE TABLE IF NOT EXISTS manual_review_actions (
+                id BIGSERIAL PRIMARY KEY, review_key VARCHAR(160) NOT NULL UNIQUE,
+                item_kind VARCHAR(64) NOT NULL, action VARCHAR(32) NOT NULL,
+                error_type VARCHAR(64), comment TEXT NOT NULL DEFAULT '',
+                llm_draft_json TEXT NOT NULL DEFAULT '{}', actor VARCHAR(128) NOT NULL DEFAULT '',
+                created_at VARCHAR(64) NOT NULL
+            )""")
+        _ACTION_TABLE_READY = True
 
 
 def _ensure_triage_table() -> None:
-    with _conn() as c:
-        c.execute("""CREATE TABLE IF NOT EXISTS manual_review_triage (
-            review_key VARCHAR(160) PRIMARY KEY, item_kind VARCHAR(64) NOT NULL,
-            status VARCHAR(32) NOT NULL, can_handle INTEGER NOT NULL DEFAULT 0,
-            confidence DOUBLE PRECISION NOT NULL DEFAULT 0, summary TEXT NOT NULL DEFAULT '',
-            escalation_reason TEXT NOT NULL DEFAULT '', draft_json TEXT NOT NULL DEFAULT '{}',
-            model VARCHAR(128) NOT NULL DEFAULT '', updated_at VARCHAR(64) NOT NULL
-        )""")
+    global _TRIAGE_TABLE_READY
+    if _TRIAGE_TABLE_READY:
+        return
+    with _TABLE_INIT_LOCK:
+        if _TRIAGE_TABLE_READY:
+            return
+        with _conn() as c:
+            c.execute("""CREATE TABLE IF NOT EXISTS manual_review_triage (
+                review_key VARCHAR(160) PRIMARY KEY, item_kind VARCHAR(64) NOT NULL,
+                status VARCHAR(32) NOT NULL, can_handle INTEGER NOT NULL DEFAULT 0,
+                confidence DOUBLE PRECISION NOT NULL DEFAULT 0, summary TEXT NOT NULL DEFAULT '',
+                escalation_reason TEXT NOT NULL DEFAULT '', draft_json TEXT NOT NULL DEFAULT '{}',
+                model VARCHAR(128) NOT NULL DEFAULT '', updated_at VARCHAR(64) NOT NULL
+            )""")
+        _TRIAGE_TABLE_READY = True
 
 
 def list_manual_review_triage() -> dict[str, dict[str, Any]]:
@@ -143,7 +162,7 @@ def build_manual_review_queue(limit: int = 200, *, human_only: bool = True) -> d
 
     reviews = list_reviews(limit=max(limit, 500))
     reviewed_ids = {int(row["decision_snapshot_id"]) for row in reviews if row.get("decision_snapshot_id")}
-    for row in list_decision_snapshots(limit=limit):
+    for row in list_decision_snapshot_summaries(limit=limit):
         decision_id = int(row.get("id") or 0)
         if not decision_id or decision_id in reviewed_ids:
             continue

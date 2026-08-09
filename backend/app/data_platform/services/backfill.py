@@ -968,41 +968,9 @@ def get_backfill_status() -> dict[str, Any]:
         if not cached.get("running") and str(cached.get("phase") or "") == "interrupted":
             cached = terminate_orphaned_backfill(reason="服务重启后原工作线程已不存在")
         _ensure_auto_resume_alive(cached)
-        if not cached.get("running") and str(cached.get("phase") or "") in {"completed", "completed_with_gaps"}:
-            # A completed state already persists the last plan summary.  The
-            # global status bar polls every few seconds; rebuilding the whole
-            # historical gap plan here turns a cheap status request into a
-            # multi-million-row scan and makes the dashboard time out.
-            summary = cached.get("plan_summary")
-            if isinstance(summary, dict):
-                return {"ok": True, **cached}
-            try:
-                plan = build_backfill_plan()
-                summary = plan.get("summary") if isinstance(plan, dict) else None
-                if isinstance(summary, dict) and int(summary.get("steps_needed") or 0) <= 0:
-                    normalized = {
-                        **cached,
-                        "running": False,
-                        "phase": "completed",
-                        "message": "全部数据补全已完成，当前无剩余缺口",
-                        "progress": 100,
-                        "plan_summary": summary,
-                        "current_step": None,
-                        "activity": None,
-                        "auto_resume": False,
-                        "can_resume": False,
-                        "resume_action": "",
-                    }
-                    if normalized != cached:
-                        with _lock:
-                            _state.clear()
-                            _state.update(normalized)
-                        set_json("alis:data-platform:backfill:state", normalized, ttl=86400)
-                    return {"ok": True, **normalized}
-            except Exception:
-                # Status must stay cheap and available; fall back to the last
-                # persisted state if plan reconstruction has a transient issue.
-                pass
+        # A completed state already persists the last plan summary. Do not
+        # rebuild the historical gap plan from a status poll: the dashboard
+        # calls this endpoint frequently and a rebuild scans large tables.
         return {"ok": True, **cached}
     with _lock:
         return {"ok": True, **_state}

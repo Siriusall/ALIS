@@ -23,6 +23,7 @@ from app.db.store import (
 )
 from app.integrations.broker_adapter import OrderRequest
 from app.services.backtest_data_source import BacktestDataSource
+from app.services.position_valuation import point_in_time_position_market_series
 from app.services.backtest_engine import _apply_filters, _apply_universe_controls, _factor_value, _score_rows
 from app.services.execution_engine import simulate_open_execution
 from app.services.factor_platform import compute_bound_factor
@@ -220,14 +221,13 @@ def _portfolio_state(
             continue
         px = _row_trade_price((execution_rows or {}).get(sym), prefer_open=True)
         if px <= 0:
-            px = float(ds.get_price_on_date(sym, valuation_date, field="close") or 0)
-        if px <= 0 and is_exchange_etf(sym):
-            try:
-                from app.services.defensive_assets import defensive_asset_bar
-                bar = defensive_asset_bar(_ts_code(sym), valuation_date)
-                px = float((bar or {}).get("close") or 0)
-            except Exception:  # noqa: BLE001
-                px = 0.0
+            valuation = point_in_time_position_market_series(
+                symbol=sym,
+                as_of=valuation_date,
+                fallback_price=float(pos.get("price") or 0),
+                data_source=ds,
+            )
+            px = float(valuation.get("price") or 0)
         if px <= 0:
             px = float(pos.get("price") or 0)
         val = round(px * qty, 2)
@@ -386,7 +386,7 @@ def _pretrade_symbol_limits(symbols: List[str], *, cutoff: str, max_single: floa
     from app.services.thesis_store import list_theses
     theses = [
         item
-        for item in list_theses(limit=500)
+        for item in list_theses(limit=500, include_hypotheses=False)
         if (not item.get("created_at") or str(item.get("created_at")) <= cutoff)
         and (not item.get("updated_at") or str(item.get("updated_at")) <= cutoff)
     ]
@@ -1055,7 +1055,7 @@ def run_for_trade_date(
         from app.services.thesis_store import list_theses as _list_theses_for_turnover
         thesis_status_by_symbol = {
             str(item.get("ts_code") or "").split(".")[0]: str(item.get("derived_status") or "")
-            for item in _list_theses_for_turnover(limit=500)
+            for item in _list_theses_for_turnover(limit=500, include_hypotheses=False)
         }
 
     # 先卖出（仅对不在目标池且满足 T+1 / hold_days 的仓位）

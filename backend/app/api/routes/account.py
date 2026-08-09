@@ -5,6 +5,8 @@ from pydantic import BaseModel, Field
 
 from app.api.state import add_log
 from app.db.store import add_account_balance, get_account_balance, get_positions, set_account_balance
+from app.services.position_valuation import build_position_market_series_cache
+from app.services.quant_run_engine import list_consolidated_trade_dates
 
 router = APIRouter()
 
@@ -28,9 +30,14 @@ class SetBalanceRequest(BaseModel):
 
 
 def _position_total_value() -> float:
-    """持仓总金额（按成本价：quantity * price）。"""
+    """持仓当前市值（使用未复权点时收盘价，不使用成本价）。"""
     positions = get_positions()
-    return sum(float(p.get("quantity", 0)) * float(p.get("price", 0)) for p in positions)
+    dates = list_consolidated_trade_dates()
+    valuation = build_position_market_series_cache(positions, as_of=dates[-1] if dates else "")
+    return sum(
+        float(p.get("quantity", 0)) * float((valuation.get(str(p.get("symbol") or "")) or {}).get("price") or p.get("price", 0))
+        for p in positions
+    )
 
 
 @router.get("/account", response_model=AccountResponse)

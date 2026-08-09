@@ -62,6 +62,10 @@ BACKTEST_SUPPORTED_FACTORS: set[str] = {
     "is_suspended",
 } | set(SPEC_BY_KEY)
 
+MODEL_REPLAY_REQUIRED_FACTORS = frozenset({
+    "momentum_20", "momentum_60", "volatility_20",
+})
+
 
 def _is_legacy_weights_only(content: Any) -> bool:
     """判断是否为旧版仅权重的 content（只有 volume/turnover/change_pct 数字键）。"""
@@ -215,6 +219,30 @@ def get_strategy_factor_names(content: Any, strategy_type: str) -> set[str]:
         if fn:
             out.add(fn)
     return out
+
+
+def get_replay_required_factor_names(
+    content: Any,
+    strategy_type: str,
+    *,
+    model_bindings: dict[str, Any] | None = None,
+) -> set[str]:
+    """Return factors consumed by the replay contract, not incidental defaults."""
+    config = parse_strategy_content(content, strategy_type)
+    required = get_strategy_factor_names(content, strategy_type)
+    expected_source = str(config.expected_return_source or "").strip()
+    if expected_source and expected_source != "ranking_score":
+        required.add(expected_source)
+    universe = config.universe if isinstance(config.universe, dict) else {}
+    if float(universe.get("exclude_smallest_float_mv_pct") or 0.0) > 0:
+        required.add("float_mv")
+    has_frozen_model = bool(
+        isinstance(model_bindings, dict)
+        and any(value not in (None, "", {}) for value in model_bindings.values())
+    )
+    if has_frozen_model:
+        required.update(MODEL_REPLAY_REQUIRED_FACTORS)
+    return required
 
 
 def get_strategy_score_for_market_state(

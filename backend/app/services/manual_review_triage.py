@@ -3,6 +3,7 @@ from __future__ import annotations
 import threading
 import os
 import time
+import logging
 from typing import Any
 
 from app.core.project_env import get_env_value
@@ -18,6 +19,7 @@ from app.services.review_learning import decision_outcomes
 _lock = threading.Lock()
 _running = False
 _scheduler_started = False
+logger = logging.getLogger("quant.manual_review_triage")
 
 
 def _retryable_llm_configuration_failure(state: dict[str, Any]) -> bool:
@@ -114,7 +116,10 @@ def start_manual_review_triage(limit: int = 100) -> bool:
 
     def worker() -> None:
         global _running
-        try: run_manual_review_triage_once(limit=limit)
+        try:
+            run_manual_review_triage_once(limit=limit)
+        except Exception as exc:  # noqa: BLE001 - transient DB/LLM faults retry on the next scheduled cycle
+            logger.warning("人工复核预审本轮未完成，将在下个周期重试: %s", str(exc)[:300])
         finally:
             with _lock: _running = False
 

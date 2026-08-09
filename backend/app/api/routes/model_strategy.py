@@ -61,6 +61,7 @@ from app.services.strategy_controller import (
     strategy_policy_replay_preview,
     strategy_controller_status,
 )
+from app.core.read_only_diagnostics import degraded_read
 
 router = APIRouter()
 
@@ -230,17 +231,26 @@ class StrategyPolicyReplayRequest(BaseModel):
 
 @router.get("/model-strategy/status")
 def model_strategy_status() -> dict:
-    return get_model_status()
+    try:
+        return get_model_status()
+    except Exception as exc:  # noqa: BLE001 - model diagnostics must degrade safely
+        return degraded_read("model_status", exc, items=[], models=[])
 
 
 @router.get("/model-strategy/plan-models")
 def model_strategy_plan_models() -> dict:
-    return model_family_status()
+    try:
+        return model_family_status()
+    except Exception as exc:  # noqa: BLE001 - model diagnostics must degrade safely
+        return degraded_read("plan_models", exc, items=[], models=[])
 
 
 @router.get("/model-strategy/plan-models/operations")
 def model_strategy_plan_model_operations() -> dict:
-    return plan_model_operations_status()
+    try:
+        return plan_model_operations_status()
+    except Exception as exc:  # noqa: BLE001 - optional model evidence must degrade safely
+        return degraded_read("plan_model_operations", exc, items=[], operations=[])
 
 
 @router.post("/model-strategy/plan-models/train")
@@ -452,12 +462,18 @@ def model_strategy_market_context(req: MarketContextRequest) -> dict:
 
 @router.get("/model-strategy/market-context/live")
 def model_strategy_live_market_context() -> dict:
-    return live_market_context()
+    try:
+        return live_market_context()
+    except Exception as exc:  # noqa: BLE001 - optional market evidence must degrade safely
+        return degraded_read("live_market_context", exc, market_state={}, observations={})
 
 
 @router.get("/model-strategy/market-context/history")
 def model_strategy_market_context_history(limit: int = 120) -> dict:
-    return market_context_history(limit=max(1, min(500, limit)))
+    try:
+        return market_context_history(limit=max(1, min(500, limit)))
+    except Exception as exc:  # noqa: BLE001 - optional market evidence must degrade safely
+        return degraded_read("market_context_history", exc, items=[], transitions=[], count=0)
 
 
 @router.post("/model-strategy/market-context/rebuild-history")
@@ -468,7 +484,10 @@ def model_strategy_rebuild_market_context_history(limit: int = 120) -> dict:
 @router.get("/model-strategy/market-context/governance")
 def model_strategy_market_context_governance() -> dict:
     """Report the production regime model and the evidence for promotion gates."""
-    return market_state_model_governance()
+    try:
+        return market_state_model_governance()
+    except Exception as exc:  # noqa: BLE001 - optional market evidence must degrade safely
+        return degraded_read("market_context_governance", exc, models=[], gates=[])
 
 
 @router.post("/model-strategy/market-context/materialize-training-history")
@@ -663,40 +682,80 @@ def model_strategy_lab() -> dict:
 
 @router.get("/model-strategy/evolution/tasks")
 def model_strategy_evolution_tasks(limit: int = 20) -> dict:
-    return {
-        "ok": True,
-        "items": list_evolution_tasks(limit=limit),
-        "schedule": evolution_schedule_status(),
-    }
+    try:
+        return {
+            "ok": True,
+            # The list view only needs status, lease, checkpoint and timing
+            # fields. Full result_json remains available from /{task_id} and
+            # must not be transferred for every row in the admin console.
+            "items": list_evolution_tasks(limit=limit, include_details=False),
+            "schedule": evolution_schedule_status(),
+        }
+    except Exception as exc:  # noqa: BLE001 - optional task evidence must degrade safely
+        return degraded_read("evolution_tasks", exc, items=[], schedule={})
 
 
 @router.get("/model-strategy/task-center")
-def model_strategy_task_center(limit: int = 50, log_limit: int = 200) -> dict:
+def model_strategy_task_center(limit: int = 50, log_limit: int = 200, compact: bool = False) -> dict:
     """Unified read-only process view across data, factors, models and strategies."""
-    return build_task_center(limit=limit, log_limit=log_limit)
+    try:
+        return build_task_center(
+            limit=limit,
+            log_limit=log_limit,
+            include_slo=not compact,
+            include_cycle_details=True,
+            compact_cycle=compact,
+        )
+    except Exception as exc:  # noqa: BLE001 - admin diagnostics must degrade safely
+        return degraded_read("task_center", exc, items=[], modules=[], summary={})
 
 
 @router.get("/model-strategy/evolution/schedule")
 def model_strategy_evolution_schedule() -> dict:
-    return {"ok": True, **evolution_schedule_status()}
+    try:
+        return {"ok": True, **evolution_schedule_status()}
+    except Exception as exc:  # noqa: BLE001 - optional schedule evidence must degrade safely
+        return degraded_read("evolution_schedule", exc, items=[])
 
 
 @router.get("/model-strategy/evolution/owner-summary")
 def model_strategy_owner_summary() -> dict:
-    return latest_owner_summary()
+    try:
+        return latest_owner_summary()
+    except Exception as exc:  # noqa: BLE001 - optional owner evidence must degrade safely
+        return degraded_read("owner_summary", exc, summary={}, components=[])
 
 
 @router.get("/model-strategy/evolution/ledger-audit")
 def model_strategy_ledger_audit() -> dict:
     from app.services.simulation_ledger_audit import audit_simulation_ledger
-    return audit_simulation_ledger(persist=False)
+    try:
+        return audit_simulation_ledger(persist=False)
+    except Exception as exc:  # noqa: BLE001 - optional ledger audit must degrade safely
+        from app.core.read_only_diagnostics import degraded_read
+        return degraded_read("ledger_audit", exc, issues=[], invalid_operations=[])
 
 
 @router.get("/model-strategy/evolution/research-data-assets")
 def model_strategy_research_data_assets() -> dict:
     """Read-only research-depth contract for the autonomy UI."""
     from app.services.research_data_assets import audit_research_data_assets
-    return audit_research_data_assets()
+    try:
+        return audit_research_data_assets()
+    except Exception as exc:  # noqa: BLE001 - optional research evidence must degrade safely
+        return degraded_read(
+            "research_data_assets",
+            exc,
+            schema_version="alis_research_data_assets_v1",
+            industry_components={},
+            analyst_consensus_pit={},
+            theme_exposure={},
+            announcement_extraction={},
+            industry_ocr_candidates={},
+            professional_operating_metric_candidates={},
+            gaps=[],
+            policy="only_point_in_time_sources_are_production_eligible; proxies_and_unmeasured_extraction_cannot_satisfy_research_depth_gate",
+        )
 
 
 @router.get("/model-strategy/evolution/tasks/{task_id}")

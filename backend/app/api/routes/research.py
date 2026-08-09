@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import copy
+import threading
+import time
 from typing import Any
 
 import httpx
@@ -7,6 +10,7 @@ import httpx
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 
+from app.db.store import get_positions
 from app.services.research_engine import (
     CONTRACTS,
     capability_registry,
@@ -22,20 +26,28 @@ from app.services.thesis_store import create_thesis, generate_thesis_for_stock, 
 from app.services.industry_event_engine import industry_detail, list_event_followups, list_events, list_industries, materialize_event_followups, materialize_industry_state_history, materialize_industry_state_snapshots, review_linked_event_theses, score_event, score_industry, update_event_followup
 from app.services.industry_allocator import build_industry_allocation
 from app.services.market_context import live_market_context
-from app.services.decision_store import build_review_outcome_suggestion, create_decision_snapshot, create_review, diff_decision_snapshots, list_decision_snapshots, list_pool_members, list_position_state_history, list_position_states, list_reviews, remove_pool_member, transition_pool_member, transition_position, upsert_pool_member, verify_decision_snapshot
+from app.services.decision_store import build_review_outcome_suggestion, create_decision_snapshot, create_review, diff_decision_snapshots, get_decision_snapshot, list_decision_snapshot_summaries, list_decision_snapshots, list_pool_members, list_position_state_history, list_position_states, list_reviews, remove_pool_member, transition_pool_member, transition_position, upsert_pool_member, verify_decision_snapshot
 from app.services.operations_overview import build_decision_audit, build_governance_overview, build_live_portfolio_risk
+from app.services.position_valuation import build_position_market_series_cache
+from app.services.quant_run_engine import list_consolidated_trade_dates
 from app.services.stock_pool_sync import stage_candidates_in_watch_pool
-from app.services.research_workflow import evaluate_core_pool_eligibility, process_watch_pool
+from app.services.research_workflow import build_console_stock_evidence, evaluate_core_pool_eligibility, process_watch_pool
 from app.services.advanced_controls import bayesian_update, freeze_evidence, trade_attribution
-from app.services.theme_engine import list_themes, materialize_theme_snapshots
+from app.services.theme_engine import get_theme, list_themes, materialize_theme_snapshots
 from app.services.manual_review_queue import build_manual_review_queue, submit_manual_review_action
 from app.services.llm_review_assistant import generate_review_draft, llm_token_budget_status
 from app.services.llm_research_agent import list_llm_research_proposals
 from app.services.review_learning import materialize_decision_outcomes, review_learning_overview
 from app.services.manual_review_triage import run_manual_review_triage_once, triage_status
 from app.services.profit_loop import build_portfolio_candles, build_profit_loop
+from app.services.portfolio_console import build_portfolio_console_research
+from app.core.read_only_diagnostics import degraded_read
 
 router = APIRouter()
+
+_PORTFOLIO_RISK_CACHE_TTL_SECONDS = 5.0
+_portfolio_risk_cache_lock = threading.Lock()
+_portfolio_risk_cache: dict[int, tuple[float, dict[str, Any]]] = {}
 
 
 class ResearchEvaluationRequest(BaseModel):
@@ -155,15 +167,33 @@ def research_capabilities() -> dict[str, Any]:
 
 @router.get("/research/llm/proposals")
 def research_llm_proposals(limit: int = Query(default=50, ge=1, le=200)) -> dict[str, Any]:
-    return list_llm_research_proposals(limit=limit)
+    try:
+        return list_llm_research_proposals(limit=limit)
+    except Exception as exc:  # noqa: BLE001 - optional research evidence must degrade safely
+        return degraded_read("llm_research_proposals", exc, count=0, items=[], quality_report={})
 
 
 @router.get("/research/themes")
 def research_themes(
     as_of_time: str = "", promotable_only: bool = False,
     limit: int = Query(default=100, ge=1, le=500),
+    compact: bool = False,
 ) -> dict[str, Any]:
-    return list_themes(as_of_time=as_of_time or None, promotable_only=promotable_only, limit=limit)
+    return list_themes(
+        as_of_time=as_of_time or None,
+        promotable_only=promotable_only,
+        limit=limit,
+        include_companies=not compact,
+        compact=compact,
+    )
+
+
+@router.get("/research/themes/{theme_code:path}")
+def research_theme_detail(theme_code: str, as_of_date: str = "") -> dict[str, Any]:
+    item = get_theme(theme_code, as_of_date=as_of_date)
+    if not item:
+        raise HTTPException(status_code=404, detail="主题快照不存在")
+    return {"ok": True, "item": item}
 
 
 @router.post("/research/themes/materialize")
@@ -179,6 +209,14 @@ def research_contracts() -> dict[str, Any]:
 @router.get("/research/stocks/{ts_code}")
 def research_stock(ts_code: str) -> dict[str, Any]:
     return build_stock_research(ts_code)
+
+
+@router.get("/research/stocks/{ts_code}/console-evidence")
+def research_console_stock_evidence(ts_code: str) -> dict[str, Any]:
+    try:
+        return build_console_stock_evidence(ts_code)
+    except Exception as exc:  # noqa: BLE001 - read-only panel must degrade without HTTP 500
+        return degraded_read("research_stock_evidence", exc, ts_code=str(ts_code).strip().upper(), company={}, expectations={}, valuation={}, eligibility={}, financialCompleteness={})
 
 
 @router.get("/research/expectations/{ts_code}")
@@ -208,7 +246,19 @@ def research_evaluate(req: ResearchEvaluationRequest) -> dict[str, Any]:
 
 @router.get("/research/theses")
 def research_thesis_list(ts_code: str = "", limit: int = Query(default=100, ge=1, le=500)) -> dict[str, Any]:
-    return {"ok": True, "items": list_theses(ts_code=ts_code.strip().upper(), limit=limit)}
+    try:
+        # The research page only renders thesis identity/status fields. Full
+        # hypothesis evidence remains available from the per-thesis endpoint.
+        return {
+            "ok": True,
+            "items": list_theses(
+                ts_code=ts_code.strip().upper(),
+                limit=limit,
+                include_hypotheses=False,
+            ),
+        }
+    except Exception as exc:  # noqa: BLE001 - read-only evidence must terminate safely
+        return degraded_read("research_theses", exc, items=[])
 
 
 @router.post("/research/theses")
@@ -263,9 +313,9 @@ def research_thesis_review(thesis_id: int) -> dict[str, Any]:
 
 
 @router.get("/research/industries")
-def research_industries(as_of_time: str = "") -> dict[str, Any]:
+def research_industries(as_of_time: str = "", compact: bool = False) -> dict[str, Any]:
     """Read latest or an explicit point-in-time industry-state snapshot."""
-    return list_industries(as_of_time=as_of_time or None)
+    return list_industries(as_of_time=as_of_time or None, compact=compact)
 
 
 @router.get("/research/industries/allocation")
@@ -273,16 +323,32 @@ def research_industry_allocation(
     as_of_time: str = "",
     market_state: str = "",
     equity_budget: float = Query(default=-1, ge=-1, le=1),
+    compact: bool = False,
 ) -> dict[str, Any]:
     """Expose the market -> industry budget layer used by daily selection."""
-    context = live_market_context()
-    state = market_state or str((context.get("market_state") or {}).get("state") or "unknown")
-    if equity_budget < 0:
-        defaults = {"S0": .85, "S1": .75, "S2": .70, "S3": .65, "S4": .50, "S5": .55, "S6": .50, "S7": .45, "S8": .35, "S9": .25, "S10": .10, "S11": .40}
-        equity_budget = defaults.get(state, .50)
-    return build_industry_allocation(
-        equity_budget=equity_budget, market_state=state, as_of_time=as_of_time or None,
-    )
+    try:
+        context = live_market_context()
+        state = market_state or str((context.get("market_state") or {}).get("state") or "unknown")
+        if equity_budget < 0:
+            defaults = {"S0": .85, "S1": .75, "S2": .70, "S3": .65, "S4": .50, "S5": .55, "S6": .50, "S7": .45, "S8": .35, "S9": .25, "S10": .10, "S11": .40}
+            equity_budget = defaults.get(state, .50)
+        result = build_industry_allocation(
+            equity_budget=equity_budget, market_state=state, as_of_time=as_of_time or None,
+        )
+        if not compact:
+            return result
+        row_fields = {
+            "industry", "raw_score", "quality_score", "confidence", "coverage",
+            "lifecycle", "status", "selection_score", "narrative_score",
+            "narrative_lifecycle", "narrative_promotable", "combined_score",
+            "eligible", "strong_in_weak_market", "blockers", "target_weight",
+        }
+        return {
+            **{key: value for key, value in result.items() if key not in {"items", "symbol_industries", "industry_targets"}},
+            "items": [{key: row.get(key) for key in row_fields if key in row} for row in result.get("items", [])],
+        }
+    except Exception as exc:  # noqa: BLE001 - optional industry evidence must degrade safely
+        return degraded_read("industry_allocation", exc, market_state=market_state or "unknown", items=[])
 
 
 @router.get("/research/industries/{industry_code}")
@@ -353,7 +419,10 @@ def research_pools(pool_type:str="")->dict[str,Any]: return {"ok":True,"items":l
 
 @router.get("/research/pools/eligibility/{ts_code}")
 def research_pool_eligibility(ts_code: str) -> dict[str, Any]:
-    return evaluate_core_pool_eligibility(ts_code)
+    try:
+        return evaluate_core_pool_eligibility(ts_code)
+    except Exception as exc:  # noqa: BLE001 - read-only gate evidence must degrade safely
+        return degraded_read("research_pool_eligibility", exc, ts_code=str(ts_code).strip().upper(), gates=[], eligible_for_core=None)
 
 
 @router.post("/research/pools")
@@ -402,12 +471,36 @@ def research_pool_remove(member_id:int)->dict[str,Any]: return {"ok":remove_pool
 
 
 @router.get("/research/decisions")
-def research_decisions(ts_code:str="",limit:int=Query(100,ge=1,le=500))->dict[str,Any]:return {"ok":True,"items":list_decision_snapshots(ts_code.strip().upper(),limit)}
+def research_decisions(ts_code:str="",limit:int=Query(100,ge=1,le=500),compact: bool = Query(True))->dict[str,Any]:
+    try:
+        rows = list_decision_snapshot_summaries(ts_code.strip().upper(), limit) if compact else list_decision_snapshots(ts_code.strip().upper(), limit)
+        return {"ok":True,"items":rows,"compact":compact}
+    except Exception as exc:  # noqa: BLE001 - audit evidence is optional read-only data
+        return degraded_read("decisions", exc, items=[])
+
+
+@router.get("/research/decisions/{decision_snapshot_id}")
+def research_decision_detail(decision_snapshot_id: int) -> dict[str, Any]:
+    try:
+        item = get_decision_snapshot(decision_snapshot_id)
+    except Exception as exc:  # noqa: BLE001 - optional audit evidence must degrade safely
+        return degraded_read("decision_detail", exc, id=int(decision_snapshot_id))
+    if not item:
+        raise HTTPException(status_code=404, detail="decision_snapshot_not_found")
+    return item
 
 
 @router.get("/research/evidence/verify/{decision_snapshot_id}")
 def research_evidence_verify(decision_snapshot_id: int) -> dict[str, Any]:
-    item = verify_decision_snapshot(decision_snapshot_id)
+    try:
+        item = verify_decision_snapshot(decision_snapshot_id)
+    except Exception as exc:  # noqa: BLE001 - optional audit evidence must degrade safely
+        return degraded_read(
+            "decision_evidence_verification",
+            exc,
+            id=int(decision_snapshot_id),
+            verified=False,
+        )
     if not item:
         raise HTTPException(status_code=404, detail="decision_snapshot_not_found")
     return item
@@ -444,12 +537,19 @@ def research_decision_create(req:DecisionSnapshotRequest)->dict[str,Any]:
 
 
 @router.get("/research/reviews")
-def research_reviews(limit:int=Query(100,ge=1,le=500))->dict[str,Any]:return {"ok":True,"items":list_reviews(limit)}
+def research_reviews(limit: int = Query(100, ge=1, le=500)) -> dict[str, Any]:
+    try:
+        return {"ok": True, "items": list_reviews(limit)}
+    except Exception as exc:  # noqa: BLE001 - optional review evidence must degrade safely
+        return degraded_read("reviews", exc, items=[])
 
 
 @router.get("/research/reviews/learning-overview")
 def research_review_learning_overview() -> dict[str, Any]:
-    return review_learning_overview()
+    try:
+        return review_learning_overview()
+    except Exception as exc:  # noqa: BLE001 - optional learning evidence must degrade safely
+        return degraded_read("review_learning", exc, items=[], summary={})
 
 
 @router.post("/research/reviews/materialize-outcomes")
@@ -458,13 +558,31 @@ def research_materialize_review_outcomes(limit: int = Query(default=1000, ge=1, 
 
 
 @router.get("/research/profit-loop")
-def research_profit_loop() -> dict[str, Any]:
-    return build_profit_loop(persist=False)
+def research_profit_loop(compact: bool = Query(False)) -> dict[str, Any]:
+    try:
+        if compact:
+            return build_portfolio_console_research()
+        return build_profit_loop(persist=False)
+    except Exception as exc:  # noqa: BLE001 - optional research evidence must degrade safely
+        return degraded_read("profit_loop", exc, overview={}, sell_labels=[])
 
 
 @router.get("/research/portfolio-candles")
 def research_portfolio_candles(limit: int = Query(90, ge=20, le=250)) -> dict[str, Any]:
-    return build_portfolio_candles(limit)
+    try:
+        return build_portfolio_candles(limit)
+    except Exception as exc:  # noqa: BLE001 - optional portfolio evidence must degrade safely
+        return degraded_read(
+            "portfolio_candles",
+            exc,
+            series=[],
+            position_count=0,
+            unit="indexed_account_equity",
+            base=100,
+            data_as_of_date="",
+            benchmark={"symbol": "000300.SH", "name": "沪深300", "available": False},
+            latest_comparison={},
+        )
 
 
 @router.get("/research/manual-review/queue")
@@ -558,7 +676,33 @@ def research_position_state_history(
 
 @router.get("/research/portfolio-risk/live")
 def research_live_portfolio_risk(lookback: int = Query(120, ge=20, le=252)) -> dict[str, Any]:
-    return build_live_portfolio_risk(lookback=lookback)
+    try:
+        cache_key = max(20, min(int(lookback or 120), 252))
+        now = time.monotonic()
+        with _portfolio_risk_cache_lock:
+            cached = _portfolio_risk_cache.get(cache_key)
+        if cached and now - cached[0] < _PORTFOLIO_RISK_CACHE_TTL_SECONDS:
+            return copy.deepcopy(cached[1])
+
+        positions = get_positions()
+        trade_dates = list_consolidated_trade_dates()
+        as_of = trade_dates[-1] if trade_dates else ""
+        valuation_cache = build_position_market_series_cache(
+            positions,
+            as_of=as_of,
+            lookback=cache_key,
+        )
+        result = build_live_portfolio_risk(
+            lookback=cache_key,
+            positions=positions,
+            as_of=as_of,
+            valuation_cache=valuation_cache,
+        )
+        with _portfolio_risk_cache_lock:
+            _portfolio_risk_cache[cache_key] = (time.monotonic(), copy.deepcopy(result))
+        return result
+    except Exception as exc:  # noqa: BLE001 - optional portfolio evidence must degrade safely
+        return degraded_read("portfolio_risk", exc, target_weights=[], exposures=[], breaches=[])
 
 
 @router.get("/research/governance/overview")
@@ -567,5 +711,8 @@ def research_governance_overview() -> dict[str, Any]:
 
 
 @router.get("/research/decision-audit")
-def research_decision_audit(limit: int = Query(100, ge=1, le=500)) -> dict[str, Any]:
-    return build_decision_audit(limit=limit)
+def research_decision_audit(limit: int = Query(100, ge=1, le=500), compact: bool = Query(False)) -> dict[str, Any]:
+    try:
+        return build_decision_audit(limit=limit, compact=compact)
+    except Exception as exc:  # noqa: BLE001 - optional audit evidence must degrade safely
+        return degraded_read("decision_audit", exc, decisions=[], reviews=[])

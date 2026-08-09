@@ -8,6 +8,7 @@ import json
 import math
 import os
 import random
+import threading
 import time
 from typing import Any, Callable
 
@@ -30,11 +31,17 @@ WAVE_MAX_RUNTIME_SECONDS = max(
 )
 WAVE_MAX_RETRIES = max(0, int(os.getenv("ALIS_V10_WAVE_MAX_RETRIES", "2")))
 EXPERT_MAX_AGE_DAYS = max(1, int(os.getenv("ALIS_V10_EXPERT_MAX_AGE_DAYS", "30")))
+FACTOR_ANALYSIS_QUERY_BATCH_SIZE = max(
+    1, min(int(os.getenv("ALIS_V10_FACTOR_ANALYSIS_QUERY_BATCH_SIZE", "10")), 20)
+)
 RESEARCH_LINES = (
     "candidate_generation",
     "cluster_distillation",
     "strategy_portfolio",
 )
+
+_RESEARCH_TABLES_READY = False
+_RESEARCH_TABLES_INIT_LOCK = threading.Lock()
 
 
 def strategy_research_enabled() -> bool:
@@ -57,6 +64,17 @@ def _hash(value: Any) -> str:
 
 
 def ensure_strategy_research_tables() -> None:
+    global _RESEARCH_TABLES_READY
+    if _RESEARCH_TABLES_READY:
+        return
+    with _RESEARCH_TABLES_INIT_LOCK:
+        if _RESEARCH_TABLES_READY:
+            return
+        _ensure_strategy_research_tables_once()
+        _RESEARCH_TABLES_READY = True
+
+
+def _ensure_strategy_research_tables_once() -> None:
     with _conn() as conn:
         conn.execute(
             """CREATE TABLE IF NOT EXISTS strategy_research_events (
@@ -74,6 +92,10 @@ def ensure_strategy_research_tables() -> None:
         conn.execute(
             """CREATE INDEX IF NOT EXISTS idx_strategy_research_events_line_status
                ON strategy_research_events(research_line,status,created_at)"""
+        )
+        conn.execute(
+            """CREATE INDEX IF NOT EXISTS idx_strategy_research_events_generation_source
+               ON strategy_research_events(research_line,event_type,source_id,created_at)"""
         )
         conn.execute(
             """CREATE TABLE IF NOT EXISTS strategy_research_waves (
@@ -275,6 +297,10 @@ def ensure_strategy_research_tables() -> None:
                ON strategy_factor_contributions(factor_key,updated_at)"""
         )
         conn.execute(
+            """CREATE INDEX IF NOT EXISTS idx_strategy_factor_contribution_recent
+               ON strategy_factor_contributions(updated_at,absolute_contribution)"""
+        )
+        conn.execute(
             """CREATE TABLE IF NOT EXISTS strategy_factor_interactions (
                factor_left TEXT NOT NULL,
                factor_right TEXT NOT NULL,
@@ -444,12 +470,19 @@ def analyze_factor_pool(factors: list[dict[str, Any]]) -> dict[str, Any]:
                 tuple(ids),
             ).fetchone()
             latest_date = str(dict(latest).get("trade_date") or "") if latest else ""
-            rows = conn.execute(
-                f"""SELECT factor_definition_id,ts_code,standardized_value
-                    FROM factor_values WHERE trade_date=?
-                      AND factor_definition_id IN ({placeholders})""",
-                (latest_date, *ids),
-            ).fetchall() if latest_date else []
+            rows = []
+            if latest_date:
+                # Keep each latest-day read below the statement/transfer
+                # budget when the factor pool spans the full registry.
+                for start in range(0, len(ids), FACTOR_ANALYSIS_QUERY_BATCH_SIZE):
+                    chunk = ids[start:start + FACTOR_ANALYSIS_QUERY_BATCH_SIZE]
+                    chunk_placeholders = ",".join("?" for _ in chunk)
+                    rows.extend(conn.execute(
+                        f"""SELECT factor_definition_id,ts_code,standardized_value
+                            FROM factor_values WHERE trade_date=?
+                              AND factor_definition_id IN ({chunk_placeholders})""",
+                        (latest_date, *chunk),
+                    ).fetchall())
         for raw in rows:
             row = dict(raw)
             if row.get("standardized_value") is None:
@@ -1591,8 +1624,9 @@ def run_candidate_environment_matrix(
             },
         }
 
+    low_memory_worker = str(os.getenv("ALIS_WORKER_PROFILE", "")).lower() in {"2gb", "low_memory", "low-memory"}
     parallelism = max(1, min(
-        int(os.getenv("ALIS_V10_ENV_PARALLELISM", "2")),
+        int(os.getenv("ALIS_V10_ENV_PARALLELISM", "1" if low_memory_worker else "2")),
         max(1, len(historical)),
         4,
     ))
@@ -3027,6 +3061,7 @@ def materialize_next_portfolio_challenger() -> dict[str, Any]:
     from app.db.store import create_model_version, create_strategy, list_model_versions, list_strategies
     from app.services.continuous_factor_research import _active_research_snapshot, _baseline_research_spec
     from app.services.production_strategy import resolve_production_strategy_champion
+    from app.services.strategy_config import get_replay_required_factor_names
 
     ensure_strategy_research_tables()
     with _conn() as conn:
@@ -3099,6 +3134,54 @@ def materialize_next_portfolio_challenger() -> dict[str, Any]:
             prototypes=prototypes,
             router=payload.get("routing") or build_environment_expert_router(prototypes),
         )
+    model_bindings = (
+        prototypes[0].get("model_bindings")
+        or baseline.get("model_bindings")
+        or {}
+    )
+    factor_bindings = baseline.get("factor_bindings") or {}
+    required_factors = get_replay_required_factor_names(
+        content,
+        "formula",
+        model_bindings=model_bindings,
+    )
+    missing_factor_bindings = sorted(
+        factor for factor in required_factors
+        if not isinstance(factor_bindings.get(factor), dict)
+    )
+    if missing_factor_bindings:
+        blocked_payload = {
+            **payload,
+            "governance_block": {
+                "schema_version": "alis_replay_factor_contract_gate_v1",
+                "status": "blocked_incomplete_factor_bindings",
+                "required_factors": sorted(required_factors),
+                "missing_factor_bindings": missing_factor_bindings,
+                "production_change_forbidden": True,
+            },
+        }
+        with _conn() as conn:
+            conn.execute(
+                """UPDATE strategy_research_events
+                   SET status='blocked',payload_json=?,consumed_at=?
+                   WHERE event_id=? AND status='running'""",
+                (_json(blocked_payload), _now(), event["event_id"]),
+            )
+            conn.execute(
+                """UPDATE strategy_portfolio_candidates
+                   SET status='blocked_incomplete_factor_bindings',updated_at=?
+                   WHERE portfolio_id=?""",
+                (_now(), payload.get("portfolio_id")),
+            )
+        return {
+            "ok": False,
+            "schema_version": RESEARCH_SCHEMA_VERSION,
+            "status": "blocked_incomplete_factor_bindings",
+            "portfolio_id": payload.get("portfolio_id"),
+            "required_factors": sorted(required_factors),
+            "missing_factor_bindings": missing_factor_bindings,
+            "production_change_forbidden": True,
+        }
     name = f"ALIS V10 策略组合 {str(payload.get('portfolio_id') or '')[-8:]}"
     strategy = next((item for item in list_strategies() if str(item.get("name") or "") == name), None)
     if not strategy:
@@ -3122,8 +3205,8 @@ def materialize_next_portfolio_challenger() -> dict[str, Any]:
                 "strategy_id": int(strategy["id"]),
                 "champion_reference": champion.get("champion_version"),
                 "selection_strategy": content,
-                "factor_bindings": baseline.get("factor_bindings") or {},
-                "model_bindings": prototypes[0].get("model_bindings") or baseline.get("model_bindings") or {},
+                "factor_bindings": factor_bindings,
+                "model_bindings": model_bindings,
                 "market_state_binding": prototypes[0].get("market_state_binding") or baseline.get("market_state_binding") or {},
                 "strategy_controller_version_id": prototypes[0].get("strategy_controller_version_id"),
                 "research_package_hash": str(
@@ -3499,7 +3582,7 @@ def persist_market_environments(environments: list[dict[str, Any]]) -> int:
     return len(environments)
 
 
-def continuous_strategy_research_status() -> dict[str, Any]:
+def continuous_strategy_research_status(*, console: bool = False) -> dict[str, Any]:
     ensure_strategy_research_tables()
     with _conn() as conn:
         event_rows = [dict(row) for row in conn.execute(
@@ -3528,7 +3611,8 @@ def continuous_strategy_research_status() -> dict[str, Any]:
         ).fetchall()]
         raw_waves = [dict(row) for row in conn.execute(
             """SELECT * FROM strategy_research_waves
-               ORDER BY created_at DESC LIMIT 100"""
+               ORDER BY created_at DESC LIMIT ?""",
+            (40 if console else 100,),
         ).fetchall()]
         raw_experts = [dict(row) for row in conn.execute(
             """SELECT e.*,m.name AS environment_name,m.environment_type
@@ -3536,38 +3620,68 @@ def continuous_strategy_research_status() -> dict[str, Any]:
                LEFT JOIN dynamic_market_environments m
                  ON m.environment_id=e.environment_id
                ORDER BY e.environment_version DESC,e.environment_id,e.rank_no
-               LIMIT 200"""
+               LIMIT ?""",
+            (120 if console else 200,),
         ).fetchall()]
         raw_events = [dict(row) for row in conn.execute(
             """SELECT event_id,payload_json,status,created_at
                FROM strategy_research_events
                WHERE research_line='candidate_generation'
                  AND event_type='candidate_strategy_generated'
-               ORDER BY created_at DESC LIMIT 200"""
+               ORDER BY created_at DESC LIMIT ?""",
+            (40 if console else 200,),
         ).fetchall()]
         raw_backtests = [dict(row) for row in conn.execute(
-            """SELECT candidate_id,environment_id,result_json,status,updated_at
-               FROM strategy_environment_backtests
-               ORDER BY updated_at DESC LIMIT 2000"""
+            """SELECT b.candidate_id,b.environment_id,b.result_json,b.status,b.updated_at,
+                      m.name AS environment_name,m.environment_type
+                 FROM strategy_environment_backtests b
+                 LEFT JOIN dynamic_market_environments m ON m.environment_id=b.environment_id
+                ORDER BY b.updated_at DESC LIMIT ?""",
+            (800 if console else 2000,),
         ).fetchall()]
     experts: list[dict[str, Any]] = []
     for row in raw_experts:
         evidence = json.loads(row.pop("evidence_json") or "{}")
-        row["fitness_detail"] = json.loads(row.pop("fitness_json") or "{}")
-        row.update(evidence)
+        fitness_detail = json.loads(row.pop("fitness_json") or "{}")
+        if console:
+            # The research console renders factor weights and identity only;
+            # nested backtest evidence remains available from Wave details.
+            row["factor_count"] = int(evidence.get("factor_count") or 0)
+            row["factor_weights"] = evidence.get("factor_weights") or {}
+        else:
+            row["fitness_detail"] = fitness_detail
+            row.update(evidence)
         row["rank"] = int(row.pop("rank_no") or 0)
         experts.append(row)
     matrix: dict[str, list[dict[str, Any]]] = {}
     for row in raw_backtests:
         result = json.loads(row.get("result_json") or "{}")
+        if console:
+            metrics = result.get("metrics") if isinstance(result.get("metrics"), dict) else {}
+            result = {
+                "environment_name": result.get("environment_name") or row.get("environment_name"),
+                "environment_type": result.get("environment_type") or row.get("environment_type"),
+                "environment_version": result.get("environment_version"),
+                "environment_fitness": {
+                    "fitness": (result.get("environment_fitness") or {}).get("fitness"),
+                    "rankable": bool((result.get("environment_fitness") or {}).get("rankable")),
+                },
+                "metrics": {
+                    key: metrics.get(key)
+                    for key in ("total_return", "benchmark_return", "excess_return", "max_drawdown", "turnover_rate")
+                    if metrics.get(key) is not None
+                },
+            }
         result.setdefault("status", row.get("status"))
         result.setdefault("environment_id", row.get("environment_id"))
         result.setdefault("updated_at", row.get("updated_at"))
         matrix.setdefault(str(row.get("candidate_id") or ""), []).append(result)
     combinations: list[dict[str, Any]] = []
-    for event in raw_events:
+    for event in raw_events[:24] if console else raw_events:
         payload = json.loads(event.get("payload_json") or "{}")
         environment_results = matrix.get(str(payload.get("candidate_id") or ""), [])
+        if console:
+            environment_results = environment_results[:8]
         rankable = [
             item for item in environment_results
             if bool((item.get("environment_fitness") or environment_fitness(item)).get("rankable"))
@@ -3605,6 +3719,7 @@ def continuous_strategy_research_status() -> dict[str, Any]:
     return {
         "ok": True,
         "schema_version": RESEARCH_SCHEMA_VERSION,
+        "console": bool(console),
         "activation_status": "enabled" if enabled else "explicitly_disabled",
         "research_lines": list(RESEARCH_LINES),
         "generation_modes": list(GENERATION_MODES),
@@ -3630,14 +3745,140 @@ def continuous_strategy_research_status() -> dict[str, Any]:
             "formal_chain": ["purged_oos", "dsr", "sealed_holdout", "future_shadow"],
             "replace_only_after_confirmed_improvement": True,
         },
+        "projection_limits": {
+            "max_candidates": 24,
+            "max_environments_per_candidate": 8,
+            "detail_route": "/api/factors/research/analytics/waves/{wave_id}",
+        } if console else None,
+    }
+
+
+def strategy_research_analytics_console() -> dict[str, Any]:
+    """Return only the bounded evidence needed by the Wave console.
+
+    The full analytics projection also materializes factor guidance and
+    learning backfill. Those sections belong to dedicated research views and
+    are not needed to render Wave status, expert governance, or similarity.
+    """
+    ensure_strategy_research_tables()
+    now = datetime.now().astimezone()
+    with _conn() as conn:
+        contracts = [dict(row) for row in conn.execute(
+            """SELECT c.*,w.status AS wave_status,w.expected_count,w.completed_count,
+                      w.failed_count,w.created_at AS wave_created_at,w.distilled_at
+                 FROM strategy_research_wave_contracts c
+                 LEFT JOIN strategy_research_waves w ON w.wave_id=c.wave_id
+                ORDER BY c.created_at DESC LIMIT 40"""
+        ).fetchall()]
+        experts = [dict(row) for row in conn.execute(
+            """SELECT e.*,m.name AS environment_name,m.environment_type
+                 FROM strategy_environment_experts e
+                 LEFT JOIN dynamic_market_environments m ON m.environment_id=e.environment_id
+                ORDER BY e.environment_id,e.environment_version DESC,e.rank_no
+                LIMIT 120"""
+        ).fetchall()]
+
+    waves: list[dict[str, Any]] = []
+    for row in contracts:
+        row["freeze"] = json.loads(row.pop("freeze_json") or "{}")
+        row["quota"] = json.loads(row.pop("quota_json") or "{}")
+        row["checkpoint"] = json.loads(row.pop("checkpoint_json") or "{}")
+        waves.append(row)
+
+    expert_governance: list[dict[str, Any]] = []
+    by_environment: dict[str, list[dict[str, Any]]] = {}
+    for row in experts:
+        row["fitness_detail"] = json.loads(row.pop("fitness_json") or "{}")
+        row["evidence"] = json.loads(row.pop("evidence_json") or "{}")
+        by_environment.setdefault(str(row["environment_id"]), []).append(row)
+    for environment_id, rows in by_environment.items():
+        champions = [row for row in rows if str(row.get("role") or "") == "champion"]
+        fitnesses = [float(row.get("fitness") or 0.0) for row in champions]
+        latest = champions[0] if champions else rows[0]
+        try:
+            updated = datetime.fromisoformat(str(latest["updated_at"]))
+            age_days = max(0.0, (now - updated.astimezone()).total_seconds() / 86400)
+        except (TypeError, ValueError):
+            age_days = float(EXPERT_MAX_AGE_DAYS + 1)
+        mean_fitness = sum(fitnesses) / len(fitnesses) if fitnesses else 0.0
+        variance = (
+            sum((value - mean_fitness) ** 2 for value in fitnesses) / len(fitnesses)
+            if fitnesses else 0.0
+        )
+        expert_governance.append({
+            "environment_id": environment_id,
+            "prototype_id": latest.get("prototype_id"),
+            "environment_version": latest.get("environment_version"),
+            "fitness": float(latest.get("fitness") or 0.0),
+            "version_observations": len(fitnesses),
+            "ranking_stability": round(1.0 / (1.0 + math.sqrt(variance)), 8),
+            "age_days": round(age_days, 4),
+            "expiry_status": "expired" if age_days > EXPERT_MAX_AGE_DAYS else "fresh",
+            "maximum_age_days": EXPERT_MAX_AGE_DAYS,
+        })
+
+    environment_similarity: list[dict[str, Any]] = []
+    environment_ids = sorted(by_environment)
+    for left_index, left in enumerate(environment_ids):
+        left_champions = {
+            str(row.get("prototype_id") or "")
+            for row in by_environment[left]
+            if str(row.get("role") or "") == "champion"
+        }
+        for right in environment_ids[left_index + 1:]:
+            right_champions = {
+                str(row.get("prototype_id") or "")
+                for row in by_environment[right]
+                if str(row.get("role") or "") == "champion"
+            }
+            union = left_champions | right_champions
+            similarity = len(left_champions & right_champions) / len(union) if union else 0.0
+            if similarity <= 0:
+                continue
+            environment_similarity.append({
+                "environment_left": left,
+                "environment_right": right,
+                "champion_jaccard": round(similarity, 8),
+                "research_weight_multiplier": 0.5 if similarity >= 0.80 else 0.75,
+                "recommendation": "merge_review" if similarity >= 0.80 else "downweight_overlap",
+            })
+    return {
+        "ok": True,
+        "schema_version": "alis_strategy_research_analytics_console_v1",
+        "console": True,
+        "waves": waves,
+        "expert_governance": expert_governance,
+        "environment_similarity": sorted(environment_similarity, key=lambda row: -float(row["champion_jaccard"])),
+        "comparability_gate": {
+            "required_dimensions": [
+                "research_snapshot_id", "environment_version",
+                "cost_contract", "execution_contract",
+            ],
+            "cross_contract_ranking_forbidden": True,
+        },
     }
 
 
 def strategy_research_analytics() -> dict[str, Any]:
-    """Read-only research efficiency, factor graph and batch audit projection."""
+    """Read-only research efficiency, factor graph and batch audit projection.
+
+    Historical learning backfill and runtime-metric compaction are owned by
+    the autonomous research worker.  A console GET must not scan historical
+    candidate evidence or mutate the research database.
+    """
     ensure_strategy_research_tables()
-    compaction = compact_research_runtime_metrics()
-    learning_backfill = backfill_factor_learning()
+    compaction = {
+        "ok": True,
+        "schema_version": "alis_research_metric_compaction_v1",
+        "deferred": True,
+        "reason": "由自治研究任务后台维护，读取页面不执行压缩或删除",
+    }
+    learning_backfill = {
+        "ok": True,
+        "schema_version": "alis_factor_learning_backfill_v1",
+        "deferred": True,
+        "reason": "由候选生成自治任务后台维护，读取页面不执行历史回填",
+    }
     guidance = factor_combination_guidance(limit=500)
     now = datetime.now().astimezone()
     with _conn() as conn:
@@ -3755,7 +3996,7 @@ def strategy_research_analytics() -> dict[str, Any]:
             "tiered_budget": True,
             "catastrophic_early_stop": True,
             "parallel_environment_capability": True,
-            "parallelism": max(1, min(4, int(os.getenv("ALIS_V10_ENV_PARALLELISM", "2")))),
+            "parallelism": max(1, min(4, int(os.getenv("ALIS_V10_ENV_PARALLELISM", "1" if str(os.getenv("ALIS_WORKER_PROFILE", "")).lower() in {"2gb", "low_memory", "low-memory"} else "2")))),
             "archive_policy": "daily_rollup_after_30_days_with_bounded_read_projection",
             "metric_compaction": compaction,
         },
@@ -3785,13 +4026,23 @@ def strategy_research_factor_analytics(
                 ORDER BY c.updated_at DESC,c.absolute_contribution DESC LIMIT ?""",
             tuple(params),
         ).fetchall()]
-        event_rows = [dict(row) for row in conn.execute(
-            """SELECT source_id,payload_json,created_at
-               FROM strategy_research_events
-               WHERE research_line='candidate_generation'
-                 AND event_type='candidate_strategy_generated'
-               ORDER BY created_at ASC"""
-        ).fetchall()]
+        candidate_ids = sorted({
+            str(row.get("candidate_id") or "")
+            for row in rows
+            if str(row.get("candidate_id") or "")
+        })
+        event_rows = []
+        if candidate_ids:
+            event_placeholders = ",".join("?" for _ in candidate_ids)
+            event_rows = [dict(row) for row in conn.execute(
+                f"""SELECT source_id,payload_json,created_at
+                    FROM strategy_research_events
+                   WHERE research_line='candidate_generation'
+                     AND event_type='candidate_strategy_generated'
+                     AND source_id IN ({event_placeholders})
+                   ORDER BY created_at ASC""",
+                tuple(candidate_ids),
+            ).fetchall()]
     event_by_candidate: dict[str, dict[str, Any]] = {}
     for event in event_rows:
         payload = json.loads(event.get("payload_json") or "{}")

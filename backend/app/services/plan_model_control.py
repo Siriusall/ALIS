@@ -505,6 +505,8 @@ _locks: set[str] = set()
 _lock = threading.Lock()
 _status_cache: dict[str, Any] = {"at": 0.0, "value": None}
 _operations_cache: dict[str, Any] = {"at": 0.0, "value": None}
+_base_coverage_cache: dict[str, Any] = {"at": 0.0, "value": None}
+_base_coverage_cache_lock = threading.Lock()
 _status_refresh_lock = threading.Lock()
 
 
@@ -2317,6 +2319,7 @@ def _build_plan_training_dataset(
     date_limit = max_sessions + horizon + 5
     if on_progress:
         on_progress("dataset", 0.24, f"读取最近 {date_limit} 个交易日训练日历")
+    coverage_news_rows: list[Any] = []
     with data_conn() as c:
         date_rows = c.execute(
             """SELECT trade_date
@@ -6655,7 +6658,7 @@ def _is_duplicate_training_dataset(model_key: str, dataset: dict[str, Any]) -> t
     return False, latest, signature
 
 
-def _base_coverage_snapshot() -> dict[str, int]:
+def _read_base_coverage_snapshot() -> dict[str, int]:
     from app.data_platform.db import _conn as data_conn
 
     def count_distinct(c: Any, table: str, candidates: list[str]) -> int:
@@ -6677,6 +6680,10 @@ def _base_coverage_snapshot() -> dict[str, int]:
                 return 0
         return 0
 
+    # Parse request-ledger metadata after the SQL block; initialize the
+    # accumulator before the event summary is assembled.
+    news_dates: set[str] = set()
+    compact_news_dates: set[str] | None = None
     with data_conn() as c:
         try:
             trade_dates = int(dict(c.execute("SELECT COUNT(*) count FROM dc_available_trade_dates").fetchone()).get("count") or 0)
@@ -6702,27 +6709,48 @@ def _base_coverage_snapshot() -> dict[str, int]:
         }
         announcement_events = len(announcement_dates)
         try:
-            coverage_news_rows = c.execute(
-                """SELECT payload_json,available_time
-                   FROM dc_tushare_raw_records
-                   WHERE api_name='major_news'"""
-            ).fetchall()
+            # Coverage reporting must use the request ledger, not rescan the
+            # 67M-row raw payload table.  The ledger carries the same
+            # point-in-time request date and row-count evidence without
+            # transferring article bodies into the API process.
+            if getattr(c, "_is_postgres", False):
+                # The coverage ledger is compact evidence, but returning and
+                # JSON-decoding every request row made the status page spend
+                # several seconds in Python. Extract only the covered event
+                # dates in PostgreSQL and keep the old path for fixtures.
+                compact_news_dates = {
+                    str(dict(row).get("event_date") or "")
+                    for row in c.execute(
+                        """SELECT DISTINCT
+                                  REPLACE(
+                                      SUBSTRING(
+                                          COALESCE(
+                                              NULLIF(params_json::jsonb->>'start_date',''),
+                                              params_json::jsonb->>'end_date'
+                                          ),
+                                          1,
+                                          10
+                                      ),
+                                      '-',
+                                      ''
+                                  ) AS event_date
+                           FROM dc_tushare_request_coverage
+                          WHERE api_name='major_news'
+                            AND rows_read>0
+                            AND result_status IN ('success','valid_empty')"""
+                    ).fetchall()
+                    if dict(row).get("event_date")
+                }
+                coverage_news_rows = []
+            else:
+                coverage_news_rows = c.execute(
+                    """SELECT params_json,rows_read,result_status
+                       FROM dc_tushare_request_coverage
+                       WHERE api_name='major_news'
+                         AND result_status IN ('success','valid_empty')"""
+                ).fetchall()
         except Exception:
             coverage_news_rows = []
-        news_dates: set[str] = set()
-        if coverage_news_rows:
-            from app.services.news_theme_cluster import _match_companies
-            for row in coverage_news_rows:
-                item = dict(row)
-                payload = _payload_dict(item.get("payload_json"))
-                text = f"{payload.get('title') or ''} {payload.get('content') or ''}".strip()
-                if not text or not _match_companies(text):
-                    continue
-                event_time = str(payload.get("pub_time") or item.get("available_time") or "")
-                event_date = event_time[:10].replace("-", "")
-                if event_date:
-                    news_dates.add(event_date)
-        news_events = len(news_dates)
         try:
             top_list_rows = c.execute(
                 """SELECT DISTINCT trade_date
@@ -6738,7 +6766,6 @@ def _base_coverage_snapshot() -> dict[str, int]:
             for row in top_list_rows
             if dict(row).get("trade_date")
         }
-        events = len(announcement_dates | news_dates)
         try:
             capital = int(dict(c.execute(
                 """SELECT COUNT(*) count
@@ -6762,6 +6789,23 @@ def _base_coverage_snapshot() -> dict[str, int]:
             ).fetchone()).get("count") or 0)
         except Exception:
             narrative_v3 = 0
+    # Parse only compact request metadata after releasing the data-platform
+    # connection.  This is coverage evidence, not the event-feature path;
+    # article/company matching remains in the point-in-time feature pipeline.
+    if compact_news_dates is not None:
+        news_dates.update(compact_news_dates)
+    elif coverage_news_rows:
+        for row in coverage_news_rows:
+            item = dict(row)
+            if int(item.get("rows_read") or 0) <= 0:
+                continue
+            payload = _payload_dict(item.get("params_json"))
+            event_time = str(payload.get("start_date") or payload.get("end_date") or "")
+            event_date = event_time[:10].replace("-", "")
+            if event_date:
+                news_dates.add(event_date)
+    news_events = len(news_dates)
+    events = len(announcement_dates | news_dates)
     return {
         "trade_dates": trade_dates,
         "themes": themes,
@@ -6773,6 +6817,18 @@ def _base_coverage_snapshot() -> dict[str, int]:
         "capital": max(0, capital - CAPITAL_FLOW_HISTORY_SESSIONS - 10),
         "capital_raw": capital,
     }
+
+
+def _base_coverage_snapshot(*, cache_seconds: int = 30) -> dict[str, int]:
+    """Reuse the compact cross-table coverage evidence during status reads."""
+    now = time.monotonic()
+    with _base_coverage_cache_lock:
+        cached = _base_coverage_cache.get("value")
+        if isinstance(cached, dict) and now - float(_base_coverage_cache.get("at") or 0) < max(1, cache_seconds):
+            return cached
+        value = _read_base_coverage_snapshot()
+        _base_coverage_cache.update({"at": time.monotonic(), "value": value})
+        return value
 
 
 def _coverage_snapshot(model_key: str, base: dict[str, int] | None = None) -> dict[str, Any]:
@@ -7703,7 +7759,7 @@ def _latest_market_state_code() -> str:
         return "S1"
 
 
-def plan_model_operations_status(*, cache_seconds: int = 3) -> dict[str, Any]:
+def plan_model_operations_status(*, cache_seconds: int = 15) -> dict[str, Any]:
     """Lightweight polling contract: no coverage scans or artifact loading."""
     now_monotonic = time.monotonic()
     cached = _operations_cache.get("value")
@@ -8063,7 +8119,6 @@ def _plan_model_candidate_governance_blocker(
 
 @_serialize_status_refresh
 def model_family_status() -> dict[str, Any]:
-    stale_reconciliation = reconcile_stale_plan_model_runs()
     now = time.monotonic()
     cached = _status_cache.get("value")
     if isinstance(cached, dict) and now - float(_status_cache.get("at") or 0) < 30:
@@ -8271,7 +8326,13 @@ def model_family_status() -> dict[str, Any]:
         "counts": counts,
         "lightgbm_params": LIGHTGBM_PARAMS,
         "evaluation_contracts": supported_model_contracts(),
-        "stale_reconciliation": stale_reconciliation,
+        # Status GETs are strictly read-only. Stale-run reconciliation is
+        # owned by autonomous model maintenance and must not delay or mutate
+        # a console read.
+        "stale_reconciliation": {
+            "status": "deferred_to_autonomous_model_maintenance",
+            "read_only": True,
+        },
     }
     _status_cache.update({"at": now, "value": result})
     return result

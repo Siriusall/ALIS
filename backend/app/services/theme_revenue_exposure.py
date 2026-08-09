@@ -51,17 +51,27 @@ def materialize_theme_revenue_exposure(*, as_of_time: str | None = None, limit_c
             cutoff_date = str(dict(row).get("value") or "") if row else ""
         clause = "WHERE available_time<=?" if cutoff else ""
         params: tuple[Any, ...] = (cutoff,) if cutoff else ()
+        company_limit = max(1, min(int(limit_companies), 8_000))
         rows = [dict(row) for row in conn.execute(
-            f"""WITH eligible AS (
-                    SELECT ts_code,period,available_time,payload_json,
-                           ROW_NUMBER() OVER(PARTITION BY ts_code ORDER BY period DESC,available_time DESC,id DESC) AS company_rank
-                    FROM dc_tushare_raw_records WHERE api_name='fina_mainbz' {('AND available_time<=?' if cutoff else '')}
-                ), latest_period AS (
-                    SELECT ts_code,MAX(period) period FROM eligible GROUP BY ts_code
-                ) SELECT e.ts_code,e.period,e.available_time,e.payload_json
-                  FROM eligible e JOIN latest_period p ON p.ts_code=e.ts_code AND p.period=e.period
-                 ORDER BY e.ts_code,e.available_time DESC LIMIT ?""",
-            params + (max(1, min(int(limit_companies), 12_000)) * 30,),
+            f"""WITH latest_period AS (
+                    SELECT ts_code,MAX(period) AS period
+                      FROM dc_tushare_raw_records
+                     WHERE api_name='fina_mainbz' {('AND available_time<=?' if cutoff else '')}
+                     GROUP BY ts_code
+                ), limited_companies AS (
+                    SELECT ts_code,period
+                      FROM latest_period
+                     ORDER BY ts_code
+                     LIMIT ?
+                )
+                SELECT r.ts_code,r.period,r.available_time,r.payload_json
+                  FROM dc_tushare_raw_records r
+                  JOIN limited_companies p
+                    ON p.ts_code=r.ts_code AND p.period=r.period
+                 WHERE r.api_name='fina_mainbz' {('AND r.available_time<=?' if cutoff else '')}
+                 ORDER BY r.ts_code,r.available_time DESC
+                 LIMIT ?""",
+            params + (company_limit,) + params + (company_limit * 30,),
         ).fetchall()]
     # Limit by companies after fetching their full latest-period segments.
     by_company: dict[str, list[dict[str, Any]]] = {}

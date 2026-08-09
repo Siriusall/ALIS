@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
+import time
 from datetime import datetime
 from typing import Any
 
@@ -12,6 +14,11 @@ from app.services.performance_reports import latest_performance_learning_context
 
 
 ALLOWED_TARGETS = {"factor", "model", "strategy", "data"}
+_schema_ready_at = 0.0
+_schema_lock = threading.Lock()
+_proposal_cache: dict[int, tuple[float, dict[str, Any]]] = {}
+_proposal_cache_lock = threading.Lock()
+_PROPOSAL_CACHE_TTL_SECONDS = 15.0
 
 
 def _confidence(value: Any) -> float:
@@ -33,20 +40,39 @@ def _string_list(value: Any, *, limit: int, item_limit: int) -> list[str]:
 
 
 def _ensure_tables() -> None:
-    with _conn() as conn:
-        conn.execute("""CREATE TABLE IF NOT EXISTS llm_research_proposals (
-            id BIGSERIAL PRIMARY KEY,
-            proposal_key VARCHAR(64) NOT NULL UNIQUE,
-            status VARCHAR(32) NOT NULL DEFAULT 'proposed',
-            source_period VARCHAR(32) NOT NULL DEFAULT '',
-            payload_json TEXT NOT NULL,
-            model VARCHAR(128) NOT NULL DEFAULT '',
-            created_at VARCHAR(64) NOT NULL,
-            updated_at VARCHAR(64) NOT NULL
-        )""")
-        conn.execute(
-            "ALTER TABLE llm_research_proposals ADD COLUMN IF NOT EXISTS evidence_json TEXT NOT NULL DEFAULT '{}'"
-        )
+    global _schema_ready_at
+    now = time.monotonic()
+    if now - _schema_ready_at < 60:
+        return
+    with _schema_lock:
+        now = time.monotonic()
+        if now - _schema_ready_at < 60:
+            return
+        with _conn() as conn:
+            conn.execute("""CREATE TABLE IF NOT EXISTS llm_research_proposals (
+                id BIGSERIAL PRIMARY KEY,
+                proposal_key VARCHAR(64) NOT NULL UNIQUE,
+                status VARCHAR(32) NOT NULL DEFAULT 'proposed',
+                source_period VARCHAR(32) NOT NULL DEFAULT '',
+                payload_json TEXT NOT NULL,
+                model VARCHAR(128) NOT NULL DEFAULT '',
+                created_at VARCHAR(64) NOT NULL,
+                updated_at VARCHAR(64) NOT NULL
+            )""")
+            conn.execute(
+                "ALTER TABLE llm_research_proposals ADD COLUMN IF NOT EXISTS evidence_json TEXT NOT NULL DEFAULT '{}'"
+            )
+            conn.execute("""CREATE TABLE IF NOT EXISTS llm_research_proposal_assessments (
+                id BIGSERIAL PRIMARY KEY, proposal_id BIGINT NOT NULL UNIQUE, status VARCHAR(32) NOT NULL,
+                assessment_json TEXT NOT NULL DEFAULT '{}', created_at VARCHAR(64) NOT NULL, updated_at VARCHAR(64) NOT NULL
+            )""")
+            conn.execute("""CREATE TABLE IF NOT EXISTS llm_research_routes (
+                id BIGSERIAL PRIMARY KEY, proposal_id BIGINT NOT NULL, hypothesis_index INTEGER NOT NULL,
+                route_key VARCHAR(64) NOT NULL, status VARCHAR(32) NOT NULL, evidence_json TEXT NOT NULL DEFAULT '{}',
+                result_json TEXT NOT NULL DEFAULT '{}', created_at VARCHAR(64) NOT NULL, updated_at VARCHAR(64) NOT NULL,
+                UNIQUE(proposal_id,hypothesis_index,route_key)
+            )""")
+        _schema_ready_at = time.monotonic()
 
 
 def _json_object(value: Any) -> dict[str, Any]:
@@ -59,19 +85,14 @@ def _json_object(value: Any) -> dict[str, Any]:
 
 def list_llm_research_proposals(*, limit: int = 50) -> dict[str, Any]:
     """Return proposal, deterministic assessment and route evidence without executing work."""
-    _ensure_tables()
     n = max(1, min(int(limit or 50), 200))
+    now = time.monotonic()
+    with _proposal_cache_lock:
+        cached = _proposal_cache.get(n)
+        if cached and now - cached[0] < _PROPOSAL_CACHE_TTL_SECONDS:
+            return cached[1]
+    _ensure_tables()
     with _conn() as conn:
-        conn.execute("""CREATE TABLE IF NOT EXISTS llm_research_proposal_assessments (
-            id BIGSERIAL PRIMARY KEY, proposal_id BIGINT NOT NULL UNIQUE, status VARCHAR(32) NOT NULL,
-            assessment_json TEXT NOT NULL DEFAULT '{}', created_at VARCHAR(64) NOT NULL, updated_at VARCHAR(64) NOT NULL
-        )""")
-        conn.execute("""CREATE TABLE IF NOT EXISTS llm_research_routes (
-            id BIGSERIAL PRIMARY KEY, proposal_id BIGINT NOT NULL, hypothesis_index INTEGER NOT NULL,
-            route_key VARCHAR(64) NOT NULL, status VARCHAR(32) NOT NULL, evidence_json TEXT NOT NULL DEFAULT '{}',
-            result_json TEXT NOT NULL DEFAULT '{}', created_at VARCHAR(64) NOT NULL, updated_at VARCHAR(64) NOT NULL,
-            UNIQUE(proposal_id,hypothesis_index,route_key)
-        )""")
         proposals = [dict(row) for row in conn.execute(
             "SELECT * FROM llm_research_proposals ORDER BY id DESC LIMIT ?", (n,),
         ).fetchall()]
@@ -103,7 +124,7 @@ def list_llm_research_proposals(*, limit: int = 50) -> dict[str, Any]:
         items.append(row)
     from app.services.llm_research_governance import llm_research_proposal_quality_report
 
-    return {
+    result = {
         "ok": True,
         "schema_version": "alis_llm_research_proposal_audit_v1",
         "count": len(items),
@@ -111,6 +132,9 @@ def list_llm_research_proposals(*, limit: int = 50) -> dict[str, Any]:
         "quality_report": llm_research_proposal_quality_report(limit=200),
         "policy": "read_only; proposal_evidence_only; no_generation_or_execution",
     }
+    with _proposal_cache_lock:
+        _proposal_cache[n] = (time.monotonic(), result)
+    return result
 
 
 def _normalise_proposal(

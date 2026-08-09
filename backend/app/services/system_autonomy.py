@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import copy
 from datetime import datetime
 import json
 import os
 import threading
+import time
 from typing import Any, Callable
 
 from app.core.error_evidence import error_evidence
@@ -15,12 +17,33 @@ _LONG_STEP_TIMEOUT_SECONDS = max(
     _STEP_TIMEOUT_SECONDS,
     min(int(os.getenv("ALIS_AUTONOMY_LONG_STEP_TIMEOUT_SECONDS", "3600")), 7200),
 )
-_LONG_RUNNING_STEPS = frozenset({"factor_daily_cycle", "plan_model_autonomy"})
+_LONG_RUNNING_STEPS = frozenset({
+    "factor_daily_cycle",
+    "plan_model_autonomy",
+    "profit_and_portfolio",
+    "periodic_performance_review",
+    "research_maintenance",
+    "free_industry_financials",
+    "pmi_demand_proxies",
+    "cn_ppi_price_proxies",
+    "theme_revenue_exposure",
+})
 _running_steps: set[str] = set()
 _running_steps_lock = threading.Lock()
+_owner_summary_cache_lock = threading.Lock()
+_owner_summary_build_lock = threading.Lock()
+_owner_summary_cache: tuple[float, dict[str, Any]] | None = None
+_OWNER_SUMMARY_CACHE_TTL_SECONDS = 30.0
 
 
 def _run_step(name: str, fn: Callable[[], dict[str, Any]]) -> dict[str, Any]:
+    """Run a step in-line so a budget overrun cannot orphan its work.
+
+    Python threads cannot be safely cancelled. The former implementation
+    returned after the budget while a daemon thread could keep its database
+    transaction and memory alive. The outer task has an independent heartbeat,
+    so the budget is now an observability threshold rather than a fake kill.
+    """
     started = datetime.now().astimezone()
     with _running_steps_lock:
         if name in _running_steps:
@@ -31,49 +54,27 @@ def _run_step(name: str, fn: Callable[[], dict[str, Any]]) -> dict[str, Any]:
                 "health": {"status": "degraded", "reason": "previous_autonomy_step_still_running"},
             }
         _running_steps.add(name)
-    box: dict[str, Any] = {}
-
-    def invoke() -> None:
-        try:
-            box["result"] = fn()
-        except BaseException as exc:  # returned on the owning bus thread
-            box["error"] = exc
-        finally:
-            with _running_steps_lock:
-                _running_steps.discard(name)
-
-    worker = threading.Thread(target=invoke, daemon=True, name=f"autonomy-step:{name}")
-    worker.start()
     timeout_seconds = (
         _LONG_STEP_TIMEOUT_SECONDS
         if name in _LONG_RUNNING_STEPS
         else _STEP_TIMEOUT_SECONDS
     )
-    worker.join(timeout_seconds)
-    if worker.is_alive():
-        step = {
-            "name": name, "ok": False,
-            "duration_seconds": round((datetime.now().astimezone() - started).total_seconds(), 3),
-            "started_at": started.isoformat(), "finished_at": datetime.now().astimezone().isoformat(),
-            "error": f"step_timeout_after_{timeout_seconds}s",
-            "result": {"status": "timed_out", "timeout_seconds": timeout_seconds},
-        }
-        from app.services.autonomous_healing import classify_step_health
-
-        step["health"] = classify_step_health(step)
-        return step
     try:
-        if "error" in box:
-            raise box["error"]
-        result = box.get("result")
+        result = fn()
+        duration_seconds = round((datetime.now().astimezone() - started).total_seconds(), 3)
         if not isinstance(result, dict):
             raise TypeError("autonomy_step_must_return_dict")
         step = {
             "name": name,
             "ok": bool(result.get("ok", True)),
-            "duration_seconds": round((datetime.now().astimezone() - started).total_seconds(), 3),
+            "duration_seconds": duration_seconds,
             "started_at": started.isoformat(), "finished_at": datetime.now().astimezone().isoformat(),
             "result": result,
+            "timing": {
+                "budget_seconds": timeout_seconds,
+                "over_budget": duration_seconds > timeout_seconds,
+                "policy": "observability_only; completed_work_is_not_marked_failed",
+            },
         }
         from app.services.autonomous_healing import classify_step_health
 
@@ -91,6 +92,9 @@ def _run_step(name: str, fn: Callable[[], dict[str, Any]]) -> dict[str, Any]:
 
         step["health"] = classify_step_health(step)
         return step
+    finally:
+        with _running_steps_lock:
+            _running_steps.discard(name)
 
 
 def _skip_experimental_step(name: str, gate: dict[str, Any]) -> dict[str, Any]:
@@ -282,7 +286,7 @@ def _owner_summary(steps: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def run_system_autonomy_cycle() -> dict[str, Any]:
+def run_system_autonomy_cycle(*, trade_date: str = "") -> dict[str, Any]:
     """Run the existing deterministic modules as one auditable daily bus cycle."""
     from app.data_platform.services.oos_hard_data import audit_oos_hard_data
     from app.services.auto_pipeline import run_daily_maintenance
@@ -313,7 +317,15 @@ def run_system_autonomy_cycle() -> dict[str, Any]:
 
     hard_data_step = _run_step("hard_data_gate", lambda: audit_oos_hard_data(include_dates=False))
     sealed_holdout_step = _run_step("sealed_holdout_data_gate", lambda: audit_sealed_strategy_holdout(include_dates=False))
-    decision_data_step = _run_step("decision_data_gate", assess_latest_decision_data_health)
+    frozen_trade_date = str(trade_date or "").replace("-", "")[:8]
+    decision_data_step = _run_step(
+        "decision_data_gate",
+        lambda: (
+            assess_latest_decision_data_health(frozen_trade_date)
+            if frozen_trade_date
+            else assess_latest_decision_data_health()
+        ),
+    )
     decision_data = decision_data_step.get("result") if isinstance(decision_data_step.get("result"), dict) else {}
     experiments_allowed = bool(decision_data.get("experiment_ready")) and str((hard_data_step.get("result") or {}).get("status") or "") == "ready"
     decisions_allowed = bool(decision_data.get("decision_ready"))
@@ -332,7 +344,14 @@ def run_system_autonomy_cycle() -> dict[str, Any]:
             lambda: run_corporate_action_cycle(as_of_date=_latest_trade_date()),
         ),
         _run_step("simulation_ledger_audit", audit_simulation_ledger),
-        decision_step("profit_and_portfolio", build_profit_loop),
+        decision_step(
+            "profit_and_portfolio",
+            lambda: (
+                build_profit_loop(signal_date=frozen_trade_date)
+                if frozen_trade_date
+                else build_profit_loop()
+            ),
+        ),
         experimental_step("factor_daily_cycle", run_factor_daily_cycle),
         experimental_step("plan_model_autonomy", lambda: run_auto_optimization_once(force=False)),
         _run_step("periodic_performance_review", run_periodic_performance_review),
@@ -409,7 +428,7 @@ def _owner_rebalance_action(action: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def latest_owner_summary() -> dict[str, Any]:
+def _build_latest_owner_summary() -> dict[str, Any]:
     with _conn() as conn:
         row = conn.execute(
             """SELECT id,status,result_json,finished_at FROM evolution_tasks
@@ -428,7 +447,6 @@ def latest_owner_summary() -> dict[str, Any]:
     except Exception:
         result = {}
     summary = result.get("owner_summary") or {}
-
     def append_read_error(exc: BaseException, operation: str) -> None:
         questions = summary.setdefault("questions", {})
         questions.setdefault("evidence_errors", []).append(
@@ -444,6 +462,27 @@ def latest_owner_summary() -> dict[str, Any]:
         and isinstance(result.get("steps"), list)
     ):
         summary = _owner_summary(result["steps"])
+    # The stored summary is evidence from a completed cycle, not a live
+    # health probe. Keep that provenance explicit so a historical timeout is
+    # not presented as an unqualified current outage.
+    summary["evidence_source"] = {
+        "kind": "completed_autonomy_cycle",
+        "task_id": int(item.get("id") or 0),
+        "finished_at": str(item.get("finished_at") or ""),
+        "live_rechecked": False,
+    }
+    questions = summary.get("questions") if isinstance(summary.get("questions"), dict) else {}
+    anomalies = questions.get("anomalies") if isinstance(questions.get("anomalies"), list) else []
+    for anomaly in anomalies:
+        if isinstance(anomaly, dict):
+            anomaly.setdefault("evidence_scope", "completed_cycle")
+            anomaly.setdefault("observed_at", str(item.get("finished_at") or ""))
+    supervision = questions.get("incident_supervision") if isinstance(questions.get("incident_supervision"), dict) else {}
+    cases = supervision.get("cases") if isinstance(supervision.get("cases"), list) else []
+    for case in cases:
+        if isinstance(case, dict):
+            case.setdefault("evidence_scope", "completed_cycle")
+            case.setdefault("observed_at", str(item.get("finished_at") or ""))
     try:
         from app.services.acceptance_progress import build_acceptance_progress
 
@@ -462,10 +501,19 @@ def latest_owner_summary() -> dict[str, Any]:
             "error": evidence["message"],
             "error_evidence": evidence,
         }
+    # The latest completed cycle already contains the sealed-data gate result.
+    # Re-running the 126-session audit on every console cold start made a
+    # historical evidence endpoint compete with the live readiness endpoint.
+    # Use that persisted result; the admin readiness route remains the live
+    # place for a fresh audit.
     try:
-        from app.services.sealed_strategy_holdout import audit_sealed_strategy_holdout
-        holdout = audit_sealed_strategy_holdout(include_dates=False)
-        if holdout.get("status") == "ready":
+        sealed_step = next(
+            (step for step in (result.get("steps") or [])
+             if isinstance(step, dict) and str(step.get("name") or "") == "sealed_holdout_data_gate"),
+            None,
+        )
+        sealed_result = sealed_step.get("result") if isinstance(sealed_step, dict) else None
+        if isinstance(sealed_result, dict) and str(sealed_result.get("status") or "") == "ready":
             questions = summary.setdefault("questions", {})
             anomalies = questions.setdefault("anomalies", [])
             anomalies[:] = [item for item in anomalies if str(item.get("module") or "") != "sealed_holdout_data_gate"]
@@ -479,77 +527,10 @@ def latest_owner_summary() -> dict[str, Any]:
             questions["incident_supervision"] = supervision
     except Exception as exc:
         append_read_error(exc, "owner_summary:sealed_holdout")
-    try:
-        from app.services.profit_loop import get_latest_daily_rebalance_plan
-        latest_plan = get_latest_daily_rebalance_plan()
-        proposal = latest_plan.get("proposal") if isinstance(latest_plan.get("proposal"), list) else []
-        actionable = [action for action in proposal if int(action.get("planned_quantity") or 0) > 0]
-        questions = summary.setdefault("questions", {})
-        questions["today_rebalance"] = {
-            "status": str(latest_plan.get("status") or "not_generated"),
-            "plan_date": latest_plan.get("trade_date"),
-            "proposal_count": len(actionable),
-            "execution_authorized": bool(latest_plan.get("execution_authorized")),
-            "planned_execute_at": latest_plan.get("planned_execute_at"),
-            "planned_execute_date": latest_plan.get("planned_execute_date"),
-            "blocked_reason": latest_plan.get("blocked_reason"),
-            "validation_error_code": latest_plan.get("validation_error_code"),
-            "validation_errors": latest_plan.get("validation_errors") or [],
-            "risk_limit_contract": latest_plan.get("risk_limit_contract") or {},
-            "actions": [_owner_rebalance_action(action) for action in proposal],
-        }
-    except Exception as exc:
-        append_read_error(exc, "owner_summary:latest_rebalance_plan")
-    try:
-        from app.services.profit_loop import build_portfolio_candles
-        comparison_payload = build_portfolio_candles(limit=90)
-        comparison = comparison_payload.get("latest_comparison") or {}
-        profit = ((summary.get("questions") or {}).get("profit") or {})
-        if comparison:
-            profit.update({
-                "benchmark_return": comparison.get("benchmark_return_pct"),
-                "excess_return": comparison.get("excess_return_pct"),
-                "benchmark_period_start": (
-                    (comparison_payload.get("series") or [{}])[0].get("date")
-                ),
-                "benchmark_period_end": comparison.get("date"),
-            })
-    except Exception as exc:
-        append_read_error(exc, "owner_summary:portfolio_comparison")
-    try:
-        from app.services.simulation_ledger_audit import audit_simulation_ledger
-        ledger = audit_simulation_ledger(persist=False)
-        questions = summary.setdefault("questions", {})
-        changes = questions.setdefault("system_changes", {})
-        changes.update({
-            "ledger_status": ledger.get("status"),
-            "ledger_cash_drift": ledger.get("cash_drift"),
-            "ledger_position_drift_count": len(ledger.get("position_deltas") or []),
-        })
-        anomalies = questions.setdefault("anomalies", [])
-        anomalies[:] = [item for item in anomalies if str(item.get("module") or "") != "simulation_ledger_audit"]
-        if not ledger.get("ok"):
-            anomalies.append({
-                "module": "simulation_ledger_audit",
-                "message": "；".join(str(item.get("message") or "") for item in ledger.get("issues") or []),
-            })
-        supervision = questions.get("incident_supervision") if isinstance(questions.get("incident_supervision"), dict) else {}
-        summary["healthy"] = int(supervision.get("owner_action_required_count") or 0) == 0 if supervision else not anomalies
-    except Exception as exc:
-        questions = summary.setdefault("questions", {})
-        anomalies = questions.setdefault("anomalies", [])
-        evidence = error_evidence(
-            exc,
-            operation="owner_summary:simulation_ledger_audit",
-            source="owner_summary",
-        )
-        anomalies.append({
-            "module": "simulation_ledger_audit",
-            "message": f"独立账本审计失败：{evidence['message']}",
-            "error_evidence": evidence,
-        })
-        supervision = questions.get("incident_supervision") if isinstance(questions.get("incident_supervision"), dict) else {}
-        summary["healthy"] = int(supervision.get("owner_action_required_count") or 0) == 0 if supervision else False
+    # Rebalance, performance and ledger values are also frozen in the latest
+    # cycle summary. Their dedicated APIs provide the live detail when the
+    # owner drills down, so do not rebuild historical curves or replay the
+    # entire ledger during this compact overview request.
     try:
         # The stored daily summary is historical evidence, but execution
         # permission is live state. Never leave the UI on a stale Champion gate
@@ -583,6 +564,29 @@ def latest_owner_summary() -> dict[str, Any]:
     }
 
 
+def latest_owner_summary() -> dict[str, Any]:
+    """Return the owner snapshot without repeating expensive read-only audits."""
+    global _owner_summary_cache
+    now = time.monotonic()
+    with _owner_summary_cache_lock:
+        cached = _owner_summary_cache
+    if cached and now - cached[0] < _OWNER_SUMMARY_CACHE_TTL_SECONDS:
+        return copy.deepcopy(cached[1])
+
+    # The owner page and the evolution page can ask for the same snapshot at
+    # once. Only one request performs the bounded audits; the other reuses it.
+    with _owner_summary_build_lock:
+        now = time.monotonic()
+        with _owner_summary_cache_lock:
+            cached = _owner_summary_cache
+        if cached and now - cached[0] < _OWNER_SUMMARY_CACHE_TTL_SECONDS:
+            return copy.deepcopy(cached[1])
+        value = _build_latest_owner_summary()
+        with _owner_summary_cache_lock:
+            _owner_summary_cache = (time.monotonic(), copy.deepcopy(value))
+        return value
+
+
 AUTONOMY_SLO_WINDOW_SESSIONS = 20
 AUTONOMY_SLO_TARGETS = {
     "cycle_completion_rate": 0.95,
@@ -610,10 +614,58 @@ def build_autonomy_slo(tasks: list[dict[str, Any]] | None = None, *, window_sess
     """Measure rolling autonomy reliability from persisted cycle evidence."""
     if tasks is None:
         with _conn() as conn:
-            rows = conn.execute(
-                """SELECT * FROM evolution_tasks WHERE task_type='system_autonomy_cycle'
-                   ORDER BY id DESC LIMIT 200"""
-            ).fetchall()
+            if getattr(conn, "_is_postgres", False):
+                # SLO checks only need three gate results. Avoid transferring
+                # every historical step and its nested evidence to the API.
+                query = """
+                    SELECT id,task_type,status,payload_json,attempt,created_at,finished_at,
+                           jsonb_build_object(
+                               'steps', COALESCE((
+                                   SELECT jsonb_agg(
+                                       jsonb_build_object(
+                                           'name', step->>'name',
+                                           'ok', step->'ok',
+                                           'result', CASE step->>'name'
+                                               WHEN 'hard_data_gate' THEN jsonb_build_object(
+                                                   'status', step->'result'->'status'
+                                               )
+                                               WHEN 'decision_data_gate' THEN jsonb_build_object(
+                                                   'decision_ready', step->'result'->'decision_ready',
+                                                   'ok', step->'result'->'ok'
+                                               )
+                                               WHEN 'simulation_ledger_audit' THEN jsonb_build_object(
+                                                   'cash_drift', step->'result'->'cash_drift',
+                                                   'position_deltas', CASE
+                                                       WHEN jsonb_typeof(step->'result'->'position_deltas')='array'
+                                                            AND jsonb_array_length(step->'result'->'position_deltas') > 0
+                                                       THEN '[1]'::jsonb
+                                                       ELSE '[]'::jsonb
+                                                   END
+                                               )
+                                               ELSE '{}'::jsonb
+                                           END
+                                       )
+                                   )
+                                   FROM jsonb_array_elements(
+                                       COALESCE(result_json::jsonb->'steps','[]'::jsonb)
+                                   ) AS step
+                                   WHERE step->>'name' IN (
+                                       'hard_data_gate','decision_data_gate','simulation_ledger_audit'
+                                   )
+                               ), '[]'::jsonb)
+                           )::text AS result_json
+                    FROM evolution_tasks
+                    WHERE task_type='system_autonomy_cycle'
+                    ORDER BY id DESC LIMIT 200
+                """
+            else:
+                query = """
+                    SELECT id,task_type,status,payload_json,result_json,attempt,created_at,finished_at
+                    FROM evolution_tasks
+                    WHERE task_type='system_autonomy_cycle'
+                    ORDER BY id DESC LIMIT 200
+                """
+            rows = conn.execute(query).fetchall()
         from app.services.evolution_orchestrator import _row
         tasks = [_row(row) for row in rows]
     sessions: dict[str, list[dict[str, Any]]] = {}

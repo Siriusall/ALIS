@@ -8,6 +8,7 @@ from app.data_platform.db import _conn
 from app.data_platform.services.market_calendar import target_trade_date
 from app.data_platform.services.runtime_logs import list_runtime_logs
 from app.data_platform.redis_store import health as redis_health, stream_health
+from app.data_platform.services.snapshot_health import latest_usable_snapshot_date
 
 
 def _dict(row: Any) -> dict[str, Any]:
@@ -22,22 +23,7 @@ def _value(row: Any, key: str, default: Any = 0) -> Any:
 
 def _latest_usable_snapshot_date(c: Any) -> str:
     stock_count = int(_value(c.execute("SELECT COUNT(*) n FROM dc_stock_master").fetchone(), "n"))
-    threshold = max(1, int(stock_count * 0.8)) if stock_count else 1
-    row = c.execute(
-        """
-        SELECT trade_date value
-        FROM dc_stock_daily_snapshot
-        GROUP BY trade_date
-        HAVING SUM(CASE WHEN close IS NOT NULL THEN 1 ELSE 0 END) >= ?
-        ORDER BY trade_date DESC
-        LIMIT 1
-        """,
-        (threshold,),
-    ).fetchone()
-    usable = str(_value(row, "value", ""))
-    if usable:
-        return usable
-    return str(_value(c.execute("SELECT MAX(trade_date) value FROM dc_stock_daily_snapshot").fetchone(), "value", ""))
+    return latest_usable_snapshot_date(c, stock_count)
 
 
 def _quality_issue(

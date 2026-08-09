@@ -281,6 +281,23 @@ def _validate_selection_snapshot(snapshot: dict[str, Any]) -> None:
                         f"统一计划已消费模型缺少冻结版本：{symbol}/{key}",
                         code="invalid_authoritative_plan",
                     )
+                # V2 snapshots distinguish a model being online for the
+                # cross-section from a sparse model producing a score for this
+                # particular symbol. Event models must not invent a zero score
+                # when no eligible event exists, while dense consumed models
+                # remain fail-closed if their per-symbol score is absent.
+                score_available = model_value.get("score_available")
+                if score_available is None:
+                    # Old frozen contracts did not carry this explicit field;
+                    # preserve their original strict validation semantics.
+                    score_available = model_value.get("raw_score") is not None
+                if score_available is not True:
+                    if key != "event_impact_assessor_v2" or model_value.get("raw_score") is not None:
+                        raise ReplayRiskGateError(
+                            f"统一计划已消费模型缺少逐标的评分：{symbol}/{key}",
+                            code="invalid_authoritative_plan",
+                        )
+                    continue
                 _finite_number(model_value.get("raw_score"), field=f"{symbol}.models.{key}.raw_score")
                 percentile = _finite_number(
                     model_value.get("percentile"),

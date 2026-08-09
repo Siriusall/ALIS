@@ -70,26 +70,96 @@ def get_thesis(thesis_id: int) -> dict[str, Any] | None:
     return value
 
 
-def list_theses(ts_code: str = "", limit: int = 100) -> list[dict[str, Any]]:
+def list_theses(
+    ts_code: str = "",
+    limit: int = 100,
+    *,
+    include_hypotheses: bool = True,
+) -> list[dict[str, Any]]:
     with _conn() as c:
-        if ts_code:
-            rows = c.execute("SELECT * FROM investment_theses WHERE ts_code=? ORDER BY updated_at DESC LIMIT ?", (ts_code, limit)).fetchall()
+        if include_hypotheses:
+            thesis_sql = "SELECT * FROM investment_theses"
         else:
-            rows = c.execute("SELECT * FROM investment_theses ORDER BY updated_at DESC LIMIT ?", (limit,)).fetchall()
+            # Summary consumers only need identity, timestamps and the derived
+            # status. Avoid transferring evidence-heavy thesis columns twice.
+            thesis_sql = (
+                "SELECT id,ts_code,title,thesis_type,core_thesis,status,confidence,"
+                "next_review_at,created_at,updated_at FROM investment_theses"
+            )
+        if ts_code:
+            rows = c.execute(
+                f"{thesis_sql} WHERE ts_code=? ORDER BY updated_at DESC LIMIT ?",
+                (ts_code, limit),
+            ).fetchall()
+        else:
+            rows = c.execute(
+                f"{thesis_sql} ORDER BY updated_at DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
         values = [dict(row) for row in rows]
         ids = [int(row["id"]) for row in values]
-        hypotheses = [] if not ids else [dict(row) for row in c.execute(
-            f"SELECT * FROM thesis_hypotheses WHERE thesis_id IN ({','.join('?' for _ in ids)}) ORDER BY thesis_id,id",
-            tuple(ids),
-        ).fetchall()]
+        if not ids:
+            return []
+        if include_hypotheses:
+            hypotheses = [dict(row) for row in c.execute(
+                f"SELECT * FROM thesis_hypotheses WHERE thesis_id IN ({','.join('?' for _ in ids)}) ORDER BY thesis_id,id",
+                tuple(ids),
+            ).fetchall()]
+        else:
+            hypotheses = [dict(row) for row in c.execute(
+                f"SELECT thesis_id,necessary,status FROM thesis_hypotheses WHERE thesis_id IN ({','.join('?' for _ in ids)}) ORDER BY thesis_id,id",
+                tuple(ids),
+            ).fetchall()]
     by_thesis: dict[int, list[dict[str, Any]]] = {thesis_id: [] for thesis_id in ids}
     for item in hypotheses:
-        item["expected"] = _loads(item.pop("expected_json", "{}"), {})
-        item["evidence"] = _loads(item.pop("evidence_json", "[]"), [])
+        if include_hypotheses:
+            item["expected"] = _loads(item.pop("expected_json", "{}"), {})
+            item["evidence"] = _loads(item.pop("evidence_json", "[]"), [])
         by_thesis.setdefault(int(item["thesis_id"]), []).append(item)
     for value in values:
-        value["hypotheses"] = by_thesis.get(int(value["id"]), [])
+        value["hypotheses"] = by_thesis.get(int(value["id"]), []) if include_hypotheses else []
         value["derived_status"], value["derived_confidence"] = _derive_thesis_state(value["hypotheses"])
+    return values
+
+
+def list_theses_for_symbols(symbols: list[str]) -> list[dict[str, Any]]:
+    """Read only thesis evidence that can match the current holdings."""
+    candidates: set[str] = set()
+    for value in symbols:
+        raw = str(value or "").strip().upper()
+        if not raw:
+            continue
+        base = raw.split(".", 1)[0]
+        candidates.update({raw, base, f"{base}.SH", f"{base}.SZ", f"{base}.BJ"})
+    if not candidates:
+        return []
+
+    thesis_placeholders = ",".join("?" for _ in candidates)
+    with _conn() as c:
+        values = [dict(row) for row in c.execute(
+            f"""SELECT id,ts_code,title,thesis_type,core_thesis,status,confidence,
+                      next_review_at,created_at,updated_at
+                 FROM investment_theses
+                WHERE ts_code IN ({thesis_placeholders})
+                ORDER BY updated_at DESC,id DESC""",
+            tuple(sorted(candidates)),
+        ).fetchall()]
+        ids = [int(row["id"]) for row in values]
+        if not ids:
+            return []
+        hypotheses = [dict(row) for row in c.execute(
+            "SELECT thesis_id,necessary,status FROM thesis_hypotheses "
+            f"WHERE thesis_id IN ({','.join('?' for _ in ids)}) ORDER BY thesis_id,id",
+            tuple(ids),
+        ).fetchall()]
+
+    by_thesis: dict[int, list[dict[str, Any]]] = {thesis_id: [] for thesis_id in ids}
+    for item in hypotheses:
+        by_thesis.setdefault(int(item["thesis_id"]), []).append(item)
+    for value in values:
+        thesis_hypotheses = by_thesis.get(int(value["id"]), [])
+        value["hypotheses"] = []
+        value["derived_status"], value["derived_confidence"] = _derive_thesis_state(thesis_hypotheses)
     return values
 
 
@@ -210,7 +280,14 @@ def generate_thesis_for_stock(
     if len(ready) < 3:
         return {"ok": False, "ts_code": code, "status": "insufficient_evidence", "reason": "fewer_than_three_ready_dimensions", "ready_dimensions": ready}
 
-    all_existing = [item for item in list_theses(ts_code=code, limit=50) if item.get("thesis_type") == "system_research_v1"]
+    all_existing = [
+        item for item in list_theses(
+            ts_code=code,
+            limit=50,
+            include_hypotheses=False,
+        )
+        if item.get("thesis_type") == "system_research_v1"
+    ]
     invalidated = [item for item in all_existing if item.get("derived_status") == "invalidated"]
     if invalidated and not force:
         return {

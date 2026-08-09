@@ -7,8 +7,14 @@ from pathlib import Path
 
 from app.core.project_env import load_project_env
 from app.core.runtime_guard import assert_data_platform_path_boundary, assert_database_boundary
+from app.core.db_connection_gate import DatabaseConnectionGate
+from app.core.db_connect import connect_postgres
 
 load_project_env()
+
+_DATA_PLATFORM_DB_CONNECTION_GATE = DatabaseConnectionGate(
+    "ALIS_DATA_DB_MAX_CONNECTIONS", default=8
+)
 
 DB_PATH = Path(os.getenv("DATA_PLATFORM_DB_PATH", str(Path(__file__).resolve().parents[1] / "data" / "data-platform.db")))
 
@@ -221,6 +227,11 @@ CREATE TABLE dc_stock_daily_snapshot (
             name TEXT NOT NULL DEFAULT '',
             industry TEXT NOT NULL DEFAULT '',
             close REAL,
+            open REAL,
+            high REAL,
+            low REAL,
+            pre_close REAL,
+            adj_factor REAL,
             change_pct REAL,
             volume REAL,
             turnover REAL,
@@ -238,6 +249,29 @@ CREATE TABLE dc_stock_daily_snapshot (
             available_time TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             PRIMARY KEY (ts_code, trade_date)
+        );
+CREATE TABLE dc_stock_daily_snapshot_stats (
+            trade_date TEXT PRIMARY KEY,
+            rows_total INTEGER NOT NULL DEFAULT 0,
+            market_rows INTEGER NOT NULL DEFAULT 0,
+            min_available_time TEXT NOT NULL DEFAULT '',
+            max_available_time TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL
+        );
+CREATE TABLE dc_research_asset_summary (
+            asset_key TEXT PRIMARY KEY,
+            records BIGINT NOT NULL DEFAULT 0,
+            symbols BIGINT NOT NULL DEFAULT 0,
+            latest_available_time TEXT NOT NULL DEFAULT '',
+            missing_pit INTEGER NOT NULL DEFAULT 0,
+            measurement TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL
+        );
+CREATE TABLE dc_research_asset_symbol_index (
+            asset_key TEXT NOT NULL,
+            ts_code TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (asset_key, ts_code)
         );
 CREATE TABLE dc_available_trade_dates (
             trade_date TEXT PRIMARY KEY,
@@ -440,10 +474,13 @@ CREATE TABLE tushare_api_catalog (
             updated_at TEXT NOT NULL
         );
 CREATE INDEX idx_dc_announcement_ts_time ON dc_announcement_raw (ts_code, publish_time);
+CREATE INDEX idx_dc_announcement_event_announcement ON dc_announcement_event (announcement_id);
 CREATE INDEX idx_dc_event_date ON dc_announcement_event (event_date);
 CREATE INDEX idx_dc_event_type ON dc_announcement_event (event_type);
 CREATE INDEX idx_dc_industry_metric_date ON dc_industry_metric_value (data_date);
+CREATE INDEX idx_dc_industry_metric_metric_available_date ON dc_industry_metric_value (metric_code, available_time, data_date);
 CREATE INDEX idx_dc_industry_metric_industry ON dc_industry_metric_definition (industry_code);
+CREATE INDEX idx_dc_industry_metric_name_metric ON dc_industry_metric_definition (industry_name, metric_code);
 CREATE INDEX idx_dc_research_ocr_status ON dc_research_ocr_observation (validation_status, observation_date);
 CREATE INDEX idx_dc_research_ocr_document_status ON dc_research_ocr_document (status, updated_at);
 CREATE INDEX idx_dc_professional_metric_document_status ON dc_professional_metric_document (status, updated_at);
@@ -461,6 +498,9 @@ CREATE INDEX idx_dc_raw_api_available ON dc_tushare_raw_records (api_name, avail
 CREATE INDEX idx_dc_etf_pcf_date ON dc_etf_pcf_header (trade_date, exchange);
 CREATE INDEX idx_dc_etf_pcf_component_date ON dc_etf_pcf_component (trade_date, etf_code);
 CREATE INDEX idx_dc_raw_api_ts_available ON dc_tushare_raw_records (api_name, ts_code, available_time, id);
+CREATE INDEX idx_dc_raw_income_pit_rank ON dc_tushare_raw_records (ts_code, period, available_time DESC, id DESC) WHERE api_name='income' AND available_time<>'';
+CREATE INDEX idx_dc_raw_balancesheet_pit_rank ON dc_tushare_raw_records (ts_code, period, available_time DESC, id DESC) WHERE api_name='balancesheet' AND available_time<>'';
+CREATE INDEX idx_dc_raw_fina_mainbz_pit_rank ON dc_tushare_raw_records (ts_code, period DESC, available_time DESC, id DESC) WHERE api_name='fina_mainbz' AND available_time<>'';
 CREATE INDEX idx_dc_tushare_failed_status ON dc_tushare_failed_requests (status, last_failed_at);
 CREATE INDEX idx_dc_request_coverage_api_symbol ON dc_tushare_request_coverage (api_name,ts_code,period);
 CREATE INDEX idx_dc_request_coverage_api_date ON dc_tushare_request_coverage (api_name,trade_date);
@@ -470,6 +510,9 @@ CREATE INDEX idx_dc_available_trade_dates_updated ON dc_available_trade_dates (u
 CREATE INDEX idx_dc_snapshot_date ON dc_stock_daily_snapshot (trade_date);
 CREATE INDEX idx_dc_snapshot_symbol ON dc_stock_daily_snapshot (symbol);
 CREATE INDEX idx_dc_snapshot_date_symbol ON dc_stock_daily_snapshot (trade_date, symbol);
+CREATE INDEX idx_dc_snapshot_stats_date ON dc_stock_daily_snapshot_stats (trade_date);
+CREATE INDEX idx_dc_research_asset_summary_updated ON dc_research_asset_summary (updated_at);
+CREATE INDEX idx_dc_research_asset_symbol_asset ON dc_research_asset_symbol_index (asset_key, ts_code);
 CREATE INDEX idx_dc_market_context_state ON dc_market_context_snapshot (market_state,trade_date);
 CREATE INDEX idx_dc_app_state_updated ON dc_app_state (updated_at);
 CREATE INDEX idx_dc_stock_industry ON dc_stock_master (industry);
@@ -482,7 +525,9 @@ CREATE INDEX idx_dc_runs_job_started ON data_ingestion_runs (job_name, started_a
 CREATE INDEX idx_dc_announcement_publish ON dc_announcement_raw (publish_time);
 CREATE INDEX idx_dc_announcement_label_version ON dc_announcement_label (label_version, labelled_at);
 CREATE INDEX idx_dc_announcement_reference_contract ON dc_announcement_reference_label (reference_contract, event_type);
+CREATE INDEX idx_dc_announcement_reference_lookup ON dc_announcement_reference_label (source_code, announcement_id, reference_contract);
 CREATE INDEX idx_dc_announcement_review_status ON dc_announcement_label_review_queue (queue_contract, status, stratum);
+CREATE INDEX idx_dc_announcement_review_lookup ON dc_announcement_label_review_queue (source_code, announcement_id, queue_contract);
 """
 
 class Connection:
@@ -547,21 +592,29 @@ def _conn():
         assert_database_boundary(url, role="data-platform")
         if url.startswith("postgresql+psycopg://"):
             url = url.replace("postgresql+psycopg://", "postgresql://", 1)
-        raw = psycopg.connect(
-            url,
-            row_factory=dict_row,
-            connect_timeout=int(os.getenv("DATABASE_CONNECT_TIMEOUT_SECONDS", "5")),
-        )
-        try:
-            raw.execute(
-                "SELECT set_config('statement_timeout', %s, false)",
-                (os.getenv("DATABASE_STATEMENT_TIMEOUT_MS", "30000"),),
+        connect_timeout = int(os.getenv("DATABASE_CONNECT_TIMEOUT_SECONDS", "5"))
+        with _DATA_PLATFORM_DB_CONNECTION_GATE.slot(connect_timeout):
+            raw = connect_postgres(
+                psycopg.connect,
+                url,
+                row_factory=dict_row,
+                timeout=connect_timeout,
+                role="data-platform",
             )
-            conn = Connection(raw, is_postgres=True)
-            yield conn
-            raw.commit()
-        finally:
-            raw.close()
+            try:
+                raw.execute(
+                    "SELECT set_config('statement_timeout', %s, false)",
+                    (os.getenv("DATABASE_STATEMENT_TIMEOUT_MS", "30000"),),
+                )
+                raw.execute(
+                    "SELECT set_config('idle_in_transaction_session_timeout', %s, false)",
+                    (os.getenv("DATABASE_IDLE_IN_TRANSACTION_TIMEOUT_MS", "120000"),),
+                )
+                conn = Connection(raw, is_postgres=True)
+                yield conn
+                raw.commit()
+            finally:
+                raw.close()
         return
     default_path = Path(__file__).resolve().parents[1] / "data" / "data-platform.db"
     assert_data_platform_path_boundary(DB_PATH, default_path=default_path)
@@ -622,8 +675,40 @@ def init_db() -> None:
                 updated_at VARCHAR(64) NOT NULL)""")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_dc_available_trade_dates_updated ON dc_available_trade_dates (updated_at)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_dc_market_context_state ON dc_market_context_snapshot (market_state,trade_date)")
+            existing_snapshot_columns = {
+                str(row["column_name"])
+                for row in conn.execute(
+                    "SELECT column_name FROM information_schema.columns WHERE table_schema='public' AND table_name='dc_stock_daily_snapshot'"
+                ).fetchall()
+            }
+            for column in ("change_pct", "volume", "turnover", "open", "high", "low", "pre_close", "adj_factor"):
+                if column not in existing_snapshot_columns:
+                    conn.execute(f"ALTER TABLE dc_stock_daily_snapshot ADD COLUMN {column} DOUBLE PRECISION")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_dc_snapshot_ts_date_bars ON dc_stock_daily_snapshot (ts_code,trade_date) INCLUDE (close,volume,turnover)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_dc_snapshot_ts_available_date ON dc_stock_daily_snapshot (ts_code,available_time,trade_date DESC) INCLUDE (pe_ttm)")
+            # History replay only accepts rows with a real point-in-time
+            # adjustment factor. Keep that predicate in the index so a
+            # missing-factor history window does not scan the full snapshot.
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_dc_snapshot_history_pit ON dc_stock_daily_snapshot (ts_code,trade_date) INCLUDE (close,volume,turnover,available_time,adj_factor) WHERE adj_factor IS NOT NULL")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_dc_snapshot_history_cover ON dc_stock_daily_snapshot (ts_code,trade_date) INCLUDE (close,volume,turnover,available_time,adj_factor)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_dc_snapshot_ts_available_date ON dc_stock_daily_snapshot (ts_code,available_time,trade_date DESC)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_dc_snapshot_date_available ON dc_stock_daily_snapshot (trade_date,available_time)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_dc_raw_income_pit_rank ON dc_tushare_raw_records (ts_code,period,available_time DESC,id DESC) WHERE api_name='income' AND available_time<>''")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_dc_raw_balancesheet_pit_rank ON dc_tushare_raw_records (ts_code,period,available_time DESC,id DESC) WHERE api_name='balancesheet' AND available_time<>''")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_dc_raw_fina_mainbz_pit_rank ON dc_tushare_raw_records (ts_code,period DESC,available_time DESC,id DESC) WHERE api_name='fina_mainbz' AND available_time<>''")
+            conn.execute("CREATE TABLE IF NOT EXISTS dc_stock_daily_snapshot_stats (trade_date VARCHAR(8) PRIMARY KEY, rows_total BIGINT NOT NULL DEFAULT 0, market_rows BIGINT NOT NULL DEFAULT 0, min_available_time VARCHAR(64) NOT NULL DEFAULT '', max_available_time VARCHAR(64) NOT NULL DEFAULT '', updated_at VARCHAR(64) NOT NULL)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_dc_snapshot_stats_date ON dc_stock_daily_snapshot_stats (trade_date)")
+            conn.execute("""CREATE TABLE IF NOT EXISTS dc_research_asset_summary (
+                asset_key VARCHAR(128) PRIMARY KEY, records BIGINT NOT NULL DEFAULT 0,
+                symbols BIGINT NOT NULL DEFAULT 0, latest_available_time VARCHAR(64) NOT NULL DEFAULT '',
+                missing_pit INTEGER NOT NULL DEFAULT 0, measurement VARCHAR(128) NOT NULL DEFAULT '',
+                updated_at VARCHAR(64) NOT NULL)""")
+            conn.execute("""CREATE TABLE IF NOT EXISTS dc_research_asset_symbol_index (
+                asset_key VARCHAR(128) NOT NULL, ts_code VARCHAR(32) NOT NULL,
+                updated_at VARCHAR(64) NOT NULL, PRIMARY KEY(asset_key,ts_code))""")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_dc_research_asset_summary_updated ON dc_research_asset_summary(updated_at)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_dc_research_asset_symbol_asset ON dc_research_asset_symbol_index(asset_key,ts_code)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_dc_industry_metric_metric_available_date ON dc_industry_metric_value (metric_code,available_time,data_date)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_dc_industry_metric_name_metric ON dc_industry_metric_definition (industry_name,metric_code)")
             conn.execute("""CREATE TABLE IF NOT EXISTS dc_industry_state_snapshot (
                 as_of_date VARCHAR(8) NOT NULL, industry_name VARCHAR(255) NOT NULL,
                 state_json TEXT NOT NULL, evidence_json TEXT NOT NULL,
@@ -658,10 +743,16 @@ def init_db() -> None:
                 features_json TEXT NOT NULL, source_as_of_time VARCHAR(64) NOT NULL,
                 created_at VARCHAR(64) NOT NULL, updated_at VARCHAR(64) NOT NULL)""")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_model_training_feature_set_date ON model_training_history(feature_set,feature_date)")
-            for column in ("change_pct", "volume", "turnover"):
-                conn.execute(f"ALTER TABLE dc_stock_daily_snapshot ADD COLUMN IF NOT EXISTS {column} DOUBLE PRECISION")
-            conn.execute("ALTER TABLE dc_tushare_request_coverage ADD COLUMN IF NOT EXISTS result_status VARCHAR(32) NOT NULL DEFAULT 'success'")
-            conn.execute("ALTER TABLE dc_tushare_request_coverage ADD COLUMN IF NOT EXISTS result_reason TEXT NOT NULL DEFAULT ''")
+            existing_coverage_columns = {
+                str(row["column_name"])
+                for row in conn.execute(
+                    "SELECT column_name FROM information_schema.columns WHERE table_schema='public' AND table_name='dc_tushare_request_coverage'"
+                ).fetchall()
+            }
+            if "result_status" not in existing_coverage_columns:
+                conn.execute("ALTER TABLE dc_tushare_request_coverage ADD COLUMN result_status VARCHAR(32) NOT NULL DEFAULT 'success'")
+            if "result_reason" not in existing_coverage_columns:
+                conn.execute("ALTER TABLE dc_tushare_request_coverage ADD COLUMN result_reason TEXT NOT NULL DEFAULT ''")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_dc_request_coverage_result ON dc_tushare_request_coverage (result_status,api_name)")
             conn.execute("""CREATE TABLE IF NOT EXISTS dc_cold_archive_manifest (
                 archive_id VARCHAR(96) PRIMARY KEY, dataset VARCHAR(64) NOT NULL,

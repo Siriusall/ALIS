@@ -15,7 +15,7 @@ from app.db.store import (
 )
 from app.services.backtest_data_source import BacktestDataSource
 from app.services.data_health import build_data_health_report
-from app.services.decision_store import list_decision_snapshots, list_position_states, list_reviews
+from app.services.decision_store import list_decision_snapshots, list_position_states, list_reviews, summarize_decision_audit
 from app.services.model_registry import get_model_status
 from app.services.quant_risk import (
     constrained_cvar_weights,
@@ -33,7 +33,7 @@ from app.services.risk_limit_contract import (
     DEFAULT_GLOBAL_SINGLE_ASSET_LIMIT,
     DEFAULT_INDUSTRY_LIMIT,
 )
-from app.services.thesis_store import list_theses
+from app.services.thesis_store import list_theses_for_symbols
 
 
 def _f(value: Any) -> float:
@@ -130,10 +130,17 @@ def _deleveraging_actions(exposures: list[dict[str, Any]], breaches: list[dict[s
     return actions
 
 
-def build_live_portfolio_risk(lookback: int = 120) -> dict[str, Any]:
-    positions = [x for x in get_positions() if int(x.get("quantity") or 0) > 0]
-    dates = list_consolidated_trade_dates()
-    as_of = dates[-1] if dates else ""
+def build_live_portfolio_risk(
+    lookback: int = 120,
+    *,
+    valuation_cache: dict[str, dict[str, Any]] | None = None,
+    positions: list[dict[str, Any]] | None = None,
+    as_of: str | None = None,
+) -> dict[str, Any]:
+    positions = [x for x in (positions if positions is not None else get_positions()) if int(x.get("quantity") or 0) > 0]
+    if as_of is None:
+        dates = list_consolidated_trade_dates()
+        as_of = dates[-1] if dates else ""
     ds = BacktestDataSource()
     returns_by_symbol: dict[str, list[float]] = {}
     exposures: list[dict[str, Any]] = []
@@ -142,13 +149,15 @@ def build_live_portfolio_risk(lookback: int = 120) -> dict[str, Any]:
     market_value = 0.0
     for item in positions:
         symbol = str(item.get("symbol") or "").strip()
-        valuation = point_in_time_position_market_series(
-            symbol=symbol,
-            as_of=as_of,
-            fallback_price=_f(item.get("price")),
-            lookback=lookback,
-            data_source=ds,
-        )
+        valuation = (valuation_cache or {}).get(symbol)
+        if valuation is None:
+            valuation = point_in_time_position_market_series(
+                symbol=symbol,
+                as_of=as_of,
+                fallback_price=_f(item.get("price")),
+                lookback=lookback,
+                data_source=ds,
+            )
         price = _f(valuation.get("price"))
         returns = list(valuation.get("returns") or [])
         price_source = str(valuation.get("price_source") or "")
@@ -214,7 +223,7 @@ def build_live_portfolio_risk(lookback: int = 120) -> dict[str, Any]:
         breaches.append({"code": "drawdown_limit", "severity": "error", "message": f"高水位回撤 {drawdown:.1%} 达到10%风险门"})
     if len(exposures) < 5 and market_value > 0:
         breaches.append({"code": "diversification", "severity": "warning", "message": "权益持仓少于5只，需说明集中配置原因"})
-    theses = list_theses(limit=500)
+    theses = list_theses_for_symbols([str(item.get("symbol") or "") for item in exposures])
     thesis_by_symbol = {str(x.get("ts_code") or "").split(".")[0]: x for x in theses}
     for item in exposures:
         thesis = thesis_by_symbol.get(item["symbol"])
@@ -373,7 +382,9 @@ def build_governance_overview() -> dict[str, Any]:
     }
 
 
-def build_decision_audit(limit: int = 100) -> dict[str, Any]:
+def build_decision_audit(limit: int = 100, *, compact: bool = False) -> dict[str, Any]:
+    if compact:
+        return summarize_decision_audit(limit=limit)
     decisions = list_decision_snapshots(limit=limit)
     reviews = list_reviews(limit=limit)
     reviewed_ids = {int(x["decision_snapshot_id"]) for x in reviews if x.get("decision_snapshot_id")}

@@ -271,8 +271,11 @@ def repair_fund_daily_from_tencent(trade_date: str, ts_codes: Iterable[str]) -> 
             "missing": missing,
         }
 
+    # A quote fetched after the close must not be represented as though it had
+    # been available at 15:00.  The execution scheduler will re-check on its
+    # next tick and may consume it only after this real observation time.
     now = _now()
-    available_time = f"{target[:4]}-{target[4:6]}-{target[6:8]}T15:00:00"
+    available_time = now
     written = 0
     with _conn() as c:
         for code in missing:
@@ -306,6 +309,7 @@ def repair_fund_daily_from_tencent(trade_date: str, ts_codes: Iterable[str]) -> 
         "ok": written == len(missing),
         "status": "completed" if written == len(missing) else "partial_or_raced",
         "source_code": SOURCE_TENCENT_ETF_QUOTE,
+        "available_time": available_time,
         "requested": len(missing),
         "received": len(quotes),
         "rows_written": written,

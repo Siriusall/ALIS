@@ -12,6 +12,8 @@ from datetime import datetime
 import json
 import math
 import os
+import threading
+import time
 from statistics import median
 
 from app.data_platform.db import _conn
@@ -20,6 +22,11 @@ from app.services.hsmm_shadow import (
     HSMM_MAX_DURATION_WEEKS,
     HSMM_MIN_DURATION_WEEKS,
 )
+
+
+_market_enrichment_cache_lock = threading.Lock()
+_market_enrichment_cache: dict[tuple[str, str], tuple[float, dict[str, Any]]] = {}
+_MARKET_ENRICHMENT_CACHE_TTL_SECONDS = 300.0
 
 
 def _clip(value: float, low: float = -1.0, high: float = 1.0) -> float:
@@ -472,6 +479,12 @@ def _production_regime_reason(governance: dict[str, Any]) -> str:
 def _market_enrichment_observations(latest: str, *, as_of_time: str | None = None) -> dict[str, Any]:
     """Build the three previously-neutralized daily market observations."""
     cutoff = str(as_of_time or "") or f"{latest[:4]}-{latest[4:6]}-{latest[6:8]}T23:59:59"
+    cache_key = (str(latest), cutoff)
+    now = time.monotonic()
+    with _market_enrichment_cache_lock:
+        cached = _market_enrichment_cache.get(cache_key)
+        if cached and now - cached[0] < _MARKET_ENRICHMENT_CACHE_TTL_SECONDS:
+            return {**cached[1], "coverage": dict(cached[1].get("coverage") or {})}
     result: dict[str, Any] = {
         "northbound_flow_z": None,
         "leader_persistence": None,
@@ -499,33 +512,35 @@ def _market_enrichment_observations(latest: str, *, as_of_time: str | None = Non
             result["coverage"]["northbound"] = len(north_values)
 
         date_rows = [str(dict(row).get("trade_date") or "") for row in c.execute(
-            "SELECT DISTINCT trade_date FROM dc_tushare_raw_records WHERE api_name='daily' AND trade_date<=? AND available_time<=? ORDER BY trade_date DESC LIMIT 21",
-            (latest, cutoff),
+            "SELECT trade_date FROM dc_available_trade_dates WHERE trade_date<=? ORDER BY trade_date DESC LIMIT 21",
+            (latest,),
         ).fetchall()]
         if date_rows:
             placeholders = ",".join("?" for _ in date_rows)
+            # Rank on the database host and return only the top 50 positive
+            # turnover names per session. The API only needs leader overlap;
+            # transferring every row of 21 full cross-sections is unnecessary.
             daily_rows = [dict(row) for row in c.execute(
-                f"SELECT trade_date,ts_code,payload_json FROM dc_tushare_raw_records WHERE api_name='daily' AND trade_date IN ({placeholders}) AND available_time<=?",
+                f"""WITH ranked AS (
+                         SELECT trade_date,ts_code,
+                                ROW_NUMBER() OVER (PARTITION BY trade_date ORDER BY turnover DESC,ts_code) AS rank
+                           FROM dc_stock_daily_snapshot
+                          WHERE trade_date IN ({placeholders})
+                            AND available_time<=?
+                            AND change_pct>0
+                            AND turnover>0
+                     )
+                     SELECT trade_date,ts_code FROM ranked WHERE rank<=50""",
                 (*date_rows, cutoff),
             ).fetchall()]
             leaders_by_date: dict[str, set[str]] = {}
             for row in daily_rows:
                 try:
-                    payload = json.loads(row.get("payload_json") or "{}")
-                    pct = float(payload.get("pct_chg") or 0)
-                    amount = float(payload.get("amount") or 0)
                     code = str(row.get("ts_code") or "")
-                    if code and pct > 0 and amount > 0:
+                    if code:
                         leaders_by_date.setdefault(str(row.get("trade_date") or ""), set()).add(code)
                 except (TypeError, ValueError, json.JSONDecodeError):
                     continue
-            for day, codes in list(leaders_by_date.items()):
-                ranked = sorted(
-                    (row for row in daily_rows if str(row.get("trade_date") or "") == day and str(row.get("ts_code") or "") in codes),
-                    key=lambda row: float(json.loads(row.get("payload_json") or "{}").get("amount") or 0),
-                    reverse=True,
-                )
-                leaders_by_date[day] = {str(row.get("ts_code") or "") for row in ranked[:50]}
             current = leaders_by_date.get(latest, set())
             prior_sets = [leaders_by_date.get(day, set()) for day in date_rows[1:] if leaders_by_date.get(day)]
             if current and prior_sets:
@@ -539,18 +554,23 @@ def _market_enrichment_observations(latest: str, *, as_of_time: str | None = Non
         fundamental_by_period: dict[str, dict[str, float]] = {}
         for period in periods:
             rows = c.execute(
-                "SELECT ts_code,payload_json FROM dc_tushare_raw_records WHERE api_name='fina_indicator' AND period=? AND available_time<=?",
+                """SELECT ts_code,
+                          payload_json::jsonb->>'q_profit_yoy' AS q_profit_yoy,
+                          payload_json::jsonb->>'q_sales_yoy' AS q_sales_yoy,
+                          payload_json::jsonb->>'roe' AS roe
+                     FROM dc_tushare_raw_records
+                    WHERE api_name='fina_indicator' AND period=? AND available_time<=?""",
                 (period, cutoff),
             ).fetchall()
             values: dict[str, float] = {}
             for row in rows:
                 try:
-                    payload = json.loads(dict(row).get("payload_json") or "{}")
+                    payload = dict(row)
                     # TuShare 的 q_profit_yoy 在部分财报批次为空；使用同一口径的
                     # q_sales_yoy，再退化到 ROE，避免整段基本面观测被误判为缺失。
                     value = next((payload.get(key) for key in ("q_profit_yoy", "q_sales_yoy", "roe") if payload.get(key) is not None), None)
                     if value is not None:
-                        values[str(dict(row).get("ts_code") or "")] = float(value)
+                        values[str(payload.get("ts_code") or "")] = float(value)
                 except (TypeError, ValueError, json.JSONDecodeError):
                     continue
             fundamental_by_period[period] = values
@@ -561,16 +581,23 @@ def _market_enrichment_observations(latest: str, *, as_of_time: str | None = Non
             fundamental_signal = median(current_values.values()) / 50.0 if current_values else 0.0
             if comparable:
                 fundamental_signal = (fundamental_signal + median(comparable) / 50.0) / 2.0
+            placeholders = ",".join("?" for _ in date_rows)
             price_rows = c.execute(
-                """SELECT trade_date,AVG(NULLIF(payload_json::jsonb->>'pct_chg','')::double precision) average_return
-                   FROM dc_tushare_raw_records WHERE api_name='daily' AND trade_date<=? AND available_time<=?
-                   GROUP BY trade_date ORDER BY trade_date DESC LIMIT 20""",
-                (latest, cutoff),
+                f"""SELECT trade_date,AVG(change_pct) average_return
+                   FROM dc_stock_daily_snapshot
+                  WHERE trade_date IN ({placeholders}) AND available_time<=?
+                  GROUP BY trade_date ORDER BY trade_date DESC LIMIT 20""",
+                (*date_rows, cutoff),
             ).fetchall()
             price_signal = (sum(float(dict(row).get("average_return") or 0) for row in price_rows) / max(1, len(price_rows))) / 3.0
             result["price_fundamental_divergence"] = round(max(-1.0, min(1.0, price_signal - fundamental_signal)), 6)
             result["coverage"]["fundamental_codes"] = len(current_values)
-    return result
+    with _market_enrichment_cache_lock:
+        if len(_market_enrichment_cache) > 16:
+            oldest = min(_market_enrichment_cache, key=lambda key: _market_enrichment_cache[key][0])
+            _market_enrichment_cache.pop(oldest, None)
+        _market_enrichment_cache[cache_key] = (time.monotonic(), result)
+    return {**result, "coverage": dict(result.get("coverage") or {})}
 
 
 def live_market_context() -> dict[str, Any]:
@@ -578,34 +605,61 @@ def live_market_context() -> dict[str, Any]:
     if isinstance(cached, dict):
         return cached
     with _conn() as c:
+        # The normalized snapshot is the production market-data contract. The
+        # raw JSON archive remains evidence storage and must not be scanned by
+        # an interactive read.
         dates = [str(dict(row)["trade_date"]) for row in c.execute(
-            """SELECT DISTINCT trade_date FROM dc_tushare_raw_records
-               WHERE api_name='daily' ORDER BY trade_date DESC LIMIT 6"""
+            """SELECT trade_date FROM dc_available_trade_dates
+               ORDER BY trade_date DESC LIMIT 6"""
         ).fetchall()]
         if len(dates) < 2:
             return {"ok": False, "status": "insufficient_data", "reason": "至少需要两个交易日行情"}
         latest, previous = dates[0], dates[1]
+        # Redis is a transport cache; the database snapshot is the durable
+        # read model. Reuse it after a Redis miss only when it was refreshed
+        # after the latest trade-date index, otherwise rebuild from source.
+        stored_snapshot = c.execute(
+            """SELECT result_json,updated_at
+                 FROM dc_market_context_snapshot
+                WHERE trade_date=?""",
+            (latest,),
+        ).fetchone()
+        latest_index = c.execute(
+            "SELECT updated_at FROM dc_available_trade_dates WHERE trade_date=?",
+            (latest,),
+        ).fetchone()
+        if stored_snapshot and latest_index:
+            stored = dict(stored_snapshot)
+            index = dict(latest_index)
+            if str(stored.get("updated_at") or "") >= str(index.get("updated_at") or ""):
+                try:
+                    snapshot_payload = json.loads(stored.get("result_json") or "{}")
+                except (TypeError, json.JSONDecodeError):
+                    snapshot_payload = {}
+                if isinstance(snapshot_payload, dict) and snapshot_payload.get("trade_date") == latest and snapshot_payload.get("ok"):
+                    set_json("alis:market-context:live:v5", snapshot_payload, ttl=300)
+                    return snapshot_payload
         breadth_row = dict(c.execute(
             """SELECT COUNT(*) total,
-                      SUM(CASE WHEN NULLIF(payload_json::jsonb->>'pct_chg','')::double precision>0 THEN 1 ELSE 0 END) rising,
-                      AVG(NULLIF(payload_json::jsonb->>'pct_chg','')::double precision/100.0) average_return
-               FROM dc_tushare_raw_records WHERE api_name='daily' AND trade_date=?""", (latest,)
+                      SUM(CASE WHEN change_pct>0 THEN 1 ELSE 0 END) rising,
+                      AVG(change_pct/100.0) average_return
+               FROM dc_stock_daily_snapshot WHERE trade_date=?""", (latest,)
         ).fetchone())
         limit_row = dict(c.execute(
             """SELECT COUNT(*) total,
-                      SUM(CASE WHEN NULLIF(payload_json::jsonb->>'pct_chg','')::double precision>=9.7 THEN 1 ELSE 0 END) limit_up,
-                      SUM(CASE WHEN NULLIF(payload_json::jsonb->>'pct_chg','')::double precision<=-9.7 THEN 1 ELSE 0 END) limit_down
-               FROM dc_tushare_raw_records WHERE api_name='daily' AND trade_date=?""", (latest,)
+                      SUM(CASE WHEN change_pct>=9.7 THEN 1 ELSE 0 END) limit_up,
+                      SUM(CASE WHEN change_pct<=-9.7 THEN 1 ELSE 0 END) limit_down
+               FROM dc_stock_daily_snapshot WHERE trade_date=?""", (latest,)
         ).fetchone())
         amount_rows = [dict(row) for row in c.execute(
-            """SELECT trade_date,SUM(NULLIF(payload_json::jsonb->>'amount','')::double precision) total_amount
-               FROM dc_tushare_raw_records WHERE api_name='daily' AND trade_date IN (?,?,?,?,?,?)
+            """SELECT trade_date,SUM(COALESCE(turnover,0.0)) total_amount
+               FROM dc_stock_daily_snapshot WHERE trade_date IN (?,?,?,?,?,?)
                GROUP BY trade_date""", tuple(dates)
         ).fetchall()]
         concentration_row = dict(c.execute(
             """WITH values AS (
-                 SELECT NULLIF(payload_json::jsonb->>'amount','')::double precision amount
-                 FROM dc_tushare_raw_records WHERE api_name='daily' AND trade_date=?),
+                 SELECT turnover AS amount
+                 FROM dc_stock_daily_snapshot WHERE trade_date=?),
                ranked AS (SELECT amount,NTILE(20) OVER(ORDER BY amount DESC) bucket FROM values WHERE amount IS NOT NULL)
                SELECT SUM(CASE WHEN bucket=1 THEN amount ELSE 0 END)/NULLIF(SUM(amount),0) concentration FROM ranked""", (latest,)
         ).fetchone())

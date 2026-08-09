@@ -20,7 +20,9 @@ from app.services.plan_model_control import (
     active_production_plan_model_bindings,
     controlled_strategy_ab_passed_current_contract,
 )
+from app.services.factor_platform import registered_factor_bindings
 from app.services.production_strategy import resolve_production_strategy_champion
+from app.services.strategy_config import get_replay_required_factor_names
 
 
 SHADOW_SCHEMA_VERSION = "alis_model_future_shadow_v1"
@@ -148,6 +150,31 @@ def _contract(
     strategy = champion.get("strategy") if isinstance(
         champion.get("strategy"), dict
     ) else {}
+    candidate_model_bindings = dict(reference_bindings)
+    candidate_model_bindings[str(version.get("model_key") or "")] = _binding(version)
+    required_factors = get_replay_required_factor_names(
+        strategy.get("content") or {},
+        str(strategy.get("type") or "formula"),
+        model_bindings=candidate_model_bindings,
+    )
+    factor_bindings = dict(champion.get("factor_bindings") or {})
+    research_bindings = registered_factor_bindings(
+        required_factors,
+        statuses=("active", "candidate"),
+    )
+    for factor_key in sorted(required_factors):
+        if not isinstance(factor_bindings.get(factor_key), dict):
+            binding = research_bindings.get(factor_key)
+            if isinstance(binding, dict):
+                factor_bindings[factor_key] = binding
+    missing_factors = sorted(
+        factor_key for factor_key in required_factors
+        if not isinstance(factor_bindings.get(factor_key), dict)
+    )
+    if missing_factors:
+        raise ValueError(
+            "研究影子合同缺少可回放因子绑定：" + ",".join(missing_factors)
+        )
     contract = {
         "schema_version": SHADOW_SCHEMA_VERSION,
         "champion_id": int(champion["champion_id"]),
@@ -157,7 +184,13 @@ def _contract(
         "strategy_controller_version_id": int(
             champion["strategy_controller_version_id"]
         ),
-        "factor_bindings": dict(champion.get("factor_bindings") or {}),
+        # Candidate/shadow replay may consume a passed candidate factor
+        # binding, but this never grants that factor production permission.
+        "factor_bindings": factor_bindings,
+        "research_factor_binding_keys": sorted(
+            key for key, value in factor_bindings.items()
+            if isinstance(value, dict) and str(value.get("status") or "") == "candidate"
+        ),
         "reference_model_bindings": reference_bindings,
         "candidate_model_binding": _binding(version),
         "target_model_reference": "disabled_ablation",
@@ -426,6 +459,12 @@ def advance_model_shadow_candidate(
     if _binding_ids(current_references) != dict(
         shadow.get("reference_binding_ids") or {}
     ):
+        return enroll_model_shadow_candidate(
+            int(model_version_id),
+            force_reset=True,
+        )
+    expected_contract = _contract(version, reference_bindings=current_references)
+    if str(shadow.get("contract_hash") or "") != str(expected_contract.get("contract_hash") or ""):
         return enroll_model_shadow_candidate(
             int(model_version_id),
             force_reset=True,
@@ -739,8 +778,8 @@ def ensure_model_shadow_tasks() -> dict[str, Any]:
                 "production_change_forbidden": True,
             },
             dedupe_key=(
-                f"model_shadow_observation:v1:{int(version['id'])}:"
-                f"{latest_ready}"
+                f"model_shadow_observation:v2:{int(version['id'])}:"
+                f"{latest_ready}:{str(shadow.get('contract_hash') or '')[:16]}"
             ),
             priority=68,
         )

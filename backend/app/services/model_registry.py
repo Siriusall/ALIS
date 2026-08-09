@@ -99,14 +99,18 @@ def reconcile_active_model_artifact(model_key: str = MODEL_KEY) -> dict[str, Any
     return None
 
 
-def get_model_status() -> dict[str, Any]:
+def get_model_status(*, include_review_feedback: bool = True) -> dict[str, Any]:
     invalid_active = reconcile_active_model_artifact(MODEL_KEY)
     active = get_active_model_version(MODEL_KEY)
     latest_run = get_latest_model_train_run()
     versions = list_model_versions(MODEL_KEY, limit=10)
     active_artifact = model_artifact_status(active) if active else {"ok": False, "status": "no_active_model"}
     from app.services.review_learning import model_feedback_gate
-    version_feedback = {str(item.get("version") or ""): model_feedback_gate(str(item.get("version") or "")) for item in versions}
+    version_feedback = (
+        {str(item.get("version") or ""): model_feedback_gate(str(item.get("version") or "")) for item in versions}
+        if include_review_feedback
+        else {}
+    )
     return {
         "model_key": MODEL_KEY,
         "active_version": active,

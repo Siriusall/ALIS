@@ -8,8 +8,14 @@ from app.data_platform.services.daily_update import daily_update_status
 from app.data_platform.services.backfill import get_plan_model_data_backfill_status
 from app.data_platform.services.runtime_logs import list_runtime_logs
 from app.db.store import list_quant_run_tasks
-from app.services.evolution_orchestrator import evolution_runtime_status, evolution_schedule_status, list_evolution_tasks
+from app.services.evolution_orchestrator import (
+    evolution_runtime_status,
+    evolution_schedule_status,
+    get_evolution_task,
+    list_evolution_tasks,
+)
 from app.data_platform.services.daily_update import simple_health
+from app.core.read_only_diagnostics import degraded_read
 from app.services.runtime_heartbeat import status as runtime_heartbeat_status
 
 
@@ -64,6 +70,9 @@ STEP_LABELS = {
 TASK_TYPE_MODULE = {
     "factor_daily_cycle": "factor", "strategy_shadow_cycle": "strategy",
     "strategy_evolution_cycle": "strategy", "strategy_controller_oos": "strategy",
+    "strategy_candidate_generation": "strategy", "strategy_environment_backtest": "strategy",
+    "strategy_cluster_distillation": "strategy", "strategy_portfolio_research": "strategy",
+    "strategy_failure_model_training": "strategy", "strategy_portfolio_formal_queue": "strategy",
     "model_candidate_research": "model",
     "model_strategy_impact_validation": "model",
     "model_shadow_observation": "model",
@@ -74,12 +83,54 @@ TASK_TYPE_MODULE = {
 TASK_TYPE_LABEL = {
     "factor_daily_cycle": "因子日评价", "strategy_shadow_cycle": "策略影子观察",
     "strategy_evolution_cycle": "正式策略演化", "strategy_controller_oos": "策略控制器 OOS",
+    "strategy_candidate_generation": "策略候选生成", "strategy_environment_backtest": "策略环境回测",
+    "strategy_cluster_distillation": "策略簇蒸馏", "strategy_portfolio_research": "策略组合研究",
+    "strategy_failure_model_training": "策略失败归因训练", "strategy_portfolio_formal_queue": "策略组合正式入队",
     "model_candidate_research": "模型候选分层筛选",
     "model_strategy_impact_validation": "模型完整策略影响验证",
     "model_shadow_observation": "模型未来影子观察",
     "plan_model_autonomy": "任务原生模型自治调度",
     "system_autonomy_cycle": "每日自治循环", "sealed_holdout_adj_factor_backfill": "密封验证集批量补全",
 }
+
+RETIRED_TASK_TYPES = {"factor_research_cycle"}
+
+
+def _is_terminal_research_contract_failure(task: dict[str, Any]) -> bool:
+    """Do not turn an exhausted, non-retriable research contract into a live outage.
+
+    These failures remain visible in the task/evidence history.  They are
+    already terminal and the scheduler must create a fresh task after the
+    governing data or contract changes; presenting them as the current module
+    state makes the health console stay red forever.
+    """
+    if str(task.get("status") or "").lower() not in {"failed", "error"}:
+        return False
+    try:
+        attempts = int(task.get("attempt") or 0)
+        max_attempts = int(task.get("max_attempts") or 0)
+    except (TypeError, ValueError):
+        return False
+    if max_attempts <= 0 or attempts < max_attempts:
+        return False
+    task_type = str(task.get("task_type") or "")
+    if task_type not in {
+        "strategy_shadow_cycle",
+        "strategy_evolution_cycle",
+        "strategy_environment_backtest",
+        "model_shadow_observation",
+        "model_strategy_impact_validation",
+    }:
+        return False
+    evidence = f"{task.get('message') or ''} {task.get('error') or ''} {task.get('result_json') or ''}".lower()
+    return any(marker in evidence for marker in (
+        "oos 永久硬数据未就绪",
+        "最新决策数据未就绪",
+        "冻结策略包缺少因子绑定",
+        "未知模型绑定",
+        "blocked_by_decision_data",
+        "blocked_incomplete_factor_bindings",
+    ))
 
 
 def _iso(value: Any) -> str | None:
@@ -185,6 +236,9 @@ def _evolution_next_step(task: dict[str, Any]) -> str:
 def _normalise_evolution(task: dict[str, Any], schedule: dict[str, Any]) -> dict[str, Any]:
     task_type = str(task.get("task_type") or "")
     module = TASK_TYPE_MODULE.get(task_type, "autonomy")
+    activity_scope = "history" if task_type in RETIRED_TASK_TYPES else None
+    if _is_terminal_research_contract_failure(task):
+        activity_scope = "history"
     next_at = _iso(task.get("next_run_at")) if str(task.get("status")) in {"queued", "retry_wait"} else _schedule_for(module, schedule)
     return {
         "id": f"evolution:{task.get('id')}", "source": "evolution", "source_id": int(task.get("id") or 0),
@@ -202,6 +256,10 @@ def _normalise_evolution(task: dict[str, Any], schedule: dict[str, Any]) -> dict
         "max_attempts": int(task.get("max_attempts") or 0),
         "checkpoint": task.get("checkpoint") if isinstance(task.get("checkpoint"), dict) else {},
         "estimated_remaining_seconds": task.get("estimated_remaining_seconds"),
+        **({
+            "activity_scope": activity_scope,
+            "history_reason": "V10 事件驱动研究已替代旧连续因子任务",
+        } if activity_scope else {}),
     }
 
 
@@ -436,6 +494,8 @@ def _latest_failure_summary(tasks: list[dict[str, Any]]) -> tuple[int, int]:
     """Separate unresolved latest failures from historical failed records."""
     latest_by_contract: dict[tuple[str, str], dict[str, Any]] = {}
     for item in tasks:
+        if item.get("activity_scope") == "history":
+            continue
         key = (str(item.get("source") or ""), str(item.get("task_type") or ""))
         if key not in latest_by_contract:
             latest_by_contract[key] = item
@@ -455,6 +515,30 @@ def _assign_activity_scope(tasks: list[dict[str, Any]]) -> None:
         else:
             item["activity_scope"] = "current"
             latest_contracts.add(key)
+
+
+def _business_task_views(tasks: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, int]]:
+    """Keep resident processes separate from work that advances the business loop.
+
+    A healthy scheduler is necessary, but it is not itself a data update,
+    decision, execution, or research task.  The owner console needs that
+    distinction to answer whether anything is actually progressing.
+    """
+    current = [item for item in tasks if item.get("activity_scope") != "history"]
+    runtime_services = [item for item in current if item.get("source") == "runtime"]
+    business = [item for item in current if item.get("source") != "runtime"]
+    active_states = {"running", "waiting", "observing", "blocked", "degraded", "partial", "failed"}
+    active = [item for item in business if str(item.get("status") or "") in active_states]
+    summary = {
+        "active": len(active),
+        "running": sum(1 for item in active if item.get("status") == "running"),
+        "waiting": sum(1 for item in active if item.get("status") in {"waiting", "observing"}),
+        "blocked": sum(1 for item in active if item.get("status") == "blocked"),
+        "failed": sum(1 for item in active if item.get("status") == "failed"),
+        "runtime_healthy": sum(1 for item in runtime_services if item.get("status") == "running"),
+        "runtime_total": len(runtime_services),
+    }
+    return active, runtime_services, summary
 
 
 def _evolution_runtime_tasks() -> list[dict[str, Any]]:
@@ -522,24 +606,62 @@ def _background_runtime_tasks() -> list[dict[str, Any]]:
     return items
 
 
-def build_task_center(*, limit: int = 50, log_limit: int = 200) -> dict[str, Any]:
+def build_task_center(
+    *,
+    limit: int = 50,
+    log_limit: int = 200,
+    include_slo: bool = True,
+    include_cycle_details: bool = True,
+    compact_cycle: bool = False,
+) -> dict[str, Any]:
     generated = datetime.now().astimezone()
-    schedule = evolution_schedule_status()
-    evolution = list_evolution_tasks(limit=max(limit, 20))
+    read_diagnostics: list[dict[str, Any]] = []
+
+    def safe_read(component: str, reader, fallback):
+        try:
+            return reader()
+        except Exception as exc:  # noqa: BLE001 - one optional read must not erase the task center
+            read_diagnostics.append(degraded_read(component, exc))
+            return fallback
+
+    schedule = safe_read("evolution_schedule", evolution_schedule_status, {})
+    evolution = safe_read("evolution_tasks", lambda: list_evolution_tasks(limit=max(limit, 20)), [])
     tasks = [_normalise_evolution(task, schedule) for task in evolution]
-    latest_cycle = next((task for task in evolution if str(task.get("task_type")) == "system_autonomy_cycle" and isinstance(task.get("result"), dict)), None)
+    latest_cycle = next(
+        (
+            task
+            for task in evolution
+            if str(task.get("task_type")) == "system_autonomy_cycle"
+        ),
+        None,
+    )
+    if latest_cycle and include_cycle_details:
+        detailed_cycle = safe_read(
+            "evolution_task_detail",
+            lambda: get_evolution_task(
+                int(latest_cycle.get("id") or 0),
+                compact=compact_cycle,
+            ),
+            None,
+        )
+        if detailed_cycle:
+            latest_cycle = detailed_cycle
     if latest_cycle:
         tasks.extend(_normalise_cycle_steps(latest_cycle, schedule))
-    daily = daily_update_status()
+    daily = safe_read("daily_update_status", daily_update_status, {})
     tasks.append(_daily_task(daily, generated))
-    tasks.append(_decision_data_task(simple_health(), daily, generated))
+    try:
+        health = simple_health()
+    except Exception as exc:  # noqa: BLE001 - task center must expose degraded state
+        health = degraded_read("decision_data_health", exc)
+    tasks.append(_decision_data_task(health, daily, generated))
     model_data_backfill = _model_data_backfill_task()
     if model_data_backfill:
         tasks.append(model_data_backfill)
     tasks.extend(_evolution_runtime_tasks())
     tasks.extend(_background_runtime_tasks())
-    tasks.extend(_data_runs(min(limit, 50)))
-    tasks.extend(_quant_tasks(min(limit, 30)))
+    tasks.extend(safe_read("data_ingestion_runs", lambda: _data_runs(min(limit, 50)), []))
+    tasks.extend(safe_read("quant_run_tasks", lambda: _quant_tasks(min(limit, 30)), []))
     tasks.sort(key=lambda item: str(item.get("updated_at") or item.get("created_at") or ""), reverse=True)
     _assign_activity_scope(tasks)
     completed_holdout = next(
@@ -556,10 +678,21 @@ def build_task_center(*, limit: int = 50, log_limit: int = 200) -> dict[str, Any
                 item["activity_scope"] = "history"
     unresolved_failures, failed_records = _latest_failure_summary(tasks)
     current_tasks = [item for item in tasks if item.get("activity_scope") != "history"]
-    from app.services.system_autonomy import build_autonomy_slo
-    autonomy_slo = build_autonomy_slo()
-    from app.services.profit_loop import build_execution_chain_slo
-    execution_slo = build_execution_chain_slo()
+    active_business_tasks, runtime_services, business_summary = _business_task_views(tasks)
+    if include_slo:
+        from app.services.system_autonomy import build_autonomy_slo
+        try:
+            autonomy_slo = build_autonomy_slo()
+        except Exception as exc:  # noqa: BLE001 - admin diagnostics must degrade safely
+            autonomy_slo = degraded_read("autonomy_slo", exc)
+        from app.services.profit_loop import build_execution_chain_slo
+        try:
+            execution_slo = build_execution_chain_slo()
+        except Exception as exc:  # noqa: BLE001 - admin diagnostics must degrade safely
+            execution_slo = degraded_read("execution_slo", exc)
+    else:
+        autonomy_slo = {"status": "deferred", "deferred": True, "reason": "紧凑任务中心只返回页面所需任务与日志"}
+        execution_slo = {"status": "deferred", "deferred": True, "reason": "紧凑任务中心只返回页面所需任务与日志"}
 
     module_items = []
     for key, name, description in MODULES:
@@ -585,7 +718,7 @@ def build_task_center(*, limit: int = 50, log_limit: int = 200) -> dict[str, Any
         })
 
     return {
-        "ok": True, "schema_version": "alis_task_center_v1", "generated_at": generated.isoformat(),
+        "ok": True, "schema_version": "alis_task_center_v2", "generated_at": generated.isoformat(),
         "summary": {
             "running": sum(1 for item in current_tasks if item.get("status") == "running"),
             "waiting": sum(1 for item in current_tasks if item.get("status") in {"waiting", "observing"}),
@@ -595,9 +728,20 @@ def build_task_center(*, limit: int = 50, log_limit: int = 200) -> dict[str, Any
             "completed": sum(1 for item in current_tasks if item.get("status") == "completed"),
         },
         "modules": module_items, "tasks": tasks[: max(20, min(limit * 3, 200))],
+        # The two explicit projections prevent clients from presenting a
+        # resident scheduler as a user-visible business operation.
+        "active_business_tasks": active_business_tasks,
+        "runtime_services": runtime_services,
+        "business_summary": business_summary,
         "autonomy_slo": autonomy_slo,
         "execution_slo": execution_slo,
-        "logs": list_runtime_logs(limit=max(20, min(log_limit, 500))), "schedule": schedule,
+        "logs": safe_read(
+            "runtime_logs",
+            lambda: list_runtime_logs(limit=max(20, min(log_limit, 500))),
+            [],
+        ),
+        "schedule": schedule,
+        "read_diagnostics": read_diagnostics,
         "policy": {
             "read_only": True,
             "time_zone": str(generated.tzinfo),

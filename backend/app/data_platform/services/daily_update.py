@@ -14,11 +14,13 @@ from app.data_platform.services.data_center import (
     run_data_quality_checks,
     sync_cninfo_announcements,
     sync_market_bundle,
+    sync_index_bundle,
     sync_stock_basic,
     sync_trade_calendar,
 )
 from app.data_platform.services.decision_data_contract import decision_data_contract, latest_decision_ready_trade_date
 from app.data_platform.services.market_calendar import target_trade_date
+from app.data_platform.services.snapshot_health import estimated_table_count, latest_usable_snapshot_date
 from app.data_platform.services.exchange_etf_pcf import sync_exchange_etf_pcf
 from app.data_platform.services.oos_hard_data import audit_oos_hard_data
 from app.core.error_evidence import error_evidence
@@ -58,27 +60,23 @@ def _latest_trade_date() -> str:
 
 def _latest_usable_snapshot_date(c: Any) -> str:
     stock_count = int(dict(c.execute("SELECT COUNT(*) cnt FROM dc_stock_master").fetchone()).get("cnt") or 0)
-    threshold = max(1, int(stock_count * 0.8)) if stock_count else 1
-    row = c.execute(
-        """
-        SELECT trade_date value
-        FROM dc_stock_daily_snapshot
-        GROUP BY trade_date
-        HAVING SUM(CASE WHEN close IS NOT NULL THEN 1 ELSE 0 END) >= ?
-        ORDER BY trade_date DESC
-        LIMIT 1
-        """,
-        (threshold,),
-    ).fetchone()
-    value = str(dict(row).get("value") or "") if row else ""
-    if value:
-        return value
-    fallback = c.execute("SELECT MAX(trade_date) value FROM dc_stock_daily_snapshot").fetchone()
-    return str(dict(fallback).get("value") or "") if fallback else ""
+    return latest_usable_snapshot_date(c, stock_count)
 
 
 def _latest_decision_ready_trade_date(c: Any) -> str:
     return latest_decision_ready_trade_date(c)
+
+
+def _benchmark_ready_for_date(c: Any, trade_date: str) -> bool:
+    """Return whether the point-in-time benchmark has a raw close for T."""
+    row = c.execute(
+        """SELECT 1 FROM dc_tushare_raw_records
+           WHERE api_name='index_daily' AND ts_code='000300.SH'
+             AND trade_date=? AND COALESCE(payload_json,'')<>''
+           LIMIT 1""",
+        (str(trade_date or "").replace("-", "")[:8],),
+    ).fetchone()
+    return bool(row)
 
 
 def _set_state(**values: Any) -> None:
@@ -193,6 +191,20 @@ def _worker(parent_run_id: int) -> None:
                 category="upstream_not_ready",
                 retry_after_seconds=600,
             )
+
+        # The benchmark is not part of the stock decision completeness gate,
+        # but it is a first-class daily output for account attribution. Keep
+        # it in the same close-of-day loop so the chart never silently lags
+        # behind the account curve again.
+        _set_state(phase="benchmark", message=f"正在更新 {trade_date} 沪深300基准", progress=60, trade_date=trade_date)
+        benchmark_result = sync_index_bundle(
+            index_code="000300.SH",
+            start_date=trade_date,
+            end_date=trade_date,
+        )
+        steps.append({"step": "benchmark", "result": benchmark_result})
+        if not bool(benchmark_result.get("ok")):
+            logger.warning("daily benchmark update deferred trade_date=%s result=%s", trade_date, benchmark_result)
 
         _set_state(phase="etf_daily", message=f"正在按交易日更新 {trade_date} ETF 日线", progress=68)
         try:
@@ -351,12 +363,14 @@ def start_daily_update_scheduler() -> bool:
                     should_check = _scheduler_should_check(now, target)
                     if should_check:
                         ready = _latest_decision_ready_trade_date(c)
+                        benchmark_ready = _benchmark_ready_for_date(c, target)
                         retry_policy = _daily_update_retry_policy(c, target, now=now)
                     else:
                         ready = ""
+                        benchmark_ready = False
                         retry_policy = {"allowed": False, "reason": "before_close_data_window"}
                 if should_check:
-                    if target and ready != target and retry_policy.get("allowed"):
+                    if target and (ready != target or not benchmark_ready) and retry_policy.get("allowed"):
                         result = start_daily_update()
                         if result.get("ok"):
                             logger.info("自动收盘日更已启动 target=%s previous_ready=%s", target, ready)
@@ -403,9 +417,10 @@ def simple_health() -> dict[str, Any]:
     with _conn() as c:
         target = target_trade_date(c)
         contract = decision_data_contract(target, conn=c)
+        snapshot_count, snapshot_count_estimated = estimated_table_count(c, "dc_stock_daily_snapshot")
         values = {
             "stock_count": c.execute("SELECT COUNT(*) cnt FROM dc_stock_master").fetchone(),
-            "snapshot_count": c.execute("SELECT COUNT(*) cnt FROM dc_stock_daily_snapshot").fetchone(),
+            "snapshot_count": {"cnt": snapshot_count},
             "latest_trade_date": {"value": _latest_usable_snapshot_date(c)},
             "latest_decision_ready_trade_date": {"value": _latest_decision_ready_trade_date(c)},
             "latest_announcement": c.execute("SELECT MAX(publish_time) value FROM dc_announcement_raw").fetchone(),
@@ -431,6 +446,7 @@ def simple_health() -> dict[str, Any]:
         "latest_decision_ready_trade_date": decision_ready,
         "decision_contract": contract,
         "stock_count": stock_count, "snapshot_count": snapshot_count,
+        "snapshot_count_estimated": snapshot_count_estimated,
         "latest_announcement": data["latest_announcement"].get("value"),
         "historical_failed_runs": int(data["failed_runs"].get("cnt") or 0),
         "recent_failed_runs": int(data["recent_failed_runs"].get("cnt") or 0),

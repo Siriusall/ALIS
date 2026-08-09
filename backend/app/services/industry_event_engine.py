@@ -137,33 +137,105 @@ def _industry_state_from_series(series: list[dict[str, Any]]) -> tuple[dict[str,
 
 def _derived_industry_proxies(c, *, as_of_time: str | None = None) -> dict[str, dict[str, Any]]:
     """Build auditable P1 industry proxies from company financial and valuation facts."""
-    cutoff_clause = "AND r.available_time<=?" if as_of_time else ""
-    params: tuple[Any, ...] = (str(as_of_time),) if as_of_time else ()
+    target_rows: dict[str, list[dict[str, Any]]] | None = None
 
     def ranked(api_name: str) -> list[dict[str, Any]]:
-        return [dict(row) for row in c.execute(
-            f"""WITH dedup AS (
-                    SELECT DISTINCT ON (r.ts_code,r.period)
-                           r.ts_code,r.period,r.payload_json,r.available_time,r.id
-                    FROM dc_tushare_raw_records r
-                    WHERE r.api_name='{api_name}' {cutoff_clause}
-                    ORDER BY r.ts_code,r.period,r.available_time DESC,
-                             length(r.payload_json) DESC,r.id DESC
-                ), ranked AS (
-                    SELECT ts_code,period,payload_json,
-                           ROW_NUMBER() OVER(PARTITION BY ts_code ORDER BY period DESC) rn
-                    FROM dedup
-                ) SELECT ts_code,period,payload_json FROM ranked
-                  WHERE rn<=8 ORDER BY ts_code,period DESC""",
-            params,
-        ).fetchall()]
+        nonlocal target_rows
+        if target_rows is None:
+            # Preserve the existing eight-period contract for target selection,
+            # but send only the two-year comparison periods used below.
+            period_clause = "AND r.available_time<=?" if as_of_time else ""
+            target_sql = f"""WITH dedup_periods AS MATERIALIZED (
+                    SELECT DISTINCT ON (r.api_name,r.ts_code,r.period)
+                           r.api_name,r.ts_code,r.period,r.available_time,r.id
+                      FROM dc_tushare_raw_records r
+                     WHERE r.api_name IN ('income','balancesheet') {period_clause}
+                     ORDER BY r.api_name,r.ts_code,r.period,r.available_time DESC,r.id DESC
+                ), limited AS MATERIALIZED (
+                    SELECT api_name,ts_code,period
+                      FROM (
+                        SELECT api_name,ts_code,period,
+                               ROW_NUMBER() OVER(PARTITION BY api_name,ts_code ORDER BY period DESC) AS rn
+                          FROM dedup_periods
+                      ) ranked
+                     WHERE rn<=8
+                ), income_latest AS (
+                    SELECT DISTINCT ON (ts_code) ts_code,period
+                      FROM limited
+                     WHERE api_name='income'
+                     ORDER BY ts_code,period DESC
+                ), income_targets AS (
+                    SELECT 'income'::text AS api_name,ts_code,period FROM income_latest
+                    UNION
+                    SELECT 'income'::text,ts_code,
+                           ((SUBSTRING(period,1,4)::integer-1)::text || SUBSTRING(period,5,4))
+                      FROM income_latest
+                ), common_periods AS MATERIALIZED (
+                    SELECT ts_code,period
+                      FROM limited
+                     GROUP BY ts_code,period
+                    HAVING COUNT(*)=2
+                ), latest_common AS (
+                    SELECT DISTINCT ON (common.ts_code) common.ts_code,common.period
+                      FROM common_periods common
+                     WHERE EXISTS (
+                           SELECT 1
+                             FROM common_periods prior
+                            WHERE prior.ts_code=common.ts_code
+                              AND prior.period=((SUBSTRING(common.period,1,4)::integer-1)::text || SUBSTRING(common.period,5,4))
+                     )
+                     ORDER BY common.ts_code,common.period DESC
+                ), common_targets AS (
+                    SELECT 'income'::text AS api_name,ts_code,period FROM latest_common
+                    UNION
+                    SELECT 'income'::text,ts_code,
+                           ((SUBSTRING(period,1,4)::integer-1)::text || SUBSTRING(period,5,4))
+                      FROM latest_common
+                    UNION
+                    SELECT 'balancesheet'::text,ts_code,period FROM latest_common
+                    UNION
+                    SELECT 'balancesheet'::text,ts_code,
+                           ((SUBSTRING(period,1,4)::integer-1)::text || SUBSTRING(period,5,4))
+                      FROM latest_common
+                ), targets AS (
+                    SELECT api_name,ts_code,period FROM income_targets
+                    UNION
+                    SELECT api_name,ts_code,period FROM common_targets
+                ), payload AS MATERIALIZED (
+                    SELECT DISTINCT ON (r.api_name,r.ts_code,r.period)
+                           r.api_name,r.ts_code,r.period,
+                           CASE WHEN r.api_name='income'
+                                THEN r.payload_json::jsonb->>'total_revenue' END AS total_revenue,
+                           CASE WHEN r.api_name='income'
+                                THEN r.payload_json::jsonb->>'n_income' END AS n_income,
+                           CASE WHEN r.api_name='balancesheet'
+                                THEN r.payload_json::jsonb->>'inventories' END AS inventories
+                      FROM dc_tushare_raw_records r
+                      JOIN targets t
+                        ON t.api_name=r.api_name AND t.ts_code=r.ts_code AND t.period=r.period
+                     WHERE 1=1 {period_clause}
+                     ORDER BY r.api_name,r.ts_code,r.period,r.available_time DESC,r.id DESC
+                )
+                SELECT api_name,ts_code,period,total_revenue,n_income,inventories
+                  FROM payload
+                 ORDER BY api_name,ts_code,period DESC"""
+            query_params = ((str(as_of_time),) if as_of_time else ()) * 2
+            grouped = {"income": [], "balancesheet": []}
+            for row in c.execute(target_sql, query_params).fetchall():
+                item = dict(row)
+                source_api = str(item.pop("api_name") or "")
+                if source_api in grouped:
+                    grouped[source_api].append(item)
+            target_rows = grouped
+        return list(target_rows.get(api_name, []))
 
     master = {str(row["ts_code"]): str(row["industry"] or "").strip() for row in c.execute(
         "SELECT ts_code,industry FROM dc_stock_master WHERE COALESCE(industry,'')<>''"
     ).fetchall()}
     income_rows, balance_rows = ranked("income"), ranked("balancesheet")
-    latest_date_clause = "AND available_time<=?" if as_of_time else ""
-    date_params: tuple[Any, ...] = (str(as_of_time),) if as_of_time else ()
+    as_of_date = str(as_of_time or "")[:10].replace("-", "")
+    latest_date_clause = "AND s.available_time<=? AND s.trade_date<=?" if as_of_time else ""
+    date_params: tuple[Any, ...] = (str(as_of_time), as_of_date) if as_of_time else ()
     # A window over every stock/date is prohibitively expensive for historical
     # replay. The lateral lookup is backed by the point-in-time index and
     # reads one latest eligible valuation row per company instead.
@@ -181,10 +253,11 @@ def _derived_industry_proxies(c, *, as_of_time: str | None = None) -> dict[str, 
     def payloads(rows: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
         result: dict[str, list[dict[str, Any]]] = {}
         for row in rows:
-            try:
-                value = json.loads(row.get("payload_json") or "{}")
-            except (TypeError, json.JSONDecodeError):
-                value = {}
+            value = {
+                key: row.get(key)
+                for key in ("total_revenue", "n_income", "inventories")
+                if row.get(key) is not None
+            }
             value["_period"] = str(row.get("period") or "")
             result.setdefault(str(row.get("ts_code") or ""), []).append(value)
         return result
@@ -353,9 +426,129 @@ def _industry_dynamic_factor_score(
         "pmi_signal": pmi_signal,
     }
 
-@lru_cache(maxsize=32)
-def _list_industries_cached(as_of_time: str) -> dict[str, Any]:
+
+def _normalize_materialized_state(state: dict[str, Any]) -> dict[str, Any]:
+    """Repair stale status labels without recomputing the industry universe.
+
+    Older materialization runs could persist ``insufficient_data`` after the
+    proxy evidence had already been written into the state components.  The
+    component values and evidence count are sufficient to reapply the same
+    deterministic scoring contract on the read path.
+    """
+    if not isinstance(state, dict):
+        return {}
+    components = state.get("components")
+    if not isinstance(components, dict):
+        return state
+    observations = {
+        str(key): value.get("value")
+        for key, value in components.items()
+        if isinstance(value, dict) and value.get("value") is not None
+    }
+    if not observations:
+        return state
+    try:
+        history_points = int(state.get("evidence_points") or 0)
+    except (TypeError, ValueError):
+        history_points = 0
+    normalized = score_industry(observations, history_points=history_points)
+    if state.get("status") != "insufficient_data" or normalized.get("status") != "ready":
+        return state
+    return {
+        **state,
+        "score": normalized.get("score", state.get("score")),
+        "coverage": normalized.get("coverage", state.get("coverage")),
+        "status": "ready",
+        "lifecycle": normalized.get("lifecycle", state.get("lifecycle")),
+        "missing": normalized.get("missing", state.get("missing", [])),
+    }
+
+def _latest_industry_snapshot(as_of_date: str, *, compact: bool = False) -> dict[str, Any] | None:
+    """Read the materialized industry contract without recomputing 112 states."""
+    snapshot_where = "WHERE as_of_date<=?" if as_of_date else ""
+    snapshot_params: tuple[Any, ...] = (as_of_date,) if as_of_date else ()
+    with _conn() as c:
+        snapshot_columns = (
+            "industry_name,as_of_date,model_version,state_json"
+            if compact
+            else "*"
+        )
+        snapshots = [dict(row) for row in c.execute(
+            f"""SELECT {snapshot_columns} FROM (
+                   SELECT s.*,ROW_NUMBER() OVER(
+                       PARTITION BY industry_name ORDER BY as_of_date DESC,available_time DESC
+                   ) rn
+                   FROM dc_industry_state_snapshot s """ + snapshot_where + """
+               ) ranked WHERE rn=1""",
+            snapshot_params,
+        ).fetchall()]
+        if not snapshots:
+            return None
+        definitions = [] if compact else [dict(row) for row in c.execute(
+            """SELECT industry_code,industry_name,metric_code,metric_name,unit,frequency,source_code,description
+               FROM dc_industry_metric_definition ORDER BY industry_name,metric_name"""
+        ).fetchall()]
+        if compact:
+            company_counts = {
+                str(dict(row).get("industry") or ""): int(dict(row).get("company_count") or 0)
+                for row in c.execute(
+                    """SELECT industry,COUNT(*) company_count FROM dc_stock_master
+                       WHERE COALESCE(industry,'')<>'' GROUP BY industry"""
+                ).fetchall()
+            }
+            companies = []
+        else:
+            company_counts = {}
+            companies = [dict(row) for row in c.execute(
+                """SELECT industry,ts_code,name FROM dc_stock_master
+                   WHERE COALESCE(industry,'')<>'' ORDER BY industry,ts_code"""
+            ).fetchall()]
+    definitions_by_name: dict[str, list[dict[str, Any]]] = {}
+    for item in definitions:
+        definitions_by_name.setdefault(str(item.get("industry_name") or ""), []).append(item)
+    companies_by_name: dict[str, list[dict[str, str]]] = {}
+    for item in companies:
+        name = str(item.get("industry") or "").strip()
+        if name:
+            companies_by_name.setdefault(name, []).append({
+                "ts_code": str(item.get("ts_code") or ""),
+                "name": str(item.get("name") or ""),
+            })
+    items: list[dict[str, Any]] = []
+    for row in snapshots:
+        industry_name = str(row.get("industry_name") or "").strip()
+        if not industry_name or industry_name.lower() == "nan":
+            continue
+        try:
+            state = json.loads(row.get("state_json") or "{}")
+            evidence = {} if compact else json.loads(row.get("evidence_json") or "{}")
+        except (TypeError, json.JSONDecodeError):
+            state, evidence = {}, {}
+        state = _normalize_materialized_state(state)
+        metrics = definitions_by_name.get(industry_name, [])
+        members = companies_by_name.get(industry_name, [])
+        items.append({
+            "industry_code": f"snapshot:{industry_name}",
+            "industry_name": industry_name,
+            "metrics": metrics,
+            "total_evidence_points": int(state.get("evidence_points") or 0),
+            "state": state,
+            "evidence": evidence,
+            "state_as_of_date": row.get("as_of_date"),
+            "state_model_version": row.get("model_version"),
+            "company_count": company_counts.get(industry_name, len(members)),
+            "companies": members[:20],
+            "limitations": [],
+        })
+    return {"ok": True, "items": items, "count": len(items), "source": "materialized_industry_state_snapshot"}
+
+
+@lru_cache(maxsize=64)
+def _list_industries_cached(as_of_time: str, compact: bool = False) -> dict[str, Any]:
     as_of_date = str(as_of_time or "")[:10].replace("-", "")
+    snapshot_result = _latest_industry_snapshot(as_of_date, compact=compact)
+    if snapshot_result:
+        return snapshot_result
     with _conn() as c:
         definitions = [dict(row) for row in c.execute(
             """SELECT d.*,COUNT(v.metric_code) value_count,MIN(v.data_date) first_date,MAX(v.data_date) last_date
@@ -454,8 +647,18 @@ def _list_industries_cached(as_of_time: str) -> dict[str, Any]:
     return {"ok": True, "items": list(grouped.values()), "count": len(grouped)}
 
 
-def list_industries(*, as_of_time: str | None = None) -> dict[str, Any]:
-    return _list_industries_cached(str(as_of_time or ""))
+def list_industries(*, as_of_time: str | None = None, compact: bool = False) -> dict[str, Any]:
+    result = _list_industries_cached(str(as_of_time or ""), compact)
+    if not compact:
+        return result
+    fields = {
+        "industry_code", "industry_name", "state", "state_as_of_date",
+        "state_model_version", "company_count", "limitations",
+    }
+    return {
+        **{key: value for key, value in result.items() if key != "items"},
+        "items": [{key: row.get(key) for key in fields if key in row} for row in result.get("items", [])],
+    }
 
 
 def clear_industry_cache() -> None:
@@ -716,7 +919,10 @@ def list_events(*, ts_code: str = "", limit: int = 100, as_of_time: str | None =
         rows.extend(_structured_raw_events(c, ts_code=ts_code, limit=limit, as_of_time=as_of_time))
     try:
         from app.services.thesis_store import list_theses
-        thesis_by_code = {str(x.get("ts_code") or ""): x for x in list_theses(limit=500)}
+        thesis_by_code = {
+            str(x.get("ts_code") or ""): x
+            for x in list_theses(limit=500, include_hypotheses=False)
+        }
     except Exception:
         thesis_by_code = {}
     for item in rows:

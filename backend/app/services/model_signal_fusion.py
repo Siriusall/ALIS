@@ -1168,6 +1168,17 @@ def apply_model_signals(
         model_values = {
             key: {
                 "raw_score": raw_scores[key].get(symbol),
+                # An online event model is intentionally sparse: most stocks
+                # have no eligible point-in-time event on a given day. Keep
+                # that distinct from an invalid numeric score so the frozen
+                # plan can validate the actual per-symbol consumption.
+                "score_available": symbol in raw_scores[key],
+                "score_status": (
+                    "scored" if symbol in raw_scores[key]
+                    else "no_observable_event" if key == "event_impact_assessor_v2"
+                    and availability[key]["available"]
+                    else "not_scored"
+                ),
                 "percentile": percentiles[key].get(symbol),
                 "version_id": (online_versions.get(key) or {}).get("id"),
                 "version": (online_versions.get(key) or {}).get("version"),

@@ -23,6 +23,7 @@ from app.data_platform.services.trade_calendar_contract import (
     audit_trade_calendar_range,
     repair_trade_calendar_range,
 )
+from app.data_platform.services.snapshot_health import snapshot_stats_for_range
 from app.db.store import _conn, get_model_version
 from app.services.production_strategy import resolve_production_strategy_champion
 from app.services.strategy_replay import run_strategy_replay
@@ -108,21 +109,20 @@ def audit_sealed_strategy_holdout(*, include_dates: bool = False) -> dict[str, A
     )
     calendar_dates = set(calendar.get("present_dates") or [])
     with _data_conn() as conn:
-        rows = conn.execute(
-            """SELECT trade_date,COUNT(*) AS rows_total,
-                      SUM(CASE WHEN close IS NOT NULL AND volume IS NOT NULL AND turnover IS NOT NULL THEN 1 ELSE 0 END) AS market_rows,
-                      MAX(available_time) AS max_available_time
-               FROM dc_stock_daily_snapshot WHERE trade_date BETWEEN ? AND ?
-               GROUP BY trade_date""",
-            (SEALED_HOLDOUT_START, SEALED_HOLDOUT_END),
-        ).fetchall()
+        snapshots = snapshot_stats_for_range(
+            conn,
+            SEALED_HOLDOUT_START,
+            SEALED_HOLDOUT_END,
+            expected_dates=SEALED_HOLDOUT_DATES,
+        )
+        if snapshots is None:
+            snapshots = {}
     compact = list(SEALED_HOLDOUT_DATES)
     api_dates = _date_api_sets(SEALED_HOLDOUT_START, SEALED_HOLDOUT_END)
     benchmark_dates = _benchmark_date_set(
         SEALED_HOLDOUT_START,
         SEALED_HOLDOUT_END,
     )
-    snapshots = {str(dict(row).get("trade_date") or ""): dict(row) for row in rows}
     details: list[dict[str, Any]] = []
     for trade_date in compact:
         snapshot = snapshots.get(trade_date) or {}

@@ -10,6 +10,7 @@ from app.data_platform.db import _conn
 from app.data_platform.redis_store import delete as redis_delete, get_json, set_json
 from app.data_platform.services.market_calendar import target_trade_date
 from app.data_platform.services.assets import _report_periods
+from app.data_platform.services.snapshot_health import latest_usable_snapshot_date
 
 _cache_lock = threading.Lock()
 _cache: dict[str, Any] = {"at": 0.0, "value": None}
@@ -33,22 +34,7 @@ def _value(row: Any, key: str, default: Any = 0) -> Any:
 
 
 def _latest_usable_snapshot_date(c: Any, stock_count: int) -> str:
-    threshold = max(1, int(stock_count * 0.8)) if stock_count else 1
-    row = c.execute(
-        """
-        SELECT trade_date value
-        FROM dc_stock_daily_snapshot
-        GROUP BY trade_date
-        HAVING SUM(CASE WHEN close IS NOT NULL THEN 1 ELSE 0 END) >= ?
-        ORDER BY trade_date DESC
-        LIMIT 1
-        """,
-        (threshold,),
-    ).fetchone()
-    usable = str(_value(row, "value", ""))
-    if usable:
-        return usable
-    return str(_value(c.execute("SELECT MAX(trade_date) value FROM dc_stock_daily_snapshot").fetchone(), "value", ""))
+    return latest_usable_snapshot_date(c, stock_count)
 
 
 def _recent_report_periods(today: date) -> list[str]:
@@ -82,7 +68,10 @@ def _metrics() -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
         raw_window = {}
         for api in ("daily", "adj_factor", "suspend_d", "stk_limit", "moneyflow"):
             raw_window[api] = dict(c.execute(
-                "SELECT COUNT(DISTINCT trade_date) dates FROM dc_tushare_raw_records WHERE api_name=? AND trade_date BETWEEN ? AND ?",
+                """SELECT COUNT(DISTINCT trade_date) dates
+                   FROM dc_tushare_request_coverage
+                  WHERE api_name=? AND trade_date BETWEEN ? AND ?
+                    AND result_status IN ('success','not_applicable','valid_empty','deferred_empty')""",
                 (api, window_start, history_end),
             ).fetchone())
         report_periods = _recent_report_periods(date.today())
@@ -93,18 +82,11 @@ def _metrics() -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
             covered_pairs = int(_value(c.execute(
                 f"""
                 SELECT COUNT(DISTINCT ts_code || ':' || period) n
-                FROM (
-                    SELECT ts_code,period
-                    FROM dc_tushare_raw_records
-                    WHERE api_name=? AND period IN ({period_placeholders}) AND ts_code<>''
-                    UNION
-                    SELECT ts_code,period
-                    FROM dc_tushare_request_coverage
-                    WHERE api_name=? AND period IN ({period_placeholders}) AND ts_code<>''
-                      AND result_status IN ('success','not_applicable','valid_empty','deferred_empty')
-                ) done
+                  FROM dc_tushare_request_coverage
+                 WHERE api_name=? AND period IN ({period_placeholders}) AND ts_code<>''
+                   AND result_status IN ('success','not_applicable','valid_empty','deferred_empty')
                 """,
-                (api, *report_periods, api, *report_periods),
+                (api, *report_periods),
             ).fetchone(), "n"))
             financial_pair_coverage[api] = (min(covered_pairs, financial_expected), financial_expected)
         checked_symbols = {}
@@ -130,7 +112,7 @@ def _metrics() -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
             "SELECT COUNT(*) n FROM dc_trade_calendar WHERE exchange='SSE' AND cal_date BETWEEN ? AND ?", (window_start, calendar_end)
         ).fetchone(), "n"))
         history_dates = int(_value(c.execute(
-            "SELECT COUNT(DISTINCT trade_date) n FROM dc_stock_daily_snapshot WHERE trade_date BETWEEN ? AND ?", (window_start, history_end)
+            "SELECT COUNT(*) n FROM dc_available_trade_dates WHERE trade_date BETWEEN ? AND ?", (window_start, history_end)
         ).fetchone(), "n"))
         theme_snapshot_dates = int(_value(c.execute(
             """

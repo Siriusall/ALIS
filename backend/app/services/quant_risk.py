@@ -12,6 +12,7 @@ except ImportError:  # lightweight contract-test store shim
     update_account_high_water_mark = lambda equity: equity
 from app.services.backtest_data_source import BacktestDataSource
 from app.services.data_health import build_data_health_report
+from app.services.position_valuation import build_position_market_series_cache
 from app.services.risk_limit_contract import DEFAULT_GLOBAL_SINGLE_ASSET_LIMIT
 
 REQUIRED_MARKET_DAY_APIS = ("daily", "daily_basic", "stk_limit")
@@ -294,8 +295,23 @@ def evaluate_account_drawdown_gate(*, max_drawdown: float = 0.10) -> RiskPauseDe
     cash = max(0.0, _safe_float(get_account_balance()))
     position_value = 0.0
     try:
-        for pos in get_positions():
-            position_value += max(0.0, _safe_float(pos.get("quantity"))) * max(0.0, _safe_float(pos.get("price")))
+        positions = get_positions()
+        dates = []
+        try:
+            from app.services.quant_run_engine import list_consolidated_trade_dates
+            dates = list_consolidated_trade_dates()
+        except Exception:
+            dates = []
+        valuation = build_position_market_series_cache(
+            positions,
+            as_of=dates[-1] if dates else "",
+        )
+        for pos in positions:
+            symbol = str(pos.get("symbol") or "")
+            price = _safe_float((valuation.get(symbol) or {}).get("price"))
+            if price <= 0:
+                price = _safe_float(pos.get("price"))
+            position_value += max(0.0, _safe_float(pos.get("quantity"))) * max(0.0, price)
     except Exception:
         position_value = 0.0
     equity = cash + position_value

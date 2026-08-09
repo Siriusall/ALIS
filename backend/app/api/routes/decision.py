@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import copy
+import threading
+import time
 from typing import Any
 
 from fastapi import APIRouter, Query
 
 from app.data_platform.db import _conn as data_conn
 from app.data_platform.services.decision_data_contract import decision_data_contract
-from app.db.store import get_account_balance, get_account_baseline, get_account_high_water_mark, get_backtest_result, get_positions, list_backtests, list_executions, list_operations
+from app.db.store import get_account_balance, get_account_baseline, get_account_high_water_mark, get_backtest_result, get_positions, list_backtests, list_executions, list_operations_for_execution_ids
 from app.services.backtest_data_source import BacktestDataSource
 from app.services.data_health import build_data_health_report
 from app.services.market_context import live_market_context
@@ -14,11 +17,18 @@ from app.services.model_registry import get_model_status
 from app.services.quant_run_engine import list_consolidated_trade_dates
 from app.services.operations_overview import build_live_portfolio_risk
 from app.services.theme_engine import list_themes
-from app.services.daily_rebalance import build_daily_rebalance_report
+from app.services.daily_rebalance import build_daily_rebalance_report, build_daily_rebalance_summary
+from app.services.profit_loop import get_latest_daily_rebalance_plan
 from app.services.decision_enhancement import build_decision_enhancement
 from app.services.quant_risk import evaluate_model_readiness_gate
+from app.services.position_valuation import build_position_market_series_cache, point_in_time_position_market_series
+from app.core.read_only_diagnostics import degraded_read
 
 router = APIRouter()
+
+_DECISION_SUMMARY_CACHE_TTL_SECONDS = 10.0
+_decision_summary_cache_lock = threading.Lock()
+_decision_summary_cache: dict[int, tuple[float, dict[str, Any]]] = {}
 
 MIN_CASH_FOR_TRADE = 10_000.0
 MAX_SINGLE_POSITION_PCT = 0.40
@@ -53,14 +63,18 @@ def _equity_budget_breach(ledger: dict[str, Any], position_gate: dict[str, Any])
     return risk_budget > 0 and current_equity > risk_budget + 0.005, current_equity, risk_budget
 
 
-def _ledger_summary() -> dict[str, Any]:
-    from app.services.position_valuation import point_in_time_position_market_series
-
+def _ledger_summary(
+    *,
+    positions: list[dict[str, Any]] | None = None,
+    latest_date: str | None = None,
+    valuation_cache: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     cash_balance = float(get_account_balance() or 0)
     baseline = float(get_account_baseline() or 0)
-    positions = get_positions()
-    latest_trade_dates = list_consolidated_trade_dates()
-    latest_date = latest_trade_dates[-1] if latest_trade_dates else ""
+    positions = positions if positions is not None else get_positions()
+    if latest_date is None:
+        latest_trade_dates = list_consolidated_trade_dates()
+        latest_date = latest_trade_dates[-1] if latest_trade_dates else ""
     ds = BacktestDataSource()
     market_value = 0.0
     by_symbol_value: dict[str, float] = {}
@@ -69,12 +83,14 @@ def _ledger_summary() -> dict[str, Any]:
         qty = int(p.get("quantity") or 0)
         if not sym or qty <= 0:
             continue
-        valuation = point_in_time_position_market_series(
-            symbol=sym,
-            as_of=latest_date,
-            fallback_price=float(p.get("price") or 0),
-            data_source=ds,
-        )
+        valuation = (valuation_cache or {}).get(sym)
+        if valuation is None:
+            valuation = point_in_time_position_market_series(
+                symbol=sym,
+                as_of=latest_date,
+                fallback_price=float(p.get("price") or 0),
+                data_source=ds,
+            )
         px = float(valuation.get("price") or 0)
         mv = round(px * qty, 2)
         market_value += mv
@@ -125,7 +141,12 @@ def _ledger_summary() -> dict[str, Any]:
     }
 
 
-def _market_overview() -> dict[str, Any]:
+def _market_overview(
+    *,
+    valuation_cache: dict[str, dict[str, Any]] | None = None,
+    positions: list[dict[str, Any]] | None = None,
+    as_of: str | None = None,
+) -> dict[str, Any]:
     """Return a provenance-aware market snapshot without inventing missing inputs."""
     try:
         context = live_market_context()
@@ -168,7 +189,11 @@ def _market_overview() -> dict[str, Any]:
         "reason": "" if theme_items else theme_error or "尚无满足两类来源、至少5个关联标的和3个交易日确认门的主题",
     }
     try:
-        portfolio_risk = build_live_portfolio_risk()
+        portfolio_risk = build_live_portfolio_risk(
+            valuation_cache=valuation_cache,
+            positions=positions,
+            as_of=as_of,
+        )
     except Exception as exc:  # noqa: BLE001
         portfolio_risk = {"ok": False, "status": "unknown", "breaches": [], "limitations": [str(exc)[:160]]}
     state_multiplier = float(context["market_state"]["risk_budget_multiplier"])
@@ -196,9 +221,10 @@ def _recent_execution_summary() -> dict[str, Any] | None:
     ex = executions[0]
     latest_trade_date = str(ex.get("executed_at") or "")[:10]
     day_executions = [item for item in executions if str(item.get("executed_at") or "")[:10] == latest_trade_date]
-    ops = []
-    for execution in day_executions:
-        ops.extend(list_operations(execution_id=int(execution["id"]), limit=100))
+    ops = list_operations_for_execution_ids(
+        [int(execution["id"]) for execution in day_executions],
+        limit_per_execution=100,
+    )
     position_names = {str(item.get("symbol") or ""): str(item.get("name") or "") for item in get_positions()}
     symbols = {str(operation.get("symbol") or "") for operation in ops if operation.get("symbol")}
     if symbols:
@@ -490,16 +516,49 @@ def _risk_gate_explanation(
 
 
 @router.get("/decision/daily-report")
-def decision_daily_report() -> dict[str, Any]:
+def decision_daily_report(compact: bool = Query(default=False)) -> dict[str, Any]:
     """P3-7 每日调仓报告"""
-    return build_daily_rebalance_report()
+    try:
+        return build_daily_rebalance_summary() if compact else build_daily_rebalance_report()
+    except Exception as exc:  # noqa: BLE001 - report is read-only and must expose blocked state
+        return degraded_read("daily_rebalance_report", exc, sections=[], trades=[], positions=[])
+
+
+@router.get("/decision/latest-plan")
+def decision_latest_plan() -> dict[str, Any]:
+    """Return the latest immutable formal plan without running a daily report."""
+    try:
+        return get_latest_daily_rebalance_plan()
+    except Exception as exc:  # noqa: BLE001 - a console read must expose failure
+        return degraded_read("latest_daily_rebalance_plan", exc, proposal=[])
+
+
 @router.get("/decision/summary")
 def decision_summary(limit_days: int = Query(30, ge=1, le=250)) -> dict[str, Any]:
+    cache_key = max(1, min(int(limit_days or 30), 250))
+    now = time.monotonic()
+    with _decision_summary_cache_lock:
+        cached = _decision_summary_cache.get(cache_key)
+    if cached and now - cached[0] < _DECISION_SUMMARY_CACHE_TTL_SECONDS:
+        return copy.deepcopy(cached[1])
+
     data_health = build_data_health_report(limit_days=limit_days)
     latest_data_contract = _latest_decision_data_contract()
-    ledger = _ledger_summary()
-    model_status = get_model_status()
-    market_overview = _market_overview()
+    positions = get_positions()
+    latest_trade_dates = list_consolidated_trade_dates()
+    latest_date = latest_trade_dates[-1] if latest_trade_dates else ""
+    valuation_cache = build_position_market_series_cache(positions, as_of=latest_date)
+    ledger = _ledger_summary(
+        positions=positions,
+        latest_date=latest_date,
+        valuation_cache=valuation_cache,
+    )
+    model_status = get_model_status(include_review_feedback=False)
+    market_overview = _market_overview(
+        valuation_cache=valuation_cache,
+        positions=positions,
+        as_of=latest_date,
+    )
     gate_decision = _build_gate_decision(
         data_health=data_health,
         latest_data_contract=latest_data_contract,
@@ -532,8 +591,9 @@ def decision_summary(limit_days: int = Query(30, ge=1, le=250)) -> dict[str, Any
         market_overview=market_overview,
         ledger=ledger,
         recent_execution=recent_execution,
+        include_candidate_shadow_ab=False,
     )
-    return {
+    result = {
         "data_health": data_health,
         "latest_data_contract": latest_data_contract,
         "ledger": ledger,
@@ -546,3 +606,10 @@ def decision_summary(limit_days: int = Query(30, ge=1, le=250)) -> dict[str, Any
         "latest_model_validation": _latest_model_validation(model_status),
         "latest_analyze": None,
     }
+    with _decision_summary_cache_lock:
+        # Keep only the most recent bounded read variants in this process.
+        if len(_decision_summary_cache) >= 4 and cache_key not in _decision_summary_cache:
+            oldest_key = min(_decision_summary_cache, key=lambda key: _decision_summary_cache[key][0])
+            _decision_summary_cache.pop(oldest_key, None)
+        _decision_summary_cache[cache_key] = (time.monotonic(), copy.deepcopy(result))
+    return result

@@ -18,6 +18,7 @@ from app.core.trade_calendar import is_trade_day
 from app.db.store import (
     _conn,
     get_model_version,
+    get_strategy,
     list_model_versions,
     update_model_version_metrics,
     update_model_version_status,
@@ -26,6 +27,7 @@ from app.db.store import (
 from app.services.production_strategy import resolve_production_strategy_champion
 from app.services.walk_forward_validation import run_purged_walk_forward_validation
 from app.services.strategy_replay import run_strategy_replay
+from app.services.strategy_config import get_replay_required_factor_names
 from app.services.backtest_data_source import BacktestDataSource
 from app.services.strategy_lifecycle import advance_formal_candidate_lifecycle
 from app.services.strategy_statistics import deflated_sharpe_ratio
@@ -38,6 +40,8 @@ LEASE_MINUTES = max(10, min(int(os.getenv("EVOLUTION_LEASE_MINUTES", "30")), 180
 POLL_SECONDS = max(2, min(int(os.getenv("EVOLUTION_POLL_SECONDS", "5")), 60))
 AUTO_ENABLED = str(os.getenv("EVOLUTION_AUTO_ENABLED", "1")).lower() in {"1", "true", "yes", "on"}
 V10_RESEARCH_ENABLED = str(os.getenv("ALIS_V10_RESEARCH_ENABLED", "1")).lower() in {"1", "true", "yes", "on"}
+LOW_MEMORY_WORKER = str(os.getenv("ALIS_WORKER_PROFILE", "")).lower() in {"2gb", "low_memory", "low-memory"}
+WORKER_RESEARCH_BATCH_SIZE = 1 if LOW_MEMORY_WORKER else 4
 AUTO_WEEKDAY = max(0, min(int(os.getenv("EVOLUTION_AUTO_WEEKDAY", "4")), 6))
 AUTO_HOUR = max(0, min(int(os.getenv("EVOLUTION_AUTO_HOUR", "18")), 23))
 MAX_CANDIDATES_PER_CYCLE = max(1, min(int(os.getenv("EVOLUTION_MAX_CANDIDATES", "6")), 20))
@@ -53,16 +57,29 @@ RESOURCE_BUDGET_RETRY_SECONDS = max(
 RESOURCE_BUDGET_MAX_STALLED_RESUMES = max(
     1, min(int(os.getenv("EVOLUTION_RESOURCE_BUDGET_MAX_STALLED_RESUMES", "2")), 10)
 )
+LEASE_RECOVERY_INTERVAL_SECONDS = max(
+    15, min(int(os.getenv("EVOLUTION_LEASE_RECOVERY_INTERVAL_SECONDS", "30")), 300)
+)
 HEARTBEAT_PULSE_SECONDS = max(
     1, min(int(os.getenv("EVOLUTION_HEARTBEAT_PULSE_SECONDS", "5")), 60)
 )
+HEARTBEAT_DB_RETRY_ATTEMPTS = max(
+    1, min(int(os.getenv("EVOLUTION_HEARTBEAT_DB_RETRY_ATTEMPTS", "3")), 5)
+)
+HEARTBEAT_DB_RETRY_BACKOFF_SECONDS = max(
+    0.1, min(float(os.getenv("EVOLUTION_HEARTBEAT_DB_RETRY_BACKOFF_SECONDS", "0.5")), 5.0)
+)
+LEGACY_TASK_RECONCILIATION_VERSION = "alis_evolution_task_reconciliation_v1"
 WORKER_ID = f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
 SYSTEM_AUTONOMY_RECOVERY_POLICY_VERSION = "v3"
 SYSTEM_AUTONOMY_MAX_RECOVERY_CONTINUATIONS = 2
 _worker_started = False
 _scheduler_started = False
+_lease_recovery_started = False
 _start_lock = threading.Lock()
 _runtime_lock = threading.Lock()
+_active_task_lock = threading.Lock()
+_active_task_ids: set[int] = set()
 _runtime_status: dict[str, dict[str, Any]] = {
     "worker": {"started": False, "alive": False, "heartbeat_at": None, "last_error": ""},
     "scheduler": {"started": False, "alive": False, "heartbeat_at": None, "last_error": ""},
@@ -162,6 +179,25 @@ def _lease_owner_process_alive(owner: Any) -> bool | None:
     return True
 
 
+def _is_task_execution_active(task_id: int) -> bool:
+    with _active_task_lock:
+        return int(task_id) in _active_task_ids
+
+
+def _with_heartbeat_db_retry(operation: Callable[[], Any]) -> Any:
+    """Retry only the small lease read/write boundary on transient DB failures."""
+    for attempt in range(HEARTBEAT_DB_RETRY_ATTEMPTS):
+        try:
+            return operation()
+        except EvolutionTaskCancelled:
+            raise
+        except Exception:
+            if attempt + 1 >= HEARTBEAT_DB_RETRY_ATTEMPTS:
+                raise
+            time.sleep(HEARTBEAT_DB_RETRY_BACKOFF_SECONDS * (2 ** attempt))
+    raise RuntimeError("heartbeat retry loop exhausted")
+
+
 def _json(value: Any) -> str:
     return json.dumps(value if value is not None else {}, ensure_ascii=False, default=str)
 
@@ -196,6 +232,111 @@ def _row(row: Any) -> dict[str, Any]:
     return item
 
 
+_TASK_LIST_COLUMNS = (
+    "id,task_type,dedupe_key,status,phase,progress,message,error,attempt,max_attempts,priority,"
+    "stop_requested,deadline_at,lease_owner,lease_expires_at,heartbeat_at,next_run_at,"
+    "started_at,finished_at,created_at,updated_at"
+)
+
+
+def _get_evolution_task_summary(task_id: int) -> dict[str, Any] | None:
+    """Read task metadata without transferring frozen JSON evidence."""
+    with _conn() as conn:
+        row = conn.execute(
+            f"SELECT {_TASK_LIST_COLUMNS} FROM evolution_tasks WHERE id=?",
+            (int(task_id),),
+        ).fetchone()
+    return _row(row) if row else None
+
+
+def _task_payload(task: dict[str, Any]) -> dict[str, Any]:
+    payload = task.get("payload")
+    return payload if isinstance(payload, dict) else {}
+
+
+def _superseded_task_reason(
+    task: dict[str, Any],
+    successor_edges: set[tuple[int, str]],
+) -> str | None:
+    """Return a reason for an active task that must never be executed.
+
+    V10 research is event-driven. The former weekly generic strategy task and
+    a predecessor branch that already produced a later research artifact are
+    historical evidence, not work waiting for a worker.
+    """
+    task_type = str(task.get("task_type") or "")
+    payload = _task_payload(task)
+    trigger = str(payload.get("trigger") or "")
+    if V10_RESEARCH_ENABLED and task_type == "strategy_evolution_cycle" and trigger == "weekly_scheduler":
+        return "旧 weekly_scheduler 合同已由 V10 事件驱动研究替代，保留证据但禁止执行"
+    if V10_RESEARCH_ENABLED and task_type == "strategy_candidate_generation":
+        predecessor = int(payload.get("predecessor_task_id") or 0)
+        if predecessor and any(edge[0] == predecessor for edge in successor_edges):
+            return "同一研究前驱已有后继研究链，保留失败证据但禁止重复执行"
+    return None
+
+
+def reconcile_superseded_evolution_tasks(*, limit: int = 200) -> dict[str, Any]:
+    """Atomically quarantine queued research branches superseded by V10.
+
+    This is intentionally narrow: only queued/retry-wait tasks with a
+    deterministic replacement are changed. Running tasks, including formal
+    OOS with a live lease, are never touched.
+    """
+    now = _now().isoformat()
+    with _conn() as conn:
+        rows = conn.execute(
+            """SELECT id,task_type,status,payload_json
+               FROM evolution_tasks
+               WHERE status IN ('queued','retry_wait')
+               ORDER BY id ASC LIMIT ?""",
+            (max(1, min(int(limit), 500)),),
+        ).fetchall()
+        all_rows = conn.execute(
+            """SELECT id,task_type,status,payload_json
+               FROM evolution_tasks
+               WHERE status IN ('completed','running','queued','retry_wait')""",
+        ).fetchall()
+        successor_edges: set[tuple[int, str]] = set()
+        successor_types = {
+            "strategy_cluster_distillation",
+            "strategy_portfolio_research",
+            "strategy_portfolio_formal_queue",
+            "strategy_evolution_cycle",
+        }
+        for row in all_rows:
+            item = dict(row)
+            payload = _loads(item.get("payload_json"), {})
+            predecessor = int(payload.get("predecessor_task_id") or 0) if isinstance(payload, dict) else 0
+            if predecessor and str(item.get("task_type") or "") in successor_types:
+                successor_edges.add((predecessor, str(item.get("task_type") or "")))
+
+        quarantined: list[dict[str, Any]] = []
+        for row in rows:
+            task = dict(row)
+            task["payload"] = _loads(task.pop("payload_json", None), {})
+            reason = _superseded_task_reason(task, successor_edges)
+            if not reason:
+                continue
+            cursor = conn.execute(
+                """UPDATE evolution_tasks
+                   SET status='cancelled',phase='superseded',progress=1,
+                       message=?,error=NULL,stop_requested=1,
+                       finished_at=?,lease_owner=NULL,lease_expires_at=NULL,
+                       heartbeat_at=?,updated_at=?
+                   WHERE id=? AND status IN ('queued','retry_wait')""",
+                (reason, now, now, now, int(task["id"])),
+            )
+            if int(cursor.rowcount or 0) > 0:
+                quarantined.append({"id": int(task["id"]), "reason": reason})
+    return {
+        "ok": True,
+        "schema_version": LEGACY_TASK_RECONCILIATION_VERSION,
+        "quarantined": quarantined,
+        "count": len(quarantined),
+    }
+
+
 def create_evolution_task(
     *,
     task_type: str = "strategy_evolution_cycle",
@@ -221,22 +362,22 @@ def create_evolution_task(
             conn.execute("SELECT pg_advisory_xact_lock(hashtext(?))", (lock_key,))
         if coalesce_active_type:
             active = conn.execute(
-                """SELECT * FROM evolution_tasks
+                """SELECT id FROM evolution_tasks
                    WHERE task_type=?
                      AND status IN ('queued','running','retry_wait')
                    ORDER BY priority ASC,created_at ASC LIMIT 1""",
                 (str(task_type),),
             ).fetchone()
             if active:
-                return _row(active)
+                return _get_evolution_task_summary(int(active["id"])) or {"id": int(active["id"])}
         existing = conn.execute(
-            """SELECT * FROM evolution_tasks
+            """SELECT id FROM evolution_tasks
                WHERE dedupe_key=?
                ORDER BY id DESC LIMIT 1""",
             (key,),
         ).fetchone()
         if existing:
-            return _row(existing)
+            return _get_evolution_task_summary(int(existing["id"])) or {"id": int(existing["id"])}
         conn.execute(
             """INSERT INTO evolution_tasks(
                    task_type,dedupe_key,status,phase,progress,message,payload_json,
@@ -250,7 +391,7 @@ def create_evolution_task(
             ),
         )
         task_id = conn.last_insert_id()
-    return get_evolution_task(task_id) or {"id": task_id, "status": "queued"}
+    return _get_evolution_task_summary(task_id) or {"id": task_id, "status": "queued"}
 
 
 def enqueue_factor_strategy_research_event(
@@ -276,7 +417,7 @@ def enqueue_factor_strategy_research_event(
         payload={
             **identity,
             "trigger": str(trigger),
-            **({"batch_size": 4} if V10_RESEARCH_ENABLED else {"candidates_per_task": 1}),
+            **({"batch_size": WORKER_RESEARCH_BATCH_SIZE} if V10_RESEARCH_ENABLED else {"candidates_per_task": 1}),
             "evidence": dict(evidence or {}),
         },
         dedupe_key=f"factor_strategy_research_event:v2:{task_type}:{digest}",
@@ -285,16 +426,63 @@ def enqueue_factor_strategy_research_event(
     )
 
 
-def get_evolution_task(task_id: int) -> dict[str, Any] | None:
+def get_evolution_task(task_id: int, *, compact: bool = False) -> dict[str, Any] | None:
     with _conn() as conn:
-        row = conn.execute("SELECT * FROM evolution_tasks WHERE id=?", (int(task_id),)).fetchone()
+        if compact and getattr(conn, "_is_postgres", False):
+            # Keep the task-center projection small while preserving the
+            # step-level status needed by the management page.  Full result
+            # evidence remains available from the task-detail endpoint.
+            row = conn.execute(
+                """SELECT id,task_type,dedupe_key,status,phase,progress,message,payload_json,checkpoint_json,
+                          COALESCE((
+                              SELECT jsonb_agg(jsonb_build_object(
+                                  'name', step ->> 'name',
+                                  'ok', COALESCE(NULLIF(step ->> 'ok', '')::boolean, false),
+                                  'error', step ->> 'error',
+                                  'started_at', step ->> 'started_at',
+                                  'finished_at', step ->> 'finished_at',
+                                  'duration_seconds', COALESCE(NULLIF(step ->> 'duration_seconds', '')::double precision, 0),
+                                  'result', jsonb_build_object(
+                                      'status', step -> 'result' ->> 'status',
+                                      'reason', step -> 'result' ->> 'reason'
+                                  ),
+                                  'health', jsonb_build_object(
+                                      'status', step -> 'health' ->> 'status',
+                                      'reason', step -> 'health' ->> 'reason'
+                                  )
+                              ) ORDER BY step_order)
+                              FROM jsonb_array_elements(
+                                  COALESCE(result_json::jsonb -> 'steps', '[]'::jsonb)
+                              ) WITH ORDINALITY AS step_data(step, step_order)
+                          ), '[]'::jsonb)::text AS result_json,
+                          error,attempt,max_attempts,priority,stop_requested,deadline_at,lease_owner,
+                          lease_expires_at,heartbeat_at,next_run_at,started_at,finished_at,created_at,updated_at
+                   FROM evolution_tasks WHERE id=?""",
+                (int(task_id),),
+            ).fetchone()
+        else:
+            row = conn.execute("SELECT * FROM evolution_tasks WHERE id=?", (int(task_id),)).fetchone()
     return _row(row) if row else None
 
 
-def list_evolution_tasks(limit: int = 20) -> list[dict[str, Any]]:
+def _read_evolution_task_for_worker(task_id: int) -> dict[str, Any] | None:
+    """Keep a transient DB outage from escaping the worker loop."""
+    try:
+        return _with_heartbeat_db_retry(lambda: get_evolution_task(int(task_id)))
+    except Exception as exc:  # noqa: BLE001 - lease recovery will retry later
+        logger.warning("worker could not read evolution task id=%s: %s", task_id, exc)
+        return None
+
+
+def list_evolution_tasks(limit: int = 20, *, include_details: bool = False) -> list[dict[str, Any]]:
+    # List/health views must not pull the two unbounded JSON documents.  The
+    # task detail endpoint reads them on demand for a single task.
+    columns = _TASK_LIST_COLUMNS
+    if include_details:
+        columns = columns + ",payload_json,checkpoint_json,result_json"
     with _conn() as conn:
         rows = conn.execute(
-            "SELECT * FROM evolution_tasks ORDER BY id DESC LIMIT ?",
+            f"SELECT {columns} FROM evolution_tasks ORDER BY id DESC LIMIT ?",
             (max(1, min(int(limit), 200)),),
         ).fetchall()
     return [_row(row) for row in rows]
@@ -459,10 +647,20 @@ def ensure_latest_ready_system_cycle() -> dict[str, Any]:
     health = assess_latest_decision_data_health()
     readiness = health.get("readiness") if isinstance(health.get("readiness"), dict) else {}
     trade_date = str(readiness.get("target_trade_date") or "")
+    if not bool(health.get("decision_ready")):
+        from app.data_platform.db import _conn as data_conn
+        from app.data_platform.services.decision_data_contract import latest_decision_ready_trade_date
+
+        with data_conn() as conn:
+            recovered_trade_date = latest_decision_ready_trade_date(conn)
+        if recovered_trade_date:
+            health = assess_latest_decision_data_health(recovered_trade_date)
+            readiness = health.get("readiness") if isinstance(health.get("readiness"), dict) else {}
+            trade_date = str(readiness.get("target_trade_date") or recovered_trade_date)
     if not trade_date or not bool(health.get("decision_ready")):
         return {"ok": False, "reason": "decision_data_not_ready", "trade_date": trade_date}
     tasks = [
-        task for task in list_evolution_tasks(limit=200)
+            task for task in list_evolution_tasks(limit=200)
         if str(task.get("task_type") or "") == "system_autonomy_cycle"
     ]
     active = next(
@@ -621,34 +819,38 @@ def _update_active_task(
 
 def _heartbeat(task_id: int, *, phase: str, progress: float, message: str, checkpoint: dict[str, Any]) -> None:
     try:
-        _ensure_task_active(task_id)
+        _with_heartbeat_db_retry(lambda: _ensure_task_active(task_id))
     except EvolutionTaskBudgetExceeded:
         # The validation callback may carry a just-completed window. Preserve
         # that business checkpoint before yielding the task at the budget edge.
         now = _now()
-        _update_active_task(
-            int(task_id),
-            statuses=("running",),
-            require_not_stopped=True,
-            expected_lease_owner=WORKER_ID,
+        _with_heartbeat_db_retry(
+            lambda: _update_active_task(
+                int(task_id),
+                statuses=("running",),
+                require_not_stopped=True,
+                expected_lease_owner=WORKER_ID,
+                phase=phase,
+                progress=max(0.0, min(0.999, float(progress))),
+                message=message,
+                checkpoint=checkpoint,
+                heartbeat_at=now.isoformat(),
+                lease_expires_at=(now + timedelta(minutes=LEASE_MINUTES)).isoformat(),
+            )
+        )
+        raise
+    now = _now()
+    _with_heartbeat_db_retry(
+        lambda: _update_task(
+            task_id,
             phase=phase,
             progress=max(0.0, min(0.999, float(progress))),
             message=message,
             checkpoint=checkpoint,
             heartbeat_at=now.isoformat(),
+            lease_owner=WORKER_ID,
             lease_expires_at=(now + timedelta(minutes=LEASE_MINUTES)).isoformat(),
         )
-        raise
-    now = _now()
-    _update_task(
-        task_id,
-        phase=phase,
-        progress=max(0.0, min(0.999, float(progress))),
-        message=message,
-        checkpoint=checkpoint,
-        heartbeat_at=now.isoformat(),
-        lease_owner=WORKER_ID,
-        lease_expires_at=(now + timedelta(minutes=LEASE_MINUTES)).isoformat(),
     )
 
 
@@ -668,21 +870,22 @@ def _run_with_heartbeat_pulse(
             elapsed = max(1, int(time.monotonic() - started))
             try:
                 _runtime_heartbeat("worker")
-                _ensure_task_active(int(task_id))
-                latest = get_evolution_task(int(task_id)) or {}
+                _with_heartbeat_db_retry(lambda: _ensure_task_active(int(task_id)))
                 now = _now()
-                _update_active_task(
-                    int(task_id),
-                    statuses=("running",),
-                    require_not_stopped=True,
-                    expected_lease_owner=WORKER_ID,
-                    phase=str(latest.get("phase") or phase),
-                    message=(
-                        f"{str(latest.get('message') or message).split(' · 已运行', 1)[0]}"
-                        f" · 已运行 {elapsed} 秒"
-                    ),
-                    heartbeat_at=now.isoformat(),
-                    lease_expires_at=(now + timedelta(minutes=LEASE_MINUTES)).isoformat(),
+                _with_heartbeat_db_retry(
+                    lambda: _update_active_task(
+                        int(task_id),
+                        statuses=("running",),
+                        require_not_stopped=True,
+                        expected_lease_owner=WORKER_ID,
+                        phase=phase,
+                        message=(
+                            f"{message}"
+                            f" · 已运行 {elapsed} 秒"
+                        ),
+                        heartbeat_at=now.isoformat(),
+                        lease_expires_at=(now + timedelta(minutes=LEASE_MINUTES)).isoformat(),
+                    )
                 )
             except EvolutionTaskCancelled:
                 return
@@ -923,6 +1126,110 @@ def _strategy_targets() -> list[dict[str, Any]]:
         if generated and int(item["strategy_id"]) == int(generated["strategy_id"]):
             item["name"] = generated["name"]
     return targets
+
+
+def _strategy_cycle_factor_contract_issues(
+    targets: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Find challenger packages that cannot be replayed from frozen inputs."""
+
+    champion = resolve_production_strategy_champion()
+    champion_model_bindings = (
+        champion.get("model_bindings")
+        if isinstance(champion.get("model_bindings"), dict)
+        else None
+    )
+    issues: list[dict[str, Any]] = []
+    for target in targets:
+        if str(target.get("role") or "") != "challenger":
+            continue
+        strategy_id = int(target.get("strategy_id") or 0)
+        strategy = get_strategy(strategy_id) if strategy_id else None
+        if not strategy:
+            issues.append({
+                "strategy_id": strategy_id or None,
+                "model_version_id": int(target.get("model_version_id") or 0) or None,
+                "missing_factor_bindings": [],
+                "reason": "strategy_not_found",
+            })
+            continue
+        model_bindings = (
+            target.get("model_bindings")
+            if isinstance(target.get("model_bindings"), dict)
+            else champion_model_bindings
+        )
+        required_factors = get_replay_required_factor_names(
+            strategy.get("content"),
+            str(strategy.get("type") or "formula"),
+            model_bindings=model_bindings,
+        )
+        frozen_bindings = (
+            target.get("factor_bindings")
+            if isinstance(target.get("factor_bindings"), dict)
+            else {}
+        )
+        missing = sorted(
+            factor for factor in required_factors
+            if not isinstance(frozen_bindings.get(factor), dict)
+        )
+        if missing:
+            issues.append({
+                "strategy_id": strategy_id or None,
+                "model_version_id": int(target.get("model_version_id") or 0) or None,
+                "required_factors": sorted(required_factors),
+                "missing_factor_bindings": missing,
+                "reason": "incomplete_frozen_factor_bindings",
+            })
+    return issues
+
+
+def _record_factor_contract_block(issues: list[dict[str, Any]]) -> None:
+    """Quarantine invalid candidates without changing production permissions."""
+
+    for issue in issues:
+        version_id = int(issue.get("model_version_id") or 0)
+        if not version_id:
+            continue
+        version = get_model_version(version_id)
+        if not version:
+            continue
+        validation = dict(version.get("validation") or {})
+        reasons = list(validation.get("blocking_reasons") or [])
+        reason = {
+            "code": "blocked_incomplete_factor_bindings",
+            "required_factors": issue.get("required_factors") or [],
+            "missing_factor_bindings": issue.get("missing_factor_bindings") or [],
+        }
+        validation.update({
+            "status": "blocked_incomplete_factor_bindings",
+            "production_eligible": False,
+            "next_gate": "candidate_rebuild",
+            "blocking_reasons": [*reasons, reason],
+        })
+        update_model_version_validation(version_id, validation=validation)
+
+
+def _finish_contract_block(task: dict[str, Any], result: dict[str, Any]) -> None:
+    """Persist a deterministic contract block as terminal, without retrying."""
+
+    task_id = int(task["id"])
+    message = "冻结策略合同不完整，任务已阻断且不会自动重试"
+    _update_active_task(
+        task_id,
+        statuses=("running",),
+        require_not_stopped=True,
+        expected_lease_owner=WORKER_ID,
+        status="failed",
+        phase="blocked_contract",
+        progress=1.0,
+        message=message,
+        result=result,
+        error=message,
+        lease_owner=None,
+        lease_expires_at=None,
+        heartbeat_at=_now().isoformat(),
+        finished_at=_now().isoformat(),
+    )
 
 
 def _formal_trial_cohort(
@@ -1227,6 +1534,15 @@ def _execute_strategy_cycle(
     baseline_targets = [item for item in targets if item.get("role") == "baseline"]
     research_targets = [item for item in targets if item.get("role") not in {"champion", "baseline"}][:max_candidates]
     targets = champion_targets + baseline_targets + research_targets
+    contract_issues = _strategy_cycle_factor_contract_issues(targets)
+    if contract_issues:
+        _record_factor_contract_block(contract_issues)
+        return {
+            "schema_version": "alis_replay_factor_contract_gate_v1",
+            "status": "blocked_incomplete_factor_bindings",
+            "production_change_forbidden": True,
+            "contract_issues": contract_issues,
+        }
     max_windows = max(1, min(int(payload.get("max_windows") or MAX_WINDOWS_PER_CANDIDATE), MAX_WINDOWS_PER_CANDIDATE))
     completed = checkpoint.get("completed") if isinstance(checkpoint.get("completed"), list) else []
     frozen_window = (
@@ -1587,7 +1903,7 @@ def execute_evolution_task(
         payload = task.get("payload") if isinstance(task.get("payload"), dict) else {}
         evidence = payload.get("evidence") if isinstance(payload.get("evidence"), dict) else {}
         return run_active_candidate_generation_line(
-            batch_size=max(1, min(int(payload.get("batch_size") or 4), 20)),
+            batch_size=max(1, min(int(payload.get("batch_size") or WORKER_RESEARCH_BATCH_SIZE), WORKER_RESEARCH_BATCH_SIZE if LOW_MEMORY_WORKER else 20)),
             model_version_id=(
                 int(payload.get("evidence_id"))
                 if str(payload.get("evidence_type") or "") == "model_version"
@@ -1930,6 +2246,8 @@ def execute_evolution_task(
     if task_type == "system_autonomy_cycle":
         from app.services.system_autonomy import run_system_autonomy_cycle
 
+        task_trade_date = str((task.get("payload") or {}).get("trade_date") or "").replace("-", "")[:8]
+
         _heartbeat(
             int(task["id"]), phase="system_autonomy", progress=0.05,
             message="正在运行模型、策略、组合、复盘与研究自治周期",
@@ -1939,7 +2257,7 @@ def execute_evolution_task(
             int(task["id"]),
             phase="system_autonomy",
             message="正在运行模型、策略、组合、复盘与研究自治周期",
-            runner=run_system_autonomy_cycle,
+            runner=lambda: run_system_autonomy_cycle(trade_date=task_trade_date),
         )
     raise ValueError(f"unsupported evolution task type: {task.get('task_type')}")
 
@@ -2113,6 +2431,8 @@ def _defer_for_resource_budget(
 
 def _schedule_strategy_continuation(*, completed_task_id: int) -> dict[str, Any] | None:
     """Keep draining and extending the candidate lineage without waiting for next Friday."""
+    if V10_RESEARCH_ENABLED:
+        return None
     targets = _strategy_targets()
     challengers = [item for item in targets if item.get("role") == "challenger"]
     if not challengers:
@@ -2262,7 +2582,7 @@ def _schedule_v10_research_continuation(
                     "distilled_prototypes_available"
                     if generated_ids else "cluster_needs_more_evidence"
                 ),
-                "batch_size": 4,
+                "batch_size": WORKER_RESEARCH_BATCH_SIZE,
             },
             f"after-cluster-{source_id}",
             94,
@@ -2287,7 +2607,7 @@ def _schedule_v10_research_continuation(
 
 def _finish_failure(task: dict[str, Any], exc: Exception) -> None:
     task_id = int(task["id"])
-    latest = get_evolution_task(task_id)
+    latest = _read_evolution_task_for_worker(task_id)
     if not latest or str(latest.get("status") or "") in TERMINAL_STATES:
         return
     task = latest
@@ -2337,16 +2657,17 @@ def _finish_failure(task: dict[str, Any], exc: Exception) -> None:
         )
 
 
-def run_worker_once() -> dict[str, Any] | None:
-    task = _claim_next_task()
-    if not task:
-        return None
+def _run_claimed_task(task: dict[str, Any]) -> dict[str, Any]:
+    task_id = int(task["id"])
     try:
         result = execute_evolution_task(task)
         if str(result.get("status") or "") == "blocked_by_decision_data":
             _defer_for_decision_data(task, result)
-            return get_evolution_task(int(task["id"]))
-        _finish_success(int(task["id"]), result)
+            return get_evolution_task(task_id) or task
+        if str(result.get("status") or "") == "blocked_incomplete_factor_bindings":
+            _finish_contract_block(task, result)
+            return get_evolution_task(task_id) or task
+        _finish_success(task_id, result)
         if str(task.get("task_type") or "").startswith("strategy_"):
             try:
                 _schedule_v10_research_continuation(completed_task=task, result=result)
@@ -2399,9 +2720,30 @@ def run_worker_once() -> dict[str, Any] | None:
                     task.get("id"),
                 )
     except Exception as exc:
-        logger.exception("evolution task failed id=%s", task.get("id"))
-        _finish_failure(get_evolution_task(int(task["id"])) or task, exc)
-    return get_evolution_task(int(task["id"]))
+        logger.exception("evolution task failed id=%s", task_id)
+        _finish_failure(_read_evolution_task_for_worker(task_id) or task, exc)
+    return _read_evolution_task_for_worker(task_id) or task
+
+
+def run_worker_once() -> dict[str, Any] | None:
+    reconciliation = reconcile_superseded_evolution_tasks()
+    if reconciliation.get("count"):
+        logger.warning(
+            "quarantined %s superseded evolution task(s): %s",
+            reconciliation["count"],
+            [item.get("id") for item in reconciliation.get("quarantined") or []],
+        )
+    task = _claim_next_task()
+    if not task:
+        return None
+    task_id = int(task["id"])
+    with _active_task_lock:
+        _active_task_ids.add(task_id)
+    try:
+        return _run_claimed_task(task)
+    finally:
+        with _active_task_lock:
+            _active_task_ids.discard(task_id)
 
 
 def recover_evolution_tasks() -> int:
@@ -2425,6 +2767,7 @@ def recover_evolution_tasks() -> int:
         ).fetchall()
         recovered: list[Any] = []
         for row in rows:
+            task_id = int(row["id"])
             lease_expires_at = row.get("lease_expires_at") if isinstance(row, dict) else row["lease_expires_at"]
             expired = not lease_expires_at
             if lease_expires_at:
@@ -2434,12 +2777,18 @@ def recover_evolution_tasks() -> int:
                     expired = True
             owner = row.get("lease_owner") if isinstance(row, dict) else row["lease_owner"]
             owner_alive = _lease_owner_process_alive(owner)
+            if owner_alive is True:
+                # A live owner may still be inside a long-running step. Only
+                # the same process can distinguish an abandoned claim from
+                # an active task; never requeue another live process's lease.
+                if str(owner) != WORKER_ID or _is_task_execution_active(task_id) or not expired:
+                    continue
             if not expired and owner_alive is not False:
                 continue
             owner_predicate = "lease_owner=?" if owner else "lease_owner IS NULL"
             params: tuple[Any, ...] = (
-                (now, now, now, int(row["id"]), owner)
-                if owner else (now, now, now, int(row["id"]))
+                (now, now, now, task_id, owner)
+                if owner else (now, now, now, task_id)
             )
             cursor = conn.execute(
                 f"""UPDATE evolution_tasks SET status='queued',phase='recovered',
@@ -2454,7 +2803,7 @@ def recover_evolution_tasks() -> int:
 
 
 def start_evolution_worker() -> bool:
-    global _worker_started
+    global _worker_started, _lease_recovery_started
     with _start_lock:
         if _worker_started:
             return False
@@ -2472,6 +2821,25 @@ def start_evolution_worker() -> bool:
                 time.sleep(POLL_SECONDS)
 
     threading.Thread(target=loop, daemon=True, name="evolution-worker").start()
+    with _start_lock:
+        if not _lease_recovery_started:
+            _lease_recovery_started = True
+
+            def recovery_loop() -> None:
+                while True:
+                    try:
+                        recovered = _with_heartbeat_db_retry(recover_evolution_tasks)
+                        if recovered:
+                            logger.warning("recovered %s expired evolution task lease(s)", recovered)
+                    except Exception:  # noqa: BLE001 - recovery must not stop task execution
+                        logger.exception("evolution lease recovery loop failed")
+                    time.sleep(LEASE_RECOVERY_INTERVAL_SECONDS)
+
+            threading.Thread(
+                target=recovery_loop,
+                daemon=True,
+                name="evolution-lease-recovery",
+            ).start()
     return True
 
 
@@ -2500,7 +2868,7 @@ def start_evolution_scheduler() -> bool:
                     dedupe_key=f"research_seed:v2:{research_task_type}:{now.date().isoformat()}",
                     payload={
                         "trigger": "continuous_scheduler",
-                        **({"batch_size": 4} if V10_RESEARCH_ENABLED else {"candidates_per_task": 1}),
+                        **({"batch_size": WORKER_RESEARCH_BATCH_SIZE} if V10_RESEARCH_ENABLED else {"candidates_per_task": 1}),
                     },
                     priority=90,
                 )
@@ -2528,7 +2896,12 @@ def start_evolution_scheduler() -> bool:
                         },
                         priority=70,
                     )
-                if _is_scheduled_trade_day(now) and now.weekday() == AUTO_WEEKDAY and now.hour >= AUTO_HOUR:
+                if (
+                    not V10_RESEARCH_ENABLED
+                    and _is_scheduled_trade_day(now)
+                    and now.weekday() == AUTO_WEEKDAY
+                    and now.hour >= AUTO_HOUR
+                ):
                     create_evolution_task(
                         task_type="strategy_evolution_cycle",
                         dedupe_key=f"strategy_evolution_cycle:{now.date().isoformat()}",

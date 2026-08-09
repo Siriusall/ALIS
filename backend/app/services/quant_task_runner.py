@@ -58,6 +58,7 @@ _DEFENSIVE_EXECUTION_REFRESH_INTERVAL_SEC = max(
     min(int(os.getenv("QUANT_DEFENSIVE_EXECUTION_REFRESH_INTERVAL_SEC", "300")), 3600),
 )
 _auto_scheduler_started = False
+_auto_scheduler_watchdog_started = False
 _defensive_execution_refresh_lock = threading.Lock()
 _defensive_execution_refresh_attempts: dict[str, float] = {}
 
@@ -391,7 +392,7 @@ def start_auto_simulation_scheduler() -> bool:
     This only resumes the existing simulated quant-run tasks. The real/manual
     broker route remains protected by ``ensure_manual_trade_allowed``.
     """
-    global _auto_scheduler_started
+    global _auto_scheduler_started, _auto_scheduler_watchdog_started
     if not _AUTO_SIMULATION_ENABLED:
         return False
     with _task_lock:
@@ -473,7 +474,21 @@ def start_auto_simulation_scheduler() -> bool:
                 beat("auto_simulation_scheduler", error=str(exc))
             threading.Event().wait(_AUTO_SIMULATION_INTERVAL_SEC)
 
-    threading.Thread(target=_loop, name="quant-auto-simulation", daemon=True).start()
+    scheduler_thread = threading.Thread(target=_loop, name="quant-auto-simulation", daemon=True)
+    scheduler_thread.start()
+    with _task_lock:
+        watchdog_needed = not _auto_scheduler_watchdog_started
+        _auto_scheduler_watchdog_started = True
+    if watchdog_needed:
+        def _watchdog() -> None:
+            from app.services.runtime_heartbeat import beat
+
+            pulse_seconds = max(5, min(30, _AUTO_SIMULATION_INTERVAL_SEC // 3))
+            while scheduler_thread.is_alive():
+                beat("auto_simulation_scheduler")
+                threading.Event().wait(pulse_seconds)
+
+        threading.Thread(target=_watchdog, name="quant-auto-simulation-heartbeat", daemon=True).start()
     logger.info(
         "自动模拟调度已启动；首次以 %s 检查，首次正式调仓后沿用实际执行时分；每 %ss 检查日更与执行条件",
         _AUTO_SIMULATION_CLOSE_TIME.strftime("%H:%M"),
@@ -914,6 +929,32 @@ def run_quant_task_async(task_id: int) -> bool:
 
     def _worker() -> None:
         _mark_running(task_id, True)
+        active_claim: tuple[str, str] | None = None
+
+        def _quarantine_active_claim(reason: str) -> None:
+            nonlocal active_claim
+            if not active_claim:
+                return
+            signal_date, claim_token = active_claim
+            try:
+                from app.services.profit_loop import quarantine_daily_rebalance_execution_claim
+
+                quarantined = quarantine_daily_rebalance_execution_claim(
+                    signal_date,
+                    claim_token=claim_token,
+                    reason=reason,
+                )
+                if quarantined:
+                    logger.error(
+                        "quarantined failed autonomous plan task_id=%s signal=%s",
+                        task_id,
+                        signal_date,
+                    )
+            except Exception:
+                logger.exception("failed to quarantine autonomous plan task_id=%s signal=%s", task_id, signal_date)
+            finally:
+                active_claim = None
+
         try:
             task0 = get_quant_run_task(task_id)
             if not task0:
@@ -1313,6 +1354,11 @@ def run_quant_task_async(task_id: int) -> bool:
                 # book.  Different task ids must not execute or checkpoint a
                 # trade concurrently inside the same service process.
                 with _account_execution_lock:
+                    if mode == "autonomous_daily":
+                        active_claim = (
+                            signal_date,
+                            f"quant-task:{int(task_id)}:{signal_date}:{execute_date}",
+                        )
                     result = _execute_step_with_retry(
                         task_id=task_id,
                         task_live=task_live,
@@ -1350,6 +1396,7 @@ def run_quant_task_async(task_id: int) -> bool:
                         exchange_group=exchange_group,
                         mode=mode,
                     )
+                    active_claim = None
                 done_signals.add(result.signal_date)
                 processed_total += 1
                 # 若在本步执行期间收到停止请求，本步落账后立即停止，不再继续后续步骤。
@@ -1422,6 +1469,7 @@ def run_quant_task_async(task_id: int) -> bool:
                     last_run_status="completed",
                 )
         except HistoricalDataMissingError as e:
+            _quarantine_active_claim(str(e))
             trigger_backfill_merge_meta_async(reason=f"quant_task_{task_id}_508")
             logger.warning("quant task paused by 508 historical data missing task_id=%s | %s", task_id, str(e)[:160])
             decision = pause_decision(
@@ -1450,6 +1498,7 @@ def run_quant_task_async(task_id: int) -> bool:
                 last_risk_code="historical_data_missing_508",
             )
         except ReplayRiskGateError as e:
+            _quarantine_active_claim(str(e))
             logger.warning("quant task paused by risk gate task_id=%s code=%s | %s", task_id, getattr(e, "code", ""), str(e)[:160])
             decision = pause_decision(
                 code=getattr(e, "code", "replay_risk_gate"),
@@ -1477,6 +1526,7 @@ def run_quant_task_async(task_id: int) -> bool:
                 last_risk_code=getattr(e, "code", "replay_risk_gate"),
             )
         except Exception as e:  # noqa: BLE001
+            _quarantine_active_claim(str(e))
             if _is_tushare_auth_error(e):
                 logger.warning("quant task paused by tushare auth error task_id=%s | %s", task_id, str(e)[:160])
                 decision = pause_decision(

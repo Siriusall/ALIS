@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import hashlib
 import os
+import threading
 from datetime import datetime, time as dtime
 from statistics import mean
 from typing import Any
@@ -14,6 +15,7 @@ from app.services.decision_store import list_pool_members
 from app.services.industry_allocator import build_industry_allocation
 from app.services.market_context import live_market_context
 from app.services.operations_overview import build_live_portfolio_risk
+from app.services.position_valuation import build_position_market_series_cache
 from app.services.plan_model_control import model_family_status
 from app.services.review_learning import materialize_decision_outcomes, model_feedback_gate, review_learning_overview
 from app.services.risk_limit_contract import (
@@ -27,6 +29,9 @@ from app.services.two_group_optimizer import two_group_cvar_optimizer
 UNIFIED_DAILY_DECISION_SCHEMA_VERSION = "alis_unified_daily_decision_v2"
 LEGACY_UNIFIED_DAILY_DECISION_SCHEMA_VERSION = "alis_unified_daily_decision_v1"
 UNIFIED_EXECUTION_SAFETY_SCHEMA_VERSION = "alis_t1_execution_safety_v2"
+
+_TABLES_READY = False
+_TABLES_INIT_LOCK = threading.Lock()
 
 
 def _now() -> str:
@@ -91,6 +96,17 @@ def _legacy_pool_preview_inputs(
 
 
 def _ensure_tables() -> None:
+    global _TABLES_READY
+    if _TABLES_READY:
+        return
+    with _TABLES_INIT_LOCK:
+        if _TABLES_READY:
+            return
+        _ensure_tables_once()
+        _TABLES_READY = True
+
+
+def _ensure_tables_once() -> None:
     with business_conn() as c:
         c.execute("""CREATE TABLE IF NOT EXISTS model_live_health (
             model_key VARCHAR(128) PRIMARY KEY,
@@ -199,44 +215,88 @@ def _latest_trade_date() -> str:
 
 
 def _position_returns(symbols: list[str], limit: int = 120) -> dict[str, list[float]]:
+    requested = [str(value or "").strip() for value in symbols if str(value or "").strip()]
+    if not requested:
+        return {}
+    history_limit = max(20, min(252, int(limit or 120)))
+    code_by_symbol: dict[str, list[str]] = {}
+    symbol_by_code: dict[str, str] = {}
+    for symbol in requested:
+        normalized = symbol.split(".", 1)[0]
+        code = symbol if "." in symbol else f"{symbol}.SH" if normalized.startswith(("5", "6", "9")) else f"{symbol}.SZ"
+        candidates = list(dict.fromkeys((symbol, code)))
+        code_by_symbol[symbol] = candidates
+        for candidate in candidates:
+            symbol_by_code.setdefault(candidate, symbol)
+
     result: dict[str, list[float]] = {}
+    placeholders = ",".join("?" for _ in symbol_by_code)
     with data_conn() as c:
-        for symbol in symbols:
-            code = symbol if "." in symbol else f"{symbol}.SH" if symbol.startswith(("5", "6", "9")) else f"{symbol}.SZ"
-            rows = [dict(row) for row in c.execute(
-                """SELECT change_pct FROM dc_stock_daily_snapshot
-                   WHERE ts_code IN (?,?) AND change_pct IS NOT NULL
-                   ORDER BY trade_date DESC LIMIT ?""",
-                (symbol, code, limit),
-            ).fetchall()]
-            returns = [float(row["change_pct"]) / 100.0 for row in reversed(rows) if row.get("change_pct") is not None]
-            if not returns:
-                raw_rows = [dict(row) for row in c.execute(
-                    """SELECT payload_json FROM dc_tushare_raw_records
-                       WHERE api_name='fund_daily' AND ts_code IN (?,?)
-                       ORDER BY trade_date DESC LIMIT ?""",
-                    (symbol, code, limit),
-                ).fetchall()]
-                parsed = []
-                for row in reversed(raw_rows):
-                    try:
-                        payload = json.loads(row.get("payload_json") or "{}")
-                        change = payload.get("pct_chg")
-                        if change is not None:
-                            parsed.append(float(change) / 100.0)
-                    except (TypeError, ValueError, json.JSONDecodeError):
-                        continue
-                returns = parsed
-            if returns:
+        rows = c.execute(
+            f"""WITH ranked AS (
+                    SELECT ts_code,trade_date,change_pct,
+                           ROW_NUMBER() OVER(PARTITION BY ts_code ORDER BY trade_date DESC) AS series_rank
+                      FROM dc_stock_daily_snapshot
+                     WHERE ts_code IN ({placeholders}) AND change_pct IS NOT NULL
+                )
+                SELECT ts_code,trade_date,change_pct
+                  FROM ranked
+                 WHERE series_rank<=?
+                 ORDER BY ts_code,trade_date""",
+            tuple(symbol_by_code) + (history_limit,),
+        ).fetchall()
+        grouped: dict[str, list[float]] = {}
+        for row in rows:
+            item = dict(row)
+            grouped.setdefault(str(item.get("ts_code") or ""), []).append(float(item["change_pct"]) / 100.0)
+        for code, returns in grouped.items():
+            symbol = symbol_by_code.get(code)
+            if symbol and returns:
                 result[symbol] = returns
+
+        missing = [symbol for symbol in requested if symbol not in result]
+        missing_codes = [code for symbol in missing for code in code_by_symbol[symbol] if code in symbol_by_code]
+        if missing_codes:
+            raw_placeholders = ",".join("?" for _ in missing_codes)
+            raw_rows = c.execute(
+                f"""WITH ranked AS (
+                        SELECT ts_code,trade_date,payload_json,
+                               ROW_NUMBER() OVER(PARTITION BY ts_code ORDER BY trade_date DESC) AS series_rank
+                          FROM dc_tushare_raw_records
+                         WHERE api_name='fund_daily' AND ts_code IN ({raw_placeholders})
+                    )
+                    SELECT ts_code,trade_date,payload_json
+                      FROM ranked
+                     WHERE series_rank<=?
+                     ORDER BY ts_code,trade_date""",
+                tuple(missing_codes) + (history_limit,),
+            ).fetchall()
+            raw_grouped: dict[str, list[float]] = {}
+            for row in raw_rows:
+                item = dict(row)
+                try:
+                    payload = json.loads(item.get("payload_json") or "{}")
+                    change = payload.get("pct_chg")
+                    if change is not None:
+                        raw_grouped.setdefault(str(item.get("ts_code") or ""), []).append(float(change) / 100.0)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    continue
+            for code, returns in raw_grouped.items():
+                symbol = symbol_by_code.get(code)
+                if symbol and returns:
+                    result[symbol] = returns
     return result
 
 
-def _latest_decision_data_gate() -> dict[str, Any]:
+def _latest_decision_data_gate(trade_date: str = "") -> dict[str, Any]:
     try:
         from app.services.data_health import assess_latest_decision_data_health
 
-        return assess_latest_decision_data_health()
+        return (
+            assess_latest_decision_data_health(trade_date)
+            if trade_date
+            else assess_latest_decision_data_health()
+        )
     except Exception as exc:
         return {
             "decision_ready": False,
@@ -381,12 +441,11 @@ def build_model_live_monitor(*, persist: bool = True) -> dict[str, Any]:
     return {"ok": True, "schema_version": "model_live_monitor_v1", "items": rows, "degraded_count": sum(1 for x in rows if x["status"] == "degraded")}
 
 
-def build_portfolio_reoptimization() -> dict[str, Any]:
+def build_portfolio_reoptimization(*, signal_date: str = "") -> dict[str, Any]:
     positions = get_positions()
     names = {str(p.get("symbol") or ""): str(p.get("name") or "") for p in positions}
-    risk = build_live_portfolio_risk()
     holding_symbols = [str(p.get("symbol") or "") for p in positions if str(p.get("symbol") or "")]
-    decision_data_gate = _latest_decision_data_gate()
+    decision_data_gate = _latest_decision_data_gate(signal_date)
     readiness = decision_data_gate.get("readiness") if isinstance(decision_data_gate.get("readiness"), dict) else {}
     ready_trade_date = str(readiness.get("latest_decision_ready_trade_date") or "")
     target_trade_date = str(readiness.get("target_trade_date") or "")
@@ -427,6 +486,17 @@ def build_portfolio_reoptimization() -> dict[str, Any]:
     # Existing holdings always remain in the optimisation set so the unified
     # selector can express hold/reduce/exit without losing account continuity.
     symbols = list(dict.fromkeys(holding_symbols + selection_candidate_symbols))
+    valuation_as_of = ready_trade_date or _latest_trade_date()
+    valuation_cache = build_position_market_series_cache(
+        positions,
+        as_of=valuation_as_of,
+        lookback=120,
+    )
+    risk = build_live_portfolio_risk(
+        valuation_cache=valuation_cache,
+        positions=positions,
+        as_of=valuation_as_of,
+    )
     # The selection payload is immutable once hashed. Portfolio and holding
     # scope belong to the containing daily-decision contract, never inside it.
     missing_names = [symbol for symbol in symbols if not names.get(symbol)]
@@ -614,7 +684,7 @@ def build_portfolio_reoptimization() -> dict[str, Any]:
         from app.services.thesis_store import list_theses
         thesis_status_by_symbol = {
             str(item.get("ts_code") or "").split(".")[0]: str(item.get("derived_status") or "")
-            for item in list_theses(limit=1000)
+            for item in list_theses(limit=1000, include_hypotheses=False)
         }
     position_pnl_by_symbol: dict[str, float] = {}
     for symbol, position in position_map.items():
@@ -1495,12 +1565,19 @@ def materialize_daily_rebalance_plan(portfolio: dict[str, Any] | None = None) ->
         }
     _ensure_tables()
     with business_conn() as c:
-        latest_same_day = c.execute(
-            """SELECT status FROM daily_rebalance_plans
-               WHERE trade_date=? ORDER BY version DESC LIMIT 1""",
-            (trade_date,),
-        ).fetchone()
-    if str(dict(latest_same_day or {}).get("status") or "") in {
+        latest_same_day_query = """SELECT status FROM daily_rebalance_plans
+               WHERE trade_date=? ORDER BY version DESC LIMIT 1"""
+        if getattr(c, "_is_postgres", False) or getattr(c, "_is_mysql", False):
+            latest_same_day_query += " FOR UPDATE"
+        latest_same_day = c.execute(latest_same_day_query, (trade_date,)).fetchone()
+    latest_same_day_status = str(dict(latest_same_day or {}).get("status") or "")
+    if latest_same_day_status == "planned":
+        frozen_plan = get_latest_daily_rebalance_plan(trade_date)
+        frozen_plan["generation_policy"] = (
+            "同一信号日已有正式计划；计划合同已冻结，后续研究证据变化不得重生成或替换 T+1 计划"
+        )
+        return frozen_plan
+    if latest_same_day_status in {
         "blocked_by_contract_revision",
         "blocked_by_contract_validation",
     }:
@@ -1622,6 +1699,8 @@ def claim_daily_rebalance_execution_input(
     Historical replay deliberately gets no override: only a still-planned row
     whose signal and execution dates exactly match may drive live simulation.
     """
+    from app.services.quant_run_contracts import ReplayRiskGateError
+
     _ensure_tables()
     signal = str(signal_date or "").replace("-", "")[:8]
     execute = str(execute_date or "").replace("-", "")[:8]
@@ -1631,8 +1710,8 @@ def claim_daily_rebalance_execution_input(
     claimed_at = datetime.now().astimezone().isoformat(timespec="seconds")
     with business_conn() as c:
         query = """SELECT * FROM daily_rebalance_plans
-                   WHERE replace(trade_date,'-','')=?
-                     AND replace(planned_execute_date,'-','')=?
+                   WHERE trade_date=?
+                     AND planned_execute_date=?
                    ORDER BY version DESC LIMIT 1"""
         if getattr(c, "_is_postgres", False) or getattr(c, "_is_mysql", False):
             query += " FOR UPDATE"
@@ -1649,6 +1728,23 @@ def claim_daily_rebalance_execution_input(
             contract = json.loads(record.get("proposal_json") or "{}")
         except (TypeError, json.JSONDecodeError):
             return None
+        schema_version = str(contract.get("schema_version") or "")
+        if schema_version != UNIFIED_DAILY_DECISION_SCHEMA_VERSION:
+            # Autonomous execution may consume only the current frozen
+            # contract. Preserve older evidence, but quarantine it before any
+            # execution claim can be written.
+            c.execute(
+                """UPDATE daily_rebalance_plans
+                   SET status='blocked_by_contract_revision',
+                       validation_error_code='legacy_authoritative_plan',
+                       validation_errors_json=?,validated_at=?
+                   WHERE id=? AND status='planned'""",
+                (json.dumps(["旧正式调仓计划合同已隔离，禁止执行"], ensure_ascii=False), _now(), int(row["id"])),
+            )
+            raise ReplayRiskGateError(
+                "旧正式调仓计划合同已隔离，禁止执行",
+                code="legacy_authoritative_plan",
+            )
         canonical = json.dumps(contract, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         actual_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
         if actual_hash != str(record.get("input_hash") or ""):
@@ -1795,6 +1891,41 @@ def list_pending_daily_rebalance_execution_inputs() -> list[dict[str, Any]]:
     return [item for item in latest_by_signal.values() if item.get("plan_id")]
 
 
+def count_pending_daily_rebalance_execution_inputs() -> int:
+    """Count pending plans without loading their frozen contracts.
+
+    The management readiness summary only needs the count.  Keep contract and
+    defensive-asset expansion in the execution-facing reader above so a
+    dashboard read cannot pull large JSON blobs or positions just to render a
+    badge.
+    """
+    _ensure_tables()
+    with business_conn() as c:
+        rows = c.execute(
+            """SELECT trade_date,planned_execute_date,version,status
+               FROM daily_rebalance_plans
+               WHERE status IN ('planned','blocked_by_contract_validation',
+                                'blocked_by_contract_revision',
+                                'blocked_by_execution_recovery',
+                                'missed_execution_window')
+               ORDER BY trade_date ASC,version DESC"""
+        ).fetchall()
+    latest_by_signal: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        item = dict(row)
+        signal_date = str(item.get("trade_date") or "").replace("-", "")[:8]
+        if signal_date in latest_by_signal:
+            continue
+        latest_by_signal[signal_date] = item
+    return sum(
+        1
+        for item in latest_by_signal.values()
+        if str(item.get("status") or "") == "planned"
+        and len(str(item.get("trade_date") or "").replace("-", "")[:8]) == 8
+        and len(str(item.get("planned_execute_date") or "").replace("-", "")[:8]) == 8
+    )
+
+
 def mark_missed_daily_rebalance_execution_inputs(current_execute_date: str) -> int:
     """Close plans whose exact frozen execution session has already passed.
 
@@ -1827,6 +1958,31 @@ def release_daily_rebalance_execution_claim(signal_date: str, *, claim_token: st
                SET status='planned',execution_claim_token='',execution_claimed_at=NULL
                WHERE trade_date=? AND status='executing' AND execution_claim_token=?""",
             (signal, str(claim_token or "")),
+        )
+    return int(getattr(changed, "rowcount", 0) or 0) == 1
+
+
+def quarantine_daily_rebalance_execution_claim(
+    signal_date: str, *, claim_token: str, reason: str,
+) -> bool:
+    """Isolate a claimed plan after an execution failure without releasing it for replay."""
+    signal = str(signal_date or "").replace("-", "")[:8]
+    detail = str(reason or "execution_failed")[:500]
+    now = _now()
+    with business_conn() as c:
+        changed = c.execute(
+            """UPDATE daily_rebalance_plans
+               SET status='blocked_by_execution_recovery',
+                   validation_error_code='execution_failed_recovery',
+                   validation_errors_json=?,validated_at=?
+               WHERE replace(trade_date,'-','')=?
+                 AND status='executing' AND execution_claim_token=?""",
+            (
+                json.dumps([f"执行失败，计划已隔离：{detail}"], ensure_ascii=False),
+                now,
+                signal,
+                str(claim_token or ""),
+            ),
         )
     return int(getattr(changed, "rowcount", 0) or 0) == 1
 
@@ -1864,22 +2020,36 @@ def recover_interrupted_daily_rebalance_plans() -> int:
     return interrupted + len(legacy_ids)
 
 
-def get_latest_daily_rebalance_plan(trade_date: str = "") -> dict[str, Any]:
+def get_latest_daily_rebalance_plan(trade_date: str = "", *, compact: bool = False) -> dict[str, Any]:
     """Read the latest persisted plan without generating a new version."""
     _ensure_tables()
+    columns = (
+        "id,trade_date,planned_execute_date,planned_execute_at,version,status,"
+        "execution_id,generated_at,executed_at,execution_claim_token,execution_claimed_at,"
+        "validation_error_code,validation_errors_json,validated_at"
+        if compact
+        else
+        "id,trade_date,planned_execute_date,planned_execute_at,version,status,proposal_json,"
+        "execution_id,generated_at,executed_at,execution_claim_token,execution_claimed_at,"
+        "validation_error_code,validation_errors_json,validated_at"
+    )
     with business_conn() as c:
         row = c.execute(
-            """SELECT * FROM daily_rebalance_plans
+            f"""SELECT {columns}
+               FROM daily_rebalance_plans
                WHERE (?='' OR trade_date=?) ORDER BY trade_date DESC,version DESC LIMIT 1""",
             (trade_date, trade_date),
         ).fetchone()
     if not row:
         return {"status": "not_generated", "execution_authorized": False}
     item = dict(row)
-    try:
-        contract = json.loads(item.get("proposal_json") or "{}")
-    except (TypeError, json.JSONDecodeError):
+    if compact:
         contract = {}
+    else:
+        try:
+            contract = json.loads(item.get("proposal_json") or "{}")
+        except (TypeError, json.JSONDecodeError):
+            contract = {}
     return {
         "id": int(item["id"]), "trade_date": str(item.get("trade_date") or ""),
         "data_as_of_date": str(item.get("trade_date") or ""),
@@ -1912,6 +2082,11 @@ def get_latest_daily_rebalance_plan(trade_date: str = "") -> dict[str, Any]:
         "risk_budget": contract.get("risk_budget") or {},
         "decision_data_gate": contract.get("decision_data_gate") or {},
         "selection_snapshot": contract.get("selection_snapshot") or {},
+        # These are part of the already-frozen T-day contract.  Expose them
+        # for read-only consoles rather than reconstructing decision rationale
+        # from a later live controller run.
+        "pretrade_controller": contract.get("pretrade_controller") or {},
+        "expected_return_contract": contract.get("expected_return_contract") or {},
         "decision_contract_schema_version": str(contract.get("schema_version") or ""),
         "risk_limit_contract": contract.get("risk_limit_contract") or {},
         "validation_error_code": str(item.get("validation_error_code") or ""),
@@ -1949,6 +2124,8 @@ EXECUTION_SLO_TARGETS = {
 
 
 def _plan_has_actionable_orders(plan: dict[str, Any]) -> bool:
+    if "actionable" in plan:
+        return bool(plan.get("actionable"))
     try:
         contract = json.loads(plan.get("proposal_json") or "{}")
     except (TypeError, json.JSONDecodeError):
@@ -1962,6 +2139,8 @@ def _plan_has_actionable_orders(plan: dict[str, Any]) -> bool:
 
 
 def _plan_execution_authorized(plan: dict[str, Any]) -> bool:
+    if "execution_authorized" in plan:
+        return bool(plan.get("execution_authorized"))
     try:
         contract = json.loads(plan.get("proposal_json") or "{}")
     except (TypeError, json.JSONDecodeError):
@@ -1975,20 +2154,41 @@ def build_execution_chain_slo(
     *,
     as_of_date: str | None = None,
     window_plans: int = EXECUTION_SLO_WINDOW_PLANS,
+    compact: bool = False,
 ) -> dict[str, Any]:
     """Measure plan-to-execution integrity from immutable plan and ledger links."""
     _ensure_tables()
     cutoff = str(as_of_date or datetime.now().astimezone().date().isoformat()).replace("-", "")[:8]
     if plans is None:
         with business_conn() as c:
-            rows = c.execute(
-                """SELECT * FROM daily_rebalance_plans
-                   WHERE status<>'superseded' ORDER BY trade_date DESC,version DESC LIMIT 200"""
-            ).fetchall()
+            if compact and getattr(c, "_is_postgres", False):
+                # PostgreSQL evaluates authorization and actionability in
+                # place, so the dashboard does not transfer historical
+                # contracts over the database connection.
+                rows = c.execute(
+                    """SELECT id,trade_date,planned_execute_date,version,status,
+                              execution_id,executed_at,
+                              COALESCE((proposal_json::jsonb ->> 'execution_authorized') = 'true', false)
+                                AS execution_authorized,
+                              EXISTS (
+                                  SELECT 1
+                                    FROM jsonb_array_elements(
+                                        COALESCE(proposal_json::jsonb -> 'proposal', '[]'::jsonb)
+                                    ) AS proposal_item
+                                   WHERE COALESCE(proposal_item ->> 'action', '') NOT IN ('', 'hold', 'observe')
+                                     AND ABS(COALESCE(NULLIF(proposal_item ->> 'weight_change', '')::double precision, 0)) > 1e-9
+                              ) AS actionable
+                       FROM daily_rebalance_plans
+                       WHERE status<>'superseded'
+                       ORDER BY trade_date DESC,version DESC LIMIT 200"""
+                ).fetchall()
+            else:
+                rows = c.execute(
+                    """SELECT id,trade_date,planned_execute_date,version,status,proposal_json,execution_id,executed_at
+                       FROM daily_rebalance_plans
+                       WHERE status<>'superseded' ORDER BY trade_date DESC,version DESC LIMIT 200"""
+        ).fetchall()
         plans = [dict(row) for row in rows]
-    if operations is None:
-        from app.db.store import list_operations
-        operations = list_operations(execution_id=None, limit=200000)
     latest_by_signal: dict[str, dict[str, Any]] = {}
     for plan in plans:
         signal_date = str(plan.get("trade_date") or "").replace("-", "")[:8]
@@ -2004,6 +2204,17 @@ def build_execution_chain_slo(
     )
     due = due[:max(1, int(window_plans))]
     selected_execution_ids = {int(item.get("execution_id") or 0) for item in due if int(item.get("execution_id") or 0) > 0}
+    if operations is None:
+        if selected_execution_ids:
+            placeholders = ",".join("?" for _ in selected_execution_ids)
+            with business_conn() as c:
+                rows = c.execute(
+                    f"SELECT execution_id,operation_uid FROM operations WHERE execution_id IN ({placeholders})",
+                    tuple(sorted(selected_execution_ids)),
+                ).fetchall()
+            operations = [dict(row) for row in rows]
+        else:
+            operations = []
     scoped_operations = [item for item in operations if int(item.get("execution_id") or 0) in selected_execution_ids]
     operation_execution_ids = {int(item.get("execution_id") or 0) for item in scoped_operations}
     operation_uids = [str(item.get("operation_uid") or "") for item in scoped_operations if str(item.get("operation_uid") or "")]
@@ -2018,6 +2229,19 @@ def build_execution_chain_slo(
         execute_date = str(plan.get("planned_execute_date") or "").replace("-", "")[:8]
         resolved = status == "executed"
         binding_valid = bool(resolved and ((actionable and execution_id in operation_execution_ids) or (not actionable and execution_id == 0)))
+        # A quarantined plan with no execution id or completion timestamp is a
+        # terminal safety state: it cannot be replayed and has no transaction
+        # to reconcile. Keep it in the historical SLO sample, but do not call
+        # it an active stranded execution for the current readiness gate.
+        isolated_recovery = bool(
+            status == "blocked_by_execution_recovery"
+            and execution_id <= 0
+            and not executed_at
+        )
+        stranded_execution = bool(
+            status == "executing"
+            or (status == "blocked_by_execution_recovery" and not isolated_recovery)
+        )
         observations.append({
             "plan_id": int(plan.get("id") or 0),
             "signal_date": str(plan.get("trade_date") or "").replace("-", "")[:8],
@@ -2028,7 +2252,8 @@ def build_execution_chain_slo(
             "resolved": resolved,
             "on_schedule": bool(resolved and executed_date == execute_date),
             "binding_valid": binding_valid,
-            "stranded_execution": status in {"executing", "blocked_by_execution_recovery"},
+            "isolated_recovery": isolated_recovery,
+            "stranded_execution": stranded_execution,
         })
     count = len(observations)
 
@@ -2043,6 +2268,11 @@ def build_execution_chain_slo(
         "duplicate_plan_execution_id_count": len(execution_ids) - len(set(execution_ids)),
         "duplicate_operation_uid_count": duplicate_operation_uid_count,
         "stranded_execution_count": sum(bool(item["stranded_execution"]) for item in observations),
+        "isolated_recovery_count": sum(bool(item["isolated_recovery"]) for item in observations),
+        "executed_binding_anomaly_count": sum(
+            1 for item in observations
+            if item.get("status") == "executed" and not item.get("binding_valid")
+        ),
     }
     enough_samples = count >= max(1, int(window_plans))
     gates = {
@@ -2055,16 +2285,27 @@ def build_execution_chain_slo(
         "no_stranded_executions": bool(enough_samples and metrics["stranded_execution_count"] == 0),
     })
     status = "observing" if not enough_samples else "passed" if all(gates.values()) else "failed"
+    current_blockers: list[str] = []
+    if metrics["stranded_execution_count"]:
+        current_blockers.append("存在仍在执行或带执行记录的隔离计划")
+    if metrics["duplicate_plan_execution_id_count"]:
+        current_blockers.append("存在重复的计划执行 ID")
+    if metrics["duplicate_operation_uid_count"]:
+        current_blockers.append("存在重复的操作 UID")
+    if metrics["executed_binding_anomaly_count"]:
+        current_blockers.append("已完成计划缺少可验证的成交绑定")
     return {
-        "schema_version": "alis_execution_chain_rolling_slo_v1",
+        "schema_version": "alis_execution_chain_rolling_slo_v2",
         "status": status,
         "window_plans": int(window_plans),
         "observed_due_plans": count,
         "targets": EXECUTION_SLO_TARGETS,
         "metrics": metrics,
         "gates": gates,
-        "observations": observations,
-        "policy": "latest_execution_authorized_non_superseded_due_plan_per_signal_date; actionable_execution_requires_linked_operations; zero_order_execution_requires_frozen_no_action_proposal",
+        "current_blocking": bool(current_blockers),
+        "current_blockers": current_blockers,
+        "observations": [] if compact else observations,
+        "policy": "latest_execution_authorized_non_superseded_due_plan_per_signal_date; isolated_recovery_without_execution_id_is_historical_only; current_blocking_requires_active_or_unreconciled_execution_or_duplicate_binding",
     }
 
 
@@ -2130,10 +2371,14 @@ def build_simulation_learning_loop(*, persist: bool = True) -> dict[str, Any]:
     return {"ok": True, "schema_version": "simulation_learning_loop_v1", "materialized": materialized, "overview": overview, "sell_labels": labels}
 
 
-def build_profit_loop(*, persist: bool = True) -> dict[str, Any]:
+def build_profit_loop(*, persist: bool = True, signal_date: str = "") -> dict[str, Any]:
     attribution = build_return_attribution_loop(persist=persist)
     monitor = build_model_live_monitor(persist=persist)
-    portfolio = build_portfolio_reoptimization()
+    portfolio = (
+        build_portfolio_reoptimization(signal_date=signal_date)
+        if signal_date
+        else build_portfolio_reoptimization()
+    )
     rebalance_plan = materialize_daily_rebalance_plan(portfolio) if persist else get_latest_daily_rebalance_plan()
     portfolio_candles = build_portfolio_candles()
     sells = build_sell_rebalance_diagnostics(monitor, portfolio, persist=persist)

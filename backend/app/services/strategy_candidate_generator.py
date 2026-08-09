@@ -18,7 +18,7 @@ from app.db.store import (
 )
 from app.services.production_strategy import resolve_production_strategy_champion
 from app.services.factor_platform import active_factor_bindings
-from app.services.strategy_config import get_strategy_factor_names
+from app.services.strategy_config import get_replay_required_factor_names
 from app.services.experiment_memory import find_rejected_hypothesis, upsert_experiment_memory
 
 
@@ -33,6 +33,27 @@ REGIME_SELECTION_NAME_PREFIX = "ALIS Challenger 价值低波状态风控"
 REGIME_FACTOR_NAME_PREFIX = "ALIS Challenger 价值低波状态因子"
 MAX_AUTONOMOUS_LINEAGE_TRIALS_PER_ROOT = 8
 MAX_ADAPTIVE_PARAMETER_TRIALS = 4
+
+
+def _active_replay_factor_bindings(
+    content: dict[str, Any],
+    *,
+    model_bindings: dict[str, Any] | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Freeze only active factors that the replay will actually consume."""
+    required = get_replay_required_factor_names(
+        content,
+        "formula",
+        model_bindings=model_bindings,
+    )
+    bindings = active_factor_bindings(required)
+    missing = sorted(required - set(bindings))
+    if missing:
+        raise ValueError(
+            "候选策略未通过冻结因子合同，缺少当前 active 绑定："
+            + ",".join(missing)
+        )
+    return bindings
 
 
 def _stable_evidence_hash(value: dict[str, Any]) -> str:
@@ -201,9 +222,7 @@ def ensure_selection_allocation_challenger(
             "strategy_id": int(strategy["id"]),
             "champion_reference": champion["champion_version"],
             "selection_strategy": content,
-            "factor_bindings": active_factor_bindings(
-                get_strategy_factor_names(content, "formula")
-            ),
+            "factor_bindings": _active_replay_factor_bindings(content),
             "evidence_contract": evidence_contract,
             "experiment_memory": evidence_contract["experiment_memory"],
         },
@@ -341,7 +360,7 @@ def ensure_diversified_selection_challenger(*, source_model_version_id: int) -> 
             "strategy_id": int(strategy["id"]),
             "champion_reference": champion["champion_version"],
             "selection_strategy": content,
-            "factor_bindings": active_factor_bindings(get_strategy_factor_names(content, "formula")),
+            "factor_bindings": _active_replay_factor_bindings(content),
             "evidence_contract": evidence_contract,
             "experiment_memory": evidence_contract["experiment_memory"],
         },
@@ -547,7 +566,7 @@ def ensure_regime_aware_selection_challengers(*, source_model_version_id: int) -
                 "strategy_id": int(strategy["id"]),
                 "champion_reference": champion["champion_version"],
                 "selection_strategy": content,
-                "factor_bindings": active_factor_bindings(get_strategy_factor_names(content, "formula")),
+                "factor_bindings": _active_replay_factor_bindings(content),
                 "evidence_contract": evidence_contract,
                 "experiment_memory": evidence_contract["experiment_memory"],
             },
@@ -719,7 +738,7 @@ def ensure_regime_factor_selection_challengers(*, source_model_version_id: int) 
                 "diagnosis": "thin_excess_and_bull_window_participation_gap",
                 "strategy_id": int(strategy["id"]), "champion_reference": champion["champion_version"],
                 "selection_strategy": content,
-                "factor_bindings": active_factor_bindings(get_strategy_factor_names(content, "formula")),
+                "factor_bindings": _active_replay_factor_bindings(content),
                 "evidence_contract": evidence_contract, "experiment_memory": evidence_contract["experiment_memory"],
             },
             metrics={}, validation={"status": "pending_oos", "production_eligible": False, "next_gate": "quick_diagnostic"}, is_active=False,
@@ -874,7 +893,7 @@ def ensure_stabilized_regime_successor(*, source_model_version_id: int) -> dict[
             },
             "diagnosis": "v6_family_failed_bounded_stabilization", "strategy_id": int(strategy["id"]),
             "champion_reference": champion["champion_version"], "selection_strategy": content,
-            "factor_bindings": active_factor_bindings(get_strategy_factor_names(content, "formula")),
+            "factor_bindings": _active_replay_factor_bindings(content),
             "evidence_contract": evidence_contract, "experiment_memory": evidence_contract["experiment_memory"],
         },
         metrics={}, validation={"status": "pending_oos", "production_eligible": False, "next_gate": "quick_diagnostic"}, is_active=False,
@@ -1119,7 +1138,7 @@ def ensure_autonomous_lineage_successor(*, root_model_version_id: int) -> dict[s
             "role": "challenger", "generation": "automatic_strategy_lineage", "generation_index": next_generation,
             "diagnosis": primary_cause, "strategy_id": int(strategy["id"]), "champion_reference": champion["champion_version"],
             "selection_strategy": content,
-            "factor_bindings": active_factor_bindings(get_strategy_factor_names(content, "formula")),
+            "factor_bindings": _active_replay_factor_bindings(content),
             "lineage": {
                 "root_model_version_id": int(root_model_version_id), "parent_model_version_id": int(parent["id"]),
                 "generation_index": next_generation, "hypothesis_family": mutation_family,
@@ -1281,9 +1300,7 @@ def _ensure_adaptive_parameter_challenger(
             "strategy_id": int(strategy["id"]),
             "champion_reference": champion["champion_version"],
             "selection_strategy": content,
-            "factor_bindings": active_factor_bindings(
-                get_strategy_factor_names(content, "formula")
-            ),
+            "factor_bindings": _active_replay_factor_bindings(content),
             "parameter_search": params,
         },
         metrics={},
@@ -1368,9 +1385,7 @@ def _ensure_dual_trend_challenger(
                 "strategy_id": int(strategy["id"]),
                 "champion_reference": champion["champion_version"],
                 "selection_strategy": content,
-                "factor_bindings": active_factor_bindings(
-                    get_strategy_factor_names(content, "formula")
-                ),
+                "factor_bindings": _active_replay_factor_bindings(content),
             },
             metrics={},
             validation={"status": "pending_oos", "production_eligible": False, "next_gate": "quick_diagnostic"},
@@ -1469,9 +1484,7 @@ def ensure_dynamic_exposure_challenger() -> dict[str, Any]:
                 "strategy_id": int(strategy["id"]),
                 "champion_reference": champion["champion_version"],
                 "selection_strategy": base_content,
-                "factor_bindings": active_factor_bindings(
-                    get_strategy_factor_names(base_content, "formula")
-                ),
+                "factor_bindings": _active_replay_factor_bindings(base_content),
             },
             metrics={},
             validation={"status": "pending_oos", "production_eligible": False, "next_gate": "formal_oos"},

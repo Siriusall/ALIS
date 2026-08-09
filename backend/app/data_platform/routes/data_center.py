@@ -79,6 +79,7 @@ from app.data_platform.services.exchange_etf_pcf import backfill_exchange_etf_pc
 from app.data_platform.services.oos_hard_data import audit_oos_hard_data
 from app.services.sealed_strategy_holdout import audit_sealed_strategy_holdout
 from app.services.llm_data_operations import list_llm_data_operation_cases
+from app.core.read_only_diagnostics import degraded_read
 
 router = APIRouter(tags=["data-center"])
 
@@ -102,12 +103,18 @@ class StreamBulkActionRequest(BaseModel):
 
 @router.get("/data-center/simple-health")
 def data_center_simple_health() -> dict[str, Any]:
-    return simple_health()
+    try:
+        return simple_health()
+    except Exception as exc:  # noqa: BLE001 - optional diagnostic must not become a 500
+        return degraded_read("data_center_simple_health", exc)
 
 
 @router.get("/data-center/observability")
 def data_center_observability(limit_logs: int = Query(default=50, ge=1, le=200)) -> dict[str, Any]:
-    return get_observability(limit_logs=limit_logs)
+    try:
+        return get_observability(limit_logs=limit_logs)
+    except Exception as exc:  # noqa: BLE001 - optional diagnostic must not become a 500
+        return degraded_read("data_center_observability", exc, logs=[], issues=[])
 
 
 @router.get("/data-center/runtime-logs")
@@ -116,12 +123,15 @@ def data_center_runtime_logs(
     limit: int = Query(default=100, ge=1, le=500),
     wait_seconds: float = Query(default=0.0, ge=0.0, le=30.0),
 ) -> dict[str, Any]:
-    deadline = time.monotonic() + float(wait_seconds or 0)
-    items = list_runtime_logs_since(after_id=after_id, limit=limit)
-    while not items and wait_seconds > 0 and time.monotonic() < deadline:
-        time.sleep(0.5)
+    try:
+        deadline = time.monotonic() + float(wait_seconds or 0)
         items = list_runtime_logs_since(after_id=after_id, limit=limit)
-    return {"ok": True, "after_id": after_id, "total": len(items), "items": items}
+        while not items and wait_seconds > 0 and time.monotonic() < deadline:
+            time.sleep(0.5)
+            items = list_runtime_logs_since(after_id=after_id, limit=limit)
+        return {"ok": True, "after_id": after_id, "total": len(items), "items": items}
+    except Exception as exc:  # noqa: BLE001 - optional runtime evidence must degrade safely
+        return degraded_read("runtime_logs", exc, after_id=after_id, total=0, items=[])
 
 
 @router.get("/data-center/streams")
@@ -129,7 +139,10 @@ def data_center_streams(
     limit: int = Query(default=50, ge=1, le=200),
     pending_limit: int = Query(default=50, ge=1, le=500),
 ) -> dict[str, Any]:
-    return stream_admin_status(limit=limit, pending_limit=pending_limit)
+    try:
+        return stream_admin_status(limit=limit, pending_limit=pending_limit)
+    except Exception as exc:  # noqa: BLE001 - optional stream evidence must degrade safely
+        return degraded_read("streams", exc, items=[], pending=[])
 
 
 @router.post("/data-center/streams/messages/{message_id}")
@@ -150,7 +163,10 @@ def data_center_stream_bulk_action(req: StreamBulkActionRequest) -> dict[str, An
 
 @router.get("/data-center/readiness")
 def data_center_readiness() -> dict[str, Any]:
-    return readiness_overview()
+    try:
+        return readiness_overview()
+    except Exception as exc:  # noqa: BLE001 - optional diagnostic must not become a 500
+        return degraded_read("data_center_readiness", exc, consumers=[])
 
 
 @router.get("/data-center/readiness/refresh")
@@ -165,27 +181,42 @@ def data_center_start_readiness_refresh() -> dict[str, Any]:
 
 @router.get("/data-center/assets")
 def data_center_assets() -> dict[str, Any]:
-    return get_data_assets()
+    try:
+        return get_data_assets()
+    except Exception as exc:  # noqa: BLE001 - optional catalog read must degrade safely
+        return degraded_read("data_assets", exc, items=[])
 
 
 @router.get("/data-center/assets/watermarks")
 def data_center_asset_watermarks() -> dict[str, Any]:
-    return asset_watermark_status()
+    try:
+        return asset_watermark_status()
+    except Exception as exc:  # noqa: BLE001 - optional asset evidence must degrade safely
+        return degraded_read("asset_watermarks", exc, items=[])
 
 
 @router.get("/data-center/oos-hard-data")
 def data_center_oos_hard_data(include_dates: bool = Query(default=False)) -> dict[str, Any]:
-    return audit_oos_hard_data(include_dates=include_dates)
+    try:
+        return audit_oos_hard_data(include_dates=include_dates)
+    except Exception as exc:  # noqa: BLE001 - optional diagnostic must not become a 500
+        return degraded_read("oos_hard_data", exc, include_dates=include_dates)
 
 
 @router.get("/data-center/sealed-strategy-holdout")
 def data_center_sealed_strategy_holdout(include_dates: bool = Query(default=False)) -> dict[str, Any]:
-    return audit_sealed_strategy_holdout(include_dates=include_dates)
+    try:
+        return audit_sealed_strategy_holdout(include_dates=include_dates)
+    except Exception as exc:  # noqa: BLE001 - optional diagnostic must not become a 500
+        return degraded_read("sealed_strategy_holdout", exc, include_dates=include_dates)
 
 
 @router.get("/data-center/llm-data-operations")
 def data_center_llm_data_operations(limit: int = Query(default=20, ge=1, le=100)) -> dict[str, Any]:
-    return list_llm_data_operation_cases(limit=limit)
+    try:
+        return list_llm_data_operation_cases(limit=limit)
+    except Exception as exc:  # noqa: BLE001 - optional diagnostic must not become a 500
+        return degraded_read("llm_data_operations", exc, items=[], count=0)
 
 
 @router.get("/data-center/migration-manifest")
@@ -228,12 +259,34 @@ def data_center_daily_update_status() -> dict[str, Any]:
 def data_center_backfill_plan(
     market_batch_days: int = Query(default=30, ge=1, le=80),
     financial_batch_size: int = Query(default=100, ge=1, le=300),
+    rebuild: bool = Query(default=False),
 ) -> dict[str, Any]:
-    """Generate a historical completion plan from audit-window gaps."""
-    return build_backfill_plan(
-        market_batch_days=market_batch_days,
-        financial_batch_size=financial_batch_size,
-    )
+    """Read the persisted plan; rebuild only when explicitly requested.
+
+    Plan generation scans historical coverage and is an operator action, not a
+    page-read operation. The dashboard needs the last durable evidence and
+    must not launch a multi-million-row audit on every refresh.
+    """
+    try:
+        if rebuild:
+            return build_backfill_plan(
+                market_batch_days=market_batch_days,
+                financial_batch_size=financial_batch_size,
+            )
+        snapshot = get_backfill_status()
+        persisted_plan = snapshot.get("plan") if isinstance(snapshot, dict) else None
+        if isinstance(persisted_plan, dict):
+            return {"ok": True, **persisted_plan, "snapshot_source": "persisted_backfill_state"}
+        return {
+            "ok": True,
+            "status": str((snapshot or {}).get("phase") or "idle"),
+            "message": str((snapshot or {}).get("message") or "尚未生成计划"),
+            "steps": [],
+            "summary": (snapshot or {}).get("plan_summary") or {},
+            "snapshot_source": "persisted_backfill_state",
+        }
+    except Exception as exc:  # noqa: BLE001 - optional diagnostic must not become a 500
+        return degraded_read("backfill_plan", exc, steps=[])
 
 
 @router.post("/data-center/backfill/start")
@@ -255,7 +308,10 @@ def data_center_backfill_start(
 
 @router.get("/data-center/backfill/status")
 def data_center_backfill_status() -> dict[str, Any]:
-    return get_backfill_status()
+    try:
+        return get_backfill_status()
+    except Exception as exc:  # noqa: BLE001 - optional backfill evidence must degrade safely
+        return degraded_read("backfill_status", exc, items=[])
 
 
 @router.post("/data-center/backfill/terminate-orphan")
@@ -294,7 +350,10 @@ def data_center_web_crawl_status() -> dict[str, Any]:
 def data_center_status(limit_runs: int = Query(default=10, ge=1, le=100)) -> dict[str, Any]:
     """Return data-center source/catalog coverage and latest ingestion runs."""
 
-    return get_data_center_status(limit_runs=limit_runs)
+    try:
+        return get_data_center_status(limit_runs=limit_runs)
+    except Exception as exc:  # noqa: BLE001 - optional diagnostic must not become a 500
+        return degraded_read("data_center_status", exc, sources=[], catalog=[], runs=[])
 
 
 @router.post("/data-center/seed")
@@ -388,7 +447,10 @@ def data_center_failed_tushare_requests(
     limit: int = Query(default=100, ge=1, le=500),
 ) -> dict[str, Any]:
     """List persisted failed calls available for selective recovery."""
-    return list_failed_tushare_requests(status=request_status, limit=limit)
+    try:
+        return list_failed_tushare_requests(status=request_status, limit=limit)
+    except Exception as exc:  # noqa: BLE001 - optional failure evidence must degrade safely
+        return degraded_read("failed_tushare_requests", exc, items=[])
 
 
 @router.post("/data-center/tushare/failed-requests/resume")

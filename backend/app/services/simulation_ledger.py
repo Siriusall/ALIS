@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 
-from app.db.store import get_execution, list_executions, list_operations, list_quant_run_task_records, list_recent_quant_run_task_records
+from app.db.store import get_execution, list_executions, list_operations_for_execution_ids, list_recent_quant_run_task_records
 from app.services.backtest_data_source import BacktestDataSource
 
 
@@ -24,22 +24,14 @@ def _safe_int(value: Any) -> int:
 def _task_context_by_execution(limit: int) -> tuple[dict[int, dict[str, Any]], list[dict[str, Any]]]:
     out: dict[int, dict[str, Any]] = {}
     warnings: list[dict[str, Any]] = []
-    for record in list_recent_quant_run_task_records(limit=limit):
+    # Recent task rows already identify the exact execution record needed by
+    # the ledger. Fetch their detail JSON in the same bounded query instead of
+    # reopening one query per task/run pair.
+    for record in list_recent_quant_run_task_records(limit=limit, include_detail=True):
         execution_id = record.get("execution_id")
         if execution_id is None:
             continue
-        detail = {}
-        try:
-            records = list_quant_run_task_records(int(record["task_id"]), limit=5000)
-            detail = next((item.get("detail") or {} for item in records if item.get("id") == record.get("id")), {})
-        except Exception as exc:
-            detail = {}
-            warnings.append({
-                "code": "task_context_unavailable",
-                "execution_id": int(execution_id),
-                "task_id": record.get("task_id"),
-                "message": str(exc)[:240],
-            })
+        detail = record.get("detail") if isinstance(record.get("detail"), dict) else {}
         out[int(execution_id)] = {**record, "detail": detail}
     return out, warnings
 
@@ -85,7 +77,34 @@ def build_simulation_ledger(*, limit: int = 20, execution_id: int | None = None)
     executions = [get_execution(int(execution_id))] if execution_id is not None else list_executions(limit=n)
     executions = [item for item in executions if item]
     context_map, evidence_warnings = _task_context_by_execution(limit=max(100, n * 5))
+    operations_by_execution: dict[int, list[dict[str, Any]]] = {}
+    for operation in list_operations_for_execution_ids(
+        [int(item.get("id") or 0) for item in executions],
+        limit_per_execution=5000,
+    ):
+        operations_by_execution.setdefault(int(operation.get("execution_id") or 0), []).append(operation)
     ds = BacktestDataSource()
+    close_maps_by_date: dict[str, dict[str, float]] = {}
+    close_warnings_by_date: dict[str, dict[str, Any]] = {}
+    for execution in executions:
+        eid = int(execution.get("id") or 0)
+        context = context_map.get(eid) or {}
+        execute_date = context.get("execute_date") or str(execution.get("executed_at") or "")[:10]
+        if not execute_date or execute_date in close_maps_by_date or execute_date in close_warnings_by_date:
+            continue
+        operations = operations_by_execution.get(eid, [])
+        try:
+            close_maps_by_date[execute_date] = ds.load_close_map(
+                execute_date,
+                [str(operation.get("symbol") or "") for operation in operations],
+            )
+        except Exception as exc:
+            close_maps_by_date[execute_date] = {}
+            close_warnings_by_date[execute_date] = {
+                "code": "execution_close_map_unavailable",
+                "execute_date": execute_date,
+                "message": str(exc)[:240],
+            }
     items: list[dict[str, Any]] = []
     for execution in executions:
         eid = int(execution.get("id") or 0)
@@ -94,22 +113,22 @@ def build_simulation_ledger(*, limit: int = 20, execution_id: int | None = None)
         signal_date = context.get("signal_date")
         execute_date = context.get("execute_date") or str(execution.get("executed_at") or "")[:10]
         detail = context.get("detail") if isinstance(context.get("detail"), dict) else {}
-        operations = list_operations(execution_id=eid, limit=5000)
-        close_map: dict[str, float] = {}
-        try:
-            snap = ds.load_snapshot(str(execute_date or "").replace("-", ""))
-            close_map = {str(row.symbol): _safe_float(getattr(row, "close", 0)) for row in snap}
-        except Exception as exc:
-            close_map = {}
-            warning = {
-                "code": "execution_snapshot_unavailable",
-                "execution_id": eid,
-                "execute_date": execute_date,
-                "message": str(exc)[:240],
-            }
+        operations = operations_by_execution.get(eid, [])
+        close_map = close_maps_by_date.get(execute_date, {})
+        date_warning = close_warnings_by_date.get(execute_date)
+        if date_warning:
+            warning = {**date_warning, "execution_id": eid}
             evidence_warnings.append(warning)
             item_warnings.append(warning)
-        rows = [_operation_row(op, close_price=close_map.get(str(op.get("symbol") or ""))) for op in sorted(operations, key=lambda x: int(x.get("id") or 0))]
+        rows = [
+            _operation_row(
+                op,
+                close_price=close_map.get(
+                    str(op.get("symbol") or "").strip().upper().split(".", 1)[0].zfill(6)
+                ),
+            )
+            for op in sorted(operations, key=lambda x: int(x.get("id") or 0))
+        ]
         blocked = []
         actions = detail.get("rebalance_actions") if isinstance(detail.get("rebalance_actions"), dict) else {}
         if actions:

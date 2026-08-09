@@ -7,6 +7,7 @@ from typing import Any
 
 from app.data_platform.db import _conn
 from app.data_platform.services.market_calendar import target_trade_date
+from app.data_platform.services.snapshot_health import snapshot_stats_for_range
 
 CONTRACT_VERSION = "alis_oos_hard_data_v2"
 TRAIN_SESSIONS = 756
@@ -35,41 +36,31 @@ def _date_api_sets(start_date: str, end_date: str) -> dict[str, set[str]]:
         for api in HARD_APIS:
             if api == "adj_factor":
                 rows = conn.execute(
-                    """SELECT coverage.trade_date,MAX(coverage.rows_read) AS row_count,
-                              coverage.trade_date AS max_available_time
-                       FROM dc_tushare_request_coverage coverage
-                       WHERE coverage.api_name=? AND coverage.trade_date BETWEEN ? AND ?
-                         AND coverage.result_status='success' AND coverage.rows_read>=?
-                       GROUP BY coverage.trade_date""",
-                    (api, start_date, end_date, MINIMUM_HARD_API_ROWS),
+                    """SELECT trade_date,MAX(rows_read) AS row_count
+                       FROM dc_tushare_request_coverage
+                      WHERE api_name=? AND trade_date BETWEEN ? AND ?
+                        AND result_status IN ('success','not_applicable','valid_empty','deferred_empty')
+                      GROUP BY trade_date""",
+                    (api, start_date, end_date),
                 ).fetchall()
             else:
-                # dc_available_trade_dates is a compact snapshot ledger.  It
-                # gives us one indexed raw-existence probe per retained date,
-                # including legacy slices whose coverage row predates the
-                # current ledger, without scanning the full raw table.  It is
-                # intentionally independent from dc_trade_calendar.
+                # The compact date ledger covers legacy market slices whose
+                # request-coverage rows predate the current audit ledger.
                 rows = conn.execute(
-                    """SELECT available.trade_date,? AS row_count,
-                              available.trade_date AS max_available_time
-                       FROM dc_available_trade_dates available
-                       WHERE available.trade_date BETWEEN ? AND ?
-                         AND EXISTS (
-                           SELECT 1 FROM dc_tushare_raw_records raw
-                           WHERE raw.api_name=? AND raw.trade_date=available.trade_date
-                         )""",
+                    """SELECT available.trade_date,? AS row_count
+                         FROM dc_available_trade_dates available
+                        WHERE available.trade_date BETWEEN ? AND ?
+                          AND EXISTS (
+                              SELECT 1 FROM dc_tushare_raw_records raw
+                               WHERE raw.api_name=? AND raw.trade_date=available.trade_date
+                          )""",
                     (MINIMUM_HARD_API_ROWS, start_date, end_date, api),
                 ).fetchall()
             valid: set[str] = set()
             for row in rows:
                 item = dict(row)
                 trade_date = str(item.get("trade_date") or "")
-                cutoff = f"{trade_date[:4]}-{trade_date[4:6]}-{trade_date[6:]}T15:00:00"
-                # Raw ingestion derives economic availability from trade_date
-                # at 15:00. Full-slice evidence comes from the compact request
-                # coverage ledger, avoiding a 7M-row raw-table scan per batch.
-                pit_ok = True
-                if int(item.get("row_count") or 0) >= MINIMUM_HARD_API_ROWS and pit_ok:
+                if int(item.get("row_count") or 0) >= MINIMUM_HARD_API_ROWS:
                     valid.add(trade_date)
             result[api] = valid
     return result
@@ -79,10 +70,10 @@ def _benchmark_date_set(start_date: str, end_date: str) -> set[str]:
     with _conn() as conn:
         rows = conn.execute(
             """SELECT trade_date,MAX(available_time) AS max_available_time
-               FROM dc_tushare_raw_records
-               WHERE api_name='index_daily' AND ts_code=?
-                 AND trade_date BETWEEN ? AND ?
-               GROUP BY trade_date""",
+                 FROM dc_tushare_raw_records
+                WHERE api_name='index_daily' AND ts_code=?
+                  AND trade_date BETWEEN ? AND ?
+                GROUP BY trade_date""",
             (BENCHMARK_INDEX_CODE, start_date, end_date),
         ).fetchall()
     valid: set[str] = set()
@@ -116,15 +107,9 @@ def audit_oos_hard_data(*, end_date: str | None = None, include_dates: bool = Tr
     api_dates = _date_api_sets(start, end)
     benchmark_dates = _benchmark_date_set(start, end)
     with _conn() as conn:
-        snapshot_rows = conn.execute(
-            """SELECT trade_date,COUNT(*) AS rows_total,
-                      SUM(CASE WHEN close IS NOT NULL AND volume IS NOT NULL AND turnover IS NOT NULL THEN 1 ELSE 0 END) AS market_rows,
-                      MIN(available_time) AS min_available_time,MAX(available_time) AS max_available_time
-               FROM dc_stock_daily_snapshot WHERE trade_date BETWEEN ? AND ?
-               GROUP BY trade_date""",
-            (start, end),
-        ).fetchall()
-    snapshots = {str(dict(row).get("trade_date") or ""): dict(row) for row in snapshot_rows}
+        snapshots = snapshot_stats_for_range(conn, start, end)
+        if snapshots is None:
+            snapshots = {}
     details: list[dict[str, Any]] = []
     for trade_date in calendar_dates:
         snapshot = snapshots.get(trade_date) or {}

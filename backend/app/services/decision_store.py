@@ -58,10 +58,15 @@ def upsert_pool_member(*, ts_code: str, pool_type: str, reason: str) -> dict[str
     return dict(row)
 
 
-def list_pool_members(pool_type: str = "") -> list[dict[str, Any]]:
+def list_pool_members(pool_type: str = "", limit: int | None = None) -> list[dict[str, Any]]:
     with _conn() as c:
-        if pool_type: rows = c.execute("SELECT * FROM stock_pool_memberships WHERE pool_type=? AND status='active' ORDER BY updated_at DESC", (pool_type,)).fetchall()
-        else: rows = c.execute("SELECT * FROM stock_pool_memberships WHERE status='active' ORDER BY updated_at DESC").fetchall()
+        params: tuple[Any, ...] = (pool_type,) if pool_type else ()
+        where = "pool_type=? AND status='active'" if pool_type else "status='active'"
+        sql = f"SELECT * FROM stock_pool_memberships WHERE {where} ORDER BY updated_at DESC"
+        if limit is not None:
+            sql += " LIMIT ?"
+            params += (max(1, min(int(limit), 500)),)
+        rows = c.execute(sql, params).fetchall()
     return [dict(x) for x in rows]
 
 
@@ -173,6 +178,13 @@ def verify_decision_snapshot(decision_snapshot_id: int) -> dict[str, Any] | None
     }
 
 
+def get_decision_snapshot(decision_snapshot_id: int) -> dict[str, Any] | None:
+    """Load one complete frozen decision for the selected audit record."""
+    with _conn() as c:
+        row = c.execute("SELECT * FROM decision_snapshots WHERE id=?", (int(decision_snapshot_id),)).fetchone()
+    return _decode(row, ("market_state_json", "research_state_json", "valuation_json", "portfolio_context_json", "target_weight_contract_json", "invalidation_conditions_json")) if row else None
+
+
 def _structured_diff(left: Any, right: Any, *, path: str = "", limit: int = 200) -> list[dict[str, Any]]:
     """Small deterministic diff for frozen JSON evidence, capped for API use."""
     if left == right:
@@ -224,10 +236,62 @@ def diff_decision_snapshots(left_id: int, right_id: int) -> dict[str, Any] | Non
 
 
 def list_decision_snapshots(ts_code: str = "", limit: int = 100) -> list[dict[str, Any]]:
+    columns = "id,ts_code,decision_type,decision_time,price,thesis_id,execution_id,operation_id,data_as_of_time,model_version,market_state_json,research_state_json,valuation_json,portfolio_context_json,target_weight_contract_json,reason,invalidation_conditions_json,evidence_hash,evidence_schema_version,created_at"
     with _conn() as c:
-        if ts_code: rows = c.execute("SELECT * FROM decision_snapshots WHERE ts_code=? ORDER BY decision_time DESC LIMIT ?", (ts_code,limit)).fetchall()
-        else: rows = c.execute("SELECT * FROM decision_snapshots ORDER BY decision_time DESC LIMIT ?", (limit,)).fetchall()
+        if ts_code: rows = c.execute(f"SELECT {columns} FROM decision_snapshots WHERE ts_code=? ORDER BY decision_time DESC,id DESC LIMIT ?", (ts_code,limit)).fetchall()
+        else: rows = c.execute(f"SELECT {columns} FROM decision_snapshots ORDER BY decision_time DESC,id DESC LIMIT ?", (limit,)).fetchall()
     return [_decode(x,("market_state_json","research_state_json","valuation_json","portfolio_context_json","target_weight_contract_json","invalidation_conditions_json")) for x in rows]
+
+
+def list_decision_snapshot_summaries(ts_code: str = "", limit: int = 100) -> list[dict[str, Any]]:
+    """List only fields needed to select an audit record in the console."""
+    columns = "id,ts_code,decision_type,decision_time,price,thesis_id,execution_id,operation_id,data_as_of_time,model_version,reason,evidence_hash,evidence_schema_version,created_at"
+    bounded = max(1, min(int(limit), 500))
+    with _conn() as c:
+        if ts_code:
+            rows = c.execute(
+                f"SELECT {columns} FROM decision_snapshots WHERE ts_code=? ORDER BY decision_time DESC,id DESC LIMIT ?",
+                (ts_code, bounded),
+            ).fetchall()
+        else:
+            rows = c.execute(
+                f"SELECT {columns} FROM decision_snapshots ORDER BY decision_time DESC,id DESC LIMIT ?",
+                (bounded,),
+            ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def summarize_decision_audit(limit: int = 100) -> dict[str, Any]:
+    """Return audit counters without transferring full frozen decision payloads."""
+    bounded = max(1, min(int(limit), 500))
+    with _conn() as c:
+        decision_rows = c.execute(
+            """SELECT id,data_as_of_time,decision_time,model_version,market_state_json,research_state_json
+               FROM decision_snapshots ORDER BY decision_time DESC,id DESC LIMIT ?""",
+            (bounded,),
+        ).fetchall()
+        review_rows = c.execute(
+            "SELECT decision_snapshot_id FROM review_records ORDER BY review_time DESC,id DESC LIMIT ?",
+            (bounded,),
+        ).fetchall()
+    decisions = [_decode(row, ("market_state_json", "research_state_json")) for row in decision_rows]
+    review_values = [dict(row) for row in review_rows]
+    reviewed_ids = {int(row["decision_snapshot_id"]) for row in review_values if row.get("decision_snapshot_id")}
+    missing = [row for row in decisions if int(row.get("id") or 0) not in reviewed_ids]
+    future_violations = [
+        row for row in decisions
+        if str(row.get("data_as_of_time") or "") > str(row.get("decision_time") or "")
+    ]
+    missing_evidence = [
+        row for row in decisions
+        if not row.get("market_state") or not row.get("research_state") or not row.get("model_version")
+    ]
+    return {
+        "ok": not future_violations and not missing_evidence,
+        "counts": {"decisions": len(decisions), "reviews": len(reviewed_ids), "awaiting_review": len(missing)},
+        "quality": {"future_data_violations": len(future_violations), "missing_evidence": len(missing_evidence)},
+        "compact": True,
+    }
 
 
 def create_review(payload: dict[str, Any]) -> dict[str, Any]:
@@ -239,7 +303,7 @@ def create_review(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def list_reviews(limit: int = 100) -> list[dict[str, Any]]:
-    with _conn() as c: rows=c.execute("SELECT * FROM review_records ORDER BY review_time DESC LIMIT ?",(limit,)).fetchall()
+    with _conn() as c: rows=c.execute("SELECT id,decision_snapshot_id,review_time,outcome_json,attribution_json,error_type,lessons,created_at FROM review_records ORDER BY review_time DESC,id DESC LIMIT ?",(limit,)).fetchall()
     return [_decode(x,("outcome_json","attribution_json")) for x in rows]
 
 

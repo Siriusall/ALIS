@@ -14,6 +14,9 @@ from app.services.cache_consolidation import FACTOR_KEYS_FOR_COVERAGE
 _health_cache_lock = threading.Lock()
 _health_cache: dict[int, tuple[float, dict[str, Any]]] = {}
 _HEALTH_CACHE_TTL_SECONDS = 20.0
+_decision_health_cache_lock = threading.Lock()
+_decision_health_cache: tuple[float, dict[str, Any]] | None = None
+_DECISION_HEALTH_CACHE_TTL_SECONDS = 20.0
 _FACTOR_COVERAGE_THRESHOLDS = {
     "close": 0.8,
     "volume": 0.8,
@@ -195,25 +198,63 @@ def _latest_adj_factor_coverage(trade_date: str) -> dict[str, Any]:
     }
 
 
-def assess_latest_decision_data_health() -> dict[str, Any]:
-    """Decide whether current data may feed strategy research and simulation.
+def assess_latest_decision_data_health(trade_date: str = "") -> dict[str, Any]:
+    """Decide whether one completed data slice may feed research and simulation.
 
     Daily execution already has its own hard gate. This broader read-only
     contract catches coverage drift before the autonomous research bus creates
-    candidates from a partial latest market slice.
+    candidates from a partial market slice. Recovery tasks pass their frozen
+    trade date explicitly so a post-midnight run does not silently switch to
+    the new calendar day's still-incomplete data.
     """
-    from app.data_platform.services.daily_update import simple_health
+    global _decision_health_cache
+    requested_trade_date = str(trade_date or "").replace("-", "")[:8]
+    now = time.monotonic()
+    if not requested_trade_date:
+        with _decision_health_cache_lock:
+            cached = _decision_health_cache
+        if cached and now - cached[0] < _DECISION_HEALTH_CACHE_TTL_SECONDS:
+            return cached[1]
 
-    readiness = simple_health()
+    if requested_trade_date:
+        from app.data_platform.services.decision_data_contract import decision_data_contract
+
+        contract = decision_data_contract(requested_trade_date)
+        readiness = {
+            "ok": bool(contract.get("ok")),
+            "level": "healthy" if contract.get("ok") else "blocked",
+            "summary": (
+                f"{requested_trade_date} 决策数据完整"
+                if contract.get("ok")
+                else str(contract.get("reason") or f"{requested_trade_date} 决策数据未就绪")
+            ),
+            "target_trade_date": requested_trade_date,
+            "latest_trade_date": requested_trade_date,
+            "latest_decision_ready_trade_date": requested_trade_date if contract.get("ok") else "",
+            "decision_contract": contract,
+        }
+    else:
+        from app.data_platform.services.daily_update import simple_health
+
+        readiness = simple_health()
+
     report = build_data_health_report(limit_days=_DECISION_DRIFT_LOOKBACK_DAYS + 1)
     snapshots = report.get("market_snapshots") if isinstance(report.get("market_snapshots"), dict) else {}
     recent_days = snapshots.get("recent_days") if isinstance(snapshots.get("recent_days"), list) else []
-    latest = recent_days[-1] if recent_days else {}
+    latest = (
+        next((item for item in recent_days if str(item.get("date") or "") == requested_trade_date), {})
+        if requested_trade_date
+        else recent_days[-1] if recent_days else {}
+    )
     latest_date = str(latest.get("date") or readiness.get("latest_decision_ready_trade_date") or "")
     latest_rows = int(latest.get("symbol_rows") or 0)
+    baseline_candidates = [
+        item for item in recent_days
+        if str(item.get("date") or "") < latest_date
+    ] if latest_date else []
     baseline_rows = [
         int(item.get("symbol_rows") or 0)
-        for item in recent_days[:-1]
+        for item in baseline_candidates
         if int(item.get("symbol_rows") or 0) > 0
     ][-_DECISION_DRIFT_LOOKBACK_DAYS:]
     baseline = float(median(baseline_rows)) if len(baseline_rows) >= 3 else 0.0
@@ -260,7 +301,7 @@ def assess_latest_decision_data_health() -> dict[str, Any]:
         })
     decision_ready = not any(item["level"] == "error" for item in issues)
     experiment_ready = decision_ready and bool(adj_factor["ready"])
-    return {
+    result = {
         "ok": decision_ready,
         "status": "ready" if experiment_ready else "degraded" if decision_ready else "blocked",
         "schema_version": "alis_latest_decision_data_health_v1",
@@ -283,3 +324,7 @@ def assess_latest_decision_data_health() -> dict[str, Any]:
             "strategy_experiments": "require decision data and latest adj_factor coverage",
         },
     }
+    if not requested_trade_date:
+        with _decision_health_cache_lock:
+            _decision_health_cache = (time.monotonic(), result)
+    return result

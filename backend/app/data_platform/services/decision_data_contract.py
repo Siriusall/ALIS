@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from app.data_platform.db import _conn
+from app.data_platform.services.snapshot_health import candidate_snapshot_dates
 
 
 REQUIRED_DECISION_APIS = ("daily", "daily_basic", "stk_limit")
@@ -147,19 +148,7 @@ def latest_decision_ready_trade_date(conn: Any) -> str:
     latest = latest_market_trade_date(conn)
     if latest and decision_data_contract(latest, conn=conn).get("ok"):
         return latest
-    row = conn.execute(
-        """SELECT s.trade_date AS value
-           FROM dc_stock_daily_snapshot s
-           WHERE s.trade_date < ?
-             AND EXISTS (SELECT 1 FROM dc_tushare_raw_records r WHERE r.trade_date=s.trade_date AND r.api_name='daily')
-             AND EXISTS (SELECT 1 FROM dc_tushare_raw_records r WHERE r.trade_date=s.trade_date AND r.api_name='daily_basic')
-             AND EXISTS (SELECT 1 FROM dc_tushare_raw_records r WHERE r.trade_date=s.trade_date AND r.api_name='stk_limit')
-           GROUP BY s.trade_date
-           HAVING SUM(CASE WHEN s.close IS NOT NULL THEN 1 ELSE 0 END) >= ?
-              AND SUM(CASE WHEN s.total_mv IS NOT NULL THEN 1 ELSE 0 END) >= ?
-              AND SUM(CASE WHEN s.up_limit IS NOT NULL AND s.down_limit IS NOT NULL THEN 1 ELSE 0 END)
-                  >= SUM(CASE WHEN s.close IS NOT NULL THEN 1 ELSE 0 END) * ?
-           ORDER BY s.trade_date DESC LIMIT 1""",
-        (latest or "99999999", threshold, threshold, DECISION_MIN_STOCK_COVERAGE),
-    ).fetchone()
-    return str(_row_dict(row).get("value") or "")
+    for candidate in candidate_snapshot_dates(conn, before=latest or "", limit=12):
+        if decision_data_contract(candidate, conn=conn).get("ok"):
+            return candidate
+    return ""
