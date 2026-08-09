@@ -36,8 +36,10 @@ export async function readApi(path: string, signal?: AbortSignal, timeoutMs = AP
     if (!response.ok) {
       // /api/health deliberately uses HTTP 503 for readiness failures, but
       // its diagnostic payload is still useful to the read-only admin page.
-      if ((path === "/api/health" || path === "/api/trading-ready") && response.status === 503) return response.json();
-      throw new Error(`HTTP ${response.status}`);
+      if ((path.split("?", 1)[0] === "/api/health" || path.split("?", 1)[0] === "/api/trading-ready") && response.status === 503) return response.json();
+      const error = new Error(`HTTP ${response.status}`) as Error & { status?: number };
+      error.status = response.status;
+      throw error;
     }
     return response.json();
   } finally {
@@ -46,7 +48,15 @@ export async function readApi(path: string, signal?: AbortSignal, timeoutMs = AP
   }
 }
 
-export async function writeApi(path: string, body?: unknown): Promise<Json> {
+const AUTH_WRITE_PATHS = new Set([
+  "/api/auth/login",
+  "/api/auth/register",
+]);
+
+export async function authWriteApi(path: string, body?: unknown): Promise<Json> {
+  if (!AUTH_WRITE_PATHS.has(path)) {
+    throw new Error("前端只允许认证写入，业务写接口已被拒绝");
+  }
   const token = getToken();
   const response = await fetch(`${API_BASE}${path}`, {
     method: "POST", headers: { Accept: "application/json", "Content-Type": "application/json", ...(token ? { Authorization: `Bearer ${token}` } : {}) },
@@ -61,49 +71,56 @@ export async function writeApi(path: string, body?: unknown): Promise<Json> {
 
 export const endpoints = {
   health: "/api/health",
-  tradingReady: "/api/trading-ready",
+  tradingReady: "/api/trading-ready?detail=compact",
   apiCatalog: "/api/openapi.json",
   owner: "/api/model-strategy/evolution/owner-summary",
   decision: "/api/decision/summary",
+  latestPlan: "/api/decision/latest-plan",
   report: "/api/decision/daily-report",
+  reportCompact: "/api/decision/daily-report?compact=true",
   ledger: "/api/quant-runs/ledger-summary",
-  ledgerDetail: "/api/quant-runs/simulation-ledger?limit=50",
+  ledgerDetail: "/api/quant-runs/simulation-ledger?limit=20",
   positions: "/api/positions",
   performance: "/api/quant-runs/performance",
   portfolio: "/api/research/portfolio-candles",
   risk: "/api/research/portfolio-risk/live",
   strategy: "/api/model-strategy/strategy-lab",
-  tasks: "/api/model-strategy/task-center?limit=30&log_limit=80",
-  evolutionTasks: "/api/model-strategy/evolution/tasks?limit=60",
+  tasks: "/api/model-strategy/task-center?compact=true&limit=16&log_limit=40",
+  adminTasksLive: "/api/model-strategy/task-center?compact=true&limit=30&log_limit=20",
+  modelTasksLive: "/api/model-strategy/task-center?compact=true&limit=24&log_limit=40",
+  evolutionTasks: "/api/model-strategy/evolution/tasks?limit=30",
   evolutionSchedule: "/api/model-strategy/evolution/schedule",
   ledgerAudit: "/api/model-strategy/evolution/ledger-audit",
-  quantTasks: "/api/quant-runs/tasks?limit=50",
+  quantTasks: "/api/quant-runs/tasks?limit=20",
   quantStatus: "/api/quant-runs/status",
-  quantRecent: "/api/quant-runs/recent?limit=20",
-  executions: "/api/executions?limit=100",
-  operations: "/api/operations?limit=200",
+  quantRecent: "/api/quant-runs/recent?limit=10",
+  operationsPage: "/api/operations/page?limit=20&offset=0",
+  executionsPage: "/api/executions/page?limit=20&offset=0",
   data: "/api/data-center/readiness",
   oos: "/api/data-center/oos-hard-data",
   sealed: "/api/data-center/sealed-strategy-holdout",
-  research: "/api/research/profit-loop",
+  research: "/api/research/profit-loop?compact=true",
   researchContracts: "/api/research/contracts",
   researchGovernance: "/api/research/governance/overview",
   researchPositionState: "/api/research/position-state",
   researchDataAssets: "/api/model-strategy/evolution/research-data-assets",
   analystConsensus: "/api/model-strategy/analyst-consensus/batch?limit=100",
   theses: "/api/research/theses",
-  industries: "/api/research/industries",
-  industryAllocation: "/api/research/industries/allocation",
-  themes: "/api/research/themes",
+  industries: "/api/research/industries?compact=true",
+  industryAllocation: "/api/research/industries/allocation?compact=true",
+  themes: "/api/research/themes?limit=100&compact=true",
   events: "/api/research/events",
   pools: "/api/research/pools",
   factors: "/api/factors/registry",
   factorStatus: "/api/factors",
   factorResearch: "/api/factors/research/status",
+  factorResearchConsole: "/api/factors/research/status?console=true",
+  factorResearchCompact: "/api/factors/research/status?compact=true",
   researchAnalytics: "/api/factors/research/analytics",
+  researchAnalyticsConsole: "/api/factors/research/analytics/console",
   researchFactorAnalytics: "/api/factors/research/analytics/factors?limit=600",
   researchTimeseries: "/api/factors/research/analytics/timeseries?limit=1000",
-  researchExpertHistory: "/api/factors/research/analytics/experts/history?limit=1000",
+  researchExpertHistory: "/api/factors/research/analytics/experts/history?limit=100",
   researchEnvironmentSimilarity: "/api/factors/research/analytics/environment-similarity",
   researchArchive: "/api/factors/research/analytics/archive",
   factorLineage: "/api/factors/strategy-lineage",
@@ -129,21 +146,22 @@ export const endpoints = {
   dailyUpdateStatus: "/api/data-center/daily-update/status",
   backfillStatus: "/api/data-center/backfill/status",
   backfillPlan: "/api/data-center/backfill/plan",
-  decisionAudit: "/api/research/decision-audit",
-  decisions: "/api/research/decisions",
-  reviews: "/api/research/reviews",
+  decisionAudit: "/api/research/decision-audit?limit=20&compact=true",
+  decisions: "/api/research/decisions?limit=20&compact=true",
+  reviews: "/api/research/reviews?limit=20",
   reviewLearning: "/api/research/reviews/learning-overview",
   llmBudget: "/api/research/llm/token-budget",
-  llmProposals: "/api/research/llm/proposals?limit=50",
-  performanceReports: "/api/quant-runs/performance/reports",
-  backtests: "/api/backtest/list?limit=50",
+  llmProposals: "/api/research/llm/proposals?limit=20",
+  performanceReports: "/api/quant-runs/performance/reports?limit=20",
+  backtests: "/api/backtest/list?limit=20",
 } as const;
 
 export function asArray(value: unknown): Json[] {
   return Array.isArray(value) ? value.filter((item) => item && typeof item === "object") : [];
 }
 
-export function firstArray(source: Json | undefined, keys: string[]): Json[] {
+export function firstArray(source: Json | Json[] | undefined, keys: string[]): Json[] {
+  if (Array.isArray(source)) return asArray(source);
   for (const key of keys) {
     const value = key.split(".").reduce<any>((current, part) => current?.[part], source);
     if (Array.isArray(value)) return asArray(value);

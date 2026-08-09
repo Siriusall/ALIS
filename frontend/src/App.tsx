@@ -1,50 +1,66 @@
-import { Activity, BriefcaseBusiness, ChartNoAxesCombined, Database, FileSearch, FlaskConical, Gauge, LayoutDashboard, LogOut, Menu, RefreshCw, Settings, X } from "lucide-react";
+import { Activity, BriefcaseBusiness, ChartNoAxesCombined, FlaskConical, Gauge, LayoutDashboard, LogOut, Menu, RefreshCw, X } from "lucide-react";
+import type { LucideIcon } from "lucide-react";
 import { useState } from "react";
 import { NavLink, Navigate, Route, Routes, useLocation } from "react-router-dom";
 import { AuthPage, RequireAuth, useAuth } from "./auth";
 import { ConsoleLoading, ErrorStrip } from "./components";
-import { AdminOverview, DataAssets, EvidenceChain, Evolution, FactorGuidance, ModelGovernance, Operations, Overview, Portfolio, Research, ResearchEfficiency, ResearchWaves, TodayDecision } from "./pages";
+import { DataAssets, EvidenceChain, Evolution, FactorGuidance, ModelGovernance, Operations, Overview, Portfolio, Research, ResearchEfficiency, ResearchWaves, SystemObservatory, TodayDecision } from "./pages";
 import { preloadConsoleRoutes, useConsoleData } from "./useConsoleData";
 
-const ownerNav = [
-  ["/overview", "总览", LayoutDashboard], ["/decision", "今日决策", Activity],
-  ["/portfolio", "账户与组合", BriefcaseBusiness], ["/evolution", "研究与进化", ChartNoAxesCombined],
-  ["/research", "研究中心", FlaskConical],
-] as const;
-const adminNav = [
-  ["/admin", "运行总览", LayoutDashboard], ["/admin/operations", "任务与链路", Activity],
-  ["/admin/data", "数据与日更", Database], ["/admin/models", "模型治理", Gauge],
-  ["/admin/evidence", "证据与审计", FileSearch],
-] as const;
+type NavItem = {
+  key: string;
+  path: string;
+  label: string;
+  Icon: LucideIcon;
+  children?: ReadonlyArray<readonly [string, string]>;
+};
+
+const consoleNav: NavItem[] = [
+  { key: "overview", path: "/overview", label: "总览", Icon: LayoutDashboard },
+  { key: "decision", path: "/decision", label: "今日决策", Icon: Activity },
+  { key: "portfolio", path: "/portfolio", label: "账户与组合", Icon: BriefcaseBusiness },
+  { key: "research", path: "/research", label: "公司与行业研究", Icon: FlaskConical },
+  { key: "models", path: "/evolution", label: "模型与因子", Icon: ChartNoAxesCombined, children: [
+    ["/evolution", "策略进化"], ["/models", "模型治理"],
+    ["/evolution/factors", "因子关系"], ["/evolution/metrics", "进化效率"], ["/evolution/waves", "实验批次"],
+  ] },
+  { key: "system", path: "/system", label: "系统", Icon: Gauge, children: [
+    ["/system", "运行概览"], ["/operations", "任务与链路"], ["/data", "数据与日更"], ["/evidence", "证据与审计"],
+  ] },
+];
 const pageNames: Record<string, string> = {
   "/overview": "投资系统总览", "/decision": "今日决策", "/portfolio": "账户与组合",
-  "/evolution": "研究与进化", "/research": "研究中心", "/admin": "管理后台",
-  "/evolution/factors": "因子关系与指导", "/evolution/metrics": "研究效率",
-  "/evolution/waves": "批次与专家治理",
-  "/admin/operations": "任务与链路", "/admin/models": "模型治理",
-  "/admin/data": "数据与日更", "/admin/evidence": "证据与审计",
+  "/system": "系统运行",
+  "/evolution": "策略进化", "/research": "公司与行业研究",
+  "/evolution/factors": "因子关系与指导", "/evolution/metrics": "进化效率",
+  "/evolution/waves": "实验批次与专家",
+  "/operations": "任务与链路", "/models": "模型治理",
+  "/data": "数据与日更", "/evidence": "证据与审计",
 };
 
 function ConsoleApp() {
   const location = useLocation();
   const { user, logout } = useAuth();
-  const { data, errors, loading, refreshing, progress, refresh } = useConsoleData(location.pathname);
+  const { data, errors, loading, loadingMessage, refreshing, progress, refresh } = useConsoleData(location.pathname);
   const [open, setOpen] = useState(false);
-  const admin = location.pathname.startsWith("/admin");
-  const nav = admin ? adminNav : ownerNav;
+  const [expandedNav, setExpandedNav] = useState<string | null>(null);
+  const currentPage = pageNames[location.pathname] || "控制台";
   return <div className="app-shell">
     <aside className={open ? "sidebar open" : "sidebar"}>
-      <div className="brand"><div>AL</div><span><strong>ALIS</strong><small>{admin ? "系统管理后台" : "模拟投资控制台"}</small></span><button onClick={() => setOpen(false)} aria-label="关闭导航"><X size={19}/></button></div>
-      <nav>{nav.map(([path,label,Icon]) => <div className="nav-entry" key={path}><NavLink to={path} end={path === "/admin" || path === "/evolution"} onPointerEnter={()=>void preloadConsoleRoutes([path])} onFocus={()=>void preloadConsoleRoutes([path])} onClick={() => setOpen(false)}><Icon size={18}/><span>{label}</span></NavLink>{!admin&&path==="/evolution"&&<div className="nav-children"><NavLink to="/evolution" end onPointerEnter={()=>void preloadConsoleRoutes(["/evolution"])} onFocus={()=>void preloadConsoleRoutes(["/evolution"])} onClick={()=>setOpen(false)}>当前页面</NavLink><NavLink to="/evolution/factors" onPointerEnter={()=>void preloadConsoleRoutes(["/evolution/factors"])} onFocus={()=>void preloadConsoleRoutes(["/evolution/factors"])} onClick={()=>setOpen(false)}>因子关系与指导</NavLink><NavLink to="/evolution/metrics" onPointerEnter={()=>void preloadConsoleRoutes(["/evolution/metrics"])} onFocus={()=>void preloadConsoleRoutes(["/evolution/metrics"])} onClick={()=>setOpen(false)}>研究效率</NavLink><NavLink to="/evolution/waves" onPointerEnter={()=>void preloadConsoleRoutes(["/evolution/waves"])} onFocus={()=>void preloadConsoleRoutes(["/evolution/waves"])} onClick={()=>setOpen(false)}>批次与专家治理</NavLink></div>}</div>)}</nav>
-      <NavLink className="console-switch" to={admin ? "/overview" : "/admin"} onPointerEnter={()=>void preloadConsoleRoutes([admin?"/overview":"/admin"])} onFocus={()=>void preloadConsoleRoutes([admin?"/overview":"/admin"])}>{admin ? <LayoutDashboard size={17}/> : <Settings size={17}/>}<span>{admin ? "返回投资前台" : "进入管理后台"}</span></NavLink>
-      <div className="sidebar-foot"><span className={loading || refreshing ? "pulse" : ""}/><div><strong>{loading ? "正在载入" : refreshing ? "后台刷新" : "只读控制台"}</strong><small>写操作由自治系统执行</small></div></div>
+      <div className="brand"><div><ChartNoAxesCombined size={21} strokeWidth={2.2}/></div><span><strong>ALIS</strong><small>量化研究与模拟交易</small></span><button onClick={() => setOpen(false)} aria-label="关闭导航"><X size={19}/></button></div>
+      <nav>{consoleNav.map((item) => {
+        const groupActive = Boolean(item.children?.some(([path]) => location.pathname === path));
+        const childrenVisible = Boolean(item.children && (groupActive || expandedNav === item.key));
+        return <div className="nav-entry" key={item.key}><NavLink to={item.path} end className={({ isActive }) => isActive || groupActive ? "active" : undefined} onPointerEnter={()=>void preloadConsoleRoutes([item.path])} onFocus={()=>void preloadConsoleRoutes([item.path])} onClick={() => { setOpen(false); if (item.children) setExpandedNav(item.key); }}><item.Icon size={18}/><span>{item.label}</span></NavLink>{childrenVisible && <div className="nav-children">{item.children!.map(([path, label]) => <NavLink key={path} to={path} end onPointerEnter={()=>void preloadConsoleRoutes([path])} onFocus={()=>void preloadConsoleRoutes([path])} onClick={()=>setOpen(false)}>{label}</NavLink>)}</div>}</div>;
+      })}</nav>
+      <div className="sidebar-foot"><span className={loading || refreshing ? "pulse" : ""}/><div><strong>{loading ? "正在载入" : refreshing ? "正在刷新" : "数据已同步"}</strong><small>更新于当前会话</small></div></div>
     </aside>
     <div className="app-body">
-      <header className="topbar"><button className="mobile-menu" onClick={() => setOpen(true)} aria-label="打开导航"><Menu size={20}/></button><div><span>{admin ? "系统管理" : user?.username || "模拟账户"}</span><strong>{admin ? "全链路只读监控" : "¥200,000 基准权益"}</strong></div><div className="topbar-actions"><button className="icon-button" onClick={refresh} disabled={loading || refreshing} title="刷新只读数据" aria-label="刷新数据"><RefreshCw size={18} className={loading || refreshing ? "spin" : ""}/></button><button className="icon-button" onClick={logout} title="退出登录" aria-label="退出登录"><LogOut size={17}/></button></div></header>
-      <main>{loading ? <ConsoleLoading page={pageNames[location.pathname] || "控制台"} completed={progress.completed} total={progress.total}/> : <><ErrorStrip errors={errors}/><Routes>
-        <Route path="/overview" element={<Overview data={data}/>}/><Route path="/decision" element={<TodayDecision data={data}/>}/><Route path="/portfolio" element={<Portfolio data={data}/>}/><Route path="/evolution" element={<Evolution data={data}/>}/><Route path="/evolution/factors" element={<FactorGuidance data={data}/>}/><Route path="/evolution/metrics" element={<ResearchEfficiency data={data}/>}/><Route path="/evolution/waves" element={<ResearchWaves data={data}/>}/><Route path="/research" element={<Research data={data}/>}/><Route path="/factors" element={<Navigate to="/evolution" replace/>}/>
-        <Route path="/admin" element={<AdminOverview data={data}/>}/><Route path="/admin/operations" element={<Operations data={data}/>}/><Route path="/admin/data" element={<DataAssets data={data}/>}/><Route path="/admin/models" element={<ModelGovernance data={data}/>}/><Route path="/admin/evidence" element={<EvidenceChain data={data}/>}/>
-        <Route path="/operations" element={<Navigate to="/admin/operations" replace/>}/><Route path="/data" element={<Navigate to="/admin/data" replace/>}/><Route path="/models" element={<Navigate to="/admin/models" replace/>}/><Route path="/evidence" element={<Navigate to="/admin/evidence" replace/>}/><Route path="*" element={<Navigate to="/overview" replace/>}/>
+      <header className="topbar"><button className="mobile-menu" onClick={() => setOpen(true)} aria-label="打开导航"><Menu size={20}/></button><div className="topbar-context"><span>{user?.username || "模拟账户"}</span><strong>{currentPage}</strong></div><div className="topbar-actions"><button className="icon-button" onClick={refresh} disabled={loading || refreshing} title="刷新数据" aria-label="刷新数据"><RefreshCw size={18} className={loading || refreshing ? "spin" : ""}/></button><button className="icon-button" onClick={logout} title="退出登录" aria-label="退出登录"><LogOut size={17}/></button></div></header>
+      <main>{loading ? <ConsoleLoading page={currentPage} completed={progress.completed} total={progress.total} message={loadingMessage}/> : <><ErrorStrip errors={errors}/><Routes>
+        <Route path="/overview" element={<Overview data={data}/>}/><Route path="/system" element={<SystemObservatory data={data}/>}/><Route path="/decision" element={<TodayDecision data={data}/>}/><Route path="/portfolio" element={<Portfolio data={data}/>}/><Route path="/evolution" element={<Evolution data={data}/>}/><Route path="/evolution/factors" element={<FactorGuidance data={data}/>}/><Route path="/evolution/metrics" element={<ResearchEfficiency data={data}/>}/><Route path="/evolution/waves" element={<ResearchWaves data={data}/>}/><Route path="/research" element={<Research data={data}/>}/><Route path="/factors" element={<Navigate to="/evolution" replace/>}/>
+        <Route path="/operations" element={<Operations data={data}/>}/><Route path="/data" element={<DataAssets data={data}/>}/><Route path="/models" element={<ModelGovernance data={data}/>}/><Route path="/evidence" element={<EvidenceChain data={data}/>}/>
+        <Route path="/admin" element={<Navigate to="/overview" replace/>}/><Route path="/admin/operations" element={<Navigate to="/operations" replace/>}/><Route path="/admin/data" element={<Navigate to="/data" replace/>}/><Route path="/admin/models" element={<Navigate to="/models" replace/>}/><Route path="/admin/evidence" element={<Navigate to="/evidence" replace/>}/><Route path="*" element={<Navigate to="/overview" replace/>}/>
       </Routes></>}</main>
     </div>{open && <button className="scrim" aria-label="关闭导航" onClick={() => setOpen(false)}/>}
   </div>;

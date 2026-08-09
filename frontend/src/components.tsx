@@ -1,4 +1,5 @@
-import { ChevronRight, Database, RefreshCw, ShieldCheck, ShieldAlert } from "lucide-react";
+import { ChevronRight, Database, RefreshCw, ShieldAlert } from "lucide-react";
+import type { LucideIcon } from "lucide-react";
 import type { ReactNode } from "react";
 
 export type Tone = "good" | "watch" | "danger" | "info" | "neutral";
@@ -22,38 +23,40 @@ export function Status({ children, tone }: { children: ReactNode; tone?: Tone })
   return <span className={`status status-${tone || toneOf(value)}`}><i />{label}</span>;
 }
 
-export function PageHeader({ eyebrow, title, summary, actions }: { eyebrow: string; title: string; summary: string; actions?: ReactNode }) {
-  return <header className="page-header"><div><p className="eyebrow">{eyebrow}</p><h1>{title}</h1><p>{summary}</p></div>{actions}</header>;
+export function PageHeader({ eyebrow, title, summary, actions }: { eyebrow?: string; title: string; summary: string; actions?: ReactNode }) {
+  return <header className="page-header"><div>{eyebrow && <span className="page-eyebrow">{eyebrow}</span>}<h1>{title}</h1><p>{summary}</p></div>{actions}</header>;
 }
 
 export function Section({ title, detail, children, className = "" }: { title: string; detail?: string; children: ReactNode; className?: string }) {
   return <section className={`section ${className}`}><header className="section-head"><div><h2>{title}</h2>{detail && <p>{detail}</p>}</div></header>{children}</section>;
 }
 
-export function Metric({ label, value, note, tone = "neutral" }: { label: string; value: ReactNode; note?: ReactNode; tone?: Tone }) {
-  return <div className={`metric metric-${tone}`}><span>{label}</span><strong>{value}</strong>{note && <small>{note}</small>}</div>;
+export function Metric({ label, value, note, tone = "neutral", icon: Icon }: { label: string; value: ReactNode; note?: ReactNode; tone?: Tone; icon?: LucideIcon }) {
+  return <div className={`metric metric-${tone}`}>
+    <div className="metric-top"><span>{label}</span>{Icon && <i className="metric-icon"><Icon size={17} strokeWidth={1.8}/></i>}</div>
+    <strong>{value}</strong>
+    {note && <small>{note}</small>}
+  </div>;
 }
 
-export function Empty({ title = "暂无可用证据", detail = "后端未返回该项数据。" }: { title?: string; detail?: string }) {
-  return <div className="empty"><Database size={20} /><div><strong>{title}</strong><p>{detail}</p></div></div>;
+export function Empty({ title = "暂无记录", detail }: { title?: string; detail?: string }) {
+  return <div className="empty"><Database size={20} /><div><strong>{title}</strong>{detail && <p>{detail}</p>}</div></div>;
 }
 
 export function ErrorStrip({ errors }: { errors: Record<string, string> }) {
   const items = Object.entries(errors);
   if (!items.length) return null;
-  return <div className="error-strip"><ShieldAlert size={17} /><span>{items.length} 组只读数据暂时无法获取：{items.map(([key, message]) => `${key} (${message})`).join("；")}。相关区域不会用推测值填充。</span></div>;
+  return <div className="error-strip"><ShieldAlert size={17} /><span>{items.length} 组数据暂不可用：{items.map(([key, message]) => `${key}（${message}）`).join("；")}</span></div>;
 }
 
-export function ConsoleLoading({ page, completed, total }: { page: string; completed: number; total: number }) {
+export function ConsoleLoading({ page, completed, total, message }: { page: string; completed: number; total: number; message?: string }) {
   const percent = total > 0 ? Math.round(completed / total * 100) : 0;
   return <div className="console-loading" role="status" aria-live="polite">
     <div className="loading-mark"><RefreshCw size={22} /></div>
-    <p className="eyebrow">ALIS OWNER CONSOLE</p>
     <h1>正在加载{page}</h1>
-    <p>正在汇总决策、账户和运行证据</p>
+    <p>{message || "正在同步数据"}</p>
     <div className="loading-progress" aria-label={`加载进度 ${percent}%`}><i style={{ width: `${percent}%` }} /></div>
-    <div className="loading-meta"><span>{completed}/{total} 个数据域</span><strong>{percent}%</strong></div>
-    <div className="loading-policy"><ShieldCheck size={16} /><span>只读同步，不会生成计划或触发交易</span></div>
+    <div className="loading-meta"><span>{completed}/{total} 个数据项</span><strong>{percent}%</strong></div>
     <div className="loading-skeleton" aria-hidden="true"><i/><i/><i/><i/></div>
   </div>;
 }

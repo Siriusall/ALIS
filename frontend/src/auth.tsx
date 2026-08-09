@@ -1,6 +1,6 @@
 import { createContext, FormEvent, ReactNode, useContext, useEffect, useState } from "react";
 import { Navigate, useNavigate } from "react-router-dom";
-import { getToken, readApi, setToken, writeApi } from "./api";
+import { authWriteApi, getToken, readApi, setToken } from "./api";
 
 type User = { id: number; username: string; created_at?: string };
 type AuthValue = { user: User | null; loading: boolean; login: (u: string, p: string) => Promise<void>; register: (u: string, p: string) => Promise<void>; logout: () => void };
@@ -10,7 +10,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<User | null>(null); const [loading, setLoading] = useState(true);
   useEffect(() => { let active=true; if (!getToken()) { setLoading(false); return; } readApi("/api/auth/me").then(x=>active&&setUser(x as User)).catch(()=>setToken(null)).finally(()=>active&&setLoading(false)); return()=>{active=false}; },[]);
   useEffect(()=>{const expired=()=>{setToken(null);setUser(null)};window.addEventListener("alis:session-expired",expired);return()=>window.removeEventListener("alis:session-expired",expired)},[]);
-  async function authenticate(path:string, username:string,password:string){const result=await writeApi(path,{username,password});setToken(String(result.access_token));setUser(result.user as User);}
+  async function authenticate(path:string, username:string,password:string){const result=await authWriteApi(path,{username,password});setToken(String(result.access_token));setUser(result.user as User);}
   return <AuthContext.Provider value={{user,loading,login:(u,p)=>authenticate("/api/auth/login",u,p),register:(u,p)=>authenticate("/api/auth/register",u,p),logout:()=>{setToken(null);setUser(null)}}}>{children}</AuthContext.Provider>;
 }
 export function useAuth(){const value=useContext(AuthContext);if(!value)throw new Error("AuthProvider missing");return value;}
