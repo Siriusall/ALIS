@@ -20,6 +20,7 @@ Thumbs.db
 # Python
 __pycache__/
 *.py[cod]
+backend/tests/
 .venv/
 venv/
 .pytest_cache/
