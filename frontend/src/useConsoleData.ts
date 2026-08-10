@@ -227,6 +227,36 @@ async function loadEndpoint(key: keyof typeof endpoints, force = false, signal?:
   return loadPath(String(key), endpoints[key], force, signal);
 }
 
+function retryableReadFailure(error: any) {
+  return error?.name !== "AbortError" && Number(error?.status || 0) === 0;
+}
+
+function waitForReadRetry(signal?: AbortSignal) {
+  if (signal?.aborted) return Promise.reject(abortError());
+  return new Promise<void>((resolve, reject) => {
+    const timer = window.setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, 250);
+    const onAbort = () => {
+      window.clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      reject(abortError());
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+async function loadEndpointWithRetry(key: keyof typeof endpoints, force = false, signal?: AbortSignal): Promise<Json> {
+  try {
+    return await loadEndpoint(key, force, signal);
+  } catch (error) {
+    if (!retryableReadFailure(error)) throw error;
+    await waitForReadRetry(signal);
+    return loadEndpoint(key, true, signal);
+  }
+}
+
 type InitialDynamicRequest = {
   dataKey: "researchStockEvidence" | "researchIndustryEvidence" | "evidenceVerification" | "decisionDetail";
   cacheKey: string;
@@ -257,7 +287,7 @@ function initialDynamicRequests(pathname: string, data: ConsoleData): InitialDyn
     });
     return requests;
   }
-  if (pathname === "/admin/evidence") {
+  if (pathname === "/admin/evidence" || pathname === "/evidence") {
     const decisions = firstArray(data.decisions, ["items", "decisions"]);
     const id = Number(decisions[0]?.id || 0);
     return id ? [
@@ -359,7 +389,7 @@ export function useConsoleData(pathname: string) {
       while (cursor < entries.length) {
         const key = entries[cursor++];
         try {
-          const value = await loadEndpoint(key, force, activeController.signal);
+          const value = await loadEndpointWithRetry(key, force, activeController.signal);
           if (controller.current !== activeController) return;
           loadedData[key] = value;
           setData((current) => ({ ...current, [key]: value }));

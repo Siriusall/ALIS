@@ -125,7 +125,7 @@ export const endpoints = {
   researchArchive: "/api/factors/research/analytics/archive",
   factorLineage: "/api/factors/strategy-lineage",
   models: "/api/model-strategy/status",
-  planModels: "/api/model-strategy/plan-models",
+  planModels: "/api/model-strategy/plan-models?console=true",
   modelOperations: "/api/model-strategy/plan-models/operations",
   modelWorkbench: "/api/model-strategy/workbench",
   modelGovernance: "/api/model-strategy/market-context/governance",

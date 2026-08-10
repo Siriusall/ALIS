@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from app.db.store import get_model_version, update_model_version_validation
@@ -238,9 +238,28 @@ def model_strategy_status() -> dict:
 
 
 @router.get("/model-strategy/plan-models")
-def model_strategy_plan_models() -> dict:
+def model_strategy_plan_models(
+    console: bool = Query(False, description="返回管理前端所需的精简只读视图"),
+) -> dict:
     try:
-        return model_family_status()
+        payload = model_family_status()
+        if not console:
+            return payload
+        omitted_fields = {
+            "versions",
+            "newest_recorded_version",
+            "latest_artifact",
+            "latest_train_run",
+            "data_actions",
+        }
+        return {
+            **payload,
+            "items": [
+                {key: value for key, value in item.items() if key not in omitted_fields}
+                for item in payload.get("items", [])
+                if isinstance(item, dict)
+            ],
+        }
     except Exception as exc:  # noqa: BLE001 - model diagnostics must degrade safely
         return degraded_read("plan_models", exc, items=[], models=[])
 
