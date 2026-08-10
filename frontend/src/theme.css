@@ -273,6 +273,23 @@ main {
   grid-template-columns: 1fr;
 }
 
+.reason-grid {
+  gap: 12px;
+  overflow: visible;
+  border: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
+.reason-grid > div {
+  min-height: 108px;
+  padding: 16px 18px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+  box-shadow: var(--shadow);
+}
+
 .state-ribbon,
 .metric-grid,
 .health-chain,
