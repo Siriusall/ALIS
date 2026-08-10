@@ -168,12 +168,6 @@ def startup() -> None:
     champion = ensure_production_strategy_champion()
     logger.info("Active ALIS production Champion: %s", champion.get("version"))
     autonomous_task = _start_component("autonomous_simulation_task", ensure_autonomous_simulation_task)
-    if isinstance(autonomous_task, dict):
-        logger.info(
-            "Autonomous simulation task ready: task_id=%s created=%s",
-            ((autonomous_task.get("task") or {}).get("id")),
-            autonomous_task.get("created"),
-        )
     recovery = _start_component("quant_task_recovery", reconcile_quant_tasks_on_startup)
     if isinstance(recovery, dict):
         logger.info(
@@ -181,6 +175,17 @@ def startup() -> None:
             int(recovery.get("interrupted") or 0),
             int(recovery.get("waiting_schedule") or 0),
             int(recovery.get("pending_preserved") or 0),
+        )
+    # Refresh the startup component after reconciliation so /api/health exposes
+    # the final task state instead of the pre-recovery snapshot.
+    autonomous_task = _start_component("autonomous_simulation_task", ensure_autonomous_simulation_task)
+    if isinstance(autonomous_task, dict):
+        logger.info(
+            "Autonomous simulation task ready: task_id=%s created=%s status=%s phase=%s",
+            ((autonomous_task.get("task") or {}).get("id")),
+            autonomous_task.get("created"),
+            ((autonomous_task.get("task") or {}).get("status")),
+            ((autonomous_task.get("task") or {}).get("replay_status")),
         )
     _start_component("rebalance_execution_recovery", recover_interrupted_daily_rebalance_plans)
     _start_component("auto_simulation_scheduler", start_auto_simulation_scheduler)
