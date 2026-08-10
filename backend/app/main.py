@@ -34,7 +34,7 @@ from app.core.error_evidence import error_evidence
 from app.db.store import database_health as primary_database_health
 from app.services.quant_task_runner import (
     ensure_autonomous_simulation_task,
-    resume_quant_tasks_on_startup,
+    reconcile_quant_tasks_on_startup,
     start_auto_simulation_scheduler,
 )
 from app.data_platform.services.daily_update import start_daily_update_scheduler
@@ -174,9 +174,14 @@ def startup() -> None:
             ((autonomous_task.get("task") or {}).get("id")),
             autonomous_task.get("created"),
         )
-    paused = _start_component("quant_task_recovery", resume_quant_tasks_on_startup)
-    if isinstance(paused, int) and paused > 0:
-        logger.info("Paused interrupted quant tasks on startup: %d", paused)
+    recovery = _start_component("quant_task_recovery", reconcile_quant_tasks_on_startup)
+    if isinstance(recovery, dict):
+        logger.info(
+            "Quant task startup reconciliation: interrupted=%d waiting_schedule=%d pending_preserved=%d",
+            int(recovery.get("interrupted") or 0),
+            int(recovery.get("waiting_schedule") or 0),
+            int(recovery.get("pending_preserved") or 0),
+        )
     _start_component("rebalance_execution_recovery", recover_interrupted_daily_rebalance_plans)
     _start_component("auto_simulation_scheduler", start_auto_simulation_scheduler)
     _start_component("daily_update_scheduler", start_daily_update_scheduler)

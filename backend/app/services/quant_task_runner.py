@@ -987,8 +987,8 @@ def run_quant_task_async(task_id: int) -> bool:
                 started_at=task0.get("started_at") or now,
                 replay_mode=mode,
                 replay_status="planning",
-                last_message="正在生成补跑计划",
                 error=None,
+                last_message="正在生成补跑计划",
             )
 
             if enable_data_health_gate and replay_opinion_gates:
@@ -1121,21 +1121,23 @@ def run_quant_task_async(task_id: int) -> bool:
                     mode=mode,
                 )
             if not plan.get("ok"):
+                waiting_for_schedule = mode == "autonomous_daily"
                 _transition_task_status(
                     task_id,
-                    "paused",
-                    "batch_completed",
+                    "pending" if waiting_for_schedule else "paused",
+                    "schedule_wait" if waiting_for_schedule else "batch_completed",
                     replay_mode=mode,
-                    replay_status=("waiting_formal_plan" if mode == "autonomous_daily" else "no_gap"),
+                    replay_status=("waiting_schedule" if waiting_for_schedule else "no_gap"),
                     replay_gap_days=0,
                     replay_current_execute_date=None,
                     replay_target_execute_date=None,
                     processed_steps=0,
                     total_steps=0,
+                    error=None,
                     finished_at=None,
                     last_message=(
-                        "自治任务等待下一份到期正式调仓计划"
-                        if mode == "autonomous_daily" else "任务已暂停：当前无可补跑缺口"
+                        "等待收盘调度与下一份到期正式调仓计划"
+                        if waiting_for_schedule else "任务已暂停：当前无可补跑缺口"
                     ),
                 )
                 upsert_quant_replay_waterline(
@@ -1448,17 +1450,23 @@ def run_quant_task_async(task_id: int) -> bool:
                     last_run_status="checkpoint_saved",
                 )
             else:
+                waiting_for_schedule = mode == "autonomous_daily"
                 _transition_task_status(
                     task_id,
-                    "paused",
-                    "batch_completed",
-                    replay_status="completed",
+                    "pending" if waiting_for_schedule else "paused",
+                    "schedule_wait" if waiting_for_schedule else "batch_completed",
+                    replay_status="waiting_schedule" if waiting_for_schedule else "completed",
                     replay_gap_days=0,
                     replay_current_execute_date=None,
                     replay_target_execute_date=None,
                     processed_steps=processed_total,
+                    error=None,
                     finished_at=None,
-                    last_message=f"本批执行 {processed_total} 步；等待下一交易日自动继续",
+                    last_message=(
+                        f"本次正式计划已完成 {processed_total} 步；等待下一交易日收盘调度"
+                        if waiting_for_schedule
+                        else f"本批执行 {processed_total} 步；等待下一交易日自动继续"
+                    ),
                 )
                 upsert_quant_replay_waterline(
                     strategy_id=strategy_id,
@@ -1561,21 +1569,64 @@ def run_quant_task_async(task_id: int) -> bool:
     return True
 
 
-def resume_quant_tasks_on_startup() -> int:
+def _is_autonomous_schedule_wait(task: dict) -> bool:
+    if str(task.get("replay_mode") or "") != "autonomous_daily":
+        return False
+    if str(task.get("error") or "").strip():
+        return False
+    replay_status = str(task.get("replay_status") or "")
+    if replay_status in {"waiting_schedule", "waiting_formal_plan", "no_gap", "completed"}:
+        return True
+    message = str(task.get("last_message") or "")
+    return (
+        not task.get("started_at")
+        and int(task.get("processed_steps") or 0) == 0
+        and int(task.get("total_steps") or 0) == 0
+        and message in {
+            "任务已创建，等待执行",
+            "自动任务参数已与当前 Champion 同步",
+            "后端重启，任务已安全暂停；下一收盘调度会自动继续，也可手动继续",
+            "自治任务等待下一份到期正式调仓计划",
+            "等待收盘调度与下一份到期正式调仓计划",
+        }
+    )
+
+
+def reconcile_quant_tasks_on_startup() -> dict[str, int]:
+    """Classify restart recovery without conflating idle, queued and blocked work."""
     tasks = list_active_quant_run_tasks()
-    paused = 0
+    summary = {"interrupted": 0, "waiting_schedule": 0, "pending_preserved": 0}
     for t in tasks:
         status = normalize_status(t.get("status"))
-        if status in {"pending", "running"} and can_transition(status, "paused", event="startup_pause"):
+        task_id = int(t.get("id") or 0)
+        if status == "running" and can_transition(status, "paused", event="startup_pause"):
             if _transition_task_status(
-                int(t.get("id") or 0),
+                task_id,
                 "paused",
                 "startup_pause",
+                replay_status="recovery_pending",
                 finished_at=None,
-                last_message="后端重启，任务已安全暂停；下一收盘调度会自动继续，也可手动继续",
+                last_message="运行被进程重启中断，等待安全恢复检查",
             ):
-                paused += 1
-    return paused
+                summary["interrupted"] += 1
+            continue
+        if _is_autonomous_schedule_wait(t) and status in {"pending", "paused"}:
+            if _transition_task_status(
+                task_id,
+                "pending",
+                "schedule_wait",
+                replay_status="waiting_schedule",
+                error=None,
+                finished_at=None,
+                last_message="等待收盘调度与下一份到期正式调仓计划",
+            ):
+                summary["waiting_schedule"] += 1
+            continue
+        if status == "pending":
+            # A fresh queued task has not lost an executing thread.  Preserve it.
+            # Checkpointed manual replays remain pending for explicit continuation.
+            summary["pending_preserved"] += 1
+    return summary
 
 
 def ensure_autonomous_simulation_task() -> dict:

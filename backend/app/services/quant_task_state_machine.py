@@ -33,6 +33,11 @@ EVENT_TRANSITIONS: Final[dict[str, dict[str, set[str]]]] = {
     "checkpoint_saved": {
         "running": {"pending"},
     },
+    "schedule_wait": {
+        "running": {"pending"},
+        "paused": {"pending"},
+        "pending": {"pending"},
+    },
     "batch_completed": {
         "running": {"paused"},
     },
@@ -47,7 +52,6 @@ EVENT_TRANSITIONS: Final[dict[str, dict[str, set[str]]]] = {
     },
     "startup_pause": {
         "running": {"paused"},
-        "pending": {"paused"},
     },
 }
 
@@ -81,4 +85,3 @@ def can_transition(current: str | None, target: str | None, event: str | None = 
         "failed": set(),
     }
     return tgt in fallback.get(cur, set())
-

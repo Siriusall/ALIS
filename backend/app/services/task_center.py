@@ -155,6 +155,8 @@ def _status(value: Any, *, phase: Any = None) -> str:
         return "running"
     if raw in {"queued", "retry_wait"}:
         return "waiting"
+    if raw == "pending":
+        return "waiting"
     if raw == "observing":
         return "observing"
     if raw in {"paused", "stopped"}:
@@ -472,16 +474,67 @@ def _quant_tasks(limit: int) -> list[dict[str, Any]]:
     for task in tasks:
         total = int(task.get("total_steps") or 0)
         processed = int(task.get("processed_steps") or 0)
-        state = _status(task.get("status"))
-        autonomous_idle = str(task.get("replay_mode") or "") == "autonomous_daily" and total == 0 and state == "completed"
+        raw_status = str(task.get("status") or "").lower()
+        replay_status = str(task.get("replay_status") or "")
+        autonomous = str(task.get("replay_mode") or "") == "autonomous_daily"
+        task_error = str(task.get("error") or "").strip()
+        task_message = str(task.get("last_message") or "")
+        legacy_schedule_wait = (
+            autonomous
+            and not task_error
+            and processed == 0
+            and total == 0
+            and (
+                raw_status == "pending"
+                or task_message in {
+                    "任务已创建，等待执行",
+                    "自动任务参数已与当前 Champion 同步",
+                    "后端重启，任务已安全暂停；下一收盘调度会自动继续，也可手动继续",
+                    "自治任务等待下一份到期正式调仓计划",
+                    "等待收盘调度与下一份到期正式调仓计划",
+                }
+            )
+        )
+        waiting_schedule = autonomous and (
+            replay_status in {"waiting_schedule", "waiting_formal_plan"}
+            or legacy_schedule_wait
+        )
+        recovery_pending = replay_status == "recovery_pending"
+        risk_paused = raw_status == "paused" and bool(task_error)
+        state = (
+            "waiting_schedule" if waiting_schedule
+            else "recovery_pending" if recovery_pending
+            else "blocked" if risk_paused
+            else _status(raw_status)
+        )
+        current_step = (
+            "等待收盘时间、完整收盘数据和到期正式计划"
+            if waiting_schedule
+            else "上次运行被进程重启中断，等待执行认领、账本和检查点复核"
+            if recovery_pending
+            else str(task.get("last_message") or "风险门保持暂停")
+            if risk_paused
+            else f"已处理 {processed}/{total or '?'} 个交易日"
+        )
+        next_step = (
+            "满足收盘数据门后由调度器自动领取正式计划"
+            if waiting_schedule
+            else "安全恢复检查通过后，自治任务自动继续；手工回放等待明确继续"
+            if recovery_pending
+            else "解除风险阻断后按状态机恢复"
+            if risk_paused
+            else "处理下一个交易日并写入模拟账本"
+            if state == "running"
+            else "按状态机复核"
+        )
         items.append({
             "id": f"quant:{task.get('id')}", "source": "quant_run", "source_id": int(task.get("id") or 0),
             "module": "execution", "task_type": "simulation_strategy_execution", "name": f"模拟策略执行 #{task.get('id')}",
-            "status": state, "raw_status": str(task.get("status") or ""), "phase": str(task.get("replay_status") or ""),
-            "progress": processed / total if total > 0 else (1.0 if state == "completed" else 0.0),
+            "status": state, "raw_status": raw_status, "phase": replay_status,
+            "progress": 0.0 if waiting_schedule or recovery_pending else processed / total if total > 0 else (1.0 if state == "completed" else 0.0),
             "message": str(task.get("last_message") or task.get("error") or "等待执行"), "error": _iso(task.get("error")),
-            "current_step": "常驻模拟执行器空闲，当前没有到期订单" if autonomous_idle else f"已处理 {processed}/{total or '?'} 个交易日",
-            "next_step": "到正式计划执行时间后自动领取订单" if autonomous_idle else "处理下一个交易日并写入模拟账本" if state == "running" else "等待下一正式计划执行日" if state == "completed" else "按状态机复核",
+            "current_step": current_step,
+            "next_step": next_step,
             "next_run_at": None, "created_at": _iso(task.get("created_at")), "started_at": _iso(task.get("started_at")),
             "heartbeat_at": _iso(task.get("updated_at")), "updated_at": _iso(task.get("updated_at")),
             "finished_at": _iso(task.get("finished_at")), "attempt": 1, "max_attempts": 1,
@@ -527,12 +580,15 @@ def _business_task_views(tasks: list[dict[str, Any]]) -> tuple[list[dict[str, An
     current = [item for item in tasks if item.get("activity_scope") != "history"]
     runtime_services = [item for item in current if item.get("source") == "runtime"]
     business = [item for item in current if item.get("source") != "runtime"]
-    active_states = {"running", "waiting", "observing", "blocked", "degraded", "partial", "failed"}
+    active_states = {
+        "running", "waiting", "waiting_schedule", "recovery_pending", "observing",
+        "blocked", "degraded", "partial", "failed",
+    }
     active = [item for item in business if str(item.get("status") or "") in active_states]
     summary = {
         "active": len(active),
         "running": sum(1 for item in active if item.get("status") == "running"),
-        "waiting": sum(1 for item in active if item.get("status") in {"waiting", "observing"}),
+        "waiting": sum(1 for item in active if item.get("status") in {"waiting", "waiting_schedule", "recovery_pending", "observing"}),
         "blocked": sum(1 for item in active if item.get("status") == "blocked"),
         "failed": sum(1 for item in active if item.get("status") == "failed"),
         "runtime_healthy": sum(1 for item in runtime_services if item.get("status") == "running"),
@@ -700,7 +756,7 @@ def build_task_center(
         # Failed tasks are operationally active incidents until explicitly
         # superseded; do not let a later idle/completed task hide the failure
         # on the module card.
-        active = next((item for item in related if item.get("status") in {"running", "waiting", "observing", "blocked", "degraded", "partial", "failed"}), None)
+        active = next((item for item in related if item.get("status") in {"running", "waiting", "waiting_schedule", "recovery_pending", "observing", "blocked", "degraded", "partial", "failed"}), None)
         latest = active or (related[0] if related else None)
         next_at = latest.get("next_run_at") if latest and latest.get("next_run_at") else _schedule_for(key, schedule)
         module_items.append({
@@ -713,7 +769,7 @@ def build_task_center(
             "estimated_remaining_seconds": (latest or {}).get("estimated_remaining_seconds"),
             "checkpoint": (latest or {}).get("checkpoint") if isinstance((latest or {}).get("checkpoint"), dict) else {},
             "running_count": sum(1 for item in related if item.get("status") == "running"),
-            "waiting_count": sum(1 for item in related if item.get("status") in {"waiting", "observing", "paused"}),
+            "waiting_count": sum(1 for item in related if item.get("status") in {"waiting", "waiting_schedule", "recovery_pending", "observing", "paused"}),
             "failed_count": sum(1 for item in related if item.get("status") == "failed"),
         })
 
@@ -721,7 +777,7 @@ def build_task_center(
         "ok": True, "schema_version": "alis_task_center_v2", "generated_at": generated.isoformat(),
         "summary": {
             "running": sum(1 for item in current_tasks if item.get("status") == "running"),
-            "waiting": sum(1 for item in current_tasks if item.get("status") in {"waiting", "observing"}),
+            "waiting": sum(1 for item in current_tasks if item.get("status") in {"waiting", "waiting_schedule", "recovery_pending", "observing"}),
             "current_internal_errors": unresolved_failures,
             "recent_failed_records": failed_records,
             "failed": unresolved_failures,

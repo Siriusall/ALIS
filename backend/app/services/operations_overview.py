@@ -83,7 +83,7 @@ def _is_actionable_paused_task(task: dict[str, Any]) -> bool:
     if str(task.get("error") or "").strip():
         return True
     replay_status = str(task.get("replay_status") or "")
-    if replay_status in {"completed", "waiting_formal_plan", "no_gap"}:
+    if replay_status in {"completed", "waiting_formal_plan", "waiting_schedule", "recovery_pending", "no_gap"}:
         return False
     if str(task.get("replay_mode") or "") == "autonomous_daily":
         message = str(task.get("last_message") or "")
