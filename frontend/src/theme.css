@@ -269,6 +269,10 @@ main {
   gap: 20px;
 }
 
+.decision-layout {
+  grid-template-columns: 1fr;
+}
+
 .state-ribbon,
 .metric-grid,
 .health-chain,
