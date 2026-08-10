@@ -287,7 +287,7 @@ def model_strategy_train_all_plan_models() -> dict:
 
 @router.get("/model-strategy/auto-optimization")
 def model_strategy_auto_optimization() -> dict:
-    return build_auto_optimization_status()
+    return build_auto_optimization_status(apply_auto_reject=False)
 
 
 @router.post("/model-strategy/auto-optimization/run")
@@ -482,7 +482,7 @@ def model_strategy_market_context(req: MarketContextRequest) -> dict:
 @router.get("/model-strategy/market-context/live")
 def model_strategy_live_market_context() -> dict:
     try:
-        return live_market_context()
+        return live_market_context(persist=False)
     except Exception as exc:  # noqa: BLE001 - optional market evidence must degrade safely
         return degraded_read("live_market_context", exc, market_state={}, observations={})
 

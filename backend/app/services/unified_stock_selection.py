@@ -314,15 +314,13 @@ def build_unified_stock_selection(
             "all_models_score_daily": True,
             "formal_promotion_requires_fresh_oos": True,
             "first_live_review_after_future_sessions": 20,
-            "champion_failure_quarantine_preserved": True,
+            "champion_failure_warning_only": True,
             "tiers": {
-                "limited_rank": [
+                "observation_only": [
                     "medium_horizon_lambdarank_v1",
                     "capital_persistence_multitask_v1",
                     "leader_lambdarank_v1",
-                ],
-                "risk_only": ["event_impact_assessor_v2"],
-                "observation_only": [
+                    "event_impact_assessor_v2",
                     "narrative_transition_multitask_v1",
                     "market_regime_hsmm_v1",
                 ],

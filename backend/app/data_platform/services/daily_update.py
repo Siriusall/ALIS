@@ -203,7 +203,7 @@ def _worker(parent_run_id: int) -> None:
             end_date=trade_date,
         )
         steps.append({"step": "benchmark", "result": benchmark_result})
-        if not bool(benchmark_result.get("ok")):
+        if not bool(benchmark_result.get("benchmark_ready")):
             logger.warning("daily benchmark update deferred trade_date=%s result=%s", trade_date, benchmark_result)
 
         _set_state(phase="etf_daily", message=f"正在按交易日更新 {trade_date} ETF 日线", progress=68)

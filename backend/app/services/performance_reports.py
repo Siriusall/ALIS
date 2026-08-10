@@ -83,6 +83,7 @@ def enrich_performance_period(
             "sessions": 0,
             "return_factor": 1.0,
             "benchmark_factor": 1.0,
+            "benchmark_sessions": 0,
             "confidence_total": 0.0,
             "market_model_versions": set(),
         })
@@ -90,6 +91,7 @@ def enrich_performance_period(
         bucket["return_factor"] *= 1.0 + float(point.get("daily_return_pct") or 0) / 100.0
         if point.get("daily_benchmark_return_pct") is not None:
             bucket["benchmark_factor"] *= 1.0 + float(point["daily_benchmark_return_pct"]) / 100.0
+            bucket["benchmark_sessions"] += 1
         bucket["confidence_total"] += float(state_info.get("confidence") or 0)
         if state_info.get("model_version"):
             bucket["market_model_versions"].add(str(state_info["model_version"]))
@@ -97,7 +99,15 @@ def enrich_performance_period(
         state: {
             "sessions": int(value["sessions"]),
             "return_pct": round((value["return_factor"] - 1.0) * 100.0, 4),
-            "benchmark_return_pct": round((value["benchmark_factor"] - 1.0) * 100.0, 4),
+            "benchmark_return_pct": (
+                round((value["benchmark_factor"] - 1.0) * 100.0, 4)
+                if int(value["benchmark_sessions"]) == int(value["sessions"]) else None
+            ),
+            "benchmark_coverage": {
+                "sessions": int(value["benchmark_sessions"]),
+                "required_sessions": int(value["sessions"]),
+                "complete": int(value["benchmark_sessions"]) == int(value["sessions"]),
+            },
             "average_confidence": round(value["confidence_total"] / max(1, value["sessions"]), 4),
             "market_model_versions": sorted(value["market_model_versions"]),
         }

@@ -3,7 +3,7 @@ from typing import Optional
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
-from app.api.state import add_log, ensure_manual_trade_allowed
+from app.api.state import add_log
 from app.core.a_share_fees import FEE_SCHEDULE_VERSION
 from app.db.store import (
     create_and_apply_buy_execution,
@@ -46,10 +46,14 @@ def _order_total_cost(orders: list) -> float:
 
 @router.post("/execute/open", response_model=ExecutionResponse)
 def execute_open(req: ExecuteRequest) -> ExecutionResponse:
-    try:
-        ensure_manual_trade_allowed("开仓")
-    except RuntimeError as e:
-        raise HTTPException(status_code=403, detail=str(e))
+    # Manual candidate submission is intentionally retired.  Production
+    # simulation may only consume an authorized, frozen daily rebalance plan;
+    # accepting arbitrary request candidates would bypass point-in-time,
+    # decision-version, ledger and execution-lease contracts.
+    raise HTTPException(
+        status_code=410,
+        detail="手动开仓接口已关闭，成交只能由已授权的冻结调仓计划产生",
+    )
     balance = get_account_balance()
     if balance < 100:
         raise HTTPException(

@@ -198,6 +198,38 @@ def _latest_adj_factor_coverage(trade_date: str) -> dict[str, Any]:
     }
 
 
+def _latest_benchmark_coverage(trade_date: str) -> dict[str, Any]:
+    """Require the point-in-time HS300 close used by OOS and attribution."""
+    from app.data_platform.db import _conn
+
+    value = str(trade_date or "").replace("-", "")[:8]
+    cutoff = (
+        f"{value[:4]}-{value[4:6]}-{value[6:]}T15:00:00"
+        if len(value) == 8
+        else ""
+    )
+    with _conn() as conn:
+        row = conn.execute(
+            """SELECT COUNT(*) AS rows_read,MAX(available_time) AS max_available_time
+               FROM dc_tushare_raw_records
+               WHERE api_name='index_daily' AND ts_code='000300.SH'
+                 AND trade_date=?""",
+            (value,),
+        ).fetchone()
+    item = dict(row) if row else {}
+    rows_read = int(item.get("rows_read") or 0)
+    max_available_time = str(item.get("max_available_time") or "")
+    ready = rows_read > 0 and bool(cutoff) and bool(max_available_time) and max_available_time <= cutoff
+    return {
+        "trade_date": value,
+        "ts_code": "000300.SH",
+        "rows_read": rows_read,
+        "max_available_time": max_available_time or None,
+        "cutoff": cutoff or None,
+        "ready": ready,
+    }
+
+
 def assess_latest_decision_data_health(trade_date: str = "") -> dict[str, Any]:
     """Decide whether one completed data slice may feed research and simulation.
 
@@ -299,8 +331,22 @@ def assess_latest_decision_data_health(trade_date: str = "") -> dict[str, Any]:
             "message": "最新复权因子切片未达到正式研究合同，暂停新增策略实验",
             "detail": adj_factor,
         })
+    benchmark = _latest_benchmark_coverage(latest_date) if latest_date else {
+        "trade_date": "", "ts_code": "000300.SH", "rows_read": 0, "ready": False,
+    }
+    if not benchmark["ready"]:
+        issues.append({
+            "level": "warning",
+            "code": "latest_benchmark_not_ready",
+            "message": "最新沪深300点时切片尚未就绪，暂停 OOS、Shadow 与收益归因实验",
+            "detail": benchmark,
+        })
     decision_ready = not any(item["level"] == "error" for item in issues)
-    experiment_ready = decision_ready and bool(adj_factor["ready"])
+    experiment_ready = (
+        decision_ready
+        and bool(adj_factor["ready"])
+        and bool(benchmark["ready"])
+    )
     result = {
         "ok": decision_ready,
         "status": "ready" if experiment_ready else "degraded" if decision_ready else "blocked",
@@ -316,12 +362,15 @@ def assess_latest_decision_data_health(trade_date: str = "") -> dict[str, Any]:
             "row_count_ratio": round(row_ratio, 4) if row_ratio is not None else None,
         },
         "adj_factor": adj_factor,
+        "benchmark": benchmark,
         "issues": issues,
         "policy": {
             "row_count_drift_floor": _DECISION_ROW_COUNT_DRIFT_FLOOR,
             "minimum_prior_days_for_drift": 3,
             "simulation_execution": "blocked only for decision-data errors",
-            "strategy_experiments": "require decision data and latest adj_factor coverage",
+            "strategy_experiments": (
+                "require decision data, latest adj_factor coverage, and point-in-time HS300 benchmark"
+            ),
         },
     }
     if not requested_trade_date:

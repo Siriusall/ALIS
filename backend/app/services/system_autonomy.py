@@ -20,6 +20,7 @@ _LONG_STEP_TIMEOUT_SECONDS = max(
 _LONG_RUNNING_STEPS = frozenset({
     "factor_daily_cycle",
     "plan_model_autonomy",
+    "strategy_shadow_recovery",
     "profit_and_portfolio",
     "periodic_performance_review",
     "research_maintenance",
@@ -37,12 +38,13 @@ _OWNER_SUMMARY_CACHE_TTL_SECONDS = 30.0
 
 
 def _run_step(name: str, fn: Callable[[], dict[str, Any]]) -> dict[str, Any]:
-    """Run a step in-line so a budget overrun cannot orphan its work.
+    """Run a bounded step without blocking the autonomous bus.
 
-    Python threads cannot be safely cancelled. The former implementation
-    returned after the budget while a daemon thread could keep its database
-    transaction and memory alive. The outer task has an independent heartbeat,
-    so the budget is now an observability threshold rather than a fake kill.
+    Python cannot safely kill a running thread.  On timeout the worker is
+    therefore left to finish cooperatively, while the bus receives a terminal
+    ``timed_out`` observation immediately.  The name remains in
+    ``_running_steps`` until the original worker exits, preventing re-entry;
+    late results are never written back into the already-returned step.
     """
     started = datetime.now().astimezone()
     with _running_steps_lock:
@@ -59,11 +61,58 @@ def _run_step(name: str, fn: Callable[[], dict[str, Any]]) -> dict[str, Any]:
         if name in _LONG_RUNNING_STEPS
         else _STEP_TIMEOUT_SECONDS
     )
-    try:
-        result = fn()
-        duration_seconds = round((datetime.now().astimezone() - started).total_seconds(), 3)
-        if not isinstance(result, dict):
-            raise TypeError("autonomy_step_must_return_dict")
+    finished = threading.Event()
+    outcome: dict[str, Any] = {}
+
+    def worker() -> None:
+        try:
+            result = fn()
+            if not isinstance(result, dict):
+                raise TypeError("autonomy_step_must_return_dict")
+            outcome["result"] = result
+        except Exception as exc:  # noqa: BLE001 - step failure is evidence, not bus failure
+            outcome["error"] = str(exc)[:2000]
+        finally:
+            with _running_steps_lock:
+                _running_steps.discard(name)
+            finished.set()
+
+    thread = threading.Thread(target=worker, name=f"alis-autonomy-{name}", daemon=True)
+    thread.start()
+    if not finished.wait(timeout_seconds):
+        step = {
+            "name": name,
+            "ok": False,
+            "duration_seconds": round((datetime.now().astimezone() - started).total_seconds(), 3),
+            "started_at": started.isoformat(),
+            "finished_at": datetime.now().astimezone().isoformat(),
+            "result": {
+                "status": "timed_out",
+                "timeout_seconds": timeout_seconds,
+                "worker_alive": thread.is_alive(),
+                "late_result_policy": "discarded_from_bus_terminal_state",
+            },
+            "error": f"autonomy_step_timeout:{timeout_seconds}s",
+            "timing": {
+                "budget_seconds": timeout_seconds,
+                "over_budget": True,
+                "policy": "bus_continues; worker_finishes_without_reentry",
+            },
+            "health": {"status": "degraded", "reason": "timed_out"},
+        }
+        return step
+
+    duration_seconds = round((datetime.now().astimezone() - started).total_seconds(), 3)
+    if "error" in outcome:
+        step = {
+            "name": name,
+            "ok": False,
+            "duration_seconds": duration_seconds,
+            "started_at": started.isoformat(), "finished_at": datetime.now().astimezone().isoformat(),
+            "error": outcome["error"],
+        }
+    else:
+        result = outcome["result"]
         step = {
             "name": name,
             "ok": bool(result.get("ok", True)),
@@ -72,29 +121,14 @@ def _run_step(name: str, fn: Callable[[], dict[str, Any]]) -> dict[str, Any]:
             "result": result,
             "timing": {
                 "budget_seconds": timeout_seconds,
-                "over_budget": duration_seconds > timeout_seconds,
-                "policy": "observability_only; completed_work_is_not_marked_failed",
+                "over_budget": False,
+                "policy": "bounded_worker",
             },
         }
-        from app.services.autonomous_healing import classify_step_health
+    from app.services.autonomous_healing import classify_step_health
 
-        step["health"] = classify_step_health(step)
-        return step
-    except Exception as exc:
-        step = {
-            "name": name,
-            "ok": False,
-            "duration_seconds": round((datetime.now().astimezone() - started).total_seconds(), 3),
-            "started_at": started.isoformat(), "finished_at": datetime.now().astimezone().isoformat(),
-            "error": str(exc)[:2000],
-        }
-        from app.services.autonomous_healing import classify_step_health
-
-        step["health"] = classify_step_health(step)
-        return step
-    finally:
-        with _running_steps_lock:
-            _running_steps.discard(name)
+    step["health"] = classify_step_health(step)
+    return step
 
 
 def _skip_experimental_step(name: str, gate: dict[str, Any]) -> dict[str, Any]:
@@ -296,6 +330,7 @@ def run_system_autonomy_cycle(*, trade_date: str = "") -> dict[str, Any]:
     from app.services.plan_model_auto_optimizer import run_auto_optimization_once
     from app.services.performance_reports import run_periodic_performance_review
     from app.services.review_data_quality_governance import run_review_data_quality_governance
+    from app.services.strategy_lifecycle import run_strategy_shadow_cycle
     from app.services.research_data_assets import audit_research_data_assets
     from app.services.theme_revenue_exposure import materialize_theme_revenue_exposure
     from app.services.free_research_data import materialize_cn_ppi_price_proxies, materialize_financial_industry_series, materialize_futures_price_proxies
@@ -354,6 +389,10 @@ def run_system_autonomy_cycle(*, trade_date: str = "") -> dict[str, Any]:
         ),
         experimental_step("factor_daily_cycle", run_factor_daily_cycle),
         experimental_step("plan_model_autonomy", lambda: run_auto_optimization_once(force=False)),
+        experimental_step(
+            "strategy_shadow_recovery",
+            lambda: run_strategy_shadow_cycle(max_new_sessions_per_candidate=5),
+        ),
         _run_step("periodic_performance_review", run_periodic_performance_review),
         _run_step("review_data_quality_governance", run_review_data_quality_governance),
         experimental_step("strategy_policy_maturity", advance_waiting_strategy_policy_candidates),

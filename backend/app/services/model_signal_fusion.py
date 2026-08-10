@@ -37,7 +37,6 @@ from app.services.plan_model_control import (
     _event_usable_trade_date,
     _payload_dict,
     audit_plan_model_production_eligibility,
-    controlled_strategy_ab_passed_current_contract,
     score_plan_model_feature_batch,
     score_plan_model_features,
 )
@@ -58,10 +57,10 @@ LIMITED_LIVE_MODEL_KEYS = frozenset({
     "capital_persistence_multitask_v1",
     "leader_lambdarank_v1",
 })
-LIMITED_LIVE_WEIGHT_SCALE = 0.40  # 0.50 base model mass -> at most 0.20 live impact
-LIMITED_LIVE_PASSED_SCALE = 0.60
-LIMITED_LIVE_WATCH_SCALE = 0.20
-LIMITED_LIVE_AGGREGATE_CAP = 0.20
+LIMITED_LIVE_WEIGHT_SCALE = 0.0
+LIMITED_LIVE_PASSED_SCALE = 0.0
+LIMITED_LIVE_WATCH_SCALE = 0.0
+LIMITED_LIVE_AGGREGATE_CAP = 0.0
 MAX_EVENT_RISK_PENALTY = 0.03
 MAX_THEME_RANK_BONUS = 0.08
 MAX_NARRATIVE_MODEL_RANK_ADJUSTMENT = 0.06
@@ -667,89 +666,20 @@ def _resolve_online_inference_versions(
 
 
 def _limited_live_authorization(version: dict[str, Any] | None) -> dict[str, Any]:
-    """Resolve capped live authority without confusing it with production status."""
-    if not version or str(version.get("model_key") or "") not in LIMITED_LIVE_MODEL_KEYS:
-        return {
-            "authorized": False,
-            "tier": "shadow_only",
-            "weight_scale": 0.0,
-            "reason": "model_family_not_limited_rank_eligible",
-            "observed_return_sessions": 0,
-        }
-    metrics = version.get("metrics") if isinstance(version.get("metrics"), dict) else {}
-    impact = metrics.get("strategy_impact_ab")
-    if not isinstance(impact, dict) or not controlled_strategy_ab_passed_current_contract(
-        str(version.get("model_key") or ""), impact
-    ):
-        return {
-            "authorized": False,
-            "tier": "shadow_only",
-            "weight_scale": 0.0,
-            "reason": "current_controlled_strategy_ab_not_passed",
-            "observed_return_sessions": 0,
-        }
-    task_oos = metrics.get("task_native_oos") if isinstance(metrics.get("task_native_oos"), dict) else {}
-    prerequisites_passed = bool(
-        metrics.get("task_metric_passed")
-        and bool(task_oos.get("passed", True))
-        and int(metrics.get("walk_forward_windows") or metrics.get("oos_windows") or 0) >= 5
-    )
-    if not prerequisites_passed:
-        return {
-            "authorized": False,
-            "tier": "shadow_only",
-            "weight_scale": 0.0,
-            "reason": "task_native_oos_not_complete",
-            "observed_return_sessions": 0,
-        }
-    validation = version.get("validation") if isinstance(version.get("validation"), dict) else {}
-    shadow = validation.get("model_shadow") if isinstance(validation.get("model_shadow"), dict) else {}
-    shadow_status = str(shadow.get("status") or "not_started")
-    observed_sessions = int(shadow.get("observed_return_sessions") or 0)
-    latest = shadow.get("latest_evidence") if isinstance(shadow.get("latest_evidence"), dict) else {}
-    gates = latest.get("gates") if isinstance(latest.get("gates"), dict) else {}
-    if shadow_status == "failed":
-        return {
-            "authorized": False,
-            "tier": "shadow_only",
-            "weight_scale": 0.0,
-            "reason": "future_shadow_failed",
-            "observed_return_sessions": observed_sessions,
-        }
-    if shadow_status == "passed":
-        return {
-            "authorized": True,
-            "tier": "limited_rank_increased",
-            "weight_scale": LIMITED_LIVE_PASSED_SCALE,
-            "reason": "future_shadow_passed_formal_promotion_still_required",
-            "observed_return_sessions": observed_sessions,
-        }
-    if observed_sessions >= 20:
-        positive = bool(gates.get("cumulative_return_delta_positive"))
-        mean_positive = bool(gates.get("mean_daily_return_delta_positive"))
-        if not positive and not mean_positive:
-            return {
-                "authorized": False,
-                "tier": "shadow_only",
-                "weight_scale": 0.0,
-                "reason": "first_20_session_review_negative",
-                "observed_return_sessions": observed_sessions,
-            }
-        return {
-            "authorized": True,
-            "tier": "limited_rank_deweighted",
-            "weight_scale": LIMITED_LIVE_WATCH_SCALE,
-            "reason": "first_20_session_review_inconclusive",
-            "observed_return_sessions": observed_sessions,
-        }
+    """Candidates remain observation-only until complete production promotion."""
+    validation = version.get("validation") if version and isinstance(
+        version.get("validation"), dict
+    ) else {}
+    shadow = validation.get("model_shadow") if isinstance(
+        validation.get("model_shadow"), dict
+    ) else {}
     return {
-        "authorized": True,
-        "tier": "limited_rank_initial",
-        "weight_scale": LIMITED_LIVE_WEIGHT_SCALE,
-        "reason": "awaiting_first_20_session_review",
-        "observed_return_sessions": observed_sessions,
+        "authorized": False,
+        "tier": "shadow_only",
+        "weight_scale": 0.0,
+        "reason": "candidate_requires_complete_production_qualification",
+        "observed_return_sessions": int(shadow.get("observed_return_sessions") or 0),
     }
-
 
 def _limited_live_authorized(version: dict[str, Any] | None) -> bool:
     return bool(_limited_live_authorization(version)["authorized"])
@@ -1313,18 +1243,8 @@ def apply_model_signals(
             and event_outputs.get("event_hard_veto") is True
         )
         event_risk_penalty = 0.0
-        if event_model_online and event_contract_ready and not event_model_available:
-            positive = _safe(event_outputs.get("positive_impact_probability"))
-            reversal = _safe(event_outputs.get("reversal_probability"))
-            q10 = _safe(event_outputs.get("abnormal_return_q10"))
-            negative_strength = max(
-                0.0,
-                0.50 - positive,
-                reversal - 0.50,
-                min(0.50, -q10 * 5.0),
-            )
-            event_risk_penalty = min(MAX_EVENT_RISK_PENALTY, negative_strength * 0.06)
-            fused -= event_risk_penalty
+        # Non-production event candidates are observation-only. Their scores
+        # cannot change ranking, vetoes, exits, or risk in live decisions.
         if capital_block or narrative_exit or event_block:
             blocked.append({
                 "symbol": symbol,
@@ -1420,6 +1340,7 @@ def apply_model_signals(
             "trigger_models": [
                 key for key in MODEL_KEYS
                 if availability[key]["available"]
+                and (explicit_bundle or authorized_availability[key]["available"])
             ],
         }
         reranked.append((row, fused * 100.0))
@@ -1432,7 +1353,10 @@ def apply_model_signals(
                 "model_key": key,
                 "version_id": (online_versions.get(key) or {}).get("id"),
                 "version": (online_versions.get(key) or {}).get("version"),
-                "consumed": bool(availability[key]["available"]),
+                "consumed": bool(
+                    availability[key]["available"]
+                    and (explicit_bundle or authorized_availability[key]["available"])
+                ),
                 "online": bool(availability[key]["available"]),
                 "trade_authorized": bool(
                     authorized_availability[key]["available"]
@@ -1511,7 +1435,8 @@ def apply_model_signals(
             "maturity_multipliers": maturity_multipliers,
             "effective_model_weights": {key: round(weight, 6) for key, weight in effective_weights.items()},
             "limited_live_authorization": {
-                "enabled": True,
+                "enabled": False,
+                "policy": "complete_production_qualification_required",
                 "model_keys": sorted(LIMITED_LIVE_MODEL_KEYS),
                 "initial_weight_scale": LIMITED_LIVE_WEIGHT_SCALE,
                 "passed_weight_scale": LIMITED_LIVE_PASSED_SCALE,

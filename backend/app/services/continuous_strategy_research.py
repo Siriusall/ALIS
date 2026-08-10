@@ -3583,7 +3583,6 @@ def persist_market_environments(environments: list[dict[str, Any]]) -> int:
 
 
 def continuous_strategy_research_status(*, console: bool = False) -> dict[str, Any]:
-    ensure_strategy_research_tables()
     with _conn() as conn:
         event_rows = [dict(row) for row in conn.execute(
             """SELECT research_line,event_type,status,COUNT(*) AS count
@@ -3760,7 +3759,6 @@ def strategy_research_analytics_console() -> dict[str, Any]:
     learning backfill. Those sections belong to dedicated research views and
     are not needed to render Wave status, expert governance, or similarity.
     """
-    ensure_strategy_research_tables()
     now = datetime.now().astimezone()
     with _conn() as conn:
         contracts = [dict(row) for row in conn.execute(
@@ -3866,7 +3864,6 @@ def strategy_research_analytics() -> dict[str, Any]:
     the autonomous research worker.  A console GET must not scan historical
     candidate evidence or mutate the research database.
     """
-    ensure_strategy_research_tables()
     compaction = {
         "ok": True,
         "schema_version": "alis_research_metric_compaction_v1",

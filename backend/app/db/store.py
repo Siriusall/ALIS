@@ -14,6 +14,7 @@ import os
 import re
 import sqlite3
 from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
@@ -65,6 +66,9 @@ _DEFAULT_STRATEGY_CONTENT = {
 
 _BUSINESS_DB_CONNECTION_GATE = DatabaseConnectionGate(
     "ALIS_BUSINESS_DB_MAX_CONNECTIONS", default=10
+)
+_ACTIVE_BUSINESS_TRANSACTION: ContextVar[Optional["_ConnWrapper"]] = ContextVar(
+    "alis_active_business_transaction", default=None,
 )
 
 
@@ -183,6 +187,12 @@ def _rounded_account_balance_expression(conn: _ConnWrapper, expression: str) -> 
     return f"ROUND({expression}, 2)"
 
 
+def _acquire_simulation_account_lock(conn: _ConnWrapper) -> None:
+    """Serialize all cash/position writers across API and worker processes."""
+    if getattr(conn, "_is_postgres", False):
+        conn.execute("SELECT pg_advisory_xact_lock(?)", (1095522643,))  # 'ALIS'
+
+
 def _split_sql_statements(sql: str) -> List[str]:
     """按分号拆分 SQL，忽略空段和仅注释。"""
     parts = re.split(r";\s*", sql)
@@ -191,6 +201,13 @@ def _split_sql_statements(sql: str) -> List[str]:
 
 @contextmanager
 def _conn():
+    active = _ACTIVE_BUSINESS_TRANSACTION.get()
+    if active is not None:
+        # Reuse the plan-level transaction for nested ledger/store calls.  The
+        # outer owner alone commits, rolls back through connection close, and
+        # releases the connection-gate slot.
+        yield active
+        return
     if _is_postgres():
         import psycopg
         from psycopg.rows import dict_row
@@ -237,6 +254,20 @@ def _conn():
         raise RuntimeError(
             "DATABASE_URL 未配置为 PostgreSQL；SQLite 已禁用，请设置 DATABASE_URL。"
         )
+
+
+@contextmanager
+def atomic_business_transaction():
+    """Make nested business-store mutations one commit/rollback unit."""
+    if _ACTIVE_BUSINESS_TRANSACTION.get() is not None:
+        raise RuntimeError("不允许嵌套开启模拟账本原子事务")
+    with _conn() as connection:
+        _acquire_simulation_account_lock(connection)
+        token = _ACTIVE_BUSINESS_TRANSACTION.set(connection)
+        try:
+            yield connection
+        finally:
+            _ACTIVE_BUSINESS_TRANSACTION.reset(token)
 
 
 def _migrate_positions_operations_name(c: _ConnWrapper) -> None:
@@ -1615,6 +1646,7 @@ def create_and_apply_buy_execution(
         raise ValueError(f"买入预算与逐笔成本不一致: budget={float(budget or 0):.2f}, ledger={total_cost:.2f}")
     names = name_by_symbol or {}
     with _conn() as c:
+        _acquire_simulation_account_lock(c)
         account_row = c.execute(
             "SELECT balance FROM account WHERE id=1" + (" FOR UPDATE" if c._is_mysql else "")
         ).fetchone()
@@ -1925,6 +1957,7 @@ def sell_position(
     sell_qty = 0
     pos_qty = 0
     with _conn() as c:
+        _acquire_simulation_account_lock(c)
         lock_suffix = " FOR UPDATE" if getattr(c, "_is_postgres", False) or getattr(c, "_is_mysql", False) else ""
         cur = c.execute(
             "SELECT id, symbol, quantity, price, name, bought_at FROM positions WHERE id = ?" + lock_suffix,

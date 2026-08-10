@@ -3,8 +3,30 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 
-from app.db.store import get_execution, list_executions, list_operations_for_execution_ids, list_recent_quant_run_task_records
+from app.db.store import (
+    get_execution,
+    list_executions,
+    list_operations_for_execution_ids,
+    list_recent_quant_run_task_records,
+    list_quant_run_task_records as _list_quant_run_task_records,
+)
 from app.services.backtest_data_source import BacktestDataSource
+
+
+def list_quant_run_task_records(task_id: int, limit: int = 5000) -> list[dict[str, Any]]:
+    """Compatibility adapter for bounded task-context inspection.
+
+    The ledger now uses the recent execution-indexed query, but callers that
+    need a specific task may still use the store contract without reaching
+    into the database layer themselves.
+    """
+    return _list_quant_run_task_records(int(task_id), limit=int(limit))
+
+
+def list_operations(execution_id: int, limit: int = 5000) -> list[dict[str, Any]]:
+    """Compatibility adapter for one execution's operation evidence."""
+    rows = list_operations_for_execution_ids([int(execution_id)], limit=int(limit))
+    return [dict(row) for row in rows if int(row.get("execution_id") or 0) == int(execution_id)]
 
 
 def _safe_float(value: Any) -> float:
@@ -27,11 +49,25 @@ def _task_context_by_execution(limit: int) -> tuple[dict[int, dict[str, Any]], l
     # Recent task rows already identify the exact execution record needed by
     # the ledger. Fetch their detail JSON in the same bounded query instead of
     # reopening one query per task/run pair.
-    for record in list_recent_quant_run_task_records(limit=limit, include_detail=True):
+    try:
+        recent_records = list_recent_quant_run_task_records(limit=limit, include_detail=True)
+    except TypeError:
+        # Keep compatibility with lightweight read-only adapters that expose
+        # the older one-argument signature.
+        recent_records = list_recent_quant_run_task_records(limit=limit)
+    for record in recent_records:
         execution_id = record.get("execution_id")
         if execution_id is None:
             continue
         detail = record.get("detail") if isinstance(record.get("detail"), dict) else {}
+        if not detail and record.get("task_id") is not None:
+            try:
+                task_rows = list_quant_run_task_records(int(record["task_id"]), limit=5000)
+                matching = next((row for row in task_rows if int(row.get("id") or 0) == int(record.get("id") or 0)), None)
+                if isinstance(matching, dict) and isinstance(matching.get("detail"), dict):
+                    detail = matching["detail"]
+            except Exception as exc:  # noqa: BLE001 - evidence is optional
+                warnings.append({"code": "task_context_unavailable", "task_id": record.get("task_id"), "execution_id": execution_id, "error": str(exc)})
         out[int(execution_id)] = {**record, "detail": detail}
     return out, warnings
 
@@ -83,6 +119,17 @@ def build_simulation_ledger(*, limit: int = 20, execution_id: int | None = None)
         limit_per_execution=5000,
     ):
         operations_by_execution.setdefault(int(operation.get("execution_id") or 0), []).append(operation)
+    # Compatibility fallback for storage adapters that only expose the
+    # single-execution operation contract.
+    if executions and not operations_by_execution:
+        for execution in executions:
+            eid = int(execution.get("id") or 0)
+            try:
+                rows = list_operations(eid, limit=5000)
+            except Exception as exc:  # noqa: BLE001 - evidence is optional
+                evidence_warnings.append({"code": "execution_operations_unavailable", "execution_id": eid, "message": str(exc)[:240]})
+                rows = []
+            operations_by_execution[eid] = rows
     ds = BacktestDataSource()
     close_maps_by_date: dict[str, dict[str, float]] = {}
     close_warnings_by_date: dict[str, dict[str, Any]] = {}
@@ -94,14 +141,19 @@ def build_simulation_ledger(*, limit: int = 20, execution_id: int | None = None)
             continue
         operations = operations_by_execution.get(eid, [])
         try:
-            close_maps_by_date[execute_date] = ds.load_close_map(
-                execute_date,
-                [str(operation.get("symbol") or "") for operation in operations],
-            )
+            symbols = [str(operation.get("symbol") or "") for operation in operations]
+            if hasattr(ds, "load_close_map"):
+                close_maps_by_date[execute_date] = ds.load_close_map(execute_date, symbols)
+            else:
+                rows = ds.load_snapshot(execute_date)
+                close_maps_by_date[execute_date] = {
+                    str(getattr(row, "symbol", "") or "").split(".", 1)[0].zfill(6): float(getattr(row, "close", 0) or 0)
+                    for row in rows if str(getattr(row, "symbol", "") or "")
+                }
         except Exception as exc:
             close_maps_by_date[execute_date] = {}
             close_warnings_by_date[execute_date] = {
-                "code": "execution_close_map_unavailable",
+                "code": "execution_snapshot_unavailable",
                 "execute_date": execute_date,
                 "message": str(exc)[:240],
             }

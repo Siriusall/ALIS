@@ -9,13 +9,19 @@ from datetime import datetime
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Any
 
-from app.db.store import _conn as business_conn, get_account_baseline
+from app.db.store import _conn as business_conn, atomic_business_transaction, get_account_baseline
 
 
 _CENT = Decimal("0.01")
 _READONLY_AUDIT_CACHE_TTL_SECONDS = 15.0
 _readonly_audit_cache_lock = threading.Lock()
 _readonly_audit_cache: tuple[float, dict[str, Any]] | None = None
+
+
+def invalidate_simulation_ledger_audit_cache() -> None:
+    global _readonly_audit_cache
+    with _readonly_audit_cache_lock:
+        _readonly_audit_cache = None
 
 
 def _money(value: Any) -> Decimal:
@@ -273,7 +279,9 @@ def audit_simulation_ledger(*, persist: bool = True) -> dict[str, Any]:
                 return copy.deepcopy(cached[1])
     if persist:
         _ensure_table()
-    with business_conn() as conn:
+    # A shared account advisory lock prevents the audit from mixing rows from
+    # before and after one ledger commit under PostgreSQL READ COMMITTED.
+    with atomic_business_transaction() as conn:
         operations = [
             dict(row) for row in conn.execute(
                 """SELECT id,symbol,side,price,quantity,at,
@@ -307,11 +315,12 @@ def audit_simulation_ledger(*, persist: bool = True) -> dict[str, Any]:
             ).fetchall()
         }
         account_row = conn.execute("SELECT balance FROM account WHERE id=1").fetchone()
+        baseline_cash = float(get_account_baseline())
     actual_cash = round(float((dict(account_row) if account_row else {}).get("balance") or 0), 2)
     replay = replay_simulation_ledger(
         operations,
         actions,
-        baseline_cash=float(get_account_baseline()),
+        baseline_cash=baseline_cash,
         adjustments=adjustments,
     )
     expected_positions = {

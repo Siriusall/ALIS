@@ -15,11 +15,16 @@ def evaluate_core_pool_eligibility(
     prepared_thesis: dict[str, Any] | None = None,
     prepared_research: dict[str, Any] | None = None,
     prepared_valuation: dict[str, Any] | None = None,
+    persist_research: bool = True,
 ) -> dict[str, Any]:
     """Evaluate all plan-defined evidence gates against one authoritative snapshot."""
     normalized = str(ts_code).strip().upper()
-    research = prepared_research if isinstance(prepared_research, dict) else build_stock_research(normalized, as_of_time=as_of_time)
-    valuation = prepared_valuation if isinstance(prepared_valuation, dict) else build_valuation_state(normalized, as_of_time=as_of_time)
+    research = prepared_research if isinstance(prepared_research, dict) else build_stock_research(
+        normalized, persist=persist_research, as_of_time=as_of_time,
+    )
+    valuation = prepared_valuation if isinstance(prepared_valuation, dict) else build_valuation_state(
+        normalized, persist=persist_research, as_of_time=as_of_time,
+    )
     theses = (
         [prepared_thesis]
         if isinstance(prepared_thesis, dict) and prepared_thesis
@@ -75,7 +80,7 @@ def evaluate_core_pool_eligibility(
 def build_console_stock_evidence(ts_code: str) -> dict[str, Any]:
     """Build the default research-page stock panel from one authoritative read."""
     normalized = str(ts_code).strip().upper()
-    research = build_stock_research(normalized)
+    research = build_stock_research(normalized, persist=False)
     linked_states = research.get("linked_states") or {}
     expectation = linked_states.get("expectation") or {}
     valuation = linked_states.get("valuation") or {}
@@ -83,6 +88,7 @@ def build_console_stock_evidence(ts_code: str) -> dict[str, Any]:
         normalized,
         prepared_research=research,
         prepared_valuation=valuation,
+        persist_research=False,
     )
     # Eligibility already evaluates the same point-in-time financial contract.
     # Reuse that evidence instead of issuing a second database read for the

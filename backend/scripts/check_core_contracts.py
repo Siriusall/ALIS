@@ -194,17 +194,19 @@ def check_startup_init_split() -> None:
         for n in ast.walk(startup_fn)
         if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
     }
-    allowed = {"init_db", "resume_quant_tasks_on_startup"}
+    # The formal runtime provisions schemas out-of-band and startup only
+    # verifies connectivity before acquiring the background lease.  Database
+    # migrations must not be hidden inside API startup.
+    required_startup_calls = {"_verify_database_connections", "acquire_background_runtime_lease"}
     heavy_calls = {
         "run_data_initialization",
         "roll_forward_daily_cache",
         "prefetch_daily_bars_for_init",
         "build_consolidated_cache_bundle",
     }
-    _assert("init_db" in called, "startup must initialize database schema")
-    _assert("resume_quant_tasks_on_startup" in called, "startup must reconcile interrupted quant tasks")
     _assert(called.isdisjoint(heavy_calls), "startup must not call heavy data initialization")
-    _assert(allowed.issubset(called), "startup must stay limited to database and task reconciliation")
+    _assert(required_startup_calls.issubset(called), "startup must verify databases and acquire the runtime lease")
+    _assert("init_db" not in called, "startup must not run schema migrations")
 
     init_routes_text = init_routes_path.read_text(encoding="utf-8")
     _assert("run_data_initialization" in init_routes_text, "/api/init route must call run_data_initialization")
@@ -213,11 +215,21 @@ def check_startup_init_split() -> None:
 
 
 def check_market_context() -> None:
+    # ``check_risk_decisions`` installs lightweight module stubs.  Clear the
+    # temporary persistence stub before importing the market-context/HSMM
+    # stack, which needs the real model persistence functions.
+    sys.modules.pop("app.db.store", None)
+    import app.db.store  # noqa: F401
     from app.services.market_context import score_market_sentiment, score_theme_narratives
     from app.services.quant_risk import hrp_fallback_weights
     sentiment = score_market_sentiment(breadth=0.7, average_return=0.02, volume_ratio=1.2, limit_up_ratio=0.03, limit_down_ratio=0.01, northbound_flow_z=1.0)
     _assert(0 <= sentiment["score"] <= 100, "sentiment score must be bounded")
-    themes = score_theme_narratives([{"theme": "demo", "strength": 0.8, "breadth": 0.8, "persistence": 0.8, "source_diversity": 0.8, "source_types": 2, "related_instruments": 5, "sessions": 3}])
+    themes = score_theme_narratives([{
+        "theme": "demo", "strength": 0.8, "breadth": 0.8,
+        "persistence": 0.8, "source_diversity": 0.8,
+        "price_confirmation": 0.8, "fundamental_verifiability": 0.8,
+        "source_types": 2, "related_instruments": 5, "sessions": 3,
+    }])
     _assert(themes and themes[0]["promotable"] is True, "theme promotion gate must pass with complete evidence")
     fallback = hrp_fallback_weights({"a": [0.01, -0.02, 0.01], "b": [0.03, -0.04, 0.02]}, max_single=0.8)
     _assert(abs(sum(fallback.values()) - 1.0) < 1e-6, "HRP fallback weights must normalize")

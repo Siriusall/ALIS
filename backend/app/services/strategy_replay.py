@@ -23,6 +23,7 @@ from app.services.hsmm_shadow import infer_hsmm_state_as_of
 from app.services.factor_platform import compute_bound_factor
 from app.services.strategy_config import (
     get_replay_required_factor_names,
+    get_strategy_factor_names,
     get_strategy_expert_route,
     get_strategy_score_for_market_state,
     parse_strategy_content,

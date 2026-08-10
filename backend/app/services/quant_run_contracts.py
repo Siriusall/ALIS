@@ -25,8 +25,12 @@ class ReplayRiskGateError(Exception):
 
 def require_consistent_simulation_ledger() -> None:
     """Stop new mutations when the account projection differs from its ledger."""
-    from app.services.simulation_ledger_audit import audit_simulation_ledger
+    from app.services.simulation_ledger_audit import (
+        audit_simulation_ledger,
+        invalidate_simulation_ledger_audit_cache,
+    )
 
+    invalidate_simulation_ledger_audit_cache()
     audit = audit_simulation_ledger(persist=False)
     if audit.get("ok"):
         return

@@ -1133,6 +1133,49 @@ def _upsert_raw_records(api_name: str, df: pd.DataFrame) -> int:
             ann_date = str(payload.get("ann_date") or "").strip()
             available_time = _point_in_time_available_time(api_name, payload, fallback=now)
             record_key = _record_key(api_name, payload, idx)
+            if api_name == "index_daily" and ts_code == "000300.SH":
+                previous = c.execute(
+                    """SELECT source_code,payload_json FROM dc_tushare_raw_records
+                       WHERE api_name=? AND record_key=? LIMIT 1""",
+                    (api_name, record_key),
+                ).fetchone()
+                previous_item = dict(previous) if previous else {}
+                previous_source = str(previous_item.get("source_code") or "")
+                if previous_source in {"eastmoney_index_daily_fallback", "sina_index_daily_fallback"}:
+                    try:
+                        previous_payload = json.loads(previous_item.get("payload_json") or "{}")
+                    except (TypeError, json.JSONDecodeError):
+                        previous_payload = {}
+                    mismatches = []
+                    for field in ("open", "high", "low", "close"):
+                        try:
+                            if abs(float(payload[field]) - float(previous_payload[field])) > 0.021:
+                                mismatches.append(field)
+                        except (KeyError, TypeError, ValueError):
+                            mismatches.append(field)
+                    if mismatches:
+                        c.execute(
+                            """INSERT INTO dc_data_quality_checks
+                               (check_name,scope,status,severity,message,affected_count,checked_at,meta_json)
+                               VALUES(?,?,?,?,?,?,?,?)""",
+                            (
+                                "hs300_fallback_primary_reconciliation",
+                                f"index_daily:{ts_code}:{trade_date}",
+                                "failed",
+                                "critical",
+                                "沪深300备用日线与后到 TuShare 主源字段不一致，保留备用记录等待复核",
+                                1,
+                                now,
+                                _strict_json({"fallback_source": previous_source, "mismatched_fields": mismatches}),
+                            ),
+                        )
+                        continue
+                    payload.update({
+                        "pending_primary_reconciliation": False,
+                        "fallback_reconciliation_status": "matched_primary",
+                        "reconciled_fallback_source": previous_source,
+                        "reconciled_at": now,
+                    })
             if api_name == "stk_holdernumber":
                 end_date = str(payload.get("end_date") or "")
                 holder_num = payload.get("holder_num")
@@ -3274,7 +3317,38 @@ def sync_index_bundle(index_code: str = "000300.SH", start_date: str | None = No
         _safe_sync_raw("index_daily", {"ts_code": index_code, "start_date": start_date, "end_date": end_date}),
         _safe_sync_raw("index_weight", {"index_code": index_code, "start_date": start_date, "end_date": end_date}),
     ]
-    return {"ok": all(bool(x.get("ok")) for x in results), "index_code": index_code, "start_date": start_date, "end_date": end_date, "results": results}
+    fallback: dict[str, Any] | None = None
+    if index_code == "000300.SH" and start_date == end_date:
+        with _conn() as c:
+            exact = c.execute(
+                """SELECT 1 FROM dc_tushare_raw_records
+                   WHERE api_name='index_daily' AND ts_code=? AND trade_date=? LIMIT 1""",
+                (index_code, start_date),
+            ).fetchone()
+        if exact is None:
+            try:
+                from app.data_platform.services.eastmoney_index_daily_fallback import (
+                    repair_hs300_index_daily_from_eastmoney,
+                )
+
+                fallback = repair_hs300_index_daily_from_eastmoney(start_date)
+            except Exception as exc:  # noqa: BLE001
+                fallback = {"ok": False, "status": "fallback_request_failed", "error": str(exc)[:300]}
+    with _conn() as c:
+        benchmark_ready = bool(c.execute(
+            """SELECT 1 FROM dc_tushare_raw_records
+               WHERE api_name='index_daily' AND ts_code=? AND trade_date=? LIMIT 1""",
+            (index_code, end_date),
+        ).fetchone())
+    return {
+        "ok": all(bool(x.get("ok")) for x in results),
+        "index_code": index_code,
+        "start_date": start_date,
+        "end_date": end_date,
+        "results": results,
+        "fallback": fallback,
+        "benchmark_ready": benchmark_ready,
+    }
 
 
 def sync_training_market_date_vip(trade_date: str) -> dict[str, Any]:

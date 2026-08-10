@@ -58,6 +58,25 @@ def is_factor_governance_eligible(definition: dict[str, Any]) -> bool:
     return str(definition.get("category") or "") not in NON_ALPHA_FACTOR_CATEGORIES
 
 
+def _factor_future_evaluations(
+    definition: dict[str, Any],
+    rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Keep one genuinely future cross-section per date for candidates."""
+    created_date = str(definition.get("created_at") or "")[:10].replace("-", "")
+    unique: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        end_date = str(row.get("end_date") or "").replace("-", "")[:8]
+        if not end_date or (
+            str(definition.get("status") or "") == "candidate"
+            and created_date
+            and end_date <= created_date
+        ):
+            continue
+        unique.setdefault(end_date, row)
+    return list(unique.values())
+
+
 def _safe(value: Any) -> float:
     try:
         number = float(value or 0)
@@ -311,8 +330,14 @@ def _factor_definition_row(item: dict[str, Any]) -> dict[str, Any]:
 
 
 def factor_registry_status() -> dict[str, Any]:
-    definitions = ensure_factor_registry()
     with _conn() as conn:
+        definitions = [
+            _factor_definition_row(dict(row)) for row in conn.execute(
+                """SELECT * FROM factor_definitions
+                   WHERE status IN ('active','candidate','degraded')
+                   ORDER BY category,factor_key"""
+            ).fetchall()
+        ]
         value_row = conn.execute(
             "SELECT MAX(trade_date) AS latest_date,COUNT(*) AS value_count FROM factor_values"
         ).fetchone()
@@ -738,10 +763,7 @@ def govern_factor_versions(minimum_evaluations: int = 20) -> dict[str, Any]:
                     (int(definition["id"]),),
                 ).fetchall()
             ]
-            unique_future_dates: dict[str, dict[str, Any]] = {}
-            for row in rows:
-                unique_future_dates.setdefault(str(row.get("end_date") or ""), row)
-            rows = list(unique_future_dates.values())
+            rows = _factor_future_evaluations(definition, rows)
             if len(rows) < int(minimum_evaluations):
                 continue
             recent = rows[:int(minimum_evaluations)]
@@ -756,8 +778,13 @@ def govern_factor_versions(minimum_evaluations: int = 20) -> dict[str, Any]:
             selection_penalty = math.sqrt(2.0 * math.log(max(1, trial_count)))
             selection_adjusted_z = raw_z - selection_penalty
             multiple_testing_passed = selection_adjusted_z >= 1.645
+            current = str(definition.get("status") or "")
             evidence = {
                 "evaluation_count": len(recent),
+                "future_observation_start_date": str(
+                    definition.get("created_at") or ""
+                )[:10].replace("-", "") or None,
+                "future_cross_sections_only": current == "candidate",
                 "average_rank_ic": round(avg_rank_ic, 8),
                 "positive_rank_ic_ratio": round(positive_ratio, 8),
                 "average_cost_after_incremental_oos": round(avg_cost_after, 8),
@@ -768,7 +795,6 @@ def govern_factor_versions(minimum_evaluations: int = 20) -> dict[str, Any]:
                 "selection_adjusted_z": round(selection_adjusted_z, 8),
                 "multiple_testing_passed": multiple_testing_passed,
             }
-            current = str(definition.get("status") or "")
             event_type = ""
             new_status = current
             if (

@@ -726,19 +726,35 @@ def _execute_step_with_retry(
             "正式调仓计划不存在、已执行或已被其他执行器领取",
             code="formal_plan_not_claimable",
         )
+    def _run_atomically():
+        from app.db.store import atomic_business_transaction
+
+        with atomic_business_transaction():
+            result = run_for_trade_date(
+                strategy_id=int(task_live.get("strategy_id") or 0),
+                signal_date=signal_date,
+                execute_date=execute_date,
+                top_n=int(task_live.get("top_n") or 10),
+                budget_ratio=float(task_live.get("budget_ratio") or 1.0),
+                exchange_group=str(task_live.get("exchange_group") or "HS"),
+                progress_callback=progress_callback,
+                strict_no_future=True,
+                scoring_timeout_sec=scoring_timeout_sec,
+                authoritative_plan=authoritative_plan,
+            )
+            if str(task_live.get("replay_mode") or "") == "autonomous_daily":
+                from app.services.profit_loop import mark_daily_rebalance_plan_executed
+
+                mark_daily_rebalance_plan_executed(
+                    signal_date,
+                    execute_date,
+                    result.execution_id,
+                    claim_token=str((authoritative_plan or {}).get("execution_claim_token") or ""),
+                )
+            return result
+
     try:
-        return run_for_trade_date(
-            strategy_id=int(task_live.get("strategy_id") or 0),
-            signal_date=signal_date,
-            execute_date=execute_date,
-            top_n=int(task_live.get("top_n") or 10),
-            budget_ratio=float(task_live.get("budget_ratio") or 1.0),
-            exchange_group=str(task_live.get("exchange_group") or "HS"),
-            progress_callback=progress_callback,
-            strict_no_future=True,
-            scoring_timeout_sec=scoring_timeout_sec,
-            authoritative_plan=authoritative_plan,
-        )
+        return _run_atomically()
     except Exception as e_step:  # noqa: BLE001
         if not _is_tushare_auth_error(e_step):
             raise
@@ -749,18 +765,7 @@ def _execute_step_with_retry(
             str(e_step)[:160],
         )
         reset_tushare_client()
-        return run_for_trade_date(
-            strategy_id=int(task_live.get("strategy_id") or 0),
-            signal_date=signal_date,
-            execute_date=execute_date,
-            top_n=int(task_live.get("top_n") or 10),
-            budget_ratio=float(task_live.get("budget_ratio") or 1.0),
-            exchange_group=str(task_live.get("exchange_group") or "HS"),
-            progress_callback=progress_callback,
-            strict_no_future=True,
-            scoring_timeout_sec=scoring_timeout_sec,
-            authoritative_plan=authoritative_plan,
-        )
+        return _run_atomically()
 
 
 def _build_replay_plan_context(

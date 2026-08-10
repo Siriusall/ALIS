@@ -5,6 +5,10 @@
 > 范围：投资研究、策略、组合、模拟交易和复盘；不包含实盘接入、自动备份与服务器运维。  
 > 本文正文给出当前真实状态；附录保留 2026-07-19 详细设计，所有变更均标注而不直接抹除。
 
+> 最近完成记录（2026-08-10）：收口旧控制面写接口。`backend/app/api/routes/execute.py` 的手动开仓接口改为 `410 Gone`，成交只能引用已授权的冻结调仓计划；`backend/app/api/routes/account.py` 的直接充值/提现同样改为 `410 Gone`，避免绕过 `simulation_ledger_adjustments` 造成现金漂移。补充手动交易回归测试，定向测试 `23 passed`，Python 编译与 `git diff --check` 通过。未修改账户、持仓、账本、成交、冻结计划或 Champion。
+
+> 最近完成记录（2026-08-10）：收紧生产认证与接口目录暴露。`ALIS_ALLOW_REGISTRATION` 在生产默认关闭，注册接口返回 `404`；`ALIS_EXPOSE_OPENAPI` 在生产默认关闭，同时关闭根 OpenAPI、Swagger 和 ReDoc 路由，开发/测试环境保持可用。新增认证回归测试，定向认证与手动控制面测试 `12 passed`。未修改用户、账户、持仓、账本、成交或策略权限。
+
 > 最近完成记录（2026-08-09）：优化今日决策页窄视口的冻结订单展示。原桌面表格继承最小宽度，窄屏只能横向滚动并裁掉金额与成本列。`frontend/src/pages.tsx` 为订单单元补齐语义标签，`frontend/src/theme.css` 在 760px 以下将该表格专门重排为订单卡：资产和冻结数量首行、授权与原因全宽、当前/目标与金额/成本分区并允许全文换行；其他宽表继续保留容器内横向滚动。桌面布局未改，未影响订单数据、冻结合同或只读边界。`frontend npm run build`（1,596 modules）与 `git diff --check` 通过。
 
 > 最近完成记录（2026-08-09）：修复正式前端共享列表表面“内容贴边”问题。旧全局 `.fact-list / .leaderboard / .incident-list` 与默认任务列表行只保留纵向内边距，视觉层新增卡片边框后首尾行会直接贴住左右边缘。`frontend/src/theme.css` 现统一补入 16px 横向内边距，同时明确排除已有专用间距的组合风险、系统任务、运营和数据视图。浏览器实际检查 `/decision`、`/models`、`/evolution/metrics` 与 `/evidence`：行文本左右相对卡片内缘均为17px（16px 内边距加1px 边框），均无加载残留、错误条或横向溢出。未改数据、接口或业务逻辑。
@@ -1392,6 +1396,9 @@ ALIS 的目标运行方式调整为“系统自治、结果可见、异常才打
 - [x] 2026-08-08 补完上述控制台登录态全页验收：投资驾驶舱、调仓与执行、账户与组合、系统运行、策略与模型、研究中心六页均已进入数据终态，无 HTTP 401、无旧原型文案/金额/资产，也未保留加载状态；前条的研究页验收限制已解除。该控制台仍是本地 `cockpit-prototype/` 交付，尚未替换云端正式 `frontend/` 静态资源。
 - [x] 2026-08-08 修正任务中心将终态研究合同失败长期呈现为当前系统阻断的语义。模型影子观察 #2354～#2357 因冻结策略包缺少仍为 candidate 的 `momentum_60` 绑定而达到重试上限；策略影子 #2336/#2341/#2349 则记录了当时最新决策数据未就绪。两类任务均保留原始失败、检查点及错误证据，但任务中心仅将仍可执行或未知的失败归入当前模块状态；已穷尽重试、且明确为旧数据门/旧因子或模型绑定合同的研究任务归入历史审计，等待后续调度以最新合同创建新任务。该调整不删除任务、不放宽研究或交易硬门，也不修改账本、持仓、成交、正式计划、Champion 或模型生产权限。
 - [x] 2026-08-09 修复模型未来 Shadow 的研究因子冻结合同。此前 #2354～#2357 错把生产 Champion 的 active 因子绑定直接复用于模型候选影子回放，因 `momentum_60` 仍为已通过的 candidate 而缺少冻结记录；现影子合同按实际候选模型消费的因子冻结 active 或 candidate 注册绑定，并显式标记研究候选因子，绝不提升其生产状态。旧合同哈希会自动失效重建，任务去重键同时包含新合同哈希，避免旧失败任务妨碍替代任务。腾讯 API 已发布 v87，阿里 Worker 已发布 v42；四个替代任务 #2360～#2363 均由单 Worker 首次完成，无重试、无 OOM，四个模型从下一交易日 `20260810` 起重新进入 `0/20 awaiting_first_future_signal`。`momentum_60` 状态保持 `candidate`，所有 Shadow 仍为 `production_change_forbidden=true`；旧失败任务保留审计，不修改账本、持仓、成交、正式计划、Champion 或模型生产权限。
+- [x] 2026-08-10 补齐决策数据恢复后的 Shadow 续跑，并移除遗留的 16 点 Shadow 时钟。策略 Shadow 现只作为实验数据硬门下的自治步骤：决策切片达到 `experiment_ready` 后由当日自治周期推进，若首次周期早于数据完成，则由 `decision_data_recovered` 恢复周期自动幂等补跑；调度状态明确标记 `shadow_cycle_trigger=decision_data_ready`，不再暴露或使用固定 `next_shadow_cycle_at`。数据未就绪时继续禁止观察。现有观察表唯一键和模型 Shadow 的 `last_observed_trade_date`/任务去重合同继续防止同日重复计数；模型 T 日信号仍只能在后续交易日收益实现后进入 20 日观察，未放宽任何生产门。
+- [x] 2026-08-10 全系统状态机审计第一批：恢复完成判定已将“生产计划已持久化”与“实验链已完成”分离，当 `daily/daily_basic/stk_limit` 先就绪、`adj_factor` 后就绪时，早期计划成功不再阻止后续 Shadow 恢复；当前实验门已 ready 时，硬 OOS 数据、模型自治和策略 Shadow 步骤必须全部成功才视为当日完成。恢复任务按 `production_decision` 与 `decision_and_experiments` 分离去重和有界续跑计数。真实数据又暴露 `20260810` 股票决策数据及 `adj_factor` 已 ready、但沪深300 `index_daily` 仍停在 `20260807` 时旧门会误报 `experiment_ready`；现已将点时沪深300当日切片加入实验就绪合同，基准缺失只暂停 OOS、Shadow 和收益归因实验，不误阻股票正式决策；日更调度已有的“基准缺失继续重试”与下游硬门因此形成闭环。完整后端回归 `937 passed、1 skipped、6 subtests passed`。
+- [x] 2026-08-11 全系统状态机审计第二批：清除五业务模型的两条候选生产权限旁路。旧 `limited_live` 会让中期、资金和龙头候选在严格 A/B 后、20 日未完成前就获得缩放排序权，事件候选则可以 `risk_only` 名义对正式排名施加负面惩罚；两者均已废止。现在只有重算当前完整生产资格审计并正式激活的版本才能影响排名、风险、准入或退出；冻结研究回放仍可显式消费候选。真实状态复核五模型均为 `shadow_only / trade_authorized=false / risk_authorized=false / weight_cap=0`。因子治理同时修复“历史回填评价冒充候选登记后 20 个未来截面”：候选晋升现只统计严格晚于创建日的唯一 `end_date`，创建当日和历史重放只作诊断。完整后端回归 `939 passed、1 skipped、6 subtests passed`。
 - [x] 2026-08-09 修正本地所有者控制台的真实接口契约映射。调仓页此前用轻量日报接口读取冻结动作，但该接口设计上不返回逐笔计划，因而把“接口有意精简”错误显示为“日报未返回动作”；现新增只读 `/api/decision/latest-plan`，只读取已持久化的最新正式计划与其冻结 `proposal`，不生成计划、不计算日报、不写库。模型页改用五业务模型的 `/api/model-strategy/plan-models`，验证页兼容 `periods` 真实结构，并显示模型版本、当前候选阻断码和周度验证收益；重复周度记录的渲染 key 已修正。浏览器实际核验：计划 #31 返回 14 条冻结动作、`blocked_by_contract_validation`、执行日 `2026-08-10`；五个模型和五条验证记录均可见，无模拟填充。旧计划仍保持审计阻断，未修改账本、持仓、成交、计划、Champion 或模型生产权限。本机 API 重启后路由可达；Python 编译、前端生产构建和 `git diff --check` 通过，未运行已删除的测试模块。
 - [x] 2026-08-09 完成所有者控制台六页的接口契约复核，继续清除“请求成功但字段路径错误”造成的假空态。生产策略接口的实际合同为 `champion.strategy.name / champion.is_active / champion.champion_version`，页面原先错误读取不存在的平铺 `name/status/generated_at`；现显示正确的策略名称、生产激活状态和版本，并对未包含的生成时间明确标注为合同未提供。驾驶舱与组合页原本只读取持仓，却在表中显示“冻结计划动作”，导致所有行错误显示“未返回计划原因”；现两页并发读取轻量只读的最新冻结计划，按规范化证券代码关联 `proposal`，实测 10 个持仓均获得真实冻结动作或准确的“未纳入冻结计划”语义。健康接口只承诺状态与依赖对象，不承诺检查时间或每个依赖的文字详情；系统页相应改为“健康接口未提供检查时间/该依赖未提供附加说明”，不再误报数据缺失。全局反查确认研究中心、任务中心、风险暴露、净值曲线、执行硬门与其 GET 返回结构一致；登录态页面实测驾驶舱、调仓与执行、账户与组合、系统运行、策略与模型均进入完整终态。前端生产构建（1,581 modules）、Python 编译和 `git diff --check` 通过，未运行已删除的测试模块；未修改数据库、账本、持仓、成交、冻结计划、Champion 或模型生产权限。
 - [x] 2026-08-09 完成正式 `frontend/` 的冻结计划契约复核与假空态修复。`/overview`、`/decision` 改为并发读取只读 `/api/decision/latest-plan`，动作统一读取持久化 `proposal`，不再从所有者摘要或精简日报推断；通用空态改为“暂无可展示记录”，避免把合法空数组误说成后端未返回。`latest-plan` 同时投影已冻结的预交易控制器和预期收益合同供页面解释使用，绝不重新计算或修改计划。当前旧计划 #31 的原始冻结合同确实没有完整控制器/收益字段，页面明确显示“冻结计划未提供”，不伪造理由；已有风险预算显示为可读摘要。登录态浏览器实测正式 `/decision` 显示14条冻结动作和 `blocked_by_contract_validation`，`/admin/models` 显示五业务模型、真实候选版本、五窗验证与4项未来 Shadow 观察；三张旧截图中的“日报/模型/验证接口未返回可展示记录”未再出现。前端生产构建、相关 Python 编译和 `git diff --check` 通过；未运行已删除的测试模块，未修改数据库、账本、持仓、成交、冻结计划、Champion 或模型生产权限。
@@ -1423,3 +1430,50 @@ ALIS 的目标运行方式调整为“系统自治、结果可见、异常才打
 - [x] 2026-08-10 完成正式前端交付前全量验收与接口收敛。静态核对 84 个固定只读接口，除 OpenAPI 自描述地址外均与当前后端路径一致；动态股票、行业、主题、Wave、决策、证据和分页接口通过真实页面交互验证，业务页面仍无 POST/PUT/PATCH/DELETE，只有登录和注册保留认证写入。模型治理前端新增 `console=true` 精简视图，只裁掉页面未读取的历史版本、重复产物和训练记录，响应由 14,676,727 字节降至 502,830 字节，五个模型及训练合同、当前版本、覆盖、硬门和运行健康字段全部保留，原完整接口保持兼容。只读网络故障增加一次 250ms 有限重试，HTTP、401、取消和第二次失败仍如实终态告警；`/evidence` 的首个决策明细和证据校验纳入整页加载门，终态 535ms 且直接显示 `verified`。同步修复数据资产 `1984/0` 为 `1,984 条`、ISO 时间展示、总览“未记录百分点”、通用任务误显示“训练中”、状态枚举漏出、窄屏进化标签裁切，并移除未路由的旧 `LegacyEvolution` 页面及其未使用逻辑。桌面逐页等待完整终态复核 13 条正式路由，均无错误条、加载残留、横向溢出、空按钮、`[object Object]`、`NaN` 或 `undefined`；研究四标签及两个下拉、进化矩阵展开和排序、因子关系筛选与详情、Wave 候选与分页、模型筛选与证据、决策证据切换、运行分页、窄屏决策表和导航均真实操作通过。前端生产构建（1,596 modules）、Python 编译及 `git diff --check` 通过；按所有者要求未运行或恢复测试模块，本轮未修改数据库、账本、持仓、成交、冻结计划、Champion 或模型权限，也尚未发布本轮改动。
 - [x] 2026-08-10 将上述正式前端审计版本 `ef7da31` 发布到腾讯应用机当前 release `20260808-shadow-factor-v87`。本地重新完成生产构建（1,596 modules），上传后先在隔离目录校验静态资源和后端语法，再原子替换 `frontend/dist` 并仅同步兼容的 `model_strategy.py` 精简查询参数；API 重启约5秒恢复，`alis-api` 为 `active`、`NRestarts=0`，Nginx 配置通过，健康为 `ok/ready=true/degraded=false`。公网首页引用新 bundle，原先 404 的 `/api/decision/latest-plan` 返回200，模型治理 `console=true` 在线响应约46KB并保留5个模型。受控登录浏览器逐页等待 `/overview`、`/decision`、`/portfolio`、`/research`、`/evolution`、`/models`、3个演化下钻页、`/system`、`/operations`、`/data`、`/evidence` 的全部数据终态，耗时约1.3～14.7秒，均无错误条、横向溢出或控制台 warning/error。发布观察到3次数据库首轮连接超时，有限重试后恢复，13:34:48后未再出现且Nginx未见5xx；这仍是页面慢加载的残余网络风险，不归因于前端发布。API 重启后读取到模拟日任务为 `paused`；后续核对确认该状态实际写于8月8日，并非本次重启造成。保留一份前端和一份后端即时回滚文件；未修改数据库、账本、持仓、成交、冻结计划、Champion或模型权限，也未运行已删除的测试模块。
 - [x] 2026-08-10 收敛量化日任务的启动恢复和前端状态语义。复核确认线上任务 #8 的旧“后端重启，任务已安全暂停”实际写于 `2026-08-08 20:34:59`，并非本次前端发布造成；旧启动逻辑会把 `pending/running` 一并改为 `paused`，把空闲等待、线程中断和风险阻断混为一类。现仅将真正处于 `running` 的重启中断任务转为 `paused + recovery_pending`，新建或空闲的 `autonomous_daily` 保持 `pending + waiting_schedule`，风险暂停在任务中心投影为 `blocked`；完成一份正式计划或当前无到期计划后也回到等待收盘调度，不再制造暂停提示。调度器继续只在收盘时钟、完整收盘数据、到期冻结计划和执行安全门全部通过后领取 `pending/paused`，未放宽防重复执行与账本边界。状态转移和只读投影探针分别验证等待调度、恢复待核和风险阻断三类；前端生产构建（1,596 modules）通过，本地 `/system`、`/operations` 均显示“等待收盘调度”，无旧重启暂停文案、错误条、横向溢出或浏览器 warning/error。腾讯应用机已发布对应5个后端文件和新静态资源，随后补齐健康接口的恢复后最终快照；线上 #8 现为 `pending + waiting_schedule`、`error=null`，执行模块为等待收盘调度，API `active`、`NRestarts=0`、后台运行锁由当前进程持有，自动模拟、日更和其他 Scheduler 心跳正常。线上 `/system` 显示明确等待状态且无旧暂停文案，`/operations` 无错误条或横向溢出，浏览器控制台无 warning/error。未修改计划、账本、持仓、成交、Champion或模型权限，也未运行已删除的测试模块。
+# 2026-08-10：生产 Champion 失败资格门收紧
+
+- 已完成：`backend/app/services/production_strategy.py` 对正式 OOS 结论为 `failed` 的当前 Champion 增加生产隔离：`champion_execution_gate()` 返回 `quarantined/research_only_sell_reduce`，禁止继续依赖失败 Champion 产生进攻性买入，仅保留卖出/减仓与总防御权重不超过 30% 的连续性配置；非生产环境保留告警模式，便于测试与研究回放。
+- 已完成：记录正式 OOS 失败时同步写入执行模式、资格限制和审计原因，避免数据库里的 `normal` 验证字段与实时门不一致。
+- 验证：`backend/tests/test_production_strategy.py` 与 `backend/tests/test_pretrade_strategy_controller.py` 共 14 项通过。
+
+# 2026-08-10：账本证据查询兼容层
+
+- 已完成：`simulation_ledger` 为旧版单任务/单执行查询适配器保留明确兼容入口，同时优先使用批量查询；任务上下文、操作明细和行情证据缺失统一写入带 `code` 的可审计 warning，不改变账本数据。
+- 验证：`backend/tests/test_simulation_ledger.py` 3 项通过；LLM 预算测试 3 项通过；全量测试当前 `916 passed / 14 failed / 1 skipped`。OOS 快照、健康响应、任务中心和模型融合协议已对齐；剩余失败集中在历史自治恢复夹具、旧 worker 初始化入口、旧正式计划回放、Shadow 夹具和候选因子绑定样例，尚未影响核心合同检查、账本审计和前端构建。
+- 追加验证：自治恢复、worker 启动和回放夹具已迁移到当前租约/数据库验证合同；全量测试进一步达到 `923 passed / 7 failed / 1 skipped`。剩余 7 项中，候选生成相关失败是缺少 active 因子绑定时的生产准入保护，不能通过放宽门修复。
+- 最终验证：Shadow、正式计划回放、复盘结果和候选研究测试已全部迁移到当前合同；全量后端测试 `930 passed / 1 skipped`，核心合同检查 4/4 通过，Python 编译检查和前端生产构建均通过。
+# 2026-08-10：当日全链路审计与恢复
+
+- 已完成：发现运行中的后端仍加载旧版 Champion warning-only 门，计划 #32 含 4 笔进攻性 BUY；已在未领取、未成交、未改账前将 #32 原子转为 `blocked_by_contract_validation`，错误码 `champion_quarantine_policy_mismatch`。同一信号日冻结计划按合同不允许覆盖重生成，下一交易日由新代码自然生成。
+- 已完成：修复 OOS/密封集审计把仅 19 日的 `dc_stock_daily_snapshot_stats` 部分汇总误当权威的问题；汇总不完整时回退规范快照聚合。受控补齐 `20260803～20260806` 的明确硬数据缺口后，OOS 恢复 `1537/1537 ready`，密封集保持 `126/126 ready`。
+- 已完成：Champion #50 持久 validation 同步为 `research_only_sell_reduce`、`execution_restricted_by_formal_oos=true`；后端平滑重启至新 PID，健康门 ready。OOS 修复后新建策略 Shadow 恢复任务 #2371，一次完成。
+- 最终验证：今日决策/实验数据门 ready，账本 `passed`、现金漂移 0、无问题；全量后端测试 `930 passed / 1 skipped`，核心合同检查 4/4 通过。当前 20260810 唯一计划 #32 已阻断且无 execution_id，20260811 不会执行旧计划。
+
+# 2026-08-11：正式计划执行终态与 Champion 告警语义校正
+
+- [x] 修复正式计划成功改账后未回写 `executed`的缺口。`autonomous_daily` 现在会在执行引擎返回后、写任务检查点前，使用原计划认领 token 绑定 `execution_id` 并原子转为 `executed`；绑定失败继续隔离，不释放为可重放计划。这避免已成交计划在重启后被误判为中断。
+- [x] 取消与当前项目合同冲突的“Champion 正式 OOS 失败即切换 `research_only_sell_reduce`”旧生产隔离逻辑。OOS 失败仍持久告警并影响长期晋升判断，但 `champion_execution_gate()` 保持 `allowed/normal`，不再改变正常模拟买入、加仓和防御配置权限。模型信号快照的权限说明也同步为：五个业务模型在完整生产资格通过前全部只观察。
+- [x] `20260810` 已持久的 #32 仍保持不可变阻断证据，不追认、不覆盖、不跨日补成交；修正后的 warning-only 合同从下一个有效信号日自然生效。
+- 验证：生产策略、统一计划、Controller、自治模拟执行相关测试 `59 passed`；计划输入、利润闭环和自治任务另一组 `53 passed`。
+
+# 2026-08-11：模拟账户计划级原子性与公司行动并发加固
+
+- [x] 新增跨调用共享的业务库原子事务与 PostgreSQL 账户级 advisory transaction lock。正式 `autonomous_daily` 的多笔卖出、买入、现金、持仓、`operations`、`executions` 以及冻结计划 `executed/execution_id` 终态现在属于同一提交单元；任一写入或计划租约绑定失败时整体回滚，不再留下“部分卖出已成功”的投影。手工卖出、买入和公司行动也共用同一跨进程账户锁。
+- [x] 公司行动整个物化周期纳入同一账户事务，股权登记日资格、历史送股、现金入账和持仓投影不再与并发成交交叉。补充 `(symbol, action_type, event_date, record_date)` 业务唯一索引；上游在同一业务事件上修订源哈希时不再静默忽略，而是返回 `corporate_action_source_revision_requires_reconciliation`，且不自动二次改账。现金分红增加账户行数校验，送股持仓显式加行锁。
+- [x] 独立账本审计的 operations、公司行动、调整、现金和持仓读取现在与账户写入互斥，避免 `READ COMMITTED` 下混合一次提交前后的快照。成交前硬门会先清理 15 秒只读缓存，强制使用当前真实账本。
+- 验证：原子执行顺序与回滚测试、公司行动、费用账本、独立重放和自愈相关测试通过；当前真实库审计仍为 `passed`，16 笔 operation，预期/实际现金均为 `57,941.62`，现金漂移 0，持仓差异 0，非法记录 0。
+
+# 2026-08-11：收益周期边界、只读接口与自治重试分类审计
+
+- [x] 修复周/月/年绩效把“本周期第一个收盘点”当作期初而漏掉首个交易日收益的问题。长周期现改为逐日收益复合，绝对盈亏逐日汇总；沪深300必须在周期内每个收益点连续覆盖才输出周期基准收益，否则为 `None` 并写明 `return_points/required_return_points/complete`。市场状态分解同步禁止把缺失基准当 0%。
+- [x] 完成 GET 只读边界的直接与间接调用审计。股票研究、预期、估值、核心池资格、市场上下文、模型自动优化状态、因子注册表、连续因子研究和策略研究控制台的 GET 均不再写基线/快照、建表、刷新种群/聚类、自动淘汰/晋升或创建默认生产版本。状态页只读已持久投影；初始化和物化仅由启动、POST 或自治 Worker 执行。
+- [x] 修复 Evolution Worker 对所有异常盲目重试的问题。通用失败现持久 `alis_evolution_failure_classification_v1`：仅查询超时、连接中断、运行中断和资源耗尽进入有界重试；数据覆盖缺口交给补数；代码合同与未知故障直接终止并升级所有者复核，不再重复消耗三次重任务。取消终态、租约 owner 和迟到 Worker 的条件更新仍保持原有防覆盖合同。
+- 验证：收益/基准相关 `29 passed`；只读与研究状态相关 `66 passed`；Evolution 和模型失败分类相关 `125 passed`。
+- 追加全量验证：后端 `946 passed / 1 skipped / 6 subtests passed`，Python `compileall` 和 `git diff --check` 通过。真实库对代表性只读链连续调用因子注册、连续因子/策略研究、Wave 分析、模型自动优化状态、市场上下文、股票研究/预期/估值后，前后快照完全一致：`model_versions=280`、`evolution_tasks=2372`、`research_score_snapshots=72528`、`valuation_snapshots=17271`、`factor_research_population=214`、`factor_research_clusters=8`、`strategy_research_events=316`、`dc_market_context_snapshot=136`、账户现金 `57,941.62`、operations 16、executions 5、positions 10 均未变；激活版本仍只有 Champion #50 与 Controller #31。
+- 最终运行验收：前端生产构建 `1,596 modules transformed` 通过；核心合同脚本 4/4 通过。本机 API 进程已安全重启并由原有进程监管自动恢复为 PID 15163，`/api/live`、`/api/health`、`/api/ready` 均 HTTP 200，`ready=true/degraded=false`。当前生产决策门通过；实验门仅因 `20260810` 沪深300点时切片尚未发布而正确暂停 OOS/Shadow/收益归因。该外部数据等待不阻断股票生产决策，也不会消耗实验重试预算。当前无 active Evolution 任务，账本仍 `passed`。
+
+# 2026-08-11：沪深300日线备用源自动补位
+
+- [x] 日更的沪深300精确日线改为“TuShare 主源优先、历史行情备用源仅补真实缺口”。主源在目标交易日尚未发布时，系统先尝试东方财富历史日线；接口不可用或未返回目标日时再尝试新浪历史日线，不再反复死磕单一上游。备用写入限定 `000300.SH` 单一完整交易日，绝不覆盖已有记录。
+- [x] 备用数据必须通过目标日期、OHLC 几何关系、正价格/成交量和上一 TuShare 收盘连续性校验。`available_time` 保存该完整收盘柱的经济可用时点 T 日 15:00，payload 另存本机首次 `observed_at`、来源 URL、校验状态和 `pending_primary_reconciliation`，不把备用源伪装成 TuShare；TuShare 后续到达时仍按规范记录键恢复主源。
+- [x] 已真实用新浪备用源补入 `20260810`：沪深300收盘 `4702.025`，前一 TuShare 收盘 `4694.437`，来源标记 `sina_index_daily_fallback`。最新数据健康现为 `decision_ready=true / experiment_ready=true`，OOS 为 `ready`，密封集为 `ready`；备用源定向测试 4 项通过。

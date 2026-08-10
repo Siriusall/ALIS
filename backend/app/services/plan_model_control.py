@@ -6903,6 +6903,14 @@ def classify_plan_model_training_failure(error: Any) -> dict[str, Any]:
         retryable = True
         action = "bounded_retry"
     elif any(value in message for value in (
+        "connection refused", "connection reset", "connection aborted",
+        "server closed the connection", "could not connect", "network is unreachable",
+        "temporary failure", "temporarily unavailable", "ssl eof", "remote end closed",
+    )):
+        category = "transient_external_dependency"
+        retryable = True
+        action = "bounded_retry"
+    elif any(value in message for value in (
         "capital_moneyflow_query_failed",
         "moneyflow_query_failed",
         "training_symbol_anchor_query_failed",
@@ -7846,24 +7854,14 @@ def plan_model_operations_status(*, cache_seconds: int = 15) -> dict[str, Any]:
             "version_id": int(online_version.get("id") or 0) or None if online_version else None,
             "version": online_version.get("version") if online_version else None,
             "trade_authorized": bool(active or limited_authorized),
-            "risk_authorized": bool(
-                active
-                or (
-                    online_version
-                    and key == "event_impact_assessor_v2"
-                )
-            ),
+            "risk_authorized": bool(active),
             "weight_cap": 0.20 if limited_authorized else 0.0,
             "authorization_tier": (
                 "production" if active else str(limited_authorization["tier"])
-                if limited_authorized else "risk_only"
-                if online_version and key == "event_impact_assessor_v2"
-                else "shadow_only" if online_version else "unavailable"
+                if limited_authorized else "shadow_only" if online_version else "unavailable"
             ),
             "authorization_reason": (
                 "production_contract_passed" if active
-                else "event_negative_adjustment_and_exit_reference_only"
-                if online_version and key == "event_impact_assessor_v2"
                 else str(limited_authorization["reason"])
             ),
             "future_observed_sessions": int(

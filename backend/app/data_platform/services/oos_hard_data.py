@@ -107,7 +107,12 @@ def audit_oos_hard_data(*, end_date: str | None = None, include_dates: bool = Tr
     api_dates = _date_api_sets(start, end)
     benchmark_dates = _benchmark_date_set(start, end)
     with _conn() as conn:
-        snapshots = snapshot_stats_for_range(conn, start, end)
+        snapshots = snapshot_stats_for_range(
+            conn,
+            start,
+            end,
+            expected_dates=calendar_dates,
+        )
         if snapshots is None:
             snapshots = {}
     details: list[dict[str, Any]] = []

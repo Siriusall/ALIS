@@ -952,8 +952,17 @@ def build_quant_run_performance(
             benchmark_points = [
                 item for item in points if _safe_float(item.get("benchmark_equity")) > 0
             ]
-            bm_start = _safe_float((benchmark_points[0] if benchmark_points else {}).get("benchmark_equity"))
-            bm_end = _safe_float((benchmark_points[-1] if benchmark_points else {}).get("benchmark_equity"))
+            strategy_factor = 1.0
+            for item in points:
+                strategy_factor *= 1.0 + float(item.get("daily_return_pct") or 0.0) / 100.0
+            benchmark_daily_returns = [
+                float(item["daily_benchmark_return_pct"])
+                for item in points if item.get("daily_benchmark_return_pct") is not None
+            ]
+            benchmark_complete = len(benchmark_daily_returns) == len(points)
+            benchmark_factor = 1.0
+            for daily_return in benchmark_daily_returns:
+                benchmark_factor *= 1.0 + daily_return / 100.0
             drawdowns = [_safe_float(x.get("drawdown_pct")) for x in points]
             start_date, end_date = str(first["date"]), str(last["date"])
             period_ops = [x for x in operations if start_date <= str(x.get("at") or "")[:10] <= end_date]
@@ -994,21 +1003,24 @@ def build_quant_run_performance(
                 "return_pct": (
                     float(last.get("daily_return_pct") or 0)
                     if len(points) == 1 else
-                    round((end_index / start_index - 1.0) * 100.0, 4) if start_index else 0.0
+                    round((strategy_factor - 1.0) * 100.0, 4)
                 ),
                 "absolute_return": (
                     float(last.get("daily_absolute_return") or 0)
-                    if len(points) == 1 else round(absolute_return, 4)
+                    if len(points) == 1 else round(sum(float(item.get("daily_absolute_return") or 0.0) for item in points), 4)
                 ),
                 "benchmark_return_pct": (
                     last.get("daily_benchmark_return_pct")
                     if len(points) == 1 else
-                    round((bm_end / bm_start - 1.0) * 100.0, 4) if bm_start else None
+                    round((benchmark_factor - 1.0) * 100.0, 4) if benchmark_complete else None
                 ),
                 "benchmark_coverage": {
                     "start_date": (benchmark_points[0].get("date") if benchmark_points else None),
                     "end_date": (benchmark_points[-1].get("date") if benchmark_points else None),
                     "points": len(benchmark_points),
+                    "return_points": len(benchmark_daily_returns),
+                    "required_return_points": len(points),
+                    "complete": benchmark_complete,
                 },
                 "max_drawdown_pct": round(min(drawdowns), 4) if drawdowns else 0.0,
                 "turnover_rate": round(traded_amount / ((start + end) / 2.0), 6) if (start + end) > 0 else 0.0,

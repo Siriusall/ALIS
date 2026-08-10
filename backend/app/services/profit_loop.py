@@ -543,7 +543,7 @@ def build_portfolio_reoptimization(*, signal_date: str = "") -> dict[str, Any]:
         }
     else:
         try:
-            context = live_market_context()
+            context = live_market_context(persist=True)
         except Exception:
             context = {}
         state = str((context.get("market_state") or {}).get("state") or "S1")

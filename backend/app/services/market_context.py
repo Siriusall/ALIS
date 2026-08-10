@@ -600,7 +600,7 @@ def _market_enrichment_observations(latest: str, *, as_of_time: str | None = Non
     return {**result, "coverage": dict(result.get("coverage") or {})}
 
 
-def live_market_context() -> dict[str, Any]:
+def live_market_context(*, persist: bool = False) -> dict[str, Any]:
     cached = get_json("alis:market-context:live:v5")
     if isinstance(cached, dict):
         return cached
@@ -731,15 +731,16 @@ def live_market_context() -> dict[str, Any]:
         ],
         "available_time": now,
     }
-    with _conn() as c:
-        c.execute(
-            """INSERT INTO dc_market_context_snapshot(trade_date,market_state,state_confidence,sentiment_score,observations_json,result_json,model_version,available_time,created_at,updated_at)
-               VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(trade_date) DO UPDATE SET market_state=excluded.market_state,state_confidence=excluded.state_confidence,
-               sentiment_score=excluded.sentiment_score,observations_json=excluded.observations_json,result_json=excluded.result_json,model_version=excluded.model_version,
-               available_time=excluded.available_time,updated_at=excluded.updated_at""",
-            (latest, market_state, confidence, score, json.dumps(observations, ensure_ascii=False), json.dumps(payload, ensure_ascii=False), "transparent_four_state_v1", now, now, now),
-        )
-    set_json("alis:market-context:live:v5", payload, ttl=300)
+    if persist:
+        with _conn() as c:
+            c.execute(
+                """INSERT INTO dc_market_context_snapshot(trade_date,market_state,state_confidence,sentiment_score,observations_json,result_json,model_version,available_time,created_at,updated_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(trade_date) DO UPDATE SET market_state=excluded.market_state,state_confidence=excluded.state_confidence,
+                   sentiment_score=excluded.sentiment_score,observations_json=excluded.observations_json,result_json=excluded.result_json,model_version=excluded.model_version,
+                   available_time=excluded.available_time,updated_at=excluded.updated_at""",
+                (latest, market_state, confidence, score, json.dumps(observations, ensure_ascii=False), json.dumps(payload, ensure_ascii=False), "transparent_four_state_v1", now, now, now),
+            )
+        set_json("alis:market-context:live:v5", payload, ttl=300)
     return payload
 
 

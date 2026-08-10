@@ -749,8 +749,20 @@ def ensure_default_strategy_policy_version() -> dict[str, Any]:
 
 
 def strategy_controller_status() -> dict[str, Any]:
-    active = ensure_default_strategy_policy_version()
+    active = get_active_model_version(STRATEGY_MODEL_KEY)
     versions = list_model_versions(STRATEGY_MODEL_KEY, limit=20)
+    if not active:
+        return {
+            "ok": False,
+            "status": "not_initialized",
+            "schema_version": "strategy_controller_status_v1",
+            "model_key": STRATEGY_MODEL_KEY,
+            "active_version": None,
+            "policy": DEFAULT_STRATEGY_POLICY,
+            "versions": versions[:2],
+            "version_count": len(versions),
+            "generated_at": datetime.now().isoformat(),
+        }
     visible_versions = [item for item in versions if item.get("is_active")][:1] + [item for item in versions if not item.get("is_active")][:2]
     return {
         "ok": True,

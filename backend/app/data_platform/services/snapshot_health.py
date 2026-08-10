@@ -12,17 +12,22 @@ def _value(row: Any, key: str, default: Any = "") -> Any:
 
 def _summary_table_available(c: Any) -> bool:
     """Check the optional summary table without aborting the transaction."""
-    if bool(getattr(c, "_is_postgres", False)):
+    try:
+        if bool(getattr(c, "_is_postgres", False)):
+            row = c.execute(
+                "SELECT to_regclass(?) AS table_name",
+                ("public.dc_stock_daily_snapshot_stats",),
+            ).fetchone()
+            return bool(_value(row, "table_name", ""))
         row = c.execute(
-            "SELECT to_regclass(?) AS table_name",
-            ("public.dc_stock_daily_snapshot_stats",),
+            "SELECT 1 AS present FROM sqlite_master WHERE type='table' AND name=?",
+            ("dc_stock_daily_snapshot_stats",),
         ).fetchone()
-        return bool(_value(row, "table_name", ""))
-    row = c.execute(
-        "SELECT 1 AS present FROM sqlite_master WHERE type='table' AND name=?",
-        ("dc_stock_daily_snapshot_stats",),
-    ).fetchone()
-    return row is not None
+        return row is not None
+    except Exception:
+        # Lightweight read-only adapters may not implement schema discovery;
+        # the caller can safely use its bounded snapshot fallback.
+        return False
 
 
 def snapshot_stats_for_range(c: Any, start: str, end: str, *, expected_dates: list[str] | tuple[str, ...] | None = None) -> dict[str, dict[str, Any]] | None:
@@ -31,8 +36,28 @@ def snapshot_stats_for_range(c: Any, start: str, end: str, *, expected_dates: li
     Audits must never silently treat a partially backfilled summary as complete;
     callers retain their bounded compatibility aggregate when a date is absent.
     """
+    def aggregate_normalized() -> dict[str, dict[str, Any]] | None:
+        try:
+            rows = c.execute(
+                """SELECT trade_date,
+                          COUNT(*) AS rows_total,
+                          COUNT(CASE WHEN close IS NOT NULL AND volume IS NOT NULL AND turnover IS NOT NULL THEN 1 END) AS market_rows,
+                          MIN(available_time) AS min_available_time,
+                          MAX(available_time) AS max_available_time
+                     FROM dc_stock_daily_snapshot
+                    WHERE trade_date BETWEEN ? AND ?
+                    GROUP BY trade_date""",
+                (start, end),
+            ).fetchall()
+            result = {str(_value(row, "trade_date", "")): dict(row) for row in rows if _value(row, "trade_date", "")}
+            return result
+        except Exception:
+            return None
+
     if not _summary_table_available(c):
-        return None
+        # Older data adapters do not materialize the daily summary table yet;
+        # derive the same bounded evidence from the normalized snapshot rows.
+        return aggregate_normalized()
     rows = c.execute(
         """SELECT trade_date,rows_total,market_rows,min_available_time,max_available_time
              FROM dc_stock_daily_snapshot_stats
@@ -41,7 +66,9 @@ def snapshot_stats_for_range(c: Any, start: str, end: str, *, expected_dates: li
     ).fetchall()
     result = {str(_value(row, "trade_date", "")): dict(row) for row in rows if _value(row, "trade_date", "")}
     if expected_dates is not None and not set(str(value) for value in expected_dates).issubset(result):
-        return None
+        # A partially backfilled summary table is an optimization, never an
+        # authority. Fall back to normalized rows for the complete audit range.
+        return aggregate_normalized()
     return result
 
 

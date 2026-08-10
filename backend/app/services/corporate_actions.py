@@ -7,7 +7,12 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from app.data_platform.db import _conn as data_conn
-from app.db.store import _conn as business_conn, get_positions, _rounded_account_balance_expression
+from app.db.store import (
+    _conn as business_conn,
+    atomic_business_transaction,
+    get_positions,
+    _rounded_account_balance_expression,
+)
 
 
 def _normalize_ts_code(symbol: str) -> str:
@@ -42,6 +47,10 @@ def _ensure_table() -> None:
                    applied_at VARCHAR(64) NOT NULL,
                    UNIQUE(symbol,action_type,event_date,source_hash)
                )"""
+        )
+        conn.execute(
+            """CREATE UNIQUE INDEX IF NOT EXISTS uq_simulation_corporate_action_event
+               ON simulation_corporate_actions(symbol,action_type,event_date,record_date)"""
         )
 
 
@@ -248,6 +257,12 @@ def build_replay_corporate_actions(
 
 
 def materialize_simulation_corporate_actions(*, as_of_date: str) -> dict[str, Any]:
+    """Apply one whole corporate-action cycle as a serialized account transaction."""
+    with atomic_business_transaction():
+        return _materialize_simulation_corporate_actions(as_of_date=as_of_date)
+
+
+def _materialize_simulation_corporate_actions(*, as_of_date: str) -> dict[str, Any]:
     """Apply known cash/stock dividends once to the simulation account."""
     _ensure_table()
     target_date = str(as_of_date or "").replace("-", "")[:8]
@@ -269,6 +284,7 @@ def materialize_simulation_corporate_actions(*, as_of_date: str) -> dict[str, An
     skipped = 0
     no_entitlement = 0
     recorded = 0
+    source_conflicts: list[dict[str, Any]] = []
     for event in events:
         entitled = quantity_entitled(
             operations,
@@ -295,12 +311,23 @@ def materialize_simulation_corporate_actions(*, as_of_date: str) -> dict[str, An
             now = datetime.now().astimezone().isoformat()
             with business_conn() as conn:
                 existing = conn.execute(
-                    """SELECT id FROM simulation_corporate_actions
+                    """SELECT id,source_hash,status FROM simulation_corporate_actions
                        WHERE symbol=? AND action_type=? AND event_date=? AND record_date=?
                        LIMIT 1""",
                     (event["symbol"], action_type, event_date, event["record_date"]),
                 ).fetchone()
                 if existing:
+                    existing_row = dict(existing)
+                    if str(existing_row.get("source_hash") or "") != str(event.get("source_hash") or ""):
+                        source_conflicts.append({
+                            "symbol": event["symbol"],
+                            "action_type": action_type,
+                            "event_date": event_date,
+                            "record_date": event["record_date"],
+                            "existing_action_id": int(existing_row.get("id") or 0),
+                            "existing_status": str(existing_row.get("status") or ""),
+                            "code": "corporate_action_source_revision_requires_reconciliation",
+                        })
                     skipped += 1
                     continue
                 status = "applied" if entitled > 0 and (cash_amount > 0 or share_quantity > 0) else "no_entitlement"
@@ -318,13 +345,16 @@ def materialize_simulation_corporate_actions(*, as_of_date: str) -> dict[str, An
                     ),
                 )
                 if status == "applied" and action_type == "cash_dividend":
-                    conn.execute(
+                    credited = conn.execute(
                         f"UPDATE account SET balance={_rounded_account_balance_expression(conn, 'balance+?')} WHERE id=1",
                         (cash_amount,),
                     )
+                    if int(getattr(credited, "rowcount", 0) or 0) != 1:
+                        raise RuntimeError("模拟账户不存在，现金分红整体回滚")
                 elif status == "applied" and action_type == "stock_dividend":
+                    lock_suffix = " FOR UPDATE" if getattr(conn, "_is_postgres", False) or getattr(conn, "_is_mysql", False) else ""
                     position = conn.execute(
-                        "SELECT id,quantity,price,name,bought_at FROM positions WHERE symbol=?",
+                        "SELECT id,quantity,price,name,bought_at FROM positions WHERE symbol=?" + lock_suffix,
                         (event["symbol"],),
                     ).fetchone()
                     if position:
@@ -363,7 +393,7 @@ def materialize_simulation_corporate_actions(*, as_of_date: str) -> dict[str, An
             if action_type == "stock_dividend" and status == "applied":
                 prior_actions.append(item)
     return {
-        "ok": True,
+        "ok": not source_conflicts,
         "schema_version": "alis_simulation_corporate_actions_v1",
         "as_of_date": target_date,
         "event_count": len(events),
@@ -371,6 +401,7 @@ def materialize_simulation_corporate_actions(*, as_of_date: str) -> dict[str, An
         "recorded_count": recorded,
         "no_entitlement_count": no_entitlement,
         "already_materialized": skipped,
+        "source_conflicts": source_conflicts,
         "simulation_only": True,
     }
 

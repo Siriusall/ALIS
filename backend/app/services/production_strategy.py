@@ -4,6 +4,7 @@ from copy import deepcopy
 from datetime import datetime
 from typing import Any
 
+from app.core.config import settings
 from app.db.store import (
     create_model_version,
     get_active_model_version,
@@ -175,7 +176,9 @@ def ensure_production_strategy_champion(*, force_rebind: bool = False) -> dict[s
 
 
 def resolve_production_strategy_champion() -> dict[str, Any]:
-    champion = ensure_production_strategy_champion()
+    champion = get_active_model_version(CHAMPION_MODEL_KEY)
+    if not champion:
+        raise RuntimeError("ALIS 唯一生产 Champion 未初始化")
     config = champion.get("config") if isinstance(champion.get("config"), dict) else {}
     strategy_id = int(config.get("strategy_id") or 0)
     strategy = config.get("selection_strategy") if isinstance(config.get("selection_strategy"), dict) else None
@@ -239,6 +242,11 @@ def champion_execution_gate() -> dict[str, Any]:
         "reason": "active_champion_failed_formal_oos_warning_only",
         "formal_oos_warning_active": True,
         "execution_restricted_by_formal_oos": False,
+        "defensive_continuity": {
+            "enabled": False,
+            "maximum_total_weight": 0.0,
+            "reason": "formal_oos_failure_is_research_warning_not_execution_authority",
+        },
         "formal_oos": {
             "outperform_window_count": int(summary.get("outperform_window_count") or 0),
             "valid_window_count": int(summary.get("valid_window_count") or 0),
@@ -276,15 +284,16 @@ def record_champion_formal_oos_result(result: dict[str, Any]) -> dict[str, Any]:
     metrics["formal_oos"] = formal
     update_model_version_metrics(champion_id, metrics=metrics)
     validation = dict(current.get("validation") if isinstance(current.get("validation"), dict) else {})
+    gate = champion_execution_gate()
     validation.update({
         "formal_oos_status": formal["status"],
-        "execution_mode": "normal",
-        "execution_gate_reason": "active_champion_failed_formal_oos_warning_only" if formal["status"] == "failed" else "formal_oos_passed",
+        "execution_mode": gate.get("mode", "normal") if formal["status"] == "failed" else "normal",
+        "execution_gate_reason": gate.get("reason") if formal["status"] == "failed" else "formal_oos_passed",
         "formal_oos_warning_active": formal["status"] == "failed",
-        "execution_restricted_by_formal_oos": False,
+        "execution_restricted_by_formal_oos": bool(gate.get("execution_restricted_by_formal_oos")) if formal["status"] == "failed" else False,
     })
     update_model_version_validation(champion_id, validation=validation)
-    return {"recorded": True, "champion_id": champion_id, "status": formal["status"], "execution_gate": champion_execution_gate()}
+    return {"recorded": True, "champion_id": champion_id, "status": formal["status"], "execution_gate": gate}
 
 
 def champion_strategy_policy_context() -> dict[str, Any]:

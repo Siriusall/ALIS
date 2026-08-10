@@ -186,7 +186,7 @@ def _batch_quotes_and_names(symbols: list[str], trade_date: str) -> tuple[dict[s
 def _build_daily_rebalance_report() -> dict[str, Any]:
     """Generate P3-7 daily rebalancing report with specific trade recommendations."""
     now = datetime.now().isoformat(timespec="seconds")
-    market = live_market_context()
+    market = live_market_context(persist=True)
     positions_raw = get_positions()
     report_trade_date = str(market.get("trade_date") or "").replace("-", "")[:8]
     if len(report_trade_date) != 8 or not report_trade_date.isdigit():

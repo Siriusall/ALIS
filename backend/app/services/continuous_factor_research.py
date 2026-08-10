@@ -2237,7 +2237,6 @@ def run_continuous_factor_research_cycle(
 
 
 def continuous_factor_research_status(*, compact: bool = False, console: bool = False) -> dict[str, Any]:
-    ensure_continuous_research_tables()
     with _conn() as conn:
         snapshot_row = conn.execute(
             "SELECT * FROM factor_research_snapshots ORDER BY created_at DESC LIMIT 1"
@@ -2343,8 +2342,49 @@ def continuous_factor_research_status(*, compact: bool = False, console: bool = 
             "clusters": [],
         }
     experiments = _experiment_rows(str(snapshot["snapshot_id"]))
-    population = refresh_research_population(str(snapshot["snapshot_id"]))
-    clusters = refresh_research_clusters(str(snapshot["snapshot_id"]))
+    with _conn() as conn:
+        population_rows = [dict(row) for row in conn.execute(
+            """SELECT experiment_id,rank_no,role,fitness,evidence_json,updated_at
+               FROM factor_research_population WHERE snapshot_id=? ORDER BY rank_no""",
+            (str(snapshot["snapshot_id"]),),
+        ).fetchall()]
+        cluster_rows = [dict(row) for row in conn.execute(
+            """SELECT cluster_id,representative_experiment_id,member_count,
+                      factor_centroid_json,behavior_centroid_json,evidence_json,updated_at
+               FROM factor_research_clusters WHERE snapshot_id=?
+               ORDER BY updated_at DESC,representative_experiment_id""",
+            (str(snapshot["snapshot_id"]),),
+        ).fetchall()]
+    experiment_by_id = {str(item.get("experiment_id") or ""): item for item in experiments}
+    population = []
+    for row in population_rows:
+        evidence = _loads(row.pop("evidence_json", "{}"), {})
+        experiment = experiment_by_id.get(str(row.get("experiment_id") or "")) or {}
+        population.append({
+            "experiment_id": row.get("experiment_id"),
+            "rank": int(row.get("rank_no") or 0),
+            "role": row.get("role"),
+            "fitness": float(row.get("fitness") or 0.0),
+            "factor_weights": experiment.get("factor_weights") or {},
+            "generation": int(evidence.get("generation") or experiment.get("generation") or 0),
+            "research_stage": evidence.get("research_stage") or experiment.get("research_stage"),
+            "mutation_type": experiment.get("mutation_type"),
+            "parent_experiment_id": experiment.get("parent_experiment_id"),
+            "optimization_lane": str((evidence.get("research_spec") or {}).get("optimization_lane") or "factor"),
+            "metrics": (evidence.get("metrics") or {}).get("aggregate") or evidence.get("metrics") or {},
+            "updated_at": row.get("updated_at"),
+        })
+    clusters = []
+    for row in cluster_rows:
+        clusters.append({
+            "cluster_id": row.get("cluster_id"),
+            "representative_experiment_id": row.get("representative_experiment_id"),
+            "member_count": int(row.get("member_count") or 0),
+            "factor_centroid": _loads(row.get("factor_centroid_json"), {}),
+            "behavior_centroid": _loads(row.get("behavior_centroid_json"), {}),
+            "evidence": _loads(row.get("evidence_json"), {}),
+            "updated_at": row.get("updated_at"),
+        })
     quick_completed = sum(
         item["research_stage"] == "quick_screen" and item["status"] == "completed"
         for item in experiments

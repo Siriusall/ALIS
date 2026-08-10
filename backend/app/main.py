@@ -4,7 +4,7 @@ import sys
 import time
 from contextlib import asynccontextmanager
 
-from fastapi import Depends, FastAPI
+from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
@@ -258,12 +258,20 @@ async def lifespan(_: FastAPI):
             _background_runtime_lease.release()
 
 
-app = FastAPI(title=settings.app_name, lifespan=lifespan)
+app = FastAPI(
+    title=settings.app_name,
+    lifespan=lifespan,
+    openapi_url="/openapi.json" if settings.expose_openapi else None,
+    docs_url="/docs" if settings.expose_openapi else None,
+    redoc_url="/redoc" if settings.expose_openapi else None,
+)
 
 
 @app.get("/api/openapi.json", include_in_schema=False)
 def api_openapi() -> dict:
     """Serve the API catalog under the same /api prefix as browser requests."""
+    if not settings.expose_openapi:
+        raise HTTPException(status_code=404, detail="API catalog is disabled in this environment")
     return app.openapi()
 
 

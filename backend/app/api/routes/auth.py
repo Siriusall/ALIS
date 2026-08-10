@@ -79,6 +79,8 @@ def require_current_user(
 @router.post("/auth/register", response_model=TokenResponse)
 def register(body: UserRegister) -> TokenResponse:
     """注册新用户，成功后返回 token 与用户信息。"""
+    if not settings.allow_registration:
+        raise HTTPException(status_code=404, detail="当前运行环境已关闭公开注册")
     if get_user_by_username(body.username):
         raise HTTPException(status_code=400, detail="用户名已存在")
     user = create_user(body.username, hash_password(body.password))

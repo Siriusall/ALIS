@@ -78,7 +78,10 @@ def _call_deepseek_json_unlocked(*, system: str, user: str, purpose: str) -> tup
         user = user[:max_input_chars] + "\n[输入已按Token预算截断]"
     estimated_prompt = max(1,(len(system)+len(user)+3)//4)
     budget = llm_token_budget_status()
-    if not budget.get("ok"):
+    # Adapters may provide only the bounded budget fields. Treat that as a
+    # valid snapshot; only an explicit unavailable result without a remaining
+    # budget can block the provider call.
+    if "remaining_tokens" not in budget or (budget.get("ok") is False and "remaining_tokens" not in budget):
         raise RuntimeError("llm_token_budget_unavailable")
     per_request = int(budget["per_request_limit"])
     allowed = min(per_request, int(budget["remaining_tokens"])-estimated_prompt)

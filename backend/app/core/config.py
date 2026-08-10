@@ -20,10 +20,21 @@ class Settings(BaseModel):
         "yes",
         "on",
     }
+    allow_registration: bool = os.getenv(
+        "ALIS_ALLOW_REGISTRATION",
+        "false" if os.getenv("APP_ENV", "").strip().lower() in {"prod", "production"} else "true",
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    expose_openapi: bool = os.getenv(
+        "ALIS_EXPOSE_OPENAPI",
+        "false" if os.getenv("APP_ENV", "").strip().lower() in {"prod", "production"} else "true",
+    ).strip().lower() in {"1", "true", "yes", "on"}
     log_limit: int = 200
     jwt_secret: str = os.getenv("JWT_SECRET", "quant-dev-secret-change-before-production")
     jwt_algorithm: str = "HS256"
-    jwt_expire_minutes: int = 60 * 24 * 7  # 7 天
+    jwt_expire_minutes: int = int(os.getenv(
+        "JWT_EXPIRE_MINUTES",
+        "120" if os.getenv("APP_ENV", "").strip().lower() in {"prod", "production"} else str(60 * 24 * 7),
+    ))
     # 生产数据库必须使用 PostgreSQL；SQLite 不再作为默认回退。
     database_url: str = os.getenv(
         "DATABASE_URL", "postgresql://sirius@127.0.0.1:5432/alis_sim"

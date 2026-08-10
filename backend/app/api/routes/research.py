@@ -208,7 +208,7 @@ def research_contracts() -> dict[str, Any]:
 
 @router.get("/research/stocks/{ts_code}")
 def research_stock(ts_code: str) -> dict[str, Any]:
-    return build_stock_research(ts_code)
+    return build_stock_research(ts_code, persist=False)
 
 
 @router.get("/research/stocks/{ts_code}/console-evidence")
@@ -221,12 +221,12 @@ def research_console_stock_evidence(ts_code: str) -> dict[str, Any]:
 
 @router.get("/research/expectations/{ts_code}")
 def research_expectation(ts_code: str) -> dict[str, Any]:
-    return build_expectation_state(ts_code)
+    return build_expectation_state(ts_code, persist_baseline=False)
 
 
 @router.get("/research/valuations/{ts_code}")
 def research_valuation(ts_code: str) -> dict[str, Any]:
-    return build_valuation_state(ts_code)
+    return build_valuation_state(ts_code, persist=False)
 
 
 @router.post("/research/evaluate")
@@ -420,7 +420,7 @@ def research_pools(pool_type:str="")->dict[str,Any]: return {"ok":True,"items":l
 @router.get("/research/pools/eligibility/{ts_code}")
 def research_pool_eligibility(ts_code: str) -> dict[str, Any]:
     try:
-        return evaluate_core_pool_eligibility(ts_code)
+        return evaluate_core_pool_eligibility(ts_code, persist_research=False)
     except Exception as exc:  # noqa: BLE001 - read-only gate evidence must degrade safely
         return degraded_read("research_pool_eligibility", exc, ts_code=str(ts_code).strip().upper(), gates=[], eligible_for_core=None)
 

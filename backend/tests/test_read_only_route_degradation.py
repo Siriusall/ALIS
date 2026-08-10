@@ -1,0 +1,107 @@
+from app.api.routes import model_strategy, research
+
+
+def test_evidence_verification_degrades_on_database_failure(monkeypatch):
+    def fail(_snapshot_id):
+        raise TimeoutError("database connection timeout")
+
+    monkeypatch.setattr(research, "verify_decision_snapshot", fail)
+
+    result = research.research_evidence_verify(47)
+
+    assert result["ok"] is False
+    assert result["status"] == "degraded"
+    assert result["component"] == "decision_evidence_verification"
+    assert result["id"] == 47
+    assert result["verified"] is False
+    assert result["error"]["code"] == "database_query_timeout"
+
+
+def test_market_context_history_degrades_on_database_failure(monkeypatch):
+    def fail(*, limit):
+        raise ConnectionError("database connection refused")
+
+    monkeypatch.setattr(model_strategy, "market_context_history", fail)
+
+    result = model_strategy.model_strategy_market_context_history(120)
+
+    assert result["ok"] is False
+    assert result["status"] == "degraded"
+    assert result["component"] == "market_context_history"
+    assert result["items"] == []
+    assert result["transitions"] == []
+    assert result["count"] == 0
+    assert result["error"]["code"] == "database_unavailable"
+
+
+def test_research_data_assets_degrades_without_http_500(monkeypatch):
+    from app.services import research_data_assets
+
+    def fail():
+        raise RuntimeError("canceling statement due to statement timeout")
+
+    monkeypatch.setattr(research_data_assets, "audit_research_data_assets", fail)
+
+    result = model_strategy.model_strategy_research_data_assets()
+
+    assert result["ok"] is False
+    assert result["status"] == "degraded"
+    assert result["data_available"] is False
+    assert result["component"] == "research_data_assets"
+    assert result["error"]["code"] == "database_query_timeout"
+
+
+def test_research_get_routes_explicitly_disable_persistence(monkeypatch):
+    calls = {}
+    monkeypatch.setattr(
+        research,
+        "build_stock_research",
+        lambda code, **kwargs: calls.setdefault("stock", (code, kwargs)) or {},
+    )
+    monkeypatch.setattr(
+        research,
+        "build_expectation_state",
+        lambda code, **kwargs: calls.setdefault("expectation", (code, kwargs)) or {},
+    )
+    monkeypatch.setattr(
+        research,
+        "build_valuation_state",
+        lambda code, **kwargs: calls.setdefault("valuation", (code, kwargs)) or {},
+    )
+    monkeypatch.setattr(
+        research,
+        "evaluate_core_pool_eligibility",
+        lambda code, **kwargs: calls.setdefault("eligibility", (code, kwargs)) or {},
+    )
+
+    research.research_stock("000001.SZ")
+    research.research_expectation("000001.SZ")
+    research.research_valuation("000001.SZ")
+    research.research_pool_eligibility("000001.SZ")
+
+    assert calls["stock"][1] == {"persist": False}
+    assert calls["expectation"][1] == {"persist_baseline": False}
+    assert calls["valuation"][1] == {"persist": False}
+    assert calls["eligibility"][1] == {"persist_research": False}
+
+
+def test_model_status_get_routes_disable_governance_and_snapshot_writes(monkeypatch):
+    calls = {}
+    monkeypatch.setattr(
+        model_strategy,
+        "build_auto_optimization_status",
+        lambda **kwargs: calls.setdefault("optimizer", kwargs) or {},
+    )
+    monkeypatch.setattr(
+        model_strategy,
+        "live_market_context",
+        lambda **kwargs: calls.setdefault("market", kwargs) or {"ok": True},
+    )
+
+    model_strategy.model_strategy_auto_optimization()
+    model_strategy.model_strategy_live_market_context()
+
+    assert calls == {
+        "optimizer": {"apply_auto_reject": False},
+        "market": {"persist": False},
+    }

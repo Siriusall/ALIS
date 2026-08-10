@@ -3,8 +3,7 @@ from __future__ import annotations
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
-from app.api.state import add_log
-from app.db.store import add_account_balance, get_account_balance, get_positions, set_account_balance
+from app.db.store import get_account_balance, get_positions, set_account_balance
 from app.services.position_valuation import build_position_market_series_cache
 from app.services.quant_run_engine import list_consolidated_trade_dates
 
@@ -51,23 +50,14 @@ def get_account() -> AccountResponse:
 
 @router.post("/account/topup", response_model=AccountResponse)
 def top_up(body: TopUpRequest) -> AccountResponse:
-    """充值。"""
-    new_balance = add_account_balance(body.amount)
-    add_log("INFO", f"账户充值: +{body.amount}, 余额={new_balance}")
-    pv = round(_position_total_value(), 2)
-    return AccountResponse(balance=new_balance, position_value=pv, assets=round(new_balance + pv, 2))
+    """Retired: cash changes must be represented by an audited ledger adjustment."""
+    raise HTTPException(status_code=410, detail="直接充值已关闭，请使用受审计的账户调整流程")
 
 
 @router.post("/account/withdraw", response_model=AccountResponse)
 def withdraw(body: WithdrawRequest) -> AccountResponse:
-    """提现。余额不足时拒绝，不静默改成部分提现。"""
-    current = get_account_balance()
-    if body.amount > current:
-        raise HTTPException(status_code=400, detail=f"余额不足：当前余额 {current:.2f} 元")
-    new_balance = add_account_balance(-body.amount)
-    add_log("INFO", f"账户提现: -{body.amount}, 余额={new_balance}")
-    pv = round(_position_total_value(), 2)
-    return AccountResponse(balance=new_balance, position_value=pv, assets=round(new_balance + pv, 2))
+    """Retired: cash changes must be represented by an audited ledger adjustment."""
+    raise HTTPException(status_code=410, detail="直接提现已关闭，请使用受审计的账户调整流程")
 
 
 @router.put("/account", response_model=AccountResponse)

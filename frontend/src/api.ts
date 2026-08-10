@@ -5,8 +5,15 @@ const API_READ_TIMEOUT_MS = Number(import.meta.env.VITE_API_READ_TIMEOUT_MS || 6
 const TOKEN_KEY = "alis_access_token";
 let sessionProbe: Promise<void> | null = null;
 
-export function getToken() { return window.localStorage.getItem(TOKEN_KEY); }
-export function setToken(token: string | null) { if (token) window.localStorage.setItem(TOKEN_KEY, token); else window.localStorage.removeItem(TOKEN_KEY); }
+export function getToken() {
+  return window.sessionStorage.getItem(TOKEN_KEY);
+}
+export function setToken(token: string | null) {
+  if (token) window.sessionStorage.setItem(TOKEN_KEY, token);
+  else window.sessionStorage.removeItem(TOKEN_KEY);
+  // Remove tokens written by pre-session-storage builds.
+  window.localStorage.removeItem(TOKEN_KEY);
+}
 
 async function confirmSessionExpired(token: string | null) {
   if (!token || sessionProbe) return sessionProbe;

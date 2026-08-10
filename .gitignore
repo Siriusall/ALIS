@@ -20,7 +20,7 @@ Thumbs.db
 # Python
 __pycache__/
 *.py[cod]
-backend/tests/
+# Keep backend tests versioned. They are part of the release contract.
 .venv/
 venv/
 .pytest_cache/

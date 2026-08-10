@@ -1,0 +1,50 @@
+from app.services import decision_version_manifest
+
+
+def test_decision_manifest_is_stable_and_freezes_all_component_versions(monkeypatch):
+    monkeypatch.setattr(
+        decision_version_manifest,
+        "resolve_production_strategy_champion",
+        lambda: {"champion_id": 50, "champion_version": "champion-v1", "strategy_id": 1},
+    )
+    monkeypatch.setattr(
+        decision_version_manifest,
+        "active_strategy_policy_context",
+        lambda: {"strategy_policy_version_id": 2, "strategy_policy_version": "controller-v1"},
+    )
+    monkeypatch.setattr(
+        decision_version_manifest,
+        "get_active_model_version",
+        lambda key: {"id": len(key), "version": f"{key}-v1", "status": "active"},
+    )
+    monkeypatch.setattr(
+        decision_version_manifest,
+        "active_factor_bindings",
+        lambda: {"momentum_20": {"definition_id": 1, "version": "v1"}},
+    )
+    monkeypatch.setattr(
+        decision_version_manifest,
+        "active_execution_cost_contract",
+        lambda: {"version": "cost-v1", "round_trip_rate": 0.004},
+    )
+    portfolio = {
+        "optimizer": {
+            "selected_method": "hrp",
+            "method_competition": {"schema_version": "portfolio_method_competition_v1"},
+        },
+        "risk_budget": {"equity_budget": 0.8},
+    }
+    first = decision_version_manifest.build_decision_version_manifest(
+        trade_date="20260722", portfolio=portfolio
+    )
+    second = decision_version_manifest.build_decision_version_manifest(
+        trade_date="20260722", portfolio=portfolio
+    )
+
+    assert first == second
+    assert first["strategy"]["model_version_id"] == 50
+    assert first["strategy"]["version"] == "champion-v1"
+    assert first["portfolio"]["selected_method"] == "hrp"
+    assert first["execution_cost"]["version"] == "cost-v1"
+    assert len(first["model_versions"]) == 5
+    assert len(first["manifest_hash"]) == 64

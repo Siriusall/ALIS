@@ -590,7 +590,8 @@ def evolution_schedule_status() -> dict[str, Any]:
             "requires_market_close": False,
             "priority": 90,
         },
-        "next_shadow_cycle_at": _next_business_day_at(now, 16).isoformat() if AUTO_ENABLED else None,
+        "next_shadow_cycle_at": None,
+        "shadow_cycle_trigger": "decision_data_ready",
         "next_system_cycle_at": _next_business_day_at(now, 17).isoformat() if AUTO_ENABLED else None,
         "next_formal_cycle_at": _next_weekday_at(now, AUTO_WEEKDAY, AUTO_HOUR).isoformat() if AUTO_ENABLED else None,
     }
@@ -601,6 +602,7 @@ def enqueue_system_autonomy_recovery(
     data_contract: dict[str, Any],
     *,
     continuation_after: int | None = None,
+    experiment_ready: bool = False,
 ) -> dict[str, Any]:
     """Create one same-date catch-up cycle for each newly ready data contract.
 
@@ -615,6 +617,9 @@ def enqueue_system_autonomy_recovery(
         "counts": data_contract.get("counts") or {},
         "expected_rows": data_contract.get("expected_rows") or {},
         "coverage": data_contract.get("coverage") or {},
+        "recovery_scope": (
+            "decision_and_experiments" if experiment_ready else "production_decision"
+        ),
     }
     fingerprint = hashlib.sha256(
         json.dumps(fingerprint_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -635,6 +640,9 @@ def enqueue_system_autonomy_recovery(
             "trade_date": trade_date,
             "data_contract_fingerprint": fingerprint,
             "continuation_after_task_id": int(continuation_after or 0) or None,
+            "recovery_scope": (
+                "decision_and_experiments" if experiment_ready else "production_decision"
+            ),
         },
         priority=85,
     )
@@ -659,6 +667,10 @@ def ensure_latest_ready_system_cycle() -> dict[str, Any]:
             trade_date = str(readiness.get("target_trade_date") or recovered_trade_date)
     if not trade_date or not bool(health.get("decision_ready")):
         return {"ok": False, "reason": "decision_data_not_ready", "trade_date": trade_date}
+    experiments_required = bool(health.get("experiment_ready"))
+    required_recovery_scope = (
+        "decision_and_experiments" if experiments_required else "production_decision"
+    )
     tasks = [
             task for task in list_evolution_tasks(limit=200)
         if str(task.get("task_type") or "") == "system_autonomy_cycle"
@@ -689,11 +701,23 @@ def ensure_latest_ready_system_cycle() -> dict[str, Any]:
             continue
         result = task.get("result") if isinstance(task.get("result"), dict) else {}
         decision_ready_for_date = False
+        experiment_ready_for_date = False
+        hard_data_ready = False
+        model_autonomy_completed = False
+        strategy_shadow_completed = False
         plan_status = ""
         plan_is_unified_persisted = False
         for step in result.get("steps") or []:
-            if not isinstance(step, dict) or str(step.get("name") or "") != "decision_data_gate":
-                if isinstance(step, dict) and str(step.get("name") or "") == "profit_and_portfolio":
+            step_name = str(step.get("name") or "") if isinstance(step, dict) else ""
+            if step_name != "decision_data_gate":
+                if step_name == "hard_data_gate":
+                    hard_result = step.get("result") if isinstance(step.get("result"), dict) else {}
+                    hard_data_ready = bool(step.get("ok")) and str(hard_result.get("status") or "") == "ready"
+                elif step_name == "plan_model_autonomy":
+                    model_autonomy_completed = bool(step.get("ok"))
+                elif step_name == "strategy_shadow_recovery":
+                    strategy_shadow_completed = bool(step.get("ok"))
+                elif step_name == "profit_and_portfolio":
                     profit = step.get("result") if isinstance(step.get("result"), dict) else {}
                     plan = profit.get("rebalance_plan") if isinstance(profit.get("rebalance_plan"), dict) else {}
                     plan_status = str(plan.get("status") or "")
@@ -705,14 +729,30 @@ def ensure_latest_ready_system_cycle() -> dict[str, Any]:
             gate = step.get("result") if isinstance(step.get("result"), dict) else {}
             gate_readiness = gate.get("readiness") if isinstance(gate.get("readiness"), dict) else {}
             decision_ready_for_date = bool(gate.get("decision_ready")) and str(gate_readiness.get("target_trade_date") or "") == trade_date
-        if decision_ready_for_date and plan_is_unified_persisted and plan_status != "compatibility_preview_only":
+            experiment_ready_for_date = bool(gate.get("experiment_ready"))
+        production_completed = (
+            decision_ready_for_date
+            and plan_is_unified_persisted
+            and plan_status != "compatibility_preview_only"
+        )
+        experiments_completed = (
+            experiment_ready_for_date
+            and hard_data_ready
+            and model_autonomy_completed
+            and strategy_shadow_completed
+        )
+        if production_completed and (not experiments_required or experiments_completed):
             return {"ok": True, "status": "already_completed", "trade_date": trade_date, "task_id": task.get("id")}
         if decision_ready_for_date:
             latest_incomplete_task_id = max(
                 latest_incomplete_task_id,
                 int(task.get("id") or 0),
             )
-            if int((task.get("payload") or {}).get("continuation_after_task_id") or 0) > 0:
+            task_scope = str((task.get("payload") or {}).get("recovery_scope") or "production_decision")
+            if (
+                task_scope == required_recovery_scope
+                and int((task.get("payload") or {}).get("continuation_after_task_id") or 0) > 0
+            ):
                 continuation_count += 1
     if continuation_count >= SYSTEM_AUTONOMY_MAX_RECOVERY_CONTINUATIONS:
         return {
@@ -730,6 +770,7 @@ def ensure_latest_ready_system_cycle() -> dict[str, Any]:
         trade_date,
         contract,
         continuation_after=latest_incomplete_task_id or None,
+        experiment_ready=experiments_required,
     )
 
 
@@ -2637,13 +2678,23 @@ def _finish_failure(task: dict[str, Any], exc: Exception) -> None:
         return
     attempt = int(task.get("attempt") or 1)
     maximum = int(task.get("max_attempts") or 3)
-    if attempt < maximum:
+    from app.services.plan_model_control import classify_plan_model_training_failure
+
+    classification = classify_plan_model_training_failure(exc)
+    retryable = bool(classification.get("retryable"))
+    failure_result = {
+        "schema_version": "alis_evolution_failure_classification_v1",
+        "classification": classification,
+        "task_type": str(task.get("task_type") or ""),
+    }
+    if retryable and attempt < maximum:
         delay = min(900, 30 * (2 ** max(0, attempt - 1)))
         _update_active_task(
             task_id, statuses=("running",), require_not_stopped=True,
             expected_lease_owner=WORKER_ID,
             status="retry_wait", phase="retry_wait",
             message=f"执行失败，{delay} 秒后自动重试", error=str(exc)[:2000],
+            result=failure_result,
             next_run_at=(_now() + timedelta(seconds=delay)).isoformat(),
             lease_owner=None, lease_expires_at=None,
         )
@@ -2652,7 +2703,11 @@ def _finish_failure(task: dict[str, Any], exc: Exception) -> None:
             task_id, statuses=("running",), require_not_stopped=True,
             expected_lease_owner=WORKER_ID,
             status="failed", phase="failed", progress=1.0,
-            message="超过自动重试次数", error=str(exc)[:2000],
+            message=(
+                "超过自动重试次数"
+                if retryable else "确定性或未知故障已停止重试，等待所有者异常复核"
+            ),
+            error=str(exc)[:2000], result=failure_result,
             lease_owner=None, lease_expires_at=None, finished_at=_now().isoformat(),
         )
 
@@ -2879,12 +2934,6 @@ def start_evolution_scheduler() -> bool:
                         dedupe_key=f"factor_daily_cycle:{now.date().isoformat()}",
                         payload={"trigger": "daily_scheduler"},
                         priority=20,
-                    )
-                    create_evolution_task(
-                        task_type="strategy_shadow_cycle",
-                        dedupe_key=f"strategy_shadow_cycle:{now.date().isoformat()}",
-                        payload={"max_new_sessions": 5, "trigger": "daily_scheduler"},
-                        priority=50,
                     )
                 if _is_scheduled_trade_day(now) and now.hour >= 17:
                     create_evolution_task(
