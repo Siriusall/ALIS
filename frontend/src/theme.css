@@ -1925,6 +1925,9 @@ main {
 }
 
 .research-tabs {
+  width: max-content;
+  max-width: 100%;
+  align-items: center;
   gap: 4px;
   padding: 4px;
   border: 1px solid var(--line);
@@ -1933,8 +1936,13 @@ main {
 }
 
 .research-tabs button {
+  flex: 0 0 auto;
+  height: 40px;
+  padding: 0 16px;
   border-radius: 6px;
   color: #737d8d;
+  font-size: 13px;
+  font-weight: 600;
 }
 
 .research-tabs button:hover { color: #5137c8; }
