@@ -21,6 +21,7 @@ export function Status({ children, tone }: { children: ReactNode; tone?: Tone })
   const labels: Record<string, string> = {
     ok: "正常", ready: "就绪", healthy: "健康", normal: "正常", running: "运行中",
     waiting: "等待", queued: "排队", pending: "等待", observing: "观察中", idle: "空闲",
+    waiting_schedule: "等待收盘调度", recovery_pending: "等待安全恢复",
     paused: "已暂停", degraded: "降级", partial: "部分可用", blocked: "阻断",
     failed: "失败", complete: "完整", completed: "完成", passed: "通过", verified: "已验证",
     available: "可用", unavailable: "不可用", distilled: "已蒸馏", eligible: "符合资格",
