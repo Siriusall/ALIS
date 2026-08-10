@@ -68,13 +68,13 @@ def test_scheduler_retries_an_overdue_trade_date_on_weekend() -> None:
     )
 
 
-def test_scheduler_does_not_pull_current_trade_date_before_close() -> None:
+def test_scheduler_starts_lightweight_discovery_immediately_after_close() -> None:
     assert not daily_update._scheduler_should_check(
-        datetime(2026, 7, 29, 15, 59, 0),
+        datetime(2026, 7, 29, 15, 0, 0),
         "20260729",
     )
     assert daily_update._scheduler_should_check(
-        datetime(2026, 7, 29, 16, 5, 0),
+        datetime(2026, 7, 29, 15, 1, 0),
         "20260729",
     )
 

@@ -165,17 +165,31 @@ class PlanningAndBundleCorrectnessTest(unittest.TestCase):
         sync.assert_called_once_with("daily_basic", {"trade_date": "20260710"})
 
     @patch("app.data_platform.services.data_center.build_stock_daily_snapshot", return_value={"ok": True})
+    @patch("app.data_platform.services.data_center._decision_core_ready", side_effect=[
+        (False, {"snapshot": {"ok": False}, "decision_contract": {
+            "ok": False, "missing_apis": ["daily", "daily_basic", "stk_limit"], "incomplete_apis": [],
+        }}),
+        (True, {"snapshot": {"ok": True}, "decision_contract": {"ok": True}}),
+    ])
+    @patch(
+        "app.data_platform.services.market_data_discovery.discover_market_core",
+        return_value={
+            "ok": True,
+            "winners": {"daily": "tushare", "daily_basic": "tushare", "stk_limit": "tushare"},
+        },
+    )
     @patch("app.data_platform.services.data_center.sync_complete_stk_limit_slice", return_value={"ok": True, "api": "stk_limit"})
     @patch("app.data_platform.services.data_center._safe_sync_raw", return_value={"ok": True})
-    def test_market_bundle_checks_trading_constraints_and_moneyflow_by_default(self, sync, _stk_limit, _snapshot) -> None:
+    def test_market_bundle_checks_trading_constraints_and_moneyflow_by_default(
+        self, sync, _stk_limit, _discovery, _core_ready, _snapshot,
+    ) -> None:
         result = sync_market_bundle("20260710")
         self.assertTrue(result["ok"])
         self.assertIn("adj_factor", result["apis"])
         self.assertIn("suspend_d", result["apis"])
         self.assertIn("moneyflow", result["apis"])
-        sync.assert_any_call("adj_factor", {"trade_date": "20260710"})
-        sync.assert_any_call("suspend_d", {"trade_date": "20260710"})
-        sync.assert_any_call("moneyflow", {"trade_date": "20260710"})
+        sync.assert_any_call("daily", {"trade_date": "20260710"})
+        sync.assert_any_call("daily_basic", {"trade_date": "20260710"})
 
     @patch("app.data_platform.services.data_center.build_stock_daily_snapshot", return_value={"ok": True})
     @patch("app.data_platform.services.data_center._safe_sync_raw", return_value={"ok": True})

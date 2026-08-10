@@ -40,6 +40,17 @@ CREATE TABLE data_sources (
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
+CREATE TABLE dc_market_provider_probe (
+            dataset TEXT NOT NULL,
+            trade_date TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            status TEXT NOT NULL,
+            probed_at TEXT NOT NULL,
+            next_probe_at TEXT NOT NULL,
+            latency_ms INTEGER NOT NULL DEFAULT 0,
+            evidence_json TEXT NOT NULL DEFAULT '{}',
+            PRIMARY KEY (dataset, trade_date, provider)
+        );
 CREATE TABLE dc_announcement_event (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             announcement_id INTEGER NOT NULL,

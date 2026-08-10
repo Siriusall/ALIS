@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import Any
 
@@ -185,7 +186,11 @@ def fetch_sina_hs300_bar(trade_date: str) -> dict[str, Any] | None:
     }
 
 
-def repair_hs300_index_daily_from_eastmoney(trade_date: str) -> dict[str, Any]:
+def repair_hs300_index_daily_from_eastmoney(
+    trade_date: str,
+    *,
+    provider: str = "",
+) -> dict[str, Any]:
     """Fill one verified exact-session gap without replacing primary data."""
     target = str(trade_date or "").replace("-", "")[:8]
     if len(target) != 8 or not target.isdigit():
@@ -198,7 +203,7 @@ def repair_hs300_index_daily_from_eastmoney(trade_date: str) -> dict[str, Any]:
         ).fetchone()
         prior = conn.execute(
             """SELECT trade_date,payload_json FROM dc_tushare_raw_records
-               WHERE api_name='index_daily' AND ts_code=? AND trade_date<? AND source_code='tushare'
+               WHERE api_name='index_daily' AND ts_code=? AND trade_date<?
                ORDER BY trade_date DESC LIMIT 1""",
             (BENCHMARK_CODE, target),
         ).fetchone()
@@ -214,15 +219,39 @@ def repair_hs300_index_daily_from_eastmoney(trade_date: str) -> dict[str, Any]:
         prior_close = 0
     provider_errors: list[str] = []
     bar: dict[str, Any] | None = None
+    providers = {
+        "eastmoney": fetch_eastmoney_hs300_bar,
+        "sina": fetch_sina_hs300_bar,
+    }
+    provider_alias = {
+        SOURCE_EASTMONEY_INDEX: "eastmoney",
+        SOURCE_SINA_INDEX: "sina",
+        "eastmoney": "eastmoney",
+        "sina": "sina",
+    }
+    if provider:
+        selected = provider_alias.get(provider)
+        if not selected:
+            return {"ok": False, "status": "unknown_provider", "rows_written": 0}
+        providers = {selected: providers[selected]}
+    executor = ThreadPoolExecutor(max_workers=len(providers), thread_name_prefix="hs300-provider")
+    futures = {executor.submit(fetcher, target): name for name, fetcher in providers.items()}
     try:
-        bar = fetch_eastmoney_hs300_bar(target)
-    except requests.RequestException as exc:
-        provider_errors.append(f"eastmoney:{type(exc).__name__}")
-    if bar is None:
-        try:
-            bar = fetch_sina_hs300_bar(target)
-        except requests.RequestException as exc:
-            provider_errors.append(f"sina:{type(exc).__name__}")
+        for future in as_completed(futures):
+            name = futures[future]
+            try:
+                candidate = future.result()
+            except requests.RequestException as exc:
+                provider_errors.append(f"{name}:{type(exc).__name__}")
+                continue
+            if candidate is not None:
+                bar = candidate
+                for pending in futures:
+                    if pending is not future:
+                        pending.cancel()
+                break
+    finally:
+        executor.shutdown(wait=bar is None)
     if bar is None:
         return {"ok": False, "status": "fallback_not_published", "rows_written": 0,
                 "provider_errors": provider_errors}

@@ -863,7 +863,7 @@ class BacktestDataSource:
                     raw = conn.execute(sql, params).fetchone()
                 if raw:
                     item = dict(raw)
-                    self._record_pit_read("tushare.index_daily", [item])
+                    self._record_pit_read("canonical_market.index_daily", [item])
                     payload = json.loads(str(item.get("payload_json") or "{}"))
                     value = float(payload.get(field) or 0)
                     return value if value > 0 else None
@@ -903,7 +903,7 @@ class BacktestDataSource:
         try:
             with _conn() as conn:
                 raw_rows = [dict(row) for row in conn.execute(sql, params).fetchall()]
-            self._record_pit_read("tushare.index_daily_trend", raw_rows)
+            self._record_pit_read("canonical_market.index_daily_trend", raw_rows)
             closes = [
                 float(json.loads(str(row.get("payload_json") or "{}")).get("close") or 0)
                 for row in reversed(raw_rows)

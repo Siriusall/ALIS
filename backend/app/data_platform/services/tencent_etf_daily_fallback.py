@@ -1,10 +1,10 @@
 """Audited Tencent quote fallback for required defensive ETF daily bars.
 
 The fallback is deliberately narrow: it may only fill an exact-date missing
-``fund_daily`` record for the registered defensive ETF universe.  Same-day
-TuShare overlap validates the Tencent field mapping, and every missing symbol
-must also match its latest preceding TuShare close.  Existing rows are never
-updated.
+``fund_daily`` record for the registered defensive ETF universe. Same-day
+TuShare overlap is used when available but is no longer a prerequisite; every
+missing symbol must independently match the latest preceding canonical close.
+Existing rows are never updated.
 """
 
 from __future__ import annotations
@@ -82,7 +82,7 @@ def _parse_quotes(text: str, trade_date: str) -> dict[str, dict[str, Any]]:
         stamp = str(fields[30] or "").strip()
         if len(code) != 6 or len(target) != 8 or not stamp.startswith(target):
             continue
-        exchange = "SH" if fields[0] == "1" else "SZ" if fields[0] == "0" else ""
+        exchange = "SH" if fields[0] == "1" else "SZ" if fields[0] in {"0", "51"} else ""
         if not exchange:
             continue
         try:
@@ -174,7 +174,7 @@ def _previous_tushare_closes(c: Any, trade_date: str, codes: list[str]) -> dict[
     for code in codes:
         row = c.execute(
             """SELECT payload_json FROM dc_tushare_raw_records
-               WHERE api_name='fund_daily' AND ts_code=? AND trade_date<? AND source_code='tushare'
+               WHERE api_name='fund_daily' AND ts_code=? AND trade_date<?
                ORDER BY trade_date DESC LIMIT 1""",
             (code, trade_date),
         ).fetchone()
@@ -236,17 +236,9 @@ def repair_fund_daily_from_tencent(trade_date: str, ts_codes: Iterable[str]) -> 
         previous_closes = _previous_tushare_closes(c, target, missing)
     if not missing:
         return {"ok": True, "status": "nothing_missing", "rows_written": 0, "missing": []}
-    if len(references) < MIN_SAME_DAY_REFERENCE:
-        return {
-            "ok": False,
-            "status": "insufficient_same_day_reference",
-            "reference_count": len(references),
-            "rows_written": 0,
-            "missing": missing,
-        }
     quotes = fetch_tencent_etf_quotes(reference_universe, target)
     compared, mismatches = _same_day_mismatches(references, quotes)
-    if compared < MIN_SAME_DAY_REFERENCE or mismatches:
+    if references and (compared < MIN_SAME_DAY_REFERENCE or mismatches):
         return {
             "ok": False,
             "status": "same_day_cross_check_failed",
@@ -281,7 +273,11 @@ def repair_fund_daily_from_tencent(trade_date: str, ts_codes: Iterable[str]) -> 
         for code in missing:
             payload = dict(quotes[code])
             payload.update({
-                "verification_status": "same_day_and_previous_close_cross_checked",
+                "verification_status": (
+                    "same_day_and_previous_close_cross_checked"
+                    if compared >= MIN_SAME_DAY_REFERENCE
+                    else "provider_contract_and_previous_close_cross_checked"
+                ),
                 "same_day_reference_count": compared,
                 "previous_tushare_close": previous_closes[code],
                 "field_contract_version": "alis_tencent_defensive_etf_daily_fallback_v1",

@@ -32,8 +32,8 @@ _scheduler_started = False
 _DAILY_UPDATE_ENABLED = str(os.getenv("ALIS_DAILY_UPDATE_ENABLED", "1")).strip().lower() in {"1", "true", "yes", "on"}
 _DAILY_UPDATE_INTERVAL_SEC = max(60, min(int(os.getenv("ALIS_DAILY_UPDATE_INTERVAL_SEC", "60")), 3600))
 _DAILY_UPDATE_START_TIME = dtime(
-    max(0, min(int(os.getenv("ALIS_DAILY_UPDATE_HOUR", "16")), 23)),
-    max(0, min(int(os.getenv("ALIS_DAILY_UPDATE_MINUTE", "5")), 59)),
+    max(0, min(int(os.getenv("ALIS_DAILY_UPDATE_HOUR", "15")), 23)),
+    max(0, min(int(os.getenv("ALIS_DAILY_UPDATE_MINUTE", "1")), 59)),
 )
 _DAILY_UPDATE_INTERNAL_FAULT_COOLDOWN_SEC = max(
     300,
@@ -77,6 +77,15 @@ def _benchmark_ready_for_date(c: Any, trade_date: str) -> bool:
         (str(trade_date or "").replace("-", "")[:8],),
     ).fetchone()
     return bool(row)
+
+
+def _adj_factor_ready_for_date(c: Any, trade_date: str) -> bool:
+    row = c.execute(
+        """SELECT MAX(rows_read) AS rows_read FROM dc_tushare_request_coverage
+           WHERE api_name='adj_factor' AND trade_date=? AND result_status='success'""",
+        (str(trade_date or "").replace("-", "")[:8],),
+    ).fetchone()
+    return int((dict(row) if row else {}).get("rows_read") or 0) >= 500
 
 
 def _set_state(**values: Any) -> None:
@@ -162,7 +171,18 @@ def _worker(parent_run_id: int) -> None:
         trade_date = _latest_trade_date()
 
         _set_state(phase="market", message=f"正在更新 {trade_date} 行情和估值", progress=50, trade_date=trade_date)
-        market_result = sync_market_bundle(trade_date)
+        with _conn() as c:
+            already_ready_date = _latest_decision_ready_trade_date(c)
+        market_result = (
+            {
+                "ok": True,
+                "status": "canonical_slice_already_ready",
+                "trade_date": trade_date,
+                "policy": "skip_redundant_bulk_after_probe_discovery",
+            }
+            if already_ready_date == trade_date
+            else sync_market_bundle(trade_date)
+        )
         steps.append({"step": "market", "result": market_result})
         with _conn() as c:
             ready_date = _latest_decision_ready_trade_date(c)
@@ -186,10 +206,36 @@ def _worker(parent_run_id: int) -> None:
                     category="waiting_stk_limit_gap_repair",
                     retry_after_seconds=600,
                 )
+            if market_category == "upstream_not_published":
+                raise DailyUpdateDataBlocked(
+                    f"{trade_date} 各行情源探针均尚未发现完整收盘切片",
+                    category="upstream_not_ready",
+                    retry_after_seconds=60,
+                )
+            if market_category == "bulk_slice_contract_failed":
+                raise DailyUpdateDataBlocked(
+                    f"{trade_date} 首个已发布源的全量切片未通过合同，下一轮改选其他已发布源",
+                    category="provider_bulk_contract_failed",
+                    retry_after_seconds=60,
+                )
             raise DailyUpdateDataBlocked(
                 f"上游尚未发布 {trade_date} 完整收盘数据，自动日更将在冷却后复核",
                 category="upstream_not_ready",
                 retry_after_seconds=600,
+            )
+
+        with _conn() as c:
+            adj_factor_ready = _adj_factor_ready_for_date(c, trade_date)
+        if not adj_factor_ready:
+            adj_result = sync_market_bundle(trade_date, apis=["adj_factor"])
+            steps.append({"step": "adj_factor", "result": adj_result})
+            from app.data_platform.services.market_data_discovery import mark_provider_bulk_result
+            mark_provider_bulk_result(
+                "adj_factor",
+                trade_date,
+                "tushare",
+                ok=bool(adj_result.get("ok")),
+                evidence={"status": adj_result.get("failure_category") or "completed"},
             )
 
         # The benchmark is not part of the stock decision completeness gate,
@@ -208,14 +254,56 @@ def _worker(parent_run_id: int) -> None:
 
         _set_state(phase="etf_daily", message=f"正在按交易日更新 {trade_date} ETF 日线", progress=68)
         try:
-            etf_daily = backfill_etf_daily_incremental(
-                start_date=trade_date,
-                end_date=trade_date,
-                cursor="",
-                limit_dates=1,
-                nav_limit_funds=0,
+            from app.data_platform.services.tencent_etf_daily_fallback import repair_fund_daily_from_tencent
+            from app.data_platform.services.market_data_discovery import (
+                discover_first_published,
+                mark_provider_bulk_result,
             )
-            steps.append({"step": "etf_daily", "result": etf_daily})
+            from app.services.defensive_assets import DEFENSIVE_ASSETS
+
+            defensive_codes = sorted(str(item["ts_code"]) for item in DEFENSIVE_ASSETS)
+            etf_discovery = discover_first_published("defensive_fund_daily", trade_date)
+            winner = str(etf_discovery.get("winner") or "")
+            if winner == "tushare":
+                provider_result = backfill_etf_daily_incremental(
+                    start_date=trade_date,
+                    end_date=trade_date,
+                    cursor="",
+                    limit_dates=1,
+                    nav_limit_funds=0,
+                )
+            elif winner == "tencent_etf_quote":
+                provider_result = repair_fund_daily_from_tencent(trade_date, defensive_codes)
+            else:
+                provider_result = {"ok": False, "status": "no_provider_published"}
+            with _conn() as conn:
+                placeholders = ",".join("?" for _ in defensive_codes)
+                row = conn.execute(
+                    f"""SELECT COUNT(DISTINCT ts_code) AS count
+                        FROM dc_tushare_raw_records
+                        WHERE api_name='fund_daily' AND trade_date=?
+                          AND ts_code IN ({placeholders})""",
+                    (trade_date, *defensive_codes),
+                ).fetchone()
+            slice_rows = int((dict(row) if row else {}).get("count") or 0)
+            slice_ready = slice_rows == len(defensive_codes)
+            if winner:
+                mark_provider_bulk_result(
+                    "defensive_fund_daily",
+                    trade_date,
+                    winner,
+                    ok=slice_ready,
+                    evidence={"status": provider_result.get("status"), "rows": slice_rows},
+                )
+            steps.append({"step": "etf_daily", "result": {
+                "ok": slice_ready,
+                "provider_discovery_contract": "alis_market_publication_probe_v1",
+                "winner": winner,
+                "discovery": etf_discovery,
+                "provider_result": provider_result,
+                "slice_rows": slice_rows,
+                "required_rows": len(defensive_codes),
+            }})
         except Exception as exc:  # noqa: BLE001
             logger.warning("daily ETF market update deferred: %s", str(exc)[:300])
             steps.append({"step": "etf_daily", "result": error_evidence(
@@ -364,18 +452,45 @@ def start_daily_update_scheduler() -> bool:
                     if should_check:
                         ready = _latest_decision_ready_trade_date(c)
                         benchmark_ready = _benchmark_ready_for_date(c, target)
+                        adj_factor_ready = _adj_factor_ready_for_date(c, target)
                         retry_policy = _daily_update_retry_policy(c, target, now=now)
                     else:
                         ready = ""
                         benchmark_ready = False
+                        adj_factor_ready = False
                         retry_policy = {"allowed": False, "reason": "before_close_data_window"}
                 if should_check:
-                    if target and (ready != target or not benchmark_ready) and retry_policy.get("allowed"):
-                        result = start_daily_update()
-                        if result.get("ok"):
-                            logger.info("自动收盘日更已启动 target=%s previous_ready=%s", target, ready)
-                        elif result.get("reason") != "already_running":
-                            logger.warning("自动收盘日更启动失败 target=%s result=%s", target, result)
+                    if target and (ready != target or not benchmark_ready or not adj_factor_ready) and retry_policy.get("allowed"):
+                        from app.data_platform.services.market_data_discovery import (
+                            discover_first_published,
+                            discover_market_core,
+                        )
+
+                        if ready != target:
+                            discovery = discover_market_core(target)
+                        elif not benchmark_ready:
+                            discovery = discover_first_published("index_daily", target)
+                        else:
+                            discovery = discover_first_published("adj_factor", target)
+                        if discovery.get("ok"):
+                            result = start_daily_update()
+                            if result.get("ok"):
+                                logger.info(
+                                    "自动收盘日更发现已发布源并启动全量 target=%s previous_ready=%s discovery=%s",
+                                    target,
+                                    ready,
+                                    discovery.get("winners") or discovery.get("winner"),
+                                )
+                            elif result.get("reason") != "already_running":
+                                logger.warning("自动收盘日更启动失败 target=%s result=%s", target, result)
+                        else:
+                            _set_state(
+                                running=False,
+                                phase="discovering",
+                                message=f"正在探测 {target} 各行情源发布时间",
+                                trade_date=target,
+                                discovery=discovery,
+                            )
                     elif target and ready != target and retry_policy.get("reason") == "data_refresh_cooldown":
                         _set_state(
                             running=False,
@@ -408,6 +523,18 @@ def daily_update_status() -> dict[str, Any]:
         with _conn() as c:
             state["latest_usable_snapshot_date"] = _latest_usable_snapshot_date(c)
             state["latest_decision_ready_trade_date"] = _latest_decision_ready_trade_date(c)
+            target = target_trade_date(c)
+            probe_rows = c.execute(
+                """SELECT dataset,provider,status,probed_at,next_probe_at,latency_ms
+                   FROM dc_market_provider_probe WHERE trade_date=?
+                   ORDER BY dataset,probed_at,latency_ms""",
+                (target,),
+            ).fetchall()
+            state["provider_discovery"] = {
+                "trade_date": target,
+                "items": [dict(row) for row in probe_rows],
+                "policy": "probe_all_due_sources_then_bulk_fetch_first_publisher_only",
+            }
     except Exception as exc:  # noqa: BLE001
         state["status_error"] = str(exc)[:200]
     return state

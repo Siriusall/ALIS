@@ -1176,6 +1176,57 @@ def _upsert_raw_records(api_name: str, df: pd.DataFrame) -> int:
                         "reconciled_fallback_source": previous_source,
                         "reconciled_at": now,
                     })
+            elif api_name in {"daily", "daily_basic", "stk_limit"}:
+                previous = c.execute(
+                    """SELECT source_code,payload_json FROM dc_tushare_raw_records
+                       WHERE api_name=? AND record_key=? LIMIT 1""",
+                    (api_name, record_key),
+                ).fetchone()
+                previous_item = dict(previous) if previous else {}
+                previous_source = str(previous_item.get("source_code") or "")
+                if previous_source == "tencent_market_snapshot":
+                    try:
+                        previous_payload = json.loads(previous_item.get("payload_json") or "{}")
+                    except (TypeError, json.JSONDecodeError):
+                        previous_payload = {}
+                    tolerances = {
+                        "daily": {"open": 0.021, "high": 0.021, "low": 0.021, "close": 0.021, "pre_close": 0.021},
+                        "daily_basic": {"turnover_rate": 0.051, "volume_ratio": 0.051, "pe_ttm": 0.101, "pb": 0.051},
+                        "stk_limit": {"up_limit": 0.011, "down_limit": 0.011},
+                    }[api_name]
+                    mismatches = []
+                    for field, tolerance in tolerances.items():
+                        left, right = payload.get(field), previous_payload.get(field)
+                        if left is None or right is None:
+                            continue
+                        try:
+                            if abs(float(left) - float(right)) > tolerance:
+                                mismatches.append(field)
+                        except (TypeError, ValueError):
+                            mismatches.append(field)
+                    status = "conflict_primary_selected" if mismatches else "matched_primary"
+                    payload.update({
+                        "pending_primary_reconciliation": False,
+                        "fallback_reconciliation_status": status,
+                        "reconciled_fallback_source": previous_source,
+                        "reconciled_at": now,
+                    })
+                    if mismatches:
+                        c.execute(
+                            """INSERT INTO dc_data_quality_checks
+                               (check_name,scope,status,severity,message,affected_count,checked_at,meta_json)
+                               VALUES(?,?,?,?,?,?,?,?)""",
+                            (
+                                "market_provider_reconciliation",
+                                f"{api_name}:{ts_code}:{trade_date}",
+                                "warning",
+                                "medium",
+                                "腾讯先到切片与后到 TuShare 主源存在字段差异，已保留冲突证据并采用主源修订",
+                                1,
+                                now,
+                                _strict_json({"fallback_source": previous_source, "mismatched_fields": mismatches}),
+                            ),
+                        )
             if api_name == "stk_holdernumber":
                 end_date = str(payload.get("end_date") or "")
                 holder_num = payload.get("holder_num")
@@ -1704,8 +1755,8 @@ def sync_complete_stk_limit_slice(trade_date: str) -> dict[str, Any]:
     }
 
 
-def sync_market_bundle(trade_date: str, *, include_suspend: bool = False, apis: list[str] | None = None) -> dict[str, Any]:
-    """Sync daily market/valuation/trading-status bundle for one trade date."""
+def _sync_tushare_market_bundle(trade_date: str, *, include_suspend: bool = False, apis: list[str] | None = None) -> dict[str, Any]:
+    """Run the TuShare provider without controlling provider selection."""
 
     # Suspension/resumption and money flow are core daily inputs, not optional
     # enrichments. Include both in every normal market update so an empty
@@ -1731,6 +1782,7 @@ def sync_market_bundle(trade_date: str, *, include_suspend: bool = False, apis: 
     failure_categories = [str(item.get("category") or "") for item in results if not item.get("ok")]
     return {
         "ok": all(bool(x.get("ok")) for x in results),
+        "provider": SOURCE_TUSHARE,
         "trade_date": trade_date,
         "apis": requested_apis,
         "results": results,
@@ -1740,6 +1792,120 @@ def sync_market_bundle(trade_date: str, *, include_suspend: bool = False, apis: 
             if "pagination_truncated" in failure_categories
             else ("truncated" if "truncated" in failure_categories else (failure_categories[0] if failure_categories else ""))
         ),
+    }
+
+
+def _decision_core_ready(trade_date: str) -> tuple[bool, dict[str, Any]]:
+    from app.data_platform.services.decision_data_contract import decision_data_contract
+
+    snapshot = build_stock_daily_snapshot(trade_date)
+    with _conn() as conn:
+        contract = decision_data_contract(trade_date, conn=conn)
+    return bool(contract.get("ok")), {"snapshot": snapshot, "decision_contract": contract}
+
+
+def sync_market_bundle(trade_date: str, *, include_suspend: bool = False, apis: list[str] | None = None) -> dict[str, Any]:
+    """Probe providers first, then bulk-fetch only from each first publisher."""
+    if apis is not None:
+        return _sync_tushare_market_bundle(trade_date, include_suspend=include_suspend, apis=apis)
+
+    from app.data_platform.services.market_data_discovery import (
+        discover_market_core,
+        mark_provider_bulk_result,
+    )
+    from app.data_platform.services.tencent_market_snapshot import sync_tencent_market_bundle
+
+    default_apis = ["daily", "daily_basic", "stk_limit", "adj_factor", "suspend_d", "moneyflow", "moneyflow_hsgt"]
+    existing_ready, existing_evidence = _decision_core_ready(trade_date)
+    if existing_ready:
+        return {
+            "ok": True,
+            "trade_date": trade_date,
+            "apis": default_apis,
+            "status": "canonical_slice_already_ready",
+            "snapshot": existing_evidence["snapshot"],
+            "decision_contract": existing_evidence["decision_contract"],
+            "policy": "skip_probe_and_bulk_for_complete_canonical_slice",
+        }
+    existing_contract = dict(existing_evidence.get("decision_contract") or {})
+    needed_apis = sorted(set(existing_contract.get("missing_apis") or ()) | set(existing_contract.get("incomplete_apis") or ()))
+    discovery = discover_market_core(trade_date, needed_apis or None)
+    if not discovery.get("ok"):
+        core_ready, evidence = _decision_core_ready(trade_date)
+        return {
+            "ok": core_ready,
+            "trade_date": trade_date,
+            "apis": default_apis,
+            "provider_discovery_contract": "alis_market_publication_probe_v1",
+            "discovery": discovery,
+            "snapshot": evidence["snapshot"],
+            "decision_contract": evidence["decision_contract"],
+            "failure_category": "upstream_not_published" if not core_ready else "",
+            "policy": "probe_all_due_sources_then_bulk_fetch_first_publisher_only",
+        }
+
+    winners = dict(discovery.get("winners") or {})
+    tencent_apis = sorted(api for api, provider in winners.items() if provider == "tencent_market_snapshot")
+    jobs: list[tuple[str, list[str], Callable[[], dict[str, Any]]]] = []
+    if tencent_apis:
+        jobs.append((
+            "tencent_market_snapshot",
+            tencent_apis,
+            lambda: sync_tencent_market_bundle(trade_date, tencent_apis),
+        ))
+    for api, provider in winners.items():
+        if provider != SOURCE_TUSHARE:
+            continue
+        if api == "stk_limit":
+            jobs.append((f"tushare:{api}", [api], lambda: sync_complete_stk_limit_slice(trade_date)))
+        else:
+            jobs.append((
+                f"tushare:{api}",
+                [api],
+                lambda api_name=api: _safe_sync_raw(api_name, {"trade_date": trade_date}),
+            ))
+
+    provider_results: list[dict[str, Any]] = []
+    if jobs:
+        with ThreadPoolExecutor(max_workers=len(jobs), thread_name_prefix="market-bulk") as executor:
+            futures = {executor.submit(job): (name, datasets) for name, datasets, job in jobs}
+            for future, (name, datasets) in futures.items():
+                try:
+                    result = dict(future.result())
+                except Exception as exc:  # noqa: BLE001
+                    result = {"ok": False, "status": "bulk_fetch_failed", "error": str(exc)[:300]}
+                result.setdefault("provider_job", name)
+                provider_results.append(result)
+                provider = "tencent_market_snapshot" if name == "tencent_market_snapshot" else SOURCE_TUSHARE
+                for dataset in datasets:
+                    mark_provider_bulk_result(
+                        dataset,
+                        trade_date,
+                        provider,
+                        ok=bool(result.get("ok")),
+                        evidence={"status": result.get("status"), "rows": result.get("received") or result.get("rows_read")},
+                    )
+
+    core_ready, evidence = _decision_core_ready(trade_date)
+    if core_ready:
+        def _enrich() -> None:
+            for api_name in ("adj_factor", "suspend_d", "moneyflow", "moneyflow_hsgt"):
+                _safe_sync_raw(api_name, {"trade_date": trade_date})
+
+        threading.Thread(target=_enrich, daemon=True, name=f"market-enrichment-{trade_date}").start()
+    return {
+        "ok": core_ready,
+        "trade_date": trade_date,
+        "apis": default_apis,
+        "provider_discovery_contract": "alis_market_publication_probe_v1",
+        "bulk_contract": "alis_market_first_publisher_bulk_v1",
+        "discovery": discovery,
+        "winners": winners,
+        "provider_results": provider_results,
+        "snapshot": evidence["snapshot"],
+        "decision_contract": evidence["decision_contract"],
+        "failure_category": "" if core_ready else "bulk_slice_contract_failed",
+        "policy": "probe_all_due_sources_then_bulk_fetch_first_publisher_only",
     }
 
 
@@ -3308,32 +3474,101 @@ def sync_expectation_bundle(ts_code: str, period: str | None = None) -> dict[str
 
 
 def sync_index_bundle(index_code: str = "000300.SH", start_date: str | None = None, end_date: str | None = None) -> dict[str, Any]:
-    """Sync index metadata, daily bars, and weights."""
+    """Probe equivalent index sources, then fetch from the first publisher."""
 
     if not start_date or not end_date:
         start_date, end_date = _recent_calendar_window(days_back=30, days_forward=0)
+    if index_code == "000300.SH" and start_date == end_date:
+        with _conn() as conn:
+            existing = conn.execute(
+                """SELECT source_code FROM dc_tushare_raw_records
+                   WHERE api_name='index_daily' AND ts_code=? AND trade_date=? LIMIT 1""",
+                (index_code, start_date),
+            ).fetchone()
+        if existing:
+            existing_source = str(dict(existing).get("source_code") or "")
+            if existing_source != SOURCE_TUSHARE:
+                threading.Thread(
+                    target=lambda: _safe_sync_raw(
+                        "index_daily",
+                        {"ts_code": index_code, "start_date": start_date, "end_date": end_date},
+                    ),
+                    daemon=True,
+                    name=f"index-primary-reconcile-{start_date}",
+                ).start()
+            return {
+                "ok": True,
+                "benchmark_ready": True,
+                "status": "canonical_bar_already_ready",
+                "winner": existing_source,
+                "index_code": index_code,
+                "start_date": start_date,
+                "end_date": end_date,
+                "reconciliation_pending": existing_source != SOURCE_TUSHARE,
+                "policy": "consume_ready_bar_immediately_reconcile_primary_in_background",
+            }
+        from app.data_platform.services.eastmoney_index_daily_fallback import (
+            repair_hs300_index_daily_from_eastmoney,
+        )
+        from app.data_platform.services.market_data_discovery import (
+            discover_first_published,
+            mark_provider_bulk_result,
+        )
+
+        discovery = discover_first_published("index_daily", start_date)
+        winner = str(discovery.get("winner") or "")
+        if winner == SOURCE_TUSHARE:
+            bulk = _safe_sync_raw(
+                "index_daily",
+                {"ts_code": index_code, "start_date": start_date, "end_date": end_date},
+            )
+        elif winner:
+            bulk = repair_hs300_index_daily_from_eastmoney(start_date, provider=winner)
+        else:
+            bulk = {"ok": False, "status": "no_provider_published"}
+        with _conn() as conn:
+            ready = bool(conn.execute(
+                """SELECT 1 FROM dc_tushare_raw_records
+                   WHERE api_name='index_daily' AND ts_code=? AND trade_date=? LIMIT 1""",
+                (index_code, start_date),
+            ).fetchone())
+        if winner:
+            mark_provider_bulk_result(
+                "index_daily",
+                start_date,
+                winner,
+                ok=ready,
+                evidence={"status": bulk.get("status"), "rows": bulk.get("rows_written") or bulk.get("rows_read")},
+            )
+
+        def _metadata() -> None:
+            _safe_sync_raw("index_basic", {"market": "SSE"})
+            _safe_sync_raw(
+                "index_weight",
+                {"index_code": index_code, "start_date": start_date, "end_date": end_date},
+            )
+
+        if ready:
+            threading.Thread(target=_metadata, daemon=True, name=f"index-metadata-{start_date}").start()
+        return {
+            "ok": ready,
+            "benchmark_ready": ready,
+            "provider_discovery_contract": "alis_market_publication_probe_v1",
+            "bulk_contract": "alis_index_first_publisher_bulk_v1",
+            "winner": winner,
+            "index_code": index_code,
+            "start_date": start_date,
+            "end_date": end_date,
+            "discovery": discovery,
+            "bulk_result": bulk,
+            "metadata_pending": ["index_basic", "index_weight"] if ready else [],
+            "policy": "probe_all_due_sources_then_bulk_fetch_first_publisher_only",
+        }
     results = [
         _safe_sync_raw("index_basic", {"market": "SSE"}),
         _safe_sync_raw("index_daily", {"ts_code": index_code, "start_date": start_date, "end_date": end_date}),
         _safe_sync_raw("index_weight", {"index_code": index_code, "start_date": start_date, "end_date": end_date}),
     ]
-    fallback: dict[str, Any] | None = None
-    if index_code == "000300.SH" and start_date == end_date:
-        with _conn() as c:
-            exact = c.execute(
-                """SELECT 1 FROM dc_tushare_raw_records
-                   WHERE api_name='index_daily' AND ts_code=? AND trade_date=? LIMIT 1""",
-                (index_code, start_date),
-            ).fetchone()
-        if exact is None:
-            try:
-                from app.data_platform.services.eastmoney_index_daily_fallback import (
-                    repair_hs300_index_daily_from_eastmoney,
-                )
-
-                fallback = repair_hs300_index_daily_from_eastmoney(start_date)
-            except Exception as exc:  # noqa: BLE001
-                fallback = {"ok": False, "status": "fallback_request_failed", "error": str(exc)[:300]}
     with _conn() as c:
         benchmark_ready = bool(c.execute(
             """SELECT 1 FROM dc_tushare_raw_records
@@ -3346,7 +3581,6 @@ def sync_index_bundle(index_code: str = "000300.SH", start_date: str | None = No
         "start_date": start_date,
         "end_date": end_date,
         "results": results,
-        "fallback": fallback,
         "benchmark_ready": benchmark_ready,
     }
 

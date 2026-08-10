@@ -210,7 +210,8 @@ def _latest_benchmark_coverage(trade_date: str) -> dict[str, Any]:
     )
     with _conn() as conn:
         row = conn.execute(
-            """SELECT COUNT(*) AS rows_read,MAX(available_time) AS max_available_time
+            """SELECT COUNT(*) AS rows_read,MAX(available_time) AS max_available_time,
+                      MAX(source_code) AS source_code
                FROM dc_tushare_raw_records
                WHERE api_name='index_daily' AND ts_code='000300.SH'
                  AND trade_date=?""",
@@ -225,6 +226,7 @@ def _latest_benchmark_coverage(trade_date: str) -> dict[str, Any]:
         "ts_code": "000300.SH",
         "rows_read": rows_read,
         "max_available_time": max_available_time or None,
+        "source_code": str(item.get("source_code") or "") or None,
         "cutoff": cutoff or None,
         "ready": ready,
     }

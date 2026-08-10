@@ -315,35 +315,42 @@ def _refresh_missing_frozen_defensive_assets(
         if last_attempt and now - last_attempt < _DEFENSIVE_EXECUTION_REFRESH_INTERVAL_SEC:
             return {**status, "refresh": "throttled"}
         _defensive_execution_refresh_attempts[refresh_key] = now
-    result = materialize_defensive_asset_history(
-        start_date=execute_date,
-        end_date=execute_date,
-        ts_codes=missing,
+    from app.data_platform.services.tencent_etf_daily_fallback import repair_fund_daily_from_tencent
+    from app.data_platform.services.market_data_discovery import (
+        discover_first_published,
+        mark_provider_bulk_result,
     )
-    refreshed = defensive_asset_execution_status(execute_date, required)
-    fallback_result: dict[str, Any] | None = None
-    if refreshed.get("missing"):
-        from app.data_platform.services.tencent_etf_daily_fallback import (
-            repair_fund_daily_from_tencent,
-        )
 
-        try:
-            # Pass the complete frozen defensive universe: existing same-day
-            # TuShare rows are the mandatory provider-mapping reference sample.
-            fallback_result = repair_fund_daily_from_tencent(execute_date, required)
-        except Exception as exc:  # noqa: BLE001
-            fallback_result = {
-                "ok": False,
-                "status": "fallback_request_failed",
-                "error": str(exc)[:500],
-                "rows_written": 0,
-            }
-        refreshed = defensive_asset_execution_status(execute_date, required)
+    discovery = discover_first_published("defensive_fund_daily", execute_date)
+    winner = str(discovery.get("winner") or "")
+    if winner == "tushare":
+        provider_result = materialize_defensive_asset_history(
+            start_date=execute_date,
+            end_date=execute_date,
+            ts_codes=missing,
+        )
+    elif winner == "tencent_etf_quote":
+        provider_result = repair_fund_daily_from_tencent(execute_date, required)
+    else:
+        provider_result = {"ok": False, "status": "no_provider_published", "rows_written": 0}
+    refreshed = defensive_asset_execution_status(execute_date, required)
+    if winner:
+        mark_provider_bulk_result(
+            "defensive_fund_daily",
+            execute_date,
+            winner,
+            ok=not bool(refreshed.get("missing")),
+            evidence={"status": provider_result.get("status"), "missing": refreshed.get("missing") or []},
+        )
     return {
         **refreshed,
         "refresh": "attempted",
-        "refresh_result": result,
-        "fallback_result": fallback_result,
+        "provider_discovery_contract": "alis_market_publication_probe_v1",
+        "winner": winner,
+        "discovery": discovery,
+        "provider_result": provider_result,
+        "refresh_result": provider_result if winner == "tushare" else None,
+        "fallback_result": provider_result if winner == "tencent_etf_quote" else None,
     }
 
 

@@ -34,7 +34,7 @@ def decision_data_contract(trade_date: str | None = None, *, conn: Any | None = 
         stock_count = int(_row_dict(stock_row).get("count") or 0)
         threshold = max(1, int(stock_count * DECISION_MIN_STOCK_COVERAGE)) if stock_count else 1
         api_rows = active.execute(
-            """SELECT api_name,COUNT(*) AS rows FROM dc_tushare_raw_records
+            """SELECT api_name,COUNT(DISTINCT ts_code) AS rows FROM dc_tushare_raw_records
                WHERE trade_date=? AND api_name IN ('daily','daily_basic','stk_limit')
                GROUP BY api_name""",
             (value,),
@@ -43,6 +43,19 @@ def decision_data_contract(trade_date: str | None = None, *, conn: Any | None = 
             str(_row_dict(row).get("api_name") or ""): int(_row_dict(row).get("rows") or 0)
             for row in api_rows
         }
+        provider_rows = active.execute(
+            """SELECT api_name,source_code,COUNT(DISTINCT ts_code) AS rows
+               FROM dc_tushare_raw_records
+               WHERE trade_date=? AND api_name IN ('daily','daily_basic','stk_limit')
+               GROUP BY api_name,source_code ORDER BY api_name,source_code""",
+            (value,),
+        ).fetchall() if value else []
+        provider_counts: dict[str, dict[str, int]] = {}
+        for row in provider_rows:
+            item = _row_dict(row)
+            provider_counts.setdefault(str(item.get("api_name") or ""), {})[
+                str(item.get("source_code") or "unknown")
+            ] = int(item.get("rows") or 0)
         snapshot = active.execute(
             """SELECT COUNT(*) AS snapshot_rows,
                       SUM(CASE WHEN close IS NOT NULL THEN 1 ELSE 0 END) AS close_rows,
@@ -122,6 +135,8 @@ def decision_data_contract(trade_date: str | None = None, *, conn: Any | None = 
         "minimum_rows_by_api": minimum_rows_by_api,
         "expected_rows": expected_rows,
         "counts": counts,
+        "provider_rows": provider_counts,
+        "provider_policy": "first_contract_valid_slice_wins_later_sources_reconcile",
         "snapshot_limit_rows": snapshot_limit_rows,
         "raw_limit_rows": raw_limit_covered,
         # 5518 is derived from the target-date daily rows intersected with

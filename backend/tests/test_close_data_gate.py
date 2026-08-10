@@ -179,6 +179,14 @@ def test_frozen_t1_refresh_only_requests_missing_defensive_assets(monkeypatch) -
         "app.services.defensive_assets.materialize_defensive_asset_history",
         lambda **kwargs: captured.update(kwargs) or {"ok": True},
     )
+    monkeypatch.setattr(
+        "app.data_platform.services.market_data_discovery.discover_first_published",
+        lambda *_args: {"ok": True, "winner": "tushare"},
+    )
+    monkeypatch.setattr(
+        "app.data_platform.services.market_data_discovery.mark_provider_bulk_result",
+        lambda *_args, **_kwargs: None,
+    )
 
     result = quant_task_runner._refresh_missing_frozen_defensive_assets(
         "20260731",
@@ -198,7 +206,6 @@ def test_frozen_t1_refresh_only_requests_missing_defensive_assets(monkeypatch) -
 def test_frozen_t1_refresh_uses_verified_fallback_after_primary_stays_partial(monkeypatch) -> None:
     statuses = iter([
         {"ok": False, "missing": ["510880.SH"], "required": ["510880.SH", "511010.SH"]},
-        {"ok": False, "missing": ["510880.SH"], "required": ["510880.SH", "511010.SH"]},
         {"ok": True, "missing": [], "required": ["510880.SH", "511010.SH"]},
     ])
     captured = {}
@@ -215,6 +222,14 @@ def test_frozen_t1_refresh_uses_verified_fallback_after_primary_stays_partial(mo
         "app.data_platform.services.tencent_etf_daily_fallback.repair_fund_daily_from_tencent",
         lambda trade_date, ts_codes: captured.update({"trade_date": trade_date, "ts_codes": ts_codes})
         or {"ok": True, "rows_written": 1},
+    )
+    monkeypatch.setattr(
+        "app.data_platform.services.market_data_discovery.discover_first_published",
+        lambda *_args: {"ok": True, "winner": "tencent_etf_quote"},
+    )
+    monkeypatch.setattr(
+        "app.data_platform.services.market_data_discovery.mark_provider_bulk_result",
+        lambda *_args, **_kwargs: None,
     )
 
     result = quant_task_runner._refresh_missing_frozen_defensive_assets(
