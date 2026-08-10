@@ -1968,6 +1968,10 @@ main {
   display: none;
 }
 
+.model-evidence-summary small {
+  overflow-wrap: anywhere;
+}
+
 .research-line-grid article,
 .expert-pool-grid article,
 .population-grid article,
