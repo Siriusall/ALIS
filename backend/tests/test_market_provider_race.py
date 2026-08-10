@@ -54,7 +54,7 @@ def test_market_bundle_bulk_fetches_only_probe_winners(monkeypatch):
 
     assert result["ok"] is True
     assert set(result["winners"].values()) == {"tencent_market_snapshot"}
-    assert result["bulk_contract"] == "alis_market_first_publisher_bulk_v1"
+    assert result["bulk_contract"] == "alis_market_hedged_first_complete_slice_v2"
     assert result["provider_results"][0]["apis"] == ["daily", "daily_basic", "stk_limit"]
 
 
@@ -127,3 +127,54 @@ def test_no_bulk_request_when_no_probe_has_published(monkeypatch):
 
     assert result["ok"] is False
     assert result["failure_category"] == "upstream_not_published"
+
+
+def test_slow_primary_starts_qualified_hedge_and_returns_first_complete(monkeypatch):
+    state = {"ready": False}
+    monkeypatch.setattr(
+        discovery, "discover_market_core",
+        lambda *_args: {"ok": True, "winners": {"daily": "tencent_market_snapshot"}},
+    )
+    monkeypatch.setattr(discovery, "hedge_delay_seconds", lambda *_args: .01)
+    monkeypatch.setattr(
+        discovery, "available_bulk_candidates",
+        lambda *_args: [{"provider": "tushare", "performance": {"eta_ms": 20, "reliability": 1.0}}],
+    )
+    monkeypatch.setattr(discovery, "mark_provider_bulk_result", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(tencent, "sync_tencent_market_bundle", lambda *_args: time.sleep(.08) or {"ok": False})
+
+    def tushare_bulk(*_args, **_kwargs):
+        state["ready"] = True
+        return {"ok": True, "rows_read": 5500, "status": "published"}
+
+    monkeypatch.setattr(data_center, "_safe_sync_raw", tushare_bulk)
+    monkeypatch.setattr(
+        data_center, "_decision_core_ready",
+        lambda _date: (state["ready"], {"snapshot": {"ok": state["ready"]}, "decision_contract": {
+            "ok": state["ready"], "missing_apis": [] if state["ready"] else ["daily"], "incomplete_apis": [],
+        }}),
+    )
+
+    result = data_center.sync_market_bundle("20260810")
+
+    assert result["ok"] is True
+    assert result["hedge_started"][0]["provider"] == "tushare"
+    assert result["policy"].startswith("first_publisher_starts_immediately")
+
+
+def test_provider_performance_opens_circuit_after_consecutive_failures():
+    with discovery._conn() as conn:
+        for offset in range(3):
+            conn.execute(
+                """INSERT INTO dc_market_provider_performance
+                   (dataset,provider,sample_date,probe_latency_ms,bulk_latency_ms,coverage,success,
+                    failure_kind,completed_at,evidence_json) VALUES(?,?,?,?,?,?,?,?,?,?)
+                   ON CONFLICT(dataset,provider,sample_date) DO UPDATE SET success=excluded.success""",
+                ("test_slice", "broken_source", f"2026080{offset + 1}", 10, 100, 0, 0,
+                 "timeout", "2026-08-10T15:01:00+08:00", "{}"),
+            )
+
+    performance = discovery.provider_performance("test_slice", "broken_source")
+
+    assert performance["circuit_open"] is True
+    assert performance["consecutive_failures"] == 3

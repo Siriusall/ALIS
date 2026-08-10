@@ -533,8 +533,15 @@ def daily_update_status() -> dict[str, Any]:
             state["provider_discovery"] = {
                 "trade_date": target,
                 "items": [dict(row) for row in probe_rows],
-                "policy": "probe_all_due_sources_then_bulk_fetch_first_publisher_only",
+                "policy": "adaptive_probe_then_hedged_first_complete_slice_v2",
             }
+            performance_rows = c.execute(
+                """SELECT dataset,provider,sample_date,bulk_latency_ms,coverage,success,failure_kind,completed_at
+                   FROM dc_market_provider_performance
+                   WHERE sample_date=(SELECT MAX(sample_date) FROM dc_market_provider_performance)
+                   ORDER BY dataset,provider"""
+            ).fetchall()
+            state["provider_performance"] = [dict(row) for row in performance_rows]
     except Exception as exc:  # noqa: BLE001
         state["status_error"] = str(exc)[:200]
     return state

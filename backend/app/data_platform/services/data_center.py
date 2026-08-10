@@ -5,7 +5,7 @@ import hashlib
 import os
 import time
 import threading
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -1805,12 +1805,14 @@ def _decision_core_ready(trade_date: str) -> tuple[bool, dict[str, Any]]:
 
 
 def sync_market_bundle(trade_date: str, *, include_suspend: bool = False, apis: list[str] | None = None) -> dict[str, Any]:
-    """Probe providers first, then bulk-fetch only from each first publisher."""
+    """Probe first, start immediately, then hedge a slow bulk with another published source."""
     if apis is not None:
         return _sync_tushare_market_bundle(trade_date, include_suspend=include_suspend, apis=apis)
 
     from app.data_platform.services.market_data_discovery import (
+        available_bulk_candidates,
         discover_market_core,
+        hedge_delay_seconds,
         mark_provider_bulk_result,
     )
     from app.data_platform.services.tencent_market_snapshot import sync_tencent_market_bundle
@@ -1866,27 +1868,110 @@ def sync_market_bundle(trade_date: str, *, include_suspend: bool = False, apis: 
             ))
 
     provider_results: list[dict[str, Any]] = []
+    hedge_started: list[dict[str, Any]] = []
+    completed_evidence: dict[str, Any] | None = None
     if jobs:
-        with ThreadPoolExecutor(max_workers=len(jobs), thread_name_prefix="market-bulk") as executor:
-            futures = {executor.submit(job): (name, datasets) for name, datasets, job in jobs}
-            for future, (name, datasets) in futures.items():
+        # Do not use a context manager here: returning as soon as the canonical contract is
+        # complete must not wait for the losing hedge.  Its late result is reconciliation-only.
+        executor = ThreadPoolExecutor(max_workers=max(4, len(jobs) + 3), thread_name_prefix="market-bulk")
+        pending: dict[Any, tuple[str, list[str], float]] = {
+            executor.submit(job): (name, datasets, time.monotonic()) for name, datasets, job in jobs
+        }
+        launched = {(dataset, "tencent_market_snapshot" if name == "tencent_market_snapshot" else SOURCE_TUSHARE)
+                    for name, datasets, _job in jobs for dataset in datasets}
+        hedge_deadline = time.monotonic() + min(
+            hedge_delay_seconds(dataset, provider)
+            for dataset, provider in launched
+        )
+        bulk_started_at = time.monotonic()
+        hard_deadline = bulk_started_at + max(30.0, float(os.getenv("MARKET_BULK_HARD_TIMEOUT_SECONDS", "120")))
+
+        def _launch_hedges() -> None:
+            for dataset in winners:
+                for candidate in available_bulk_candidates(dataset, trade_date):
+                    provider = str(candidate.get("provider") or "")
+                    if not provider or (dataset, provider) in launched:
+                        continue
+                    if provider == "tencent_market_snapshot":
+                        job = lambda dataset_name=dataset: sync_tencent_market_bundle(trade_date, [dataset_name])
+                    elif provider == SOURCE_TUSHARE and dataset == "stk_limit":
+                        job = lambda: sync_complete_stk_limit_slice(trade_date)
+                    elif provider == SOURCE_TUSHARE:
+                        job = lambda dataset_name=dataset: _safe_sync_raw(dataset_name, {"trade_date": trade_date})
+                    else:
+                        continue
+                    pending[executor.submit(job)] = (f"hedge:{provider}:{dataset}", [dataset], time.monotonic())
+                    launched.add((dataset, provider))
+                    hedge_started.append({
+                        "dataset": dataset, "provider": provider,
+                        "reason": "primary_exceeded_historical_progress_deadline",
+                        "performance": candidate.get("performance") or {},
+                    })
+                    break
+
+        hedged = False
+        while pending:
+            if time.monotonic() >= hard_deadline:
+                for future in pending:
+                    future.cancel()
+                provider_results.append({
+                    "ok": False, "status": "bulk_hard_timeout",
+                    "bulk_latency_ms": int((time.monotonic() - bulk_started_at) * 1000),
+                })
+                break
+            if not hedged:
+                timeout = max(0.0, hedge_deadline - time.monotonic())
+            elif not hedge_started:
+                # A slower probe may publish just after the first hedge check.
+                timeout = min(1.0, max(0.0, hard_deadline - time.monotonic()))
+            else:
+                timeout = max(0.0, hard_deadline - time.monotonic())
+            done, _ = wait(set(pending), timeout=timeout, return_when=FIRST_COMPLETED)
+            if not done and not hedged:
+                _launch_hedges()
+                hedged = True
+                continue
+            if not done and hedged and not hedge_started:
+                _launch_hedges()
+                continue
+            for future in done:
+                name, datasets, started = pending.pop(future)
+                latency_ms = max(0, int((time.monotonic() - started) * 1000))
                 try:
                     result = dict(future.result())
                 except Exception as exc:  # noqa: BLE001
                     result = {"ok": False, "status": "bulk_fetch_failed", "error": str(exc)[:300]}
                 result.setdefault("provider_job", name)
+                result["bulk_latency_ms"] = latency_ms
                 provider_results.append(result)
-                provider = "tencent_market_snapshot" if name == "tencent_market_snapshot" else SOURCE_TUSHARE
+                provider = "tencent_market_snapshot" if "tencent_market_snapshot" in name else SOURCE_TUSHARE
+                received = int(result.get("received") or result.get("rows_read") or 0)
+                expected = int(result.get("expected") or received or 0)
+                coverage = received / expected if expected else (1.0 if result.get("ok") else 0.0)
                 for dataset in datasets:
                     mark_provider_bulk_result(
-                        dataset,
-                        trade_date,
-                        provider,
-                        ok=bool(result.get("ok")),
-                        evidence={"status": result.get("status"), "rows": result.get("received") or result.get("rows_read")},
+                        dataset, trade_date, provider, ok=bool(result.get("ok")), latency_ms=latency_ms,
+                        coverage=coverage,
+                        evidence={"status": result.get("status"), "rows": received, "hedged": name.startswith("hedge:")},
                     )
+            ready_now, _ready_evidence = _decision_core_ready(trade_date)
+            if ready_now:
+                completed_evidence = _ready_evidence
+                for future in pending:
+                    future.cancel()
+                break
+            if not pending:
+                _launch_hedges()
+                hedged = True
+            if not hedged and time.monotonic() >= hedge_deadline:
+                _launch_hedges()
+                hedged = True
+        executor.shutdown(wait=False, cancel_futures=True)
 
-    core_ready, evidence = _decision_core_ready(trade_date)
+    if completed_evidence is not None:
+        core_ready, evidence = True, completed_evidence
+    else:
+        core_ready, evidence = _decision_core_ready(trade_date)
     if core_ready:
         def _enrich() -> None:
             for api_name in ("adj_factor", "suspend_d", "moneyflow", "moneyflow_hsgt"):
@@ -1898,14 +1983,21 @@ def sync_market_bundle(trade_date: str, *, include_suspend: bool = False, apis: 
         "trade_date": trade_date,
         "apis": default_apis,
         "provider_discovery_contract": "alis_market_publication_probe_v1",
-        "bulk_contract": "alis_market_first_publisher_bulk_v1",
+        "bulk_contract": "alis_market_hedged_first_complete_slice_v2",
         "discovery": discovery,
         "winners": winners,
         "provider_results": provider_results,
+        "hedge_started": hedge_started,
         "snapshot": evidence["snapshot"],
         "decision_contract": evidence["decision_contract"],
         "failure_category": "" if core_ready else "bulk_slice_contract_failed",
-        "policy": "probe_all_due_sources_then_bulk_fetch_first_publisher_only",
+        "field_source_policy": {
+            "daily": "first_full_contract_source; tushare_late_reconciliation",
+            "stk_limit": "first_full_contract_source; exact_limit_cross_check",
+            "daily_basic": "fast_source_provisional; tushare_field_definitions_authoritative_on_reconciliation",
+            "adj_factor": "tushare_only_until_pit_equivalent_source_exists",
+        },
+        "policy": "first_publisher_starts_immediately; hedge_on_historical_progress_deadline; first_complete_contract_wins",
     }
 
 

@@ -136,7 +136,12 @@ def decision_data_contract(trade_date: str | None = None, *, conn: Any | None = 
         "expected_rows": expected_rows,
         "counts": counts,
         "provider_rows": provider_counts,
-        "provider_policy": "first_contract_valid_slice_wins_later_sources_reconcile",
+        "provider_policy": "hedged_first_complete_slice_wins_field_authority_reconciles_v2",
+        "field_source_authority": {
+            "daily": "first_valid_full_slice_then_tushare_reconcile",
+            "stk_limit": "first_valid_full_slice_then_exact_cross_check",
+            "daily_basic": "tushare_authoritative_after_fast_provisional_slice",
+        },
         "snapshot_limit_rows": snapshot_limit_rows,
         "raw_limit_rows": raw_limit_covered,
         # 5518 is derived from the target-date daily rows intersected with

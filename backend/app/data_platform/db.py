@@ -51,6 +51,19 @@ CREATE TABLE dc_market_provider_probe (
             evidence_json TEXT NOT NULL DEFAULT '{}',
             PRIMARY KEY (dataset, trade_date, provider)
         );
+CREATE TABLE dc_market_provider_performance (
+            dataset TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            sample_date TEXT NOT NULL,
+            probe_latency_ms INTEGER NOT NULL DEFAULT 0,
+            bulk_latency_ms INTEGER NOT NULL DEFAULT 0,
+            coverage REAL NOT NULL DEFAULT 0,
+            success INTEGER NOT NULL DEFAULT 0,
+            failure_kind TEXT NOT NULL DEFAULT '',
+            completed_at TEXT NOT NULL,
+            evidence_json TEXT NOT NULL DEFAULT '{}',
+            PRIMARY KEY (dataset, provider, sample_date)
+        );
 CREATE TABLE dc_announcement_event (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             announcement_id INTEGER NOT NULL,

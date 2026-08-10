@@ -9,6 +9,8 @@ durable ledger so the minute scheduler does not hammer upstream APIs.
 from __future__ import annotations
 
 import json
+import os
+import statistics
 import threading
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
@@ -53,6 +55,90 @@ def _probe_interval_seconds(now: datetime) -> int:
     if 15 * 60 + 20 <= minutes < 16 * 60:
         return 180
     return 600
+
+
+def _adaptive_probe_interval_seconds(dataset: str, provider: str, now: datetime) -> int:
+    """Tighten polling near this provider's recent publication time."""
+    base = _probe_interval_seconds(now)
+    try:
+        with _conn() as conn:
+            rows = conn.execute(
+                """SELECT probed_at FROM dc_market_provider_probe
+                   WHERE dataset=? AND provider=? AND status IN ('available','bulk_validated')
+                   ORDER BY trade_date DESC LIMIT 20""",
+                (dataset, provider),
+            ).fetchall()
+        minutes = []
+        for row in rows:
+            value = datetime.fromisoformat(str(dict(row).get("probed_at") or ""))
+            minutes.append(value.hour * 60 + value.minute + value.second / 60)
+        if len(minutes) < 3:
+            return base
+        expected = statistics.median(minutes)
+        current = now.hour * 60 + now.minute + now.second / 60
+        if expected - 5 <= current <= expected + 10:
+            return min(base, 60)
+        if current < expected - 15:
+            return max(base, 300)
+    except Exception:  # noqa: BLE001 - scheduling must remain fail-safe
+        return base
+    return base
+
+
+def provider_performance(dataset: str, provider: str) -> dict[str, Any]:
+    """Return a bounded historical ETA/reliability score for bulk hedging."""
+    with _conn() as conn:
+        rows = conn.execute(
+            """SELECT bulk_latency_ms,coverage,success,failure_kind
+               FROM dc_market_provider_performance WHERE dataset=? AND provider=?
+               ORDER BY sample_date DESC LIMIT 20""",
+            (dataset, provider),
+        ).fetchall()
+    samples = [dict(row) for row in rows]
+    successes = [row for row in samples if int(row.get("success") or 0) == 1]
+    latencies = [int(row.get("bulk_latency_ms") or 0) for row in successes if int(row.get("bulk_latency_ms") or 0) > 0]
+    reliability = sum(int(row.get("success") or 0) for row in samples) / len(samples) if samples else .75
+    coverage = statistics.mean(float(row.get("coverage") or 0) for row in successes) if successes else .8
+    eta_ms = int(statistics.median(latencies)) if latencies else int(os.getenv("MARKET_BULK_DEFAULT_ETA_MS", "12000"))
+    consecutive_failures = 0
+    for row in samples:
+        if int(row.get("success") or 0):
+            break
+        consecutive_failures += 1
+    circuit_open = consecutive_failures >= int(os.getenv("MARKET_PROVIDER_CIRCUIT_FAILURES", "3"))
+    score = eta_ms / max(.1, reliability * max(.5, coverage))
+    return {
+        "samples": len(samples), "eta_ms": eta_ms, "reliability": round(reliability, 4),
+        "coverage": round(coverage, 4), "consecutive_failures": consecutive_failures,
+        "circuit_open": circuit_open, "completion_score": round(score, 2),
+    }
+
+
+def available_bulk_candidates(dataset: str, trade_date: str) -> list[dict[str, Any]]:
+    """Rank all already-published providers by expected complete-slice time."""
+    with _conn() as conn:
+        rows = conn.execute(
+            """SELECT provider,status,latency_ms,probed_at FROM dc_market_provider_probe
+               WHERE dataset=? AND trade_date=? AND status IN ('available','bulk_validated')""",
+            (dataset, trade_date),
+        ).fetchall()
+    ranked = []
+    for raw in rows:
+        row = dict(raw)
+        perf = provider_performance(dataset, str(row["provider"]))
+        if perf["circuit_open"] and str(row.get("status") or "") != "bulk_validated":
+            continue
+        ranked.append({**row, "performance": perf})
+    return sorted(ranked, key=lambda item: (
+        float(item["performance"]["completion_score"]), int(item.get("latency_ms") or 0), str(item["provider"])
+    ))
+
+
+def hedge_delay_seconds(dataset: str, provider: str) -> float:
+    perf = provider_performance(dataset, provider)
+    floor = float(os.getenv("MARKET_BULK_HEDGE_MIN_SECONDS", "3"))
+    ceiling = float(os.getenv("MARKET_BULK_HEDGE_MAX_SECONDS", "20"))
+    return max(floor, min(ceiling, perf["eta_ms"] / 1000 * .75))
 
 
 def _tushare_probe(dataset: str, trade_date: str) -> dict[str, Any]:
@@ -158,7 +244,7 @@ def _run_probe(dataset: str, provider: str, trade_date: str) -> dict[str, Any]:
                 provider,
                 status,
                 _iso(observed),
-                _iso(observed + timedelta(seconds=_probe_interval_seconds(observed))),
+                _iso(observed + timedelta(seconds=_adaptive_probe_interval_seconds(dataset, provider, observed))),
                 latency_ms,
                 json.dumps(evidence, ensure_ascii=False, separators=(",", ":"), default=str),
             ),
@@ -195,12 +281,14 @@ def _eligible_providers(dataset: str, trade_date: str) -> list[str]:
             (dataset, trade_date),
         ).fetchall()
     state = {str(dict(row).get("provider") or ""): dict(row) for row in rows}
-    return [
+    eligible = [
         provider for provider in providers
         if provider not in state
         or str(state[provider].get("status") or "") == "available"
         or str(state[provider].get("next_probe_at") or "") <= now
     ]
+    healthy = [provider for provider in eligible if not provider_performance(dataset, provider)["circuit_open"]]
+    return healthy or eligible
 
 
 def discover_first_published(dataset: str, trade_date: str) -> dict[str, Any]:
@@ -279,6 +367,8 @@ def mark_provider_bulk_result(
     *,
     ok: bool,
     evidence: dict[str, Any] | None = None,
+    latency_ms: int = 0,
+    coverage: float = 0,
 ) -> None:
     """Close the probe→bulk loop so a bad winner can be bypassed next tick."""
     observed = _now()
@@ -300,5 +390,19 @@ def mark_provider_bulk_result(
                 dataset,
                 str(trade_date),
                 provider,
+            ),
+        )
+        conn.execute(
+            """INSERT INTO dc_market_provider_performance
+               (dataset,provider,sample_date,probe_latency_ms,bulk_latency_ms,coverage,success,
+                failure_kind,completed_at,evidence_json) VALUES(?,?,?,?,?,?,?,?,?,?)
+               ON CONFLICT(dataset,provider,sample_date) DO UPDATE SET
+               bulk_latency_ms=excluded.bulk_latency_ms,coverage=excluded.coverage,
+               success=excluded.success,failure_kind=excluded.failure_kind,
+               completed_at=excluded.completed_at,evidence_json=excluded.evidence_json""",
+            (
+                dataset, provider, str(trade_date), 0, max(0, int(latency_ms)), max(0.0, min(1.0, float(coverage))),
+                1 if ok else 0, "" if ok else str((evidence or {}).get("status") or "bulk_failed"),
+                _iso(observed), json.dumps(evidence or {}, ensure_ascii=False, separators=(",", ":"), default=str),
             ),
         )
