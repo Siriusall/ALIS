@@ -2005,6 +2005,8 @@ main {
   color: #5f40db;
 }
 
+.research-line-grid header .status { min-width: max-content; }
+
 .research-line-grid h3,
 .expert-pool-grid h3,
 .model-family-grid h3,

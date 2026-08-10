@@ -18,7 +18,19 @@ export function Status({ children, tone }: { children: ReactNode; tone?: Tone })
   const value = children && typeof children === "object" && !Array.isArray(children) && !("$$typeof" in objectValue)
     ? String(objectValue.label ?? objectValue.state ?? objectValue.status ?? "证据已记录")
     : children;
-  const labels: Record<string, string> = { ok: "正常", ready: "就绪", healthy: "健康", running: "运行中", waiting: "等待", observing: "观察中", degraded: "降级", blocked: "阻断", failed: "失败", completed: "完成", passed: "通过", owner: "本机持有", follower: "跟随实例", disabled: "已委托" };
+  const labels: Record<string, string> = {
+    ok: "正常", ready: "就绪", healthy: "健康", normal: "正常", running: "运行中",
+    waiting: "等待", queued: "排队", pending: "等待", observing: "观察中", idle: "空闲",
+    paused: "已暂停", degraded: "降级", partial: "部分可用", blocked: "阻断",
+    failed: "失败", complete: "完整", completed: "完成", passed: "通过", verified: "已验证",
+    available: "可用", unavailable: "不可用", distilled: "已蒸馏", eligible: "符合资格",
+    planned: "计划已冻结", superseded: "已被新版本替代",
+    blocked_by_contract_validation: "合同校验阻断",
+    blocked_by_contract_revision: "合同版本阻断",
+    missed_execution_window: "已错过执行窗口",
+    research_shadow_observing: "研究影子观察",
+    owner: "本机持有", follower: "跟随实例", disabled: "已委托",
+  };
   const label = typeof value === "string" ? labels[value.toLowerCase()] || value : value;
   return <span className={`status status-${tone || toneOf(value)}`}><i />{label}</span>;
 }
@@ -85,8 +97,8 @@ export function fmtPct(value: unknown, signed = true) {
 }
 
 export function fmtPoints(value: unknown, signed = true) {
-  if (value === null || value === undefined || value === "") return "未记录百分点";
+  if (value === null || value === undefined || value === "") return "未记录";
   const number = Number(value);
-  if (!Number.isFinite(number)) return "百分点不可用";
+  if (!Number.isFinite(number)) return "不可用";
   return `${signed && number > 0 ? "+" : ""}${number.toFixed(2)}%`;
 }
