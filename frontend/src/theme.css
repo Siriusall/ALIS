@@ -323,6 +323,11 @@ main {
   padding-left: 16px;
 }
 
+.progress-grid {
+  gap: 26px;
+  padding: 14px 18px 12px;
+}
+
 .headline-metrics {
   margin-bottom: 24px;
 }
