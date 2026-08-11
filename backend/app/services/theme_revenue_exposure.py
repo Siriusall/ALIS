@@ -152,6 +152,36 @@ def _latest_segment_rows(
     return result
 
 
+def _execute_many(conn: Any, sql: str, rows: list[tuple[Any, ...]]) -> None:
+    if not rows:
+        return
+    if getattr(conn, "_is_postgres", False):
+        cursor = conn._conn.cursor()
+        cursor.executemany(sql.replace("?", "%s"), rows)
+    elif getattr(conn, "_is_mysql", False):
+        cursor = conn._conn.cursor()
+        cursor.executemany(sql.replace("?", "%s"), rows)
+    else:
+        conn._conn.executemany(sql, rows)
+
+
+def _current_exposure_rows(conn: Any, codes: list[str], *, batch_size: int = 500) -> dict[str, list[dict[str, Any]]]:
+    result: dict[str, list[dict[str, Any]]] = {}
+    size = max(25, min(int(batch_size), 500))
+    for offset in range(0, len(codes), size):
+        batch = codes[offset:offset + size]
+        placeholders = ",".join("?" for _ in batch)
+        for row in conn.execute(
+            f"""SELECT theme_code,ts_code,source_fingerprint
+                  FROM dc_theme_revenue_exposure_current
+                 WHERE ts_code IN ({placeholders})""",
+            tuple(batch),
+        ).fetchall():
+            item = dict(row)
+            result.setdefault(str(item.get("ts_code") or ""), []).append(item)
+    return result
+
+
 def materialize_theme_revenue_exposure(*, as_of_time: str | None = None, limit_companies: int = 8_000) -> dict[str, Any]:
     """Incrementally persist latest revenue exposure while retaining PIT history."""
     _ensure_tables()
@@ -220,45 +250,47 @@ def materialize_theme_revenue_exposure(*, as_of_time: str | None = None, limit_c
     written = 0
     companies_changed = 0
     with _conn() as conn:
+        current_by_company = {} if cutoff else _current_exposure_rows(conn, list(by_company))
+        changed_company_codes: list[str] = []
+        history_values: list[tuple[Any, ...]] = []
+        current_values: list[tuple[Any, ...]] = []
+        removed_values: list[tuple[Any, ...]] = []
         for code, segments in by_company.items():
             exposures, fingerprint = _company_exposures(segments)
-            current_rows = [] if cutoff else [dict(row) for row in conn.execute(
-                "SELECT theme_code,source_fingerprint FROM dc_theme_revenue_exposure_current WHERE ts_code=?", (code,),
-            ).fetchall()]
+            current_rows = current_by_company.get(code) or []
             if not cutoff and current_rows and {str(row.get("source_fingerprint") or "") for row in current_rows} == {fingerprint}:
                 continue
             companies_changed += 1
             previous_themes = {str(row.get("theme_code") or "") for row in current_rows}
             if not cutoff:
-                conn.execute("DELETE FROM dc_theme_revenue_exposure_current WHERE ts_code=?", (code,))
+                changed_company_codes.append(code)
             for theme_code, exposure in exposures.items():
                 evidence_json = json.dumps(exposure["evidence"], ensure_ascii=False)
-                conn.execute(
-                    """INSERT INTO dc_theme_revenue_exposure
-                       (as_of_date,theme_code,ts_code,revenue_share,matched_sales,total_segment_sales,source_period,source_available_time,evidence_json,updated_at)
-                       VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(as_of_date,theme_code,ts_code) DO UPDATE SET
-                       revenue_share=excluded.revenue_share,matched_sales=excluded.matched_sales,total_segment_sales=excluded.total_segment_sales,
-                       source_period=excluded.source_period,source_available_time=excluded.source_available_time,evidence_json=excluded.evidence_json,updated_at=excluded.updated_at""",
-                    (cutoff_date, theme_code, code, exposure["revenue_share"], exposure["matched_sales"], exposure["total_segment_sales"], exposure["source_period"], exposure["source_available_time"], evidence_json, now),
-                )
+                history_values.append((cutoff_date, theme_code, code, exposure["revenue_share"], exposure["matched_sales"], exposure["total_segment_sales"], exposure["source_period"], exposure["source_available_time"], evidence_json, now))
                 if not cutoff:
-                    conn.execute(
-                        """INSERT INTO dc_theme_revenue_exposure_current(theme_code,ts_code,as_of_date,revenue_share,matched_sales,total_segment_sales,source_period,source_available_time,source_fingerprint,evidence_json,updated_at)
-                           VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(theme_code,ts_code) DO UPDATE SET
-                           as_of_date=excluded.as_of_date,revenue_share=excluded.revenue_share,matched_sales=excluded.matched_sales,
-                           total_segment_sales=excluded.total_segment_sales,source_period=excluded.source_period,
-                           source_available_time=excluded.source_available_time,source_fingerprint=excluded.source_fingerprint,
-                           evidence_json=excluded.evidence_json,updated_at=excluded.updated_at""",
-                        (theme_code, code, cutoff_date, exposure["revenue_share"], exposure["matched_sales"], exposure["total_segment_sales"], exposure["source_period"], exposure["source_available_time"], fingerprint, evidence_json, now),
-                    )
+                    current_values.append((theme_code, code, cutoff_date, exposure["revenue_share"], exposure["matched_sales"], exposure["total_segment_sales"], exposure["source_period"], exposure["source_available_time"], fingerprint, evidence_json, now))
                 written += 1
             for removed_theme in previous_themes - set(exposures):
-                conn.execute(
-                    """INSERT INTO dc_theme_revenue_exposure(as_of_date,theme_code,ts_code,revenue_share,matched_sales,total_segment_sales,source_period,source_available_time,evidence_json,updated_at)
-                       VALUES(?,?,?,0,0,0,'','',?,?) ON CONFLICT(as_of_date,theme_code,ts_code) DO UPDATE SET
-                       revenue_share=0,matched_sales=0,total_segment_sales=0,evidence_json=excluded.evidence_json,updated_at=excluded.updated_at""",
-                    (cutoff_date, removed_theme, code, json.dumps({"method": "fina_mainbz_theme_removed_v2", "active": False}, ensure_ascii=False), now),
-                )
+                removed_values.append((cutoff_date, removed_theme, code, json.dumps({"method": "fina_mainbz_theme_removed_v2", "active": False}, ensure_ascii=False), now))
+        if not cutoff:
+            for offset in range(0, len(changed_company_codes), 500):
+                batch = changed_company_codes[offset:offset + 500]
+                placeholders = ",".join("?" for _ in batch)
+                conn.execute(f"DELETE FROM dc_theme_revenue_exposure_current WHERE ts_code IN ({placeholders})", tuple(batch))
+        _execute_many(conn, """INSERT INTO dc_theme_revenue_exposure
+               (as_of_date,theme_code,ts_code,revenue_share,matched_sales,total_segment_sales,source_period,source_available_time,evidence_json,updated_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(as_of_date,theme_code,ts_code) DO UPDATE SET
+               revenue_share=excluded.revenue_share,matched_sales=excluded.matched_sales,total_segment_sales=excluded.total_segment_sales,
+               source_period=excluded.source_period,source_available_time=excluded.source_available_time,evidence_json=excluded.evidence_json,updated_at=excluded.updated_at""", history_values)
+        _execute_many(conn, """INSERT INTO dc_theme_revenue_exposure_current(theme_code,ts_code,as_of_date,revenue_share,matched_sales,total_segment_sales,source_period,source_available_time,source_fingerprint,evidence_json,updated_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(theme_code,ts_code) DO UPDATE SET
+               as_of_date=excluded.as_of_date,revenue_share=excluded.revenue_share,matched_sales=excluded.matched_sales,
+               total_segment_sales=excluded.total_segment_sales,source_period=excluded.source_period,
+               source_available_time=excluded.source_available_time,source_fingerprint=excluded.source_fingerprint,
+               evidence_json=excluded.evidence_json,updated_at=excluded.updated_at""", current_values)
+        _execute_many(conn, """INSERT INTO dc_theme_revenue_exposure(as_of_date,theme_code,ts_code,revenue_share,matched_sales,total_segment_sales,source_period,source_available_time,evidence_json,updated_at)
+               VALUES(?,?,?,0,0,0,'','',?,?) ON CONFLICT(as_of_date,theme_code,ts_code) DO UPDATE SET
+               revenue_share=0,matched_sales=0,total_segment_sales=0,evidence_json=excluded.evidence_json,updated_at=excluded.updated_at""", removed_values)
         max_cursor = dict(source_cursor_row) if source_cursor_row else {}
         if cutoff:
             status = "historical_partial" if partial else "historical_completed"
