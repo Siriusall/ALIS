@@ -1234,6 +1234,8 @@ def _upsert_raw_records(api_name: str, df: pd.DataFrame) -> int:
     written = 0
     field_audit: dict[tuple[str, str, str], dict[str, float]] = {}
     with _conn() as c:
+        if api_name in {"cn_ppi", "cn_ppi_headline", "cn_cpi"}:
+            _normalize_monthly_raw_record_keys(c, api_name)
         for idx, row in df.iterrows():
             payload = _clean_payload(row.to_dict())
             if api_name in {"daily", "daily_basic", "stk_limit"}:
@@ -1581,6 +1583,9 @@ def _record_key(api_name: str, payload: dict[str, Any], idx: Any) -> str:
         "cal_date",
         "exchange",
         "exchange_id",
+        "month",
+        "MONTH",
+        "date",
         "name",
         "code",
         "nav_date",
@@ -1593,6 +1598,37 @@ def _record_key(api_name: str, payload: dict[str, Any], idx: Any) -> str:
     if not parts:
         parts = [str(idx)]
     return "|".join(parts)[:240]
+
+
+def _normalize_monthly_raw_record_keys(c: Any, api_name: str) -> dict[str, int]:
+    """Replace unstable positional keys for bounded monthly macro series."""
+    rows = c.execute(
+        """SELECT id,record_key,payload_json,updated_at
+             FROM dc_tushare_raw_records WHERE api_name=?
+             ORDER BY updated_at DESC,id DESC""",
+        (api_name,),
+    ).fetchall()
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for raw in rows:
+        row = dict(raw)
+        try:
+            payload = json.loads(row.get("payload_json") or "{}")
+        except (TypeError, json.JSONDecodeError):
+            continue
+        desired = _record_key(api_name, payload if isinstance(payload, dict) else {}, row.get("id"))
+        grouped.setdefault(desired, []).append(row)
+    changed = deleted = 0
+    for desired, candidates in grouped.items():
+        winner = candidates[0]
+        loser_ids = [int(item["id"]) for item in candidates[1:]]
+        if loser_ids:
+            placeholders = ",".join("?" for _ in loser_ids)
+            c.execute(f"DELETE FROM dc_tushare_raw_records WHERE id IN ({placeholders})", tuple(loser_ids))
+            deleted += len(loser_ids)
+        if str(winner.get("record_key") or "") != desired:
+            c.execute("UPDATE dc_tushare_raw_records SET record_key=? WHERE id=?", (desired, int(winner["id"])))
+            changed += 1
+    return {"changed": changed, "deleted_duplicates": deleted}
 
 
 def normalize_report_rc_record_keys(*, limit: int = 200_000) -> dict[str, int]:

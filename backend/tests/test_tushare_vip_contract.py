@@ -61,6 +61,38 @@ def test_report_rc_key_keeps_broker_report_and_forecast_period_identity():
     assert len({first, next_period, next_broker}) == 3
 
 
+def test_monthly_macro_record_key_is_stable_by_month_not_dataframe_position():
+    july = data_center._record_key("cn_ppi", {"month": "202607", "ppi_yoy": 1.2}, 0)
+    july_reordered = data_center._record_key("cn_ppi", {"month": "202607", "ppi_yoy": 1.2}, 416)
+    june = data_center._record_key("cn_ppi", {"month": "202606", "ppi_yoy": 1.1}, 0)
+
+    assert july == july_reordered == "202607"
+    assert june == "202606"
+    assert june != july
+
+
+def test_monthly_macro_key_normalization_keeps_latest_and_removes_duplicate():
+    calls = []
+
+    class Rows:
+        def fetchall(self):
+            return [
+                {"id": 2, "record_key": "0", "payload_json": '{"month":"202606","ppi_yoy":4.1}', "updated_at": "2026-08-11"},
+                {"id": 1, "record_key": "legacy", "payload_json": '{"month":"202606","ppi_yoy":4.0}', "updated_at": "2026-07-17"},
+            ]
+
+    class Connection:
+        def execute(self, sql, params=()):
+            calls.append((sql, params))
+            return Rows()
+
+    result = data_center._normalize_monthly_raw_record_keys(Connection(), "cn_ppi")
+
+    assert result == {"changed": 1, "deleted_duplicates": 1}
+    assert any("DELETE FROM dc_tushare_raw_records" in sql and params == (1,) for sql, params in calls)
+    assert any("UPDATE dc_tushare_raw_records SET record_key" in sql and params == ("202606", 2) for sql, params in calls)
+
+
 def test_raw_payload_json_rejects_non_standard_nan():
     assert data_center._strict_json({"value": None}) == '{"value": null}'
     with pytest.raises(ValueError):
