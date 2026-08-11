@@ -329,6 +329,15 @@ def _defer_empty_request_if_exhausted(api_name: str, params: dict[str, Any], lim
     return True
 
 
+def _mature_fund_nav_empty(params: dict[str, Any], *, today_value: date | None = None) -> bool:
+    end_date = str(params.get("end_date") or params.get("nav_date") or "")
+    if len(end_date) != 8 or not end_date.isdigit():
+        return False
+    observed = (today_value or date.today()).strftime("%Y%m%d")
+    cutoff = _etf_nav_publish_cutoff(observed)
+    return bool(cutoff and end_date <= cutoff)
+
+
 def _recent_calendar_window(days_back: int = 30, days_forward: int = 60) -> tuple[str, str]:
     start = (date.today() - timedelta(days=days_back)).strftime("%Y%m%d")
     end = (date.today() + timedelta(days=days_forward)).strftime("%Y%m%d")
@@ -910,7 +919,9 @@ def sync_tushare_api_raw(api_name: str, params: dict[str, Any] | None = None, *,
                 _record_request_coverage(api_name, request_params, limit_rows, 0, result_status="not_applicable", result_reason="listed_after_period")
                 _emit_tushare_activity("skipped", api_name, request_params, rows=0, written=0, category="not_applicable", error="股票上市日晚于报告期")
                 return {"ok": True, "api": api_name, "run_id": run_id, "rows_read": 0, "rows_written": 0, "not_applicable": True}
-            if api_name in VALID_EMPTY_TUSHARE_APIS:
+            if api_name in VALID_EMPTY_TUSHARE_APIS or (
+                api_name == "fund_nav" and _mature_fund_nav_empty(request_params)
+            ):
                 finish_ingestion_run(run_id, status="valid_empty", rows_read=0, rows_written=0, meta={"api": api_name, "params": request_params, "reason": "no_optional_event"})
                 _record_request_coverage(api_name, request_params, limit_rows, 0, result_status="valid_empty", result_reason="no_optional_event")
                 _resolve_failed_tushare_request(api_name, request_params, limit_rows)
@@ -2306,6 +2317,44 @@ def _etf_nav_publish_cutoff(end_date: str, *, lag_open_sessions: int = 2) -> str
         return ""
     index = min(max(0, int(lag_open_sessions)), len(dates) - 1)
     return dates[index]
+
+
+def resolve_mature_fund_nav_empty_requests(*, limit: int = 500) -> dict[str, Any]:
+    """Close historical ETF NAV empties after the publication lag has elapsed."""
+    cutoff = _etf_nav_publish_cutoff(date.today().strftime("%Y%m%d"))
+    cap = max(1, min(int(limit), 2_000))
+    with _conn() as c:
+        rows = c.execute(
+            """SELECT id,params_json,limit_rows,attempts
+                 FROM dc_tushare_failed_requests
+                WHERE api_name='fund_nav' AND status='pending' AND error_category='empty_pending'
+                ORDER BY last_failed_at,id LIMIT ?""",
+            (cap,),
+        ).fetchall()
+    resolved = skipped = 0
+    for raw in rows:
+        item = dict(raw)
+        try:
+            params = json.loads(item.get("params_json") or "{}")
+        except (TypeError, json.JSONDecodeError):
+            skipped += 1
+            continue
+        end_date = str(params.get("end_date") or params.get("nav_date") or "")
+        if not cutoff or len(end_date) != 8 or not end_date.isdigit() or end_date > cutoff:
+            skipped += 1
+            continue
+        _record_request_coverage(
+            "fund_nav", params, item.get("limit_rows"), 0,
+            result_status="valid_empty",
+            result_reason=f"mature_empty_after_nav_publish_cutoff_{cutoff}",
+        )
+        _resolve_failed_tushare_request("fund_nav", params, item.get("limit_rows"))
+        resolved += 1
+    return {
+        "ok": True, "status": "completed", "cutoff": cutoff,
+        "examined": len(rows), "resolved": resolved, "skipped": skipped,
+        "policy": "fund_nav_empty_only_after_two_open_session_publication_lag",
+    }
 
 
 def backfill_capital_structure_history(

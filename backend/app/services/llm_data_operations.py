@@ -489,6 +489,9 @@ def run_deterministic_data_operations_cycle(
     or availability risk to the daily deterministic cycle.
     """
     _ensure_table()
+    from app.data_platform.services.data_center import resolve_mature_fund_nav_empty_requests
+
+    fund_nav_cleanup = resolve_mature_fund_nav_empty_requests(limit=500)
     evidence = build_data_operations_evidence(cycle_steps=cycle_steps)
     case_key = hashlib.sha256(json.dumps(
         {"execution_mode": "deterministic_v2", "evidence": evidence},
@@ -515,6 +518,7 @@ def run_deterministic_data_operations_cycle(
             "case_key": case_key,
             "reused": True,
             "execution_mode": "deterministic",
+            "fund_nav_cleanup": fund_nav_cleanup,
             "execution": cached_result,
         }
 
@@ -563,6 +567,7 @@ def run_deterministic_data_operations_cycle(
         "case_id": int(dict(row).get("id") or 0),
         "case_key": case_key,
         "execution_mode": "deterministic",
+        "fund_nav_cleanup": fund_nav_cleanup,
         "proposal": proposal,
         "governance": governance,
         "execution": result,
