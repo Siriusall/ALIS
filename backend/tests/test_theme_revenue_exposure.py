@@ -1,9 +1,30 @@
 from app.services.theme_revenue_exposure import (
     _company_exposures,
+    _execute_many,
     _initial_company_rows,
     _latest_segment_rows,
     _matching_themes,
 )
+
+
+def test_execute_many_uses_public_raw_connection_contract():
+    calls = []
+
+    class Cursor:
+        def executemany(self, sql, rows):
+            calls.append((sql, rows))
+
+    class RawConnection:
+        def cursor(self):
+            return Cursor()
+
+    class Connection:
+        _is_postgres = True
+        raw = RawConnection()
+
+    _execute_many(Connection(), "INSERT INTO sample VALUES(?,?)", [(1, 2)])
+
+    assert calls == [("INSERT INTO sample VALUES(%s,%s)", [(1, 2)])]
 
 
 def test_business_segment_theme_matching_keeps_multiple_supported_themes():

@@ -156,13 +156,13 @@ def _execute_many(conn: Any, sql: str, rows: list[tuple[Any, ...]]) -> None:
     if not rows:
         return
     if getattr(conn, "_is_postgres", False):
-        cursor = conn._conn.cursor()
+        cursor = conn.raw.cursor()
         cursor.executemany(sql.replace("?", "%s"), rows)
     elif getattr(conn, "_is_mysql", False):
-        cursor = conn._conn.cursor()
+        cursor = conn.raw.cursor()
         cursor.executemany(sql.replace("?", "%s"), rows)
     else:
-        conn._conn.executemany(sql, rows)
+        conn.raw.executemany(sql, rows)
 
 
 def _current_exposure_rows(conn: Any, codes: list[str], *, batch_size: int = 500) -> dict[str, list[dict[str, Any]]]:
