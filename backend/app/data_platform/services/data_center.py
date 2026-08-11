@@ -2332,6 +2332,44 @@ def _etf_nav_publish_cutoff(end_date: str, *, lag_open_sessions: int = 2) -> str
     return dates[index]
 
 
+def _bulk_mark_requests_valid_empty(
+    api_name: str,
+    records: list[tuple[int, dict[str, Any], int | None]],
+    *,
+    reason: str,
+) -> int:
+    if not records:
+        return 0
+    now = _now()
+    coverage_rows = []
+    resolved_rows = []
+    request_keys = []
+    for request_id, params, limit_rows in records:
+        key = _request_key(api_name, params, limit_rows)
+        request_keys.append(key)
+        coverage_rows.append((
+            key, api_name, str(params.get("ts_code") or ""), str(params.get("trade_date") or ""),
+            str(params.get("period") or params.get("enddate") or ""),
+            json.dumps(params, ensure_ascii=False, sort_keys=True), 0, "valid_empty", reason[:500], now,
+        ))
+        resolved_rows.append((now, int(request_id)))
+    with _conn() as c:
+        coverage_sql = """INSERT INTO dc_tushare_request_coverage
+               (request_key,api_name,ts_code,trade_date,period,params_json,rows_read,result_status,result_reason,checked_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?)
+               ON CONFLICT(request_key) DO UPDATE SET rows_read=excluded.rows_read,result_status=excluded.result_status,
+                   result_reason=excluded.result_reason,checked_at=excluded.checked_at"""
+        resolved_sql = """UPDATE dc_tushare_failed_requests
+                               SET status='resolved',resolved_at=?
+                             WHERE id=? AND status='pending'"""
+        cursor = c.raw.cursor() if bool(getattr(c, "_is_postgres", False)) else c.raw
+        cursor.executemany(coverage_sql.replace("?", "%s") if bool(getattr(c, "_is_postgres", False)) else coverage_sql, coverage_rows)
+        cursor.executemany(resolved_sql.replace("?", "%s") if bool(getattr(c, "_is_postgres", False)) else resolved_sql, resolved_rows)
+    for key in request_keys:
+        redis_set_remove("alis:data-platform:tushare:failed", key)
+    return len(records)
+
+
 def resolve_mature_fund_nav_empty_requests(*, limit: int = 500) -> dict[str, Any]:
     """Close historical ETF NAV empties after the publication lag has elapsed."""
     cutoff = _etf_nav_publish_cutoff(date.today().strftime("%Y%m%d"))
@@ -2344,7 +2382,8 @@ def resolve_mature_fund_nav_empty_requests(*, limit: int = 500) -> dict[str, Any
                 ORDER BY last_failed_at,id LIMIT ?""",
             (cap,),
         ).fetchall()
-    resolved = skipped = 0
+    eligible: list[tuple[int, dict[str, Any], int | None]] = []
+    skipped = 0
     for raw in rows:
         item = dict(raw)
         try:
@@ -2356,13 +2395,10 @@ def resolve_mature_fund_nav_empty_requests(*, limit: int = 500) -> dict[str, Any
         if not cutoff or len(end_date) != 8 or not end_date.isdigit() or end_date > cutoff:
             skipped += 1
             continue
-        _record_request_coverage(
-            "fund_nav", params, item.get("limit_rows"), 0,
-            result_status="valid_empty",
-            result_reason=f"mature_empty_after_nav_publish_cutoff_{cutoff}",
-        )
-        _resolve_failed_tushare_request("fund_nav", params, item.get("limit_rows"))
-        resolved += 1
+        eligible.append((int(item["id"]), params, item.get("limit_rows")))
+    resolved = _bulk_mark_requests_valid_empty(
+        "fund_nav", eligible, reason=f"mature_empty_after_nav_publish_cutoff_{cutoff}",
+    )
     return {
         "ok": True, "status": "completed", "cutoff": cutoff,
         "examined": len(rows), "resolved": resolved, "skipped": skipped,
@@ -2383,7 +2419,8 @@ def resolve_mature_optional_daily_empty_requests(*, limit: int = 100) -> dict[st
                 ORDER BY last_failed_at,id LIMIT ?""",
             (cap,),
         ).fetchall()
-    resolved = skipped = 0
+    eligible: list[tuple[int, dict[str, Any], int | None]] = []
+    skipped = 0
     for raw in rows:
         item = dict(raw)
         try:
@@ -2395,13 +2432,11 @@ def resolve_mature_optional_daily_empty_requests(*, limit: int = 100) -> dict[st
         if not cutoff or len(target_date) != 8 or not target_date.isdigit() or target_date > cutoff:
             skipped += 1
             continue
-        _record_request_coverage(
-            "moneyflow_hsgt", params, item.get("limit_rows"), 0,
-            result_status="valid_empty",
-            result_reason=f"optional_daily_empty_after_publication_cutoff_{cutoff}",
-        )
-        _resolve_failed_tushare_request("moneyflow_hsgt", params, item.get("limit_rows"))
-        resolved += 1
+        eligible.append((int(item["id"]), params, item.get("limit_rows")))
+    resolved = _bulk_mark_requests_valid_empty(
+        "moneyflow_hsgt", eligible,
+        reason=f"optional_daily_empty_after_publication_cutoff_{cutoff}",
+    )
     return {
         "ok": True, "status": "completed", "cutoff": cutoff,
         "examined": len(rows), "resolved": resolved, "skipped": skipped,

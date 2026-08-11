@@ -113,6 +113,45 @@ def test_optional_hsgt_empty_only_becomes_terminal_after_publish_lag(monkeypatch
     assert data_center._mature_optional_daily_empty(
         "moneyflow_hsgt", {"trade_date": "20260810"}, today_value=data_center.date(2026, 8, 11)
     ) is False
+
+
+def test_valid_empty_cleanup_batches_coverage_and_resolution(monkeypatch):
+    batches = []
+
+    class Cursor:
+        def executemany(self, sql, rows):
+            batches.append((sql, list(rows)))
+
+    class Raw:
+        def cursor(self):
+            return Cursor()
+
+    class Connection:
+        _is_postgres = True
+        raw = Raw()
+
+    class Context:
+        def __enter__(self):
+            return Connection()
+
+        def __exit__(self, *_args):
+            return False
+
+    removed = []
+    monkeypatch.setattr(data_center, "_conn", lambda: Context())
+    monkeypatch.setattr(data_center, "redis_set_remove", lambda namespace, key: removed.append((namespace, key)))
+
+    resolved = data_center._bulk_mark_requests_valid_empty(
+        "fund_nav",
+        [(11, {"ts_code": "159001.SZ", "end_date": "20260807"}, None),
+         (12, {"ts_code": "159002.SZ", "end_date": "20260807"}, None)],
+        reason="mature",
+    )
+
+    assert resolved == 2
+    assert len(batches) == 2
+    assert len(batches[0][1]) == len(batches[1][1]) == 2
+    assert len(removed) == 2
     assert data_center._mature_optional_daily_empty(
         "moneyflow", {"trade_date": "20260807"}, today_value=data_center.date(2026, 8, 11)
     ) is False
