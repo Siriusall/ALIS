@@ -44,7 +44,7 @@ COPYFILE_DISABLE=1 tar --no-xattrs -czf "$output" -C "$staging" .
 tar -tzf "$output" >/dev/null
 tar -xOf "$output" ./.alis-release-manifest >/dev/null
 tar -xOf "$output" ./frontend/dist/index.html >/dev/null
-if gzip -dc "$output" | strings | grep 'LIBARCHIVE.xattr' >/dev/null; then
+if gzip -dc "$output" | strings | grep -E '^[0-9]+ (LIBARCHIVE|SCHILY)\.xattr\.' >/dev/null; then
   echo "Refusing release bundle containing extended attributes" >&2
   exit 1
 fi
