@@ -4,9 +4,12 @@ import copy
 from datetime import datetime
 import json
 import os
+import socket
 import threading
 import time
+from datetime import timedelta
 from typing import Any, Callable
+import uuid
 
 from app.core.error_evidence import error_evidence
 from app.db.store import _conn
@@ -37,6 +40,65 @@ _owner_summary_cache: tuple[float, dict[str, Any]] | None = None
 _OWNER_SUMMARY_CACHE_TTL_SECONDS = 30.0
 
 
+def _claim_distributed_step_lease(name: str, timeout_seconds: float) -> str | None:
+    """Claim one cross-process lease for an autonomy step name."""
+    token = uuid.uuid4().hex
+    now = datetime.now().astimezone()
+    expires_at = now + timedelta(seconds=max(900.0, float(timeout_seconds) * 2.0 + 300.0))
+    with _conn() as conn:
+        conn.execute("""CREATE TABLE IF NOT EXISTS autonomy_step_leases (
+            step_name VARCHAR(160) PRIMARY KEY,
+            lease_token VARCHAR(64) NOT NULL,
+            lease_owner VARCHAR(255) NOT NULL,
+            acquired_at VARCHAR(64) NOT NULL,
+            expires_at VARCHAR(64) NOT NULL
+        )""")
+        if getattr(conn, "_is_postgres", False):
+            conn.execute("SELECT pg_advisory_xact_lock(hashtext(?))", (f"autonomy-step:{name}",))
+        row = conn.execute(
+            "SELECT lease_token,lease_owner,expires_at FROM autonomy_step_leases WHERE step_name=?",
+            (name,),
+        ).fetchone()
+        if row:
+            item = dict(row)
+            try:
+                active_until = datetime.fromisoformat(str(item.get("expires_at") or ""))
+            except ValueError:
+                active_until = now
+            owner = str(item.get("lease_owner") or "")
+            owner_alive = True
+            try:
+                if owner.startswith("pid:"):
+                    owner_host, owner_pid_text = socket.gethostname(), owner[4:]
+                else:
+                    owner_host, owner_pid_text = owner.rsplit(":pid:", 1)
+                if owner_host == socket.gethostname():
+                    owner_pid = int(owner_pid_text)
+                    os.kill(owner_pid, 0)
+            except ProcessLookupError:
+                owner_alive = False
+            except (ValueError, PermissionError, OSError):
+                owner_alive = True
+            if active_until > now and owner_alive:
+                return None
+        conn.execute(
+            """INSERT INTO autonomy_step_leases(step_name,lease_token,lease_owner,acquired_at,expires_at)
+               VALUES(?,?,?,?,?) ON CONFLICT(step_name) DO UPDATE SET
+               lease_token=excluded.lease_token,lease_owner=excluded.lease_owner,
+               acquired_at=excluded.acquired_at,expires_at=excluded.expires_at""",
+            (name, token, f"{socket.gethostname()}:pid:{os.getpid()}", now.isoformat(), expires_at.isoformat()),
+        )
+    return token
+
+
+def _release_distributed_step_lease(name: str, token: str) -> None:
+    with _conn() as conn:
+        conn.execute(
+            "DELETE FROM autonomy_step_leases WHERE step_name=? AND lease_token=?",
+            (name, token),
+        )
+
+
 def _run_step(name: str, fn: Callable[[], dict[str, Any]]) -> dict[str, Any]:
     """Run a bounded step without blocking the autonomous bus.
 
@@ -63,16 +125,33 @@ def _run_step(name: str, fn: Callable[[], dict[str, Any]]) -> dict[str, Any]:
     )
     finished = threading.Event()
     outcome: dict[str, Any] = {}
+    scope_holder: dict[str, str] = {}
 
     def worker() -> None:
+        lease_token = ""
         try:
-            result = fn()
-            if not isinstance(result, dict):
-                raise TypeError("autonomy_step_must_return_dict")
-            outcome["result"] = result
+            from app.core.autonomy_step_control import autonomy_step_scope, raise_if_cancelled
+
+            with autonomy_step_scope() as scope_id:
+                scope_holder["id"] = scope_id
+                lease_token = _claim_distributed_step_lease(name, timeout_seconds) or ""
+                if not lease_token:
+                    outcome["error"] = "previous_autonomy_step_still_running_across_workers"
+                    return
+                raise_if_cancelled()
+                result = fn()
+                raise_if_cancelled()
+                if not isinstance(result, dict):
+                    raise TypeError("autonomy_step_must_return_dict")
+                outcome["result"] = result
         except Exception as exc:  # noqa: BLE001 - step failure is evidence, not bus failure
             outcome["error"] = str(exc)[:2000]
         finally:
+            if lease_token:
+                try:
+                    _release_distributed_step_lease(name, lease_token)
+                except Exception as exc:  # noqa: BLE001 - preserve the step outcome
+                    outcome.setdefault("lease_release_error", str(exc)[:500])
             with _running_steps_lock:
                 _running_steps.discard(name)
             finished.set()
@@ -80,6 +159,9 @@ def _run_step(name: str, fn: Callable[[], dict[str, Any]]) -> dict[str, Any]:
     thread = threading.Thread(target=worker, name=f"alis-autonomy-{name}", daemon=True)
     thread.start()
     if not finished.wait(timeout_seconds):
+        from app.core.autonomy_step_control import cancel_autonomy_scope
+
+        cancelled_connections = cancel_autonomy_scope(scope_holder.get("id", ""))
         step = {
             "name": name,
             "ok": False,
@@ -91,12 +173,13 @@ def _run_step(name: str, fn: Callable[[], dict[str, Any]]) -> dict[str, Any]:
                 "timeout_seconds": timeout_seconds,
                 "worker_alive": thread.is_alive(),
                 "late_result_policy": "discarded_from_bus_terminal_state",
+                "cancelled_postgres_connections": cancelled_connections,
             },
             "error": f"autonomy_step_timeout:{timeout_seconds}s",
             "timing": {
                 "budget_seconds": timeout_seconds,
                 "over_budget": True,
-                "policy": "bus_continues; worker_finishes_without_reentry",
+                "policy": "bus_continues; postgres_queries_cancelled; lease_blocks_cross_worker_reentry",
             },
             "health": {"status": "degraded", "reason": "timed_out"},
         }

@@ -452,6 +452,28 @@ def test_step_timeout_records_failure_without_blocking_bus(monkeypatch):
 
     assert step["ok"] is False
     assert step["result"]["status"] == "timed_out"
+    assert step["result"]["cancelled_postgres_connections"] == 0
+    assert "lease_blocks_cross_worker_reentry" in step["timing"]["policy"]
+
+
+def test_step_timeout_actively_cancels_postgres_query(monkeypatch):
+    from app.db.store import _conn
+
+    monkeypatch.setattr(system_autonomy, "_STEP_TIMEOUT_SECONDS", 0.05)
+
+    def slow_query():
+        with _conn() as conn:
+            conn.execute("SELECT pg_sleep(5)")
+        return {"ok": True}
+
+    step = system_autonomy._run_step("postgres_cancel_test", slow_query)
+
+    assert step["result"]["status"] == "timed_out"
+    assert step["result"]["cancelled_postgres_connections"] == 1
+    deadline = time.monotonic() + 1
+    while "postgres_cancel_test" in system_autonomy._running_steps and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert "postgres_cancel_test" not in system_autonomy._running_steps
 
 
 def test_known_long_step_uses_independent_timeout_budget(monkeypatch):

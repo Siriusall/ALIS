@@ -672,6 +672,8 @@ def _conn():
                 timeout=connect_timeout,
                 role="data-platform",
             )
+            from app.core.autonomy_step_control import register_postgres_connection, unregister_postgres_connection
+            cancellation_registration = register_postgres_connection(raw)
             try:
                 raw.execute(
                     "SELECT set_config('statement_timeout', %s, false)",
@@ -685,6 +687,7 @@ def _conn():
                 yield conn
                 raw.commit()
             finally:
+                unregister_postgres_connection(cancellation_registration)
                 raw.close()
         return
     default_path = Path(__file__).resolve().parents[1] / "data" / "data-platform.db"

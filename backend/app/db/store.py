@@ -224,6 +224,8 @@ def _conn():
                 timeout=settings.database_connect_timeout_seconds,
                 role="business",
             )
+            from app.core.autonomy_step_control import register_postgres_connection, unregister_postgres_connection
+            cancellation_registration = register_postgres_connection(raw)
             w = None
             try:
                 raw.execute("SELECT set_config('statement_timeout', %s, false)", (str(settings.database_statement_timeout_ms),))
@@ -235,6 +237,7 @@ def _conn():
                 yield w
                 w.commit()
             finally:
+                unregister_postgres_connection(cancellation_registration)
                 if w is not None:
                     w.close()
                 else:

@@ -279,6 +279,8 @@ ALIS 的目标运行方式调整为“系统自治、结果可见、异常才打
 
 完成日期：2026-07-23（UTC+8）；2026-07-24 完成取消、超时和重启恢复加固。
 完成内容：新增 PostgreSQL `evolution_tasks` 持久化账本和 `Evolution Orchestrator`，实现任务去重、租约领取、心跳、指数退避重试、检查点恢复、安全取消、资源预算和每日/每周调度；正式 OOS 支持逐窗口持久化并从检查点续跑；策略实验室已展示任务状态、进度、重试次数、预计剩余时间、下一计划时间及正式横向基线。取消现在原子进入 `cancelled` 并立即释放租约，迟到 worker 不得覆盖终态；服务重启只恢复租约失效或同机原 PID 已死亡的任务，不抢占仍存活实例。自治步骤超过 120 秒会记录 `timed_out` 并继续总线，同名步骤和因子自愈重试在原线程退出前均被阻断。
+
+2026-08-11 完成自治步骤跨进程租约与 PostgreSQL 主动取消 V1：`autonomy_step_leases` 以步骤名、随机 token、主机 PID 和到期时间阻止不同 app/worker 进程并发执行同名步骤；同机 PID 已死亡或租约到期时才允许接管，正常结束只按原 token 释放。业务库和数据平台库连接会登记到当前自治取消域，步骤到达总线期限时对所有仍存活的 PostgreSQL 连接调用 `cancel()`，使慢 SQL 实际退出并释放连接，而非只丢弃返回值；取消域在租约领取前建立，避免领取租约本身超时后又继续启动业务函数。真实测试以 `pg_sleep(5)` 验证 50 毫秒总线期限后发送一次数据库取消且原线程在 1 秒内退出，并覆盖跨 owner 防重、释放后接管和死 PID 恢复。外部 HTTP 的连接/读取短超时在各数据源竞速步骤单独治理，不把 Python 无法强杀线程伪装成通用强制取消。后端全量回归 `975 passed、1 skipped、6 subtests passed`。
 涉及文件：`backend/app/services/evolution_orchestrator.py`、`backend/app/services/walk_forward_validation.py`、`backend/app/db/store.py`、`backend/app/main.py`、`backend/app/api/routes/model_strategy.py`、`frontend/src/components/StrategyLabPage.tsx`。
 验证方式：后端定向测试、前端生产构建、真实 PostgreSQL 后台任务和浏览器页面验收。
 验证结果：后台已真实完成因子日任务、策略影子任务和自适应 Challenger 快速诊断；失败任务保留审计证据，后续任务可继续领取。2026-07-24 任务 25/26 已进入 `cancelled` 且租约为空；任务 29 在运行中重启后从 attempt 1 自动恢复为 attempt 2，27 步最终 `completed`、租约为空。受控完整总线测试验证单步骤超时后后续步骤和自愈收尾仍会执行，且不会并发重入。当前后端全量回归 `380 passed、1 skipped、6 subtests passed`，前端最近一次生产构建完成 839 个模块。
