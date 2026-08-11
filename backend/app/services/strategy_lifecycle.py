@@ -718,7 +718,15 @@ def run_strategy_shadow_cycle(
 ) -> dict[str, Any]:
     audit = audit_oos_hard_data(include_dates=False)
     if audit.get("status") != "ready":
-        raise RuntimeError("OOS 永久硬数据未就绪，影子观察冻结")
+        return {
+            "ok": True,
+            "schema_version": "alis_strategy_shadow_cycle_v2",
+            "status": "blocked_by_oos_hard_data",
+            "reason": "OOS 永久硬数据未就绪，影子观察冻结",
+            "hard_data": audit,
+            "results": [],
+            "production_change_forbidden": True,
+        }
     ds = BacktestDataSource()
     dates = ds.get_available_trade_dates(str(audit["window_start"]), str(audit["window_end"]))
     active = resolve_production_strategy_champion()

@@ -607,6 +607,20 @@ def test_shadow_competition_promotes_exactly_one_candidate(monkeypatch):
     assert any(model_id == 10 and update["status"] == "shadow_reserve" for model_id, update in validations)
 
 
+def test_shadow_cycle_blocks_cleanly_when_oos_hard_data_is_incomplete(monkeypatch):
+    monkeypatch.setattr(lifecycle, "audit_oos_hard_data", lambda **_kwargs: {
+        "status": "blocked", "eligible_sessions": 1529, "required_sessions": 1537,
+        "repair_dates": ["20260810"],
+    })
+
+    result = lifecycle.run_strategy_shadow_cycle()
+
+    assert result["ok"] is True
+    assert result["status"] == "blocked_by_oos_hard_data"
+    assert result["results"] == []
+    assert result["hard_data"]["eligible_sessions"] == 1529
+
+
 def test_shadow_winner_crosses_real_production_promotion_contract(monkeypatch):
     candidate = {
         "id": 11,

@@ -86,6 +86,23 @@ def _benchmark_date_set(start_date: str, end_date: str) -> set[str]:
     return valid
 
 
+def _repair_benchmark_gaps(
+    benchmark_dates: list[str], benchmark_available: set[str]
+) -> list[dict[str, Any]]:
+    """Use audited peer sources for explicit dates still absent after TuShare."""
+    from app.data_platform.services.eastmoney_index_daily_fallback import (
+        repair_hs300_index_daily_from_eastmoney,
+    )
+
+    results: list[dict[str, Any]] = []
+    for trade_date in benchmark_dates:
+        if trade_date in benchmark_available:
+            continue
+        fallback = repair_hs300_index_daily_from_eastmoney(trade_date)
+        results.append({"trade_date": trade_date, **fallback})
+    return results
+
+
 def audit_oos_hard_data(*, end_date: str | None = None, include_dates: bool = True) -> dict[str, Any]:
     """Audit the latest contiguous protocol-sized calendar window.
 
@@ -250,6 +267,19 @@ def repair_oos_hard_data_batch(trade_dates: list[str], *, date_gaps: dict[str, d
         _benchmark_date_set(min(benchmark_dates), max(benchmark_dates))
         if benchmark_dates else set()
     )
+    benchmark_fallback_results: list[dict[str, Any]] = []
+    # A historical OOS repair is not allowed to depend forever on TuShare.
+    # The batch request can legitimately return only a subset (or an empty
+    # frame) even though an audited equivalent source already publishes the
+    # exact daily bar.  Repair every still-missing explicit date through the
+    # same bounded, cross-checked multi-source adapter used by the daily path.
+    if benchmark_dates:
+        benchmark_fallback_results = _repair_benchmark_gaps(
+            benchmark_dates, benchmark_available
+        )
+        benchmark_available = _benchmark_date_set(
+            min(benchmark_dates), max(benchmark_dates)
+        )
     results = []
     for trade_date in trade_dates:
         adj = adj_by_date.get(trade_date) or ({"ok": bool(adj_batch.get("ok")), "batch": True} if trade_date in adj_dates else {"ok": True, "skipped": True})
@@ -272,5 +302,6 @@ def repair_oos_hard_data_batch(trade_dates: list[str], *, date_gaps: dict[str, d
         "dates": trade_dates,
         "adj_factor_batch": adj_batch,
         "benchmark_batch": benchmark_batch,
+        "benchmark_fallback_results": benchmark_fallback_results,
         "contract": CONTRACT_VERSION,
     }
