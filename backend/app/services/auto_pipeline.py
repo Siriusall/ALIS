@@ -23,28 +23,26 @@ def run_daily_maintenance(*, max_candidates: int = 50) -> dict[str, Any]:
     research_count = 0
     for p in positions:
         code = str(p.get("symbol", "")).strip().upper()
-        if not code.endswith(".SH") and not code.endswith(".SZ"):
-            for suffix in (".SH", ".SZ"):
-                try:
-                    r = build_stock_research(f"{code}{suffix}", persist=True)
-                    if r.get("ok"):
-                        research_count += 1
-                    break
-                except Exception as e:
-                    errors.append(f"research_{code}{suffix}: {str(e)[:60]}")
-                    continue
-        else:
+        candidates = [code] if code.endswith((".SH", ".SZ")) else [f"{code}.SH", f"{code}.SZ"]
+        attempt_errors = []
+        for candidate in candidates:
             try:
-                r = build_stock_research(code, persist=True)
+                r = build_stock_research(candidate, persist=True)
                 if r.get("ok"):
                     research_count += 1
+                    attempt_errors = []
+                    break
+                attempt_errors.append(f"research_{candidate}: {r.get('status') or r.get('error') or 'not_ok'}")
             except Exception as e:
-                errors.append(f"research_{code}: {str(e)[:60]}")
+                attempt_errors.append(f"research_{candidate}: {str(e)[:60]}")
+        errors.extend(attempt_errors)
 
     # Step 2: Generate watch pool theses (this also fills the pool)
     try:
         pool_result = generate_watch_pool_theses(limit=max_candidates)
         pool_added = pool_result.get("theses_created", 0)
+        if pool_result.get("ok") is False:
+            errors.append(f"pool_theses: {str(pool_result.get('error') or pool_result.get('status') or 'not_ok')[:100]}")
     except Exception as e:
         errors.append(f"pool_theses: {str(e)[:100]}")
         pool_added = 0
@@ -59,13 +57,17 @@ def run_daily_maintenance(*, max_candidates: int = 50) -> dict[str, Any]:
             r = generate_thesis_for_stock(code, force=True)
             if r.get("ok") or r.get("thesis_id"):
                 thesis_count += 1
-        except Exception:
-            pass
+            else:
+                errors.append(f"position_thesis_{code}: {str(r.get('error') or r.get('status') or 'not_ok')[:80]}")
+        except Exception as e:
+            errors.append(f"position_thesis_{code}: {str(e)[:80]}")
 
     # Step 4: Sync position states
     state_count = 0
     for p in positions:
         sym = str(p.get("symbol", "")).strip().upper()
+        if not sym.endswith((".SH", ".SZ")):
+            sym = f"{sym}.SH" if sym.startswith(("6", "9")) else f"{sym}.SZ"
         try:
             transition_position(
                 ts_code=sym,
@@ -75,11 +77,12 @@ def run_daily_maintenance(*, max_candidates: int = 50) -> dict[str, Any]:
                 automatic_decision=True,
             )
             state_count += 1
-        except Exception:
-            pass
+        except Exception as e:
+            errors.append(f"position_state_{sym}: {str(e)[:80]}")
 
     return {
-        "ok": True,
+        "ok": not errors,
+        "status": "completed" if not errors else "partial",
         "results": {
             "research": research_count,
             "pool_theses": pool_added,
@@ -87,6 +90,7 @@ def run_daily_maintenance(*, max_candidates: int = 50) -> dict[str, Any]:
             "position_states": state_count,
         },
         "errors": errors[:10],
+        "error_count": len(errors),
         "timestamp": now,
         "model_version": "daily_maintenance_v1",
     }
