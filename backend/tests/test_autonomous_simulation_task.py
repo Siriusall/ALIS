@@ -172,6 +172,19 @@ def test_today_materializes_when_no_plan_is_due(monkeypatch):
     assert context["today_materialization"] == materialization
 
 
+def test_successful_progress_ignores_uncommitted_task_fields():
+    signal, execute = runner._successful_task_progress(
+        [{"signal_date": "2026-08-07", "execute_date": "2026-08-10"}],
+        {
+            "last_successful_signal_date": "2026-08-06",
+            "last_successful_execute_date": "2026-08-07",
+        },
+    )
+
+    assert signal == "2026-08-07"
+    assert execute == "2026-08-10"
+
+
 def test_autonomous_daily_mode_is_not_downgraded_to_replay():
     assert runner._normalized_replay_mode("autonomous_daily") == "autonomous_daily"
     assert runner._normalized_replay_mode("unknown") == "pragmatic_recover"

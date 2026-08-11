@@ -1746,10 +1746,26 @@ def claim_daily_rebalance_execution_input(
         record = dict(row)
         if str(record.get("status") or "") != "planned":
             return None
+
+        def reject_contract(message: str, code: str) -> None:
+            c.execute(
+                """UPDATE daily_rebalance_plans
+                   SET status='blocked_by_contract_validation',
+                       validation_error_code=?,validation_errors_json=?,validated_at=?
+                   WHERE id=? AND status='planned'""",
+                (
+                    str(code or "invalid_authoritative_plan")[:128],
+                    json.dumps([str(message)[:500]], ensure_ascii=False),
+                    _now(),
+                    int(row["id"]),
+                ),
+            )
+            raise ReplayRiskGateError(str(message), code=code or "invalid_authoritative_plan")
+
         try:
             contract = json.loads(record.get("proposal_json") or "{}")
         except (TypeError, json.JSONDecodeError):
-            return None
+            reject_contract("正式调仓计划 JSON 合同无法解析", "invalid_authoritative_plan")
         schema_version = str(contract.get("schema_version") or "")
         if schema_version != UNIFIED_DAILY_DECISION_SCHEMA_VERSION:
             # Autonomous execution may consume only the current frozen
@@ -1770,10 +1786,9 @@ def claim_daily_rebalance_execution_input(
         canonical = json.dumps(contract, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         actual_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
         if actual_hash != str(record.get("input_hash") or ""):
-            from app.services.quant_run_contracts import ReplayRiskGateError
-            raise ReplayRiskGateError(
+            reject_contract(
                 "正式调仓计划完整合同哈希校验失败",
-                code="invalid_authoritative_plan_hash",
+                "invalid_authoritative_plan_hash",
             )
         if str(contract.get("schema_version") or "") in {
             UNIFIED_DAILY_DECISION_SCHEMA_VERSION,
@@ -1781,7 +1796,10 @@ def claim_daily_rebalance_execution_input(
         }:
             from app.services.quant_run_plan_input import validate_unified_decision_contract
 
-            validate_unified_decision_contract(contract)
+            try:
+                validate_unified_decision_contract(contract)
+            except ReplayRiskGateError as exc:
+                reject_contract(str(exc), str(getattr(exc, "code", "") or "invalid_authoritative_plan"))
             from app.services.system_release_center import validate_frozen_release_for_execution
             frozen_release = (contract.get("decision_version_manifest") or {}).get("release") or {}
             release_gate = validate_frozen_release_for_execution(
@@ -1789,19 +1807,17 @@ def claim_daily_rebalance_execution_input(
                 str(frozen_release.get("manifest_hash") or ""),
             )
             if not release_gate.get("ok"):
-                raise ReplayRiskGateError(
+                reject_contract(
                     f"冻结系统发布与当前执行器不兼容：{release_gate.get('reason')}",
-                    code="incompatible_frozen_system_release",
+                    "incompatible_frozen_system_release",
                 )
             if (
                 str(contract.get("signal_date") or "").replace("-", "")[:8] != signal
                 or str(contract.get("planned_execute_date") or "").replace("-", "")[:8] != execute
             ):
-                from app.services.quant_run_contracts import ReplayRiskGateError
-
-                raise ReplayRiskGateError(
+                reject_contract(
                     "统一正式计划日期与数据库领取条件不一致",
-                    code="invalid_authoritative_plan",
+                    "invalid_authoritative_plan",
                 )
             frozen_strategy_id = int(
                 ((contract.get("selection_snapshot") or {}).get("strategy_id")) or 0
@@ -1810,15 +1826,13 @@ def claim_daily_rebalance_execution_input(
                 expected_strategy_id is not None
                 and frozen_strategy_id != int(expected_strategy_id)
             ):
-                from app.services.quant_run_contracts import ReplayRiskGateError
-
-                raise ReplayRiskGateError(
+                reject_contract(
                     "统一正式计划与执行任务的策略身份不一致",
-                    code="invalid_authoritative_plan",
+                    "invalid_authoritative_plan",
                 )
         proposal = contract.get("proposal") if isinstance(contract, dict) else None
         if not isinstance(proposal, list):
-            return None
+            reject_contract("正式调仓计划缺少冻结提案", "invalid_authoritative_plan")
         changed = c.execute(
             """UPDATE daily_rebalance_plans
                SET status='executing',execution_claim_token=?,execution_claimed_at=?

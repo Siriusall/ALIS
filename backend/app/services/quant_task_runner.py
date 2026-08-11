@@ -586,6 +586,15 @@ def _derive_last_execute_date(task: dict, records: list[dict], waterline: dict |
     return str(wl) if wl else ""
 
 
+def _successful_task_progress(records: list[dict], waterline: dict | None) -> tuple[str, str]:
+    """Recover only committed progress; in-flight task fields are not evidence."""
+    signals = [str(row.get("signal_date") or "") for row in records if row.get("signal_date")]
+    executions = [str(row.get("execute_date") or "") for row in records if row.get("execute_date")]
+    signal = max(signals) if signals else str((waterline or {}).get("last_successful_signal_date") or "")
+    execute = max(executions) if executions else str((waterline or {}).get("last_successful_execute_date") or "")
+    return signal, execute
+
+
 def _preflight_check_step(
     *,
     signal_date: str,
@@ -1333,7 +1342,6 @@ def run_quant_task_async(task_id: int) -> bool:
                         message=pre_decision.message[:160],
                         decision=pre_decision,
                     )
-                    update_quant_run_task(task_id, last_signal_date=signal_date, last_execute_date=execute_date)
                     h = get_quant_run_task_health(task_id)
                     upsert_quant_run_task_health(
                         task_id,
@@ -1354,8 +1362,6 @@ def run_quant_task_async(task_id: int) -> bool:
                     "step_running",
                     processed_steps=processed_total,
                     total_steps=step_total,
-                    last_signal_date=signal_date,
-                    last_execute_date=execute_date,
                     last_message=f"正在计算：信号日 {signal_date} -> 执行日 {execute_date}（{step_idx}/{step_total}）",
                 )
 
@@ -1366,8 +1372,6 @@ def run_quant_task_async(task_id: int) -> bool:
                         "step_running",
                         processed_steps=processed_total,
                         total_steps=step_total,
-                        last_signal_date=signal_date,
-                        last_execute_date=execute_date,
                         last_message=f"{phase_text}（{step_idx}/{step_total}）",
                     )
                 step_t0 = perf_counter()
@@ -1526,9 +1530,43 @@ def run_quant_task_async(task_id: int) -> bool:
             )
         except ReplayRiskGateError as e:
             _quarantine_active_claim(str(e))
-            logger.warning("quant task paused by risk gate task_id=%s code=%s | %s", task_id, getattr(e, "code", ""), str(e)[:160])
+            error_code = str(getattr(e, "code", "") or "replay_risk_gate")
+            contract_rejections = {
+                "legacy_authoritative_plan",
+                "invalid_authoritative_plan",
+                "invalid_authoritative_plan_hash",
+                "incompatible_frozen_system_release",
+            }
+            if mode == "autonomous_daily" and error_code in contract_rejections:
+                committed_records = list_quant_run_task_records(task_id, limit=5000)
+                committed_waterline = get_quant_replay_waterline(
+                    strategy_id=int(task0.get("strategy_id") or 0),
+                    exchange_group=str(task0.get("exchange_group") or "HS"),
+                )
+                successful_signal, successful_execute = _successful_task_progress(
+                    committed_records,
+                    committed_waterline,
+                )
+                _transition_task_status(
+                    task_id,
+                    "pending",
+                    "invalid_frozen_plan_quarantined",
+                    replay_status="waiting_schedule",
+                    last_signal_date=successful_signal or None,
+                    last_execute_date=successful_execute or None,
+                    error=None,
+                    finished_at=None,
+                    last_message="无效冻结计划已隔离，等待下一份到期正式计划",
+                )
+                logger.error(
+                    "invalid autonomous frozen plan quarantined task_id=%s code=%s",
+                    task_id,
+                    error_code,
+                )
+                return
+            logger.warning("quant task paused by risk gate task_id=%s code=%s | %s", task_id, error_code, str(e)[:160])
             decision = pause_decision(
-                code=getattr(e, "code", "replay_risk_gate"),
+                code=error_code,
                 message=str(e)[:160],
                 recovery_condition="按暂停原因补齐数据、资金或时段条件后点击继续。",
                 exit_condition="若同一风控原因连续触发，停止任务并人工复盘策略/数据源。",
@@ -1550,7 +1588,7 @@ def run_quant_task_async(task_id: int) -> bool:
                 step_count=int(h.get("step_count") or 0),
                 risk_hit_count=int(h.get("risk_hit_count") or 0) + 1,
                 consecutive_pause_count=int(h.get("consecutive_pause_count") or 0) + 1,
-                last_risk_code=getattr(e, "code", "replay_risk_gate"),
+                last_risk_code=error_code,
             )
         except Exception as e:  # noqa: BLE001
             _quarantine_active_claim(str(e))

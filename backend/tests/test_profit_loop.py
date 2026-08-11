@@ -409,10 +409,10 @@ def test_missed_formal_plans_leave_pending_state_and_cannot_execute_late(monkeyp
     assert claimed is None
 
 
-def test_invalid_unified_contract_never_transitions_plan_to_executing(monkeypatch):
-    state = {"status": "planned", "update_attempted": False}
+def test_invalid_unified_contract_is_quarantined_without_executing(monkeypatch):
+    state = {"status": "planned", "execution_attempted": False}
     contract = {
-        "schema_version": "alis_unified_daily_decision_v1",
+        "schema_version": profit_loop.UNIFIED_DAILY_DECISION_SCHEMA_VERSION,
         "proposal": [],
     }
     canonical = json.dumps(contract, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
@@ -438,9 +438,11 @@ def test_invalid_unified_contract_never_transitions_plan_to_executing(monkeypatc
             def execute(self, sql, _params=()):
                 if sql.lstrip().startswith("SELECT * FROM daily_rebalance_plans"):
                     return Result([plan])
+                if "SET status='blocked_by_contract_validation'" in sql:
+                    state["status"] = "blocked_by_contract_validation"
                 if "SET status='executing'" in sql:
                     state["status"] = "executing"
-                    state["update_attempted"] = True
+                    state["execution_attempted"] = True
                 return Result([])
 
         yield Conn()
@@ -453,7 +455,7 @@ def test_invalid_unified_contract_never_transitions_plan_to_executing(monkeypatc
             "20260724", "20260727", claim_token="task-invalid",
         )
 
-    assert state == {"status": "planned", "update_attempted": False}
+    assert state == {"status": "blocked_by_contract_validation", "execution_attempted": False}
 
 
 def test_unified_strategy_identity_mismatch_never_claims_plan(monkeypatch):
