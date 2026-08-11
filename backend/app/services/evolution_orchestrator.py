@@ -44,6 +44,8 @@ LOW_MEMORY_WORKER = str(os.getenv("ALIS_WORKER_PROFILE", "")).lower() in {"2gb",
 WORKER_RESEARCH_BATCH_SIZE = 1 if LOW_MEMORY_WORKER else 4
 AUTO_WEEKDAY = max(0, min(int(os.getenv("EVOLUTION_AUTO_WEEKDAY", "4")), 6))
 AUTO_HOUR = max(0, min(int(os.getenv("EVOLUTION_AUTO_HOUR", "18")), 23))
+RESEARCH_CUTOFF_HOUR = max(0, min(int(os.getenv("EVOLUTION_RESEARCH_CUTOFF_HOUR", "10")), 23))
+RESEARCH_CUTOFF_MINUTE = max(0, min(int(os.getenv("EVOLUTION_RESEARCH_CUTOFF_MINUTE", "30")), 59))
 MAX_CANDIDATES_PER_CYCLE = max(1, min(int(os.getenv("EVOLUTION_MAX_CANDIDATES", "6")), 20))
 MAX_WINDOWS_PER_CANDIDATE = max(1, min(int(os.getenv("EVOLUTION_MAX_WINDOWS", "5")), 20))
 REQUIRED_OPPORTUNITY_COST_BASELINES = ("multifactor_equal_weight", "simple_momentum")
@@ -73,6 +75,13 @@ LEGACY_TASK_RECONCILIATION_VERSION = "alis_evolution_task_reconciliation_v1"
 WORKER_ID = f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
 SYSTEM_AUTONOMY_RECOVERY_POLICY_VERSION = "v3"
 SYSTEM_AUTONOMY_MAX_RECOVERY_CONTINUATIONS = 2
+LONG_RESEARCH_TASK_TYPES = frozenset({
+    "strategy_evolution_cycle", "strategy_controller_oos", "factor_research_cycle",
+    "strategy_candidate_generation", "strategy_environment_backtest",
+    "strategy_cluster_distillation", "strategy_portfolio_research",
+    "strategy_failure_model_training", "model_candidate_research",
+    "model_strategy_impact_validation", "hsmm_shadow_training",
+})
 _worker_started = False
 _scheduler_started = False
 _lease_recovery_started = False
@@ -154,6 +163,15 @@ def _is_scheduled_trade_day(value: datetime) -> bool:
     except Exception:
         pass
     return is_trade_day(value.date())
+
+
+def _defer_long_research_claims(value: datetime) -> bool:
+    """Reserve enough wall time before the close-critical daily task window."""
+    cutoff = value.replace(
+        hour=RESEARCH_CUTOFF_HOUR, minute=RESEARCH_CUTOFF_MINUTE,
+        second=0, microsecond=0,
+    )
+    return value >= cutoff and _is_scheduled_trade_day(value)
 
 
 def _lease_owner_process_alive(owner: Any) -> bool | None:
@@ -785,14 +803,21 @@ def ensure_latest_ready_system_cycle() -> dict[str, Any]:
 def _claim_next_task() -> dict[str, Any] | None:
     now = _now()
     lease_until = (now + timedelta(minutes=LEASE_MINUTES)).isoformat()
+    research_clause = ""
+    claim_params: list[Any] = [now.isoformat()]
+    if _defer_long_research_claims(now):
+        placeholders = ",".join("?" for _ in LONG_RESEARCH_TASK_TYPES)
+        research_clause = f"AND task_type NOT IN ({placeholders})"
+        claim_params.extend(sorted(LONG_RESEARCH_TASK_TYPES))
     with _conn() as conn:
         suffix = " FOR UPDATE SKIP LOCKED" if conn._is_postgres else ""
         row = conn.execute(
             f"""SELECT * FROM evolution_tasks
                 WHERE status IN ('queued','retry_wait')
                   AND (next_run_at IS NULL OR next_run_at<=?)
+                  {research_clause}
                 ORDER BY priority ASC,created_at ASC LIMIT 1{suffix}""",
-            (now.isoformat(),),
+            tuple(claim_params),
         ).fetchone()
         if not row:
             return None

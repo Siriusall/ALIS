@@ -1,9 +1,24 @@
 from contextlib import contextmanager
-from datetime import timedelta
+from datetime import datetime, timedelta
 import time
 import pytest
 
 from app.services import evolution_orchestrator as evolution
+
+
+def test_long_research_claims_are_deferred_after_trade_day_cutoff(monkeypatch):
+    monkeypatch.setattr(evolution, "RESEARCH_CUTOFF_HOUR", 10)
+    monkeypatch.setattr(evolution, "RESEARCH_CUTOFF_MINUTE", 30)
+    monkeypatch.setattr(evolution, "_is_scheduled_trade_day", lambda _value: True)
+
+    assert evolution._defer_long_research_claims(datetime(2026, 8, 12, 10, 29)) is False
+    assert evolution._defer_long_research_claims(datetime(2026, 8, 12, 10, 30)) is True
+
+
+def test_long_research_claims_continue_on_non_trade_days(monkeypatch):
+    monkeypatch.setattr(evolution, "_is_scheduled_trade_day", lambda _value: False)
+
+    assert evolution._defer_long_research_claims(datetime(2026, 8, 15, 18, 0)) is False
 
 
 @pytest.fixture(autouse=True)
