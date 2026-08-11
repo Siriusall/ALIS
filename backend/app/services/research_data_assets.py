@@ -63,6 +63,9 @@ def _report_rc_summary(conn: Any) -> dict[str, Any]:
 
 
 def audit_research_data_assets() -> dict[str, Any]:
+    from app.services.theme_revenue_exposure import _ensure_tables as ensure_theme_revenue_tables
+
+    ensure_theme_revenue_tables()
     with _conn() as conn:
         metric_rows = [dict(row) for row in conn.execute(
             """SELECT d.metric_code,d.metric_name,d.description,d.source_code,COUNT(v.metric_code) value_count,
@@ -87,8 +90,9 @@ def audit_research_data_assets() -> dict[str, Any]:
                  FROM dc_theme_snapshot"""
         ).fetchone()
         revenue_theme = conn.execute("""SELECT COUNT(*) exposures,COUNT(DISTINCT ts_code) companies,
-                                             COUNT(DISTINCT theme_code) themes,MAX(as_of_date) latest_date
-                                      FROM dc_theme_revenue_exposure""").fetchone()
+                                             COUNT(DISTINCT theme_code) themes,
+                                             (SELECT MAX(as_of_date) FROM dc_theme_revenue_exposure_runs) latest_date
+                                      FROM dc_theme_revenue_exposure_current""").fetchone()
         announcements = conn.execute("""SELECT COUNT(*) raw_records,MAX(available_time) latest_available_time
                                         FROM dc_announcement_raw""").fetchone()
         events = conn.execute("SELECT COUNT(*) events,AVG(confidence) avg_confidence FROM dc_announcement_event").fetchone()
