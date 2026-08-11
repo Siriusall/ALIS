@@ -79,6 +79,10 @@ def test_ppi_refresh_persists_first_valid_provider(monkeypatch) -> None:
     finished = []
     monkeypatch.setattr(data_center, "_conn", connection)
     monkeypatch.setattr(
+        "app.data_platform.services.independent_research_sources.fetch_eastmoney_ppi_headline",
+        lambda *_args, **_kwargs: pd.DataFrame(),
+    )
+    monkeypatch.setattr(
         "app.data_platform.services.research_source_discovery.race_tushare_sources",
         lambda **_kwargs: {
             "ok": True, "status": "available", "winner": "tushare_official",
@@ -101,3 +105,32 @@ def test_ppi_refresh_persists_first_valid_provider(monkeypatch) -> None:
     assert result["winner"] == "tushare_official"
     assert result["rows_written"] == 1
     assert finished
+
+
+def test_ppi_refresh_retains_independent_headline_without_claiming_components(monkeypatch) -> None:
+    class Result:
+        def fetchone(self):
+            return {"rows": 0}
+    class Conn:
+        def execute(self, *_args):
+            return Result()
+    @contextmanager
+    def connection():
+        yield Conn()
+
+    monkeypatch.setattr(data_center, "_conn", connection)
+    monkeypatch.setattr(
+        "app.data_platform.services.independent_research_sources.fetch_eastmoney_ppi_headline",
+        lambda *_args, **_kwargs: pd.DataFrame([{"month": "202607", "ppi_yoy": 3.5}]),
+    )
+    monkeypatch.setattr(data_center, "_upsert_raw_records", lambda api, _frame: 1 if api == "cn_ppi_headline" else 0)
+    monkeypatch.setattr(
+        "app.data_platform.services.research_source_discovery.race_tushare_sources",
+        lambda **_kwargs: {"ok": False, "status": "not_published", "completed": []},
+    )
+
+    result = data_center.refresh_cn_ppi_from_first_source(today=date(2026, 8, 11))
+
+    assert result["status"] == "observing"
+    assert result["headline"]["status"] == "available"
+    assert result["headline"]["field_scope"] == "headline_only_no_component_claim"

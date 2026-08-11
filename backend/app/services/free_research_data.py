@@ -22,7 +22,7 @@ from app.services.industry_event_engine import _derived_industry_proxies
 
 
 FINANCIAL_SOURCE = "tushare.financial_pit"
-FUTURES_PROXY_SOURCE = "tushare.futures_proxy"
+FUTURES_PROXY_SOURCE = "exchange.futures_proxy"
 PPI_PROXY_SOURCE = "tushare.cn_ppi_proxy"
 
 
@@ -231,6 +231,30 @@ def _cached_futures_prices(contract: str, start_date: str, end_date: str) -> dic
     return {str(dict(row)["trade_date"]): dict(row) for row in rows}
 
 
+def _persist_direct_futures_cache(root_contract: str, frame: pd.DataFrame) -> None:
+    now = _now()
+    with _conn() as conn:
+        for row in _frame_rows(frame):
+            trade_date = str(row.get("trade_date") or "")
+            contract = str(row.get("mapped_contract") or "")
+            provider = str(row.get("provider") or "sina_futures_continuous")
+            if not trade_date or not contract:
+                continue
+            conn.execute(
+                """INSERT INTO dc_futures_mapping_cache(root_contract,trade_date,mapped_contract,provider,available_time,updated_at)
+                   VALUES(?,?,?,?,?,?) ON CONFLICT(root_contract,trade_date) DO UPDATE SET
+                   mapped_contract=excluded.mapped_contract,provider=excluded.provider,
+                   available_time=excluded.available_time,updated_at=excluded.updated_at""",
+                (root_contract, trade_date, contract, provider, now, now),
+            )
+            conn.execute(
+                """INSERT INTO dc_futures_price_cache(mapped_contract,trade_date,price,provider,available_time,updated_at)
+                   VALUES(?,?,?,?,?,?) ON CONFLICT(mapped_contract,trade_date) DO UPDATE SET
+                   price=excluded.price,provider=excluded.provider,available_time=excluded.available_time,updated_at=excluded.updated_at""",
+                (contract, trade_date, float(row["price"]), provider, now, now),
+            )
+
+
 def _discover_futures_prices(contract: str, start_date: str, end_date: str) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
     from app.data_platform.services.research_source_discovery import race_tushare_sources
 
@@ -277,12 +301,64 @@ def materialize_futures_price_proxies(*, start_date: str, end_date: str, specs: 
     values: list[dict[str, Any]] = []
     result: dict[str, Any] = {"ok": True, "status": "completed", "sources": [], "definitions": 0, "values": 0, "contract": "exchange_futures_proxy_v2"}
     workers = max(1, min(len(specs), 4))
+    direct_rows: dict[str, pd.DataFrame] = {}
+    direct_network_keys: set[str] = set()
+    if start_date == end_date:
+        from app.data_platform.services.independent_research_sources import fetch_sina_continuous_futures
+
+        for spec in specs:
+            cached_mapping = _cached_mappings(spec.root_contract, start_date, end_date)
+            mapping = cached_mapping.get(start_date) or {}
+            contract = str(mapping.get("mapped_contract") or "")
+            cached_price = (_cached_futures_prices(contract, start_date, end_date).get(start_date) or {}) if contract else {}
+            if contract and cached_price:
+                direct_rows[spec.key] = pd.DataFrame([{
+                    "trade_date": start_date, "price": cached_price["price"],
+                    "mapped_contract": contract, "provider": cached_price.get("provider") or mapping.get("provider"),
+                }])
+        network_specs = tuple(spec for spec in specs if spec.key not in direct_rows)
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="sina-futures") as executor:
+            direct_futures = {
+                spec.key: executor.submit(
+                    fetch_sina_continuous_futures, spec.root_contract, start_date, end_date,
+                    timeout_seconds=8.0,
+                ) for spec in network_specs
+            }
+            for key, future in direct_futures.items():
+                try:
+                    direct_rows[key] = future.result()
+                    if not direct_rows[key].empty:
+                        direct_network_keys.add(key)
+                        spec = next(item for item in network_specs if item.key == key)
+                        _persist_direct_futures_cache(spec.root_contract, direct_rows[key])
+                except Exception:  # noqa: BLE001 - TuShare path remains available
+                    direct_rows[key] = pd.DataFrame()
+    missing_specs = tuple(spec for spec in specs if direct_rows.get(spec.key, pd.DataFrame()).empty)
     with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="futures-mapping") as executor:
         mapping_futures = {
             spec.key: executor.submit(_discover_futures_mapping, spec.root_contract, start_date, end_date)
-            for spec in specs
+            for spec in missing_specs
         }
         mappings = {key: future.result() for key, future in mapping_futures.items()}
+    now_available = _now()
+    for spec in specs:
+        frame = direct_rows.get(spec.key, pd.DataFrame())
+        if frame.empty:
+            continue
+        mapping_rows: dict[str, dict[str, Any]] = {}
+        for row in _frame_rows(frame):
+            trade_date = str(row.get("trade_date") or "")
+            contract = str(row.get("mapped_contract") or "")
+            mapping_rows[trade_date] = {
+                "mapped_contract": contract, "provider": str(row.get("provider") or "sina_futures_continuous"),
+                "available_time": now_available,
+            }
+        mappings[spec.key] = (mapping_rows, {
+            "status": "available" if spec.key in direct_network_keys else "cache_hit",
+            "winner": str(frame.iloc[0].get("provider") or ""),
+            "network_requests": 1 if spec.key in direct_network_keys else 0,
+            "contract": "independent_continuous_futures_exact_date_v1",
+        })
     contracts = sorted({
         str(row.get("mapped_contract") or "")
         for mapping_rows, _discovery in mappings.values() for row in mapping_rows.values()
@@ -291,9 +367,21 @@ def materialize_futures_price_proxies(*, start_date: str, end_date: str, specs: 
     with ThreadPoolExecutor(max_workers=max(1, min(len(contracts), 4)), thread_name_prefix="futures-prices") as executor:
         price_futures = {
             contract: executor.submit(_discover_futures_prices, contract, start_date, end_date)
-            for contract in contracts
+            for contract in contracts if not contract.startswith("SINA:")
         }
         prices_by_contract = {contract: future.result() for contract, future in price_futures.items()}
+    for frame in direct_rows.values():
+        for row in _frame_rows(frame):
+            contract = str(row.get("mapped_contract") or "")
+            trade_date = str(row.get("trade_date") or "")
+            if not contract or not trade_date:
+                continue
+            prices_by_contract[contract] = ({
+                trade_date: {
+                    "price": float(row["price"]), "provider": "sina_futures_continuous",
+                    "available_time": now_available,
+                },
+            }, {"status": "available", "winner": "sina_futures_continuous", "network_requests": 1})
     for spec in specs:
         mapping_rows, mapping_discovery = mappings[spec.key]
         mapped_by_date = {

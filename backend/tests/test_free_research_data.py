@@ -81,6 +81,11 @@ def test_exact_futures_mapping_cache_skips_network_probe(monkeypatch) -> None:
 
 def test_missing_futures_group_is_not_hidden_by_other_successes(monkeypatch) -> None:
     monkeypatch.setattr(service, "_ensure_futures_proxy_cache", lambda: None)
+    monkeypatch.setattr(service, "_cached_mappings", lambda *_args: {})
+    monkeypatch.setattr(
+        "app.data_platform.services.independent_research_sources.fetch_sina_continuous_futures",
+        lambda *_args, **_kwargs: __import__("pandas").DataFrame(),
+    )
     monkeypatch.setattr(service, "_discover_futures_mapping", lambda root, *_args: (
         {} if root == "SC.INE" else {"20260721": {"mapped_contract": "CU2608.SHF", "provider": "source_a"}},
         {"status": "not_published" if root == "SC.INE" else "available"},
@@ -100,6 +105,31 @@ def test_missing_futures_group_is_not_hidden_by_other_successes(monkeypatch) -> 
 
     assert result["status"] == "degraded"
     assert result["missing_sources"] == ["crude_oil"]
+
+
+def test_exact_futures_uses_independent_sina_without_tushare_mapping(monkeypatch) -> None:
+    import pandas as pd
+
+    monkeypatch.setattr(service, "_ensure_futures_proxy_cache", lambda: None)
+    monkeypatch.setattr(service, "_cached_mappings", lambda *_args: {})
+    monkeypatch.setattr(service, "_persist_direct_futures_cache", lambda *_args: None)
+    monkeypatch.setattr(
+        "app.data_platform.services.independent_research_sources.fetch_sina_continuous_futures",
+        lambda *_args, **_kwargs: pd.DataFrame([{
+            "trade_date": "20260811", "price": 550.8,
+            "mapped_contract": "SINA:SC0", "provider": "sina_futures_continuous",
+        }]),
+    )
+    monkeypatch.setattr(service, "_discover_futures_mapping", lambda *_args: (_ for _ in ()).throw(AssertionError("TuShare must not run")))
+    monkeypatch.setattr(service, "_upsert_industry_metric_definitions", lambda rows: len(rows))
+    monkeypatch.setattr(service, "_upsert_industry_metric_values", lambda rows: len(rows))
+    spec = service.FuturesProxySpec("crude_oil", "SC.INE", "原油", ("石油开采",))
+
+    result = service.materialize_futures_price_proxies(start_date="20260811", end_date="20260811", specs=(spec,))
+
+    assert result["status"] == "completed"
+    assert result["values"] == 1
+    assert result["sources"][0]["mapping_discovery"]["winner"] == "sina_futures_continuous"
 
 
 def test_cn_ppi_price_proxy_preserves_raw_available_time(monkeypatch) -> None:

@@ -937,7 +937,7 @@ def sync_tushare_api_raw(api_name: str, params: dict[str, Any] | None = None, *,
 
 
 def refresh_cn_ppi_from_first_source(*, today: date | None = None) -> dict[str, Any]:
-    """Discover the first bounded TuShare transport publishing the due PPI month."""
+    """Discover independent headline PPI plus the richer TuShare component slice."""
     observed_date = today or datetime.now().astimezone().date()
     first_this_month = observed_date.replace(day=1)
     previous_month_end = first_this_month - timedelta(days=1)
@@ -960,6 +960,37 @@ def refresh_cn_ppi_from_first_source(*, today: date | None = None) -> dict[str, 
             "status": "not_due", "target_month": target_month,
             "next_probe_day": release_probe_day, "network_requests": 0,
         }
+    from app.data_platform.services.independent_research_sources import fetch_eastmoney_ppi_headline
+
+    headline: dict[str, Any]
+    with _conn() as conn:
+        headline_existing = conn.execute(
+            "SELECT COUNT(*) rows FROM dc_tushare_raw_records WHERE api_name='cn_ppi_headline' AND trade_date=?",
+            (target_month,),
+        ).fetchone()
+    if int(dict(headline_existing).get("rows") or 0) > 0:
+        headline = {
+            "status": "cache_hit", "provider": "eastmoney_ppi_headline",
+            "rows": int(dict(headline_existing).get("rows") or 0), "network_requests": 0,
+            "field_scope": "headline_only_no_component_claim",
+        }
+    else:
+        try:
+            headline_frame = fetch_eastmoney_ppi_headline(
+                target_month, timeout_seconds=float(os.getenv("RESEARCH_PROBE_TIMEOUT_SECONDS", "12")),
+            )
+            headline_written = _upsert_raw_records("cn_ppi_headline", headline_frame) if not headline_frame.empty else 0
+            headline = {
+                "status": "available" if not headline_frame.empty else "not_published",
+                "provider": "eastmoney_ppi_headline", "rows": len(headline_frame),
+                "rows_written": headline_written, "field_scope": "headline_only_no_component_claim",
+            }
+        except Exception as exc:  # noqa: BLE001 - component discovery must still continue
+            headline = {
+                "status": "probe_failed", "provider": "eastmoney_ppi_headline",
+                "error": f"{type(exc).__name__}: {str(exc)[:300]}",
+                "field_scope": "headline_only_no_component_claim",
+            }
     from app.data_platform.services.research_source_discovery import race_tushare_sources
 
     def target_available(frame: pd.DataFrame) -> bool:
@@ -981,6 +1012,7 @@ def refresh_cn_ppi_from_first_source(*, today: date | None = None) -> dict[str, 
             "status": "degraded" if network_failed else "observing",
             "reason": "all_sources_failed" if network_failed else str(discovery.get("status") or "not_published"),
             "target_month": target_month, "discovery": {key: value for key, value in discovery.items() if key != "frame"},
+            "headline": headline,
             "production_change": False,
         }
     frame = discovery.get("frame")
@@ -1007,6 +1039,7 @@ def refresh_cn_ppi_from_first_source(*, today: date | None = None) -> dict[str, 
             "ok": True, "schema_version": "alis_cn_ppi_publication_discovery_v1",
             "status": "completed", "target_month": target_month,
             "winner": discovery.get("winner"), "rows_read": len(frame), "rows_written": written,
+            "headline": headline,
             "discovery": {key: value for key, value in discovery.items() if key != "frame"},
         }
     except Exception as exc:  # noqa: BLE001
