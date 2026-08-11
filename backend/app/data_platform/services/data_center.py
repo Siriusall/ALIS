@@ -338,6 +338,17 @@ def _mature_fund_nav_empty(params: dict[str, Any], *, today_value: date | None =
     return bool(cutoff and end_date <= cutoff)
 
 
+def _mature_optional_daily_empty(api_name: str, params: dict[str, Any], *, today_value: date | None = None) -> bool:
+    if api_name != "moneyflow_hsgt":
+        return False
+    target_date = str(params.get("trade_date") or params.get("end_date") or "")
+    if len(target_date) != 8 or not target_date.isdigit():
+        return False
+    observed = (today_value or date.today()).strftime("%Y%m%d")
+    cutoff = _etf_nav_publish_cutoff(observed)
+    return bool(cutoff and target_date <= cutoff)
+
+
 def _recent_calendar_window(days_back: int = 30, days_forward: int = 60) -> tuple[str, str]:
     start = (date.today() - timedelta(days=days_back)).strftime("%Y%m%d")
     end = (date.today() + timedelta(days=days_forward)).strftime("%Y%m%d")
@@ -919,8 +930,10 @@ def sync_tushare_api_raw(api_name: str, params: dict[str, Any] | None = None, *,
                 _record_request_coverage(api_name, request_params, limit_rows, 0, result_status="not_applicable", result_reason="listed_after_period")
                 _emit_tushare_activity("skipped", api_name, request_params, rows=0, written=0, category="not_applicable", error="股票上市日晚于报告期")
                 return {"ok": True, "api": api_name, "run_id": run_id, "rows_read": 0, "rows_written": 0, "not_applicable": True}
-            if api_name in VALID_EMPTY_TUSHARE_APIS or (
-                api_name == "fund_nav" and _mature_fund_nav_empty(request_params)
+            if (
+                api_name in VALID_EMPTY_TUSHARE_APIS
+                or (api_name == "fund_nav" and _mature_fund_nav_empty(request_params))
+                or _mature_optional_daily_empty(api_name, request_params)
             ):
                 finish_ingestion_run(run_id, status="valid_empty", rows_read=0, rows_written=0, meta={"api": api_name, "params": request_params, "reason": "no_optional_event"})
                 _record_request_coverage(api_name, request_params, limit_rows, 0, result_status="valid_empty", result_reason="no_optional_event")
@@ -2354,6 +2367,45 @@ def resolve_mature_fund_nav_empty_requests(*, limit: int = 500) -> dict[str, Any
         "ok": True, "status": "completed", "cutoff": cutoff,
         "examined": len(rows), "resolved": resolved, "skipped": skipped,
         "policy": "fund_nav_empty_only_after_two_open_session_publication_lag",
+    }
+
+
+def resolve_mature_optional_daily_empty_requests(*, limit: int = 100) -> dict[str, Any]:
+    """Close historical optional daily enrichments without assigning a numeric value."""
+    cutoff = _etf_nav_publish_cutoff(date.today().strftime("%Y%m%d"))
+    cap = max(1, min(int(limit), 500))
+    with _conn() as c:
+        rows = c.execute(
+            """SELECT id,api_name,params_json,limit_rows
+                 FROM dc_tushare_failed_requests
+                WHERE api_name='moneyflow_hsgt' AND status='pending'
+                  AND error_category IN ('empty_pending','upstream_not_ready')
+                ORDER BY last_failed_at,id LIMIT ?""",
+            (cap,),
+        ).fetchall()
+    resolved = skipped = 0
+    for raw in rows:
+        item = dict(raw)
+        try:
+            params = json.loads(item.get("params_json") or "{}")
+        except (TypeError, json.JSONDecodeError):
+            skipped += 1
+            continue
+        target_date = str(params.get("trade_date") or params.get("end_date") or "")
+        if not cutoff or len(target_date) != 8 or not target_date.isdigit() or target_date > cutoff:
+            skipped += 1
+            continue
+        _record_request_coverage(
+            "moneyflow_hsgt", params, item.get("limit_rows"), 0,
+            result_status="valid_empty",
+            result_reason=f"optional_daily_empty_after_publication_cutoff_{cutoff}",
+        )
+        _resolve_failed_tushare_request("moneyflow_hsgt", params, item.get("limit_rows"))
+        resolved += 1
+    return {
+        "ok": True, "status": "completed", "cutoff": cutoff,
+        "examined": len(rows), "resolved": resolved, "skipped": skipped,
+        "policy": "optional_moneyflow_hsgt_empty_only_after_two_open_session_lag",
     }
 
 

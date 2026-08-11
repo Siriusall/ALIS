@@ -104,6 +104,20 @@ def test_fund_nav_empty_only_becomes_terminal_after_publish_lag(monkeypatch):
     ) is False
 
 
+def test_optional_hsgt_empty_only_becomes_terminal_after_publish_lag(monkeypatch):
+    monkeypatch.setattr(data_center, "_etf_nav_publish_cutoff", lambda _date: "20260807")
+
+    assert data_center._mature_optional_daily_empty(
+        "moneyflow_hsgt", {"trade_date": "20260807"}, today_value=data_center.date(2026, 8, 11)
+    ) is True
+    assert data_center._mature_optional_daily_empty(
+        "moneyflow_hsgt", {"trade_date": "20260810"}, today_value=data_center.date(2026, 8, 11)
+    ) is False
+    assert data_center._mature_optional_daily_empty(
+        "moneyflow", {"trade_date": "20260807"}, today_value=data_center.date(2026, 8, 11)
+    ) is False
+
+
 def test_raw_payload_json_rejects_non_standard_nan():
     assert data_center._strict_json({"value": None}) == '{"value": null}'
     with pytest.raises(ValueError):
