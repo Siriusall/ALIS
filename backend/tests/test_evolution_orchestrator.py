@@ -21,6 +21,40 @@ def test_long_research_claims_continue_on_non_trade_days(monkeypatch):
     assert evolution._defer_long_research_claims(datetime(2026, 8, 15, 18, 0)) is False
 
 
+def test_checkpoint_recovery_claim_does_not_consume_failure_attempt(monkeypatch):
+    statements = []
+
+    class Result:
+        rowcount = 1
+
+        def __init__(self, row=None):
+            self.row = row
+
+        def fetchone(self):
+            return self.row
+
+    class Connection:
+        _is_postgres = True
+
+        def execute(self, sql, params=()):
+            statements.append(sql)
+            if "SELECT * FROM evolution_tasks" in sql:
+                return Result({"id": 407, "phase": "recovered"})
+            return Result()
+
+    @contextmanager
+    def connection():
+        yield Connection()
+
+    monkeypatch.setattr(evolution, "_conn", connection)
+    monkeypatch.setattr(evolution, "get_evolution_task", lambda task_id: {"id": task_id})
+    monkeypatch.setattr(evolution, "_defer_long_research_claims", lambda _now: False)
+
+    assert evolution._claim_next_task() == {"id": 407}
+    claim_sql = next(sql for sql in statements if "UPDATE evolution_tasks" in sql)
+    assert "CASE WHEN phase='recovered' THEN 0 ELSE 1 END" in claim_sql
+
+
 @pytest.fixture(autouse=True)
 def _bind_test_factor_contract(monkeypatch):
     """Replay is stubbed here; satisfy the production factor gate explicitly."""

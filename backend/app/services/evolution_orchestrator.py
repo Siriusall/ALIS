@@ -824,7 +824,8 @@ def _claim_next_task() -> dict[str, Any] | None:
         task_id = int(row["id"])
         conn.execute(
             """UPDATE evolution_tasks
-               SET status='running',phase='starting',message=?,attempt=attempt+1,
+               SET status='running',phase='starting',message=?,
+                   attempt=attempt+CASE WHEN phase='recovered' THEN 0 ELSE 1 END,
                    lease_owner=?,lease_expires_at=?,heartbeat_at=?,deadline_at=?,
                    started_at=COALESCE(started_at,?),updated_at=?
                WHERE id=? AND status IN ('queued','retry_wait')""",
