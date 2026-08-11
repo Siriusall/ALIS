@@ -56,6 +56,7 @@ STEP_LABELS = {
     "review_data_quality_governance": "复盘数据质量治理", "strategy_policy_maturity": "策略候选成熟度",
     "strategy_policy_candidates": "策略候选生成", "execution_cost_calibration": "执行成本校准",
     "simulation_corporate_actions": "模拟公司行动", "simulation_ledger_audit": "独立账本审计",
+    "system_release_governance": "系统版本发布治理",
     "profit_and_portfolio": "收益与组合决策", "research_maintenance": "研究维护",
     "free_industry_financials": "行业财务序列", "pmi_demand_proxies": "PMI 需求代理",
     "cn_ppi_raw": "PPI 原始数据", "cn_ppi_price_proxies": "PPI 价格代理",
@@ -77,7 +78,8 @@ TASK_TYPE_MODULE = {
     "model_strategy_impact_validation": "model",
     "model_shadow_observation": "model",
     "plan_model_autonomy": "model",
-    "system_autonomy_cycle": "autonomy", "sealed_holdout_adj_factor_backfill": "data",
+    "system_autonomy_cycle": "autonomy", "system_release_governance": "autonomy",
+    "sealed_holdout_adj_factor_backfill": "data",
 }
 
 TASK_TYPE_LABEL = {
@@ -90,7 +92,8 @@ TASK_TYPE_LABEL = {
     "model_strategy_impact_validation": "模型完整策略影响验证",
     "model_shadow_observation": "模型未来影子观察",
     "plan_model_autonomy": "任务原生模型自治调度",
-    "system_autonomy_cycle": "每日自治循环", "sealed_holdout_adj_factor_backfill": "密封验证集批量补全",
+    "system_autonomy_cycle": "每日自治循环", "system_release_governance": "系统版本发布治理",
+    "sealed_holdout_adj_factor_backfill": "密封验证集批量补全",
 }
 
 RETIRED_TASK_TYPES = {"factor_research_cycle"}

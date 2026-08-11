@@ -48,6 +48,10 @@ SAFE_CONFIG_KEYS = (
     "MARKET_BULK_HEDGE_MAX_SECONDS", "MARKET_BULK_HEDGE_ADVANTAGE_MS",
     "MARKET_BULK_HARD_TIMEOUT_SECONDS", "MARKET_PROVIDER_CIRCUIT_FAILURES",
 )
+AUTO_ACTIVATE_ENABLED = str(os.getenv("ALIS_SYSTEM_RELEASE_AUTO_ACTIVATE", "1")).lower() in {
+    "1", "true", "yes", "on",
+}
+_PROCESS_GIT_STATE: dict[str, Any] | None = None
 
 
 def _now() -> str:
@@ -80,6 +84,14 @@ def git_state() -> dict[str, Any]:
         return {"commit": override, "branch": "", "dirty": False, "available": bool(override)}
 
 
+def process_git_state() -> dict[str, Any]:
+    """Freeze the code identity actually imported by this backend process."""
+    global _PROCESS_GIT_STATE
+    if _PROCESS_GIT_STATE is None:
+        _PROCESS_GIT_STATE = dict(git_state())
+    return dict(_PROCESS_GIT_STATE)
+
+
 def _database_revision(conn: Any, expected: str) -> str:
     try:
         row = conn.execute("SELECT version_num FROM alembic_version LIMIT 1").fetchone()
@@ -101,7 +113,7 @@ def _safe_config() -> dict[str, str]:
 
 
 def _component_payloads() -> dict[str, dict[str, Any]]:
-    git = git_state()
+    git = process_git_state()
     revisions = database_revisions()
     champion = resolve_production_strategy_champion()
     controller = active_strategy_policy_context()
@@ -425,6 +437,19 @@ def release_status() -> dict[str, Any]:
         blocked_reason = "no_active_system_release"
     elif drift:
         blocked_reason = "active_release_drift"
+    repository = git_state()
+    runtime_git = process_git_state()
+    restart_required = bool(
+        repository.get("available") and runtime_git.get("available")
+        and str(repository.get("commit") or "") != str(runtime_git.get("commit") or "")
+    )
+    with business_conn() as conn:
+        candidate_row = conn.execute(
+            "SELECT * FROM system_releases WHERE status IN ('validated','blocked') ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        event_row = conn.execute(
+            "SELECT * FROM system_release_events ORDER BY id DESC LIMIT 1"
+        ).fetchone()
     return {
         "ok": bool(active) and not drift,
         "schema_version": "alis_system_release_status_v1",
@@ -437,4 +462,139 @@ def release_status() -> dict[str, Any]:
         "database_revisions": database_revisions(),
         "expected_database_revisions": {"sim": SIM_SCHEMA_HEAD, "data": DATA_SCHEMA_HEAD},
         "legacy_unlinked_records": legacy_unlinked,
+        "governance": {
+            "auto_activate_enabled": AUTO_ACTIVATE_ENABLED,
+            "runtime_git": runtime_git,
+            "repository_git": repository,
+            "restart_required": restart_required,
+            "latest_candidate": _release_row(dict(candidate_row)) if candidate_row else None,
+            "latest_event": dict(event_row) if event_row else None,
+        },
+    }
+
+
+def discover_release_change() -> dict[str, Any]:
+    """Read-only detector for runtime bindings, repository changes and release drift."""
+    active = active_release()
+    observed = build_release_manifest()
+    repository = git_state()
+    runtime_git = process_git_state()
+    restart_required = bool(
+        repository.get("available") and runtime_git.get("available")
+        and str(repository.get("commit") or "") != str(runtime_git.get("commit") or "")
+    )
+    changed = not active or str(active.get("manifest_hash") or "") != str(observed["manifest_hash"])
+    return {
+        "ok": True,
+        "schema_version": "alis_system_release_change_discovery_v1",
+        "changed": changed,
+        "restart_required": restart_required,
+        "active_release_id": int((active or {}).get("id") or 0) or None,
+        "active_manifest_hash": str((active or {}).get("manifest_hash") or ""),
+        "observed_manifest_hash": str(observed["manifest_hash"]),
+        "runtime_commit": str(runtime_git.get("commit") or ""),
+        "repository_commit": str(repository.get("commit") or ""),
+        "repository_dirty": bool(repository.get("dirty")),
+    }
+
+
+def validate_release_preflight(release: dict[str, Any]) -> dict[str, Any]:
+    """Run bounded live safety gates before deterministic activation."""
+    from app.services.simulation_ledger_audit import audit_simulation_ledger
+
+    stored_validation = release.get("validation") if isinstance(release.get("validation"), dict) else {}
+    base = (
+        stored_validation.get("manifest")
+        if isinstance(stored_validation.get("manifest"), dict)
+        else stored_validation
+    )
+    ledger = audit_simulation_ledger(persist=False)
+    with business_conn() as conn:
+        inflight = conn.execute(
+            "SELECT COUNT(*) count FROM daily_rebalance_plans WHERE status='executing'"
+        ).fetchone()
+        frozen = conn.execute(
+            "SELECT COUNT(*) count FROM daily_rebalance_plans WHERE status='planned'"
+        ).fetchone()
+    inflight_count = int(dict(inflight).get("count") or 0)
+    frozen_count = int(dict(frozen).get("count") or 0)
+    active = active_release()
+    target_manifest = release.get("manifest") if isinstance(release.get("manifest"), dict) else {}
+    current_manifest = (active or {}).get("manifest") if isinstance((active or {}).get("manifest"), dict) else {}
+    target_execution = ((target_manifest.get("components") or {}).get("contract.execution") or {}).get("version")
+    current_execution = ((current_manifest.get("components") or {}).get("contract.execution") or {}).get("version")
+    execution_compatible = not active or target_execution == current_execution or frozen_count == 0
+    gates = {
+        "release_manifest_validation": bool(base.get("ok")),
+        "simulation_ledger_consistent": bool(ledger.get("ok")) and str(ledger.get("status") or "") == "passed",
+        "no_execution_in_progress": inflight_count == 0,
+        "frozen_plan_execution_contract_compatible": execution_compatible,
+        "runtime_matches_repository_commit": not discover_release_change().get("restart_required"),
+        "repository_worktree_clean": not bool(git_state().get("dirty")),
+    }
+    return {
+        "ok": all(gates.values()),
+        "schema_version": "alis_system_release_preflight_v1",
+        "gates": gates,
+        "failed_gates": [key for key, passed in gates.items() if not passed],
+        "evidence": {
+            "ledger_status": ledger.get("status"),
+            "cash_drift": ledger.get("cash_drift"),
+            "position_drift_count": len(ledger.get("position_deltas") or []),
+            "executing_plan_count": inflight_count,
+            "frozen_plan_count": frozen_count,
+            "current_execution_contract": current_execution,
+            "target_execution_contract": target_execution,
+        },
+    }
+
+
+def run_release_governance_cycle(*, actor: str = "system_release_governance") -> dict[str, Any]:
+    """Discover, validate and, when safe, activate one immutable system release."""
+    discovery = discover_release_change()
+    if discovery["restart_required"]:
+        return {
+            "ok": False, "status": "restart_required", "discovery": discovery,
+            "production_change": False,
+        }
+    if not discovery["changed"]:
+        return {
+            "ok": True, "status": "unchanged", "discovery": discovery,
+            "active_release": active_release(), "production_change": False,
+        }
+    candidate = create_release(actor=actor, reason="automatic_change_discovery")
+    preflight = validate_release_preflight(candidate)
+    now = _now()
+    with business_conn() as conn:
+        conn.execute(
+            """UPDATE system_releases SET status=?,validation_status=?,validation_json=? WHERE id=?""",
+            (
+                "validated" if preflight["ok"] else "blocked",
+                "passed" if preflight["ok"] else "failed",
+                _canonical({"ok": preflight["ok"], "manifest": candidate.get("validation") or {}, "preflight": preflight}),
+                int(candidate["id"]),
+            ),
+        )
+        conn.execute(
+            """INSERT INTO system_release_events(release_id,event_type,actor,reason,evidence_json,created_at)
+               VALUES(?,?,?,?,?,?)""",
+            (int(candidate["id"]), "preflight_passed" if preflight["ok"] else "preflight_blocked",
+             actor, "automatic_release_preflight", _canonical(preflight), now),
+        )
+    if not preflight["ok"]:
+        return {
+            "ok": False, "status": "candidate_blocked", "candidate": candidate,
+            "preflight": preflight, "discovery": discovery, "production_change": False,
+        }
+    if not AUTO_ACTIVATE_ENABLED:
+        return {
+            "ok": True, "status": "candidate_validated", "candidate": candidate,
+            "preflight": preflight, "discovery": discovery, "production_change": False,
+        }
+    activated = activate_release(
+        int(candidate["id"]), actor=actor, reason="automatic_preflight_all_gates_passed",
+    )
+    return {
+        "ok": True, "status": "activated", "active_release": activated,
+        "preflight": preflight, "discovery": discovery, "production_change": True,
     }

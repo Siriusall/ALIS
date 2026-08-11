@@ -47,3 +47,39 @@ def test_release_creation_is_idempotent_and_only_validated_release_activates(mon
     active = releases.activate_release(first["id"], actor="test")
     assert active["status"] == "active"
     assert releases.active_release()["id"] == first["id"]
+
+
+def test_change_discovery_requires_restart_when_repository_commit_differs(monkeypatch):
+    monkeypatch.setattr(releases, "active_release", lambda: {"id": 1, "manifest_hash": "old"})
+    monkeypatch.setattr(releases, "build_release_manifest", lambda: {"manifest_hash": "new"})
+    monkeypatch.setattr(releases, "process_git_state", lambda: {"available": True, "commit": "a" * 40})
+    monkeypatch.setattr(releases, "git_state", lambda: {"available": True, "commit": "b" * 40, "dirty": False})
+    result = releases.discover_release_change()
+    assert result["changed"] is True
+    assert result["restart_required"] is True
+
+
+def test_governance_cycle_is_noop_when_release_is_unchanged(monkeypatch):
+    active = {"id": 7, "manifest_hash": "same", "status": "active"}
+    monkeypatch.setattr(releases, "discover_release_change", lambda: {
+        "changed": False, "restart_required": False,
+    })
+    monkeypatch.setattr(releases, "active_release", lambda: active)
+    result = releases.run_release_governance_cycle()
+    assert result["status"] == "unchanged"
+    assert result["production_change"] is False
+    assert result["active_release"]["id"] == 7
+
+
+def test_governance_cycle_activates_only_after_preflight(monkeypatch):
+    monkeypatch.setattr(releases, "_component_payloads", lambda: _components("b" * 40))
+    monkeypatch.setattr(releases, "discover_release_change", lambda: {
+        "changed": True, "restart_required": False,
+    })
+    monkeypatch.setattr(releases, "validate_release_preflight", lambda _: {
+        "ok": True, "gates": {"all": True}, "failed_gates": [],
+    })
+    result = releases.run_release_governance_cycle()
+    assert result["status"] == "activated"
+    assert result["production_change"] is True
+    assert result["active_release"]["status"] == "active"

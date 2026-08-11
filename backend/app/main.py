@@ -44,6 +44,7 @@ from app.services.evolution_orchestrator import (
     evolution_runtime_status,
     mark_evolution_component_disabled,
     recover_evolution_tasks,
+    ensure_system_release_governance_task,
     start_evolution_scheduler,
     start_evolution_worker,
 )
@@ -213,6 +214,11 @@ def startup() -> None:
     }
     _start_component("manual_review_scheduler", start_manual_review_triage_scheduler, required=False)
     recovered_evolution = _start_component("evolution_recovery", recover_evolution_tasks)
+    _start_component(
+        "system_release_governance_startup",
+        ensure_system_release_governance_task,
+        required=False,
+    )
     if _env_enabled("ALIS_EVOLUTION_WORKER_ENABLED"):
         _start_component("evolution_worker", start_evolution_worker, required=False)
     else:

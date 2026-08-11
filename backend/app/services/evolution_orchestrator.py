@@ -1843,6 +1843,15 @@ def execute_evolution_task(
     validation_runner: Callable[..., dict[str, Any]] = run_purged_walk_forward_validation,
 ) -> dict[str, Any]:
     task_type = str(task.get("task_type") or "")
+    if task_type == "system_release_governance":
+        from app.services.system_release_center import run_release_governance_cycle
+
+        _heartbeat(
+            int(task["id"]), phase="system_release_governance", progress=0.1,
+            message="正在发现系统版本变化并执行发布前硬门",
+            checkpoint=task.get("checkpoint") if isinstance(task.get("checkpoint"), dict) else {},
+        )
+        return run_release_governance_cycle(actor="evolution_system_release_governance")
     if task_type in {
         "strategy_evolution_cycle",
         "strategy_controller_oos",
@@ -2308,6 +2317,7 @@ def _finish_success(task_id: int, result: dict[str, Any]) -> None:
     task = get_evolution_task(int(task_id)) or {}
     task_type = str(task.get("task_type") or "")
     message = {
+        "system_release_governance": "系统版本变更发现与发布前硬门完成",
         "sealed_holdout_adj_factor_backfill": "密封验证集批量补全并复核完成",
         "factor_daily_cycle": "因子日物化与评价完成",
         "factor_research_cycle": "连续因子、模型与策略研究完成",
@@ -2914,6 +2924,7 @@ def start_evolution_scheduler() -> bool:
             try:
                 _runtime_heartbeat("scheduler")
                 now = _now()
+                ensure_system_release_governance_task(trigger="continuous_scheduler")
                 research_task_type = (
                     "strategy_candidate_generation"
                     if V10_RESEARCH_ENABLED else "factor_research_cycle"
@@ -2963,3 +2974,25 @@ def start_evolution_scheduler() -> bool:
 
     threading.Thread(target=loop, daemon=True, name="evolution-scheduler").start()
     return True
+
+
+def ensure_system_release_governance_task(*, trigger: str = "startup") -> dict[str, Any]:
+    """Queue release governance before research workers can consume changed bindings."""
+    from app.services.system_release_center import discover_release_change
+
+    release_change = discover_release_change()
+    if not (release_change.get("changed") or release_change.get("restart_required")):
+        return {"ok": True, "status": "unchanged", "discovery": release_change}
+    identity = hashlib.sha256(json.dumps({
+        "runtime": release_change.get("runtime_commit"),
+        "repository": release_change.get("repository_commit"),
+        "observed": release_change.get("observed_manifest_hash"),
+    }, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()[:20]
+    task = create_evolution_task(
+        task_type="system_release_governance",
+        dedupe_key=f"system_release_governance:v1:{identity}",
+        payload={"trigger": str(trigger), "discovery": release_change},
+        max_attempts=1,
+        priority=5,
+    )
+    return {"ok": True, "status": str(task.get("status") or "queued"), "task": task, "discovery": release_change}

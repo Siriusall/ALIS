@@ -6,11 +6,13 @@ from app.services.system_release_center import (
     CONTRACT_CATALOG,
     activate_release,
     create_release,
+    discover_release_change,
     list_releases,
     release_diff,
     release_events,
     release_status,
     rollback_release,
+    run_release_governance_cycle,
 )
 
 router = APIRouter(tags=["system-versions"])
@@ -19,6 +21,11 @@ router = APIRouter(tags=["system-versions"])
 @router.get("/system-versions/status")
 def system_version_status() -> dict:
     return release_status()
+
+
+@router.get("/system-versions/governance/discovery")
+def system_version_governance_discovery() -> dict:
+    return discover_release_change()
 
 
 @router.get("/system-versions/releases")
@@ -47,6 +54,11 @@ def system_version_diff(left_id: int, right_id: int) -> dict:
 @router.post("/system-versions/releases")
 def system_version_create() -> dict:
     return create_release(actor="owner_api", reason="explicit_owner_release_build")
+
+
+@router.post("/system-versions/governance/run")
+def system_version_governance_run() -> dict:
+    return run_release_governance_cycle(actor="owner_api_governance")
 
 
 @router.post("/system-versions/releases/{release_id}/activate")
