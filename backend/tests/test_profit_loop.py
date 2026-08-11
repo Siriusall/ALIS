@@ -409,7 +409,7 @@ def test_missed_formal_plans_leave_pending_state_and_cannot_execute_late(monkeyp
     assert claimed is None
 
 
-def test_invalid_unified_contract_is_quarantined_without_executing(monkeypatch):
+def test_invalid_unified_contract_is_quarantined_after_claim_rollback(monkeypatch):
     state = {"status": "planned", "execution_attempted": False}
     contract = {
         "schema_version": profit_loop.UNIFIED_DAILY_DECISION_SCHEMA_VERSION,
@@ -440,6 +440,7 @@ def test_invalid_unified_contract_is_quarantined_without_executing(monkeypatch):
                     return Result([plan])
                 if "SET status='blocked_by_contract_validation'" in sql:
                     state["status"] = "blocked_by_contract_validation"
+                    return Result([])
                 if "SET status='executing'" in sql:
                     state["status"] = "executing"
                     state["execution_attempted"] = True
@@ -450,11 +451,20 @@ def test_invalid_unified_contract_is_quarantined_without_executing(monkeypatch):
     monkeypatch.setattr(profit_loop, "_ensure_tables", lambda: None)
     monkeypatch.setattr(profit_loop, "business_conn", fake_conn)
 
-    with pytest.raises(ReplayRiskGateError):
+    with pytest.raises(ReplayRiskGateError) as captured:
         profit_loop.claim_daily_rebalance_execution_input(
             "20260724", "20260727", claim_token="task-invalid",
         )
+    assert state == {"status": "planned", "execution_attempted": False}
 
+    blocked = profit_loop.block_daily_rebalance_plan_contract(
+        "20260724",
+        "20260727",
+        code=str(captured.value.code),
+        message=str(captured.value),
+    )
+
+    assert blocked is True
     assert state == {"status": "blocked_by_contract_validation", "execution_attempted": False}
 
 

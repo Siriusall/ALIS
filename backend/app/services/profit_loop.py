@@ -1748,18 +1748,6 @@ def claim_daily_rebalance_execution_input(
             return None
 
         def reject_contract(message: str, code: str) -> None:
-            c.execute(
-                """UPDATE daily_rebalance_plans
-                   SET status='blocked_by_contract_validation',
-                       validation_error_code=?,validation_errors_json=?,validated_at=?
-                   WHERE id=? AND status='planned'""",
-                (
-                    str(code or "invalid_authoritative_plan")[:128],
-                    json.dumps([str(message)[:500]], ensure_ascii=False),
-                    _now(),
-                    int(row["id"]),
-                ),
-            )
             raise ReplayRiskGateError(str(message), code=code or "invalid_authoritative_plan")
 
         try:
@@ -1873,6 +1861,37 @@ def claim_daily_rebalance_execution_input(
         "decision_contract_schema_version": str(contract.get("schema_version") or ""),
         "execution_claim_token": token,
     }
+
+
+def block_daily_rebalance_plan_contract(
+    signal_date: str,
+    execute_date: str,
+    *,
+    code: str,
+    message: str,
+) -> bool:
+    """Persist a claim-time rejection after the failed claim transaction rolls back."""
+    signal = str(signal_date or "").replace("-", "")[:8]
+    execute = str(execute_date or "").replace("-", "")[:8]
+    with business_conn() as c:
+        changed = c.execute(
+            """UPDATE daily_rebalance_plans
+               SET status='blocked_by_contract_validation',
+                   validation_error_code=?,validation_errors_json=?,validated_at=?
+               WHERE id=(
+                   SELECT id FROM daily_rebalance_plans
+                   WHERE trade_date=? AND planned_execute_date=? AND status='planned'
+                   ORDER BY version DESC LIMIT 1
+               ) AND status='planned'""",
+            (
+                str(code or "invalid_authoritative_plan")[:128],
+                json.dumps([str(message)[:500]], ensure_ascii=False),
+                _now(),
+                signal,
+                execute,
+            ),
+        )
+        return int(getattr(changed, "rowcount", 0) or 0) == 1
 
 
 def list_pending_daily_rebalance_execution_inputs() -> list[dict[str, Any]]:

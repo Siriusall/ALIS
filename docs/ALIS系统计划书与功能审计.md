@@ -1530,3 +1530,4 @@ ALIS 的目标运行方式调整为“系统自治、结果可见、异常才打
 - [x] 到期冻结 T+1 计划的领取优先于当日新计划物化。旧顺序会先同步执行当日研究、外部数据和组合计算，使已就绪的昨日冻结计划被数分钟的新计划生成阻塞。现在只要存在当日到期计划，当轮立即进入执行数据门与领取，当日新计划延后到下一调度周期；两者仍共用冻结版本、数据完整性和防重复执行合同。
 - [x] 冻结计划领取的失败状态机改为原子收敛：JSON、完整哈希、统一决策清单、系统 Release、日期或策略身份任一校验失败，计划立即进入 `blocked_by_contract_validation` 并保留错误码，不再留在 `planned`。自治模拟任务只在成交与账本事务成功后推进 `last_signal_date/last_execute_date`；无效旧计划隔离后恢复到 `waiting_schedule`，不把“尝试过”冒充“已执行”。
 - [x] 调度器不再使用任务表的 `last_execute_date` 在领取前跳过到期计划。该字段可能来自失败的进行中尝试，不是成交证据；防重的唯一权威收敛为正式计划行的原子 `planned → executing → executed/blocked` 与 claim token。
+- [x] 计划合同拒绝的持久化与领取回滚分离：领取事务因 `ReplayRiskGateError` 回滚后，独立事务再将对应 `planned` 计划收敛为 `blocked_by_contract_validation`，避免“先 UPDATE 后抛异常”把隔离状态一起回滚。自治任务使用状态机已有的 `schedule_wait` 事件从 `running` 回到 `pending`，不再因未注册事件留在假运行态。

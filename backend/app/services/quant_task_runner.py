@@ -733,14 +733,26 @@ def _execute_step_with_retry(
 ):
     authoritative_plan = None
     if str(task_live.get("replay_mode") or "") == "autonomous_daily":
-        from app.services.profit_loop import claim_daily_rebalance_execution_input
-        claim_token = f"quant-task:{int(task_id)}:{signal_date}:{execute_date}"
-        authoritative_plan = claim_daily_rebalance_execution_input(
-            signal_date,
-            execute_date,
-            claim_token=claim_token,
-            expected_strategy_id=int(task_live.get("strategy_id") or 0),
+        from app.services.profit_loop import (
+            block_daily_rebalance_plan_contract,
+            claim_daily_rebalance_execution_input,
         )
+        claim_token = f"quant-task:{int(task_id)}:{signal_date}:{execute_date}"
+        try:
+            authoritative_plan = claim_daily_rebalance_execution_input(
+                signal_date,
+                execute_date,
+                claim_token=claim_token,
+                expected_strategy_id=int(task_live.get("strategy_id") or 0),
+            )
+        except ReplayRiskGateError as exc:
+            block_daily_rebalance_plan_contract(
+                signal_date,
+                execute_date,
+                code=str(getattr(exc, "code", "") or "invalid_authoritative_plan"),
+                message=str(exc),
+            )
+            raise
     if str(task_live.get("replay_mode") or "") == "autonomous_daily" and authoritative_plan is None:
         raise ReplayRiskGateError(
             "正式调仓计划不存在、已执行或已被其他执行器领取",
@@ -1554,7 +1566,7 @@ def run_quant_task_async(task_id: int) -> bool:
                 _transition_task_status(
                     task_id,
                     "pending",
-                    "invalid_frozen_plan_quarantined",
+                    "schedule_wait",
                     replay_status="waiting_schedule",
                     last_signal_date=successful_signal or None,
                     last_execute_date=successful_execute or None,
