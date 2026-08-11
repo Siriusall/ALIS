@@ -143,6 +143,33 @@ def test_latest_ready_date_does_not_duplicate_successful_cycle(monkeypatch):
     assert result == {"ok": True, "status": "already_completed", "trade_date": "20260724", "task_id": 44}
 
 
+def test_latest_ready_date_accepts_current_v2_unified_plan(monkeypatch):
+    monkeypatch.setattr(
+        "app.services.data_health.assess_latest_decision_data_health",
+        lambda: {"decision_ready": True, "readiness": {"target_trade_date": "20260724"}},
+    )
+    monkeypatch.setattr(evolution_orchestrator, "list_evolution_tasks", lambda limit=200: [{
+        "id": 45, "task_type": "system_autonomy_cycle", "status": "completed",
+        "result": {"steps": [
+            {"name": "decision_data_gate", "result": {
+                "decision_ready": True, "readiness": {"target_trade_date": "20260724"},
+            }},
+            {"name": "profit_and_portfolio", "result": {"rebalance_plan": {
+                "id": 10,
+                "status": "planned",
+                "persisted": True,
+                "decision_contract_schema_version": "alis_unified_daily_decision_v2",
+            }}},
+        ]},
+    }])
+
+    result = evolution_orchestrator.ensure_latest_ready_system_cycle()
+
+    assert result == {
+        "ok": True, "status": "already_completed", "trade_date": "20260724", "task_id": 45,
+    }
+
+
 def test_experiment_recovery_continues_after_plan_completed_before_adj_factor(monkeypatch):
     monkeypatch.setattr(
         "app.services.data_health.assess_latest_decision_data_health",

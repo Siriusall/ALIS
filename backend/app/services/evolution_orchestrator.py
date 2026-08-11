@@ -651,6 +651,10 @@ def enqueue_system_autonomy_recovery(
 def ensure_latest_ready_system_cycle() -> dict[str, Any]:
     """Recover a missed same-date system cycle, including after restarts/weekends."""
     from app.services.data_health import assess_latest_decision_data_health
+    from app.services.profit_loop import (
+        LEGACY_UNIFIED_DAILY_DECISION_SCHEMA_VERSION,
+        UNIFIED_DAILY_DECISION_SCHEMA_VERSION,
+    )
 
     health = assess_latest_decision_data_health()
     readiness = health.get("readiness") if isinstance(health.get("readiness"), dict) else {}
@@ -723,7 +727,11 @@ def ensure_latest_ready_system_cycle() -> dict[str, Any]:
                     plan_status = str(plan.get("status") or "")
                     plan_is_unified_persisted = bool(
                         plan.get("persisted", plan.get("id") is not None)
-                        and str(plan.get("decision_contract_schema_version") or "") == "alis_unified_daily_decision_v1"
+                        and str(plan.get("decision_contract_schema_version") or "")
+                        in {
+                            LEGACY_UNIFIED_DAILY_DECISION_SCHEMA_VERSION,
+                            UNIFIED_DAILY_DECISION_SCHEMA_VERSION,
+                        }
                     )
                 continue
             gate = step.get("result") if isinstance(step.get("result"), dict) else {}

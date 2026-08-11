@@ -316,7 +316,18 @@ def _owner_summary(steps: list[dict[str, Any]]) -> dict[str, Any]:
             "anomalies": anomalies,
             "incident_supervision": incident_supervisor,
         },
-        "healthy": int(incident_supervisor.get("owner_action_required_count") or 0) == 0 if incident_supervisor else not anomalies,
+        # The LLM incident supervisor is an additional escalation layer, not
+        # an authority that may erase deterministic step failures.  A timeout
+        # or degraded module must keep the daily cycle non-green even when the
+        # supervisor decides that no owner action is necessary.
+        "healthy": (
+            not anomalies
+            and (
+                int(incident_supervisor.get("owner_action_required_count") or 0) == 0
+                if incident_supervisor
+                else True
+            )
+        ),
     }
 
 
@@ -432,10 +443,22 @@ def run_system_autonomy_cycle(*, trade_date: str = "") -> dict[str, Any]:
     from app.services.incident_supervisor import run_incident_supervisor
     steps.append(_run_step("llm_incident_supervisor", lambda: run_incident_supervisor(steps)))
     summary = _owner_summary(steps)
+    owner_action_required = int(
+        ((summary.get("questions") or {}).get("incident_supervision") or {}).get(
+            "owner_action_required_count"
+        )
+        or 0
+    ) > 0
     return {
         "ok": all(bool(step.get("ok")) for step in steps),
         "schema_version": "alis_system_autonomy_cycle_v1",
-        "status": "completed_owner_action_required" if not summary["healthy"] else "completed",
+        "status": (
+            "completed"
+            if summary["healthy"]
+            else "completed_owner_action_required"
+            if owner_action_required
+            else "completed_with_anomalies"
+        ),
         "steps": steps,
         "owner_summary": summary,
     }

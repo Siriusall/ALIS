@@ -24,6 +24,25 @@ def test_owner_rebalance_action_keeps_weights_and_trade_amount():
     assert action["estimated_trade_amount"] == 8000.0
 
 
+def test_owner_summary_cannot_hide_deterministic_failure_behind_incident_supervisor():
+    summary = _owner_summary([
+        {
+            "name": "theme_revenue_exposure",
+            "ok": False,
+            "error": "autonomy_step_timeout:120s",
+            "health": {"status": "failed", "reason": "timeout"},
+        },
+        {
+            "name": "llm_incident_supervisor",
+            "ok": True,
+            "result": {"owner_action_required_count": 0},
+        },
+    ])
+
+    assert summary["healthy"] is False
+    assert summary["questions"]["anomalies"][0]["module"] == "theme_revenue_exposure"
+
+
 def test_owner_summary_uses_current_profit_and_autonomy_contracts():
     summary = _owner_summary(
         [
@@ -505,5 +524,5 @@ def test_full_autonomy_bus_continues_to_terminal_result_after_one_step_times_out
     assert steps["autonomous_self_healing"]["result"]["status"] == "blocked"
     assert steps["llm_incident_supervisor"]["result"]["status"] == "self_managed"
     assert steps["llm_incident_supervisor"]["result"]["owner_action_required_count"] == 0
-    assert result["status"] == "completed"
+    assert result["status"] == "completed_with_anomalies"
     release.set()
