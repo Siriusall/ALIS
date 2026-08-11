@@ -28,6 +28,7 @@ from app.api.routes import (
     research,
     signals,
     strategies,
+    system_versions,
 )
 from app.core.config import settings
 from app.core.error_evidence import error_evidence
@@ -59,6 +60,7 @@ from app.data_platform.services.stream_admin import auto_heal_stream
 from app.data_platform.services.data_center import recover_orphaned_ingestion_runs
 from app.data_platform.services.runtime_logs import write_runtime_log
 from app.services.runtime_heartbeat import status as runtime_heartbeat_status
+from app.services.system_release_center import DATA_SCHEMA_HEAD, SIM_SCHEMA_HEAD, database_revisions
 
 logging.basicConfig(
     level=logging.INFO,
@@ -143,6 +145,17 @@ def startup() -> None:
     _startup_components.clear()
     logger.info("Starting service: verifying database connectivity.")
     _verify_database_connections()
+    revisions = database_revisions()
+    revision_ok = revisions == {"sim": SIM_SCHEMA_HEAD, "data": DATA_SCHEMA_HEAD}
+    _startup_components["database_schema_revisions"] = {
+        "status": "started" if revision_ok else "failed",
+        "required": True,
+        "error": "" if revision_ok else "database migration revision mismatch",
+        "result": {"current": revisions, "expected": {"sim": SIM_SCHEMA_HEAD, "data": DATA_SCHEMA_HEAD}},
+    }
+    if not revision_ok and str(os.getenv("APP_ENV") or "").lower() != "test":
+        logger.error("Background runtime blocked by database revision mismatch: %s", revisions)
+        return
     _background_runtime_lease = acquire_background_runtime_lease()
     _startup_components["background_runtime_boundary"] = {
         "status": (
@@ -305,6 +318,7 @@ for protected_router in (
     model_strategy.router,
     research.router,
     health.router,
+    system_versions.router,
 ):
     app.include_router(
         protected_router,

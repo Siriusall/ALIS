@@ -961,6 +961,25 @@ export function SystemObservatory({ data }: { data: ConsoleData }) {
   </>;
 }
 
+export function SystemVersions({ data }: { data: ConsoleData }) {
+  const status = data.systemVersionStatus || {};
+  const active = pick(status, ["active_release"], {}) as Json;
+  const releases = firstArray(data.systemReleases, ["items"]);
+  const contracts = Object.entries(pick(data.systemContracts, ["items"], {}) as Json);
+  const revisions = pick(status, ["database_revisions"], {}) as Json;
+  const expected = pick(status, ["expected_database_revisions"], {}) as Json;
+  const unlinked = pick(status, ["legacy_unlinked_records"], {}) as Json;
+  const components = firstArray(active, ["components"]);
+  const healthy = Boolean(pick(status, ["ok"], false));
+  return <><PageHeader eyebrow="SYSTEM RELEASE CENTER" title="版本与发布" summary="统一查看代码、数据库、策略、模型、因子和数据合同的冻结发布。页面只读，发布与回滚必须通过后端确定性校验。" />
+    <div className="system-hero-grid"><article className={`system-overview-card ${healthy?"":"is-blocked"}`}><header><span className="system-card-icon"><GitBranch size={19}/></span><Status tone={healthy?"good":"danger"}>{healthy?"发布一致":"阻断新计划"}</Status></header><span>当前系统发布</span><h2>{pick(active,["release_key"],"尚未激活")}</h2><p>{healthy?"运行组件与冻结清单一致。":`原因：${pick(status,["blocked_reason"],"未建立版本证据")}`}</p><footer><div><span>发布 ID</span><strong>{pick(active,["id"],"—")}</strong></div><div><span>Git</span><strong>{String(pick(active,["git_commit"],"—")).slice(0,10)}</strong></div><div><span>组件</span><strong>{components.length}</strong></div></footer></article><article className="system-overview-card system-foundation-card"><header><span className="system-card-icon"><Database size={19}/></span><Status tone={revisions.sim===expected.sim&&revisions.data===expected.data?"good":"danger"}>双库迁移</Status></header><span>数据库修订</span><h2>{revisions.sim || "未登记"}</h2><p>数据平台：{revisions.data || "未登记"}</p><dl><div><dt>运行库目标</dt><dd>{expected.sim || "—"}</dd></div><div><dt>数据库目标</dt><dd>{expected.data || "—"}</dd></div></dl></article></div>
+    {pick(status,["drift"],false) && <Section title="版本漂移" detail="漂移不会被静默接受，新正式计划保持阻断。"><div className="dependency-list">{(pick(status,["drift_components"],[]) as string[]).map(key=><article key={key}><div><strong>{key}</strong><p>冻结值与当前观测值不同</p></div><Status tone="danger">漂移</Status></article>)}</div></Section>}
+    <Section title="当前发布组件" detail="版本清单不可变；原生模型、策略和因子注册表仍是各自权威来源。">{components.length?<div className="dependency-list">{components.map((row,index)=><article key={String(pick(row,["component_key"],index))}><div><strong>{pick(row,["component_key"],"组件")}</strong><p>组件版本记录 #{pick(row,["component_version_id"],"—")}</p></div><Status>{pick(row,["required"],false)?"必需":"可选"}</Status></article>)}</div>:<Empty title="尚无激活发布组件" />}</Section>
+    <div className="two-column"><Section title="发布历史" detail="同一清单幂等复用，不重复制造版本。">{releases.length?<div className="task-category">{releases.map(row=><article key={String(row.id)}><div><strong>{row.release_key}</strong><p>{String(row.manifest_hash||"").slice(0,16)} · {formatSystemTime(row.created_at)}</p></div><Status tone={row.status==="active"?"good":row.status==="blocked"?"danger":"neutral"}>{row.status}</Status></article>)}</div>:<Empty title="暂无发布历史" />}</Section><Section title="关键数据合同" detail="关键合同参加发布兼容性硬门。"><div className="dependency-list">{contracts.map(([key,value])=><article key={key}><div><strong>{key}</strong><p>{String((value as Json).version||"")}</p></div><Status>{(value as Json).critical?"关键":"观察"}</Status></article>)}</div></Section></div>
+    <Section title="历史谱系完整性" detail="旧记录不会伪造 Git 或数据库版本；缺少发布引用的历史记录显式保留为未知。"><dl className="fact-list"><div><dt>调仓计划未关联</dt><dd>{unlinked.daily_rebalance_plans ?? "—"}</dd></div><div><dt>决策快照未关联</dt><dd>{unlinked.decision_snapshots ?? "—"}</dd></div><div><dt>模拟成交未关联</dt><dd>{unlinked.executions ?? "—"}</dd></div></dl></Section>
+  </>;
+}
+
 export function Operations({ data }: { data: ConsoleData }) {
   const owner=unwrapOwner(data.owner); const tasks=firstArray(data.tasks,["tasks","items"]); const logs=firstArray(data.tasks,["logs"]); const incidents=ownerIncidents(owner);const apiRows=apiCatalogRows(data.apiCatalog);const readApis=apiRows.filter(row=>row.method==="GET");const coveredApis=readApis.filter(row=>row.covered==="前端已读取");const quantTasks=rowsFrom(data.quantTasks,["items","tasks"]);
   const taskStatus=(row:Json)=>String(pick(row,["status","state"],"unknown")).toLowerCase();

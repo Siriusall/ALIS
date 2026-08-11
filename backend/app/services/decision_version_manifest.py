@@ -10,6 +10,7 @@ from app.services.factor_platform import FACTOR_SCHEMA_VERSION, active_factor_bi
 from app.services.plan_model_control import PLAN_MODELS
 from app.services.production_strategy import resolve_production_strategy_champion
 from app.services.strategy_controller import active_strategy_policy_context
+from app.services.system_release_center import active_release
 
 
 def build_decision_version_manifest(
@@ -19,6 +20,7 @@ def build_decision_version_manifest(
 ) -> dict[str, Any]:
     """Freeze every production component that can change a simulated decision."""
     champion = resolve_production_strategy_champion()
+    release = active_release()
     strategy_policy = active_strategy_policy_context()
     active_model_versions = {
         key: {
@@ -68,10 +70,18 @@ def build_decision_version_manifest(
     }
     model_versions = frozen_model_versions or active_model_versions
     manifest = {
-        "schema_version": "alis_decision_version_manifest_v1",
+        "schema_version": "alis_decision_version_manifest_v2",
+        "release": {
+            "id": int(release.get("id") or 0) if release else None,
+            "release_key": str(release.get("release_key") or "") if release else "",
+            "manifest_hash": str(release.get("manifest_hash") or "") if release else "",
+            "status": str(release.get("status") or "missing") if release else "missing",
+        },
         "trade_date": str(trade_date).replace("-", "")[:8],
         "data_contract": {
-            "schema_version": "alis_oos_hard_data_v1",
+            "schema_version": "alis_decision_data_contract_v2",
+            "oos_hard_data_schema": "alis_oos_hard_data_v2",
+            "market_ingestion_schema": "alis_market_progress_aware_hedged_checkpoint_v3",
             "point_in_time_cutoff": f"{str(trade_date).replace('-', '')[:4]}-{str(trade_date).replace('-', '')[4:6]}-{str(trade_date).replace('-', '')[6:8]}T15:00:00",
         },
         "factor_contract": {

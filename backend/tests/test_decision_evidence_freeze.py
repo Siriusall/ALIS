@@ -46,6 +46,8 @@ def test_snapshot_resolves_operation_before_writing_v2_hash(monkeypatch) -> None
         def execute(self, sql, params=()):
             if "SELECT id FROM operations" in sql:
                 return _Cursor([{"id": 42}])
+            if "SELECT release_id FROM executions" in sql:
+                return _Cursor([{"release_id": 7}])
             if "INSERT INTO decision_snapshots" in sql:
                 return _Cursor([{"id": 1}])
             if "UPDATE decision_snapshots" in sql:
@@ -62,9 +64,11 @@ def test_snapshot_resolves_operation_before_writing_v2_hash(monkeypatch) -> None
     monkeypatch.setattr(decision_store, "_conn", fake_conn)
     decision_store.create_decision_snapshot(payload)
 
-    expected = _evidence_hash(_decision_evidence_payload(payload, decision_time=payload["decision_time"], operation_id=42))
+    expected = _evidence_hash(_decision_evidence_payload(
+        {**payload, "release_id": 7}, decision_time=payload["decision_time"], operation_id=42,
+    ))
     assert update_params[0][0] == expected
-    assert update_params[0][1] == "evidence_freeze_v2"
+    assert update_params[0][1] == "evidence_freeze_v3"
 
 
 def test_structured_diff_reports_only_changed_frozen_paths() -> None:

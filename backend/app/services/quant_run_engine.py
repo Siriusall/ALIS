@@ -1517,6 +1517,7 @@ def run_for_trade_date(
             budget=total_buy_cost,
             top_n=int(top_n),
             orders=orders_payload,
+            release_id=int((authoritative_plan or {}).get("release_id") or 0) or None,
         )
     elif sold_ops_payload:
         execution_id = create_execution(
@@ -1525,6 +1526,7 @@ def run_for_trade_date(
             budget=0.0,
             top_n=int(top_n),
             orders=[],
+            release_id=int((authoritative_plan or {}).get("release_id") or 0) or None,
         )
     if execution_id is not None and sold_ops_payload:
         link_recorded_operations_to_execution(execution_id, sold_ops_payload)

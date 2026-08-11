@@ -21,7 +21,7 @@ INDUSTRY_ALLOCATION_SCHEMA_VERSION = "alis_industry_allocation_v1"
 PORTFOLIO_COMPETITION_SCHEMA_VERSION = "portfolio_method_competition_v3"
 LEGACY_PORTFOLIO_COMPETITION_SCHEMA_VERSION = "portfolio_method_competition_v2"
 EXPECTED_RETURN_SCHEMA_VERSION = "alis_a_share_expected_return_20d_v1"
-DECISION_MANIFEST_SCHEMA_VERSION = "alis_decision_version_manifest_v1"
+DECISION_MANIFEST_SCHEMA_VERSION = "alis_decision_version_manifest_v2"
 UNIFIED_T1_ALLOWED_VETOES = {
     "missing_open_price",
     "suspension",
@@ -866,6 +866,14 @@ def validate_unified_decision_contract(contract: dict[str, Any]) -> None:
         raise ReplayRiskGateError("统一计划决策版本清单版本无效", code="invalid_authoritative_plan")
     if str(manifest.get("trade_date") or "").replace("-", "")[:8] != signal_date:
         raise ReplayRiskGateError("统一计划版本清单日期与信号日不一致", code="invalid_authoritative_plan")
+    release = manifest.get("release") if isinstance(manifest.get("release"), dict) else {}
+    if (
+        int(release.get("id") or 0) <= 0
+        or not str(release.get("release_key") or "")
+        or len(str(release.get("manifest_hash") or "")) != 64
+        or str(release.get("status") or "") != "active"
+    ):
+        raise ReplayRiskGateError("统一计划未冻结有效系统发布版本", code="missing_active_system_release")
     if not legacy and (
         (manifest.get("execution_contract") or {}).get("decision_schema") != UNIFIED_DAILY_DECISION_SCHEMA_VERSION
         or (manifest.get("execution_contract") or {}).get("t1_safety_schema") != UNIFIED_EXECUTION_SAFETY_SCHEMA_VERSION

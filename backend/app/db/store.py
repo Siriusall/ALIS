@@ -614,6 +614,7 @@ CREATE TABLE IF NOT EXISTS executions (
     budget REAL NOT NULL,
     top_n INTEGER NOT NULL,
     orders_json TEXT NOT NULL,
+    release_id INTEGER,
     FOREIGN KEY (strategy_id) REFERENCES strategies(id)
 );
 CREATE TABLE IF NOT EXISTS operations (
@@ -877,6 +878,84 @@ CREATE TABLE IF NOT EXISTS factor_version_events (
     created_at TEXT NOT NULL,
     FOREIGN KEY (factor_definition_id) REFERENCES factor_definitions(id)
 );
+CREATE TABLE IF NOT EXISTS system_components (
+    component_key TEXT PRIMARY KEY,
+    component_type TEXT NOT NULL,
+    name TEXT NOT NULL,
+    decision_critical INTEGER NOT NULL DEFAULT 0,
+    native_registry TEXT NOT NULL DEFAULT '',
+    description TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS system_component_versions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    component_key TEXT NOT NULL,
+    version TEXT NOT NULL,
+    content_hash TEXT NOT NULL,
+    native_table TEXT NOT NULL DEFAULT '',
+    native_id INTEGER,
+    git_commit TEXT NOT NULL DEFAULT '',
+    artifact_uri TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'registered',
+    evidence_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (component_key) REFERENCES system_components(component_key),
+    UNIQUE(component_key,version,content_hash)
+);
+CREATE TABLE IF NOT EXISTS system_component_dependencies (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    component_version_id INTEGER NOT NULL,
+    dependency_component_key TEXT NOT NULL,
+    constraint_type TEXT NOT NULL,
+    constraint_json TEXT NOT NULL DEFAULT '{}',
+    required INTEGER NOT NULL DEFAULT 1,
+    reason TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (component_version_id) REFERENCES system_component_versions(id)
+);
+CREATE TABLE IF NOT EXISTS system_releases (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    release_key TEXT NOT NULL UNIQUE,
+    status TEXT NOT NULL,
+    manifest_hash TEXT NOT NULL UNIQUE,
+    manifest_json TEXT NOT NULL,
+    git_commit TEXT NOT NULL DEFAULT '',
+    git_dirty INTEGER NOT NULL DEFAULT 0,
+    sim_db_revision TEXT NOT NULL DEFAULT '',
+    data_db_revision TEXT NOT NULL DEFAULT '',
+    config_hash TEXT NOT NULL DEFAULT '',
+    validation_status TEXT NOT NULL DEFAULT 'pending',
+    validation_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    activated_at TEXT,
+    retired_at TEXT
+);
+CREATE TABLE IF NOT EXISTS system_release_components (
+    release_id INTEGER NOT NULL,
+    component_key TEXT NOT NULL,
+    component_version_id INTEGER NOT NULL,
+    role TEXT NOT NULL DEFAULT 'required',
+    required INTEGER NOT NULL DEFAULT 1,
+    frozen_payload_json TEXT NOT NULL DEFAULT '{}',
+    PRIMARY KEY (release_id,component_key),
+    FOREIGN KEY (release_id) REFERENCES system_releases(id),
+    FOREIGN KEY (component_version_id) REFERENCES system_component_versions(id)
+);
+CREATE TABLE IF NOT EXISTS system_release_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    release_id INTEGER NOT NULL,
+    event_type TEXT NOT NULL,
+    actor TEXT NOT NULL,
+    reason TEXT NOT NULL DEFAULT '',
+    evidence_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (release_id) REFERENCES system_releases(id)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_system_release_one_active
+ON system_releases(status) WHERE status='active';
+CREATE INDEX IF NOT EXISTS idx_system_release_events_release
+ON system_release_events(release_id,created_at);
 """
 
 _MYSQL_DDL = """
@@ -1387,6 +1466,8 @@ def init_db() -> None:
                 c.execute("ALTER TABLE decision_snapshots ADD COLUMN IF NOT EXISTS execution_id BIGINT")
                 c.execute("ALTER TABLE decision_snapshots ADD COLUMN IF NOT EXISTS operation_id BIGINT")
                 c.execute("ALTER TABLE decision_snapshots ADD COLUMN IF NOT EXISTS target_weight_contract_json TEXT NOT NULL DEFAULT '{}'")
+                c.execute("ALTER TABLE decision_snapshots ADD COLUMN IF NOT EXISTS release_id BIGINT")
+                c.execute("ALTER TABLE executions ADD COLUMN IF NOT EXISTS release_id BIGINT")
                 c.execute("ALTER TABLE operations ADD COLUMN IF NOT EXISTS target_weight_contract_json TEXT NOT NULL DEFAULT '{}'")
                 c.execute("CREATE INDEX IF NOT EXISTS idx_decision_execution ON decision_snapshots(execution_id,operation_id)")
                 c.execute("CREATE INDEX IF NOT EXISTS idx_decision_time ON decision_snapshots(decision_time DESC,id DESC)")
@@ -1541,13 +1622,13 @@ def _operation_uid(execution_id: int | None, symbol: Any, side: Any, at: Any, qu
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-def create_execution(strategy_id: int, executed_at: str, budget: float, top_n: int, orders: List[Dict[str, Any]]) -> int:
+def create_execution(strategy_id: int, executed_at: str, budget: float, top_n: int, orders: List[Dict[str, Any]], *, release_id: int | None = None) -> int:
     """Insert execution and operations (buy orders). Returns execution id."""
     with _conn() as c:
         c.execute(
-            """INSERT INTO executions (strategy_id, executed_at, budget, top_n, orders_json)
-               VALUES (?, ?, ?, ?, ?)""",
-            (strategy_id, executed_at, budget, top_n, json.dumps(orders)),
+            """INSERT INTO executions (strategy_id, executed_at, budget, top_n, orders_json,release_id)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (strategy_id, executed_at, budget, top_n, json.dumps(orders), int(release_id) if release_id else None),
         )
         eid = c.last_insert_id()
         for o in orders:
@@ -1628,6 +1709,7 @@ def create_and_apply_buy_execution(
     orders: List[Dict[str, Any]],
     *,
     name_by_symbol: Optional[Dict[str, str]] = None,
+    release_id: int | None = None,
 ) -> int:
     """Atomically debit cash, persist BUY operations, and project positions."""
     buy_orders = [
@@ -1654,9 +1736,9 @@ def create_and_apply_buy_execution(
         if balance + 0.005 < total_cost:
             raise ValueError(f"账户余额不足: balance={balance:.2f}, required={total_cost:.2f}")
         c.execute(
-            """INSERT INTO executions (strategy_id,executed_at,budget,top_n,orders_json)
-               VALUES(?,?,?,?,?)""",
-            (strategy_id, executed_at, total_cost, top_n, json.dumps(buy_orders)),
+            """INSERT INTO executions (strategy_id,executed_at,budget,top_n,orders_json,release_id)
+               VALUES(?,?,?,?,?,?)""",
+            (strategy_id, executed_at, total_cost, top_n, json.dumps(buy_orders), int(release_id) if release_id else None),
         )
         execution_id = c.last_insert_id()
         now = executed_at[:19] if executed_at else datetime.now().isoformat()[:19]

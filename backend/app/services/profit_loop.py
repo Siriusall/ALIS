@@ -154,6 +154,7 @@ def _ensure_tables_once() -> None:
         c.execute("ALTER TABLE daily_rebalance_plans ADD COLUMN IF NOT EXISTS validation_error_code VARCHAR(128) NOT NULL DEFAULT ''")
         c.execute("ALTER TABLE daily_rebalance_plans ADD COLUMN IF NOT EXISTS validation_errors_json TEXT NOT NULL DEFAULT '[]'")
         c.execute("ALTER TABLE daily_rebalance_plans ADD COLUMN IF NOT EXISTS validated_at VARCHAR(64)")
+        c.execute("ALTER TABLE daily_rebalance_plans ADD COLUMN IF NOT EXISTS release_id BIGINT")
 
 
 def _fallback_execution_clock() -> dtime:
@@ -1401,6 +1402,8 @@ def _plan_block_status(portfolio: dict[str, Any]) -> tuple[str, str]:
     if not blocked:
         return "planned", ""
     keys = {str(item.get("key") or "") for item in blocked}
+    if "system_release" in keys:
+        return "blocked_by_system_release", "当前运行组件与已激活系统发布不一致，禁止生成可执行计划"
     if "market_data" in keys:
         return "blocked_by_decision_data", "最新交易日决策数据门未通过，当前方案仅作为不可执行预览"
     if "unified_selection" in keys:
@@ -1422,6 +1425,7 @@ def build_daily_decision_contract(
 ) -> dict[str, Any]:
     """Build the immutable T-day decision payload without persisting a plan."""
     from app.services.decision_version_manifest import build_decision_version_manifest
+    from app.services.system_release_center import release_status
 
     decision_gate = portfolio.get("decision_data_gate") if isinstance(portfolio.get("decision_data_gate"), dict) else {}
     proposal = portfolio.get("rebalance_proposal") or []
@@ -1429,6 +1433,15 @@ def build_daily_decision_contract(
         dict(item) for item in (portfolio.get("execution_checks") or [])
         if isinstance(item, dict)
     ]
+    release_gate = release_status()
+    execution_checks.append({
+        "key": "system_release",
+        "status": "pass" if release_gate.get("ok") else "block",
+        "detail": "active system release matches observed runtime"
+        if release_gate.get("ok") else str(release_gate.get("blocked_reason") or "system release unavailable"),
+        "release_id": int((release_gate.get("active_release") or {}).get("id") or 0),
+        "drift_components": list(release_gate.get("drift_components") or []),
+    })
     execution_authorized = bool(decision_gate.get("decision_ready")) and bool(execution_checks) and not any(
         str(item.get("status") or "") == "block" for item in execution_checks
     )
@@ -1520,8 +1533,8 @@ def _persist_contract_validation_failure(
         c.execute(
             """INSERT INTO daily_rebalance_plans
                (trade_date,planned_execute_date,planned_execute_at,version,input_hash,status,
-                proposal_json,generated_at,validation_error_code,validation_errors_json,validated_at)
-               VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                proposal_json,generated_at,validation_error_code,validation_errors_json,validated_at,release_id)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 trade_date,
                 planned_execute_date,
@@ -1534,6 +1547,7 @@ def _persist_contract_validation_failure(
                 error_code,
                 json.dumps(error_payload, ensure_ascii=False, sort_keys=True),
                 _now(),
+                int((((contract.get("decision_version_manifest") or {}).get("release") or {}).get("id")) or 0) or None,
             ),
         )
     return get_latest_daily_rebalance_plan(trade_date)
@@ -1614,7 +1628,7 @@ def materialize_daily_rebalance_plan(portfolio: dict[str, Any] | None = None) ->
     proposal = contract["proposal"]
     decision_version_manifest = contract["decision_version_manifest"]
     execution_authorized = bool(contract.get("execution_authorized"))
-    plan_status, blocked_reason = _plan_block_status(portfolio)
+    plan_status, blocked_reason = _plan_block_status(contract)
     if execution_authorized:
         plan_status, blocked_reason = "planned", ""
     canonical = json.dumps(contract, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
@@ -1644,9 +1658,10 @@ def materialize_daily_rebalance_plan(portfolio: dict[str, Any] | None = None) ->
             if version > 1:
                 c.execute("UPDATE daily_rebalance_plans SET status='superseded' WHERE trade_date=? AND status='planned'", (trade_date,))
             c.execute("""INSERT INTO daily_rebalance_plans
-                (trade_date,planned_execute_date,planned_execute_at,version,input_hash,status,proposal_json,generated_at)
-                VALUES(?,?,?,?,?,?,?,?)""",
-                (trade_date, planned_execute_date, planned_execute_at, version, input_hash, plan_status, canonical, _now()))
+                (trade_date,planned_execute_date,planned_execute_at,version,input_hash,status,proposal_json,generated_at,release_id)
+                VALUES(?,?,?,?,?,?,?,?,?)""",
+                (trade_date, planned_execute_date, planned_execute_at, version, input_hash, plan_status, canonical, _now(),
+                 int(((decision_version_manifest.get("release") or {}).get("id")) or 0) or None))
             row = dict(c.execute(
                 "SELECT * FROM daily_rebalance_plans WHERE trade_date=? AND version=?", (trade_date, version)
             ).fetchone())
@@ -1677,6 +1692,7 @@ def materialize_daily_rebalance_plan(portfolio: dict[str, Any] | None = None) ->
         "executed_at": row.get("executed_at"),
         "input_hash": input_hash,
         "decision_version_manifest": decision_version_manifest,
+        "release_id": row.get("release_id"),
         "selection_snapshot": contract.get("selection_snapshot") or {},
         "decision_contract_schema_version": contract.get("schema_version"),
         "generation_policy": "仅在最新交易日决策数据门通过后生成可执行版本；未通过时保留不可执行预览",
@@ -1760,6 +1776,17 @@ def claim_daily_rebalance_execution_input(
             from app.services.quant_run_plan_input import validate_unified_decision_contract
 
             validate_unified_decision_contract(contract)
+            from app.services.system_release_center import validate_frozen_release_for_execution
+            frozen_release = (contract.get("decision_version_manifest") or {}).get("release") or {}
+            release_gate = validate_frozen_release_for_execution(
+                int(record.get("release_id") or frozen_release.get("id") or 0),
+                str(frozen_release.get("manifest_hash") or ""),
+            )
+            if not release_gate.get("ok"):
+                raise ReplayRiskGateError(
+                    f"冻结系统发布与当前执行器不兼容：{release_gate.get('reason')}",
+                    code="incompatible_frozen_system_release",
+                )
             if (
                 str(contract.get("signal_date") or "").replace("-", "")[:8] != signal
                 or str(contract.get("planned_execute_date") or "").replace("-", "")[:8] != execute
@@ -1818,6 +1845,7 @@ def claim_daily_rebalance_execution_input(
         "risk_budget": contract.get("risk_budget") or {},
         "selection_snapshot": contract.get("selection_snapshot") or {},
         "decision_version_manifest": contract.get("decision_version_manifest") or {},
+        "release_id": record.get("release_id"),
         "risk_limit_contract": contract.get("risk_limit_contract") or {},
         "validation_error_code": str(record.get("validation_error_code") or ""),
         "validation_errors": json.loads(record.get("validation_errors_json") or "[]") if record.get("validation_errors_json") else [],

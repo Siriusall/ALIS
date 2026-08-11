@@ -170,8 +170,14 @@ def _unified_plan() -> dict:
     }
     selection["selection_hash"] = _hash(selection)
     manifest = {
-        "schema_version": "alis_decision_version_manifest_v1",
+        "schema_version": "alis_decision_version_manifest_v2",
         "trade_date": "20260724",
+        "release": {
+            "id": 9,
+            "release_key": "alis-test-release",
+            "manifest_hash": "a" * 64,
+            "status": "active",
+        },
         "factor_contract": {
             "schema_version": "alis_factor_registry_v1",
             "bindings": factor_bindings,

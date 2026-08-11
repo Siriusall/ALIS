@@ -27,6 +27,11 @@ def test_decision_manifest_is_stable_and_freezes_all_component_versions(monkeypa
         "active_execution_cost_contract",
         lambda: {"version": "cost-v1", "round_trip_rate": 0.004},
     )
+    monkeypatch.setattr(
+        decision_version_manifest,
+        "active_release",
+        lambda: {"id": 9, "release_key": "alis-test", "manifest_hash": "a" * 64, "status": "active"},
+    )
     portfolio = {
         "optimizer": {
             "selected_method": "hrp",
@@ -48,3 +53,4 @@ def test_decision_manifest_is_stable_and_freezes_all_component_versions(monkeypa
     assert first["execution_cost"]["version"] == "cost-v1"
     assert len(first["model_versions"]) == 5
     assert len(first["manifest_hash"]) == 64
+    assert first["release"]["id"] == 9

@@ -30,9 +30,9 @@ def _decode(row: Any, fields: tuple[str, ...]) -> dict[str, Any]:
     return value
 
 
-def _decision_evidence_payload(payload: dict[str, Any], *, decision_time: str, operation_id: int | None) -> dict[str, Any]:
+def _decision_evidence_payload(payload: dict[str, Any], *, decision_time: str, operation_id: int | None, include_release: bool = True) -> dict[str, Any]:
     """Canonical, replayable representation of the frozen decision inputs."""
-    return {
+    result = {
         "ts_code": payload["ts_code"], "decision_type": payload["decision_type"],
         "decision_time": decision_time, "price": payload.get("price"),
         "thesis_id": payload.get("thesis_id"), "execution_id": payload.get("execution_id"), "operation_id": operation_id,
@@ -42,6 +42,9 @@ def _decision_evidence_payload(payload: dict[str, Any], *, decision_time: str, o
         "target_weight_contract": payload.get("target_weight_contract") or {},
         "reason": payload["reason"], "invalidation_conditions": payload.get("invalidation_conditions") or [],
     }
+    if include_release:
+        result["release_id"] = payload.get("release_id")
+    return result
 
 
 def _evidence_hash(payload: dict[str, Any]) -> str:
@@ -139,17 +142,22 @@ def create_decision_snapshot(payload: dict[str, Any]) -> dict[str, Any]:
                 (payload.get("execution_id"), symbol, str(payload["decision_type"]).upper()),
             ).fetchone()
             operation_id = dict(operation)["id"] if operation else None
+        release_id = payload.get("release_id")
+        if not release_id and payload.get("execution_id"):
+            execution = c.execute("SELECT release_id FROM executions WHERE id=?", (payload.get("execution_id"),)).fetchone()
+            release_id = dict(execution).get("release_id") if execution else None
+        payload = {**payload, "release_id": release_id}
         evidence_payload = _decision_evidence_payload(payload, decision_time=decision_time, operation_id=operation_id)
         evidence_hash = _evidence_hash(evidence_payload)
-        row = c.execute("""INSERT INTO decision_snapshots(ts_code,decision_type,decision_time,price,thesis_id,execution_id,operation_id,data_as_of_time,model_version,
+        row = c.execute("""INSERT INTO decision_snapshots(ts_code,decision_type,decision_time,price,thesis_id,execution_id,operation_id,data_as_of_time,model_version,release_id,
                  market_state_json,research_state_json,valuation_json,portfolio_context_json,target_weight_contract_json,reason,invalidation_conditions_json,created_at)
-                 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) RETURNING *""", (
+                 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) RETURNING *""", (
             payload["ts_code"], payload["decision_type"], decision_time, payload.get("price"), payload.get("thesis_id"), payload.get("execution_id"), operation_id, data_as_of,
-            payload["model_version"], json.dumps(payload.get("market_state") or {}, ensure_ascii=False), json.dumps(payload.get("research_state") or {}, ensure_ascii=False),
+            payload["model_version"], release_id, json.dumps(payload.get("market_state") or {}, ensure_ascii=False), json.dumps(payload.get("research_state") or {}, ensure_ascii=False),
             json.dumps(payload.get("valuation") or {}, ensure_ascii=False), json.dumps(payload.get("portfolio_context") or {}, ensure_ascii=False),
             json.dumps(payload.get("target_weight_contract") or {}, ensure_ascii=False), payload["reason"],
             json.dumps(payload.get("invalidation_conditions") or [], ensure_ascii=False), now)).fetchone()
-        c.execute("UPDATE decision_snapshots SET evidence_hash=?, evidence_schema_version=? WHERE id=?", (evidence_hash, "evidence_freeze_v2", dict(row)["id"]))
+        c.execute("UPDATE decision_snapshots SET evidence_hash=?, evidence_schema_version=? WHERE id=?", (evidence_hash, "evidence_freeze_v3", dict(row)["id"]))
         row = c.execute("SELECT * FROM decision_snapshots WHERE id=?", (dict(row)["id"],)).fetchone()
     return _decode(row, ("market_state_json", "research_state_json", "valuation_json", "portfolio_context_json", "target_weight_contract_json", "invalidation_conditions_json"))
 
@@ -162,13 +170,16 @@ def verify_decision_snapshot(decision_snapshot_id: int) -> dict[str, Any] | None
         return None
     item = _decode(row, ("market_state_json", "research_state_json", "valuation_json", "portfolio_context_json", "target_weight_contract_json", "invalidation_conditions_json"))
     version = str(item.get("evidence_schema_version") or "")
-    if version != "evidence_freeze_v2":
+    if version not in {"evidence_freeze_v2", "evidence_freeze_v3"}:
         return {
             "ok": False, "id": int(decision_snapshot_id), "verified": False,
             "status": "legacy_schema_unverifiable", "schema_version": version or "evidence_freeze_v1",
             "reason": "旧快照在执行关联解析前计算哈希，不能按当前落库字段做严格回验",
         }
-    payload = _decision_evidence_payload(item, decision_time=str(item["decision_time"]), operation_id=item.get("operation_id"))
+    payload = _decision_evidence_payload(
+        item, decision_time=str(item["decision_time"]), operation_id=item.get("operation_id"),
+        include_release=version == "evidence_freeze_v3",
+    )
     actual = _evidence_hash(payload)
     expected = str(item.get("evidence_hash") or "")
     return {

@@ -11,6 +11,7 @@ export type ConsoleData = Partial<Record<keyof typeof endpoints, Json>> & {
 const routeKeys: Record<string, Array<keyof typeof endpoints>> = {
   "/overview": ["owner", "ledger", "portfolio", "tradingReady", "latestPlan", "health", "adminTasksLive", "dailyUpdateStatus", "watermarks", "ledgerAudit", "oos", "sealed"],
   "/system": ["health", "tradingReady", "adminTasksLive"],
+  "/system/versions": ["systemVersionStatus", "systemReleases", "systemContracts"],
   "/decision": ["owner", "decision", "tradingReady", "latestPlan"],
   "/portfolio": ["owner", "ledger", "positions", "portfolio", "risk", "research"],
   "/evolution": ["factors", "factorStatus", "factorResearchConsole", "factorLineage", "evolutionTasks"],

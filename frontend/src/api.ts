@@ -79,6 +79,9 @@ export async function authWriteApi(path: string, body?: unknown): Promise<Json> 
 export const endpoints = {
   health: "/api/health",
   tradingReady: "/api/trading-ready?detail=compact",
+  systemVersionStatus: "/api/system-versions/status",
+  systemReleases: "/api/system-versions/releases?limit=30",
+  systemContracts: "/api/system-versions/contracts",
   apiCatalog: "/api/openapi.json",
   owner: "/api/model-strategy/evolution/owner-summary",
   decision: "/api/decision/summary",
