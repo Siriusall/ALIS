@@ -1121,9 +1121,16 @@ def _upsert_raw_records(api_name: str, df: pd.DataFrame) -> int:
     now = _now()
     returned_fields = sorted(str(column) for column in df.columns)
     written = 0
+    field_audit: dict[tuple[str, str, str], dict[str, float]] = {}
     with _conn() as c:
         for idx, row in df.iterrows():
             payload = _clean_payload(row.to_dict())
+            if api_name in {"daily", "daily_basic", "stk_limit"}:
+                payload["_field_sources"] = {
+                    field: SOURCE_TUSHARE for field, value in payload.items()
+                    if not field.startswith("_") and value is not None
+                }
+                payload["_field_source_contract"] = "alis_market_field_lineage_v1"
             if api_name in FINANCIAL_RESEARCH_REQUIRED_FIELDS:
                 payload["_returned_fields"] = returned_fields
                 payload["_field_contract_version"] = "financial_research_fields_v1"
@@ -1191,7 +1198,10 @@ def _upsert_raw_records(api_name: str, df: pd.DataFrame) -> int:
                         previous_payload = {}
                     tolerances = {
                         "daily": {"open": 0.021, "high": 0.021, "low": 0.021, "close": 0.021, "pre_close": 0.021},
-                        "daily_basic": {"turnover_rate": 0.051, "volume_ratio": 0.051, "pe_ttm": 0.101, "pb": 0.051},
+                        "daily_basic": {
+                            "turnover_rate": 0.051, "volume_ratio": 0.051, "pe_ttm": 0.101,
+                            "pb": 0.051, "total_mv": 0.0, "circ_mv": 0.0,
+                        },
                         "stk_limit": {"up_limit": 0.011, "down_limit": 0.011},
                     }[api_name]
                     mismatches = []
@@ -1200,16 +1210,38 @@ def _upsert_raw_records(api_name: str, df: pd.DataFrame) -> int:
                         if left is None or right is None:
                             continue
                         try:
-                            if abs(float(left) - float(right)) > tolerance:
+                            absolute = abs(float(left) - float(right))
+                            relative = absolute / max(abs(float(left)), abs(float(right)), 1e-12)
+                            mismatch = relative > .005 if field in {"total_mv", "circ_mv"} else absolute > tolerance
+                            key = (trade_date, api_name, field)
+                            audit = field_audit.setdefault(key, {
+                                "count": 0, "mismatches": 0, "abs_sum": 0, "abs_max": 0,
+                                "relative_sum": 0, "relative_max": 0,
+                            })
+                            audit["count"] += 1
+                            audit["mismatches"] += int(mismatch)
+                            audit["abs_sum"] += absolute
+                            audit["abs_max"] = max(audit["abs_max"], absolute)
+                            audit["relative_sum"] += relative
+                            audit["relative_max"] = max(audit["relative_max"], relative)
+                            if mismatch:
                                 mismatches.append(field)
                         except (TypeError, ValueError):
                             mismatches.append(field)
                     status = "conflict_primary_selected" if mismatches else "matched_primary"
+                    previous_sources = previous_payload.get("_field_sources")
+                    field_sources = dict(previous_sources) if isinstance(previous_sources, dict) else {}
+                    for field in returned_fields:
+                        if not field.startswith("_") and payload.get(field) is not None:
+                            field_sources[field] = SOURCE_TUSHARE
                     payload.update({
                         "pending_primary_reconciliation": False,
                         "fallback_reconciliation_status": status,
                         "reconciled_fallback_source": previous_source,
                         "reconciled_at": now,
+                        "_field_sources": field_sources,
+                        "_field_source_contract": "alis_market_field_lineage_v1",
+                        "_field_reconciliation_contract": "non_null_authoritative_field_merge_v1",
                     })
                     if mismatches:
                         c.execute(
@@ -1303,6 +1335,31 @@ def _upsert_raw_records(api_name: str, df: pd.DataFrame) -> int:
                     values,
                 )
             written += 1
+        for (audit_date, dataset, field), audit in field_audit.items():
+            count = int(audit["count"])
+            mismatch_count = int(audit["mismatches"])
+            status = "conflict" if mismatch_count else "matched"
+            c.execute(
+                """INSERT INTO dc_market_provider_field_audit
+                   (dataset,trade_date,primary_provider,fallback_provider,field_name,compared_count,
+                    mismatch_count,mean_abs_diff,max_abs_diff,mean_relative_diff,max_relative_diff,
+                    status,checked_at,evidence_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                   ON CONFLICT(dataset,trade_date,primary_provider,fallback_provider,field_name) DO UPDATE SET
+                    compared_count=excluded.compared_count,mismatch_count=excluded.mismatch_count,
+                    mean_abs_diff=excluded.mean_abs_diff,max_abs_diff=excluded.max_abs_diff,
+                    mean_relative_diff=excluded.mean_relative_diff,max_relative_diff=excluded.max_relative_diff,
+                    status=excluded.status,checked_at=excluded.checked_at,evidence_json=excluded.evidence_json""",
+                (
+                    dataset, audit_date, SOURCE_TUSHARE, "tencent_market_snapshot", field, count,
+                    mismatch_count, audit["abs_sum"] / count, audit["abs_max"],
+                    audit["relative_sum"] / count, audit["relative_max"], status, now,
+                    _strict_json({
+                        "contract": "alis_market_provider_field_audit_v1",
+                        "absolute_tolerance": tolerances.get(field),
+                        "relative_tolerance": .005 if field in {"total_mv", "circ_mv"} else None,
+                    }),
+                ),
+            )
     return written
 
 

@@ -64,6 +64,23 @@ CREATE TABLE dc_market_provider_performance (
             evidence_json TEXT NOT NULL DEFAULT '{}',
             PRIMARY KEY (dataset, provider, sample_date)
         );
+CREATE TABLE dc_market_provider_field_audit (
+            dataset TEXT NOT NULL,
+            trade_date TEXT NOT NULL,
+            primary_provider TEXT NOT NULL,
+            fallback_provider TEXT NOT NULL,
+            field_name TEXT NOT NULL,
+            compared_count INTEGER NOT NULL DEFAULT 0,
+            mismatch_count INTEGER NOT NULL DEFAULT 0,
+            mean_abs_diff REAL NOT NULL DEFAULT 0,
+            max_abs_diff REAL NOT NULL DEFAULT 0,
+            mean_relative_diff REAL NOT NULL DEFAULT 0,
+            max_relative_diff REAL NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'observing',
+            checked_at TEXT NOT NULL,
+            evidence_json TEXT NOT NULL DEFAULT '{}',
+            PRIMARY KEY (dataset, trade_date, primary_provider, fallback_provider, field_name)
+        );
 CREATE TABLE dc_announcement_event (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             announcement_id INTEGER NOT NULL,

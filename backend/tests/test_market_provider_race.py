@@ -1,4 +1,7 @@
 import time
+import json
+
+import pandas as pd
 
 from app.data_platform.services import data_center
 from app.data_platform.services import market_data_discovery as discovery
@@ -178,3 +181,50 @@ def test_provider_performance_opens_circuit_after_consecutive_failures():
 
     assert performance["circuit_open"] is True
     assert performance["consecutive_failures"] == 3
+
+
+def test_daily_basic_reconciles_non_null_fields_and_keeps_field_lineage():
+    trade_date = "20990102"
+    code = "600000.SH"
+    fallback = {
+        "ts_code": code, "trade_date": trade_date, "turnover_rate": .2,
+        "volume_ratio": 1.1, "pe_ttm": 8.5, "pb": 1.0,
+        "total_mv": 1000.0, "circ_mv": 800.0,
+        "_field_sources": {field: "tencent_market_snapshot" for field in (
+            "turnover_rate", "volume_ratio", "pe_ttm", "pb", "total_mv", "circ_mv"
+        )},
+    }
+    with discovery._conn() as conn:
+        conn.execute(
+            """INSERT INTO dc_tushare_raw_records
+               (api_name,record_key,ts_code,trade_date,period,ann_date,payload_json,
+                source_code,available_time,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)
+               ON CONFLICT(api_name,record_key) DO UPDATE SET payload_json=excluded.payload_json,
+                source_code=excluded.source_code""",
+            ("daily_basic", f"{code}|{trade_date}", code, trade_date, "", "", json.dumps(fallback),
+             "tencent_market_snapshot", "2099-01-02T15:00:00", "2099-01-02T15:01:00"),
+        )
+    frame = pd.DataFrame([{
+        "ts_code": code, "trade_date": trade_date, "turnover_rate": .3,
+        "volume_ratio": 1.1, "pe_ttm": None, "pb": 1.0,
+        "total_mv": 1001.0, "circ_mv": 800.0,
+    }])
+
+    assert data_center._upsert_raw_records("daily_basic", frame) == 1
+
+    with discovery._conn() as conn:
+        row = conn.execute(
+            "SELECT payload_json,source_code FROM dc_tushare_raw_records WHERE api_name=? AND record_key=?",
+            ("daily_basic", f"{code}|{trade_date}"),
+        ).fetchone()
+        audits = conn.execute(
+            """SELECT field_name,mismatch_count FROM dc_market_provider_field_audit
+               WHERE dataset='daily_basic' AND trade_date=?""", (trade_date,),
+        ).fetchall()
+    payload = json.loads(dict(row)["payload_json"])
+    assert payload["turnover_rate"] == .3
+    assert payload["pe_ttm"] == 8.5
+    assert payload["_field_sources"]["turnover_rate"] == "tushare"
+    assert payload["_field_sources"]["pe_ttm"] == "tencent_market_snapshot"
+    assert dict(row)["source_code"] == "tushare"
+    assert {dict(item)["field_name"]: dict(item)["mismatch_count"] for item in audits}["turnover_rate"] == 1

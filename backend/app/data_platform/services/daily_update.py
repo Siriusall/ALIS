@@ -542,6 +542,21 @@ def daily_update_status() -> dict[str, Any]:
                    ORDER BY dataset,provider"""
             ).fetchall()
             state["provider_performance"] = [dict(row) for row in performance_rows]
+            from app.data_platform.services.market_data_discovery import provider_calibration_status
+            state["provider_calibration"] = provider_calibration_status()
+            audit_rows = c.execute(
+                """SELECT dataset,trade_date,primary_provider,fallback_provider,field_name,
+                          compared_count,mismatch_count,mean_abs_diff,max_abs_diff,
+                          mean_relative_diff,max_relative_diff,status,checked_at
+                   FROM dc_market_provider_field_audit WHERE trade_date=?
+                   ORDER BY dataset,field_name""",
+                (target,),
+            ).fetchall()
+            state["provider_field_audit"] = {
+                "trade_date": target,
+                "items": [dict(row) for row in audit_rows],
+                "contract": "alis_market_provider_field_audit_v1",
+            }
     except Exception as exc:  # noqa: BLE001
         state["status_error"] = str(exc)[:200]
     return state

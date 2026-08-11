@@ -23,6 +23,8 @@ class _ContractConn:
                 {"api_name": "daily_basic", "rows": 5518},
                 {"api_name": "stk_limit", "rows": 3864},
             ])
+        if "jsonb_each_text" in sql:
+            return _Result(many=[])
         if "FROM dc_stock_daily_snapshot WHERE trade_date" in sql:
             return _Result(one={
                 "snapshot_rows": 5518,

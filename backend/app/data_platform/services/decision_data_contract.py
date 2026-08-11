@@ -56,6 +56,22 @@ def decision_data_contract(trade_date: str | None = None, *, conn: Any | None = 
             provider_counts.setdefault(str(item.get("api_name") or ""), {})[
                 str(item.get("source_code") or "unknown")
             ] = int(item.get("rows") or 0)
+        field_provider_rows = active.execute(
+            """SELECT fields.key AS field_name,fields.value AS source_code,COUNT(*) AS rows
+               FROM dc_tushare_raw_records raw
+               CROSS JOIN LATERAL jsonb_each_text(
+                   COALESCE(raw.payload_json::jsonb->'_field_sources','{}'::jsonb)
+               ) fields
+               WHERE raw.trade_date=? AND raw.api_name='daily_basic'
+               GROUP BY fields.key,fields.value ORDER BY fields.key,fields.value""",
+            (value,),
+        ).fetchall() if value else []
+        field_provider_counts: dict[str, dict[str, int]] = {}
+        for row in field_provider_rows:
+            item = _row_dict(row)
+            field_provider_counts.setdefault(str(item.get("field_name") or ""), {})[
+                str(item.get("source_code") or "unknown")
+            ] = int(item.get("rows") or 0)
         snapshot = active.execute(
             """SELECT COUNT(*) AS snapshot_rows,
                       SUM(CASE WHEN close IS NOT NULL THEN 1 ELSE 0 END) AS close_rows,
@@ -123,7 +139,7 @@ def decision_data_contract(trade_date: str | None = None, *, conn: Any | None = 
         blocking_reasons.append("insufficient_snapshot_coverage")
     return {
         "ok": ready,
-        "schema_version": "alis_decision_data_contract_v1",
+        "schema_version": "alis_decision_data_contract_v2",
         "latest_trade_date": value,
         "required_apis": list(REQUIRED_DECISION_APIS),
         "present_apis": present_apis,
@@ -136,6 +152,7 @@ def decision_data_contract(trade_date: str | None = None, *, conn: Any | None = 
         "expected_rows": expected_rows,
         "counts": counts,
         "provider_rows": provider_counts,
+        "daily_basic_field_provider_rows": field_provider_counts,
         "provider_policy": "hedged_first_complete_slice_wins_field_authority_reconciles_v2",
         "field_source_authority": {
             "daily": "first_valid_full_slice_then_tushare_reconcile",

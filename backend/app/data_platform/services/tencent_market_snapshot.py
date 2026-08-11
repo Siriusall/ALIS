@@ -308,6 +308,11 @@ def sync_tencent_market_bundle(trade_date: str, apis: list[str] | tuple[str, ...
                 if code not in eligible_by_api[api_name]:
                     continue
                 payload = payloads[api_name]
+                payload["_field_sources"] = {
+                    field: SOURCE_CODE for field, value in payload.items()
+                    if not field.startswith("_") and value is not None
+                }
+                payload["_field_source_contract"] = "alis_market_field_lineage_v1"
                 payload.update(common)
                 cursor = conn.execute(
                     """INSERT INTO dc_tushare_raw_records

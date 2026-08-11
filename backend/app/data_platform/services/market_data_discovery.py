@@ -9,6 +9,7 @@ durable ledger so the minute scheduler does not hammer upstream APIs.
 from __future__ import annotations
 
 import json
+import math
 import os
 import statistics
 import threading
@@ -72,7 +73,7 @@ def _adaptive_probe_interval_seconds(dataset: str, provider: str, now: datetime)
         for row in rows:
             value = datetime.fromisoformat(str(dict(row).get("probed_at") or ""))
             minutes.append(value.hour * 60 + value.minute + value.second / 60)
-        if len(minutes) < 3:
+        if len(minutes) < 5:
             return base
         expected = statistics.median(minutes)
         current = now.hour * 60 + now.minute + now.second / 60
@@ -99,18 +100,37 @@ def provider_performance(dataset: str, provider: str) -> dict[str, Any]:
     latencies = [int(row.get("bulk_latency_ms") or 0) for row in successes if int(row.get("bulk_latency_ms") or 0) > 0]
     reliability = sum(int(row.get("success") or 0) for row in samples) / len(samples) if samples else .75
     coverage = statistics.mean(float(row.get("coverage") or 0) for row in successes) if successes else .8
-    eta_ms = int(statistics.median(latencies)) if latencies else int(os.getenv("MARKET_BULK_DEFAULT_ETA_MS", "12000"))
+    default_eta = int(os.getenv("MARKET_BULK_DEFAULT_ETA_MS", "12000"))
+    eta_ms = int(statistics.median(latencies)) if len(latencies) >= 5 else default_eta
+    p75_ms = int(sorted(latencies)[max(0, math.ceil(len(latencies) * .75) - 1)]) if len(latencies) >= 5 else default_eta
     consecutive_failures = 0
     for row in samples:
         if int(row.get("success") or 0):
             break
         consecutive_failures += 1
+    with _conn() as conn:
+        quality_row = conn.execute(
+            """SELECT COUNT(DISTINCT trade_date) AS sessions,
+                      COALESCE(SUM(mismatch_count),0) AS mismatches,
+                      COALESCE(SUM(compared_count),0) AS compared
+               FROM (SELECT * FROM dc_market_provider_field_audit
+                     WHERE dataset=? AND fallback_provider=? ORDER BY trade_date DESC LIMIT 200) recent""",
+            (dataset, provider),
+        ).fetchone()
+    quality = dict(quality_row) if quality_row else {}
+    quality_sessions = int(quality.get("sessions") or 0)
+    compared = int(quality.get("compared") or 0)
+    mismatch_rate = int(quality.get("mismatches") or 0) / compared if compared else 0.0
+    quality_factor = max(.5, 1.0 - mismatch_rate) if quality_sessions >= 5 else 1.0
     circuit_open = consecutive_failures >= int(os.getenv("MARKET_PROVIDER_CIRCUIT_FAILURES", "3"))
-    score = eta_ms / max(.1, reliability * max(.5, coverage))
+    score = p75_ms / max(.1, reliability * max(.5, coverage) * quality_factor)
     return {
-        "samples": len(samples), "eta_ms": eta_ms, "reliability": round(reliability, 4),
+        "samples": len(samples), "calibration_ready": len(successes) >= 5,
+        "eta_ms": eta_ms, "p75_ms": p75_ms, "reliability": round(reliability, 4),
         "coverage": round(coverage, 4), "consecutive_failures": consecutive_failures,
-        "circuit_open": circuit_open, "completion_score": round(score, 2),
+        "quality_sessions": quality_sessions, "field_mismatch_rate": round(mismatch_rate, 6),
+        "quality_factor": round(quality_factor, 4), "circuit_open": circuit_open,
+        "completion_score": round(score, 2),
     }
 
 
@@ -138,7 +158,14 @@ def hedge_delay_seconds(dataset: str, provider: str) -> float:
     perf = provider_performance(dataset, provider)
     floor = float(os.getenv("MARKET_BULK_HEDGE_MIN_SECONDS", "3"))
     ceiling = float(os.getenv("MARKET_BULK_HEDGE_MAX_SECONDS", "20"))
-    return max(floor, min(ceiling, perf["eta_ms"] / 1000 * .75))
+    return max(floor, min(ceiling, perf["p75_ms"] / 1000 * .75))
+
+
+def provider_calibration_status() -> list[dict[str, Any]]:
+    return [
+        {"dataset": dataset, "provider": provider, **provider_performance(dataset, provider)}
+        for dataset, providers in DATASET_PROVIDERS.items() for provider in providers
+    ]
 
 
 def _tushare_probe(dataset: str, trade_date: str) -> dict[str, Any]:
