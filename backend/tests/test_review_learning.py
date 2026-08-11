@@ -84,18 +84,21 @@ def test_materialized_outcome_persists_numeric_directional_return(monkeypatch):
 
     class DataConnection:
         def execute(self, sql, params=()):
-            if "dc_stock_daily_snapshot" in sql and "WHERE ts_code IN" in sql:
+            if "WITH requested(decision_id,code,normalized_code,start_date)" in sql:
                 return Result([
-                    {"trade_date": f"202601{day:02d}", "close": 10.0 + day, "industry": "银行"}
+                    {"decision_id": 7, "trade_date": f"202601{day:02d}", "close": 10.0 + day, "industry": "银行"}
                     for day in range(1, 62)
                 ])
             if "dc_tushare_raw_records" in sql:
                 return Result([
-                    {"trade_date": params[0], "payload_json": json.dumps({"close": 100.0})},
-                    {"trade_date": params[1], "payload_json": json.dumps({"close": 110.0})},
+                    {"trade_date": trade_date, "payload_json": json.dumps({"close": 100.0 + index})}
+                    for index, trade_date in enumerate(params)
                 ])
-            if "WITH entry_prices" in sql:
-                return Result([{"value": 0.05}])
+            if "WITH requested(industry,entry_date,exit_date)" in sql:
+                return Result([
+                    {"industry": params[index], "entry_date": params[index + 1], "exit_date": params[index + 2], "value": 0.05}
+                    for index in range(0, len(params), 3)
+                ])
             return Result()
 
     @contextmanager

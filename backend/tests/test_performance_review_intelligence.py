@@ -1,7 +1,53 @@
+from contextlib import contextmanager
+
 from app.services.performance_reports import enrich_performance_period
 from app.services import strategy_controller
 from app.services import evolution_orchestrator
 from app.services.strategy_controller import _learning_signal_suggestions
+
+
+def test_strategy_policy_shadow_materialization_reads_decisions_once_for_all_candidates(monkeypatch) -> None:
+    queries = []
+    inserts = []
+
+    class Result:
+        def __init__(self, rows=()):
+            self.rows = list(rows)
+
+        def fetchall(self):
+            return self.rows
+
+    class Connection:
+        def execute(self, sql, params=()):
+            queries.append(sql)
+            if "FROM decision_snapshots" in sql:
+                return Result([
+                    {"id": 10, "decision_time": "2026-08-01T15:00:00", "decision_type": "buy", "research_state_json": '{"score":90}', "target_weight_contract_json": "{}"},
+                    {"id": 11, "decision_time": "2026-08-02T15:00:00", "decision_type": "buy", "research_state_json": '{"score":90}', "target_weight_contract_json": "{}"},
+                ])
+            if "SELECT candidate_version_id,decision_snapshot_id" in sql:
+                return Result([{"candidate_version_id": 1, "decision_snapshot_id": 10}])
+            if "INSERT INTO strategy_policy_shadow_observations" in sql:
+                inserts.append(params)
+            return Result()
+
+    @contextmanager
+    def connection():
+        yield Connection()
+
+    monkeypatch.setattr(strategy_controller, "_ensure_strategy_policy_shadow_tables", lambda: None)
+    monkeypatch.setattr(strategy_controller, "business_conn", connection)
+    monkeypatch.setattr(strategy_controller, "list_model_versions", lambda *_args, **_kwargs: [
+        {"id": 1, "status": "candidate", "is_active": False, "version": "v1", "created_at": "2026-08-01T00:00:00", "config": {"policy": {}}},
+        {"id": 2, "status": "candidate", "is_active": False, "version": "v2", "created_at": "2026-08-02T00:00:00", "config": {"policy": {}}},
+    ])
+
+    result = strategy_controller.materialize_strategy_policy_shadow_observations()
+
+    assert sum("FROM decision_snapshots" in sql for sql in queries) == 1
+    assert sum("SELECT candidate_version_id,decision_snapshot_id" in sql for sql in queries) == 1
+    assert {(row[0], row[1]) for row in inserts} == {(1, 11), (2, 11)}
+    assert result["observations_written"] == 2
 
 
 def test_period_review_groups_market_model_cost_and_errors() -> None:

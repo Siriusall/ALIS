@@ -1150,16 +1150,43 @@ def materialize_strategy_policy_shadow_observations(*, limit_candidates: int = 3
     written = 0
     opportunities = 0
     now = datetime.now().isoformat()
+    if not candidates:
+        return {
+            "ok": True,
+            "schema_version": "strategy_policy_shadow_v2",
+            "candidate_count": 0,
+            "opportunities_seen": 0,
+            "observations_written": 0,
+            "policy": "candidate_specific_post_creation_shadow_only; incremental_batch_read; no_account_effect",
+        }
+    earliest_created_at = min(str(candidate.get("created_at") or "") for candidate in candidates)
     with business_conn() as c:
+        decisions = [dict(row) for row in c.execute(
+            """SELECT id,decision_time,decision_type,research_state_json,target_weight_contract_json
+                 FROM decision_snapshots WHERE decision_time>=? ORDER BY decision_time,id""",
+            (earliest_created_at,),
+        ).fetchall()]
+        candidate_ids = [int(candidate["id"]) for candidate in candidates]
+        placeholders = ",".join("?" for _ in candidate_ids)
+        existing = {
+            (int(row["candidate_version_id"]), int(row["decision_snapshot_id"]))
+            for row in c.execute(
+                f"""SELECT candidate_version_id,decision_snapshot_id
+                       FROM strategy_policy_shadow_observations
+                      WHERE candidate_version_id IN ({placeholders})""",
+                tuple(candidate_ids),
+            ).fetchall()
+        }
         for candidate in candidates:
             policy = ((candidate.get("config") or {}).get("policy") or DEFAULT_STRATEGY_POLICY)
             created_at = str(candidate.get("created_at") or "")
-            rows = [dict(row) for row in c.execute(
-                """SELECT id,decision_time,decision_type,research_state_json,target_weight_contract_json
-                   FROM decision_snapshots WHERE decision_time>=? ORDER BY decision_time,id""",
-                (created_at,),
-            ).fetchall()]
-            for row in rows:
+            candidate_id = int(candidate["id"])
+            for row in decisions:
+                if str(row.get("decision_time") or "") < created_at:
+                    continue
+                observation_key = (candidate_id, int(row["id"]))
+                if observation_key in existing:
+                    continue
                 try:
                     research = json.loads(row.get("research_state_json") or "{}")
                     contract = json.loads(row.get("target_weight_contract_json") or "{}")
@@ -1181,20 +1208,21 @@ def materialize_strategy_policy_shadow_observations(*, limit_candidates: int = 3
                         shadow_action,would_trade,score,evidence_json,created_at
                     ) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(candidate_version_id,decision_snapshot_id) DO NOTHING""",
                     (
-                        int(candidate["id"]), int(row["id"]), str(row.get("decision_time") or ""),
+                        candidate_id, int(row["id"]), str(row.get("decision_time") or ""),
                         str(row.get("decision_type") or ""), action, int(would_trade), score,
                         json.dumps(evidence, ensure_ascii=False), now,
                     ),
                 )
                 written += 1
                 opportunities += 1
+                existing.add(observation_key)
     return {
         "ok": True,
-        "schema_version": "strategy_policy_shadow_v1",
+        "schema_version": "strategy_policy_shadow_v2",
         "candidate_count": len(candidates),
         "opportunities_seen": opportunities,
         "observations_written": written,
-        "policy": "candidate_specific_post_creation_shadow_only; no_account_effect",
+        "policy": "candidate_specific_post_creation_shadow_only; incremental_batch_read; no_account_effect",
     }
 
 

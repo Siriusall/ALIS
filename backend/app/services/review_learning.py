@@ -55,35 +55,90 @@ def _payload(row: dict[str, Any], key: str) -> dict[str, Any]:
         return {}
 
 
-def _benchmark_prices(dates: tuple[str, str]) -> dict[str, float]:
-    with data_conn() as c:
-        rows = c.execute("""SELECT trade_date,payload_json FROM dc_tushare_raw_records
-            WHERE api_name='index_daily' AND ts_code IN ('000300.SH','000300')
-            AND trade_date IN (?,?) ORDER BY ts_code DESC""", dates).fetchall()
-    result: dict[str, float] = {}
-    for raw in rows:
-        row = dict(raw)
-        try:
-            close = float(json.loads(row.get("payload_json") or "{}").get("close") or 0)
-        except (TypeError, ValueError, json.JSONDecodeError):
-            close = 0
-        if close > 0:
-            result[str(row.get("trade_date"))] = close
+def _chunks(values: list[Any], size: int = 500) -> list[list[Any]]:
+    return [values[index:index + size] for index in range(0, len(values), size)]
+
+
+def _batch_decision_prices(decisions: list[dict[str, Any]]) -> dict[int, list[dict[str, Any]]]:
+    """Load at most 61 post-decision sessions for every decision in bounded batches."""
+    result: dict[int, list[dict[str, Any]]] = {int(item["id"]): [] for item in decisions}
+    for batch in _chunks(decisions, 400):
+        values_sql = ",".join("(?,?,?,?)" for _ in batch)
+        params: list[Any] = []
+        for decision in batch:
+            code = str(decision.get("ts_code") or "")
+            bare_code = code.split(".")[0]
+            normalized = code if "." in code else f"{bare_code}.SH" if bare_code.startswith(("5", "6", "9")) else f"{bare_code}.SZ"
+            params.extend((int(decision["id"]), code, normalized, str(decision.get("decision_time") or "").replace("-", "")[:8]))
+        with data_conn() as c:
+            rows = c.execute(
+                f"""WITH requested(decision_id,code,normalized_code,start_date) AS (VALUES {values_sql}),
+                    ranked AS (
+                        SELECT r.decision_id,s.trade_date,s.close,s.industry,
+                               ROW_NUMBER() OVER(PARTITION BY r.decision_id ORDER BY s.trade_date) AS session_no
+                          FROM requested r
+                          JOIN dc_stock_daily_snapshot s
+                            ON s.ts_code IN (r.code,r.normalized_code)
+                           AND s.trade_date>=r.start_date AND s.close>0
+                    )
+                    SELECT decision_id,trade_date,close,industry
+                      FROM ranked WHERE session_no<=61
+                     ORDER BY decision_id,trade_date""",
+                tuple(params),
+            ).fetchall()
+        for raw in rows:
+            row = dict(raw)
+            result.setdefault(int(row["decision_id"]), []).append(row)
     return result
 
 
-def _industry_return(industry: str, entry_date: str, exit_date: str) -> float | None:
-    if not industry:
-        return None
-    with data_conn() as c:
-        row = c.execute("""WITH entry_prices AS (
-              SELECT ts_code,close FROM dc_stock_daily_snapshot WHERE trade_date=? AND industry=? AND close>0
-            ), exit_prices AS (
-              SELECT ts_code,close FROM dc_stock_daily_snapshot WHERE trade_date=? AND industry=? AND close>0
-            ) SELECT AVG(x.close/e.close-1.0) value FROM entry_prices e JOIN exit_prices x USING(ts_code)""",
-            (entry_date, industry, exit_date, industry)).fetchone()
-    value = dict(row).get("value") if row else None
-    return float(value) if value is not None else None
+def _batch_benchmark_prices(dates: set[str]) -> dict[str, float]:
+    result: dict[str, float] = {}
+    for batch in _chunks(sorted(dates), 1000):
+        placeholders = ",".join("?" for _ in batch)
+        with data_conn() as c:
+            rows = c.execute(
+                f"""SELECT trade_date,payload_json FROM dc_tushare_raw_records
+                    WHERE api_name='index_daily' AND ts_code IN ('000300.SH','000300')
+                      AND trade_date IN ({placeholders}) ORDER BY ts_code DESC""",
+                tuple(batch),
+            ).fetchall()
+        for raw in rows:
+            row = dict(raw)
+            try:
+                close = float(json.loads(row.get("payload_json") or "{}").get("close") or 0)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                close = 0
+            if close > 0:
+                result[str(row.get("trade_date") or "")] = close
+    return result
+
+
+def _batch_industry_returns(keys: set[tuple[str, str, str]]) -> dict[tuple[str, str, str], float]:
+    result: dict[tuple[str, str, str], float] = {}
+    valid = sorted(key for key in keys if key[0])
+    for batch in _chunks(valid, 400):
+        values_sql = ",".join("(?,?,?)" for _ in batch)
+        params = tuple(value for key in batch for value in key)
+        with data_conn() as c:
+            rows = c.execute(
+                f"""WITH requested(industry,entry_date,exit_date) AS (VALUES {values_sql})
+                    SELECT r.industry,r.entry_date,r.exit_date,AVG(x.close/e.close-1.0) value
+                      FROM requested r
+                      JOIN dc_stock_daily_snapshot e
+                        ON e.trade_date=r.entry_date AND e.industry=r.industry AND e.close>0
+                      JOIN dc_stock_daily_snapshot x
+                        ON x.trade_date=r.exit_date AND x.industry=r.industry
+                       AND x.ts_code=e.ts_code AND x.close>0
+                     GROUP BY r.industry,r.entry_date,r.exit_date""",
+                params,
+            ).fetchall()
+        for raw in rows:
+            row = dict(raw)
+            value = row.get("value")
+            if value is not None:
+                result[(str(row["industry"]), str(row["entry_date"]), str(row["exit_date"]))] = float(value)
+    return result
 
 
 def _outcome_needs_benchmark_recompute(row: dict[str, Any] | None) -> bool:
@@ -117,18 +172,20 @@ def materialize_decision_outcomes(limit: int = 1000) -> dict[str, Any]:
                 "FROM decision_outcome_attributions"
             ).fetchall()
         }
-    created = 0
+    eligible_decisions = [
+        decision for decision in decisions
+        if any(
+            (int(decision["id"]), horizon) not in existing
+            or _outcome_needs_benchmark_recompute(existing.get((int(decision["id"]), horizon)))
+            for horizon in HORIZONS
+        )
+    ]
+    prices_by_decision = _batch_decision_prices(eligible_decisions) if eligible_decisions else {}
+    drafts: list[dict[str, Any]] = []
     pending = 0
-    for decision in decisions:
+    for decision in eligible_decisions:
         decision_id = int(decision["id"])
-        code = str(decision.get("ts_code") or "")
-        bare_code = code.split(".")[0]
-        normalized_code = code if "." in code else f"{bare_code}.SH" if bare_code.startswith(("5", "6", "9")) else f"{bare_code}.SZ"
-        date = str(decision.get("decision_time") or "").replace("-", "")[:8]
-        with data_conn() as c:
-            prices = [dict(row) for row in c.execute("""SELECT trade_date,close,industry FROM dc_stock_daily_snapshot
-                WHERE ts_code IN (?,?) AND trade_date>=? AND close>0 ORDER BY trade_date LIMIT 61""",
-                (code, normalized_code, date)).fetchall()]
+        prices = prices_by_decision.get(decision_id) or []
         if not prices:
             pending += len(HORIZONS)
             continue
@@ -145,36 +202,49 @@ def materialize_decision_outcomes(limit: int = 1000) -> dict[str, Any]:
             direction = str(decision.get("decision_type") or "").lower()
             directional = -stock_return if direction in {"sell", "reduce", "exit"} else stock_return
             entry_date, exit_date = str(entry["trade_date"]), str(exit_row["trade_date"])
-            benchmarks = _benchmark_prices((entry_date, exit_date))
-            bm_return = benchmarks.get(exit_date) / benchmarks.get(entry_date) - 1.0 if benchmarks.get(entry_date) and benchmarks.get(exit_date) else None
             industry = str(entry.get("industry") or "")
-            ind_return = _industry_return(industry, entry_date, exit_date)
+            drafts.append({
+                "decision_id": decision_id, "horizon": horizon, "existing": bool(existing_row),
+                "entry_date": entry_date, "exit_date": exit_date, "entry_price": entry_price,
+                "exit_price": exit_price, "stock_return": stock_return, "directional": directional,
+                "direction": direction, "industry": industry,
+            })
+    benchmark_prices = _batch_benchmark_prices({date for item in drafts for date in (item["entry_date"], item["exit_date"])})
+    industry_returns = _batch_industry_returns({(item["industry"], item["entry_date"], item["exit_date"]) for item in drafts})
+    created = 0
+    now = _now()
+    with _conn() as c:
+        for item in drafts:
+            entry_date, exit_date = item["entry_date"], item["exit_date"]
+            bm_return = benchmark_prices.get(exit_date) / benchmark_prices.get(entry_date) - 1.0 if benchmark_prices.get(entry_date) and benchmark_prices.get(exit_date) else None
+            industry = item["industry"]
+            ind_return = industry_returns.get((industry, entry_date, exit_date))
+            stock_return = item["stock_return"]
             market = bm_return
             industry_component = (ind_return - bm_return) if ind_return is not None and bm_return is not None else None
             selection = stock_return - (ind_return if ind_return is not None else bm_return) if (ind_return is not None or bm_return is not None) else None
-            correct = directional > 0
-            details = {"method": "fixed_horizon_brinson_v1", "industry": industry, "direction": direction,
-                "entry_price": entry_price, "exit_price": exit_price, "limitations": []}
+            correct = item["directional"] > 0
+            details = {"method": "fixed_horizon_brinson_v1", "industry": industry, "direction": item["direction"],
+                "entry_price": item["entry_price"], "exit_price": item["exit_price"], "limitations": []}
             if bm_return is None: details["limitations"].append("缺少沪深300同期收盘价")
             if ind_return is None: details["limitations"].append("缺少行业同期横截面")
-            with _conn() as c:
-                statement = """INSERT INTO decision_outcome_attributions
-                    (decision_snapshot_id,horizon_sessions,entry_date,exit_date,stock_return,directional_return,
-                     benchmark_return,industry_return,market_contribution,industry_contribution,selection_contribution,
-                     correct,attribution_json,calculated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)"""
-                params = (decision_id,horizon,entry_date,exit_date,stock_return,directional,bm_return,ind_return,market,
-                          industry_component,selection,int(correct),json.dumps(details,ensure_ascii=False),_now())
-                if existing_row:
-                    statement += """ ON CONFLICT(decision_snapshot_id,horizon_sessions) DO UPDATE SET
-                        entry_date=excluded.entry_date,exit_date=excluded.exit_date,stock_return=excluded.stock_return,
-                        directional_return=excluded.directional_return,benchmark_return=excluded.benchmark_return,
-                        industry_return=excluded.industry_return,market_contribution=excluded.market_contribution,
-                        industry_contribution=excluded.industry_contribution,selection_contribution=excluded.selection_contribution,
-                        correct=excluded.correct,attribution_json=excluded.attribution_json,calculated_at=excluded.calculated_at"""
-                else:
-                    statement += " ON CONFLICT DO NOTHING"
-                c.execute(statement, params)
-                c.execute("DELETE FROM manual_review_triage WHERE review_key=? AND status IN ('escalated','awaiting_outcome')", (f"decision:{decision_id}",))
+            statement = """INSERT INTO decision_outcome_attributions
+                (decision_snapshot_id,horizon_sessions,entry_date,exit_date,stock_return,directional_return,
+                 benchmark_return,industry_return,market_contribution,industry_contribution,selection_contribution,
+                 correct,attribution_json,calculated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)"""
+            params = (item["decision_id"],item["horizon"],entry_date,exit_date,stock_return,item["directional"],bm_return,ind_return,market,
+                      industry_component,selection,int(correct),json.dumps(details,ensure_ascii=False),now)
+            if item["existing"]:
+                statement += """ ON CONFLICT(decision_snapshot_id,horizon_sessions) DO UPDATE SET
+                    entry_date=excluded.entry_date,exit_date=excluded.exit_date,stock_return=excluded.stock_return,
+                    directional_return=excluded.directional_return,benchmark_return=excluded.benchmark_return,
+                    industry_return=excluded.industry_return,market_contribution=excluded.market_contribution,
+                    industry_contribution=excluded.industry_contribution,selection_contribution=excluded.selection_contribution,
+                    correct=excluded.correct,attribution_json=excluded.attribution_json,calculated_at=excluded.calculated_at"""
+            else:
+                statement += " ON CONFLICT DO NOTHING"
+            c.execute(statement, params)
+            c.execute("DELETE FROM manual_review_triage WHERE review_key=? AND status IN ('escalated','awaiting_outcome')", (f"decision:{item['decision_id']}",))
             created += 1
     feedback = materialize_training_feedback()
     return {"ok": True, "decisions": len(decisions), "created": created, "pending": pending, "feedback": feedback}
