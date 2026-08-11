@@ -1,4 +1,8 @@
-from app.services.corporate_actions import build_replay_corporate_actions, quantity_entitled
+from app.services.corporate_actions import (
+    _equivalent_no_entitlement_revision,
+    build_replay_corporate_actions,
+    quantity_entitled,
+)
 
 
 def test_quantity_entitlement_uses_record_date_ledger():
@@ -88,3 +92,33 @@ def test_prior_stock_dividend_changes_later_record_date_entitlement():
     assert actions[0]["share_quantity"] == 100
     assert actions[1]["quantity_entitled"] == 1100
     assert actions[1]["cash_amount"] == 110.0
+
+
+def test_equivalent_no_entitlement_source_revision_is_safe_to_reconcile():
+    existing = {
+        "status": "no_entitlement", "quantity_entitled": 0,
+        "cash_per_share": 0.2, "share_ratio": 0.1,
+        "cash_amount": 0.0, "share_quantity": 0,
+    }
+    event = {"cash_per_share": 0.2, "share_ratio": 0.1}
+
+    assert _equivalent_no_entitlement_revision(
+        existing, event, entitled=0, cash_amount=0.0, share_quantity=0,
+    )
+
+
+def test_applied_or_economically_changed_revision_stays_blocked():
+    existing = {
+        "status": "applied", "quantity_entitled": 100,
+        "cash_per_share": 0.2, "share_ratio": 0.0,
+        "cash_amount": 20.0, "share_quantity": 0,
+    }
+    assert not _equivalent_no_entitlement_revision(
+        existing, {"cash_per_share": 0.2, "share_ratio": 0.0},
+        entitled=100, cash_amount=20.0, share_quantity=0,
+    )
+    assert not _equivalent_no_entitlement_revision(
+        {**existing, "status": "no_entitlement", "quantity_entitled": 0, "cash_amount": 0},
+        {"cash_per_share": 0.3, "share_ratio": 0.0},
+        entitled=0, cash_amount=0.0, share_quantity=0,
+    )

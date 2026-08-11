@@ -61,6 +61,32 @@ def _parse_time(value: Any) -> datetime | None:
         return None
 
 
+def _equivalent_no_entitlement_revision(
+    existing: dict[str, Any],
+    event: dict[str, Any],
+    *,
+    entitled: int,
+    cash_amount: float,
+    share_quantity: int,
+) -> bool:
+    """Accept a source-only revision that provably cannot change the account."""
+    if str(existing.get("status") or "") != "no_entitlement" or int(entitled) != 0:
+        return False
+    numeric_pairs = (
+        (existing.get("cash_per_share"), event.get("cash_per_share")),
+        (existing.get("share_ratio"), event.get("share_ratio")),
+        (existing.get("cash_amount"), cash_amount),
+    )
+    try:
+        return (
+            int(existing.get("quantity_entitled") or 0) == 0
+            and int(existing.get("share_quantity") or 0) == int(share_quantity)
+            and all(math.isclose(float(left or 0), float(right or 0), rel_tol=0, abs_tol=1e-12) for left, right in numeric_pairs)
+        )
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
 def refresh_position_dividends(*, max_age_days: int = 7, limit: int = 50) -> dict[str, Any]:
     """Refresh stock dividends and listed-fund cash distributions."""
     from app.data_platform.services.data_center import sync_dividend_data, sync_fund_dividend_data
@@ -284,6 +310,7 @@ def _materialize_simulation_corporate_actions(*, as_of_date: str) -> dict[str, A
     skipped = 0
     no_entitlement = 0
     recorded = 0
+    reconciled_source_revisions = 0
     source_conflicts: list[dict[str, Any]] = []
     for event in events:
         entitled = quantity_entitled(
@@ -311,7 +338,9 @@ def _materialize_simulation_corporate_actions(*, as_of_date: str) -> dict[str, A
             now = datetime.now().astimezone().isoformat()
             with business_conn() as conn:
                 existing = conn.execute(
-                    """SELECT id,source_hash,status FROM simulation_corporate_actions
+                    """SELECT id,source_hash,status,quantity_entitled,cash_per_share,
+                              share_ratio,cash_amount,share_quantity
+                         FROM simulation_corporate_actions
                        WHERE symbol=? AND action_type=? AND event_date=? AND record_date=?
                        LIMIT 1""",
                     (event["symbol"], action_type, event_date, event["record_date"]),
@@ -319,15 +348,31 @@ def _materialize_simulation_corporate_actions(*, as_of_date: str) -> dict[str, A
                 if existing:
                     existing_row = dict(existing)
                     if str(existing_row.get("source_hash") or "") != str(event.get("source_hash") or ""):
-                        source_conflicts.append({
-                            "symbol": event["symbol"],
-                            "action_type": action_type,
-                            "event_date": event_date,
-                            "record_date": event["record_date"],
-                            "existing_action_id": int(existing_row.get("id") or 0),
-                            "existing_status": str(existing_row.get("status") or ""),
-                            "code": "corporate_action_source_revision_requires_reconciliation",
-                        })
+                        if _equivalent_no_entitlement_revision(
+                            existing_row, event, entitled=entitled,
+                            cash_amount=cash_amount, share_quantity=share_quantity,
+                        ):
+                            conn.execute(
+                                """UPDATE simulation_corporate_actions
+                                      SET source_hash=?,source_available_time=?,note=?,applied_at=?
+                                    WHERE id=?""",
+                                (
+                                    event["source_hash"], event["source_available_time"],
+                                    "无持仓权益且经济字段未变；已对账更新来源版本，不影响模拟账户",
+                                    now, int(existing_row["id"]),
+                                ),
+                            )
+                            reconciled_source_revisions += 1
+                        else:
+                            source_conflicts.append({
+                                "symbol": event["symbol"],
+                                "action_type": action_type,
+                                "event_date": event_date,
+                                "record_date": event["record_date"],
+                                "existing_action_id": int(existing_row.get("id") or 0),
+                                "existing_status": str(existing_row.get("status") or ""),
+                                "code": "corporate_action_source_revision_requires_reconciliation",
+                            })
                     skipped += 1
                     continue
                 status = "applied" if entitled > 0 and (cash_amount > 0 or share_quantity > 0) else "no_entitlement"
@@ -401,6 +446,7 @@ def _materialize_simulation_corporate_actions(*, as_of_date: str) -> dict[str, A
         "recorded_count": recorded,
         "no_entitlement_count": no_entitlement,
         "already_materialized": skipped,
+        "reconciled_source_revisions": reconciled_source_revisions,
         "source_conflicts": source_conflicts,
         "simulation_only": True,
     }
