@@ -149,8 +149,8 @@ def run_daily_screener(
                     thesis = generate_thesis_for_stock(code, force=True)
                     if thesis.get("ok") or thesis.get("thesis_id"):
                         new_theses += 1
-                except Exception:
-                    pass
+                except Exception as exc:
+                    errors.append(f"thesis_{code}: {str(exc)[:80]}")
             else:
                 reason = "硬风险" if eligible is False else f"分低({overall:.0f}/{confidence:.2f})"
                 print(f"    [{i+1}/{research_limit}] {code:10s} score={overall:.0f} conf={confidence:.2f} {reason} ❌")
@@ -173,14 +173,15 @@ def run_daily_screener(
             if not already:
                 transition_pool_member(ts_code=code, from_pool="watch", to_pool="candidate", reason=f"auto_promote_from_watch: {m.get('reason', '')}")
                 promoted += 1
-        except Exception:
-            pass
+        except Exception as exc:
+            errors.append(f"promotion_{m.get('ts_code') or 'unknown'}: {str(exc)[:80]}")
 
     # Step 5: Run portfolio optimization on candidates
     portfolio_risk = build_live_portfolio_risk()
 
     return {
-        "ok": True,
+        "ok": not errors,
+        "status": "completed" if not errors else "partial",
         "results": {
             "total_universe": len(universe),
             "prefilter_passed": len(top_candidates),
@@ -190,6 +191,7 @@ def run_daily_screener(
             "promoted_to_candidate": promoted,
         },
         "errors": errors[:10],
+        "error_count": len(errors),
         "timestamp": now,
         "trade_date": target_date,
         "data_cutoff": cutoff,

@@ -40,7 +40,7 @@ def run_daily_maintenance(*, max_candidates: int = 50) -> dict[str, Any]:
     # Step 2: Generate watch pool theses (this also fills the pool)
     try:
         pool_result = generate_watch_pool_theses(limit=max_candidates)
-        pool_added = pool_result.get("theses_created", 0)
+        pool_added = len(pool_result.get("generated_or_reviewed") or [])
         if pool_result.get("ok") is False:
             errors.append(f"pool_theses: {str(pool_result.get('error') or pool_result.get('status') or 'not_ok')[:100]}")
     except Exception as e:
