@@ -158,13 +158,14 @@ def _ensure_tables_once() -> None:
 
 
 def _fallback_execution_clock() -> dtime:
-    hour = max(0, min(int(os.getenv("QUANT_AUTO_SIMULATION_CLOSE_HOUR", "16")), 23))
-    minute = max(0, min(int(os.getenv("QUANT_AUTO_SIMULATION_CLOSE_MINUTE", "5")), 59))
+    """Use the publication-discovery window, not a guessed fixed close time."""
+    hour = max(0, min(int(os.getenv("ALIS_DAILY_UPDATE_HOUR", "15")), 23))
+    minute = max(0, min(int(os.getenv("ALIS_DAILY_UPDATE_MINUTE", "1")), 59))
     return dtime(hour, minute)
 
 
 def remembered_first_rebalance_clock() -> dtime | None:
-    """Return the first formal rebalance's actual local clock, if recorded."""
+    """Legacy diagnostic only; an observed delay must never schedule future runs."""
     try:
         with business_conn() as c:
             row = c.execute(
@@ -182,8 +183,13 @@ def remembered_first_rebalance_clock() -> dtime | None:
 
 
 def effective_rebalance_clock() -> dtime:
-    """Use 16:05 bootstrap time until the first formal execution fixes the clock."""
-    return remembered_first_rebalance_clock() or _fallback_execution_clock()
+    """Start checking with publication probes and execute once all hard gates pass.
+
+    A historical execution time is an outcome of source publication, retries and
+    incidents.  Treating the first outcome as a permanent schedule can turn one
+    delayed run into an indefinite daily delay.
+    """
+    return _fallback_execution_clock()
 
 
 def _planned_execute_at(execute_date: str) -> str:
@@ -1697,8 +1703,8 @@ def materialize_daily_rebalance_plan(portfolio: dict[str, Any] | None = None) ->
         "decision_contract_schema_version": contract.get("schema_version"),
         "generation_policy": "仅在最新交易日决策数据门通过后生成可执行版本；未通过时保留不可执行预览",
         "execution_policy": (
-            f"执行日{effective_rebalance_clock().strftime('%H:%M')}后检查；"
-            "首次正式调仓后沿用其实际执行时分；收盘数据完整时自动执行，每个交易日最多一次"
+            f"执行日{effective_rebalance_clock().strftime('%H:%M')}后随发布探针持续检查；"
+            "收盘数据与冻结执行切片完整时立即自动执行，每个交易日最多一次"
         ),
     }
 

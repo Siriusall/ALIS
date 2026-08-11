@@ -50,8 +50,8 @@ _DEFAULT_ENABLE_DATA_HEALTH_GATE = str(os.getenv("QUANT_ENABLE_DATA_HEALTH_GATE"
 _AUTO_SIMULATION_ENABLED = str(os.getenv("QUANT_AUTO_SIMULATION", "1")).strip().lower() in {"1", "true", "yes", "on"}
 _AUTO_SIMULATION_INTERVAL_SEC = max(60, min(int(os.getenv("QUANT_AUTO_SIMULATION_INTERVAL_SEC", "60")), 3600))
 _AUTO_SIMULATION_CLOSE_TIME = dtime(
-    max(0, min(int(os.getenv("QUANT_AUTO_SIMULATION_CLOSE_HOUR", "16")), 23)),
-    max(0, min(int(os.getenv("QUANT_AUTO_SIMULATION_CLOSE_MINUTE", "5")), 59)),
+    max(0, min(int(os.getenv("ALIS_DAILY_UPDATE_HOUR", "15")), 23)),
+    max(0, min(int(os.getenv("ALIS_DAILY_UPDATE_MINUTE", "1")), 59)),
 )
 _DEFENSIVE_EXECUTION_REFRESH_INTERVAL_SEC = max(
     60,
@@ -497,7 +497,7 @@ def start_auto_simulation_scheduler() -> bool:
 
         threading.Thread(target=_watchdog, name="quant-auto-simulation-heartbeat", daemon=True).start()
     logger.info(
-        "自动模拟调度已启动；首次以 %s 检查，首次正式调仓后沿用实际执行时分；每 %ss 检查日更与执行条件",
+        "自动模拟调度已启动；%s 后随发布探针持续检查，数据完整即执行；每 %ss 检查日更与执行条件",
         _AUTO_SIMULATION_CLOSE_TIME.strftime("%H:%M"),
         _AUTO_SIMULATION_INTERVAL_SEC,
     )
