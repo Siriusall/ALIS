@@ -557,6 +557,12 @@ def daily_update_status() -> dict[str, Any]:
                 "items": [dict(row) for row in audit_rows],
                 "contract": "alis_market_provider_field_audit_v1",
             }
+            from app.data_platform.services.market_bulk_execution import recent_execution_status
+            state["provider_bulk_executions"] = {
+                "trade_date": target,
+                "items": recent_execution_status(target),
+                "contract": "alis_market_bulk_checkpoint_v1",
+            }
     except Exception as exc:  # noqa: BLE001
         state["status_error"] = str(exc)[:200]
     return state

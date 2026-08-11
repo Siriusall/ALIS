@@ -81,6 +81,36 @@ CREATE TABLE dc_market_provider_field_audit (
             evidence_json TEXT NOT NULL DEFAULT '{}',
             PRIMARY KEY (dataset, trade_date, primary_provider, fallback_provider, field_name)
         );
+CREATE TABLE dc_market_bulk_execution (
+            trade_date TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            scope TEXT NOT NULL,
+            status TEXT NOT NULL,
+            total_batches INTEGER NOT NULL DEFAULT 0,
+            completed_batches INTEGER NOT NULL DEFAULT 0,
+            rows_received INTEGER NOT NULL DEFAULT 0,
+            started_at TEXT NOT NULL,
+            last_progress_at TEXT NOT NULL,
+            finished_at TEXT,
+            elapsed_ms INTEGER NOT NULL DEFAULT 0,
+            eta_ms INTEGER NOT NULL DEFAULT 0,
+            cancel_requested INTEGER NOT NULL DEFAULT 0,
+            evidence_json TEXT NOT NULL DEFAULT '{}',
+            PRIMARY KEY (trade_date, provider, scope)
+        );
+CREATE TABLE dc_market_bulk_batch_checkpoint (
+            trade_date TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            scope TEXT NOT NULL,
+            batch_index INTEGER NOT NULL,
+            status TEXT NOT NULL,
+            code_count INTEGER NOT NULL DEFAULT 0,
+            rows_received INTEGER NOT NULL DEFAULT 0,
+            codes_hash TEXT NOT NULL,
+            payload_json TEXT NOT NULL DEFAULT '{}',
+            completed_at TEXT NOT NULL,
+            PRIMARY KEY (trade_date, provider, scope, batch_index)
+        );
 CREATE TABLE dc_announcement_event (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             announcement_id INTEGER NOT NULL,

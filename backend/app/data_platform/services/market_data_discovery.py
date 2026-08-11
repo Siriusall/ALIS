@@ -161,6 +161,35 @@ def hedge_delay_seconds(dataset: str, provider: str) -> float:
     return max(floor, min(ceiling, perf["p75_ms"] / 1000 * .75))
 
 
+def hedge_decision(
+    dataset: str, primary_provider: str, candidate_provider: str, *, elapsed_ms: int,
+    primary_progress: dict[str, Any] | None = None, force: bool = False,
+) -> dict[str, Any]:
+    """Compare remaining completion time instead of relying on a fixed timer alone."""
+    primary = provider_performance(dataset, primary_provider)
+    candidate = provider_performance(dataset, candidate_provider)
+    progress = primary_progress or {}
+    completed = int(progress.get("completed_batches") or 0)
+    total = int(progress.get("total_batches") or 0)
+    reported_eta = int(progress.get("eta_ms") or 0)
+    primary_remaining = reported_eta if completed > 0 and total > completed and reported_eta > 0 else max(
+        0, int(primary["p75_ms"]) - max(0, int(elapsed_ms))
+    )
+    candidate_eta = int(candidate["p75_ms"])
+    advantage_ms = max(500, int(os.getenv("MARKET_BULK_HEDGE_ADVANTAGE_MS", "1500")))
+    minimum_elapsed_ms = int(float(os.getenv("MARKET_BULK_HEDGE_MIN_SECONDS", "3")) * 1000)
+    stalled = completed == 0 and elapsed_ms >= int(primary["p75_ms"] * .75)
+    faster = candidate_eta + advantage_ms < primary_remaining
+    start = bool(force or (elapsed_ms >= minimum_elapsed_ms and (stalled or faster)))
+    return {
+        "start": start, "reason": "primary_failed" if force else "primary_stalled" if stalled else
+        "candidate_eta_advantage" if faster else "primary_progress_preferred",
+        "primary_remaining_ms": primary_remaining, "candidate_eta_ms": candidate_eta,
+        "required_advantage_ms": advantage_ms, "primary_progress": progress,
+        "primary_performance": primary, "candidate_performance": candidate,
+    }
+
+
 def provider_calibration_status() -> list[dict[str, Any]]:
     return [
         {"dataset": dataset, "provider": provider, **provider_performance(dataset, provider)}

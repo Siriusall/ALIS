@@ -10,14 +10,24 @@ arrival is reconciled by the canonical raw writer.
 from __future__ import annotations
 
 import json
+import hashlib
 import re
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
+import time
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime
 from typing import Any
 
 import requests
 
 from app.data_platform.db import _conn
+from app.data_platform.services.market_bulk_execution import (
+    begin_execution,
+    cancel_requested,
+    completed_batches,
+    finish_execution,
+    record_batch,
+)
 
 
 SOURCE_CODE = "tencent_market_snapshot"
@@ -27,6 +37,9 @@ MAX_WORKERS = 8
 HTTP_TIMEOUT = 20
 MINIMUM_COVERAGE = 0.80
 PRICE_TOLERANCE = 0.011
+EXECUTION_SCOPE = "a_share_close"
+_execution_locks_guard = threading.Lock()
+_execution_locks: dict[str, threading.Lock] = {}
 
 
 def _now() -> str:
@@ -143,14 +156,86 @@ def _fetch_batch(codes: list[str], trade_date: str) -> dict[str, dict[str, Any]]
         session.close()
 
 
-def fetch_tencent_market_snapshot(ts_codes: list[str], trade_date: str) -> dict[str, dict[str, Any]]:
+def _execution_lock(trade_date: str) -> threading.Lock:
+    with _execution_locks_guard:
+        return _execution_locks.setdefault(str(trade_date), threading.Lock())
+
+
+def fetch_tencent_market_snapshot(
+    ts_codes: list[str], trade_date: str, *, return_meta: bool = False
+) -> Any:
     batches = [ts_codes[start:start + BATCH_SIZE] for start in range(0, len(ts_codes), BATCH_SIZE)]
-    result: dict[str, dict[str, Any]] = {}
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS, thread_name_prefix="tencent-market") as executor:
-        futures = [executor.submit(_fetch_batch, batch, trade_date) for batch in batches]
-        for future in as_completed(futures):
-            result.update(future.result())
-    return result
+    started = time.monotonic()
+    with _execution_lock(trade_date):
+        begin_execution(
+            trade_date, SOURCE_CODE, EXECUTION_SCOPE, len(batches),
+            evidence={"batch_size": BATCH_SIZE, "max_workers": MAX_WORKERS},
+        )
+        cached = completed_batches(trade_date, SOURCE_CODE, EXECUTION_SCOPE)
+        result: dict[str, dict[str, Any]] = {}
+        pending_indices: list[int] = []
+        resumed_batches = 0
+        for index, batch in enumerate(batches):
+            codes_hash = hashlib.sha256("|".join(batch).encode("utf-8")).hexdigest()
+            item = cached.get(index)
+            if item and item.get("codes_hash") == codes_hash and isinstance(item.get("payload"), dict):
+                result.update(item["payload"])
+                resumed_batches += 1
+            else:
+                pending_indices.append(index)
+        cancelled = False
+        executor = ThreadPoolExecutor(max_workers=MAX_WORKERS, thread_name_prefix="tencent-market")
+        futures: dict[Any, int] = {}
+        next_position = 0
+
+        def submit_next() -> None:
+            nonlocal next_position
+            while next_position < len(pending_indices) and len(futures) < MAX_WORKERS:
+                index = pending_indices[next_position]
+                next_position += 1
+                futures[executor.submit(_fetch_batch, batches[index], trade_date)] = index
+
+        submit_next()
+        try:
+            while futures:
+                done, _ = wait(set(futures), return_when=FIRST_COMPLETED)
+                for future in done:
+                    index = futures.pop(future)
+                    payload = future.result()
+                    result.update(payload)
+                    batch = batches[index]
+                    record_batch(
+                        trade_date, SOURCE_CODE, EXECUTION_SCOPE, index,
+                        hashlib.sha256("|".join(batch).encode("utf-8")).hexdigest(),
+                        len(batch), payload, int((time.monotonic() - started) * 1000),
+                    )
+                if cancel_requested(trade_date, SOURCE_CODE, EXECUTION_SCOPE):
+                    cancelled = True
+                    for future in list(futures):
+                        if future.cancel():
+                            futures.pop(future, None)
+                else:
+                    submit_next()
+        except Exception as exc:
+            finish_execution(
+                trade_date, SOURCE_CODE, EXECUTION_SCOPE, status="failed",
+                elapsed_ms=int((time.monotonic() - started) * 1000), evidence={"error": str(exc)[:300]},
+            )
+            raise
+        finally:
+            executor.shutdown(wait=True, cancel_futures=True)
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        status = "cancelled" if cancelled else "transfer_complete"
+        progress = finish_execution(
+            trade_date, SOURCE_CODE, EXECUTION_SCOPE, status=status, elapsed_ms=elapsed_ms,
+            evidence={"resumed_batches": resumed_batches, "rows_received": len(result)},
+        )
+        meta = {
+            "cancelled": cancelled, "resumed_batches": resumed_batches,
+            "total_batches": len(batches), "completed_batches": int(progress.get("completed_batches") or 0),
+            "elapsed_ms": elapsed_ms, "execution_scope": EXECUTION_SCOPE,
+        }
+    return (result, meta) if return_meta else result
 
 
 def _ensure_source(conn: Any, now: str) -> None:
@@ -234,9 +319,16 @@ def sync_tencent_market_bundle(trade_date: str, apis: list[str] | tuple[str, ...
         ]
     if not codes:
         return {"ok": False, "provider": SOURCE_CODE, "status": "stock_master_empty"}
-    quotes = fetch_tencent_market_snapshot(codes, target)
+    quotes, transfer = fetch_tencent_market_snapshot(codes, target, return_meta=True)
+    if transfer.get("cancelled"):
+        return {
+            "ok": False, "provider": SOURCE_CODE, "status": "cancelled_after_inflight_batches",
+            "expected": len(codes), "received": len(quotes), "progress": transfer,
+        }
     minimum = max(500, int(len(codes) * MINIMUM_COVERAGE))
     if len(quotes) < minimum:
+        finish_execution(target, SOURCE_CODE, EXECUTION_SCOPE, status="failed",
+                         elapsed_ms=int(transfer.get("elapsed_ms") or 0), evidence={"reason": "incomplete_slice"})
         return {
             "ok": False,
             "provider": SOURCE_CODE,
@@ -260,6 +352,8 @@ def sync_tencent_market_bundle(trade_date: str, apis: list[str] | tuple[str, ...
     incomplete = {api: len(codes_for_api) for api, codes_for_api in eligible_by_api.items()
                   if len(codes_for_api) < minimum}
     if incomplete:
+        finish_execution(target, SOURCE_CODE, EXECUTION_SCOPE, status="failed",
+                         elapsed_ms=int(transfer.get("elapsed_ms") or 0), evidence={"reason": "incomplete_api_fields"})
         return {
             "ok": False,
             "provider": SOURCE_CODE,
@@ -275,6 +369,8 @@ def sync_tencent_market_bundle(trade_date: str, apis: list[str] | tuple[str, ...
     with _conn() as conn:
         continuity = _previous_close_sample(conn, target, quotes)
         if not continuity.get("ok"):
+            finish_execution(target, SOURCE_CODE, EXECUTION_SCOPE, status="failed",
+                             elapsed_ms=int(transfer.get("elapsed_ms") or 0), evidence={"reason": "continuity_validation_failed"})
             return {"ok": False, "provider": SOURCE_CODE, "status": "continuity_validation_failed",
                     "received": len(quotes), "continuity": continuity}
         _ensure_source(conn, observed_at)
@@ -333,6 +429,10 @@ def sync_tencent_market_bundle(trade_date: str, apis: list[str] | tuple[str, ...
                     ),
                 )
                 inserted[api_name] += max(0, int(cursor.rowcount or 0))
+    finish_execution(
+        target, SOURCE_CODE, EXECUTION_SCOPE, status="validated",
+        elapsed_ms=int(transfer.get("elapsed_ms") or 0), evidence={"received": len(quotes), "apis": list(selected_apis)},
+    )
     return {
         "ok": True,
         "provider": SOURCE_CODE,
@@ -346,4 +446,5 @@ def sync_tencent_market_bundle(trade_date: str, apis: list[str] | tuple[str, ...
         "continuity": continuity,
         "available_time": available_time,
         "observed_at": observed_at,
+        "progress": transfer,
     }

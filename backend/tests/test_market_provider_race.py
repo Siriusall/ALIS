@@ -6,6 +6,7 @@ import pandas as pd
 from app.data_platform.services import data_center
 from app.data_platform.services import market_data_discovery as discovery
 from app.data_platform.services import tencent_market_snapshot as tencent
+from app.data_platform.services import market_bulk_execution as bulk_execution
 
 
 def _quote_line(trade_date="20260810"):
@@ -57,7 +58,7 @@ def test_market_bundle_bulk_fetches_only_probe_winners(monkeypatch):
 
     assert result["ok"] is True
     assert set(result["winners"].values()) == {"tencent_market_snapshot"}
-    assert result["bulk_contract"] == "alis_market_hedged_first_complete_slice_v2"
+    assert result["bulk_contract"] == "alis_market_progress_aware_hedged_checkpoint_v3"
     assert result["provider_results"][0]["apis"] == ["daily", "daily_basic", "stk_limit"]
 
 
@@ -162,7 +163,7 @@ def test_slow_primary_starts_qualified_hedge_and_returns_first_complete(monkeypa
 
     assert result["ok"] is True
     assert result["hedge_started"][0]["provider"] == "tushare"
-    assert result["policy"].startswith("first_publisher_starts_immediately")
+    assert result["policy"].startswith("bounded_batches_with_checkpoint_resume")
 
 
 def test_provider_performance_opens_circuit_after_consecutive_failures():
@@ -228,3 +229,53 @@ def test_daily_basic_reconciles_non_null_fields_and_keeps_field_lineage():
     assert payload["_field_sources"]["pe_ttm"] == "tencent_market_snapshot"
     assert dict(row)["source_code"] == "tushare"
     assert {dict(item)["field_name"]: dict(item)["mismatch_count"] for item in audits}["turnover_rate"] == 1
+
+
+def test_tencent_batches_cancel_unstarted_work_and_resume_checkpoint(monkeypatch):
+    trade_date = "20990103"
+    codes = [f"{index:06d}.SH" for index in range(6)]
+    with discovery._conn() as conn:
+        conn.execute("DELETE FROM dc_market_bulk_batch_checkpoint WHERE trade_date=?", (trade_date,))
+        conn.execute("DELETE FROM dc_market_bulk_execution WHERE trade_date=?", (trade_date,))
+    calls = []
+    monkeypatch.setattr(tencent, "BATCH_SIZE", 2)
+    monkeypatch.setattr(tencent, "MAX_WORKERS", 1)
+    monkeypatch.setattr(
+        tencent, "_fetch_batch",
+        lambda batch, _date: calls.append(list(batch)) or {code: {"ts_code": code} for code in batch},
+    )
+    original_record = tencent.record_batch
+    cancelled_once = {"value": False}
+
+    def record_then_cancel(*args, **kwargs):
+        result = original_record(*args, **kwargs)
+        if not cancelled_once["value"]:
+            cancelled_once["value"] = True
+            bulk_execution.request_cancel(trade_date, tencent.SOURCE_CODE, tencent.EXECUTION_SCOPE, reason="test")
+        return result
+
+    monkeypatch.setattr(tencent, "record_batch", record_then_cancel)
+    first, first_meta = tencent.fetch_tencent_market_snapshot(codes, trade_date, return_meta=True)
+    assert first_meta["cancelled"] is True
+    assert len(calls) == 1
+    assert len(first) == 2
+
+    monkeypatch.setattr(tencent, "record_batch", original_record)
+    second, second_meta = tencent.fetch_tencent_market_snapshot(codes, trade_date, return_meta=True)
+    assert second_meta["cancelled"] is False
+    assert second_meta["resumed_batches"] == 1
+    assert len(calls) == 3
+    assert len(second) == 6
+
+
+def test_dynamic_hedge_uses_live_remaining_eta(monkeypatch):
+    monkeypatch.setattr(
+        discovery, "provider_performance",
+        lambda _dataset, provider: {"p75_ms": 10_000 if provider == "primary" else 5_000},
+    )
+    decision = discovery.hedge_decision(
+        "daily", "primary", "backup", elapsed_ms=4_000,
+        primary_progress={"completed_batches": 10, "total_batches": 80, "eta_ms": 20_000},
+    )
+    assert decision["start"] is True
+    assert decision["reason"] == "candidate_eta_advantage"
