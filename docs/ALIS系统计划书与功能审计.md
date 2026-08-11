@@ -392,6 +392,8 @@ ALIS 的目标运行方式调整为“系统自治、结果可见、异常才打
 
 补充完成：2026-07-24 新增 `alis_llm_data_operations_cycle_v1`。每日自治把最多 100 条失败请求样本、真实失败总数、错误类别、尝试次数、决策数据门、正式 OOS、密封保留集和当轮异常冻结为运维证据。LLM 只能选择六类动作；确定性治理重新选择请求 ID 并执行最多 5 条安全重试，或按注册关系将确认已有官方替代源的旧接口失败关闭为 `resolved`，认证、权限、无效参数、未知接口和语义变化只升级。首次非法 JSON 已真实触发严格重试并成功解析；后续 Token 预算耗尽时已验证确定性安全回退，不会停止自治周期。执行结果写入 `llm_data_operation_cases`，相同证据幂等复用；升级状态进入所有者异常摘要。真实运行中 5 条 `fund_nav empty_pending` 有界复核仍为空，系统未伪造成功；旧 `etf_sh_cons/etf_sz_cons` 已由注册的 `exchange_official_pcf` 替代，4 条遗留失败被自动关闭，待处理总数降至 468。正式 OOS 硬数据为 1,537/1,537 `ready`；密封保留集缺口和最新决策数据阻断继续委托已有确定性自愈。后端全量回归 `390 passed、1 skipped、6 subtests passed`。
 
+2026-08-11 将生产数据运维升级为 `alis_deterministic_data_operations_cycle_v2`：每日自治步骤改名为 `data_operations`，直接以冻结证据运行既有白名单分类、治理和最多 5 条安全动作，不再读取 LLM 密钥、等待模型响应或执行 JSON 重试。旧 `run_llm_data_operations_cycle` 仅保留为非生产建议能力，不能影响每日周期健康、数据门、计划、成交或异常归属；历史 `llm_data_operations` 步骤仍兼容读取。新确定性 case 使用独立执行模式哈希并继续幂等留证，模型字段明确记录 `deterministic_governance`。定向回归覆盖生产入口绝不调用 LLM、步骤兼容和异常监督，共 `49 passed`。
+
 #### 阶段 F：所有者极简首页（P2）
 
 - [x] 首页首屏突出今日调仓、账户日/月收益、同期沪深300、累计超额和系统异常。

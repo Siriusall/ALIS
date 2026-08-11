@@ -294,6 +294,8 @@ def test_autonomy_freezes_production_plan_before_long_experiments(monkeypatch):
     assert invoked.index("profit_and_portfolio") < invoked.index("factor_daily_cycle")
     assert invoked.index("profit_and_portfolio") < invoked.index("plan_model_autonomy")
     assert invoked.index("profit_and_portfolio") < invoked.index("strategy_shadow_recovery")
+    assert "data_operations" in invoked
+    assert "llm_data_operations" not in invoked
 
 
 def test_recovery_cycle_retries_strategy_shadow_after_data_becomes_ready(monkeypatch):

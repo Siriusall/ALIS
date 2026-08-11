@@ -203,7 +203,7 @@ def _owner_summary(steps: list[dict[str, Any]]) -> dict[str, Any]:
     llm_research = ((by_name.get("llm_research_agent") or {}).get("result") or {})
     llm_governance = ((by_name.get("llm_research_governance") or {}).get("result") or {})
     llm_router = ((by_name.get("llm_proposal_router") or {}).get("result") or {})
-    llm_data_operations = ((by_name.get("llm_data_operations") or {}).get("result") or {})
+    llm_data_operations = (((by_name.get("data_operations") or by_name.get("llm_data_operations") or {}).get("result")) or {})
     incident_supervisor = ((by_name.get("llm_incident_supervisor") or {}).get("result") or {})
     healing = ((by_name.get("autonomous_self_healing") or {}).get("result") or {})
     cost_active = cost.get("active") if isinstance(cost.get("active"), dict) else {}
@@ -353,7 +353,7 @@ def run_system_autonomy_cycle(*, trade_date: str = "") -> dict[str, Any]:
     from app.services.llm_research_agent import run_llm_research_agent
     from app.services.llm_research_governance import assess_llm_research_proposals
     from app.services.llm_proposal_router import route_llm_research_proposals
-    from app.services.llm_data_operations import run_llm_data_operations_cycle
+    from app.services.llm_data_operations import run_deterministic_data_operations_cycle
     from app.services.profit_loop import _latest_trade_date, build_profit_loop
     from app.services.simulation_ledger_audit import audit_simulation_ledger
     from app.services.strategy_controller import advance_waiting_strategy_policy_candidates, run_strategy_policy_auto_optimization
@@ -431,7 +431,10 @@ def run_system_autonomy_cycle(*, trade_date: str = "") -> dict[str, Any]:
         _run_step("llm_research_governance", assess_llm_research_proposals),
         _run_step("llm_proposal_router", route_llm_research_proposals),
     ]
-    steps.append(_run_step("llm_data_operations", lambda: run_llm_data_operations_cycle(cycle_steps=steps)))
+    steps.append(_run_step(
+        "data_operations",
+        lambda: run_deterministic_data_operations_cycle(cycle_steps=steps),
+    ))
     healing_step = _run_step("autonomous_self_healing", lambda: run_autonomous_self_healing(steps))
     healing_components = ((healing_step.get("result") or {}).get("components") or {})
     for step in steps:

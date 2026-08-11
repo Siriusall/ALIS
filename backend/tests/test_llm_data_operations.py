@@ -127,6 +127,44 @@ def test_deterministic_fallback_preserves_same_safety_routes() -> None:
     assert proposal["limitations"] == ["llm_response_not_json"]
 
 
+def test_production_data_operations_never_calls_llm(monkeypatch) -> None:
+    connection = sqlite3.connect(":memory:")
+    connection.row_factory = sqlite3.Row
+    connection.execute("""CREATE TABLE llm_data_operation_cases(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,case_key TEXT UNIQUE,status TEXT,
+        evidence_json TEXT,proposal_json TEXT,governance_json TEXT,result_json TEXT,
+        model TEXT,created_at TEXT,updated_at TEXT
+    )""")
+
+    class Wrapper:
+        def execute(self, sql, params=()):
+            return connection.execute(sql, params)
+
+    @contextmanager
+    def open_connection():
+        yield Wrapper()
+        connection.commit()
+
+    evidence = _evidence()
+    calls = []
+    monkeypatch.setattr(data_ops, "_conn", open_connection)
+    monkeypatch.setattr(data_ops, "_ensure_table", lambda: None)
+    monkeypatch.setattr(data_ops, "build_data_operations_evidence", lambda **_kwargs: evidence)
+    monkeypatch.setattr(data_ops, "_call_deepseek_json", lambda **_kwargs: calls.append(_kwargs))
+    monkeypatch.setattr(
+        data_ops,
+        "execute_governed_data_operations",
+        lambda _governance: {"ok": True, "status": "completed", "actions": [], "escalations": []},
+    )
+
+    result = data_ops.run_deterministic_data_operations_cycle(cycle_steps=[])
+
+    assert calls == []
+    assert result["execution_mode"] == "deterministic"
+    assert result["llm_advisory"]["status"] == "detached_from_production_cycle"
+    assert connection.execute("SELECT model FROM llm_data_operation_cases").fetchone()[0] == "deterministic_governance"
+
+
 def test_targeted_retry_enforces_category_attempt_and_batch_boundaries(monkeypatch) -> None:
     connection = sqlite3.connect(":memory:")
     connection.row_factory = sqlite3.Row

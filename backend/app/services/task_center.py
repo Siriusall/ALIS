@@ -45,7 +45,7 @@ STEP_MODULE = {
     "official_capacity_utilization": "research", "futures_price_proxies": "research",
     "theme_revenue_exposure": "research", "research_data_assets": "research",
     "llm_research_agent": "llm", "llm_research_governance": "llm", "llm_proposal_router": "llm",
-    "llm_data_operations": "llm", "llm_incident_supervisor": "llm",
+    "data_operations": "data", "llm_data_operations": "llm", "llm_incident_supervisor": "llm",
     "autonomous_self_healing": "autonomy",
 }
 
@@ -64,7 +64,7 @@ STEP_LABELS = {
     "official_capacity_utilization": "官方产能利用率", "futures_price_proxies": "期货价格代理",
     "theme_revenue_exposure": "主题收入暴露", "research_data_assets": "研究资产审计",
     "llm_research_agent": "LLM 研究提案", "llm_research_governance": "LLM 提案治理",
-    "llm_proposal_router": "LLM 实验路由", "llm_data_operations": "LLM 数据运维",
+    "llm_proposal_router": "LLM 实验路由", "data_operations": "确定性数据运维", "llm_data_operations": "LLM 数据运维",
     "autonomous_self_healing": "确定性自愈", "llm_incident_supervisor": "问题解释与归类",
 }
 

@@ -24,6 +24,7 @@ _WAITING_REASONS: dict[str, str] = {
     "periodic_performance_review": "等待新交易日、正式 OOS 或影子样本自然成熟",
     "official_policy_documents": "等待官方来源连接恢复后按计划重试",
     "llm_data_operations": "等待上游发布数据或冷却窗口结束",
+    "data_operations": "等待上游发布数据或冷却窗口结束",
 }
 
 _RETRYABLE_DATA_CATEGORIES = {"empty_pending", "rate_limit", "transient"}
@@ -84,7 +85,7 @@ def _llm_data_operations_resolution(step: dict[str, Any]) -> tuple[str, dict[str
     normalized = {item for item in categories if item}
     if normalized and normalized.issubset(_RETRYABLE_DATA_CATEGORIES):
         return "waiting_condition", {
-            "waiting_for": _WAITING_REASONS["llm_data_operations"],
+            "waiting_for": _WAITING_REASONS["data_operations"],
             "retry_policy": "只对安全类别做有界重试；连续为空后必须重新判定 valid_empty 或接口适用性",
             "failure_signature": ",".join(sorted(normalized)),
         }
@@ -132,7 +133,7 @@ def _resolution(step: dict[str, Any], steps: list[dict[str, Any]]) -> tuple[str,
             "evidence": gaps if isinstance(gaps, list) else [],
             "retry_policy": "缺少数据接入或标注基准时由系统建设能力，时间本身不会补齐",
         }
-    if name == "llm_data_operations":
+    if name in {"llm_data_operations", "data_operations"}:
         return _llm_data_operations_resolution(step)
     if name in _WAITING_REASONS:
         result = _result(step)
@@ -207,7 +208,7 @@ def _step_cases(steps: list[dict[str, Any]]) -> list[dict[str, Any]]:
         elif resolution_class == "internal_fault" and name == "research_data_assets":
             action = "build_research_capability"
             policy = "系统将缺失的数据接入或标注基准作为内部能力缺口推进，不能仅等待"
-        elif resolution_class == "internal_fault" and name == "llm_data_operations":
+        elif resolution_class == "internal_fault" and name in {"llm_data_operations", "data_operations"}:
             action = "diagnose_data_operations"
             policy = "系统重新诊断数据运维失败类型，禁止无上限重复请求"
         case = {
@@ -226,7 +227,7 @@ def _step_cases(steps: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def _external_escalations(steps: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    data_ops = next((step for step in steps if step.get("name") == "llm_data_operations"), {})
+    data_ops = next((step for step in steps if step.get("name") in {"data_operations", "llm_data_operations"}), {})
     result = data_ops.get("result") if isinstance(data_ops.get("result"), dict) else {}
     execution = result.get("execution") if isinstance(result.get("execution"), dict) else {}
     escalations = execution.get("escalations") if isinstance(execution.get("escalations"), list) else []

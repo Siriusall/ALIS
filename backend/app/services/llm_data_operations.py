@@ -477,3 +477,100 @@ def run_llm_data_operations_cycle(*, cycle_steps: list[dict[str, Any]] | None = 
             "external_dependency_count": len(evidence.get("external_dependency_failures") or []),
         },
     }
+
+
+def run_deterministic_data_operations_cycle(
+    *, cycle_steps: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Execute the governed data-operations policy without an LLM call.
+
+    This is the production autonomy entry point.  The LLM variant remains an
+    optional research/advisory facility, but it is not allowed to add latency
+    or availability risk to the daily deterministic cycle.
+    """
+    _ensure_table()
+    evidence = build_data_operations_evidence(cycle_steps=cycle_steps)
+    case_key = hashlib.sha256(json.dumps(
+        {"execution_mode": "deterministic_v2", "evidence": evidence},
+        ensure_ascii=False,
+        sort_keys=True,
+    ).encode("utf-8")).hexdigest()
+    with _conn() as conn:
+        existing = conn.execute(
+            "SELECT * FROM llm_data_operation_cases WHERE case_key=?", (case_key,)
+        ).fetchone()
+    if existing and str(dict(existing).get("status") or "") in {
+        "completed", "escalated", "no_action",
+    }:
+        item = dict(existing)
+        try:
+            cached_result = json.loads(item.get("result_json") or "{}")
+        except (TypeError, json.JSONDecodeError):
+            cached_result = {}
+        return {
+            "ok": bool(cached_result.get("ok", True)),
+            "schema_version": "alis_deterministic_data_operations_cycle_v2",
+            "status": str(item["status"]),
+            "case_id": int(item["id"]),
+            "case_key": case_key,
+            "reused": True,
+            "execution_mode": "deterministic",
+            "execution": cached_result,
+        }
+
+    actionable = bool(
+        evidence.get("safe_retry_candidates")
+        or evidence.get("superseded_api_candidates")
+        or evidence.get("external_dependency_failures")
+        or str((evidence.get("oos_hard_data") or {}).get("status") or "") != "ready"
+        or str((evidence.get("sealed_holdout") or {}).get("status") or "") != "ready"
+        or str((evidence.get("decision_data") or {}).get("status") or "") != "ready"
+        or evidence.get("cycle_step_anomalies")
+    )
+    proposal = deterministic_data_operations_fallback(
+        evidence,
+        reason="production_cycle_uses_deterministic_governance",
+    ) if actionable else _normalise_proposal({
+        "summary": "未发现可操作异常",
+        "actions": [{"action": "audit_only", "confidence": 1.0}],
+    })
+    governance = govern_data_operations_proposal(proposal, evidence)
+    result = execute_governed_data_operations(governance) if actionable else {
+        "ok": True, "status": "no_action", "actions": [], "escalations": [],
+    }
+    status = str(result.get("status") or "completed")
+    now = datetime.now().isoformat(timespec="seconds")
+    with _conn() as conn:
+        row = conn.execute(
+            """INSERT INTO llm_data_operation_cases(
+                   case_key,status,evidence_json,proposal_json,governance_json,result_json,model,created_at,updated_at
+               ) VALUES(?,?,?,?,?,?,?,?,?)
+               ON CONFLICT(case_key) DO UPDATE SET status=excluded.status,proposal_json=excluded.proposal_json,
+               governance_json=excluded.governance_json,result_json=excluded.result_json,model=excluded.model,updated_at=excluded.updated_at
+               RETURNING id""",
+            (
+                case_key, status, json.dumps(evidence, ensure_ascii=False, default=str),
+                json.dumps(proposal, ensure_ascii=False, default=str),
+                json.dumps(governance, ensure_ascii=False, default=str),
+                json.dumps(result, ensure_ascii=False, default=str),
+                "deterministic_governance", now, now,
+            ),
+        ).fetchone()
+    return {
+        "ok": bool(result.get("ok", True)),
+        "schema_version": "alis_deterministic_data_operations_cycle_v2",
+        "status": status,
+        "case_id": int(dict(row).get("id") or 0),
+        "case_key": case_key,
+        "execution_mode": "deterministic",
+        "proposal": proposal,
+        "governance": governance,
+        "execution": result,
+        "llm_advisory": {"status": "detached_from_production_cycle"},
+        "evidence_summary": {
+            "pending_failure_count": evidence.get("pending_failure_count"),
+            "safe_retry_count": len(evidence.get("safe_retry_candidates") or []),
+            "superseded_api_count": len(evidence.get("superseded_api_candidates") or []),
+            "external_dependency_count": len(evidence.get("external_dependency_failures") or []),
+        },
+    }
