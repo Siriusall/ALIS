@@ -842,7 +842,17 @@ def _build_autonomous_plan_context(dates: list[str]) -> dict:
 
 
 def _materialize_current_plan_and_find_due_context(dates: list[str]) -> dict:
-    """Attempt today's plan, then independently resolve any already due plan."""
+    """Execute an already due frozen plan before doing today's heavy research."""
+    due_context = _build_autonomous_plan_context(dates)
+    if due_context.get("ok"):
+        return {
+            **due_context,
+            "today_materialization": {
+                "ok": True,
+                "status": "deferred_until_due_plan_processed",
+                "reason": "due_frozen_plan_has_execution_priority",
+            },
+        }
     latest = str(dates[-1]) if dates else ""
     materialization: dict = {}
     if latest:
@@ -854,10 +864,7 @@ def _materialize_current_plan_and_find_due_context(dates: list[str]) -> dict:
         except Exception as exc:  # noqa: BLE001 - due execution remains independent
             logger.warning("每日正式调仓方案生成失败 trade_date=%s: %s", latest, str(exc)[:200])
             materialization = {"ok": False, "status": "error", "error": str(exc)[:300]}
-    return {
-        **_build_autonomous_plan_context(dates),
-        "today_materialization": materialization,
-    }
+    return {**_build_autonomous_plan_context(dates), "today_materialization": materialization}
 
 
 def _persist_step_result(

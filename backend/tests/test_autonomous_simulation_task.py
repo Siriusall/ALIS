@@ -124,20 +124,16 @@ def test_autonomous_plan_waits_when_no_due_formal_plan(monkeypatch):
     assert plan == {"ok": False, "reason": "no_due_formal_plan"}
 
 
-@pytest.mark.parametrize(
-    "materialization",
-    [
-        {"status": "compatibility_preview_only", "persisted": False},
-        {"status": "blocked_by_decision_data", "persisted": True},
-    ],
-)
-def test_due_prior_plan_is_independent_of_today_materialization(
-    monkeypatch,
-    materialization,
-):
+def test_due_prior_plan_has_priority_over_today_materialization(monkeypatch):
+    called = {"materialize": 0}
+
+    def materialize():
+        called["materialize"] += 1
+        return {"status": "unexpected"}
+
     monkeypatch.setattr(
         "app.services.profit_loop.materialize_daily_rebalance_plan",
-        lambda: materialization,
+        materialize,
     )
     monkeypatch.setattr(
         "app.services.profit_loop.list_pending_daily_rebalance_execution_inputs",
@@ -151,6 +147,28 @@ def test_due_prior_plan_is_independent_of_today_materialization(
     assert context["ok"] is True
     assert context["start_idx"] == 0
     assert context["current_execute_date"] == "2026-07-27"
+    assert context["today_materialization"] == {
+        "ok": True,
+        "status": "deferred_until_due_plan_processed",
+        "reason": "due_frozen_plan_has_execution_priority",
+    }
+    assert called["materialize"] == 0
+
+
+def test_today_materializes_when_no_plan_is_due(monkeypatch):
+    materialization = {"status": "planned", "persisted": True}
+    monkeypatch.setattr(
+        "app.services.profit_loop.materialize_daily_rebalance_plan",
+        lambda: materialization,
+    )
+    monkeypatch.setattr(
+        "app.services.profit_loop.list_pending_daily_rebalance_execution_inputs",
+        lambda: [],
+    )
+
+    context = runner._materialize_current_plan_and_find_due_context(["2026-07-27"])
+
+    assert context["ok"] is False
     assert context["today_materialization"] == materialization
 
 
