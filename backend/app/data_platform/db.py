@@ -770,6 +770,7 @@ def init_db() -> None:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_dc_raw_balancesheet_pit_rank ON dc_tushare_raw_records (ts_code,period,available_time DESC,id DESC) WHERE api_name='balancesheet' AND available_time<>''")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_dc_raw_fina_mainbz_pit_rank ON dc_tushare_raw_records (ts_code,period DESC,available_time DESC,id DESC) WHERE api_name='fina_mainbz' AND available_time<>''")
             conn.execute("CREATE TABLE IF NOT EXISTS dc_stock_daily_snapshot_stats (trade_date VARCHAR(8) PRIMARY KEY, rows_total BIGINT NOT NULL DEFAULT 0, market_rows BIGINT NOT NULL DEFAULT 0, min_available_time VARCHAR(64) NOT NULL DEFAULT '', max_available_time VARCHAR(64) NOT NULL DEFAULT '', updated_at VARCHAR(64) NOT NULL)")
+            conn.execute("CREATE TABLE IF NOT EXISTS dc_stock_daily_snapshot_stats_live (trade_date VARCHAR(8) PRIMARY KEY, rows_total BIGINT NOT NULL DEFAULT 0, market_rows BIGINT NOT NULL DEFAULT 0, min_available_time VARCHAR(64) NOT NULL DEFAULT '', max_available_time VARCHAR(64) NOT NULL DEFAULT '', updated_at VARCHAR(64) NOT NULL)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_dc_snapshot_stats_date ON dc_stock_daily_snapshot_stats (trade_date)")
             conn.execute("""CREATE TABLE IF NOT EXISTS dc_research_asset_summary (
                 asset_key VARCHAR(128) PRIMARY KEY, records BIGINT NOT NULL DEFAULT 0,

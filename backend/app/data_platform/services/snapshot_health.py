@@ -10,24 +10,26 @@ def _value(row: Any, key: str, default: Any = "") -> Any:
     return default if value is None else value
 
 
-def _summary_table_available(c: Any) -> bool:
-    """Check the optional summary table without aborting the transaction."""
+def _summary_tables(c: Any) -> list[str]:
+    """Discover readable summary generations without aborting the transaction."""
     try:
         if bool(getattr(c, "_is_postgres", False)):
-            row = c.execute(
-                "SELECT to_regclass(?) AS table_name",
-                ("public.dc_stock_daily_snapshot_stats",),
-            ).fetchone()
-            return bool(_value(row, "table_name", ""))
-        row = c.execute(
-            "SELECT 1 AS present FROM sqlite_master WHERE type='table' AND name=?",
-            ("dc_stock_daily_snapshot_stats",),
-        ).fetchone()
-        return row is not None
+            tables = []
+            for name in ("dc_stock_daily_snapshot_stats_live", "dc_stock_daily_snapshot_stats"):
+                row = c.execute("SELECT to_regclass(?) AS table_name", (f"public.{name}",)).fetchone()
+                if bool(_value(row, "table_name", "")):
+                    tables.append(name)
+            return tables
+        rows = c.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name IN (?,?)",
+            ("dc_stock_daily_snapshot_stats_live", "dc_stock_daily_snapshot_stats"),
+        ).fetchall()
+        names = {str(_value(row, "name", "")) for row in rows}
+        return [name for name in ("dc_stock_daily_snapshot_stats_live", "dc_stock_daily_snapshot_stats") if name in names]
     except Exception:
         # Lightweight read-only adapters may not implement schema discovery;
         # the caller can safely use its bounded snapshot fallback.
-        return False
+        return []
 
 
 def snapshot_stats_for_range(c: Any, start: str, end: str, *, expected_dates: list[str] | tuple[str, ...] | None = None) -> dict[str, dict[str, Any]] | None:
@@ -54,15 +56,24 @@ def snapshot_stats_for_range(c: Any, start: str, end: str, *, expected_dates: li
         except Exception:
             return None
 
-    if not _summary_table_available(c):
+    summary_tables = _summary_tables(c)
+    if not summary_tables:
         # Older data adapters do not materialize the daily summary table yet;
         # derive the same bounded evidence from the normalized snapshot rows.
         return aggregate_normalized()
+    selects = [
+        f"SELECT trade_date,rows_total,market_rows,min_available_time,max_available_time,{rank} source_rank FROM {table} WHERE trade_date BETWEEN ? AND ?"
+        for rank, table in enumerate(summary_tables)
+    ]
     rows = c.execute(
-        """SELECT trade_date,rows_total,market_rows,min_available_time,max_available_time
-             FROM dc_stock_daily_snapshot_stats
-            WHERE trade_date BETWEEN ? AND ?""",
-        (start, end),
+        f"""SELECT DISTINCT ON (trade_date)
+                   trade_date,rows_total,market_rows,min_available_time,max_available_time
+              FROM ({' UNION ALL '.join(selects)}) summaries
+             ORDER BY trade_date,source_rank""" if bool(getattr(c, "_is_postgres", False)) else
+        f"""SELECT trade_date,rows_total,market_rows,min_available_time,max_available_time
+              FROM {summary_tables[0]}
+             WHERE trade_date BETWEEN ? AND ?""",
+        tuple(value for _table in (summary_tables if bool(getattr(c, "_is_postgres", False)) else summary_tables[:1]) for value in (start, end)),
     ).fetchall()
     result = {str(_value(row, "trade_date", "")): dict(row) for row in rows if _value(row, "trade_date", "")}
     if expected_dates is not None and not set(str(value) for value in expected_dates).issubset(result):

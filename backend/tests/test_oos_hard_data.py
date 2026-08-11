@@ -89,6 +89,45 @@ def test_partial_snapshot_summary_falls_back_to_normalized_rows():
     assert any("FROM dc_stock_daily_snapshot" in sql for sql in conn.queries)
 
 
+def test_snapshot_summary_reads_live_generation_before_legacy():
+    class Result:
+        def __init__(self, rows=(), row=None):
+            self.rows, self.row = list(rows), row
+
+        def fetchall(self):
+            return self.rows
+
+        def fetchone(self):
+            return self.row
+
+    class Connection:
+        _is_postgres = True
+
+        def __init__(self):
+            self.summary_sql = ""
+
+        def execute(self, sql, params=()):
+            if "to_regclass" in sql:
+                return Result(row={"table_name": params[0]})
+            if "DISTINCT ON" in sql:
+                self.summary_sql = sql
+                return Result(rows=[{
+                    "trade_date": "20260811", "rows_total": 5539,
+                    "market_rows": 5539, "min_available_time": "2026-08-11T15:00:00",
+                    "max_available_time": "2026-08-11T15:00:00",
+                }])
+            raise AssertionError(sql)
+
+    conn = Connection()
+    result = snapshot_health.snapshot_stats_for_range(
+        conn, "20260811", "20260811", expected_dates=["20260811"],
+    )
+
+    assert result and result["20260811"]["rows_total"] == 5539
+    assert "dc_stock_daily_snapshot_stats_live" in conn.summary_sql
+    assert conn.summary_sql.index("dc_stock_daily_snapshot_stats_live") < conn.summary_sql.index("dc_stock_daily_snapshot_stats WHERE")
+
+
 class FakeRows(list):
     def fetchall(self):
         return self

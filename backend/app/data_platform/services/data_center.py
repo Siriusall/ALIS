@@ -4153,6 +4153,7 @@ def _refresh_snapshot_stats(c: Any, trade_date: str, updated_at: str) -> None:
     # The summary table is a read optimization. Some production databases
     # create it with an administrative role and grant the app role SELECT
     # only; that must not make the authoritative snapshot ingestion fail.
+    target_table = "dc_stock_daily_snapshot_stats"
     if bool(getattr(c, "_is_postgres", False)):
         privilege = c.execute(
             """SELECT has_table_privilege(current_user, ?, 'INSERT')
@@ -4160,7 +4161,10 @@ def _refresh_snapshot_stats(c: Any, trade_date: str, updated_at: str) -> None:
             ("public.dc_stock_daily_snapshot_stats", "public.dc_stock_daily_snapshot_stats"),
         ).fetchone()
         if not bool(_row_value(privilege, "can_write", False)):
-            return
+            # Some upgraded databases retain the legacy summary under an
+            # administrative owner. Keep new daily watermarks in the
+            # migration-owned live table instead of silently dropping them.
+            target_table = "dc_stock_daily_snapshot_stats_live"
     row = c.execute(
         """SELECT COUNT(*) AS rows_total,
                   SUM(CASE WHEN close IS NOT NULL AND volume IS NOT NULL AND turnover IS NOT NULL THEN 1 ELSE 0 END) AS market_rows,
@@ -4179,7 +4183,7 @@ def _refresh_snapshot_stats(c: Any, trade_date: str, updated_at: str) -> None:
         updated_at,
     )
     c.execute(
-        """INSERT INTO dc_stock_daily_snapshot_stats
+        f"""INSERT INTO {target_table}
                   (trade_date,rows_total,market_rows,min_available_time,max_available_time,updated_at)
            VALUES(?,?,?,?,?,?)
            ON CONFLICT(trade_date) DO UPDATE SET
