@@ -119,6 +119,10 @@ worker_ssh 'systemctl start alis-evolution-worker'
 app_ssh "sudo bash -lc 'for n in \$(seq 1 40); do curl -fsS --max-time 5 http://127.0.0.1:8000/api/ready >/dev/null && exit 0; sleep 2; done; exit 1'"
 app_ssh 'sudo -u www-data test -r /opt/alis/current/frontend/dist/index.html'
 worker_ssh 'test "$(systemctl is-active alis-evolution-worker)" = active'
+governance_payload=$(printf '%s' \
+  'from app.services.system_release_center import run_release_governance_cycle,release_status; run_release_governance_cycle(actor="production_release_v2"); s=release_status(); a=s.get("active_release") or {}; c=((a.get("manifest") or {}).get("components") or {}).get("code.backend") or {}; assert s.get("ok") and not s.get("drift") and c.get("version") == "'"$commit"'", s' \
+  | base64 | tr -d '\n')
+app_ssh "sudo bash -lc 'set -a; source /etc/alis/alis.env; set +a; cd /opt/alis/current/backend; echo $governance_payload | base64 -d | .venv/bin/python -'"
 if [[ -n "$public_base" ]]; then
   curl -fsS --max-time 20 "$public_base/" >/dev/null
   curl -fsS --max-time 20 "$public_base/api/live" >/dev/null

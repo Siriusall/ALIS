@@ -35,12 +35,19 @@ if find "$staging" -name '._*' -print -quit | grep -q .; then
   echo "Refusing release bundle containing AppleDouble metadata" >&2
   exit 1
 fi
+if command -v xattr >/dev/null 2>&1; then
+  xattr -cr "$staging"
+fi
 
 mkdir -p "$(dirname "$output")"
 COPYFILE_DISABLE=1 tar -czf "$output" -C "$staging" .
 tar -tzf "$output" >/dev/null
 tar -xOf "$output" ./.alis-release-manifest >/dev/null
 tar -xOf "$output" ./frontend/dist/index.html >/dev/null
+if gzip -dc "$output" | strings | grep -q 'LIBARCHIVE.xattr'; then
+  echo "Refusing release bundle containing extended attributes" >&2
+  exit 1
+fi
 
 echo "bundle=$output"
 echo "commit=$commit"
