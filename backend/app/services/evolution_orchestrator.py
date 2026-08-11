@@ -1375,6 +1375,53 @@ def create_strategy_controller_oos_task(
     )
 
 
+def enqueue_strategy_shadow_daily_task(
+    trade_date: str,
+    *,
+    hard_data_audit: dict[str, Any],
+) -> dict[str, Any]:
+    """Queue one idempotent, one-session Shadow advancement task."""
+    normalized_date = str(trade_date or "").replace("-", "")[:8]
+    if len(normalized_date) != 8 or not normalized_date.isdigit():
+        return {"ok": False, "status": "invalid_trade_date", "trade_date": normalized_date}
+    if str(hard_data_audit.get("status") or "") != "ready":
+        return {
+            "ok": True,
+            "status": "blocked_by_oos_hard_data",
+            "trade_date": normalized_date,
+            "production_change_forbidden": True,
+        }
+    audit_contract = {
+        key: hard_data_audit.get(key)
+        for key in ("status", "window_start", "window_end", "eligible_sessions", "required_sessions", "schema_version")
+    }
+    fingerprint = hashlib.sha256(json.dumps(
+        audit_contract, sort_keys=True, separators=(",", ":"), default=str,
+    ).encode("utf-8")).hexdigest()[:16]
+    task = create_evolution_task(
+        task_type="strategy_shadow_cycle",
+        payload={
+            "trigger": "daily_system_autonomy",
+            "target_trade_date": normalized_date,
+            "max_new_sessions": 1,
+            "hard_data_audit": audit_contract,
+            "observation_contract": "alis_strategy_shadow_incremental_task_v3",
+        },
+        dedupe_key=f"strategy_shadow_daily:v3:{normalized_date}:{fingerprint}",
+        max_attempts=3,
+        priority=75,
+    )
+    return {
+        "ok": True,
+        "schema_version": "alis_strategy_shadow_dispatch_v3",
+        "status": str(task.get("status") or "queued"),
+        "trade_date": normalized_date,
+        "task": {key: task.get(key) for key in ("id", "status", "phase", "progress", "message")},
+        "execution_mode": "persistent_incremental_task",
+        "production_change_forbidden_until_shadow_gate": True,
+    }
+
+
 def _run_quick_gate(target: dict[str, Any], audit: dict[str, Any]) -> dict[str, Any]:
     dates = BacktestDataSource().get_available_trade_dates(
         str(audit["window_start"]), str(audit["window_end"]),
@@ -1898,10 +1945,25 @@ def execute_evolution_task(
             message="正在记录候选与 Champion 的影子对照",
             checkpoint=task.get("checkpoint") if isinstance(task.get("checkpoint"), dict) else {},
         )
+        payload = task.get("payload") if isinstance(task.get("payload"), dict) else {}
+
+        def shadow_checkpoint(progress: dict[str, Any]) -> None:
+            _heartbeat(
+                int(task["id"]), phase="shadow_observation", progress=0.5,
+                message="已持久化一个候选交易日的影子对照",
+                checkpoint={
+                    **(task.get("checkpoint") if isinstance(task.get("checkpoint"), dict) else {}),
+                    **progress,
+                },
+            )
+
         return run_strategy_shadow_cycle(
             max_new_sessions_per_candidate=max(
-                1, min(int((task.get("payload") or {}).get("max_new_sessions") or 5), 20)
+                1, min(int(payload.get("max_new_sessions") or 1), 1)
             ),
+            target_trade_date=str(payload.get("target_trade_date") or ""),
+            hard_data_audit=(payload.get("hard_data_audit") if isinstance(payload.get("hard_data_audit"), dict) else None),
+            progress_callback=shadow_checkpoint,
         )
     if task_type == "factor_daily_cycle":
         from app.services.factor_platform import run_factor_daily_cycle

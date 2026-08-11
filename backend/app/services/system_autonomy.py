@@ -424,7 +424,7 @@ def run_system_autonomy_cycle(*, trade_date: str = "") -> dict[str, Any]:
     from app.services.plan_model_auto_optimizer import run_auto_optimization_once
     from app.services.performance_reports import run_periodic_performance_review
     from app.services.review_data_quality_governance import run_review_data_quality_governance
-    from app.services.strategy_lifecycle import run_strategy_shadow_cycle
+    from app.services.evolution_orchestrator import enqueue_strategy_shadow_daily_task
     from app.services.research_data_assets import audit_research_data_assets
     from app.services.theme_revenue_exposure import materialize_theme_revenue_exposure
     from app.services.free_research_data import materialize_cn_ppi_price_proxies, materialize_financial_industry_series, materialize_futures_price_proxies
@@ -485,7 +485,10 @@ def run_system_autonomy_cycle(*, trade_date: str = "") -> dict[str, Any]:
         experimental_step("plan_model_autonomy", lambda: run_auto_optimization_once(force=False)),
         experimental_step(
             "strategy_shadow_recovery",
-            lambda: run_strategy_shadow_cycle(max_new_sessions_per_candidate=5),
+            lambda: enqueue_strategy_shadow_daily_task(
+                frozen_trade_date or str((decision_data.get("readiness") or {}).get("target_trade_date") or ""),
+                hard_data_audit=(hard_data_step.get("result") or {}),
+            ),
         ),
         _run_step("periodic_performance_review", run_periodic_performance_review),
         _run_step("review_data_quality_governance", run_review_data_quality_governance),

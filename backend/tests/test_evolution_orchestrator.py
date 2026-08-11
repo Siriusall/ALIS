@@ -43,6 +43,27 @@ def test_long_task_pulse_renews_lease_without_rewriting_checkpoint(monkeypatch):
     assert all(item["expected_lease_owner"] == evolution.WORKER_ID for item in updates)
 
 
+def test_shadow_daily_dispatch_is_idempotent_by_date_and_frozen_audit(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        evolution,
+        "create_evolution_task",
+        lambda **kwargs: calls.append(kwargs) or {"id": 91, "status": "queued", "phase": "queued", "progress": 0},
+    )
+    audit = {
+        "status": "ready", "window_start": "20200101", "window_end": "20260810",
+        "eligible_sessions": 1537, "required_sessions": 1537,
+    }
+
+    result = evolution.enqueue_strategy_shadow_daily_task("2026-08-10", hard_data_audit=audit)
+
+    assert result["execution_mode"] == "persistent_incremental_task"
+    assert calls[0]["task_type"] == "strategy_shadow_cycle"
+    assert calls[0]["payload"]["max_new_sessions"] == 1
+    assert calls[0]["payload"]["hard_data_audit"]["eligible_sessions"] == 1537
+    assert calls[0]["dedupe_key"].startswith("strategy_shadow_daily:v3:20260810:")
+
+
 def test_plan_model_autonomy_holds_worker_until_training_is_terminal(monkeypatch):
     from app.db import store
     from app.services import plan_model_auto_optimizer

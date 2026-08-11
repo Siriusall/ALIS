@@ -715,8 +715,11 @@ def run_strategy_shadow_cycle(
     *,
     replay_runner: Callable[..., dict[str, Any]] = run_strategy_replay,
     max_new_sessions_per_candidate: int = 5,
+    target_trade_date: str = "",
+    hard_data_audit: dict[str, Any] | None = None,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
-    audit = audit_oos_hard_data(include_dates=False)
+    audit = dict(hard_data_audit or audit_oos_hard_data(include_dates=False))
     if audit.get("status") != "ready":
         return {
             "ok": True,
@@ -729,6 +732,9 @@ def run_strategy_shadow_cycle(
         }
     ds = BacktestDataSource()
     dates = ds.get_available_trade_dates(str(audit["window_start"]), str(audit["window_end"]))
+    target_key = _date_key(target_trade_date)
+    if target_key:
+        dates = [date for date in dates if _date_key(date) <= target_key]
     active = resolve_production_strategy_champion()
     all_versions = list_model_versions("alis_strategy_challenger", limit=100)
     candidates = [
@@ -791,7 +797,7 @@ def run_strategy_shadow_cycle(
         )
         pending_dates = [
             date for date in dates if _date_key(date) > _date_key(last_date)
-        ][:max(1, int(max_new_sessions_per_candidate))]
+        ][:max(1, min(int(max_new_sessions_per_candidate), 1 if target_key else 20))]
         reference_version_id = int(validation.get("rollback_target_version_id") or active["champion_id"])
         reference_version = get_model_version(reference_version_id)
         reference_config = reference_version.get("config") if reference_version and isinstance(reference_version.get("config"), dict) else {}
@@ -843,6 +849,13 @@ def run_strategy_shadow_cycle(
                     "champion_summary": champion_replay.get("summary") or {},
                 },
             )
+            if progress_callback is not None:
+                progress_callback({
+                    "last_candidate_id": int(candidate["id"]),
+                    "last_trade_date": str(trade_date),
+                    "target_trade_date": target_key,
+                    "observation_persisted": True,
+                })
         observations = list_shadow_observations(int(candidate["id"]))
         status = lifecycle_status
         if status == "shadow_observation":
@@ -1023,9 +1036,11 @@ def run_strategy_shadow_cycle(
                 result["status"] = "shadow_reserve"
                 result["competition_winner"] = False
     return {
-        "schema_version": "alis_strategy_shadow_cycle_v2",
+        "schema_version": "alis_strategy_shadow_cycle_v3" if target_key else "alis_strategy_shadow_cycle_v2",
         "status": "completed",
         "hard_data_end": str(audit["window_end"]),
+        "target_trade_date": target_key,
+        "execution_mode": "persistent_one_session" if target_key else "compatibility_batch",
         "candidate_count": len(candidates),
         "results": results,
     }

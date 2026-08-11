@@ -323,16 +323,16 @@ def test_recovery_cycle_retries_strategy_shadow_after_data_becomes_ready(monkeyp
 
     monkeypatch.setattr(system_autonomy, "_run_step", controlled_run_step)
     monkeypatch.setattr(
-        "app.services.strategy_lifecycle.run_strategy_shadow_cycle",
-        lambda **kwargs: calls.append(kwargs) or {"ok": True, "status": "completed"},
+        "app.services.evolution_orchestrator.enqueue_strategy_shadow_daily_task",
+        lambda trade_date, **kwargs: calls.append((trade_date, kwargs)) or {"ok": True, "status": "queued"},
     )
 
     result = system_autonomy.run_system_autonomy_cycle(trade_date="20260810")
 
-    assert calls == [{"max_new_sessions_per_candidate": 5}]
+    assert calls == [("20260810", {"hard_data_audit": {"ok": True, "status": "ready"}})]
     assert next(
         step for step in result["steps"] if step["name"] == "strategy_shadow_recovery"
-    )["result"]["status"] == "completed"
+    )["result"]["status"] == "queued"
 
 
 def test_recovery_cycle_does_not_run_strategy_shadow_before_experiment_data_ready(monkeypatch):
