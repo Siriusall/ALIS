@@ -10,6 +10,7 @@ from typing import Any, Callable, Tuple
 from app.integrations.tushare_client import reset_tushare_client
 from app.core.trade_calendar import is_trade_day
 from app.db.store import (
+    _conn as business_conn,
     get_account_balance,
     get_quant_replay_waterline,
     get_quant_run_task_health,
@@ -76,6 +77,33 @@ def _trade_date_key(value: object) -> str:
     """Normalize supported trade-date representations for identity checks."""
     normalized = str(value or "").strip().replace("-", "")[:8]
     return normalized if len(normalized) == 8 and normalized.isdigit() else ""
+
+
+def _waiting_schedule_projection() -> dict[str, Any]:
+    """Project the next real frozen plan instead of retaining a stale attempt date."""
+    with business_conn() as conn:
+        row = conn.execute(
+            """SELECT trade_date,planned_execute_date
+                 FROM daily_rebalance_plans
+                WHERE status='planned'
+                ORDER BY planned_execute_date,version DESC LIMIT 1"""
+        ).fetchone()
+    if not row:
+        return {
+            "replay_gap_days": 0,
+            "replay_current_execute_date": None,
+            "replay_target_execute_date": None,
+            "last_message": "等待收盘调度与下一份到期正式调仓计划",
+        }
+    item = dict(row)
+    signal_date = _trade_date_key(item.get("trade_date"))
+    execute_date = _trade_date_key(item.get("planned_execute_date"))
+    return {
+        "replay_gap_days": 1,
+        "replay_current_execute_date": execute_date or None,
+        "replay_target_execute_date": execute_date or None,
+        "last_message": f"等待正式计划 {signal_date}→{execute_date} 到期执行",
+    }
 
 
 def _refresh_performance_reports(task_id: int) -> None:
@@ -1166,23 +1194,21 @@ def run_quant_task_async(task_id: int) -> bool:
                 )
             if not plan.get("ok"):
                 waiting_for_schedule = mode == "autonomous_daily"
+                waiting_projection = _waiting_schedule_projection() if waiting_for_schedule else {}
                 _transition_task_status(
                     task_id,
                     "pending" if waiting_for_schedule else "paused",
                     "schedule_wait" if waiting_for_schedule else "batch_completed",
                     replay_mode=mode,
                     replay_status=("waiting_schedule" if waiting_for_schedule else "no_gap"),
-                    replay_gap_days=0,
-                    replay_current_execute_date=None,
-                    replay_target_execute_date=None,
+                    replay_gap_days=int(waiting_projection.get("replay_gap_days") or 0),
+                    replay_current_execute_date=waiting_projection.get("replay_current_execute_date"),
+                    replay_target_execute_date=waiting_projection.get("replay_target_execute_date"),
                     processed_steps=0,
                     total_steps=0,
                     error=None,
                     finished_at=None,
-                    last_message=(
-                        "等待收盘调度与下一份到期正式调仓计划"
-                        if waiting_for_schedule else "任务已暂停：当前无可补跑缺口"
-                    ),
+                    last_message=str(waiting_projection.get("last_message") or "任务已暂停：当前无可补跑缺口"),
                 )
                 upsert_quant_replay_waterline(
                     strategy_id=strategy_id,
@@ -1572,7 +1598,7 @@ def run_quant_task_async(task_id: int) -> bool:
                     last_execute_date=successful_execute or None,
                     error=None,
                     finished_at=None,
-                    last_message="无效冻结计划已隔离，等待下一份到期正式计划",
+                    **_waiting_schedule_projection(),
                 )
                 logger.error(
                     "invalid autonomous frozen plan quarantined task_id=%s code=%s",
@@ -1691,7 +1717,7 @@ def reconcile_quant_tasks_on_startup() -> dict[str, int]:
                 replay_status="waiting_schedule",
                 error=None,
                 finished_at=None,
-                last_message="等待收盘调度与下一份到期正式调仓计划",
+                **_waiting_schedule_projection(),
             ):
                 summary["waiting_schedule"] += 1
             continue

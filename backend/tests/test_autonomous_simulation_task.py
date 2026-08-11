@@ -1,4 +1,5 @@
 import pytest
+from contextlib import nullcontext
 
 from app.services import production_strategy
 from app.services import quant_task_runner as runner
@@ -98,6 +99,41 @@ def test_trade_date_identity_accepts_compact_and_hyphenated_values():
     assert runner._trade_date_key("20260730") == "20260730"
     assert runner._trade_date_key("2026-07-30") == "20260730"
     assert runner._trade_date_key("not-a-date") == ""
+
+
+def test_waiting_schedule_projects_next_frozen_plan(monkeypatch):
+    class Connection:
+        def execute(self, *_args, **_kwargs):
+            return self
+
+        def fetchone(self):
+            return {"trade_date": "20260811", "planned_execute_date": "20260812"}
+
+    monkeypatch.setattr(runner, "business_conn", lambda: nullcontext(Connection()))
+
+    assert runner._waiting_schedule_projection() == {
+        "replay_gap_days": 1,
+        "replay_current_execute_date": "20260812",
+        "replay_target_execute_date": "20260812",
+        "last_message": "等待正式计划 20260811→20260812 到期执行",
+    }
+
+
+def test_waiting_schedule_clears_dates_without_frozen_plan(monkeypatch):
+    class Connection:
+        def execute(self, *_args, **_kwargs):
+            return self
+
+        def fetchone(self):
+            return None
+
+    monkeypatch.setattr(runner, "business_conn", lambda: nullcontext(Connection()))
+
+    projection = runner._waiting_schedule_projection()
+
+    assert projection["replay_gap_days"] == 0
+    assert projection["replay_current_execute_date"] is None
+    assert projection["replay_target_execute_date"] is None
 
 
 def test_autonomous_plan_never_executes_stale_plan_late(monkeypatch):
