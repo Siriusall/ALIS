@@ -79,7 +79,7 @@ TASK_TYPE_MODULE = {
     "model_shadow_observation": "model",
     "plan_model_autonomy": "model",
     "system_autonomy_cycle": "autonomy", "system_release_governance": "autonomy",
-    "sealed_holdout_adj_factor_backfill": "data",
+    "sealed_holdout_adj_factor_backfill": "data", "research_data_publication_probe": "data",
 }
 
 TASK_TYPE_LABEL = {
@@ -93,7 +93,7 @@ TASK_TYPE_LABEL = {
     "model_shadow_observation": "模型未来影子观察",
     "plan_model_autonomy": "任务原生模型自治调度",
     "system_autonomy_cycle": "每日自治循环", "system_release_governance": "系统版本发布治理",
-    "sealed_holdout_adj_factor_backfill": "密封验证集批量补全",
+    "sealed_holdout_adj_factor_backfill": "密封验证集批量补全", "research_data_publication_probe": "研究数据发布探测",
 }
 
 RETIRED_TASK_TYPES = {"factor_research_cycle"}

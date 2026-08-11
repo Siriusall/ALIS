@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
 from typing import Any
@@ -16,7 +17,6 @@ from typing import Any
 import pandas as pd
 
 from app.data_platform.db import _conn
-from app.data_platform.tushare_client import get_tushare_client
 from app.data_platform.services.data_center import _now, _upsert_industry_metric_definitions, _upsert_industry_metric_values
 from app.services.industry_event_engine import _derived_industry_proxies
 
@@ -139,6 +139,131 @@ def _frame_rows(frame: pd.DataFrame) -> list[dict[str, Any]]:
     return [{str(key): value for key, value in row.items()} for row in frame.to_dict(orient="records")]
 
 
+def _ensure_futures_proxy_cache() -> None:
+    with _conn() as conn:
+        conn.execute("""CREATE TABLE IF NOT EXISTS dc_futures_mapping_cache (
+            root_contract TEXT NOT NULL,trade_date TEXT NOT NULL,mapped_contract TEXT NOT NULL,
+            provider TEXT NOT NULL,available_time TEXT NOT NULL,updated_at TEXT NOT NULL,
+            PRIMARY KEY(root_contract,trade_date)
+        )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS dc_futures_price_cache (
+            mapped_contract TEXT NOT NULL,trade_date TEXT NOT NULL,price REAL NOT NULL,
+            provider TEXT NOT NULL,available_time TEXT NOT NULL,updated_at TEXT NOT NULL,
+            PRIMARY KEY(mapped_contract,trade_date)
+        )""")
+
+
+def _cached_mappings(root_contract: str, start_date: str, end_date: str) -> dict[str, dict[str, Any]]:
+    with _conn() as conn:
+        rows = conn.execute(
+            """SELECT trade_date,mapped_contract,provider,available_time
+                 FROM dc_futures_mapping_cache
+                WHERE root_contract=? AND trade_date>=? AND trade_date<=? ORDER BY trade_date""",
+            (root_contract, start_date, end_date),
+        ).fetchall()
+    return {str(dict(row)["trade_date"]): dict(row) for row in rows}
+
+
+def _discover_futures_mapping(root_contract: str, start_date: str, end_date: str) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
+    from app.data_platform.services.research_source_discovery import race_tushare_sources
+
+    cached = _cached_mappings(root_contract, start_date, end_date)
+    if cached and start_date == end_date and start_date in cached:
+        return cached, {"status": "cache_hit", "winner": cached[start_date]["provider"], "network_requests": 0}
+    discovery = race_tushare_sources(
+        dataset="futures_mapping", target_key=f"{root_contract}:{start_date}:{end_date}",
+        api_name="fut_mapping", params={"ts_code": root_contract},
+        validator=lambda frame: bool(
+            isinstance(frame, pd.DataFrame) and not frame.empty and "trade_date" in frame.columns
+            and any(start_date <= str(value) <= end_date for value in frame["trade_date"])
+        ),
+        timeout_seconds=12, cooldown_seconds=600,
+    )
+    frame = discovery.get("frame")
+    if discovery.get("ok") and isinstance(frame, pd.DataFrame):
+        now = _now()
+        with _conn() as conn:
+            for row in _frame_rows(frame):
+                trade_date = str(row.get("trade_date") or "")
+                mapped = str(row.get("mapping_ts_code") or "")
+                if not mapped or len(trade_date) != 8:
+                    continue
+                conn.execute(
+                    """INSERT INTO dc_futures_mapping_cache(root_contract,trade_date,mapped_contract,provider,available_time,updated_at)
+                       VALUES(?,?,?,?,?,?) ON CONFLICT(root_contract,trade_date) DO UPDATE SET
+                       mapped_contract=excluded.mapped_contract,provider=excluded.provider,
+                       available_time=excluded.available_time,updated_at=excluded.updated_at""",
+                    (root_contract, trade_date, mapped, str(discovery.get("winner") or ""), now, now),
+                )
+        cached = _cached_mappings(root_contract, start_date, end_date)
+    if not cached and start_date == end_date:
+        with _conn() as conn:
+            previous = conn.execute(
+                """SELECT trade_date,mapped_contract,provider,available_time
+                     FROM dc_futures_mapping_cache
+                    WHERE root_contract=? AND trade_date<? ORDER BY trade_date DESC LIMIT 1""",
+                (root_contract, start_date),
+            ).fetchone()
+        if previous:
+            item = dict(previous)
+            try:
+                age_days = (date(int(start_date[:4]), int(start_date[4:6]), int(start_date[6:8]))
+                            - date(int(str(item["trade_date"])[:4]), int(str(item["trade_date"])[4:6]), int(str(item["trade_date"])[6:8]))).days
+            except (TypeError, ValueError):
+                age_days = 999
+            if 0 < age_days <= 10:
+                cached[start_date] = {**item, "trade_date": start_date, "mapping_cache_age_days": age_days}
+                return cached, {
+                    "status": "recent_mapping_cache_fallback", "winner": item.get("provider"),
+                    "mapping_source_date": item.get("trade_date"), "mapping_cache_age_days": age_days,
+                    "network_discovery": {key: value for key, value in discovery.items() if key != "frame"},
+                }
+    return cached, {key: value for key, value in discovery.items() if key != "frame"}
+
+
+def _cached_futures_prices(contract: str, start_date: str, end_date: str) -> dict[str, dict[str, Any]]:
+    with _conn() as conn:
+        rows = conn.execute(
+            """SELECT trade_date,price,provider,available_time FROM dc_futures_price_cache
+                WHERE mapped_contract=? AND trade_date>=? AND trade_date<=? ORDER BY trade_date""",
+            (contract, start_date, end_date),
+        ).fetchall()
+    return {str(dict(row)["trade_date"]): dict(row) for row in rows}
+
+
+def _discover_futures_prices(contract: str, start_date: str, end_date: str) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
+    from app.data_platform.services.research_source_discovery import race_tushare_sources
+
+    cached = _cached_futures_prices(contract, start_date, end_date)
+    if cached and start_date == end_date and start_date in cached:
+        return cached, {"status": "cache_hit", "winner": cached[start_date]["provider"], "network_requests": 0}
+    discovery = race_tushare_sources(
+        dataset="futures_daily", target_key=f"{contract}:{start_date}:{end_date}",
+        api_name="fut_daily", params={"ts_code": contract, "start_date": start_date, "end_date": end_date, "fields": "ts_code,trade_date,close,settle"},
+        validator=lambda frame: bool(isinstance(frame, pd.DataFrame) and not frame.empty and "trade_date" in frame.columns),
+        timeout_seconds=12, cooldown_seconds=600,
+    )
+    frame = discovery.get("frame")
+    if discovery.get("ok") and isinstance(frame, pd.DataFrame):
+        now = _now()
+        with _conn() as conn:
+            for row in _frame_rows(frame):
+                trade_date = str(row.get("trade_date") or "")
+                raw = row.get("settle") if row.get("settle") is not None else row.get("close")
+                try:
+                    price = float(raw)
+                except (TypeError, ValueError):
+                    continue
+                conn.execute(
+                    """INSERT INTO dc_futures_price_cache(mapped_contract,trade_date,price,provider,available_time,updated_at)
+                       VALUES(?,?,?,?,?,?) ON CONFLICT(mapped_contract,trade_date) DO UPDATE SET
+                       price=excluded.price,provider=excluded.provider,available_time=excluded.available_time,updated_at=excluded.updated_at""",
+                    (contract, trade_date, price, str(discovery.get("winner") or ""), now, now),
+                )
+        cached = _cached_futures_prices(contract, start_date, end_date)
+    return cached, {key: value for key, value in discovery.items() if key != "frame"}
+
+
 def materialize_futures_price_proxies(*, start_date: str, end_date: str, specs: tuple[FuturesProxySpec, ...] = FUTURES_PROXY_SPECS) -> dict[str, Any]:
     """Build exchange-traded commodity price proxies for named industries.
 
@@ -147,27 +272,42 @@ def materialize_futures_price_proxies(*, start_date: str, end_date: str, specs: 
     backfill can never leak into an earlier point-in-time replay.
     """
     now = _now()
-    client = get_tushare_client().pro
+    _ensure_futures_proxy_cache()
     definitions: dict[str, dict[str, Any]] = {}
     values: list[dict[str, Any]] = []
-    result: dict[str, Any] = {"ok": True, "sources": [], "definitions": 0, "values": 0, "contract": "exchange_futures_proxy_v1"}
-    for spec in specs:
-        mapping = _frame_rows(client.fut_mapping(ts_code=spec.root_contract))
-        mapped_by_date = {
-            str(row.get("trade_date") or ""): str(row.get("mapping_ts_code") or "")
-            for row in mapping
-            if start_date <= str(row.get("trade_date") or "") <= end_date and row.get("mapping_ts_code")
+    result: dict[str, Any] = {"ok": True, "status": "completed", "sources": [], "definitions": 0, "values": 0, "contract": "exchange_futures_proxy_v2"}
+    workers = max(1, min(len(specs), 4))
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="futures-mapping") as executor:
+        mapping_futures = {
+            spec.key: executor.submit(_discover_futures_mapping, spec.root_contract, start_date, end_date)
+            for spec in specs
         }
-        contracts = sorted(set(mapped_by_date.values()))
-        closes: dict[tuple[str, str], float] = {}
-        for contract in contracts:
-            frame = client.fut_daily(ts_code=contract, start_date=start_date, end_date=end_date, fields="ts_code,trade_date,close,settle")
-            for row in _frame_rows(frame):
-                raw = row.get("settle") if row.get("settle") is not None else row.get("close")
-                try:
-                    closes[(str(row.get("trade_date") or ""), contract)] = float(raw)
-                except (TypeError, ValueError):
-                    continue
+        mappings = {key: future.result() for key, future in mapping_futures.items()}
+    contracts = sorted({
+        str(row.get("mapped_contract") or "")
+        for mapping_rows, _discovery in mappings.values() for row in mapping_rows.values()
+        if row.get("mapped_contract")
+    })
+    with ThreadPoolExecutor(max_workers=max(1, min(len(contracts), 4)), thread_name_prefix="futures-prices") as executor:
+        price_futures = {
+            contract: executor.submit(_discover_futures_prices, contract, start_date, end_date)
+            for contract in contracts
+        }
+        prices_by_contract = {contract: future.result() for contract, future in price_futures.items()}
+    for spec in specs:
+        mapping_rows, mapping_discovery = mappings[spec.key]
+        mapped_by_date = {
+            trade_date: str(row.get("mapped_contract") or "")
+            for trade_date, row in mapping_rows.items() if row.get("mapped_contract")
+        }
+        spec_contracts = sorted(set(mapped_by_date.values()))
+        closes: dict[tuple[str, str], dict[str, Any]] = {}
+        price_discoveries: list[dict[str, Any]] = []
+        for contract in spec_contracts:
+            prices, price_discovery = prices_by_contract.get(contract, ({}, {"status": "not_available"}))
+            price_discoveries.append(price_discovery)
+            for trade_date, row in prices.items():
+                closes[(trade_date, contract)] = row
         written = 0
         for industry in spec.industries:
             code = _metric_code("futures_proxy", spec.key, industry)
@@ -182,21 +322,26 @@ def materialize_futures_price_proxies(*, start_date: str, end_date: str, specs: 
                 "description": "交易所连续期货价格代理，不等同于行业现货价格或企业实际实现价。",
             }
             for trade_date, contract in mapped_by_date.items():
-                close = closes.get((trade_date, contract))
-                if close is None:
+                price_row = closes.get((trade_date, contract))
+                if price_row is None:
                     continue
+                close = float(price_row["price"])
                 values.append({
                     "metric_code": code,
                     "data_date": trade_date,
                     "value": close,
-                    "raw_value": json.dumps({"root_contract": spec.root_contract, "mapped_contract": contract, "field": "settle_or_close"}, ensure_ascii=False),
+                    "raw_value": json.dumps({"root_contract": spec.root_contract, "mapped_contract": contract, "field": "settle_or_close", "mapping_provider": (mapping_rows.get(trade_date) or {}).get("provider"), "price_provider": price_row.get("provider")}, ensure_ascii=False),
                     "source_code": FUTURES_PROXY_SOURCE,
-                    "available_time": now,
+                    "available_time": str(price_row.get("available_time") or now),
                 })
                 written += 1
-        result["sources"].append({"key": spec.key, "root_contract": spec.root_contract, "contracts": len(contracts), "values": written})
+        result["sources"].append({"key": spec.key, "root_contract": spec.root_contract, "contracts": len(spec_contracts), "values": written, "mapping_discovery": mapping_discovery, "price_discoveries": price_discoveries})
     result["definitions"] = _upsert_industry_metric_definitions(list(definitions.values()))
     result["values"] = _upsert_industry_metric_values(values)
+    missing_sources = [str(source.get("key") or "") for source in result["sources"] if not source.get("values")]
+    result["missing_sources"] = missing_sources
+    if missing_sources:
+        result["status"] = "degraded"
     return result
 
 

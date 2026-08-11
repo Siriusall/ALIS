@@ -1907,6 +1907,30 @@ def execute_evolution_task(
             checkpoint=task.get("checkpoint") if isinstance(task.get("checkpoint"), dict) else {},
         )
         return run_release_governance_cycle(actor="evolution_system_release_governance")
+    if task_type == "research_data_publication_probe":
+        from app.data_platform.services.data_center import refresh_cn_ppi_from_first_source
+        from app.services.free_research_data import materialize_futures_price_proxies
+        from app.services.profit_loop import _latest_trade_date
+
+        payload = task.get("payload") if isinstance(task.get("payload"), dict) else {}
+        _heartbeat(
+            int(task["id"]), phase="research_source_probe", progress=0.1,
+            message="正在并行探测 PPI 与期货研究数据源",
+            checkpoint=task.get("checkpoint") if isinstance(task.get("checkpoint"), dict) else {},
+        )
+        ppi = refresh_cn_ppi_from_first_source()
+        futures = {"ok": True, "status": "not_due", "reason": "before_futures_probe_window"}
+        if bool(payload.get("include_futures")):
+            trade_date = _latest_trade_date()
+            futures = materialize_futures_price_proxies(start_date=trade_date, end_date=trade_date)
+        degraded = any(str(item.get("status") or "") == "degraded" for item in (ppi, futures))
+        return {
+            "ok": True,
+            "schema_version": "alis_research_publication_probe_task_v1",
+            "status": "completed_with_anomalies" if degraded else "completed",
+            "ppi": ppi, "futures": futures,
+            "policy": "bounded_parallel_probe; first_valid_source; exact_date_cache; no_stale_data_claim",
+        }
     if task_type in {
         "strategy_evolution_cycle",
         "strategy_controller_oos",
@@ -2388,6 +2412,7 @@ def _finish_success(task_id: int, result: dict[str, Any]) -> None:
     task_type = str(task.get("task_type") or "")
     message = {
         "system_release_governance": "系统版本变更发现与发布前硬门完成",
+        "research_data_publication_probe": "研究数据多源发布探测完成",
         "sealed_holdout_adj_factor_backfill": "密封验证集批量补全并复核完成",
         "factor_daily_cycle": "因子日物化与评价完成",
         "factor_research_cycle": "连续因子、模型与策略研究完成",
@@ -3009,6 +3034,18 @@ def start_evolution_scheduler() -> bool:
                     priority=90,
                 )
                 ensure_latest_ready_system_cycle()
+                if 9 <= now.hour < 19:
+                    probe_bucket = f"{now.hour:02d}{(now.minute // 10) * 10:02d}"
+                    create_evolution_task(
+                        task_type="research_data_publication_probe",
+                        dedupe_key=f"research_data_publication_probe:v1:{now.date().isoformat()}:{probe_bucket}",
+                        payload={
+                            "trigger": "ten_minute_publication_probe",
+                            "include_futures": now.hour >= 15,
+                        },
+                        max_attempts=1,
+                        priority=65,
+                    )
                 if _is_scheduled_trade_day(now) and now.hour >= 16:
                     create_evolution_task(
                         task_type="factor_daily_cycle",

@@ -14,6 +14,7 @@ token 从项目根目录的 `.env` 中读取：TUSHARE_TOKEN=...
 import os
 import threading
 import time
+from urllib.parse import urlparse
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -45,6 +46,34 @@ def load_tushare_token_from_env() -> str:
     return _load_token_from_env()
 
 
+def create_tushare_pro_for_endpoint(token: str, endpoint: str, *, timeout_seconds: float = 12.0):
+    """Create an isolated TuShare client for one bounded provider probe."""
+    host = str(urlparse(endpoint).hostname or "")
+    for env_name in ("NO_PROXY", "no_proxy"):
+        values = [item.strip() for item in os.getenv(env_name, "").split(",") if item.strip()]
+        if host and host not in values:
+            values.append(host)
+            os.environ[env_name] = ",".join(values)
+    pro = ts.pro_api(token)
+    pro._DataApi__token = token  # type: ignore[attr-defined]
+    pro._DataApi__http_url = str(endpoint).rstrip("/")  # type: ignore[attr-defined]
+    pro._DataApi__timeout = max(3.0, min(float(timeout_seconds), 30.0))  # type: ignore[attr-defined]
+    return pro
+
+
+def configured_tushare_probe_endpoints() -> tuple[tuple[str, str], ...]:
+    configured = os.getenv(
+        "TUSHARE_PROBE_ENDPOINTS",
+        "tushare_official=http://api.waditu.com/dataapi,tushare_proxy=http://lianghua.nanyangqiankun.top",
+    )
+    result: list[tuple[str, str]] = []
+    for item in configured.split(","):
+        name, separator, endpoint = item.strip().partition("=")
+        if separator and name and endpoint and endpoint.startswith(("http://", "https://")):
+            result.append((name.strip(), endpoint.rstrip("/")))
+    return tuple(dict.fromkeys(result))
+
+
 def create_strict_tushare_pro(token: str):
     """
     严格按固定方式初始化 TuShare Pro：
@@ -53,10 +82,9 @@ def create_strict_tushare_pro(token: str):
       pro._DataApi__token = token
       pro._DataApi__http_url = "http://lianghua.nanyangqiankun.top"
     """
-    pro = ts.pro_api(token)
-    pro._DataApi__token = token  # type: ignore[attr-defined]
-    pro._DataApi__http_url = "http://lianghua.nanyangqiankun.top"  # type: ignore[attr-defined]
-    return pro
+    return create_tushare_pro_for_endpoint(
+        token, "http://lianghua.nanyangqiankun.top", timeout_seconds=30,
+    )
 
 
 class TushareClient:

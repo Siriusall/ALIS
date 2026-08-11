@@ -428,7 +428,7 @@ def run_system_autonomy_cycle(*, trade_date: str = "") -> dict[str, Any]:
     from app.services.research_data_assets import audit_research_data_assets
     from app.services.theme_revenue_exposure import materialize_theme_revenue_exposure
     from app.services.free_research_data import materialize_cn_ppi_price_proxies, materialize_financial_industry_series, materialize_futures_price_proxies
-    from app.data_platform.services.data_center import sync_tushare_api_raw
+    from app.data_platform.services.data_center import refresh_cn_ppi_from_first_source
     from app.services.official_policy_data import materialize_official_capacity_utilization, materialize_official_policy_supply, sync_official_policy_documents
     from app.services.caam_ocr_data import audit_caam_ocr_candidates, reconcile_caam_ocr_with_miit, sync_caam_ocr_candidates
     from app.services.professional_metric_documents import audit_professional_metric_candidates, sync_professional_metric_candidates
@@ -497,7 +497,7 @@ def run_system_autonomy_cycle(*, trade_date: str = "") -> dict[str, Any]:
         _run_step("research_maintenance", lambda: run_daily_maintenance(max_candidates=50)),
         _run_step("free_industry_financials", lambda: materialize_financial_industry_series(max_periods=1)),
         _run_step("pmi_demand_proxies", sync_pmi_industry_proxies),
-        _run_step("cn_ppi_raw", lambda: sync_tushare_api_raw("cn_ppi")),
+        _run_step("cn_ppi_raw", refresh_cn_ppi_from_first_source),
         _run_step("cn_ppi_price_proxies", materialize_cn_ppi_price_proxies),
         _run_step("official_policy_documents", sync_official_policy_documents),
         _run_step("official_policy_supply", materialize_official_policy_supply),

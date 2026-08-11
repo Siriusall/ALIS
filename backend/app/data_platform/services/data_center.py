@@ -936,6 +936,84 @@ def sync_tushare_api_raw(api_name: str, params: dict[str, Any] | None = None, *,
         raise
 
 
+def refresh_cn_ppi_from_first_source(*, today: date | None = None) -> dict[str, Any]:
+    """Discover the first bounded TuShare transport publishing the due PPI month."""
+    observed_date = today or datetime.now().astimezone().date()
+    first_this_month = observed_date.replace(day=1)
+    previous_month_end = first_this_month - timedelta(days=1)
+    target_month = previous_month_end.strftime("%Y%m")
+    with _conn() as conn:
+        existing = conn.execute(
+            "SELECT COUNT(*) rows FROM dc_tushare_raw_records WHERE api_name='cn_ppi' AND trade_date=?",
+            (target_month,),
+        ).fetchone()
+    if int(dict(existing).get("rows") or 0) > 0:
+        return {
+            "ok": True, "schema_version": "alis_cn_ppi_publication_discovery_v1",
+            "status": "already_current", "target_month": target_month,
+            "source": "postgresql_local", "network_requests": 0,
+        }
+    release_probe_day = max(1, min(int(os.getenv("CN_PPI_PROBE_START_DAY", "7")), 20))
+    if observed_date.day < release_probe_day:
+        return {
+            "ok": True, "schema_version": "alis_cn_ppi_publication_discovery_v1",
+            "status": "not_due", "target_month": target_month,
+            "next_probe_day": release_probe_day, "network_requests": 0,
+        }
+    from app.data_platform.services.research_source_discovery import race_tushare_sources
+
+    def target_available(frame: pd.DataFrame) -> bool:
+        if not isinstance(frame, pd.DataFrame) or frame.empty:
+            return False
+        column = "month" if "month" in frame.columns else "MONTH" if "MONTH" in frame.columns else ""
+        return bool(column and target_month in set(frame[column].astype(str)))
+
+    discovery = race_tushare_sources(
+        dataset="cn_ppi", target_key=target_month, api_name="cn_ppi", params={},
+        validator=target_available, timeout_seconds=float(os.getenv("RESEARCH_PROBE_TIMEOUT_SECONDS", "12")),
+        cooldown_seconds=int(os.getenv("RESEARCH_PROBE_COOLDOWN_SECONDS", "600")),
+    )
+    if not discovery.get("ok"):
+        completed = discovery.get("completed") if isinstance(discovery.get("completed"), list) else []
+        network_failed = bool(completed) and all(str(item.get("status") or "") == "probe_failed" for item in completed)
+        return {
+            "ok": True, "schema_version": "alis_cn_ppi_publication_discovery_v1",
+            "status": "degraded" if network_failed else "observing",
+            "reason": "all_sources_failed" if network_failed else str(discovery.get("status") or "not_published"),
+            "target_month": target_month, "discovery": {key: value for key, value in discovery.items() if key != "frame"},
+            "production_change": False,
+        }
+    frame = discovery.get("frame")
+    if not isinstance(frame, pd.DataFrame) or frame.empty:
+        return {"ok": True, "status": "observing", "reason": "winner_returned_empty", "target_month": target_month}
+    run_id = start_ingestion_run(
+        "tushare.cn_ppi.first_source", {
+            "api": "cn_ppi", "target_month": target_month, "provider": discovery.get("winner"),
+            "endpoint": discovery.get("endpoint"),
+        },
+    )
+    try:
+        written = _upsert_raw_records("cn_ppi", frame)
+        finish_ingestion_run(
+            run_id, status="completed", rows_read=len(frame), rows_written=written,
+            meta={"target_month": target_month, "provider": discovery.get("winner"), "probe_contract": discovery.get("probe_contract")},
+        )
+        _record_probe("cn_ppi", "ok", len(frame))
+        _record_request_coverage("cn_ppi", {}, None, len(frame))
+        _resolve_failed_tushare_request("cn_ppi", {}, None)
+        if written:
+            _invalidate_asset_views()
+        return {
+            "ok": True, "schema_version": "alis_cn_ppi_publication_discovery_v1",
+            "status": "completed", "target_month": target_month,
+            "winner": discovery.get("winner"), "rows_read": len(frame), "rows_written": written,
+            "discovery": {key: value for key, value in discovery.items() if key != "frame"},
+        }
+    except Exception as exc:  # noqa: BLE001
+        finish_ingestion_run(run_id, status="failed", rows_read=0, rows_written=0, error=str(exc))
+        raise
+
+
 def list_failed_tushare_requests(*, status: str = "pending", limit: int = 100) -> dict[str, Any]:
     with _conn() as c:
         count_row = c.execute(

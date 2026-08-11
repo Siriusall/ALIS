@@ -1,10 +1,6 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
-from types import SimpleNamespace
-
-import pandas as pd
-
 from app.services import free_research_data as service
 from app.services.announcement_label_benchmark import _normalise_label
 
@@ -46,14 +42,15 @@ def test_materialize_financial_series_keeps_cutoff_availability(monkeypatch) -> 
 def test_futures_proxy_backfill_is_available_when_materialised(monkeypatch) -> None:
     written_values: list[dict] = []
 
-    class Pro:
-        def fut_mapping(self, **_kwargs):
-            return pd.DataFrame([{"trade_date": "20260721", "mapping_ts_code": "CU2608.SHF"}])
-
-        def fut_daily(self, **_kwargs):
-            return pd.DataFrame([{"ts_code": "CU2608.SHF", "trade_date": "20260721", "close": 80100, "settle": 80000}])
-
-    monkeypatch.setattr(service, "get_tushare_client", lambda: SimpleNamespace(pro=Pro()))
+    monkeypatch.setattr(service, "_ensure_futures_proxy_cache", lambda: None)
+    monkeypatch.setattr(service, "_discover_futures_mapping", lambda *_args: (
+        {"20260721": {"mapped_contract": "CU2608.SHF", "provider": "source_a", "available_time": "2026-07-23T10:00:00"}},
+        {"status": "available", "winner": "source_a"},
+    ))
+    monkeypatch.setattr(service, "_discover_futures_prices", lambda *_args: (
+        {"20260721": {"price": 80000, "provider": "source_b", "available_time": "2026-07-23T10:00:00"}},
+        {"status": "available", "winner": "source_b"},
+    ))
     monkeypatch.setattr(service, "_now", lambda: "2026-07-23T10:00:00")
     monkeypatch.setattr(service, "_upsert_industry_metric_definitions", lambda rows: len(rows))
     monkeypatch.setattr(service, "_upsert_industry_metric_values", lambda rows: written_values.extend(rows) or len(rows))
@@ -64,6 +61,45 @@ def test_futures_proxy_backfill_is_available_when_materialised(monkeypatch) -> N
     assert result["values"] == 1
     assert written_values[0]["value"] == 80000.0
     assert written_values[0]["available_time"] == "2026-07-23T10:00:00"
+
+
+def test_exact_futures_mapping_cache_skips_network_probe(monkeypatch) -> None:
+    monkeypatch.setattr(service, "_cached_mappings", lambda *_args: {
+        "20260721": {"mapped_contract": "CU2608.SHF", "provider": "cached_source"},
+    })
+    monkeypatch.setattr(
+        "app.data_platform.services.research_source_discovery.race_tushare_sources",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("exact cache must win before network")),
+    )
+
+    mappings, evidence = service._discover_futures_mapping("CU.SHF", "20260721", "20260721")
+
+    assert mappings["20260721"]["mapped_contract"] == "CU2608.SHF"
+    assert evidence["status"] == "cache_hit"
+    assert evidence["network_requests"] == 0
+
+
+def test_missing_futures_group_is_not_hidden_by_other_successes(monkeypatch) -> None:
+    monkeypatch.setattr(service, "_ensure_futures_proxy_cache", lambda: None)
+    monkeypatch.setattr(service, "_discover_futures_mapping", lambda root, *_args: (
+        {} if root == "SC.INE" else {"20260721": {"mapped_contract": "CU2608.SHF", "provider": "source_a"}},
+        {"status": "not_published" if root == "SC.INE" else "available"},
+    ))
+    monkeypatch.setattr(service, "_discover_futures_prices", lambda *_args: (
+        {"20260721": {"price": 80000, "provider": "source_b", "available_time": "2026-07-23T10:00:00"}},
+        {"status": "available"},
+    ))
+    monkeypatch.setattr(service, "_upsert_industry_metric_definitions", lambda rows: len(rows))
+    monkeypatch.setattr(service, "_upsert_industry_metric_values", lambda rows: len(rows))
+    specs = (
+        service.FuturesProxySpec("copper", "CU.SHF", "铜", ("铜",)),
+        service.FuturesProxySpec("crude_oil", "SC.INE", "原油", ("石油开采",)),
+    )
+
+    result = service.materialize_futures_price_proxies(start_date="20260721", end_date="20260721", specs=specs)
+
+    assert result["status"] == "degraded"
+    assert result["missing_sources"] == ["crude_oil"]
 
 
 def test_cn_ppi_price_proxy_preserves_raw_available_time(monkeypatch) -> None:
