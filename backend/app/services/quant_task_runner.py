@@ -472,8 +472,12 @@ def start_auto_simulation_scheduler() -> bool:
                                 status = str(task.get("status") or "").lower()
                                 if status not in {"pending", "paused"}:
                                     continue
-                                if str(task.get("last_execute_date") or "") == latest:
-                                    continue
+                                # The due frozen plan row is authoritative. A
+                                # task progress field may describe an in-flight
+                                # attempt that later failed contract validation;
+                                # using it as a pre-claim dedupe key can strand a
+                                # still-planned row forever. The atomic plan
+                                # status/claim token remains the duplicate guard.
                                 run_quant_task_async(int(task["id"]))
                 beat("auto_simulation_scheduler")
             except Exception as exc:  # noqa: BLE001
