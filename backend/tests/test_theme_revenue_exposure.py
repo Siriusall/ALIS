@@ -1,4 +1,9 @@
-from app.services.theme_revenue_exposure import _company_exposures, _matching_themes
+from app.services.theme_revenue_exposure import (
+    _company_exposures,
+    _initial_company_rows,
+    _latest_segment_rows,
+    _matching_themes,
+)
 
 
 def test_business_segment_theme_matching_keeps_multiple_supported_themes():
@@ -24,3 +29,44 @@ def test_company_exposure_is_deterministic_and_uses_latest_period_segments():
     assert exposures["revenue:半导体"]["matched_sales"] == 60.0
     assert fingerprint == same_fingerprint
     assert exposures == same_exposures
+
+
+def test_initial_company_discovery_uses_bounded_distinct_index_query():
+    captured = {}
+
+    class Cursor:
+        def fetchall(self):
+            return [{"ts_code": "000001.SZ"}]
+
+    class Connection:
+        def execute(self, sql, params):
+            captured.update({"sql": sql, "params": params})
+            return Cursor()
+
+    rows = _initial_company_rows(Connection(), limit=8000)
+
+    assert rows == [{"ts_code": "000001.SZ"}]
+    assert "SELECT DISTINCT ts_code" in captured["sql"]
+    assert "GROUP BY" not in captured["sql"]
+    assert captured["params"] == (8001,)
+
+
+def test_latest_segments_are_split_into_bounded_company_batches():
+    calls = []
+
+    class Cursor:
+        def fetchall(self):
+            return []
+
+    class Connection:
+        def execute(self, sql, params):
+            calls.append((sql, params))
+            return Cursor()
+
+    _latest_segment_rows(
+        Connection(), [f"{index:06d}.SZ" for index in range(501)],
+        cutoff="2026-08-11T15:00:00", batch_size=250,
+    )
+
+    assert len(calls) == 3
+    assert [len(params) for _sql, params in calls] == [252, 252, 3]

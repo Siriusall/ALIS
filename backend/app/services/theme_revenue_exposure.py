@@ -108,6 +108,50 @@ def _company_exposures(segments: list[dict[str, Any]]) -> tuple[dict[str, dict[s
     return exposures, fingerprint
 
 
+def _initial_company_rows(conn: Any, *, limit: int) -> list[dict[str, Any]]:
+    """Discover initial companies from the PIT index without grouping all segments."""
+    return [dict(row) for row in conn.execute(
+        """SELECT DISTINCT ts_code
+             FROM dc_tushare_raw_records
+            WHERE api_name='fina_mainbz' AND available_time<>'' AND COALESCE(ts_code,'')<>''
+            ORDER BY ts_code LIMIT ?""",
+        (int(limit) + 1,),
+    ).fetchall()]
+
+
+def _latest_segment_rows(
+    conn: Any,
+    codes: list[str],
+    *,
+    cutoff: str,
+    batch_size: int = 250,
+) -> list[dict[str, Any]]:
+    """Read bounded company batches so one statement never scans the full domain."""
+    result: list[dict[str, Any]] = []
+    size = max(25, min(int(batch_size), 500))
+    for offset in range(0, len(codes), size):
+        batch = codes[offset:offset + size]
+        placeholders = ",".join("?" for _ in batch)
+        cutoff_filter = "AND available_time<=?" if cutoff else ""
+        cutoff_params: tuple[Any, ...] = (cutoff,) if cutoff else ()
+        result.extend(dict(row) for row in conn.execute(
+            f"""WITH latest_period AS (
+                    SELECT ts_code,MAX(period) AS period
+                      FROM dc_tushare_raw_records
+                     WHERE api_name='fina_mainbz' AND ts_code IN ({placeholders}) {cutoff_filter}
+                     GROUP BY ts_code
+                )
+                SELECT r.id,r.ts_code,r.period,r.available_time,r.payload_json
+                  FROM dc_tushare_raw_records r
+                  JOIN latest_period p
+                    ON p.ts_code=r.ts_code AND p.period=r.period
+                 WHERE r.api_name='fina_mainbz' {('AND r.available_time<=?' if cutoff else '')}
+                 ORDER BY r.ts_code,r.available_time DESC,r.id DESC""",
+            tuple(batch) + cutoff_params + cutoff_params,
+        ).fetchall())
+    return result
+
+
 def materialize_theme_revenue_exposure(*, as_of_time: str | None = None, limit_companies: int = 8_000) -> dict[str, Any]:
     """Incrementally persist latest revenue exposure while retaining PIT history."""
     _ensure_tables()
@@ -133,13 +177,16 @@ def materialize_theme_revenue_exposure(*, as_of_time: str | None = None, limit_c
         elif last_run:
             change_clause = "AND (updated_at>? OR (updated_at=? AND id>?))"
             change_params.extend((cursor_time, cursor_time, cursor_id))
-        changed_rows = [dict(row) for row in conn.execute(
-            f"""SELECT ts_code,MAX(updated_at) source_updated_at,MAX(id) source_id
-                   FROM dc_tushare_raw_records
-                  WHERE api_name='fina_mainbz' {change_clause}
-                  GROUP BY ts_code ORDER BY ts_code LIMIT ?""",
-            tuple(change_params + [company_limit + 1]),
-        ).fetchall()]
+        if not cutoff and not last_run:
+            changed_rows = _initial_company_rows(conn, limit=company_limit)
+        else:
+            changed_rows = [dict(row) for row in conn.execute(
+                f"""SELECT ts_code,MAX(updated_at) source_updated_at,MAX(id) source_id
+                       FROM dc_tushare_raw_records
+                      WHERE api_name='fina_mainbz' {change_clause}
+                      GROUP BY ts_code ORDER BY ts_code LIMIT ?""",
+                tuple(change_params + [company_limit + 1]),
+            ).fetchall()]
         partial = len(changed_rows) > company_limit
         changed_rows = changed_rows[:company_limit]
         changed_codes = [str(row.get("ts_code") or "") for row in changed_rows if row.get("ts_code")]
@@ -163,24 +210,7 @@ def materialize_theme_revenue_exposure(*, as_of_time: str | None = None, limit_c
                     (cutoff_date, run_status, cursor_time, cursor_id, now),
                 )
             return {"ok": True, "schema_version": "alis_theme_revenue_exposure_v2", "status": result_status, "as_of_date": cutoff_date, "companies_examined": 0, "companies_changed": 0, "exposures_written": 0, "policy": "incremental_fina_mainbz_cursor; complete_current_snapshot; point_in_time_history"}
-        placeholders = ",".join("?" for _ in changed_codes)
-        cutoff_filter = "AND available_time<=?" if cutoff else ""
-        cutoff_params: tuple[Any, ...] = (cutoff,) if cutoff else ()
-        rows = [dict(row) for row in conn.execute(
-            f"""WITH latest_period AS (
-                    SELECT ts_code,MAX(period) AS period
-                      FROM dc_tushare_raw_records
-                     WHERE api_name='fina_mainbz' AND ts_code IN ({placeholders}) {cutoff_filter}
-                     GROUP BY ts_code
-                )
-                SELECT r.id,r.ts_code,r.period,r.available_time,r.payload_json
-                  FROM dc_tushare_raw_records r
-                  JOIN latest_period p
-                    ON p.ts_code=r.ts_code AND p.period=r.period
-                 WHERE r.api_name='fina_mainbz' {('AND r.available_time<=?' if cutoff else '')}
-                 ORDER BY r.ts_code,r.available_time DESC,r.id DESC""",
-            tuple(changed_codes) + cutoff_params + cutoff_params,
-        ).fetchall()]
+        rows = _latest_segment_rows(conn, changed_codes, cutoff=cutoff)
     by_company: dict[str, list[dict[str, Any]]] = {}
     for row in rows:
         code = str(row.get("ts_code") or "")

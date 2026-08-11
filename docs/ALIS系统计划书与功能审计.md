@@ -1573,3 +1573,7 @@ ALIS 的目标运行方式调整为“系统自治、结果可见、异常才打
 # 2026-08-12：自治模拟任务日期投影修复
 
 - [x] `waiting_schedule` 不再保留上一次失败尝试的 `replay_current_execute_date/replay_target_execute_date`。任务进入等待或应用重启恢复时直接读取下一份真实 `planned` 冻结计划：存在时同时投影精确执行日并显示 `signal→execute`，不存在时清空日期；无效计划隔离后也使用同一逻辑。该字段仍只作任务中心展示，执行权威继续是正式计划行及原子领取状态机。专项测试覆盖存在下一计划和无计划两种状态。
+
+# 2026-08-12：主题收入首次物化全表扫描修复
+
+- [x] 持续审计复现 `theme_revenue_exposure` V2 在没有成功游标时运行超过90秒：所谓增量实现的首次证券发现仍对约480万条 `fina_mainbz` 做全表 `GROUP BY ts_code`，随后又在一条SQL中读取全部公司。首次发现现改为沿 `fina_mainbz` 点时部分索引执行有界 `DISTINCT ts_code LIMIT`，最新报告期明细按最多250家公司拆成独立查询；正常增量仍按 `(updated_at,id)` 游标只读取变化公司，历史截止回放继续保留 `available_time<=cutoff`。专项测试锁定首次查询不得出现GROUP BY，并验证501家公司必须拆为3批，禁止以后退化回单条全域查询。
