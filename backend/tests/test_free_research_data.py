@@ -69,6 +69,10 @@ def test_futures_proxy_backfill_is_available_when_materialised(monkeypatch) -> N
 
     monkeypatch.setattr(service, "_ensure_futures_proxy_cache", lambda: None)
     monkeypatch.setattr(service, "_sync_futures_proxy_registry", lambda *_args: None)
+    monkeypatch.setattr(
+        "app.data_platform.services.independent_research_sources.fetch_sina_continuous_futures",
+        lambda *_args, **_kwargs: __import__("pandas").DataFrame(),
+    )
     monkeypatch.setattr(service, "_discover_futures_mapping", lambda *_args: (
         {"20260721": {"mapped_contract": "CU2608.SHF", "provider": "source_a", "available_time": "2026-07-23T10:00:00"}},
         {"status": "available", "winner": "source_a"},
@@ -87,6 +91,30 @@ def test_futures_proxy_backfill_is_available_when_materialised(monkeypatch) -> N
     assert result["values"] == 1
     assert written_values[0]["value"] == 80000.0
     assert written_values[0]["available_time"] == "2026-07-23T10:00:00"
+
+
+def test_independent_futures_range_keeps_every_date(monkeypatch) -> None:
+    import pandas as pd
+
+    written_values: list[dict] = []
+    monkeypatch.setattr(service, "_ensure_futures_proxy_cache", lambda: None)
+    monkeypatch.setattr(service, "_sync_futures_proxy_registry", lambda *_args: None)
+    monkeypatch.setattr(service, "_persist_direct_futures_cache", lambda *_args: None)
+    monkeypatch.setattr(
+        "app.data_platform.services.independent_research_sources.fetch_sina_continuous_futures",
+        lambda *_args, **_kwargs: pd.DataFrame([
+            {"trade_date": "20260810", "price": 99.0, "mapped_contract": "SINA:CU0", "provider": "sina_futures_continuous"},
+            {"trade_date": "20260811", "price": 100.0, "mapped_contract": "SINA:CU0", "provider": "sina_futures_continuous"},
+        ]),
+    )
+    monkeypatch.setattr(service, "_upsert_industry_metric_definitions", lambda rows: len(rows))
+    monkeypatch.setattr(service, "_upsert_industry_metric_values", lambda rows: written_values.extend(rows) or len(rows))
+    spec = service.FuturesProxySpec("copper", "CU.SHF", "沪铜", ("铜",))
+
+    result = service.materialize_futures_price_proxies(start_date="20260810", end_date="20260811", specs=(spec,))
+
+    assert result["values"] == 2
+    assert [row["data_date"] for row in written_values] == ["20260810", "20260811"]
 
 
 def test_exact_futures_mapping_cache_skips_network_probe(monkeypatch) -> None:
