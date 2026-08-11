@@ -790,6 +790,10 @@ def init_db() -> None:
                 created_at VARCHAR(64) NOT NULL, updated_at VARCHAR(64) NOT NULL,
                 PRIMARY KEY(as_of_date,industry_name))""")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_dc_industry_state_name_date ON dc_industry_state_snapshot(industry_name,as_of_date)")
+            conn.execute("""CREATE TABLE IF NOT EXISTS dc_industry_financial_proxy_cache (
+                source_signature VARCHAR(64) PRIMARY KEY, as_of_time VARCHAR(64) NOT NULL,
+                proxies_json TEXT NOT NULL, industry_count INTEGER NOT NULL DEFAULT 0,
+                created_at VARCHAR(64) NOT NULL, updated_at VARCHAR(64) NOT NULL)""")
             conn.execute("""CREATE TABLE IF NOT EXISTS dc_theme_snapshot (
                 as_of_date VARCHAR(8) NOT NULL, theme_code VARCHAR(255) NOT NULL,
                 theme_name VARCHAR(255) NOT NULL, lifecycle VARCHAR(32) NOT NULL,

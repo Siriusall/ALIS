@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import date, datetime, timedelta
 from functools import lru_cache
+import hashlib
 import json
 import math
 import re
@@ -142,6 +143,59 @@ def _industry_state_from_series(series: list[dict[str, Any]]) -> tuple[dict[str,
     return score_industry(observations, history_points=history_points), evidence
 
 
+def _financial_proxy_source_signature(c: Any, *, as_of_time: str | None) -> str:
+    cutoff_clause = "AND available_time<=?" if as_of_time else ""
+    params: tuple[Any, ...] = (str(as_of_time),) if as_of_time else ()
+    row = c.execute(
+        f"""SELECT COUNT(*) AS row_count,COALESCE(MAX(id),0) AS max_id,
+                   COALESCE(MAX(available_time),'') AS max_available_time,
+                   COALESCE(MAX(updated_at),'') AS max_updated_at
+              FROM dc_tushare_raw_records
+             WHERE api_name IN ('income','balancesheet') {cutoff_clause}""",
+        params,
+    ).fetchone()
+    payload = dict(row) if row else {}
+    return hashlib.sha256(json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), default=str,
+    ).encode("utf-8")).hexdigest()
+
+
+def _load_financial_proxy_cache(c: Any, source_signature: str) -> dict[str, dict[str, Any]] | None:
+    row = c.execute(
+        "SELECT proxies_json FROM dc_industry_financial_proxy_cache WHERE source_signature=?",
+        (str(source_signature),),
+    ).fetchone()
+    if not row:
+        return None
+    try:
+        value = json.loads(str(dict(row).get("proxies_json") or "{}"))
+    except (TypeError, json.JSONDecodeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _store_financial_proxy_cache(
+    c: Any,
+    *,
+    source_signature: str,
+    as_of_time: str | None,
+    proxies: dict[str, dict[str, Any]],
+) -> None:
+    now = datetime.now().isoformat(timespec="seconds")
+    c.execute(
+        """INSERT INTO dc_industry_financial_proxy_cache
+               (source_signature,as_of_time,proxies_json,industry_count,created_at,updated_at)
+           VALUES(?,?,?,?,?,?) ON CONFLICT(source_signature) DO UPDATE SET
+               as_of_time=excluded.as_of_time,proxies_json=excluded.proxies_json,
+               industry_count=excluded.industry_count,updated_at=excluded.updated_at""",
+        (
+            str(source_signature), str(as_of_time or ""),
+            json.dumps(proxies, ensure_ascii=False, sort_keys=True),
+            len(proxies), now, now,
+        ),
+    )
+
+
 def _derived_industry_proxies(c, *, as_of_time: str | None = None) -> dict[str, dict[str, Any]]:
     """Build auditable P1 industry proxies from company financial and valuation facts."""
     target_rows: dict[str, list[dict[str, Any]]] | None = None
@@ -239,7 +293,12 @@ def _derived_industry_proxies(c, *, as_of_time: str | None = None) -> dict[str, 
     master = {str(row["ts_code"]): str(row["industry"] or "").strip() for row in c.execute(
         "SELECT ts_code,industry FROM dc_stock_master WHERE COALESCE(industry,'')<>''"
     ).fetchall()}
-    income_rows, balance_rows = ranked("income"), ranked("balancesheet")
+    source_signature = _financial_proxy_source_signature(c, as_of_time=as_of_time)
+    financial_derived = _load_financial_proxy_cache(c, source_signature)
+    if financial_derived is None:
+        income_rows, balance_rows = ranked("income"), ranked("balancesheet")
+    else:
+        income_rows, balance_rows = [], []
     as_of_date = str(as_of_time or "")[:10].replace("-", "")
     latest_date_clause = "AND s.available_time<=? AND s.trade_date<=?" if as_of_time else ""
     date_params: tuple[Any, ...] = (str(as_of_time), as_of_date) if as_of_time else ()
@@ -271,70 +330,78 @@ def _derived_industry_proxies(c, *, as_of_time: str | None = None) -> dict[str, 
 
     incomes, balances = payloads(income_rows), payloads(balance_rows)
     pe_by_symbol = {str(row.get("ts_code") or ""): float(row.get("pe_ttm") or 0) for row in snapshots}
-    facts: dict[str, dict[str, list[float]]] = {}
-    for symbol, industry in master.items():
-        if not industry:
-            continue
-        bucket = facts.setdefault(industry, {"revenue_growth": [], "profit_growth": [], "inventory_improvement": [], "pe": []})
-        inc = incomes.get(symbol) or []
-        current_inc = inc[0] if inc else None
-        prior_inc = None
-        if current_inc and len(str(current_inc.get("_period") or "")) == 8:
-            period = str(current_inc["_period"])
-            prior_period = str(int(period[:4]) - 1) + period[4:]
-            prior_inc = next((item for item in inc[1:] if str(item.get("_period") or "") == prior_period), None)
-        if current_inc and prior_inc:
-            for field, key in (("total_revenue", "revenue_growth"), ("n_income", "profit_growth")):
-                current, previous = current_inc.get(field), prior_inc.get(field)
-                if current is not None and previous not in (None, 0):
-                    bucket[key].append(float(current) / abs(float(previous)) - (1.0 if float(previous) > 0 else 0.0))
-        bal = balances.get(symbol) or []
-        inc_by_period = {str(item.get("_period") or ""): item for item in inc}
-        bal_by_period = {str(item.get("_period") or ""): item for item in bal}
-        inventory_period = next((
-            period for period in sorted(set(inc_by_period) & set(bal_by_period), reverse=True)
-            if len(period) == 8 and (str(int(period[:4]) - 1) + period[4:]) in inc_by_period
-            and (str(int(period[:4]) - 1) + period[4:]) in bal_by_period
-        ), None)
-        if inventory_period:
-            prior_inventory_period = str(int(inventory_period[:4]) - 1) + inventory_period[4:]
-            inventory_inc, prior_inventory_inc = inc_by_period[inventory_period], inc_by_period[prior_inventory_period]
-            current_bal, prior_bal = bal_by_period[inventory_period], bal_by_period[prior_inventory_period]
-            current_revenue, previous_revenue = inventory_inc.get("total_revenue"), prior_inventory_inc.get("total_revenue")
-            current_inventory, previous_inventory = current_bal.get("inventories"), prior_bal.get("inventories")
-            if current_revenue not in (None, 0) and previous_revenue not in (None, 0) and current_inventory is not None and previous_inventory is not None:
-                current_ratio = float(current_inventory) / abs(float(current_revenue))
-                previous_ratio = float(previous_inventory) / abs(float(previous_revenue))
-                bucket["inventory_improvement"].append(previous_ratio - current_ratio)
-        if pe_by_symbol.get(symbol, 0) > 0:
-            bucket["pe"].append(pe_by_symbol[symbol])
+    if financial_derived is None:
+        facts: dict[str, dict[str, list[float]]] = {}
+        for symbol, industry in master.items():
+            if not industry:
+                continue
+            bucket = facts.setdefault(industry, {"revenue_growth": [], "profit_growth": [], "inventory_improvement": []})
+            inc = incomes.get(symbol) or []
+            current_inc = inc[0] if inc else None
+            prior_inc = None
+            if current_inc and len(str(current_inc.get("_period") or "")) == 8:
+                period = str(current_inc["_period"])
+                prior_period = str(int(period[:4]) - 1) + period[4:]
+                prior_inc = next((item for item in inc[1:] if str(item.get("_period") or "") == prior_period), None)
+            if current_inc and prior_inc:
+                for field, key in (("total_revenue", "revenue_growth"), ("n_income", "profit_growth")):
+                    current, previous = current_inc.get(field), prior_inc.get(field)
+                    if current is not None and previous not in (None, 0):
+                        bucket[key].append(float(current) / abs(float(previous)) - (1.0 if float(previous) > 0 else 0.0))
+            bal = balances.get(symbol) or []
+            inc_by_period = {str(item.get("_period") or ""): item for item in inc}
+            bal_by_period = {str(item.get("_period") or ""): item for item in bal}
+            inventory_period = next((
+                period for period in sorted(set(inc_by_period) & set(bal_by_period), reverse=True)
+                if len(period) == 8 and (str(int(period[:4]) - 1) + period[4:]) in inc_by_period
+                and (str(int(period[:4]) - 1) + period[4:]) in bal_by_period
+            ), None)
+            if inventory_period:
+                prior_inventory_period = str(int(inventory_period[:4]) - 1) + inventory_period[4:]
+                inventory_inc, prior_inventory_inc = inc_by_period[inventory_period], inc_by_period[prior_inventory_period]
+                current_bal, prior_bal = bal_by_period[inventory_period], bal_by_period[prior_inventory_period]
+                current_revenue, previous_revenue = inventory_inc.get("total_revenue"), prior_inventory_inc.get("total_revenue")
+                current_inventory, previous_inventory = current_bal.get("inventories"), prior_bal.get("inventories")
+                if current_revenue not in (None, 0) and previous_revenue not in (None, 0) and current_inventory is not None and previous_inventory is not None:
+                    current_ratio = float(current_inventory) / abs(float(current_revenue))
+                    previous_ratio = float(previous_inventory) / abs(float(previous_revenue))
+                    bucket["inventory_improvement"].append(previous_ratio - current_ratio)
+        financial_derived = {}
+        for industry, bucket in facts.items():
+            revenue, profit, inventory = bucket["revenue_growth"], bucket["profit_growth"], bucket["inventory_improvement"]
+            observations: dict[str, float] = {}
+            if len(revenue) >= 3:
+                observations["demand_orders_sales"] = sum(1 for value in revenue if value > 0) / len(revenue) * 100
+            if len(profit) >= 3:
+                observations["profit_diffusion"] = sum(1 for value in profit if value > 0) / len(profit) * 100
+            if len(inventory) >= 3:
+                observations["inventory_cycle"] = sum(1 for value in inventory if value >= 0) / len(inventory) * 100
+            financial_derived[industry] = {
+                "observations": observations,
+                "evidence_points": len(revenue) + len(profit) + len(inventory),
+                "evidence": {
+                    "method": "dynamic_factor_v1", "company_revenue_points": len(revenue),
+                    "company_profit_points": len(profit), "company_inventory_points": len(inventory),
+                },
+            }
+        _store_financial_proxy_cache(
+            c, source_signature=source_signature, as_of_time=as_of_time, proxies=financial_derived,
+        )
 
-    derived: dict[str, dict[str, Any]] = {}
-    for industry, bucket in facts.items():
-        revenue = bucket["revenue_growth"]
-        profit = bucket["profit_growth"]
-        inventory = bucket["inventory_improvement"]
-        pe_values = sorted(bucket["pe"])
-        observations: dict[str, float] = {}
-        if len(revenue) >= 3:
-            observations["demand_orders_sales"] = sum(1 for value in revenue if value > 0) / len(revenue) * 100
-        if len(profit) >= 3:
-            observations["profit_diffusion"] = sum(1 for value in profit if value > 0) / len(profit) * 100
-        if len(inventory) >= 3:
-            observations["inventory_cycle"] = sum(1 for value in inventory if value >= 0) / len(inventory) * 100
+    derived = json.loads(json.dumps(financial_derived))
+    pe_by_industry: dict[str, list[float]] = {}
+    for symbol, industry in master.items():
+        if pe_by_symbol.get(symbol, 0) > 0:
+            pe_by_industry.setdefault(industry, []).append(pe_by_symbol[symbol])
+    for industry in sorted(set(master.values())):
+        item = derived.setdefault(industry, {"observations": {}, "evidence_points": 0, "evidence": {"method": "dynamic_factor_v1"}})
+        pe_values = sorted(pe_by_industry.get(industry) or [])
         if len(pe_values) >= 3:
             median_pe = pe_values[len(pe_values) // 2]
-            observations["industry_valuation"] = _clip(100 - max(0.0, median_pe - 8.0) / 52.0 * 80.0)
-        evidence_points = len(revenue) + len(profit) + len(inventory) + len(pe_values)
-        derived[industry] = {
-            "observations": observations,
-            "evidence_points": evidence_points,
-            "evidence": {
-                "method": "dynamic_factor_v1", "company_revenue_points": len(revenue),
-                "company_profit_points": len(profit), "company_inventory_points": len(inventory),
-                "company_valuation_points": len(pe_values),
-            },
-        }
+            item["observations"]["industry_valuation"] = _clip(100 - max(0.0, median_pe - 8.0) / 52.0 * 80.0)
+        item["evidence_points"] = int(item.get("evidence_points") or 0) + len(pe_values)
+        item["evidence"]["company_valuation_points"] = len(pe_values)
+        item["evidence"]["financial_cache_signature"] = source_signature
     return derived
 
 
