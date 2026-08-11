@@ -32,17 +32,84 @@ class FuturesProxySpec:
     root_contract: str
     name: str
     industries: tuple[str, ...]
+    cost_industries: tuple[str, ...] = ()
+    lag_days: int = 5
+    market_role: str = "industry_transmission"
 
 
 FUTURES_PROXY_SPECS = (
-    FuturesProxySpec("copper", "CU.SHF", "沪铜连续期货价格代理", ("铜", "元器件", "家用电器")),
-    FuturesProxySpec("aluminium", "AL.SHF", "沪铝连续期货价格代理", ("铝", "家用电器")),
-    FuturesProxySpec("crude_oil", "SC.INE", "原油连续期货价格代理", ("石油开采",)),
-    FuturesProxySpec("coking_coal", "JM.DCE", "焦煤连续期货价格代理", ("煤炭开采",)),
-    FuturesProxySpec("polypropylene", "PP.DCE", "聚丙烯连续期货价格代理", ("化工原料",)),
-    FuturesProxySpec("lithium_carbonate", "LC.GFE", "碳酸锂连续期货价格代理", ("电气设备",)),
-    FuturesProxySpec("rebar", "RB.SHF", "螺纹钢连续期货价格代理", ("工程机械", "汽车整车")),
+    FuturesProxySpec("copper", "CU.SHF", "沪铜", ("铜",), ("元器件", "家用电器", "电气设备"), 10),
+    FuturesProxySpec("aluminium", "AL.SHF", "沪铝", ("铝",), ("家用电器", "汽车配件"), 10),
+    FuturesProxySpec("zinc", "ZN.SHF", "沪锌", ("铅锌",), ("钢加工", "家用电器"), 10),
+    FuturesProxySpec("lead", "PB.SHF", "沪铅", ("铅锌",), ("电气设备", "汽车配件"), 10),
+    FuturesProxySpec("nickel", "NI.SHF", "沪镍", ("小金属",), ("特种钢", "电气设备"), 10),
+    FuturesProxySpec("tin", "SN.SHF", "沪锡", ("小金属",), ("元器件", "半导体"), 10),
+    FuturesProxySpec("alumina", "AO.SHF", "氧化铝", ("化工原料",), ("铝",), 5),
+    FuturesProxySpec("industrial_silicon", "SI.GFE", "工业硅", ("小金属",), ("电气设备", "半导体"), 10),
+    FuturesProxySpec("polysilicon", "PS.GFE", "多晶硅", ("化工原料",), ("电气设备",), 10),
+    FuturesProxySpec("lithium_carbonate", "LC.GFE", "碳酸锂", ("小金属",), ("电气设备",), 10),
+    FuturesProxySpec("gold", "AU.SHF", "沪金", ("黄金",), (), 1, "risk_regime"),
+    FuturesProxySpec("silver", "AG.SHF", "沪银", ("小金属",), ("元器件",), 5, "risk_and_industry"),
+    FuturesProxySpec("iron_ore", "I.DCE", "铁矿石", (), ("普钢", "特种钢"), 10),
+    FuturesProxySpec("coking_coal", "JM.DCE", "焦煤", ("煤炭开采",), ("焦炭加工", "普钢"), 5),
+    FuturesProxySpec("coke", "J.DCE", "焦炭", ("焦炭加工",), ("普钢", "特种钢"), 5),
+    FuturesProxySpec("rebar", "RB.SHF", "螺纹钢", ("普钢",), ("建筑工程", "工程机械"), 10),
+    FuturesProxySpec("hot_rolled_coil", "HC.SHF", "热轧卷板", ("普钢", "钢加工"), ("汽车配件", "家用电器"), 10),
+    FuturesProxySpec("ferrosilicon", "SF.ZCE", "硅铁", ("小金属",), ("普钢", "特种钢"), 10),
+    FuturesProxySpec("silicomanganese", "SM.ZCE", "锰硅", ("小金属",), ("普钢", "特种钢"), 10),
+    FuturesProxySpec("crude_oil", "SC.INE", "原油", ("石油开采",), ("石油加工", "化工原料", "空运", "水运"), 5),
+    FuturesProxySpec("fuel_oil", "FU.SHF", "燃料油", ("石油加工",), ("水运", "火力发电"), 5),
+    FuturesProxySpec("low_sulfur_fuel", "LU.INE", "低硫燃料油", ("石油加工",), ("水运",), 5),
+    FuturesProxySpec("bitumen", "BU.SHF", "沥青", ("石油加工",), ("公路", "路桥", "建筑工程"), 10),
+    FuturesProxySpec("lpg", "PG.DCE", "液化石油气", ("石油加工",), ("供气供热", "化工原料"), 5),
+    FuturesProxySpec("pta", "TA.ZCE", "PTA", ("化工原料",), ("化纤", "纺织"), 10),
+    FuturesProxySpec("ethylene_glycol", "EG.DCE", "乙二醇", ("化工原料",), ("化纤",), 10),
+    FuturesProxySpec("methanol", "MA.ZCE", "甲醇", ("化工原料",), ("塑料", "日用化工"), 10),
+    FuturesProxySpec("pvc", "V.DCE", "PVC", ("化工原料",), ("塑料", "其他建材"), 10),
+    FuturesProxySpec("polyethylene", "L.DCE", "聚乙烯", ("化工原料",), ("塑料", "广告包装"), 10),
+    FuturesProxySpec("polypropylene", "PP.DCE", "聚丙烯", ("化工原料",), ("塑料", "家用电器"), 10),
+    FuturesProxySpec("styrene", "EB.DCE", "苯乙烯", ("化工原料",), ("塑料", "家居用品"), 10),
+    FuturesProxySpec("soda_ash", "SA.ZCE", "纯碱", ("化工原料",), ("玻璃",), 10),
+    FuturesProxySpec("urea", "UR.ZCE", "尿素", ("化工原料",), ("农药化肥", "种植业"), 10),
+    FuturesProxySpec("soybean", "A.DCE", "豆一", ("种植业",), ("食品", "饲料"), 15),
+    FuturesProxySpec("soymeal", "M.DCE", "豆粕", ("饲料",), ("农业综合", "渔业"), 10),
+    FuturesProxySpec("soybean_oil", "Y.DCE", "豆油", (), ("食品",), 5),
+    FuturesProxySpec("palm_oil", "P.DCE", "棕榈油", (), ("食品", "日用化工"), 5),
+    FuturesProxySpec("corn", "C.DCE", "玉米", ("种植业",), ("饲料", "食品"), 15),
+    FuturesProxySpec("sugar", "SR.ZCE", "白糖", ("种植业",), ("食品", "软饮料"), 10),
+    FuturesProxySpec("cotton", "CF.ZCE", "棉花", ("种植业",), ("纺织", "服饰"), 15),
+    FuturesProxySpec("natural_rubber", "RU.SHF", "天然橡胶", ("橡胶",), ("汽车配件",), 10),
+    FuturesProxySpec("pulp", "SP.SHF", "纸浆", ("林业",), ("造纸", "广告包装"), 10),
+    FuturesProxySpec("rapeseed_oil", "OI.ZCE", "菜籽油", (), ("食品",), 5),
+    FuturesProxySpec("rapeseed_meal", "RM.ZCE", "菜籽粕", ("饲料",), ("农业综合", "渔业"), 10),
+    FuturesProxySpec("glass", "FG.ZCE", "玻璃", ("玻璃",), ("家居用品", "汽车配件"), 10),
+    FuturesProxySpec("live_hog", "LH.DCE", "生猪", ("农业综合",), ("食品",), 10),
+    FuturesProxySpec("egg", "JD.DCE", "鸡蛋", ("农业综合",), ("食品",), 5),
+    FuturesProxySpec("apple", "AP.ZCE", "苹果", ("种植业",), ("食品",), 10),
+    FuturesProxySpec("red_date", "CJ.ZCE", "红枣", ("种植业",), ("食品",), 10),
+    FuturesProxySpec("peanut", "PK.ZCE", "花生", ("种植业",), ("食品",), 10),
+    FuturesProxySpec("stainless_steel", "SS.SHF", "不锈钢", ("特种钢", "钢加工"), ("家用电器", "机械基件"), 10),
+    FuturesProxySpec("cotton_yarn", "CY.ZCE", "棉纱", ("纺织",), ("服饰",), 10),
+    FuturesProxySpec("no20_rubber", "NR.INE", "20号胶", ("橡胶",), ("汽车配件",), 10),
+    FuturesProxySpec("japonica_rice", "RR.DCE", "粳米", ("种植业",), ("食品",), 10),
+    FuturesProxySpec("paraxylene", "PX.ZCE", "对二甲苯", ("化工原料",), ("化纤",), 10),
+    FuturesProxySpec("caustic_soda", "SH.ZCE", "烧碱", ("化工原料",), ("造纸", "铝"), 10),
+    FuturesProxySpec("rapeseed", "RS.ZCE", "油菜籽", ("种植业",), ("食品", "饲料"), 15),
+    FuturesProxySpec("butadiene_rubber", "BR.SHF", "丁二烯橡胶", ("化工原料",), ("橡胶", "汽车配件"), 10),
+    FuturesProxySpec("container_freight", "EC.SHF", "集运指数欧线", ("水运",), ("商贸代理",), 5, "risk_and_industry"),
+    FuturesProxySpec("bottle_chip", "PR.ZCE", "瓶片", ("化纤",), ("软饮料", "塑料"), 10),
+    FuturesProxySpec("benzene", "BZ.ZCE", "纯苯", ("化工原料",), ("染料涂料", "塑料"), 10),
+    FuturesProxySpec("cast_aluminium_alloy", "AD.SHF", "铸造铝合金", ("铝",), ("汽车配件", "机械基件"), 10),
 )
+
+FUTURES_PROXY_EXCLUSIONS = {
+    "ZC.ZCE": "target_date_not_published_or_inactive",
+    "PM.ZCE": "target_date_not_published_or_inactive",
+    "WH.ZCE": "target_date_not_published_or_inactive",
+    "RI.ZCE": "target_date_not_published_or_inactive",
+    "LR.ZCE": "target_date_not_published_or_inactive",
+    "JR.ZCE": "target_date_not_published_or_inactive",
+}
 
 PPI_PROXY_SPECS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
     ("mining", "ppi_mp_qm_yoy", ("煤炭开采", "石油开采")),
@@ -151,6 +218,41 @@ def _ensure_futures_proxy_cache() -> None:
             provider TEXT NOT NULL,available_time TEXT NOT NULL,updated_at TEXT NOT NULL,
             PRIMARY KEY(mapped_contract,trade_date)
         )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS dc_futures_proxy_registry (
+            proxy_key TEXT PRIMARY KEY,root_contract TEXT NOT NULL,name TEXT NOT NULL,
+            revenue_industries_json TEXT NOT NULL,cost_industries_json TEXT NOT NULL,
+            lag_trading_days INTEGER NOT NULL,market_role TEXT NOT NULL,
+            contract_version TEXT NOT NULL,updated_at TEXT NOT NULL
+        )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS dc_futures_source_reconciliation (
+            root_contract TEXT NOT NULL,trade_date TEXT NOT NULL,primary_provider TEXT NOT NULL,
+            comparison_provider TEXT NOT NULL,primary_price REAL NOT NULL,comparison_price REAL NOT NULL,
+            relative_diff REAL NOT NULL,status TEXT NOT NULL,evidence_json TEXT NOT NULL,checked_at TEXT NOT NULL,
+            PRIMARY KEY(root_contract,trade_date,primary_provider,comparison_provider)
+        )""")
+
+
+def _sync_futures_proxy_registry(specs: tuple[FuturesProxySpec, ...]) -> None:
+    now = _now()
+    with _conn() as conn:
+        for spec in specs:
+            conn.execute(
+                """INSERT INTO dc_futures_proxy_registry(
+                       proxy_key,root_contract,name,revenue_industries_json,cost_industries_json,
+                       lag_trading_days,market_role,contract_version,updated_at)
+                   VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(proxy_key) DO UPDATE SET
+                       root_contract=excluded.root_contract,name=excluded.name,
+                       revenue_industries_json=excluded.revenue_industries_json,
+                       cost_industries_json=excluded.cost_industries_json,
+                       lag_trading_days=excluded.lag_trading_days,market_role=excluded.market_role,
+                       contract_version=excluded.contract_version,updated_at=excluded.updated_at""",
+                (
+                    spec.key, spec.root_contract, spec.name,
+                    json.dumps(spec.industries, ensure_ascii=False),
+                    json.dumps(spec.cost_industries, ensure_ascii=False),
+                    spec.lag_days, spec.market_role, "alis_futures_industry_transmission_v3", now,
+                ),
+            )
 
 
 def _cached_mappings(root_contract: str, start_date: str, end_date: str) -> dict[str, dict[str, Any]]:
@@ -255,6 +357,81 @@ def _persist_direct_futures_cache(root_contract: str, frame: pd.DataFrame) -> No
             )
 
 
+def audit_futures_cross_source(
+    trade_date: str, specs: tuple[FuturesProxySpec, ...], *, tolerance: float = 0.005,
+) -> dict[str, Any]:
+    """Compare cached mapped-contract settlements with independent continuous settlements."""
+    from app.data_platform.services.independent_research_sources import fetch_sina_continuous_futures
+
+    roots = {spec.root_contract for spec in specs}
+    with _conn() as conn:
+        rows = [dict(row) for row in conn.execute(
+            """SELECT m.root_contract,p.price,p.provider
+                 FROM dc_futures_mapping_cache m
+                 JOIN dc_futures_price_cache p
+                   ON p.mapped_contract=m.mapped_contract AND p.trade_date=m.trade_date
+                WHERE m.trade_date=? AND p.provider<>'sina_futures_continuous'""",
+            (trade_date,),
+        ).fetchall() if str(dict(row).get("root_contract") or "") in roots]
+        existing = {
+            str(dict(row).get("root_contract") or "") for row in conn.execute(
+                """SELECT root_contract,status FROM dc_futures_source_reconciliation
+                    WHERE trade_date=? AND comparison_provider='sina_futures_continuous'""",
+                (trade_date,),
+            ).fetchall() if str(dict(row).get("status") or "matched") == "matched"
+        }
+    pending = [row for row in rows if str(row.get("root_contract") or "") not in existing]
+    results: list[dict[str, Any]] = []
+    with ThreadPoolExecutor(max_workers=max(1, min(len(pending), 6)), thread_name_prefix="futures-reconcile") as executor:
+        futures = {
+            executor.submit(fetch_sina_continuous_futures, str(row["root_contract"]), trade_date, trade_date): row
+            for row in pending
+        }
+        for future, source in futures.items():
+            try:
+                frame = future.result()
+            except Exception as exc:  # noqa: BLE001
+                results.append({"root_contract": source["root_contract"], "status": "comparison_failed", "error": str(exc)[:200]})
+                continue
+            if frame.empty:
+                results.append({"root_contract": source["root_contract"], "status": "comparison_missing"})
+                continue
+            comparison = float(frame.iloc[0]["price"])
+            primary = float(source["price"])
+            relative_diff = abs(comparison - primary) / max(abs(primary), 1e-9)
+            status = "matched" if relative_diff <= tolerance else "conflict"
+            item = {
+                "root_contract": source["root_contract"], "primary_provider": source["provider"],
+                "comparison_provider": "sina_futures_continuous", "primary_price": primary,
+                "comparison_price": comparison, "relative_diff": relative_diff, "status": status,
+            }
+            results.append(item)
+            with _conn() as conn:
+                conn.execute(
+                    """INSERT INTO dc_futures_source_reconciliation(
+                           root_contract,trade_date,primary_provider,comparison_provider,primary_price,
+                           comparison_price,relative_diff,status,evidence_json,checked_at)
+                       VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(root_contract,trade_date,primary_provider,comparison_provider)
+                       DO UPDATE SET primary_price=excluded.primary_price,comparison_price=excluded.comparison_price,
+                       relative_diff=excluded.relative_diff,status=excluded.status,evidence_json=excluded.evidence_json,
+                       checked_at=excluded.checked_at""",
+                    (
+                        source["root_contract"], trade_date, source["provider"], "sina_futures_continuous",
+                        primary, comparison, relative_diff, status,
+                        json.dumps({"tolerance": tolerance, "contract_basis": "mapped_settlement_vs_continuous_settlement"}), _now(),
+                    ),
+                )
+    with _conn() as conn:
+        aggregate = [dict(row) for row in conn.execute(
+            "SELECT status,COUNT(*) count FROM dc_futures_source_reconciliation WHERE trade_date=? GROUP BY status",
+            (trade_date,),
+        ).fetchall()]
+    counts = {str(row["status"]): int(row["count"]) for row in aggregate}
+    return {
+        "status": "conflict" if counts.get("conflict") else "passed" if counts.get("matched") else "observing",
+        "matched": counts.get("matched", 0), "conflicts": counts.get("conflict", 0),
+        "new_checks": len(results), "tolerance": tolerance,
+    }
 def _discover_futures_prices(contract: str, start_date: str, end_date: str) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
     from app.data_platform.services.research_source_discovery import race_tushare_sources
 
@@ -297,9 +474,14 @@ def materialize_futures_price_proxies(*, start_date: str, end_date: str, specs: 
     """
     now = _now()
     _ensure_futures_proxy_cache()
+    _sync_futures_proxy_registry(specs)
     definitions: dict[str, dict[str, Any]] = {}
     values: list[dict[str, Any]] = []
-    result: dict[str, Any] = {"ok": True, "status": "completed", "sources": [], "definitions": 0, "values": 0, "contract": "exchange_futures_proxy_v2"}
+    result: dict[str, Any] = {
+        "ok": True, "status": "completed", "sources": [], "definitions": 0, "values": 0,
+        "registered_products": len(specs), "contract": "alis_futures_industry_transmission_v3",
+        "explicit_exclusions": FUTURES_PROXY_EXCLUSIONS,
+    }
     workers = max(1, min(len(specs), 4))
     direct_rows: dict[str, pd.DataFrame] = {}
     direct_network_keys: set[str] = set()
@@ -380,6 +562,9 @@ def materialize_futures_price_proxies(*, start_date: str, end_date: str, specs: 
                 trade_date: {
                     "price": float(row["price"]), "provider": "sina_futures_continuous",
                     "available_time": now_available,
+                    "previous_settle": row.get("previous_settle"),
+                    "daily_return": row.get("daily_return"),
+                    "continuity_status": row.get("continuity_status"),
                 },
             }, {"status": "available", "winner": "sina_futures_continuous", "network_requests": 1})
     for spec in specs:
@@ -397,17 +582,25 @@ def materialize_futures_price_proxies(*, start_date: str, end_date: str, specs: 
             for trade_date, row in prices.items():
                 closes[(trade_date, contract)] = row
         written = 0
-        for industry in spec.industries:
-            code = _metric_code("futures_proxy", spec.key, industry)
+        exposures = [(industry, 1, "revenue") for industry in spec.industries]
+        exposures.extend(
+            (industry, -1, "cost") for industry in spec.cost_industries if industry not in spec.industries
+        )
+        for industry, direction, exposure_role in exposures:
+            code = _metric_code(f"futures_proxy_{exposure_role}", spec.key, industry)
             definitions[code] = {
                 "metric_code": code,
                 "industry_code": f"master:{industry}",
                 "industry_name": industry,
-                "metric_name": f"产品价格：{spec.name}",
-                "unit": "price",
+                "metric_name": f"产品价格：{spec.name}（{'收入端' if direction > 0 else '成本端'}传导）",
+                "unit": "direction_adjusted_price",
                 "frequency": "daily",
                 "source_code": FUTURES_PROXY_SOURCE,
-                "description": "交易所连续期货价格代理，不等同于行业现货价格或企业实际实现价。",
+                "description": (
+                    f"交易所连续期货价格代理；transmission_direction={direction};"
+                    f"exposure_role={exposure_role};lag_trading_days={spec.lag_days};market_role={spec.market_role}。"
+                    "正值方向表示对行业景气的理论边际影响，不等同于行业现货价格或企业实际实现价。"
+                ),
             }
             for trade_date, contract in mapped_by_date.items():
                 price_row = closes.get((trade_date, contract))
@@ -417,19 +610,40 @@ def materialize_futures_price_proxies(*, start_date: str, end_date: str, specs: 
                 values.append({
                     "metric_code": code,
                     "data_date": trade_date,
-                    "value": close,
-                    "raw_value": json.dumps({"root_contract": spec.root_contract, "mapped_contract": contract, "field": "settle_or_close", "mapping_provider": (mapping_rows.get(trade_date) or {}).get("provider"), "price_provider": price_row.get("provider")}, ensure_ascii=False),
+                    "value": close * direction,
+                    "raw_value": json.dumps({
+                        "raw_price": close, "root_contract": spec.root_contract, "mapped_contract": contract,
+                        "field": "settle_or_close", "mapping_provider": (mapping_rows.get(trade_date) or {}).get("provider"),
+                        "price_provider": price_row.get("provider"), "transmission_direction": direction,
+                        "exposure_role": exposure_role, "lag_trading_days": spec.lag_days,
+                        "market_role": spec.market_role,
+                        "previous_settle": price_row.get("previous_settle"),
+                        "daily_return": price_row.get("daily_return"),
+                        "continuity_status": price_row.get("continuity_status"),
+                    }, ensure_ascii=False),
                     "source_code": FUTURES_PROXY_SOURCE,
                     "available_time": str(price_row.get("available_time") or now),
                 })
                 written += 1
-        result["sources"].append({"key": spec.key, "root_contract": spec.root_contract, "contracts": len(spec_contracts), "values": written, "mapping_discovery": mapping_discovery, "price_discoveries": price_discoveries})
+        result["sources"].append({
+            "key": spec.key, "root_contract": spec.root_contract, "contracts": len(spec_contracts),
+            "exposures": len(exposures), "revenue_industries": list(spec.industries),
+            "cost_industries": list(spec.cost_industries), "lag_trading_days": spec.lag_days,
+            "market_role": spec.market_role, "values": written,
+            "mapping_discovery": mapping_discovery, "price_discoveries": price_discoveries,
+        })
     result["definitions"] = _upsert_industry_metric_definitions(list(definitions.values()))
     result["values"] = _upsert_industry_metric_values(values)
     missing_sources = [str(source.get("key") or "") for source in result["sources"] if not source.get("values")]
     result["missing_sources"] = missing_sources
+    result["ready_products"] = len(specs) - len(missing_sources)
+    result["coverage_ratio"] = round(result["ready_products"] / len(specs), 6) if specs else 1.0
     if missing_sources:
         result["status"] = "degraded"
+    if start_date == end_date:
+        result["cross_source_audit"] = audit_futures_cross_source(start_date, specs)
+        if result["cross_source_audit"].get("status") == "conflict":
+            result["status"] = "degraded"
     return result
 
 

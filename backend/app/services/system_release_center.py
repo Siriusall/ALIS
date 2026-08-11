@@ -22,7 +22,7 @@ from app.services.strategy_controller import active_strategy_policy_context
 RELEASE_SCHEMA_VERSION = "alis_system_release_manifest_v1"
 DECISION_MANIFEST_SCHEMA_VERSION = "alis_decision_version_manifest_v2"
 SIM_SCHEMA_HEAD = "sim_0003_autonomy_step_lease"
-DATA_SCHEMA_HEAD = "data_0004_research_sources"
+DATA_SCHEMA_HEAD = "data_0006_futures_reconcile"
 REPO_ROOT = Path(__file__).resolve().parents[3]
 
 CONTRACT_CATALOG: dict[str, dict[str, Any]] = {

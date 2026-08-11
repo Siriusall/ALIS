@@ -3,11 +3,36 @@ from __future__ import annotations
 from contextlib import nullcontext
 from app.services import free_research_data as service
 from app.services.announcement_label_benchmark import _normalise_label
+from app.services.industry_event_engine import _metric_signal
 
 
 def test_metric_code_is_stable_and_industry_specific() -> None:
     assert service._metric_code("futures_proxy", "copper", "铜") == service._metric_code("futures_proxy", "copper", "铜")
     assert service._metric_code("futures_proxy", "copper", "铜") != service._metric_code("futures_proxy", "copper", "铝")
+
+
+def test_futures_registry_is_unique_directional_and_source_complete() -> None:
+    from app.data_platform.services.independent_research_sources import SINA_CONTINUOUS_SYMBOLS
+
+    specs = service.FUTURES_PROXY_SPECS
+    assert len(specs) == 62
+    assert len({item.key for item in specs}) == len(specs)
+    assert len({item.root_contract for item in specs}) == len(specs)
+    assert all(item.root_contract in SINA_CONTINUOUS_SYMBOLS for item in specs)
+    assert all(item.industries or item.cost_industries for item in specs)
+    assert all(not (set(item.industries) & set(item.cost_industries)) for item in specs)
+    assert all(1 <= item.lag_days <= 15 for item in specs)
+
+
+def test_industry_signal_obeys_futures_transmission_lag() -> None:
+    values = [{"value": value} for value in reversed([1, 2, 3, 100, 200])]
+    definition = {"metric_name": "产品价格", "description": "lag_trading_days=2"}
+
+    lagged = _metric_signal(definition, values)
+    unlagged = _metric_signal({"metric_name": "产品价格"}, values)
+
+    assert lagged is not None and unlagged is not None
+    assert lagged < unlagged
 
 
 def test_materialize_financial_series_keeps_cutoff_availability(monkeypatch) -> None:
@@ -43,6 +68,7 @@ def test_futures_proxy_backfill_is_available_when_materialised(monkeypatch) -> N
     written_values: list[dict] = []
 
     monkeypatch.setattr(service, "_ensure_futures_proxy_cache", lambda: None)
+    monkeypatch.setattr(service, "_sync_futures_proxy_registry", lambda *_args: None)
     monkeypatch.setattr(service, "_discover_futures_mapping", lambda *_args: (
         {"20260721": {"mapped_contract": "CU2608.SHF", "provider": "source_a", "available_time": "2026-07-23T10:00:00"}},
         {"status": "available", "winner": "source_a"},
@@ -81,6 +107,8 @@ def test_exact_futures_mapping_cache_skips_network_probe(monkeypatch) -> None:
 
 def test_missing_futures_group_is_not_hidden_by_other_successes(monkeypatch) -> None:
     monkeypatch.setattr(service, "_ensure_futures_proxy_cache", lambda: None)
+    monkeypatch.setattr(service, "_sync_futures_proxy_registry", lambda *_args: None)
+    monkeypatch.setattr(service, "audit_futures_cross_source", lambda *_args, **_kwargs: {"status": "observing"})
     monkeypatch.setattr(service, "_cached_mappings", lambda *_args: {})
     monkeypatch.setattr(
         "app.data_platform.services.independent_research_sources.fetch_sina_continuous_futures",
@@ -111,6 +139,8 @@ def test_exact_futures_uses_independent_sina_without_tushare_mapping(monkeypatch
     import pandas as pd
 
     monkeypatch.setattr(service, "_ensure_futures_proxy_cache", lambda: None)
+    monkeypatch.setattr(service, "_sync_futures_proxy_registry", lambda *_args: None)
+    monkeypatch.setattr(service, "audit_futures_cross_source", lambda *_args, **_kwargs: {"status": "observing"})
     monkeypatch.setattr(service, "_cached_mappings", lambda *_args: {})
     monkeypatch.setattr(service, "_persist_direct_futures_cache", lambda *_args: None)
     monkeypatch.setattr(
@@ -130,6 +160,35 @@ def test_exact_futures_uses_independent_sina_without_tushare_mapping(monkeypatch
     assert result["status"] == "completed"
     assert result["values"] == 1
     assert result["sources"][0]["mapping_discovery"]["winner"] == "sina_futures_continuous"
+
+
+def test_cost_exposure_inverts_price_direction_and_freezes_lag(monkeypatch) -> None:
+    import pandas as pd
+
+    written_values: list[dict] = []
+    monkeypatch.setattr(service, "_ensure_futures_proxy_cache", lambda: None)
+    monkeypatch.setattr(service, "_sync_futures_proxy_registry", lambda *_args: None)
+    monkeypatch.setattr(service, "audit_futures_cross_source", lambda *_args, **_kwargs: {"status": "observing"})
+    monkeypatch.setattr(service, "_cached_mappings", lambda *_args: {})
+    monkeypatch.setattr(service, "_persist_direct_futures_cache", lambda *_args: None)
+    monkeypatch.setattr(
+        "app.data_platform.services.independent_research_sources.fetch_sina_continuous_futures",
+        lambda *_args, **_kwargs: pd.DataFrame([{
+            "trade_date": "20260811", "price": 100.0,
+            "mapped_contract": "SINA:I0", "provider": "sina_futures_continuous",
+        }]),
+    )
+    monkeypatch.setattr(service, "_upsert_industry_metric_definitions", lambda rows: len(rows))
+    monkeypatch.setattr(service, "_upsert_industry_metric_values", lambda rows: written_values.extend(rows) or len(rows))
+    spec = service.FuturesProxySpec("iron_ore", "I.DCE", "铁矿石", (), ("普钢",), 10)
+
+    result = service.materialize_futures_price_proxies(start_date="20260811", end_date="20260811", specs=(spec,))
+
+    assert result["values"] == 1
+    assert written_values[0]["value"] == -100.0
+    evidence = __import__("json").loads(written_values[0]["raw_value"])
+    assert evidence["transmission_direction"] == -1
+    assert evidence["lag_trading_days"] == 10
 
 
 def test_cn_ppi_price_proxy_preserves_raw_available_time(monkeypatch) -> None:

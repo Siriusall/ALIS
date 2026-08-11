@@ -4,6 +4,7 @@ from datetime import date, datetime, timedelta
 from functools import lru_cache
 import json
 import math
+import re
 from typing import Any
 
 from app.data_platform.db import _conn
@@ -108,6 +109,11 @@ def _metric_signal(definition: dict[str, Any], values: list[dict[str, Any]]) -> 
             numeric.append(float(row.get("value")))
         except (TypeError, ValueError):
             continue
+    description = str(definition.get("description") or "")
+    lag_match = re.search(r"lag_trading_days=(\d+)", description)
+    lag = int(lag_match.group(1)) if lag_match else 0
+    if lag > 0:
+        numeric = numeric[:-lag] if len(numeric) > lag else []
     if len(numeric) < 3:
         return None
     baseline = sum(numeric[:-1]) / len(numeric[:-1])
