@@ -64,6 +64,39 @@ def test_materialize_financial_series_keeps_cutoff_availability(monkeypatch) -> 
     }
 
 
+def test_materialize_financial_series_retries_statement_timeout_with_fresh_connection(monkeypatch) -> None:
+    connections = []
+    calls = 0
+
+    class ConnectionContext:
+        def __enter__(self):
+            connection = object()
+            connections.append(connection)
+            return connection
+
+        def __exit__(self, *_args):
+            return False
+
+    def derive(_conn, *, as_of_time):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("canceling statement due to statement timeout")
+        return {}
+
+    monkeypatch.setattr(service, "_cutoff_dates", lambda _: ["2026-06-30"])
+    monkeypatch.setattr(service, "_conn", ConnectionContext)
+    monkeypatch.setattr(service, "_derived_industry_proxies", derive)
+    monkeypatch.setattr(service.time, "sleep", lambda _: None)
+    monkeypatch.setattr(service, "_upsert_industry_metric_definitions", lambda rows: len(rows))
+    monkeypatch.setattr(service, "_upsert_industry_metric_values", lambda rows: len(rows))
+
+    result = service.materialize_financial_industry_series(max_periods=1)
+
+    assert result["query_attempts"] == 2
+    assert len(connections) == 2
+
+
 def test_futures_proxy_backfill_is_available_when_materialised(monkeypatch) -> None:
     written_values: list[dict] = []
 

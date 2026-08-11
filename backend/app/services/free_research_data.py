@@ -12,13 +12,14 @@ from datetime import date
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
+import time
 from typing import Any
 
 import pandas as pd
 
 from app.data_platform.db import _conn
 from app.data_platform.services.data_center import _now, _upsert_industry_metric_definitions, _upsert_industry_metric_values
-from app.services.industry_event_engine import _derived_industry_proxies
+from app.services.industry_event_engine import _derived_industry_proxies, _is_statement_timeout
 
 
 FINANCIAL_SOURCE = "tushare.financial_pit"
@@ -149,9 +150,20 @@ def materialize_financial_industry_series(*, max_periods: int = 12) -> dict[str,
     definitions: dict[str, dict[str, Any]] = {}
     values: list[dict[str, Any]] = []
     cutoffs = _cutoff_dates(max_periods)
+    query_attempts = 0
     for cutoff in cutoffs:
-        with _conn() as conn:
-            derived = _derived_industry_proxies(conn, as_of_time=f"{cutoff}T23:59:59")
+        for attempt in range(2):
+            query_attempts += 1
+            try:
+                with _conn() as conn:
+                    derived = _derived_industry_proxies(conn, as_of_time=f"{cutoff}T23:59:59")
+                break
+            except Exception as exc:
+                if attempt or not _is_statement_timeout(exc):
+                    raise
+                # PostgreSQL leaves the timed-out transaction aborted.  Exit
+                # the context, wait briefly, then retry with a new connection.
+                time.sleep(0.25)
         for industry, item in derived.items():
             for component in (
                 "demand_orders_sales",
@@ -196,6 +208,7 @@ def materialize_financial_industry_series(*, max_periods: int = 12) -> dict[str,
         "cutoffs": len(cutoffs),
         "definitions": _upsert_industry_metric_definitions(list(definitions.values())),
         "values": _upsert_industry_metric_values(values),
+        "query_attempts": query_attempts,
         "contract": "financial_industry_pit_v1",
     }
 

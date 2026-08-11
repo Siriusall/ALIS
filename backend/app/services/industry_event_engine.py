@@ -5,6 +5,7 @@ from functools import lru_cache
 import json
 import math
 import re
+import time
 from typing import Any
 
 from app.data_platform.db import _conn
@@ -674,8 +675,12 @@ def clear_industry_cache() -> None:
     _list_industries_cached.cache_clear()
 
 
-def materialize_industry_state_snapshots(*, as_of_time: str | None = None) -> dict[str, Any]:
-    """Persist company-aggregate industry states for cheap point-in-time reads."""
+def _is_statement_timeout(exc: BaseException) -> bool:
+    detail = f"{type(exc).__name__}: {exc}".lower()
+    return "statement timeout" in detail or "querycanceled" in detail
+
+
+def _materialize_industry_state_snapshots_once(*, as_of_time: str | None = None) -> dict[str, Any]:
     cutoff = str(as_of_time or "")
     with _conn() as c:
         if cutoff:
@@ -709,6 +714,25 @@ def materialize_industry_state_snapshots(*, as_of_time: str | None = None) -> di
             written += 1
     clear_industry_cache()
     return {"ok": True, "as_of_date": as_of_date, "written": written, "ready": ready, "model_version": "dynamic_factor_v1"}
+
+
+def materialize_industry_state_snapshots(*, as_of_time: str | None = None) -> dict[str, Any]:
+    """Persist company-aggregate industry states for cheap point-in-time reads.
+
+    A statement timeout aborts the PostgreSQL transaction, so a retry must use
+    a fresh connection.  One bounded retry absorbs short index-build or bulk
+    ingest contention without hiding deterministic query failures or extending
+    the autonomous step beyond its 120-second budget.
+    """
+    for attempt in range(2):
+        try:
+            result = _materialize_industry_state_snapshots_once(as_of_time=as_of_time)
+            return {**result, "query_attempts": attempt + 1}
+        except Exception as exc:
+            if attempt or not _is_statement_timeout(exc):
+                raise
+            time.sleep(0.25)
+    raise RuntimeError("industry snapshot retry exhausted")
 
 
 def _history_anchor_rows(rows: list[dict[str, Any]], *, anchor_sessions: int, max_points: int) -> list[dict[str, Any]]:
