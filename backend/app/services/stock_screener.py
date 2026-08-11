@@ -178,6 +178,8 @@ def run_daily_screener(
 
     # Step 5: Run portfolio optimization on candidates
     portfolio_risk = build_live_portfolio_risk()
+    if isinstance(portfolio_risk, dict) and portfolio_risk.get("ok") is False:
+        errors.append(f"portfolio_risk: {str(portfolio_risk.get('error') or portfolio_risk.get('status') or 'not_ok')[:100]}")
 
     return {
         "ok": not errors,
@@ -189,7 +191,9 @@ def run_daily_screener(
             "new_pool_members": new_pool,
             "new_theses": new_theses,
             "promoted_to_candidate": promoted,
+            "portfolio_risk_status": portfolio_risk.get("status") if isinstance(portfolio_risk, dict) else "unknown",
         },
+        "portfolio_risk": portfolio_risk,
         "errors": errors[:10],
         "error_count": len(errors),
         "timestamp": now,

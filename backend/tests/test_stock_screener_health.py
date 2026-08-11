@@ -22,3 +22,4 @@ def test_daily_screener_surfaces_thesis_and_promotion_exceptions(monkeypatch):
     assert result["error_count"] == 2
     assert any(value.startswith("thesis_000001.SZ") for value in result["errors"])
     assert any(value.startswith("promotion_000001.SZ") for value in result["errors"])
+    assert result["portfolio_risk"] == {"ok": True}
