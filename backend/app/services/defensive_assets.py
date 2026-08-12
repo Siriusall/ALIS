@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from datetime import date, datetime, timedelta
 from typing import Any, Iterable
+from zoneinfo import ZoneInfo
 
 from app.data_platform.db import _conn
 from app.data_platform.services.data_center import sync_tushare_api_raw
@@ -15,6 +16,7 @@ DEFENSIVE_ASSETS: tuple[dict[str, str], ...] = (
     {"ts_code": "512890.SH", "name": "红利低波ETF", "asset_class": "low_volatility"},
     {"ts_code": "510880.SH", "name": "红利ETF", "asset_class": "dividend"},
 )
+_BUSINESS_TZ = ZoneInfo("Asia/Shanghai")
 
 
 def _registered_assets(ts_codes: Iterable[str] | None = None) -> list[dict[str, str]]:
@@ -34,8 +36,9 @@ def materialize_defensive_asset_history(
     end_date: str | None = None,
     ts_codes: Iterable[str] | None = None,
 ) -> dict[str, Any]:
-    end = str(end_date or date.today().strftime("%Y%m%d")).replace("-", "")
-    start = str(start_date or (date.today() - timedelta(days=800)).strftime("%Y%m%d")).replace("-", "")
+    business_today = datetime.now(_BUSINESS_TZ).date()
+    end = str(end_date or business_today.strftime("%Y%m%d")).replace("-", "")
+    start = str(start_date or (business_today - timedelta(days=800)).strftime("%Y%m%d")).replace("-", "")
     results = []
     for asset in _registered_assets(ts_codes):
         try:

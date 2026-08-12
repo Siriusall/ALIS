@@ -4,6 +4,7 @@ import json
 import math
 import threading
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -23,6 +24,7 @@ HSMM_EVALUATION_CONTRACT = "alis_hsmm_task_native_evaluation_v3"
 HSMM_TRAINING_ALGORITHM = "explicit_duration_forward_backward_em_v3"
 HSMM_MIN_DURATION_WEEKS = 1
 HSMM_MAX_DURATION_WEEKS = 52
+_BUSINESS_TZ = ZoneInfo("Asia/Shanghai")
 
 
 def refresh_market_regime_training_history(*, years: int = 10) -> dict[str, Any]:
@@ -30,8 +32,9 @@ def refresh_market_regime_training_history(*, years: int = 10) -> dict[str, Any]
     from datetime import date, timedelta
     from app.services.market_context import materialize_market_training_history
 
-    end = date.today().strftime("%Y%m%d")
-    start = (date.today() - timedelta(days=max(6, min(int(years), 10)) * 366)).strftime("%Y%m%d")
+    business_today = datetime.now(_BUSINESS_TZ).date()
+    end = business_today.strftime("%Y%m%d")
+    start = (business_today - timedelta(days=max(6, min(int(years), 10)) * 366)).strftime("%Y%m%d")
     results = []
     with data_conn() as c:
         for code in ("000300.SH", "000905.SH", "000852.SH"):
@@ -57,8 +60,9 @@ def refresh_compact_training_history_from_api(*, years: int = 10) -> dict[str, A
     from app.data_platform.services.data_center import sync_tushare_api_raw
     from app.services.market_context import materialize_market_training_history
 
-    end = date.today().strftime("%Y%m%d")
-    start = (date.today() - timedelta(days=max(1, min(int(years), 10)) * 366)).strftime("%Y%m%d")
+    business_today = datetime.now(_BUSINESS_TZ).date()
+    end = business_today.strftime("%Y%m%d")
+    start = (business_today - timedelta(days=max(1, min(int(years), 10)) * 366)).strftime("%Y%m%d")
     results = [
         {
             "ts_code": code,
