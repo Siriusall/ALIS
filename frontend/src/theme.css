@@ -344,6 +344,24 @@ main {
   padding-left: 16px;
 }
 
+.responsibility-grid .historical-evidence-count {
+  margin-left: auto;
+  font-size: 10px;
+  color: var(--muted);
+  font-weight: 400;
+}
+
+.responsibility-grid article.historical-evidence {
+  opacity: .78;
+}
+
+.responsibility-grid article.historical-evidence > span {
+  display: block;
+  margin-bottom: 4px;
+  font-size: 9px;
+  color: var(--muted);
+}
+
 .progress-grid {
   gap: 26px;
   padding: 14px 18px 12px;
