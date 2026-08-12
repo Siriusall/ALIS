@@ -2068,14 +2068,14 @@ def sell_position(
         bought_at = row["bought_at"] if "bought_at" in row.keys() else None
         # Read, validate, mutate the position, credit cash and persist the
         # operation under one row lock and one transaction.
-        effective_trade_date = trade_date or datetime.now().date().isoformat()
+        effective_trade_date = trade_date or _today_trade_date_iso()
         if not _is_t1_sell_allowed(bought_at, effective_trade_date):
             raise ValueError("T+1 限制：当日买入仓位不可卖出")
         sell_qty = min(quantity if quantity is not None and quantity > 0 else pos_qty, pos_qty)
         if sell_qty <= 0:
             return None
         sell_price = round(float(price), 2)
-        if sell_price <= 0:
+        if not math.isfinite(sell_price) or sell_price <= 0:
             raise ValueError("卖出价格无效，禁止以 0 元成交")
         now = datetime.now().isoformat()[:19]
         if sell_qty >= pos_qty:
@@ -2098,6 +2098,8 @@ def sell_position(
                 fee_comm = round(commission(amount), 2)
                 fee_trans = 0.0 if is_exchange_etf(sym) else round(transfer_fee(amount), 2)
                 fee_tax = 0.0 if is_exchange_etf(sym) else round(stamp_tax(amount), 2)
+            if any(not math.isfinite(fee) or fee < 0 for fee in (fee_comm, fee_trans, fee_tax)):
+                raise ValueError("卖出费用无效，卖出已整体回滚")
             net = max(0.0, round(amount - fee_comm - fee_trans - fee_tax, 2))
             credited = c.execute(
                 f"UPDATE account SET balance={_rounded_account_balance_expression(c, 'balance+?')} WHERE id=1",
