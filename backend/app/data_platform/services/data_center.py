@@ -340,6 +340,60 @@ def resolve_covered_failed_tushare_requests(*, limit: int = 500) -> dict[str, An
     }
 
 
+def reconcile_terminal_ingestion_runs(*, limit: int = 500) -> dict[str, Any]:
+    """Align stale failed ingestion runs with exact terminal request coverage.
+
+    A request can be safely closed by a later reconciliation without revisiting
+    the original ingestion run.  Leaving that run as ``failed`` causes task
+    dashboards to report an incident that has already been resolved.  Match
+    only the same canonical request key; never infer terminal state by API or
+    date alone.
+    """
+    cap = max(1, min(int(limit), 2_000))
+    terminal = {"success": "completed", "not_applicable": "not_applicable", "valid_empty": "valid_empty", "deferred_empty": "deferred_empty"}
+    with _conn() as c:
+        rows = c.execute(
+            """SELECT id,job_name,meta_json FROM data_ingestion_runs
+                WHERE status='failed' AND job_name LIKE ?
+                ORDER BY id DESC LIMIT ?""",
+            ("tushare.%", cap),
+        ).fetchall()
+        candidates: list[tuple[int, str]] = []
+        for raw in rows:
+            item = dict(raw)
+            try:
+                meta = json.loads(item.get("meta_json") or "{}")
+                api_name = str(meta.get("api") or str(item.get("job_name") or "").removeprefix("tushare."))
+                params = meta.get("params") if isinstance(meta.get("params"), dict) else {}
+                limit_rows = meta.get("limit_rows")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if not api_name:
+                continue
+            candidates.append((int(item.get("id") or 0), _request_key(api_name, params, limit_rows)))
+        if not candidates:
+            return {"ok": True, "status": "completed", "examined": len(rows), "reconciled": 0, "policy": "exact_terminal_request_coverage_only"}
+        keys = [key for _id, key in candidates]
+        placeholders = ",".join("?" for _ in keys)
+        coverage_rows = c.execute(
+            f"""SELECT request_key,result_status FROM dc_tushare_request_coverage
+                 WHERE request_key IN ({placeholders})
+                   AND result_status IN ('success','not_applicable','valid_empty','deferred_empty')""",
+            tuple(keys),
+        ).fetchall()
+        statuses = {str(dict(row).get("request_key") or ""): str(dict(row).get("result_status") or "") for row in coverage_rows}
+        updates = [(terminal[statuses[key]], run_id) for run_id, key in candidates if statuses.get(key) in terminal]
+        for status, run_id in updates:
+            c.execute(
+                "UPDATE data_ingestion_runs SET status=?,error=NULL WHERE id=? AND status='failed'",
+                (status, run_id),
+            )
+    return {
+        "ok": True, "status": "completed", "examined": len(rows), "reconciled": len(updates),
+        "policy": "exact_terminal_request_coverage_only",
+    }
+
+
 def _record_request_coverage(
     api_name: str, params: dict[str, Any], limit_rows: int | None, rows_read: int,
     *, result_status: str = "success", result_reason: str = "",

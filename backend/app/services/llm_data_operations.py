@@ -491,6 +491,7 @@ def run_deterministic_data_operations_cycle(
     _ensure_table()
     from app.data_platform.services.data_center import (
         resolve_covered_failed_tushare_requests,
+        reconcile_terminal_ingestion_runs,
         resolve_legacy_daily_index_weight_requests,
         resolve_legacy_period_only_financial_requests,
         resolve_mature_fund_nav_empty_requests,
@@ -502,6 +503,7 @@ def run_deterministic_data_operations_cycle(
     financial_request_cleanup = resolve_legacy_period_only_financial_requests(limit=100)
     fund_nav_cleanup = resolve_mature_fund_nav_empty_requests(limit=500)
     optional_daily_cleanup = resolve_mature_optional_daily_empty_requests(limit=100)
+    ingestion_run_cleanup = reconcile_terminal_ingestion_runs(limit=500)
     evidence = build_data_operations_evidence(cycle_steps=cycle_steps)
     case_key = hashlib.sha256(json.dumps(
         {"execution_mode": "deterministic_v2", "evidence": evidence},
@@ -529,6 +531,7 @@ def run_deterministic_data_operations_cycle(
             "reused": True,
             "execution_mode": "deterministic",
             "covered_failure_cleanup": covered_failure_cleanup,
+            "ingestion_run_cleanup": ingestion_run_cleanup,
             "index_weight_cleanup": index_weight_cleanup,
             "financial_request_cleanup": financial_request_cleanup,
             "fund_nav_cleanup": fund_nav_cleanup,
@@ -582,6 +585,7 @@ def run_deterministic_data_operations_cycle(
         "case_key": case_key,
         "execution_mode": "deterministic",
         "covered_failure_cleanup": covered_failure_cleanup,
+        "ingestion_run_cleanup": ingestion_run_cleanup,
         "index_weight_cleanup": index_weight_cleanup,
         "financial_request_cleanup": financial_request_cleanup,
         "fund_nav_cleanup": fund_nav_cleanup,
