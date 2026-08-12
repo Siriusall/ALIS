@@ -105,3 +105,43 @@ def test_model_status_get_routes_disable_governance_and_snapshot_writes(monkeypa
         "optimizer": {"apply_auto_reject": False},
         "market": {"persist": False},
     }
+def test_plan_model_console_projection_keeps_governance_summary_without_fold_payload(monkeypatch):
+    payload = {
+        "items": [{
+            "model_key": "medium_horizon_lambdarank_v1",
+            "name": "中期排序",
+            "latest_version": {
+                "id": 216,
+                "version": "candidate-v216",
+                "status": "candidate",
+                "metrics": {
+                    "task_native_oos": {"window_count": 5, "passed_windows": 5},
+                    "strategy_impact_ab": {"status": "passed", "windows": [{"fold": 1}]},
+                    "walk_forward_evidence": [{"large": "omit"}],
+                },
+                "validation": {
+                    "status": "pending_live_observation",
+                    "model_shadow": {"status": "observing", "observations": [{"large": "omit"}]},
+                },
+            },
+            "versions": [{"large": "omit"}],
+        }],
+    }
+    monkeypatch.setattr(model_strategy, "model_family_status", lambda: payload)
+
+    result = model_strategy.model_strategy_plan_models(console=True)
+    version = result["items"][0]["latest_version"]
+
+    assert version["id"] == 216
+    assert version["metrics"]["task_native_oos"]["passed_windows"] == 5
+    assert version["metrics"]["strategy_impact_ab"]["windows"] == [{"fold": 1}]
+    assert "walk_forward_evidence" not in version["metrics"]
+    assert "observations" not in version["validation"]["model_shadow"]
+    assert "versions" not in result["items"][0]
+
+
+def test_full_plan_model_route_keeps_complete_version_evidence(monkeypatch):
+    payload = {"items": [{"model_key": "m", "latest_version": {"metrics": {"walk_forward_evidence": [1]}}}]}
+    monkeypatch.setattr(model_strategy, "model_family_status", lambda: payload)
+
+    assert model_strategy.model_strategy_plan_models(console=False) == payload

@@ -239,6 +239,47 @@ def model_strategy_status() -> dict:
         return degraded_read("model_status", exc, items=[], models=[])
 
 
+def _console_model_version(version: Any) -> dict[str, Any] | None:
+    """Project only the fields rendered by the model-governance landing page."""
+    if not isinstance(version, dict):
+        return None
+    metrics = version.get("metrics") if isinstance(version.get("metrics"), dict) else {}
+    validation = version.get("validation") if isinstance(version.get("validation"), dict) else {}
+    shadow = validation.get("model_shadow") if isinstance(validation.get("model_shadow"), dict) else {}
+    compact_shadow = {
+        key: shadow[key]
+        for key in (
+            "status", "signal_start_trade_date", "observed_return_sessions",
+            "required_return_sessions", "minimum_effect_days", "candidate_model_effect_days",
+            "last_observed_trade_date", "production_change_forbidden",
+        )
+        if key in shadow
+    }
+    compact_validation = {
+        key: validation[key]
+        for key in ("status", "production_eligible", "live_observation_sessions", "production_eligibility")
+        if key in validation
+    }
+    if compact_shadow:
+        compact_validation["model_shadow"] = compact_shadow
+    return {
+        key: version[key]
+        for key in ("id", "model_key", "version", "status", "is_active", "created_at", "updated_at")
+        if key in version
+    } | {
+        "metrics": {
+            key: metrics[key]
+            for key in (
+                "model_evaluation_contract", "task_metrics", "task_native_oos", "task_baseline",
+                "environment_coverage", "strategy_impact_ab", "event_research_cohort_governance",
+                "narrative_lifecycle_effect_authorization",
+            )
+            if key in metrics
+        },
+        "validation": compact_validation,
+    }
+
+
 @router.get("/model-strategy/plan-models")
 def model_strategy_plan_models(
     console: bool = Query(False, description="返回管理前端所需的精简只读视图"),
@@ -257,7 +298,11 @@ def model_strategy_plan_models(
         return {
             **payload,
             "items": [
-                {key: value for key, value in item.items() if key not in omitted_fields}
+                {
+                    **{key: value for key, value in item.items() if key not in omitted_fields | {"latest_version", "active_version"}},
+                    "latest_version": _console_model_version(item.get("latest_version")),
+                    "active_version": _console_model_version(item.get("active_version")),
+                }
                 for item in payload.get("items", [])
                 if isinstance(item, dict)
             ],
