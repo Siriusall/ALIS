@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime
 from typing import Any
 from statistics import mean
@@ -19,6 +20,16 @@ from app.services.thesis_store import generate_thesis_for_stock
 from app.services.operations_overview import build_live_portfolio_risk
 from app.core.trade_calendar import get_last_trade_date
 from app.services.point_in_time import signal_available_time
+
+
+def _pool_score(reason: Any) -> float:
+    match = re.search(r"(?:^|\s)score=([-+]?\d+(?:\.\d+)?)", str(reason or ""))
+    if not match:
+        return 0.0
+    try:
+        return float(match.group(1))
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def _get_stock_universe(trade_date: str) -> list[dict[str, Any]]:
@@ -165,7 +176,7 @@ def run_daily_screener(
     # Keep existing candidate/core, promote top watch members
     # First clear old candidate/core, then promote
     watch_members = list_pool_members("watch")
-    for m in sorted(watch_members, key=lambda x: float(str(x.get("reason", "0")).split("score=")[-1].split(" ")[0].split(" conf")[0]) if "score=" in str(x.get("reason", "")) else 0.0, reverse=True)[:50]:
+    for m in sorted(watch_members, key=lambda x: _pool_score(x.get("reason")), reverse=True)[:50]:
         try:
             code = m["ts_code"]
             # Check if already in candidate or core
