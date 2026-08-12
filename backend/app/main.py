@@ -357,6 +357,8 @@ def _health_payload() -> dict:
     runtime_issues = []
     if background_owner and not evolution.get("ok"):
         runtime_issues.append("Evolution worker or scheduler heartbeat is unhealthy")
+    if background_owner and not runtime_heartbeats:
+        runtime_issues.append("Background component heartbeat evidence is missing")
     unhealthy_heartbeats = [name for name, state in runtime_heartbeats.items() if not state.get("healthy", True)]
     if background_owner and unhealthy_heartbeats:
         runtime_issues.append(f"Background component errors: {', '.join(unhealthy_heartbeats)}")
@@ -368,6 +370,7 @@ def _health_payload() -> dict:
     runtime_ready = (
         not component_issues
         and (not background_owner or evolution.get("ok"))
+        and (not background_owner or bool(runtime_heartbeats))
         and (not background_owner or not unhealthy_heartbeats)
     )
     ready = databases_ready and bool(redis.get("available", False)) and runtime_ready

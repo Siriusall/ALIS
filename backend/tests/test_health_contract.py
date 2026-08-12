@@ -50,3 +50,12 @@ def test_health_is_not_ready_when_background_heartbeat_is_stale(monkeypatch):
     assert result["status"] == "error"
     assert result["ready"] is False
     assert "daily_update_scheduler" in result["issues"][0]
+
+
+def test_health_is_not_ready_when_background_heartbeat_evidence_is_missing(monkeypatch):
+    _healthy_dependencies(monkeypatch)
+    monkeypatch.setattr(main, "redis_health", lambda: {"available": True})
+    monkeypatch.setattr(main, "runtime_heartbeat_status", lambda: {})
+    result = _payload(main.health())
+    assert result["ready"] is False
+    assert any("heartbeat evidence is missing" in item for item in result["issues"])
