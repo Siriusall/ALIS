@@ -1,6 +1,6 @@
 from app.services import quant_task_runner
 from app.services.quant_task_runner import _execution_slice_ready, _market_slice_ready
-from datetime import datetime
+from datetime import datetime, timezone
 
 
 def test_close_data_gate_requires_all_target_day_market_fields() -> None:
@@ -289,3 +289,14 @@ def test_weekend_wall_clock_closes_prior_day_plan_without_waiting_for_new_market
 
     assert changed == 1
     assert captured == ["20260801"]
+
+
+def test_trading_session_uses_utc8_not_host_timezone() -> None:
+    # 01:30 UTC is 09:30 in Shanghai and must be an open-session time.
+    assert quant_task_runner._is_trading_session_now(
+        datetime(2026, 8, 12, 1, 30, tzinfo=timezone.utc),
+    ) is True
+    # 07:30 UTC is 15:30 Shanghai, already outside the execution session.
+    assert quant_task_runner._is_trading_session_now(
+        datetime(2026, 8, 12, 7, 30, tzinfo=timezone.utc),
+    ) is False

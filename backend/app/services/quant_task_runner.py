@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import threading
 from datetime import datetime, timezone, time as dtime, timedelta
+from zoneinfo import ZoneInfo
 import os
 from time import perf_counter
 from typing import Any, Callable, Tuple
@@ -37,6 +38,7 @@ from app.services.quant_risk import RiskPauseDecision, evaluate_account_drawdown
 from app.services.quant_task_state_machine import can_transition, normalize_status
 
 logger = logging.getLogger("quant.quant_task_runner")
+_BUSINESS_TZ = ZoneInfo("Asia/Shanghai")
 
 _task_lock = threading.Lock()
 _running_task_ids: set[int] = set()
@@ -62,6 +64,11 @@ _auto_scheduler_started = False
 _auto_scheduler_watchdog_started = False
 _defensive_execution_refresh_lock = threading.Lock()
 _defensive_execution_refresh_attempts: dict[str, float] = {}
+
+
+def _business_now() -> datetime:
+    """Return wall-clock time in ALIS's UTC+8 business timezone."""
+    return datetime.now(_BUSINESS_TZ)
 
 
 def _wait_for_auto_simulation_retry(
@@ -171,7 +178,7 @@ def _refresh_research_cycle(task_id: int) -> None:
             research_snapshots = materialize_pool_research_snapshots(
                 limit=max(1, min(int(os.getenv("QUANT_RESEARCH_SNAPSHOT_STOCKS", "100")), 500)),
             )
-            today = datetime.now().date()
+            today = _business_now().date()
             defensive_assets = materialize_defensive_asset_history(
                 start_date=(today - timedelta(days=10)).strftime("%Y%m%d"),
                 end_date=today.strftime("%Y%m%d"),
@@ -197,7 +204,9 @@ def _refresh_research_cycle(task_id: int) -> None:
 
 
 def _utc_now_iso() -> str:
-    return datetime.now().astimezone().isoformat()
+    # Historical name retained for storage compatibility; scheduling and task
+    # evidence use the UTC+8 business clock rather than host defaults.
+    return _business_now().isoformat()
 
 
 def _is_running(task_id: int) -> bool:
@@ -440,7 +449,7 @@ def start_auto_simulation_scheduler() -> bool:
         mark_started("auto_simulation_scheduler", interval_seconds=_AUTO_SIMULATION_INTERVAL_SEC)
         while True:
             try:
-                now = datetime.now()
+                now = _business_now()
                 missed_count = _reconcile_missed_plans_by_wall_clock(now)
                 if missed_count:
                     logger.error(
@@ -593,8 +602,9 @@ def _compute_start_index(dates: list[str], task: dict, done_signals: set[str]) -
     return max(0, len(dates) - 2)
 
 
-def _is_trading_session_now() -> bool:
-    now = datetime.now()
+def _is_trading_session_now(now: datetime | None = None) -> bool:
+    """Evaluate the A-share session in UTC+8 regardless of host timezone."""
+    now = (now.astimezone(_BUSINESS_TZ) if now and now.tzinfo else now) or _business_now()
     if not is_trade_day(now.date()):
         return False
     t = now.time()
