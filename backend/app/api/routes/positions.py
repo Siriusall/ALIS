@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import date, datetime, timedelta
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
@@ -32,6 +33,7 @@ from app.core.a_share_fees import is_exchange_etf
 from app.services.defensive_assets import defensive_asset_bars
 
 router = APIRouter()
+_BUSINESS_TZ = ZoneInfo("Asia/Shanghai")
 
 
 def _normalize_symbol_key(symbol: str) -> str:
@@ -64,7 +66,7 @@ def _strategy_next_for_position(bought_at: Optional[str], hold_days: Optional[in
         try:
             buy = date.fromisoformat(bought_at[:10])
             sell_by = buy + timedelta(days=hold_days)
-            today = date.today()
+            today = datetime.now(_BUSINESS_TZ).date()
             if sell_by <= today:
                 return "已到持仓期满，可卖出"
             n = (sell_by - today).days
