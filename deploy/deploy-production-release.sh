@@ -58,11 +58,14 @@ scp -q "${ssh_opts[@]}" -i "$ALIS_WORKER_SSH_KEY" "$bundle" "$ALIS_WORKER_SSH_TA
 old_app=$(app_ssh 'sudo readlink -f /opt/alis/current')
 old_worker=$(worker_ssh 'readlink -f /opt/alis-worker/backend')
 switched=0
+worker_switched=0
 rollback() {
   local exit_code=$?
   if (( switched )); then
     echo "Release validation failed; restoring previous application and worker" >&2
-    worker_ssh "systemctl stop alis-evolution-worker; ln -sfn '$old_worker' /opt/alis-worker/backend; systemctl start alis-evolution-worker" || true
+    if (( worker_switched )); then
+      worker_ssh "systemctl stop alis-evolution-worker; ln -sfn '$old_worker' /opt/alis-worker/backend; systemctl start alis-evolution-worker" || true
+    fi
     app_ssh "sudo bash -lc 'ln -sfn \"$old_app\" /opt/alis/current; systemctl restart alis-api'" || true
   fi
   exit "$exit_code"
@@ -108,13 +111,21 @@ worker_ssh "bash -lc 'set -euo pipefail
   ln -s /opt/alis-worker/shared/runtime-cache $worker_release/.cache
   \"\$venv/bin/pip\" install -q -r $worker_release/requirements.txt
   \"\$venv/bin/python\" -m compileall -q $worker_release/app $worker_release/migrations
-  sed -i \"s/^ALIS_BUILD_GIT_SHA=.*/ALIS_BUILD_GIT_SHA=$commit/\" /etc/alis/worker.env
-  grep -q \"^ALIS_BUILD_GIT_SHA=$commit\$\" /etc/alis/worker.env'"
+  : 'worker environment is switched only with the active release' '"
 
-worker_ssh "systemctl stop alis-evolution-worker; ln -sfn '$worker_release' /opt/alis-worker/backend"
+worker_protected=$(worker_ssh "set -a; . /etc/alis/worker.env; set +a; psql \"\$DATABASE_URL\" -Atqc \"SELECT 1 FROM evolution_tasks WHERE status='running' AND phase IN ('formal_oos','strategy_backtest','candidate_generation','model_training') LIMIT 1\" 2>/dev/null || true")
+if [[ "$worker_protected" == "1" ]]; then
+  echo "worker_protected=1; staged worker release without switching or restarting"
+else
+  worker_ssh "sed -i 's/^ALIS_BUILD_GIT_SHA=.*/ALIS_BUILD_GIT_SHA=$commit/' /etc/alis/worker.env; grep -q '^ALIS_BUILD_GIT_SHA=$commit\$' /etc/alis/worker.env"
+  worker_ssh "systemctl stop alis-evolution-worker; ln -sfn '$worker_release' /opt/alis-worker/backend"
+  worker_switched=1
+fi
 app_ssh "sudo bash -lc 'ln -sfn \"$app_release\" /opt/alis/current; systemctl restart alis-api'"
 switched=1
-worker_ssh 'systemctl start alis-evolution-worker'
+if (( worker_switched )); then
+  worker_ssh 'systemctl start alis-evolution-worker'
+fi
 
 app_ssh "sudo bash -lc 'for n in \$(seq 1 40); do curl -fsS --max-time 5 http://127.0.0.1:8000/api/ready >/dev/null && exit 0; sleep 2; done; exit 1'"
 app_ssh 'sudo -u www-data test -r /opt/alis/current/frontend/dist/index.html'
