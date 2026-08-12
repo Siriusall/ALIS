@@ -2297,10 +2297,11 @@ def merge_execution_into_positions(
 def add_position(symbol: str, quantity: int, price: float) -> Dict[str, Any]:
     """添加或累加持仓。同 symbol 则累加数量、加权成本。"""
     symbol = (symbol or "").strip()
-    quantity = max(0, int(quantity))
-    price = max(0.0, round(float(price), 2))
-    if not symbol:
-        return {}
+    quantity = int(quantity)
+    price = float(price)
+    if not symbol or quantity <= 0 or not math.isfinite(price) or price <= 0:
+        raise ValueError("invalid_position_input")
+    price = round(price, 2)
     now = datetime.now().isoformat()[:19]
     bought_date = now[:10]
     with _conn() as c:
@@ -2323,7 +2324,10 @@ def update_position(position_id: int, quantity: Optional[int] = None, price: Opt
         if not row:
             return None
         q = int(row["quantity"]) if quantity is None else max(0, int(quantity))
-        p = float(row["price"]) if price is None else max(0.0, round(float(price), 2))
+        p = float(row["price"]) if price is None else float(price)
+        if not math.isfinite(p) or p <= 0:
+            raise ValueError("invalid_position_price")
+        p = round(p, 2)
         now = datetime.now().isoformat()[:19]
         if q <= 0:
             c.execute("DELETE FROM positions WHERE id = ?", (position_id,))
