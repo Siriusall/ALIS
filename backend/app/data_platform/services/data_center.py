@@ -1224,6 +1224,26 @@ def resolve_legacy_daily_index_weight_requests(*, limit: int = 100) -> dict[str,
                       AND meta_json LIKE ?""",
                 (f'%"start_date": "{start_date}"%', f'%"end_date": "{end_date}"%'),
             )
+        # The failed-request row may already have been reconciled in an
+        # earlier cycle.  Independently retire any exact one-day ingestion
+        # ledger entries left behind by the superseded probe.
+        stale_runs = c.execute(
+            """SELECT id,meta_json FROM data_ingestion_runs
+                WHERE job_name='tushare.index_weight' AND status='failed'
+                  AND error LIKE '%返回为空%'""",
+        ).fetchall()
+        for stale in stale_runs:
+            try:
+                payload = json.loads(dict(stale).get("meta_json") or "{}")
+                params = payload.get("params") if isinstance(payload.get("params"), dict) else {}
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if str(params.get("start_date") or "") != str(params.get("end_date") or ""):
+                continue
+            c.execute(
+                "UPDATE data_ingestion_runs SET status='valid_empty', error=NULL WHERE id=? AND status='failed'",
+                (int(dict(stale).get("id") or 0),),
+            )
     return {
         "ok": True, "status": "completed", "examined": len(rows),
         "resolved": resolved, "skipped": skipped,
