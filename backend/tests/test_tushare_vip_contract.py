@@ -142,6 +142,31 @@ def test_capital_structure_skips_hsgt_after_bounded_attempts(monkeypatch):
     assert "moneyflow_hsgt" not in calls
 
 
+def test_identical_quality_check_is_throttled_but_changed_evidence_is_not():
+    calls = []
+
+    class Result:
+        def __init__(self, present):
+            self.present = present
+
+        def fetchone(self):
+            return {"present": 1} if self.present else None
+
+    class Connection:
+        def execute(self, sql, params=()):
+            calls.append((sql, params))
+            return Result(len(calls) == 1)
+
+    item = {
+        "check_name": "snapshot_low_quality", "scope": "snapshot:20260812",
+        "status": "warning", "message": "low quality rows=16",
+    }
+    assert data_center._recent_identical_quality_check(Connection(), item, "2026-08-12T16:10:00") is True
+    changed = {**item, "message": "low quality rows=15"}
+    assert data_center._recent_identical_quality_check(Connection(), changed, "2026-08-12T16:10:00") is False
+    assert calls[0][1][:-1] != calls[1][1][:-1]
+
+
 def test_index_weight_is_a_valid_empty_event_dataset():
     assert "index_weight" in data_center.VALID_EMPTY_TUSHARE_APIS
 

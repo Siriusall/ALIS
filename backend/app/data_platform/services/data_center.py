@@ -4745,6 +4745,8 @@ def run_data_quality_checks(trade_date: str | None = None) -> dict[str, Any]:
             ))
         now = _now()
         for item in checks:
+            if _recent_identical_quality_check(c, item, now):
+                continue
             c.execute(
                 """
                 INSERT INTO dc_data_quality_checks
@@ -4763,6 +4765,18 @@ def run_data_quality_checks(trade_date: str | None = None) -> dict[str, Any]:
                 ),
             )
     return {"ok": True, "checks": checks}
+
+
+def _recent_identical_quality_check(c: Any, item: dict[str, Any], checked_at: str) -> bool:
+    """Keep periodic quality checks auditable without appending identical noise."""
+    cutoff = (datetime.fromisoformat(checked_at) - timedelta(minutes=10)).isoformat()
+    return c.execute(
+        """SELECT 1 FROM dc_data_quality_checks
+            WHERE check_name=? AND scope=? AND status=? AND message=?
+              AND checked_at >= ?
+            LIMIT 1""",
+        (item["check_name"], item["scope"], item["status"], item["message"], cutoff),
+    ).fetchone() is not None
 
 
 def _quality_item(check_name: str, scope: str, status: str, severity: str, message: str, affected_count: int) -> dict[str, Any]:
