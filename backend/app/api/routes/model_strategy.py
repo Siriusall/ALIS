@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query
@@ -64,6 +65,7 @@ from app.services.strategy_controller import (
 from app.core.read_only_diagnostics import degraded_read
 
 router = APIRouter()
+_BUSINESS_TZ = ZoneInfo("Asia/Shanghai")
 
 
 class ModelTrainRequest(BaseModel):
@@ -794,7 +796,7 @@ def model_strategy_create_evolution_task(req: EvolutionTaskRequest) -> dict:
             "max_candidates": req.max_candidates,
             "trigger": "api",
         },
-        dedupe_key=f"strategy_evolution_cycle:{datetime.now().date().isoformat()}",
+        dedupe_key=f"strategy_evolution_cycle:{datetime.now(_BUSINESS_TZ).date().isoformat()}",
         force=req.force,
     )
 
