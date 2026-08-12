@@ -23,7 +23,9 @@ def run_daily_maintenance(*, max_candidates: int = 50) -> dict[str, Any]:
     research_count = 0
     for p in positions:
         code = str(p.get("symbol", "")).strip().upper()
-        candidates = [code] if code.endswith((".SH", ".SZ")) else [f"{code}.SH", f"{code}.SZ"]
+        candidates = [code] if code.endswith((".SH", ".SZ", ".BJ")) else [
+            f"{code}.SH" if code.startswith(("5", "6", "9")) else f"{code}.BJ" if code.startswith(("4", "8")) else f"{code}.SZ"
+        ]
         attempt_errors = []
         for candidate in candidates:
             try:
@@ -51,8 +53,8 @@ def run_daily_maintenance(*, max_candidates: int = 50) -> dict[str, Any]:
     thesis_count = 0
     for p in positions:
         code = str(p.get("symbol", "")).strip().upper()
-        if not code.endswith(".SH") and not code.endswith(".SZ"):
-            code = f"{code}.SH" if code.startswith(("6", "9")) else f"{code}.SZ"
+        if not code.endswith((".SH", ".SZ", ".BJ")):
+            code = f"{code}.SH" if code.startswith(("5", "6", "9")) else f"{code}.BJ" if code.startswith(("4", "8")) else f"{code}.SZ"
         try:
             r = generate_thesis_for_stock(code, force=True)
             if r.get("ok") or r.get("thesis_id"):
@@ -66,8 +68,8 @@ def run_daily_maintenance(*, max_candidates: int = 50) -> dict[str, Any]:
     state_count = 0
     for p in positions:
         sym = str(p.get("symbol", "")).strip().upper()
-        if not sym.endswith((".SH", ".SZ")):
-            sym = f"{sym}.SH" if sym.startswith(("6", "9")) else f"{sym}.SZ"
+        if not sym.endswith((".SH", ".SZ", ".BJ")):
+            sym = f"{sym}.SH" if sym.startswith(("5", "6", "9")) else f"{sym}.BJ" if sym.startswith(("4", "8")) else f"{sym}.SZ"
         try:
             transition_position(
                 ts_code=sym,

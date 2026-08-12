@@ -37,3 +37,17 @@ def test_daily_maintenance_discards_failed_exchange_guess_after_success(monkeypa
     assert result["errors"] == []
     assert result["results"]["research"] == 1
     assert transitions[0]["ts_code"] == "000001.SZ"
+
+
+def test_daily_maintenance_preserves_north_exchange_code(monkeypatch):
+    monkeypatch.setattr(auto_pipeline, "get_positions", lambda: [{"symbol": "430001"}])
+    seen = []
+    monkeypatch.setattr(auto_pipeline, "build_stock_research", lambda code, **_: seen.append(code) or {"ok": True})
+    monkeypatch.setattr(auto_pipeline, "generate_watch_pool_theses", lambda **_: {"ok": True})
+    monkeypatch.setattr(auto_pipeline, "generate_thesis_for_stock", lambda code, **_: {"ok": True})
+    transitions = []
+    monkeypatch.setattr(auto_pipeline, "transition_position", lambda **kwargs: transitions.append(kwargs))
+    result = auto_pipeline.run_daily_maintenance()
+    assert result["ok"] is True
+    assert seen == ["430001.BJ"]
+    assert transitions[0]["ts_code"] == "430001.BJ"
