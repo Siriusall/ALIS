@@ -1,5 +1,8 @@
 from app.services import data_health
 import pytest
+from contextlib import contextmanager
+
+_REAL_LATEST_BENCHMARK_COVERAGE = data_health._latest_benchmark_coverage
 
 
 @pytest.fixture(autouse=True)
@@ -129,3 +132,33 @@ def test_recovery_gate_keeps_the_frozen_trade_date_after_midnight(monkeypatch):
     assert result["decision_ready"] is True
     assert result["readiness"]["target_trade_date"] == "20260705"
     assert result["latest_snapshot"]["trade_date"] == "20260705"
+
+
+def test_benchmark_coverage_reads_only_versions_available_by_close(monkeypatch):
+    queries: list[tuple[str, tuple]] = []
+
+    class _Rows:
+        def fetchone(self):
+            # Represents the 15:00 version after SQL filters a later repair.
+            return {
+                "rows_read": 1,
+                "max_available_time": "2026-07-06T15:00:00",
+                "source_code": "tushare",
+            }
+
+    class _Conn:
+        def execute(self, sql, params=()):
+            queries.append((sql, params))
+            return _Rows()
+
+    @contextmanager
+    def fake_conn():
+        yield _Conn()
+
+    monkeypatch.setattr(data_health, "_latest_benchmark_coverage", _REAL_LATEST_BENCHMARK_COVERAGE)
+    monkeypatch.setattr("app.data_platform.db._conn", fake_conn)
+    result = data_health._latest_benchmark_coverage("20260706")
+
+    assert result["ready"] is True
+    assert "available_time<=?" in queries[0][0]
+    assert queries[0][1] == ("20260706", "2026-07-06T15:00:00")

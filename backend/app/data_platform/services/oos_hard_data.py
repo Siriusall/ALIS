@@ -73,6 +73,8 @@ def _benchmark_date_set(start_date: str, end_date: str) -> set[str]:
                  FROM dc_tushare_raw_records
                 WHERE api_name='index_daily' AND ts_code=?
                   AND trade_date BETWEEN ? AND ?
+                  AND available_time<=
+                      (SUBSTRING(trade_date,1,4)||'-'||SUBSTRING(trade_date,5,2)||'-'||SUBSTRING(trade_date,7,2)||'T15:00:00')
                 GROUP BY trade_date""",
             (BENCHMARK_INDEX_CODE, start_date, end_date),
         ).fetchall()
@@ -80,8 +82,7 @@ def _benchmark_date_set(start_date: str, end_date: str) -> set[str]:
     for row in rows:
         item = dict(row)
         trade_date = str(item.get("trade_date") or "")
-        cutoff = f"{trade_date[:4]}-{trade_date[4:6]}-{trade_date[6:]}T15:00:00"
-        if trade_date and str(item.get("max_available_time") or "") <= cutoff:
+        if trade_date and str(item.get("max_available_time") or ""):
             valid.add(trade_date)
     return valid
 

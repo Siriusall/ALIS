@@ -214,8 +214,8 @@ def _latest_benchmark_coverage(trade_date: str) -> dict[str, Any]:
                       MAX(source_code) AS source_code
                FROM dc_tushare_raw_records
                WHERE api_name='index_daily' AND ts_code='000300.SH'
-                 AND trade_date=?""",
-            (value,),
+                 AND trade_date=? AND available_time<=?""",
+            (value, cutoff),
         ).fetchone()
     item = dict(row) if row else {}
     rows_read = int(item.get("rows_read") or 0)

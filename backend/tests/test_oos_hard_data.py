@@ -144,6 +144,31 @@ def test_oos_hard_contract_requires_five_formal_windows(monkeypatch):
     assert result["hard_requirement"] is True
 
 
+def test_oos_benchmark_set_filters_late_revisions_in_sql(monkeypatch):
+    queries: list[tuple[str, tuple]] = []
+
+    class Conn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def execute(self, sql, params=()):
+            queries.append((sql, params))
+            # Only the close-time record remains after the SQL filter.
+            return FakeRows([{
+                "trade_date": "20260722",
+                "max_available_time": "2026-07-22T15:00:00",
+            }])
+
+    monkeypatch.setattr(oos_hard_data, "_conn", lambda: Conn())
+    result = oos_hard_data._benchmark_date_set("20260722", "20260722")
+
+    assert result == {"20260722"}
+    assert "available_time<=" in queries[0][0]
+
+
 def test_oos_asset_is_permanent_blocking_asset(monkeypatch):
     monkeypatch.setattr(oos_hard_data, "audit_oos_hard_data", lambda include_dates=False: {
         "consumer": "Champion", "window_start": "20200101", "window_end": "20260722",
