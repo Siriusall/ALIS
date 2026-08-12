@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from copy import deepcopy
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
@@ -42,6 +43,7 @@ RESEARCH_LINES = (
 
 _RESEARCH_TABLES_READY = False
 _RESEARCH_TABLES_INIT_LOCK = threading.Lock()
+_BUSINESS_TZ = ZoneInfo("Asia/Shanghai")
 
 
 def strategy_research_enabled() -> bool:
@@ -52,7 +54,25 @@ def strategy_research_enabled() -> bool:
 
 
 def _now() -> str:
-    return datetime.now().astimezone().isoformat()
+    return datetime.now(_BUSINESS_TZ).isoformat()
+
+
+def _age_days_from_timestamp(value: Any, *, now: datetime | None = None) -> float:
+    """Compute expert age without mixing legacy naive and aware timestamps."""
+    current = now or datetime.now(_BUSINESS_TZ)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=_BUSINESS_TZ)
+    else:
+        current = current.astimezone(_BUSINESS_TZ)
+    try:
+        updated = datetime.fromisoformat(str(value or ""))
+        if updated.tzinfo is None:
+            updated = updated.replace(tzinfo=_BUSINESS_TZ)
+        else:
+            updated = updated.astimezone(_BUSINESS_TZ)
+        return max(0.0, (current - updated).total_seconds() / 86400)
+    except (TypeError, ValueError):
+        return float(EXPERT_MAX_AGE_DAYS + 1)
 
 
 def _json(value: Any) -> str:
@@ -3793,11 +3813,7 @@ def strategy_research_analytics_console() -> dict[str, Any]:
         champions = [row for row in rows if str(row.get("role") or "") == "champion"]
         fitnesses = [float(row.get("fitness") or 0.0) for row in champions]
         latest = champions[0] if champions else rows[0]
-        try:
-            updated = datetime.fromisoformat(str(latest["updated_at"]))
-            age_days = max(0.0, (now - updated.astimezone()).total_seconds() / 86400)
-        except (TypeError, ValueError):
-            age_days = float(EXPERT_MAX_AGE_DAYS + 1)
+        age_days = _age_days_from_timestamp(latest.get("updated_at"), now=now)
         mean_fitness = sum(fitnesses) / len(fitnesses) if fitnesses else 0.0
         variance = (
             sum((value - mean_fitness) ** 2 for value in fitnesses) / len(fitnesses)
@@ -3918,8 +3934,7 @@ def strategy_research_analytics() -> dict[str, Any]:
         champions = [row for row in rows if str(row.get("role") or "") == "champion"]
         fitnesses = [float(row.get("fitness") or 0.0) for row in champions]
         latest = champions[0] if champions else rows[0]
-        updated = datetime.fromisoformat(str(latest["updated_at"]))
-        age_days = max(0.0, (now - updated.astimezone()).total_seconds() / 86400)
+        age_days = _age_days_from_timestamp(latest.get("updated_at"), now=now)
         mean = sum(fitnesses) / len(fitnesses) if fitnesses else 0.0
         variance = (
             sum((value - mean) ** 2 for value in fitnesses) / len(fitnesses)

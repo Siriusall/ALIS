@@ -98,6 +98,25 @@ def _cooldown_remaining(api_name: str) -> int:
     return max(0, int(until - now))
 
 
+def _rate_limit_cooldown_active(value: Any, *, now: datetime | None = None) -> bool:
+    """Handle both legacy naive and timezone-aware failure timestamps."""
+    try:
+        failed = datetime.fromisoformat(str(value or "").replace("Z", "+00:00"))
+        if now is not None:
+            current = now
+        else:
+            current = datetime.now(failed.tzinfo) if failed.tzinfo else datetime.now()
+        if failed.tzinfo and current.tzinfo is None:
+            current = current.replace(tzinfo=failed.tzinfo)
+        elif failed.tzinfo and current.tzinfo:
+            current = current.astimezone(failed.tzinfo)
+        elif failed.tzinfo is None and current.tzinfo is not None:
+            current = current.replace(tzinfo=None)
+        return (current - failed).total_seconds() < AUTONOMOUS_RATE_LIMIT_COOLDOWN_SECONDS
+    except (TypeError, ValueError):
+        return False
+
+
 def _activate_rate_limit_cooldown(api_name: str, *, seconds: int | None = None) -> None:
     global _tushare_global_cooldown_until, _tushare_reduced_concurrency_until, _tushare_reduced_concurrency
     duration = int(seconds or TUSHARE_RATE_LIMIT_COOLDOWN_SECONDS)
@@ -1158,13 +1177,8 @@ def resume_safe_failed_tushare_requests_by_id(
             skipped.append({"id": request_id, "reason": "maximum_attempts_reached", "attempts": attempts})
             continue
         if category == "rate_limit":
-            try:
-                last_failed = datetime.fromisoformat(str(item.get("last_failed_at") or ""))
-                if (datetime.now() - last_failed).total_seconds() < AUTONOMOUS_RATE_LIMIT_COOLDOWN_SECONDS:
-                    skipped.append({"id": request_id, "reason": "rate_limit_cooldown_active"})
-                    continue
-            except ValueError:
-                skipped.append({"id": request_id, "reason": "invalid_last_failed_at"})
+            if _rate_limit_cooldown_active(item.get("last_failed_at")):
+                skipped.append({"id": request_id, "reason": "rate_limit_cooldown_active"})
                 continue
         try:
             params = json.loads(item.get("params_json") or "{}")
