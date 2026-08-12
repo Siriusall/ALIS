@@ -24,7 +24,12 @@ def build_candidate_observation_center(*, limit: int = 200) -> dict[str, Any]:
                       m.validation_json,m.created_at AS version_created_at,
                       a.id AS account_id,a.status AS account_status,
                       a.latest_trade_date,a.initial_cash,a.latest_cash,a.latest_equity,
-                      a.updated_at AS account_updated_at
+                      a.updated_at AS account_updated_at,
+                      e.stock_value,e.positions_json,
+                      (SELECT COUNT(*) FROM candidate_simulation_operations o WHERE o.account_id=a.id) AS operation_count,
+                      (SELECT COALESCE(SUM(o.fees),0) FROM candidate_simulation_operations o WHERE o.account_id=a.id) AS total_fees,
+                      (SELECT COUNT(*) FROM candidate_simulation_blocked_events b WHERE b.account_id=a.id) AS blocked_event_count,
+                      (SELECT COUNT(*) FROM candidate_simulation_decisions d WHERE d.account_id=a.id) AS decision_count
                  FROM candidate_lifecycle_records c
                  JOIN model_versions m ON m.id=c.model_version_id
                  LEFT JOIN candidate_simulation_accounts a ON a.id=(
@@ -32,6 +37,12 @@ def build_candidate_observation_center(*, limit: int = 200) -> dict[str, Any]:
                       WHERE a2.model_version_id=c.model_version_id
                       ORDER BY a2.updated_at DESC,a2.id DESC LIMIT 1
                  )
+                 LEFT JOIN candidate_simulation_daily_equity e
+                   ON e.account_id=a.id
+                  AND e.trade_date=(
+                     SELECT MAX(e2.trade_date) FROM candidate_simulation_daily_equity e2
+                      WHERE e2.account_id=a.id
+                  )
                 ORDER BY c.updated_at DESC,c.model_version_id DESC LIMIT ?""",
             (max(1, min(int(limit), 500)),),
         ).fetchall()]
@@ -45,6 +56,7 @@ def build_candidate_observation_center(*, limit: int = 200) -> dict[str, Any]:
         ) or []
         initial = float(row.get("initial_cash") or 0.0)
         equity = float(row.get("latest_equity") or 0.0)
+        positions = _loads(row.get("positions_json"), {})
         items.append({
             "model_version_id": int(row["model_version_id"]),
             "candidate_type": row.get("candidate_type"),
@@ -63,8 +75,14 @@ def build_candidate_observation_center(*, limit: int = 200) -> dict[str, Any]:
                 "latest_trade_date": row.get("latest_trade_date"),
                 "initial_cash": initial or None,
                 "latest_cash": float(row.get("latest_cash") or 0.0) if row.get("account_id") else None,
+                "stock_value": float(row.get("stock_value") or 0.0) if row.get("account_id") else None,
                 "latest_equity": equity if row.get("account_id") else None,
                 "return": round(equity / initial - 1.0, 10) if initial > 0 else None,
+                "position_count": len(positions) if isinstance(positions, dict) else 0,
+                "decision_count": int(row.get("decision_count") or 0),
+                "operation_count": int(row.get("operation_count") or 0),
+                "total_fees": float(row.get("total_fees") or 0.0),
+                "blocked_event_count": int(row.get("blocked_event_count") or 0),
                 "updated_at": row.get("account_updated_at"),
             },
             "next_action": (

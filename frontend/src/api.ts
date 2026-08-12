@@ -95,6 +95,7 @@ export const endpoints = {
   portfolio: "/api/research/portfolio-candles",
   risk: "/api/research/portfolio-risk/live",
   strategy: "/api/model-strategy/strategy-lab",
+  candidateObservations: "/api/model-strategy/candidate-observations?limit=200",
   tasks: "/api/model-strategy/task-center?compact=true&limit=16&log_limit=40",
   adminTasksLive: "/api/model-strategy/task-center?compact=true&limit=30&log_limit=20",
   modelTasksLive: "/api/model-strategy/task-center?compact=true&limit=24&log_limit=40",

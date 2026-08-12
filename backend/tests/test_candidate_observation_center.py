@@ -15,6 +15,9 @@ def test_observation_center_separates_runtime_account_and_eligibility(monkeypatc
                 "account_id": 2, "account_status": "observing",
                 "latest_trade_date": "20260812", "initial_cash": 200000,
                 "latest_cash": 10000, "latest_equity": 202000,
+                "stock_value": 192000, "positions_json": '{"000001.SZ":100}',
+                "decision_count": 2, "operation_count": 3, "total_fees": 18.5,
+                "blocked_event_count": 1,
                 "account_updated_at": "2026-08-12T18:00:00+08:00",
             }]
 
@@ -34,4 +37,7 @@ def test_observation_center_separates_runtime_account_and_eligibility(monkeypatc
     assert result["summary"]["observing"] == 1
     assert result["summary"]["production_authority"] == 0
     assert item["account"]["return"] == 0.01
+    assert item["account"]["position_count"] == 1
+    assert item["account"]["operation_count"] == 3
+    assert item["account"]["total_fees"] == 18.5
     assert item["blocked_reasons"] == ["formal_oos"]
