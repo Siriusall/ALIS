@@ -1979,6 +1979,8 @@ def test_operations_status_is_lightweight_and_exposes_observation_and_weights(mo
         == plan_model_control.MODEL_EVALUATION_CONTRACT
     )
     assert medium["trigger_reason"] == "新数据到达"
+    assert "timeline" in medium["latest_train_run"]["metrics"]
+    assert "targeted_training_context" not in medium["latest_train_run"]["metrics"]
     assert medium["evaluation"]["status"] == "outdated"
     assert (
         medium["evaluation"]["definition"]["task"]

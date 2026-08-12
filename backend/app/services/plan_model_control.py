@@ -7781,6 +7781,34 @@ def _latest_market_state_code() -> str:
         return "S1"
 
 
+def _compact_plan_model_train_run(run: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Return the bounded state needed by the live polling console.
+
+    Training metrics include immutable fold evidence and, for event models,
+    distribution audits large enough to make a 15-second status poll hundreds
+    of kilobytes. Those artifacts remain available through model-version
+    evidence; the operations board only renders task state, failure recovery
+    and its recent timeline.
+    """
+    if not isinstance(run, dict):
+        return None
+    fields = (
+        "id", "model_key", "model_version_id", "status", "phase", "progress", "message", "error",
+        "created_at", "started_at", "updated_at", "finished_at", "training_protocol_status",
+        "labeled_trade_date_count",
+    )
+    metrics = run.get("metrics") if isinstance(run.get("metrics"), dict) else {}
+    compact_metrics = {
+        key: metrics[key]
+        for key in ("failure_recovery", "timeline")
+        if key in metrics
+    }
+    return {
+        **{field: run[field] for field in fields if field in run},
+        "metrics": compact_metrics,
+    }
+
+
 def plan_model_operations_status(*, cache_seconds: int = 15) -> dict[str, Any]:
     """Lightweight polling contract: no coverage scans or artifact loading."""
     now_monotonic = time.monotonic()
@@ -7965,7 +7993,7 @@ def plan_model_operations_status(*, cache_seconds: int = 15) -> dict[str, Any]:
         items.append({
             "model_key": key,
             "name": contract.get("name"),
-            "latest_train_run": run,
+            "latest_train_run": _compact_plan_model_train_run(run),
             "trigger_reason": trigger_reason,
             "requested_by": context.get("requested_by") or ("autonomous_daily" if run else None),
             "next_check_at": next_check_at,
