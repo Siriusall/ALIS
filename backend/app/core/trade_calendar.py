@@ -7,9 +7,11 @@ from __future__ import annotations
 
 from datetime import date, datetime, timedelta
 from typing import Set
+from zoneinfo import ZoneInfo
 
 # 当日行情/日线数据视为可用的截止时间（本地时间，24 时制）；此前用上一交易日
 _MARKET_CLOSE_HOUR = 15
+_BUSINESS_TZ = ZoneInfo("Asia/Shanghai")
 
 
 def _build_holiday_set() -> Set[date]:
@@ -64,9 +66,9 @@ def get_last_trade_date(as_of: date | None = None, for_data_availability: bool =
     as_of 默认为今天；用于行情/日线/快照的基准日期。
     for_data_availability=True 时：若今天为交易日且当前时间早于 15:00，视为当日数据尚未产生，返回上一交易日。
     """
-    d = as_of if as_of is not None else date.today()
+    d = as_of if as_of is not None else datetime.now(_BUSINESS_TZ).date()
     if for_data_availability and is_trade_day(d):
-        now = datetime.now()
+        now = datetime.now(_BUSINESS_TZ)
         if now.hour < _MARKET_CLOSE_HOUR:
             d = d - timedelta(days=1)
     while not is_trade_day(d):
