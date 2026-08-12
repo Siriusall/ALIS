@@ -203,6 +203,52 @@ def test_buy_execution_uses_one_transaction_for_cash_operation_and_position(monk
     assert any("UPDATE account SET balance" in sql for sql in statements)
 
 
+@pytest.mark.parametrize(
+    ("order", "error"),
+    [
+        ({"symbol": "000001", "side": "BUY", "price": 10, "quantity": 100.5}, "invalid_operation"),
+        ({"symbol": "000001", "side": "BUY", "price": float("nan"), "quantity": 100}, "invalid_operation"),
+        ({"symbol": "000001", "side": "BUY", "price": 10, "quantity": 100, "commission": -1}, "invalid_operation_fees"),
+    ],
+)
+def test_compatibility_operation_writers_reject_invalid_orders_before_writing(
+    monkeypatch: pytest.MonkeyPatch, order: dict, error: str,
+) -> None:
+    statements: list[str] = []
+
+    class _Conn:
+        def execute(self, sql, _params=()):
+            statements.append(sql)
+            return _Cursor([])
+
+    @contextmanager
+    def fake_conn():
+        yield _Conn()
+
+    monkeypatch.setattr(store, "_conn", fake_conn)
+    with pytest.raises(ValueError, match=error):
+        store.create_execution(1, "2026-02-02T09:30:00", 0, 1, [order])
+    assert statements == []
+
+
+def test_compatibility_execution_writer_rejects_invalid_budget_before_writing(monkeypatch: pytest.MonkeyPatch) -> None:
+    statements: list[str] = []
+
+    class _Conn:
+        def execute(self, sql, _params=()):
+            statements.append(sql)
+            return _Cursor([])
+
+    @contextmanager
+    def fake_conn():
+        yield _Conn()
+
+    monkeypatch.setattr(store, "_conn", fake_conn)
+    with pytest.raises(ValueError, match="invalid_execution_budget"):
+        store.create_execution(1, "2026-02-02T09:30:00", float("inf"), 1, [])
+    assert statements == []
+
+
 def test_list_operations_decodes_target_weight_contract(monkeypatch: pytest.MonkeyPatch) -> None:
     class _Conn:
         def execute(self, *_args):

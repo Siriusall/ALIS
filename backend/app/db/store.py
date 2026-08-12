@@ -1626,16 +1626,74 @@ def _operation_uid(execution_id: int | None, symbol: Any, side: Any, at: Any, qu
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def _validated_operation_fields(order: Dict[str, Any], *, default_side: str = "BUY") -> dict[str, Any]:
+    """Normalize a persisted operation without silently coercing invalid trades."""
+    symbol = str(order.get("symbol") or "").strip().upper()
+    side = str(order.get("side") or default_side).strip().upper()
+    quantity_raw = order.get("quantity")
+    try:
+        quantity_value = float(quantity_raw)
+        quantity = int(quantity_value)
+        price = float(order.get("price"))
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError("invalid_operation") from None
+    if (
+        not symbol
+        or side not in {"BUY", "SELL"}
+        or not math.isfinite(quantity_value)
+        or quantity_value != quantity
+        or quantity <= 0
+        or not math.isfinite(price)
+        or price <= 0
+    ):
+        raise ValueError("invalid_operation")
+    fees: dict[str, float] = {}
+    for key in ("commission", "transfer_fee", "stamp_tax"):
+        try:
+            value = float(order.get(key) or 0)
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError("invalid_operation_fees") from None
+        if not math.isfinite(value) or value < 0:
+            raise ValueError("invalid_operation_fees")
+        fees[key] = value
+    try:
+        slippage_bps = float(order.get("slippage_bps") or 0)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError("invalid_operation_slippage") from None
+    if not math.isfinite(slippage_bps):
+        raise ValueError("invalid_operation_slippage")
+    return {
+        "symbol": symbol,
+        "side": side,
+        "quantity": quantity,
+        "price": price,
+        "commission": fees["commission"],
+        "transfer_fee": fees["transfer_fee"],
+        "stamp_tax": fees["stamp_tax"],
+        "slippage_bps": slippage_bps,
+    }
+
+
 def create_execution(strategy_id: int, executed_at: str, budget: float, top_n: int, orders: List[Dict[str, Any]], *, release_id: int | None = None) -> int:
     """Insert execution and operations (buy orders). Returns execution id."""
+    try:
+        normalized_budget = float(budget)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError("invalid_execution_budget") from None
+    if not math.isfinite(normalized_budget) or normalized_budget < 0:
+        raise ValueError("invalid_execution_budget")
+    normalized_orders = [
+        {**dict(order), **_validated_operation_fields(order)}
+        for order in orders
+    ]
     with _conn() as c:
         c.execute(
             """INSERT INTO executions (strategy_id, executed_at, budget, top_n, orders_json,release_id)
                VALUES (?, ?, ?, ?, ?, ?)""",
-            (strategy_id, executed_at, budget, top_n, json.dumps(orders), int(release_id) if release_id else None),
+            (strategy_id, executed_at, normalized_budget, top_n, json.dumps(normalized_orders), int(release_id) if release_id else None),
         )
         eid = c.last_insert_id()
-        for o in orders:
+        for o in normalized_orders:
             operation_uid = _operation_uid(eid, o.get("symbol", ""), o.get("side", "BUY"), executed_at, o.get("quantity", 0), o.get("price", 0))
             c.execute(
                 """INSERT INTO operations
@@ -1671,9 +1729,13 @@ def append_operations_to_execution(execution_id: int, executed_at: str, orders: 
     eid = int(execution_id)
     if eid <= 0 or not orders:
         return 0
+    normalized_orders = [
+        {**dict(order), **_validated_operation_fields(order, default_side="")}
+        for order in orders
+    ]
     inserted = 0
     with _conn() as c:
-        for o in orders:
+        for o in normalized_orders:
             operation_at = str(o.get("at") or executed_at)
             operation_uid = _operation_uid(eid, o.get("symbol", ""), o.get("side", ""), operation_at, o.get("quantity", 0), o.get("price", 0))
             if c.execute("SELECT id FROM operations WHERE operation_uid=?", (operation_uid,)).fetchone():
@@ -1995,11 +2057,17 @@ def insert_manual_operation(
     remark: Optional[str] = None,
 ) -> int:
     """插入一条手动操作记录（execution_id 为 NULL）。返回新记录的 id。"""
+    normalized = _validated_operation_fields({
+        "symbol": symbol,
+        "side": side,
+        "price": price,
+        "quantity": quantity,
+    }, default_side="")
     with _conn() as c:
         c.execute(
             """INSERT INTO operations (execution_id, symbol, side, price, quantity, at, remark, name)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (None, symbol, side, round(float(price), 2), int(quantity), at, remark or None, (name or "").strip()),
+            (None, normalized["symbol"], normalized["side"], round(normalized["price"], 2), normalized["quantity"], at, remark or None, (name or "").strip()),
         )
         return c.last_insert_id()
 
