@@ -118,6 +118,30 @@ def test_optional_hsgt_empty_only_becomes_terminal_after_publish_lag(monkeypatch
     ) is False
 
 
+def test_market_core_does_not_request_optional_hsgt_flow(monkeypatch):
+    calls = []
+    monkeypatch.setattr(data_center, "sync_complete_stk_limit_slice", lambda _date: {"ok": True})
+    monkeypatch.setattr(data_center, "_safe_sync_raw", lambda api, _params: calls.append(api) or {"ok": True})
+    monkeypatch.setattr(data_center, "build_stock_daily_snapshot", lambda _date: {"ok": True})
+
+    result = data_center._sync_tushare_market_bundle("20260812")
+
+    assert result["ok"] is True
+    assert "moneyflow_hsgt" not in result["apis"]
+    assert "moneyflow_hsgt" not in calls
+
+
+def test_capital_structure_skips_hsgt_after_bounded_attempts(monkeypatch):
+    calls = []
+    monkeypatch.setattr(data_center, "_optional_daily_retry_allowed", lambda *_args: False)
+    monkeypatch.setattr(data_center, "_safe_sync_raw", lambda api, params: calls.append(api) or {"ok": True, "api": api})
+
+    result = data_center.sync_capital_structure_bundle("20260806")
+
+    assert result["moneyflow_hsgt"]["status"] == "retry_budget_exhausted"
+    assert "moneyflow_hsgt" not in calls
+
+
 def test_index_weight_is_a_valid_empty_event_dataset():
     assert "index_weight" in data_center.VALID_EMPTY_TUSHARE_APIS
 

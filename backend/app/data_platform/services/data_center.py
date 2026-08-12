@@ -277,6 +277,7 @@ def _request_key(api_name: str, params: dict[str, Any], limit_rows: int | None) 
 
 COMPLETED_REQUEST_STATUSES = ("success", "not_applicable", "valid_empty", "deferred_empty")
 DEFER_EMPTY_AFTER_ATTEMPTS = 5
+OPTIONAL_DAILY_MAX_ATTEMPTS = 5
 
 
 def _record_failed_tushare_request(api_name: str, params: dict[str, Any], limit_rows: int | None, category: str, error: str) -> None:
@@ -401,6 +402,17 @@ def _mature_optional_daily_empty(api_name: str, params: dict[str, Any], *, today
     observed = (today_value or _business_today()).strftime("%Y%m%d")
     cutoff = _etf_nav_publish_cutoff(observed)
     return bool(cutoff and target_date <= cutoff)
+
+
+def _optional_daily_retry_allowed(api_name: str, params: dict[str, Any]) -> bool:
+    if api_name != "moneyflow_hsgt":
+        return True
+    with _conn() as c:
+        row = c.execute(
+            "SELECT attempts FROM dc_tushare_failed_requests WHERE request_key=? AND status='pending'",
+            (_request_key(api_name, params, None),),
+        ).fetchone()
+    return int((dict(row) if row else {}).get("attempts") or 0) < OPTIONAL_DAILY_MAX_ATTEMPTS
 
 
 def _recent_calendar_window(days_back: int = 30, days_forward: int = 60) -> tuple[str, str]:
@@ -2123,10 +2135,9 @@ def sync_complete_stk_limit_slice(trade_date: str) -> dict[str, Any]:
 def _sync_tushare_market_bundle(trade_date: str, *, include_suspend: bool = False, apis: list[str] | None = None) -> dict[str, Any]:
     """Run the TuShare provider without controlling provider selection."""
 
-    # Suspension/resumption and money flow are core daily inputs, not optional
-    # enrichments. Include both in every normal market update so an empty
-    # result is also persisted as evidence that the date was checked.
-    requested_apis = list(apis or ["daily", "daily_basic", "stk_limit", "adj_factor", "suspend_d", "moneyflow", "moneyflow_hsgt"])
+    # Cross-border aggregate flow is a delayed optional research enrichment.
+    # It must never delay or repeatedly retry the decision-data core.
+    requested_apis = list(apis or ["daily", "daily_basic", "stk_limit", "adj_factor", "suspend_d", "moneyflow"])
     if include_suspend and "suspend_d" not in requested_apis:
         requested_apis.append("suspend_d")
     allowed = {"daily", "daily_basic", "stk_limit", "adj_factor", "suspend_d", "moneyflow", "moneyflow_hsgt"}
@@ -2382,7 +2393,7 @@ def sync_market_bundle(trade_date: str, *, include_suspend: bool = False, apis: 
         core_ready, evidence = _decision_core_ready(trade_date)
     if core_ready:
         def _enrich() -> None:
-            for api_name in ("adj_factor", "suspend_d", "moneyflow", "moneyflow_hsgt"):
+            for api_name in ("adj_factor", "suspend_d", "moneyflow"):
                 _safe_sync_raw(api_name, {"trade_date": trade_date})
 
         threading.Thread(target=_enrich, daemon=True, name=f"market-enrichment-{trade_date}").start()
@@ -2411,8 +2422,8 @@ def sync_market_bundle(trade_date: str, *, include_suspend: bool = False, apis: 
 
 def sync_capital_structure_bundle(trade_date: str) -> dict[str, Any]:
     """Sync the high-permission capital, leverage and leader-seat evidence for one date."""
+    hsgt_params = {"trade_date": trade_date}
     requests: list[tuple[str, dict[str, Any]]] = [
-        ("moneyflow_hsgt", {"trade_date": trade_date}),
         ("margin", {"trade_date": trade_date}),
         ("margin_detail", {"trade_date": trade_date}),
         ("top_list", {"trade_date": trade_date}),
@@ -2423,6 +2434,9 @@ def sync_capital_structure_bundle(trade_date: str) -> dict[str, Any]:
         ("margin_secs", {"trade_date": trade_date, "exchange": "SZSE"}),
         ("margin_secs", {"trade_date": trade_date, "exchange": "BSE"}),
     ]
+    hsgt_requested = _optional_daily_retry_allowed("moneyflow_hsgt", hsgt_params)
+    if hsgt_requested:
+        requests.insert(0, ("moneyflow_hsgt", hsgt_params))
     results = [
         {"api_name": api_name, "request": params, **_safe_sync_raw(api_name, params)}
         for api_name, params in requests
@@ -2432,6 +2446,7 @@ def sync_capital_structure_bundle(trade_date: str) -> dict[str, Any]:
         "trade_date": trade_date,
         "contract": "capital_structure_vip_account_v1",
         "results": results,
+        "moneyflow_hsgt": {"status": "requested" if hsgt_requested else "retry_budget_exhausted"},
         "succeeded": sum(1 for item in results if item.get("ok")),
         "failed": sum(1 for item in results if not item.get("ok")),
     }
@@ -4570,7 +4585,8 @@ def _refresh_snapshot_stats(c: Any, trade_date: str, updated_at: str) -> None:
 
 def _refresh_oos_hard_api_stats(c: Any, api_name: str, trade_dates: list[str], updated_at: str) -> None:
     """Persist bounded point-in-time raw coverage for the permanent OOS gate."""
-    for trade_date in trade_dates:
+    targets = _oos_hard_stats_target_dates(c, trade_dates)
+    for trade_date in sorted(targets):
         row = c.execute(
             """SELECT COUNT(DISTINCT ts_code) FILTER (WHERE available_time<=
                         (SUBSTRING(trade_date,1,4)||'-'||SUBSTRING(trade_date,5,2)||'-'||SUBSTRING(trade_date,7,2)||'T15:00:00')) AS point_in_time_rows,
@@ -4595,6 +4611,43 @@ def _refresh_oos_hard_api_stats(c: Any, api_name: str, trade_dates: list[str], u
                 str(_row_value(row, "first_available_time", "") or ""), updated_at,
             ),
         )
+
+
+def _oos_hard_stats_target_dates(c: Any, trade_dates: list[str]) -> set[str]:
+    """Limit live OOS statistics to the rolling OOS and sealed-holdout assets.
+
+    Daily raw ingestion must remain usable in installations that have not yet
+    installed the OOS-statistics migration.  The summary is only consumed by
+    these two bounded historical assets, so unrelated dates must not write it.
+    """
+    candidates = {
+        str(value or "").replace("-", "")[:8]
+        for value in trade_dates
+        if len(str(value or "").replace("-", "")[:8]) == 8
+    }
+    if not candidates:
+        return set()
+
+    from app.data_platform.services.oos_hard_data import (
+        PENDING_TRADE_DAY_BUFFER,
+        REQUIRED_SESSIONS,
+    )
+    from app.services.sealed_strategy_holdout import SEALED_HOLDOUT_DATES
+
+    targets = candidates & set(SEALED_HOLDOUT_DATES)
+    try:
+        rows = c.execute(
+            """SELECT cal_date FROM dc_trade_calendar
+                 WHERE exchange='SSE' AND is_open=1
+                 ORDER BY cal_date DESC LIMIT ?""",
+            (REQUIRED_SESSIONS + PENDING_TRADE_DAY_BUFFER,),
+        ).fetchall()
+    except Exception:
+        # A missing calendar must not make ordinary ingestion depend on the
+        # optional OOS summary.  The fixed sealed dates remain safe to update.
+        return targets
+    rolling_dates = {str(_row_value(row, "cal_date", "") or "") for row in rows}
+    return targets | (candidates & rolling_dates)
 
 
 def _upsert_snapshot_row(c: Any, values: tuple[Any, ...]) -> None:
