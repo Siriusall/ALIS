@@ -201,6 +201,28 @@ def _planned_execute_at(execute_date: str) -> str:
     return f"{date_value}T{clock.hour:02d}:{clock.minute:02d}:00+08:00" if date_value else ""
 
 
+def _formal_plan_is_due(record: dict[str, Any], *, now: datetime | None = None) -> bool:
+    """Check the frozen execution timestamp before any plan claim is written."""
+    execute_date = str(record.get("planned_execute_date") or "").replace("-", "")[:8]
+    # Historical replay/cleanup may examine pre-timestamp rows.  The daily
+    # scheduler only needs a wall-clock guard for today's or a future plan;
+    # older rows are governed by their date/expiry state machine instead.
+    current = now or datetime.now().astimezone()
+    current_date = current.astimezone().strftime("%Y%m%d")
+    if execute_date and execute_date < current_date:
+        return True
+    value = str(record.get("planned_execute_at") or _planned_execute_at(execute_date)).strip()
+    if not value:
+        raise ValueError("正式调仓计划缺少冻结执行时刻")
+    try:
+        due_at = datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise ValueError("正式调仓计划执行时刻格式无效") from exc
+    if due_at.tzinfo is None:
+        due_at = due_at.astimezone()
+    return current >= due_at
+
+
 def _latest_report(period_type: str = "daily") -> dict[str, Any]:
     with business_conn() as c:
         row = c.execute(
@@ -1756,6 +1778,22 @@ def claim_daily_rebalance_execution_input(
         record = dict(row)
         if str(record.get("status") or "") != "planned":
             return None
+
+        try:
+            if not _formal_plan_is_due(record):
+                # A future frozen plan is normal scheduler state, not a
+                # contract failure.  Leave it unclaimed for its exact window.
+                return None
+        except ValueError as exc:
+            c.execute(
+                """UPDATE daily_rebalance_plans
+                   SET status='blocked_by_contract_validation',
+                       validation_error_code='invalid_planned_execute_at',
+                       validation_errors_json=?,validated_at=?
+                   WHERE id=? AND status='planned'""",
+                (json.dumps([str(exc)], ensure_ascii=False), _now(), int(row["id"])),
+            )
+            raise ReplayRiskGateError(str(exc), code="invalid_planned_execute_at") from exc
 
         def reject_contract(message: str, code: str) -> None:
             raise ReplayRiskGateError(str(message), code=code or "invalid_authoritative_plan")

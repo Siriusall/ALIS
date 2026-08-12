@@ -1,6 +1,7 @@
 from contextlib import contextmanager
 import hashlib
 import json
+from datetime import datetime
 
 import pytest
 
@@ -84,6 +85,29 @@ def test_planned_execution_time_ignores_delayed_first_rebalance(monkeypatch):
     monkeypatch.setattr(profit_loop, "remembered_first_rebalance_clock", lambda: profit_loop.dtime(16, 37))
 
     assert profit_loop._planned_execute_at("20260723") == "2026-07-23T15:01:00+08:00"
+
+
+def test_formal_plan_due_gate_respects_frozen_execution_timestamp():
+    plan = {"planned_execute_date": "20260812", "planned_execute_at": "2026-08-12T15:01:00+08:00"}
+
+    assert profit_loop._formal_plan_is_due(
+        plan, now=datetime.fromisoformat("2026-08-12T15:00:59+08:00"),
+    ) is False
+    assert profit_loop._formal_plan_is_due(
+        plan, now=datetime.fromisoformat("2026-08-12T15:01:00+08:00"),
+    ) is True
+
+
+def test_formal_plan_due_gate_rejects_invalid_timestamp():
+    with pytest.raises(ValueError, match="执行时刻格式无效"):
+        profit_loop._formal_plan_is_due({"planned_execute_date": "20260812", "planned_execute_at": "not-a-time"})
+
+
+def test_formal_plan_due_gate_keeps_historical_contract_rows_compatible():
+    assert profit_loop._formal_plan_is_due(
+        {"planned_execute_date": "20260811", "planned_execute_at": ""},
+        now=datetime.fromisoformat("2026-08-12T09:00:00+08:00"),
+    ) is True
 
 
 def test_unified_contract_keeps_small_positive_frozen_weight_as_execution_target(monkeypatch):
