@@ -11,6 +11,8 @@ def test_normalize_ts_code_preserves_suffix_and_maps_exchange_prefixes():
     assert gates.normalize_ts_code("510300") == "510300.SH"
     assert gates.normalize_ts_code("000001") == "000001.SZ"
     assert gates.normalize_ts_code("300001.sz") == "300001.SZ"
+    assert gates.normalize_ts_code("430001") == "430001.BJ"
+    assert gates.normalize_ts_code("830001") == "830001.BJ"
 
 
 def test_unsupported_market_model_falls_back_without_changing_transparent_state(monkeypatch):

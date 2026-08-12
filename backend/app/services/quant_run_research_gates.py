@@ -9,7 +9,11 @@ def normalize_ts_code(symbol: str) -> str:
     value = str(symbol or "").strip().upper()
     if "." in value:
         return value
-    return f"{value}.SH" if value[:1] in {"5", "6", "9"} else f"{value}.SZ"
+    return (
+        f"{value}.SH" if value[:1] in {"5", "6", "9"}
+        else f"{value}.BJ" if value[:1] in {"4", "8"}
+        else f"{value}.SZ"
+    )
 
 
 def production_market_context_as_of(
