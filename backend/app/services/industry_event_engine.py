@@ -8,8 +8,11 @@ import math
 import re
 import time
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from app.data_platform.db import _conn
+
+_BUSINESS_TZ = ZoneInfo("Asia/Shanghai")
 
 
 INDUSTRY_WEIGHTS = {
@@ -865,7 +868,7 @@ def _days_since(value: str, as_of_date: str | None = None) -> int:
             parsed = datetime.strptime(text[:8], "%Y%m%d").date()
         except ValueError:
             return 0
-    reference = date.today()
+    reference = datetime.now(_BUSINESS_TZ).date()
     if as_of_date:
         text = str(as_of_date)[:10].replace("-", "")
         try:
@@ -895,7 +898,7 @@ def _followup_date(event_date: Any, publish_time: Any, half_life_days: int) -> t
             return (base + timedelta(days=max(7, int(half_life_days) // 2))).isoformat(), False
         except ValueError:
             continue
-    return date.today().isoformat(), True
+    return datetime.now(_BUSINESS_TZ).date().isoformat(), True
 
 
 def score_event(item: dict[str, Any], *, as_of_date: str | None = None) -> dict[str, Any]:
@@ -1150,7 +1153,7 @@ def materialize_event_followups(*, limit: int = 500, thesis_reviews: list[dict[s
                    status=CASE WHEN status IN ('resolved','dismissed') THEN status ELSE 'in_review' END,
                    updated_at=?
                WHERE next_followup_date IS NULL OR next_followup_date=''""",
-            (date.today().isoformat(), now),
+            (datetime.now(_BUSINESS_TZ).date().isoformat(), now),
         ).rowcount
     return {"ok": True, "events": len(events), "written": written, "thesis_reviews_attached": len(reviews_by_event), "repaired_missing_dates": int(repaired or 0)}
 
