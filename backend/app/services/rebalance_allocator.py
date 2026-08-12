@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import Dict, List
 
 from app.core.a_share_fees import LOT_SIZE, apply_slippage_buy, cost_buy
@@ -59,7 +60,24 @@ def _build_tradable_orders(
     tradable: List[OrderRequest] = []
     blocked: List[OrderResult] = []
     for order in candidates:
-        raw_price = max(float(order.price or 0), 0.01)
+        try:
+            candidate_price = float(order.price or 0)
+        except (TypeError, ValueError):
+            candidate_price = 0.0
+        if not math.isfinite(candidate_price) or candidate_price <= 0:
+            blocked.append(
+                OrderResult(
+                    symbol=order.symbol,
+                    side=order.side,
+                    price=0.0,
+                    quantity=0,
+                    status="blocked",
+                    message="无有效开盘价，禁止生成买入订单",
+                    block_code="invalid_open_price",
+                )
+            )
+            continue
+        raw_price = candidate_price
         tradable_check = check_open_trade_constraints(
             side="BUY",
             symbol=order.symbol,
