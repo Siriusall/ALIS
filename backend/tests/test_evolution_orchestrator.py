@@ -917,6 +917,10 @@ def test_historical_contract_reconciliation_reason_is_limited_to_retired_binding
         "task_type": "controller_candidate_observation",
         "error": "database deadlock",
     }) is None
+    assert evolution._historical_contract_incompatibility_reason({
+        "task_type": "factor_research_cycle",
+        "error": "冻结策略包缺少因子绑定：is_st,is_suspended",
+    })
 
 
 def test_historical_data_gate_reconciliation_requires_persisted_blocked_evidence():

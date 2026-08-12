@@ -374,6 +374,7 @@ def _historical_contract_incompatibility_reason(task: dict[str, Any]) -> str | N
     """Recognise retired frozen bindings that cannot become valid by retrying."""
     if str(task.get("task_type") or "") not in {
         "controller_candidate_observation",
+        "factor_research_cycle",
         "model_shadow_observation",
         "model_strategy_impact_validation",
         "strategy_shadow_cycle",
