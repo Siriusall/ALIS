@@ -1589,9 +1589,13 @@ def run_quant_task_async(task_id: int) -> bool:
                 "legacy_authoritative_plan",
                 "invalid_authoritative_plan",
                 "invalid_authoritative_plan_hash",
+                "invalid_planned_execute_at",
                 "incompatible_frozen_system_release",
             }
-            if mode == "autonomous_daily" and error_code == "formal_plan_not_due":
+            if mode == "autonomous_daily" and error_code in {
+                "formal_plan_not_due",
+                "formal_plan_not_claimable",
+            }:
                 _transition_task_status(
                     task_id,
                     "pending",
@@ -1601,7 +1605,7 @@ def run_quant_task_async(task_id: int) -> bool:
                     finished_at=None,
                     **_waiting_schedule_projection(),
                 )
-                logger.info("autonomous plan not due yet task_id=%s", task_id)
+                logger.info("autonomous plan is not claimable yet task_id=%s code=%s", task_id, error_code)
                 return
             if mode == "autonomous_daily" and error_code in contract_rejections:
                 committed_records = list_quant_run_task_records(task_id, limit=5000)
