@@ -2666,15 +2666,21 @@ def resolve_mature_fund_nav_empty_requests(*, limit: int = 500) -> dict[str, Any
 
 
 def resolve_mature_optional_daily_empty_requests(*, limit: int = 100) -> dict[str, Any]:
-    """Close historical optional daily enrichments without assigning a numeric value."""
+    """Close mature optional daily gaps without assigning a numeric value.
+
+    ``moneyflow_hsgt`` is an optional research enrichment.  Once its two-open-
+    session publication window has elapsed, a network failure cannot keep the
+    same historical slice pending indefinitely: no numeric value is inferred,
+    but the exact request is terminally recorded as unavailable.
+    """
     cutoff = _etf_nav_publish_cutoff(_local_business_date_string())
     cap = max(1, min(int(limit), 500))
     with _conn() as c:
         rows = c.execute(
             """SELECT id,api_name,params_json,limit_rows
-                 FROM dc_tushare_failed_requests
+                FROM dc_tushare_failed_requests
                 WHERE api_name='moneyflow_hsgt' AND status='pending'
-                  AND error_category IN ('empty_pending','upstream_not_ready')
+                  AND error_category IN ('empty_pending','upstream_not_ready','transient')
                 ORDER BY last_failed_at,id LIMIT ?""",
             (cap,),
         ).fetchall()
@@ -2699,7 +2705,7 @@ def resolve_mature_optional_daily_empty_requests(*, limit: int = 100) -> dict[st
     return {
         "ok": True, "status": "completed", "cutoff": cutoff,
         "examined": len(rows), "resolved": resolved, "skipped": skipped,
-        "policy": "optional_moneyflow_hsgt_empty_only_after_two_open_session_lag",
+        "policy": "optional_moneyflow_hsgt_gap_terminal_after_two_open_session_lag",
     }
 
 

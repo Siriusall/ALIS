@@ -278,6 +278,42 @@ def test_mature_empty_cleanup_uses_shanghai_business_date_not_host_timezone():
     ) == "20260812"
 
 
+def test_mature_optional_daily_cleanup_closes_transient_gap_after_publish_lag(monkeypatch):
+    captured = []
+
+    class Result:
+        def fetchall(self):
+            return [
+                {"id": 1, "api_name": "moneyflow_hsgt", "params_json": '{"trade_date":"20260806"}', "limit_rows": None},
+                {"id": 2, "api_name": "moneyflow_hsgt", "params_json": '{"trade_date":"20260812"}', "limit_rows": None},
+            ]
+
+    class Connection:
+        def execute(self, _sql, _params=()):
+            return Result()
+
+    class Context:
+        def __enter__(self): return Connection()
+        def __exit__(self, *_args): return False
+
+    monkeypatch.setattr(data_center, "_conn", lambda: Context())
+    monkeypatch.setattr(data_center, "_local_business_date_string", lambda: "20260813")
+    monkeypatch.setattr(data_center, "_etf_nav_publish_cutoff", lambda _date: "20260811")
+    monkeypatch.setattr(
+        data_center,
+        "_bulk_mark_requests_valid_empty",
+        lambda api, records, **kwargs: captured.extend((api, row, kwargs) for row in records) or len(records),
+    )
+
+    result = data_center.resolve_mature_optional_daily_empty_requests()
+
+    assert result["resolved"] == 1
+    assert result["skipped"] == 1
+    assert captured[0][0] == "moneyflow_hsgt"
+    assert captured[0][1] == (1, {"trade_date": "20260806"}, None)
+    assert "terminal_after_two_open_session_lag" in result["policy"]
+
+
 def test_valid_empty_cleanup_batches_coverage_and_resolution(monkeypatch):
     batches = []
 
