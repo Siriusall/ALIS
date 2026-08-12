@@ -2299,7 +2299,7 @@ def _frozen_execution_order_limits(plan: dict[str, Any]) -> dict[tuple[str, str]
     limits: dict[tuple[str, str], int] = {}
     for item in frozen_orders:
         if not isinstance(item, dict):
-            return None
+            return {}
         symbol = str(item.get("symbol") or "").strip().upper()
         side = str(item.get("side") or "").strip().upper()
         try:

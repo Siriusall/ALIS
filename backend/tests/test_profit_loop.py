@@ -651,3 +651,21 @@ def test_execution_chain_slo_rejects_operations_outside_v2_frozen_orders(monkeyp
     assert result["metrics"]["frozen_order_integrity_anomaly_count"] == 1
     assert result["metrics"]["executed_binding_anomaly_count"] == 1
     assert "实际成交超出冻结订单的标的、方向或数量" in result["current_blockers"]
+
+
+def test_execution_chain_slo_fails_closed_for_malformed_v2_frozen_orders(monkeypatch):
+    monkeypatch.setattr(profit_loop, "_ensure_tables", lambda: None)
+    plan = _slo_plan(1, execution_id=1)
+    plan["proposal_json"] = json.dumps({
+        "schema_version": "alis_unified_daily_decision_v2",
+        "execution_authorized": True,
+        "proposal": [{"action": "buy", "weight_change": .1}],
+        "execution_orders": ["not-an-order"],
+    })
+    result = profit_loop.build_execution_chain_slo(
+        [plan], [{"execution_id": 1, "operation_uid": "op-1", "symbol": "510300", "side": "BUY", "quantity": 100}],
+        as_of_date="20260731", window_plans=1,
+    )
+
+    assert result["status"] == "failed"
+    assert result["metrics"]["frozen_order_integrity_anomaly_count"] == 1
