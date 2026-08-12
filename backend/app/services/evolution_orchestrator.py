@@ -1632,7 +1632,12 @@ def _execute_strategy_cycle(
 ) -> dict[str, Any]:
     audit = audit_oos_hard_data(include_dates=False)
     if audit.get("status") != "ready":
-        raise RuntimeError("OOS 永久硬数据未就绪")
+        return {
+            "status": "blocked_by_oos_hard_data",
+            "reason": "permanent_oos_hard_data_not_ready",
+            "hard_data_audit": audit,
+            "production_change_forbidden": True,
+        }
     payload = task.get("payload") if isinstance(task.get("payload"), dict) else {}
     checkpoint = task.get("checkpoint") if isinstance(task.get("checkpoint"), dict) else {}
     checkpoint_targets = (
@@ -2504,6 +2509,34 @@ def _defer_for_decision_data(
     )
 
 
+def _defer_for_oos_hard_data(task: dict[str, Any], result: dict[str, Any]) -> bool:
+    """Keep formal OOS evidence pending while an external hard-data gate blocks it."""
+    now = _now()
+    audit = result.get("hard_data_audit") if isinstance(result.get("hard_data_audit"), dict) else {}
+    non_repairable = list(audit.get("non_repairable_dates") or [])
+    return _update_active_task(
+        int(task["id"]),
+        statuses=("running",),
+        require_not_stopped=True,
+        expected_lease_owner=WORKER_ID,
+        status="retry_wait",
+        phase="waiting_for_oos_hard_data",
+        message=(
+            "正式 OOS 永久硬数据未就绪，保留检查点等待数据合同变化"
+            if not non_repairable
+            else "正式 OOS 被历史点时不可用数据阻断，保留检查点等待外部可验证修复"
+        ),
+        result=result,
+        error=None,
+        attempt=max(0, int(task.get("attempt") or 1) - 1),
+        next_run_at=(now + timedelta(seconds=DECISION_DATA_RETRY_SECONDS)).isoformat(),
+        lease_owner=None,
+        lease_expires_at=None,
+        deadline_at=None,
+        heartbeat_at=now.isoformat(),
+    )
+
+
 def _checkpoint_progress_marker(checkpoint: dict[str, Any]) -> str:
     completed = checkpoint.get("completed") if isinstance(
         checkpoint.get("completed"), list
@@ -2857,6 +2890,9 @@ def _run_claimed_task(task: dict[str, Any]) -> dict[str, Any]:
         result = execute_evolution_task(task)
         if str(result.get("status") or "") == "blocked_by_decision_data":
             _defer_for_decision_data(task, result)
+            return get_evolution_task(task_id) or task
+        if str(result.get("status") or "") == "blocked_by_oos_hard_data":
+            _defer_for_oos_hard_data(task, result)
             return get_evolution_task(task_id) or task
         if str(result.get("status") or "") == "blocked_incomplete_factor_bindings":
             _finish_contract_block(task, result)

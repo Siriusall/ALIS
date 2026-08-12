@@ -511,6 +511,28 @@ def test_data_gate_deferral_reuses_task_id_and_does_not_consume_attempt(monkeypa
     assert transition["deadline_at"] is None
 
 
+def test_oos_hard_data_deferral_reuses_task_id_and_does_not_consume_attempt(monkeypatch):
+    transition = {}
+    monkeypatch.setattr(
+        evolution,
+        "_update_active_task",
+        lambda task_id, **fields: transition.update({"task_id": task_id, **fields}) or True,
+    )
+    blocked = {
+        "status": "blocked_by_oos_hard_data",
+        "hard_data_audit": {"status": "blocked", "non_repairable_dates": ["20260701"]},
+    }
+
+    assert evolution._defer_for_oos_hard_data({"id": 92, "attempt": 1}, blocked) is True
+
+    assert transition["task_id"] == 92
+    assert transition["status"] == "retry_wait"
+    assert transition["phase"] == "waiting_for_oos_hard_data"
+    assert transition["attempt"] == 0
+    assert transition["result"] == blocked
+    assert transition["lease_owner"] is None
+
+
 def test_cycle_uses_checkpoint_and_reports_overall_progress(monkeypatch):
     monkeypatch.setattr(evolution, "audit_oos_hard_data", lambda **kwargs: {
         "status": "ready", "window_start": "20200101", "window_end": "20261231",
