@@ -1209,6 +1209,21 @@ def resolve_legacy_daily_index_weight_requests(*, limit: int = 100) -> dict[str,
         "index_weight", records,
         reason="superseded_single_day_probe_by_monthly_index_weight_window",
     )
+    # Keep the ingestion ledger aligned with the request-coverage terminal
+    # state; otherwise task-center still reports the retired probes as failed.
+    with _conn() as c:
+        for _request_id, params, _limit_rows in records:
+            start_date = str(params.get("start_date") or "")
+            end_date = str(params.get("end_date") or "")
+            c.execute(
+                """UPDATE data_ingestion_runs
+                      SET status='valid_empty', error=NULL
+                    WHERE job_name='tushare.index_weight'
+                      AND status='failed'
+                      AND meta_json LIKE ?
+                      AND meta_json LIKE ?""",
+                (f'%"start_date": "{start_date}"%', f'%"end_date": "{end_date}"%'),
+            )
     return {
         "ok": True, "status": "completed", "examined": len(rows),
         "resolved": resolved, "skipped": skipped,
