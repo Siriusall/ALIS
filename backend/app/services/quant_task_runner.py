@@ -430,6 +430,17 @@ def _reconcile_missed_plans_by_wall_clock(now: datetime) -> int:
     )
 
 
+def _auto_simulation_check_due(now: datetime, close_time: dtime) -> bool:
+    """Run close execution probes only on an A-share trading session.
+
+    Calendar weekdays include exchange holidays.  Starting the close-data
+    workflow on those dates creates avoidable upstream requests and can make a
+    normal holiday look like an execution-data delay.
+    """
+    business_now = now.astimezone(_BUSINESS_TZ) if now.tzinfo else now.replace(tzinfo=_BUSINESS_TZ)
+    return is_trade_day(business_now.date()) and business_now.time() >= close_time
+
+
 def start_auto_simulation_scheduler() -> bool:
     """Start the close-of-day simulator trigger once per process.
 
@@ -459,7 +470,7 @@ def start_auto_simulation_scheduler() -> bool:
                     )
                 from app.services.profit_loop import effective_rebalance_clock
                 close_time = effective_rebalance_clock()
-                if now.weekday() < 5 and now.time() >= close_time:
+                if _auto_simulation_check_due(now, close_time):
                     target, data_ready = _ensure_close_data_ready()
                     if not data_ready:
                         # Do not execute against the latest *old* slice while

@@ -291,6 +291,17 @@ def test_weekend_wall_clock_closes_prior_day_plan_without_waiting_for_new_market
     assert captured == ["20260801"]
 
 
+def test_auto_simulation_skips_exchange_holidays_but_runs_on_trade_days() -> None:
+    close_time = quant_task_runner.dtime(15, 1)
+
+    assert quant_task_runner._auto_simulation_check_due(
+        datetime(2026, 10, 1, 15, 2), close_time,
+    ) is False
+    assert quant_task_runner._auto_simulation_check_due(
+        datetime(2026, 8, 13, 15, 1), close_time,
+    ) is True
+
+
 def test_trading_session_uses_utc8_not_host_timezone() -> None:
     # 01:30 UTC is 09:30 in Shanghai and must be an open-session time.
     assert quant_task_runner._is_trading_session_now(
