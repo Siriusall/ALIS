@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from concurrent.futures import ThreadPoolExecutor
 import threading
 import time
@@ -22,6 +23,7 @@ from app.services.profit_loop import (
 from app.services.simulation_ledger_audit import audit_simulation_ledger
 
 router = APIRouter()
+_BUSINESS_TZ = ZoneInfo("Asia/Shanghai")
 
 _READINESS_CACHE_TTL_SECONDS = 8.0
 _readiness_cache_lock = threading.Lock()
@@ -44,7 +46,7 @@ def _read_gate(key: str, label: str, reader: Callable[[], dict[str, Any]]) -> di
 
 
 def _today_ymd() -> str:
-    return datetime.now().astimezone().date().strftime("%Y%m%d")
+    return datetime.now(_BUSINESS_TZ).date().strftime("%Y%m%d")
 
 
 @router.get("/trading-ready")
@@ -178,7 +180,7 @@ def trading_readiness(detail: str = Query("full", pattern="^(full|compact)$")) -
 
     response = {
         "schema_version": "alis_trading_readiness_v1",
-        "checked_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "checked_at": datetime.now(_BUSINESS_TZ).isoformat(timespec="seconds"),
         "status": status,
         "trading_ready": status == "ready",
         "summary": summary,
