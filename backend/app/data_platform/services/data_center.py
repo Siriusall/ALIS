@@ -306,6 +306,39 @@ def _resolve_failed_tushare_request(api_name: str, params: dict[str, Any], limit
     redis_set_remove("alis:data-platform:tushare:failed", key)
 
 
+def resolve_covered_failed_tushare_requests(*, limit: int = 500) -> dict[str, Any]:
+    """Close stale failures only when their exact request already has terminal evidence."""
+    cap = max(1, min(int(limit), 2_000))
+    with _conn() as c:
+        rows = c.execute(
+            """SELECT f.id,f.request_key
+                 FROM dc_tushare_failed_requests f
+                 JOIN dc_tushare_request_coverage q ON q.request_key=f.request_key
+                WHERE f.status='pending' AND q.result_status IN ('success','not_applicable','valid_empty','deferred_empty')
+                ORDER BY f.id LIMIT ?""",
+            (cap,),
+        ).fetchall()
+        ids = [int(dict(row)["id"]) for row in rows]
+        if ids:
+            resolved_sql = """UPDATE dc_tushare_failed_requests SET status='resolved',resolved_at=?
+                              WHERE id=? AND status='pending'"""
+            resolved_rows = [(_now(), request_id) for request_id in ids]
+            cursor = c.raw.cursor() if bool(getattr(c, "_is_postgres", False)) else c.raw
+            cursor.executemany(
+                resolved_sql.replace("?", "%s") if bool(getattr(c, "_is_postgres", False)) else resolved_sql,
+                resolved_rows,
+            )
+    for row in rows:
+        redis_set_remove("alis:data-platform:tushare:failed", str(dict(row)["request_key"]))
+    return {
+        "ok": True,
+        "status": "completed",
+        "examined": len(ids),
+        "resolved": len(ids),
+        "policy": "exact_request_key_with_terminal_coverage_only",
+    }
+
+
 def _record_request_coverage(
     api_name: str, params: dict[str, Any], limit_rows: int | None, rows_read: int,
     *, result_status: str = "success", result_reason: str = "",

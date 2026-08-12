@@ -149,6 +149,7 @@ def test_production_data_operations_never_calls_llm(monkeypatch) -> None:
     calls = []
     monkeypatch.setattr(data_ops, "_conn", open_connection)
     monkeypatch.setattr(data_ops, "_ensure_table", lambda: None)
+    monkeypatch.setattr(data_center, "resolve_covered_failed_tushare_requests", lambda **_kwargs: {"ok": True, "resolved": 0})
     monkeypatch.setattr(data_center, "resolve_mature_fund_nav_empty_requests", lambda **_kwargs: {"ok": True, "resolved": 0})
     monkeypatch.setattr(data_center, "resolve_mature_optional_daily_empty_requests", lambda **_kwargs: {"ok": True, "resolved": 0})
     monkeypatch.setattr(data_ops, "build_data_operations_evidence", lambda **_kwargs: evidence)
@@ -164,9 +165,47 @@ def test_production_data_operations_never_calls_llm(monkeypatch) -> None:
     assert calls == []
     assert result["execution_mode"] == "deterministic"
     assert result["llm_advisory"]["status"] == "detached_from_production_cycle"
+    assert result["covered_failure_cleanup"]["resolved"] == 0
     assert result["fund_nav_cleanup"]["resolved"] == 0
     assert result["optional_daily_cleanup"]["resolved"] == 0
     assert connection.execute("SELECT model FROM llm_data_operation_cases").fetchone()[0] == "deterministic_governance"
+
+
+def test_covered_failure_reconciliation_requires_the_exact_request_key(monkeypatch) -> None:
+    connection = sqlite3.connect(":memory:")
+    connection.row_factory = sqlite3.Row
+    connection.executescript("""
+        CREATE TABLE dc_tushare_failed_requests(
+            id INTEGER PRIMARY KEY,request_key TEXT,status TEXT,resolved_at TEXT
+        );
+        CREATE TABLE dc_tushare_request_coverage(
+            request_key TEXT PRIMARY KEY,result_status TEXT
+        );
+        INSERT INTO dc_tushare_failed_requests VALUES(1,'covered','pending',NULL);
+        INSERT INTO dc_tushare_failed_requests VALUES(2,'different','pending',NULL);
+        INSERT INTO dc_tushare_request_coverage VALUES('covered','success');
+        INSERT INTO dc_tushare_request_coverage VALUES('different-params','success');
+    """)
+
+    class Wrapper:
+        def execute(self, sql, params=()):
+            return connection.execute(sql, params)
+
+        raw = connection
+
+    @contextmanager
+    def open_connection():
+        yield Wrapper()
+        connection.commit()
+
+    monkeypatch.setattr(data_center, "_conn", open_connection)
+    monkeypatch.setattr(data_center, "redis_set_remove", lambda *_args: None)
+
+    result = data_center.resolve_covered_failed_tushare_requests(limit=10)
+
+    assert result["resolved"] == 1
+    assert connection.execute("SELECT status FROM dc_tushare_failed_requests WHERE id=1").fetchone()[0] == "resolved"
+    assert connection.execute("SELECT status FROM dc_tushare_failed_requests WHERE id=2").fetchone()[0] == "pending"
 
 
 def test_targeted_retry_enforces_category_attempt_and_batch_boundaries(monkeypatch) -> None:
