@@ -1723,6 +1723,15 @@ def create_and_apply_buy_execution(
     ]
     if not buy_orders:
         raise ValueError("buy orders are required")
+    for item in buy_orders:
+        symbol = str(item.get("symbol") or "").strip()
+        quantity = int(item.get("quantity") or 0)
+        price = float(item.get("price") or 0)
+        fees = [float(item.get(key) or 0) for key in ("commission", "transfer_fee", "stamp_tax")]
+        if not symbol or quantity <= 0 or not math.isfinite(price) or price <= 0:
+            raise ValueError("invalid_buy_order")
+        if any(not math.isfinite(fee) or fee < 0 for fee in fees):
+            raise ValueError("invalid_buy_order_fees")
     total_cost = round(sum(
         float(item.get("price") or 0) * int(item.get("quantity") or 0)
         + sum(float(item.get(key) or 0) for key in ("commission", "transfer_fee", "stamp_tax"))
