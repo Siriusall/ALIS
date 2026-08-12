@@ -483,12 +483,19 @@ def run_system_autonomy_cycle(*, trade_date: str = "") -> dict[str, Any]:
         ),
         experimental_step("factor_daily_cycle", run_factor_daily_cycle),
         experimental_step("plan_model_autonomy", lambda: run_auto_optimization_once(force=False)),
-        experimental_step(
-            "strategy_shadow_recovery",
-            lambda: enqueue_strategy_shadow_daily_task(
-                frozen_trade_date or str((decision_data.get("readiness") or {}).get("target_trade_date") or ""),
-                hard_data_audit=(hard_data_step.get("result") or {}),
-            ),
+        # Future shadow consumes the current experiment gate and the
+        # candidate's already-frozen formal evidence. It must not inherit the
+        # rolling historical OOS audit, whose historical PIT failures cannot
+        # become repairable through time.
+        (
+            _run_step(
+                "strategy_shadow_recovery",
+                lambda: enqueue_strategy_shadow_daily_task(
+                    frozen_trade_date or str((decision_data.get("readiness") or {}).get("target_trade_date") or ""),
+                ),
+            )
+            if bool(decision_data.get("experiment_ready"))
+            else _skip_experimental_step("strategy_shadow_recovery", decision_data)
         ),
         _run_step("periodic_performance_review", run_periodic_performance_review),
         _run_step("review_data_quality_governance", run_review_data_quality_governance),

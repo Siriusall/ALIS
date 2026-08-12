@@ -1411,43 +1411,27 @@ def create_strategy_controller_oos_task(
 
 def enqueue_strategy_shadow_daily_task(
     trade_date: str,
-    *,
-    hard_data_audit: dict[str, Any],
 ) -> dict[str, Any]:
-    """Queue one idempotent, one-session Shadow advancement task."""
+    """Queue one idempotent, one-session future Shadow observation task."""
     normalized_date = str(trade_date or "").replace("-", "")[:8]
     if len(normalized_date) != 8 or not normalized_date.isdigit():
         return {"ok": False, "status": "invalid_trade_date", "trade_date": normalized_date}
-    if str(hard_data_audit.get("status") or "") != "ready":
-        return {
-            "ok": True,
-            "status": "blocked_by_oos_hard_data",
-            "trade_date": normalized_date,
-            "production_change_forbidden": True,
-        }
-    audit_contract = {
-        key: hard_data_audit.get(key)
-        for key in ("status", "window_start", "window_end", "eligible_sessions", "required_sessions", "schema_version")
-    }
-    fingerprint = hashlib.sha256(json.dumps(
-        audit_contract, sort_keys=True, separators=(",", ":"), default=str,
-    ).encode("utf-8")).hexdigest()[:16]
     task = create_evolution_task(
         task_type="strategy_shadow_cycle",
         payload={
             "trigger": "daily_system_autonomy",
             "target_trade_date": normalized_date,
             "max_new_sessions": 1,
-            "hard_data_audit": audit_contract,
-            "observation_contract": "alis_strategy_shadow_incremental_task_v3",
+            "observation_contract": "alis_strategy_shadow_incremental_task_v4",
+            "data_contract": "current_experiment_gate_and_candidate_frozen_formal_evidence_v1",
         },
-        dedupe_key=f"strategy_shadow_daily:v3:{normalized_date}:{fingerprint}",
+        dedupe_key=f"strategy_shadow_daily:v4:{normalized_date}",
         max_attempts=3,
         priority=75,
     )
     return {
         "ok": True,
-        "schema_version": "alis_strategy_shadow_dispatch_v3",
+        "schema_version": "alis_strategy_shadow_dispatch_v4",
         "status": str(task.get("status") or "queued"),
         "trade_date": normalized_date,
         "task": {key: task.get(key) for key in ("id", "status", "phase", "progress", "message")},
@@ -2025,7 +2009,6 @@ def execute_evolution_task(
                 1, min(int(payload.get("max_new_sessions") or 1), 1)
             ),
             target_trade_date=str(payload.get("target_trade_date") or ""),
-            hard_data_audit=(payload.get("hard_data_audit") if isinstance(payload.get("hard_data_audit"), dict) else None),
             progress_callback=shadow_checkpoint,
         )
     if task_type == "factor_daily_cycle":

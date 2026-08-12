@@ -1647,6 +1647,12 @@ ALIS 的目标运行方式调整为“系统自治、结果可见、异常才打
 
 - [x] 正式 OOS/StrategyController OOS 任务在运行时再次遇到永久硬数据阻断，旧实现会抛普通异常并被归类为未知训练失败，错误消耗失败语义并升级所有者。现在返回 `blocked_by_oos_hard_data`，同一持久任务转为 `retry_wait/waiting_for_oos_hard_data`，保留检查点、释放租约、回退本次领取的 attempt，且不完成任务、不创建后续研究链、不改变生产。真实当前硬门返回 `1505/1537` 与32个不可修复历史点时日期，专项进化、策略生命周期和自治回归95项通过。
 
+# 2026-08-12：候选立即观察生命周期 V1
+
+- [x] 将“候选是否正在观察”和“候选是否有生产资格”拆成两套正交状态。新增 `candidate_lifecycle_records/events`：运行状态固定为 `created/observing/stopped/archived`，生产资格固定为 `ineligible/evaluating/eligible/promoted/rolled_back`；模型、策略、StrategyController、因子和组合候选继续保留各自原生版本状态以兼容现有消费者，但新候选经统一 `create_model_version()` 创建时立即登记为 `observing + ineligible`，默认 `production_change_forbidden=true`。候选无需先通过收益、正式 OOS、A/B、统计或密封集才能开始隔离观察；这些门只决定后续生产权限。
+- [x] 统一保存候选类型、`bugfix/performance_tuning/structural_change` 变更类型、根实验、父版本、替代版本、问题族和变更字段；生命周期事件只追加不覆盖。效果调优的新版本不得继承父版本观察收益，程序修复也生成可追溯的新版本。真实幂等登记当前仍在候选/观察状态的44个历史版本：策略16、StrategyController 9、模型19，全部保持 `observing + ineligible`，未改变 Champion、模型生产绑定、账户、持仓、订单或成交。
+- [x] 修复策略未来 Shadow 错误重复依赖滚动永久 OOS 窗口的问题。32个历史切片在对应T日15:00后才入库，正式 OOS 必须继续严格阻断且不得伪造可用时间；未来 Shadow 改为消费当前实验数据门、候选冻结证据和逐日点时回放，不再因不可逆历史缺口永久死锁。真实 `20260812` 策略 Shadow 入口返回 `completed/candidate_count=0/production_change_forbidden=true`；五业务模型独立未来 Shadow 状态不变。数据库修订头推进到 `sim_0004_candidate_lifecycle`，后端全量回归 `1098 passed、1 skipped、6 subtests passed`。
+
 # 2026-08-12：运行健康与正式计划 SQL 修复
 
 - [x] 健康/就绪探针原先只展示启动时记录的数据库修订；进程长时间未重启时，代码或迁移头已变化仍可能保持绿灯。现 `/api/health` 与 `/api/ready` 每次实时读取双库 Alembic 版本并与运行代码期望头比较，版本不一致即返回未就绪及精确 current/expected 证据，避免把旧运行实例误报为可发布。

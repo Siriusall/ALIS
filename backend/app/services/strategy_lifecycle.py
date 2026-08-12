@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 import json
 from math import isfinite
 from typing import Any, Callable
 
-from app.data_platform.services.oos_hard_data import audit_oos_hard_data
 from app.db.store import (
     _conn,
     get_model_version,
@@ -29,6 +28,7 @@ SHADOW_MAXIMUM_SESSIONS = 60
 COOLING_MINIMUM_SESSIONS = 20
 SHADOW_RETURN_CONTRACT = "non_overlapping_daily_equity_v1"
 SHADOW_MINIMUM_EFFECTIVE_REBALANCES = 4
+SHADOW_REPLAY_LOOKBACK_CALENDAR_DAYS = 90
 
 
 def _number(value: Any, default: float = 0.0) -> float:
@@ -716,25 +716,9 @@ def run_strategy_shadow_cycle(
     replay_runner: Callable[..., dict[str, Any]] = run_strategy_replay,
     max_new_sessions_per_candidate: int = 5,
     target_trade_date: str = "",
-    hard_data_audit: dict[str, Any] | None = None,
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
-    audit = dict(hard_data_audit or audit_oos_hard_data(include_dates=False))
-    if audit.get("status") != "ready":
-        return {
-            "ok": True,
-            "schema_version": "alis_strategy_shadow_cycle_v2",
-            "status": "blocked_by_oos_hard_data",
-            "reason": "OOS 永久硬数据未就绪，影子观察冻结",
-            "hard_data": audit,
-            "results": [],
-            "production_change_forbidden": True,
-        }
-    ds = BacktestDataSource()
-    dates = ds.get_available_trade_dates(str(audit["window_start"]), str(audit["window_end"]))
     target_key = _date_key(target_trade_date)
-    if target_key:
-        dates = [date for date in dates if _date_key(date) <= target_key]
     active = resolve_production_strategy_champion()
     all_versions = list_model_versions("alis_strategy_challenger", limit=100)
     candidates = [
@@ -755,6 +739,41 @@ def run_strategy_shadow_cycle(
             )
         )
     ]
+    # Future shadow is an online observation, not a second formal-OOS run.
+    # Candidates reach this stage only after formal OOS, statistics and sealed
+    # holdout gates have been frozen in their validation evidence. Requiring
+    # the rolling historical OOS window here creates a permanent deadlock when
+    # an old slice was first received after its original T-day cutoff.
+    #
+    # Replay only needs a bounded pre-signal context for the candidate's own
+    # daily return. Its point-in-time reads remain checked per observation.
+    if not candidates:
+        return {
+            "ok": True,
+            "schema_version": "alis_strategy_shadow_cycle_v3" if target_key else "alis_strategy_shadow_cycle_v2",
+            "status": "completed",
+            "target_trade_date": target_key,
+            "execution_mode": "persistent_one_session" if target_key else "compatibility_batch",
+            "candidate_count": 0,
+            "results": [],
+            "data_contract": "current_experiment_gate_and_candidate_frozen_formal_evidence_v1",
+            "production_change_forbidden": True,
+        }
+    shadow_floors = [
+        _date_key((version.get("validation") or {}).get("parallel_shadow_started_after")
+                  or (version.get("validation") or {}).get("shadow_started_after"))
+        for version in candidates
+    ]
+    shadow_floors = [value for value in shadow_floors if len(value) == 8 and value.isdigit()]
+    # A persisted shadow_passed candidate resumes promotion without another
+    # replay and therefore legitimately has no observation start marker.
+    replay_end = target_key or max(shadow_floors or [_date_key(datetime.now())])
+    replay_start = (datetime.strptime(min(shadow_floors or [replay_end]), "%Y%m%d")
+                    - timedelta(days=SHADOW_REPLAY_LOOKBACK_CALENDAR_DAYS)).strftime("%Y%m%d")
+    ds = BacktestDataSource()
+    dates = ds.get_available_trade_dates(replay_start, replay_end)
+    if target_key:
+        dates = [date for date in dates if _date_key(date) <= target_key]
     results: list[dict[str, Any]] = []
     promotion_ready: list[tuple[dict[str, Any], dict[str, Any]]] = []
     for candidate in candidates:
@@ -1038,9 +1057,11 @@ def run_strategy_shadow_cycle(
     return {
         "schema_version": "alis_strategy_shadow_cycle_v3" if target_key else "alis_strategy_shadow_cycle_v2",
         "status": "completed",
-        "hard_data_end": str(audit["window_end"]),
         "target_trade_date": target_key,
         "execution_mode": "persistent_one_session" if target_key else "compatibility_batch",
         "candidate_count": len(candidates),
         "results": results,
+        "data_contract": "current_experiment_gate_and_candidate_frozen_formal_evidence_v1",
+        "replay_window": {"start": replay_start, "end": replay_end},
+        "production_change_forbidden": True,
     }

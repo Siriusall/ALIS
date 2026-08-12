@@ -739,6 +739,39 @@ CREATE TABLE IF NOT EXISTS model_versions (
     updated_at TEXT NOT NULL
 );
 CREATE UNIQUE INDEX IF NOT EXISTS uq_model_version ON model_versions (model_key, version);
+CREATE TABLE IF NOT EXISTS candidate_lifecycle_records (
+    model_version_id INTEGER PRIMARY KEY,
+    candidate_type TEXT NOT NULL,
+    runtime_status TEXT NOT NULL,
+    eligibility_status TEXT NOT NULL,
+    change_type TEXT NOT NULL,
+    root_experiment_id TEXT NOT NULL,
+    parent_model_version_id INTEGER,
+    supersedes_model_version_id INTEGER,
+    problem_family TEXT NOT NULL,
+    changed_fields_json TEXT NOT NULL DEFAULT '[]',
+    observation_contract TEXT NOT NULL,
+    production_change_forbidden INTEGER NOT NULL DEFAULT 1,
+    stop_reason TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (model_version_id) REFERENCES model_versions(id)
+);
+CREATE TABLE IF NOT EXISTS candidate_lifecycle_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    model_version_id INTEGER NOT NULL,
+    event_type TEXT NOT NULL,
+    runtime_status TEXT NOT NULL,
+    eligibility_status TEXT NOT NULL,
+    reason TEXT NOT NULL DEFAULT '',
+    evidence_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (model_version_id) REFERENCES model_versions(id)
+);
+CREATE INDEX IF NOT EXISTS idx_candidate_lifecycle_runtime
+ON candidate_lifecycle_records(runtime_status,candidate_type);
+CREATE INDEX IF NOT EXISTS idx_candidate_lifecycle_events_version
+ON candidate_lifecycle_events(model_version_id,id);
 CREATE TABLE IF NOT EXISTS model_train_runs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     status TEXT NOT NULL,
@@ -3370,7 +3403,18 @@ def create_model_version(
                 now,
             ),
         )
-        return c.last_insert_id()
+        model_version_id = c.last_insert_id()
+        if str(status) == "candidate" and not is_active:
+            from app.services.candidate_lifecycle import register_candidate_lifecycle
+
+            register_candidate_lifecycle(
+                c,
+                model_version_id=int(model_version_id),
+                model_key=str(model_key),
+                config=dict(config or {}),
+                validation=dict(validation or {}),
+            )
+        return model_version_id
 
 
 def set_active_model_version(model_version_id: int) -> None:

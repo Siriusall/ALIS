@@ -320,10 +320,6 @@ def test_shadow_cycle_records_non_overlapping_daily_returns_from_replay(monkeypa
         "config": {"strategy_id": 11},
     }
     recorded: list[dict] = []
-    monkeypatch.setattr(lifecycle, "audit_oos_hard_data", lambda **_kwargs: {
-        "status": "ready", "window_start": "20260801", "window_end": "20260802",
-    })
-
     class FakeSource:
         def get_available_trade_dates(self, *_args):
             return ["2026-08-01", "2026-08-02"]
@@ -375,8 +371,6 @@ def test_incremental_shadow_task_reuses_frozen_audit_and_processes_only_target_s
     }
     recorded = []
     checkpoints = []
-    monkeypatch.setattr(lifecycle, "audit_oos_hard_data", lambda **_kwargs: (_ for _ in ()).throw(AssertionError("must reuse frozen audit")))
-
     class FakeSource:
         def get_available_trade_dates(self, *_args):
             return ["2026-08-01", "2026-08-02", "2026-08-03"]
@@ -404,7 +398,6 @@ def test_incremental_shadow_task_reuses_frozen_audit_and_processes_only_target_s
         replay_runner=replay_runner,
         max_new_sessions_per_candidate=20,
         target_trade_date="20260802",
-        hard_data_audit={"status": "ready", "window_start": "20260801", "window_end": "20260803"},
         progress_callback=checkpoints.append,
     )
 
@@ -623,10 +616,6 @@ def test_shadow_competition_promotes_exactly_one_candidate(monkeypatch):
     validations = []
     statuses = []
     promotions = []
-    monkeypatch.setattr(lifecycle, "audit_oos_hard_data", lambda **_kwargs: {
-        "status": "ready", "window_start": "20260701", "window_end": "20260820",
-    })
-
     class FakeSource:
         def get_available_trade_dates(self, *_args):
             return [f"2026-08-{index + 1:02d}" for index in range(20)]
@@ -654,18 +643,42 @@ def test_shadow_competition_promotes_exactly_one_candidate(monkeypatch):
     assert any(model_id == 10 and update["status"] == "shadow_reserve" for model_id, update in validations)
 
 
-def test_shadow_cycle_blocks_cleanly_when_oos_hard_data_is_incomplete(monkeypatch):
-    monkeypatch.setattr(lifecycle, "audit_oos_hard_data", lambda **_kwargs: {
-        "status": "blocked", "eligible_sessions": 1529, "required_sessions": 1537,
-        "repair_dates": ["20260810"],
-    })
+def test_shadow_cycle_does_not_depend_on_historical_oos_hard_data(monkeypatch):
+    candidate = {
+        "id": 11,
+        "validation": {"status": "shadow_observation", "shadow_started_after": "2026-08-01"},
+        "config": {"strategy_id": 11},
+    }
+    recorded = []
 
-    result = lifecycle.run_strategy_shadow_cycle()
+    class FakeSource:
+        def get_available_trade_dates(self, start, end):
+            assert start == "20260503"
+            assert end == "20260802"
+            return ["2026-08-01", "2026-08-02"]
 
-    assert result["ok"] is True
-    assert result["status"] == "blocked_by_oos_hard_data"
-    assert result["results"] == []
-    assert result["hard_data"]["eligible_sessions"] == 1529
+    monkeypatch.setattr(lifecycle, "BacktestDataSource", FakeSource)
+    monkeypatch.setattr(lifecycle, "resolve_production_strategy_champion", lambda: {"champion_id": 50, "strategy_id": 1})
+    monkeypatch.setattr(lifecycle, "list_model_versions", lambda *_args, **_kwargs: [candidate])
+    monkeypatch.setattr(lifecycle, "get_model_version", lambda *_args: {"config": {"strategy_id": 1}})
+    monkeypatch.setattr(lifecycle, "list_shadow_observations", lambda *_args, **_kwargs: list(recorded))
+    monkeypatch.setattr(lifecycle, "record_shadow_observation", lambda **kwargs: recorded.append(kwargs))
+    monkeypatch.setattr(lifecycle, "_merge_validation", lambda *_args, **kwargs: kwargs)
+    monkeypatch.setattr(lifecycle, "audit_oos_hard_data", lambda **_kwargs: (_ for _ in ()).throw(AssertionError("future shadow must not re-audit historical OOS")), raising=False)
+
+    replay = {
+        "metrics": {"max_drawdown": 0.0}, "summary": {},
+        "equity_series": [{"date": "2026-08-01", "total_value": 100.0}, {"date": "2026-08-02", "total_value": 101.0}],
+        "data_quality": {"point_in_time": {"passed": True}}, "blocked_events": [], "trades": [],
+    }
+    result = lifecycle.run_strategy_shadow_cycle(
+        replay_runner=lambda **_kwargs: replay,
+        target_trade_date="20260802",
+    )
+
+    assert result["status"] == "completed"
+    assert result["data_contract"] == "current_experiment_gate_and_candidate_frozen_formal_evidence_v1"
+    assert [row["trade_date"] for row in recorded] == ["2026-08-02"]
 
 
 def test_shadow_winner_crosses_real_production_promotion_contract(monkeypatch):
@@ -696,10 +709,6 @@ def test_shadow_winner_crosses_real_production_promotion_contract(monkeypatch):
         versions[model_id]["status"] = status
         versions[model_id]["is_active"] = is_active
         status_updates.append((model_id, status, is_active))
-
-    monkeypatch.setattr(lifecycle, "audit_oos_hard_data", lambda **_kwargs: {
-        "status": "ready", "window_start": "20260701", "window_end": "20260820",
-    })
 
     class FakeSource:
         def get_available_trade_dates(self, *_args):
@@ -757,10 +766,6 @@ def test_shadow_passed_candidate_resumes_promotion_after_restart(monkeypatch):
     }
     validations = []
     promotions = []
-    monkeypatch.setattr(lifecycle, "audit_oos_hard_data", lambda **_kwargs: {
-        "status": "ready", "window_start": "20260701", "window_end": "20260820",
-    })
-
     class FakeSource:
         def get_available_trade_dates(self, *_args):
             return ["2026-08-20"]

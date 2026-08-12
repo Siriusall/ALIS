@@ -329,7 +329,7 @@ def test_recovery_cycle_retries_strategy_shadow_after_data_becomes_ready(monkeyp
 
     result = system_autonomy.run_system_autonomy_cycle(trade_date="20260810")
 
-    assert calls == [("20260810", {"hard_data_audit": {"ok": True, "status": "ready"}})]
+    assert calls == [("20260810", {})]
     assert next(
         step for step in result["steps"] if step["name"] == "strategy_shadow_recovery"
     )["result"]["status"] == "queued"
