@@ -10,9 +10,15 @@ from datetime import datetime
 from math import sqrt
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from zoneinfo import ZoneInfo
 from app.core.runtime_paths import backend_cache_root
 
 logger = logging.getLogger("quant.cache_consolidation")
+_BUSINESS_TZ = ZoneInfo("Asia/Shanghai")
+
+
+def _now() -> datetime:
+    return datetime.now(_BUSINESS_TZ)
 
 # full-sync 任务锁与状态
 _full_sync_lock = threading.Lock()
@@ -83,7 +89,7 @@ def write_init_status(data: Dict[str, Any]) -> None:
     写入初始化状态，便于首次加载排障与重试判断。
     """
     payload = dict(data or {})
-    payload["updated_at"] = datetime.now().isoformat(timespec="seconds")
+    payload["updated_at"] = _now().isoformat(timespec="seconds")
     try:
         from app.data_platform.db import _conn
         with _conn() as conn:
@@ -625,7 +631,7 @@ def build_consolidated_cache_bundle(trade_date: Optional[str] = None) -> Dict[st
     merge_reason = _build_merge_reason_text(date_count, symbol_rows, source_status_by_date, date_filter)
     payload: Dict[str, Any] = {
         "schema_version": "2.0",
-        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "generated_at": _now().isoformat(timespec="seconds"),
         "merge_meta": {
             "impl_version": MERGE_IMPL_VERSION,
             "modified_marker": "20260304",
@@ -685,7 +691,7 @@ def build_consolidated_cache_bundle(trade_date: Optional[str] = None) -> Dict[st
             )
         return payload
 
-    latest_date = max(out.keys()) if out else datetime.now().strftime("%Y%m%d")
+    latest_date = max(out.keys()) if out else _now().strftime("%Y%m%d")
     dated_file = output_dir / f"{latest_date}.json"
     latest_file = output_dir / "latest.json"
     body = json.dumps(payload, ensure_ascii=False)
@@ -884,7 +890,7 @@ def backfill_merge_meta_for_existing_all_in_one(force: bool = False) -> Dict[str
     )
     if failed == 0:
         try:
-            marker.write_text(datetime.now().isoformat(timespec="seconds"), encoding="utf-8")
+            marker.write_text(_now().isoformat(timespec="seconds"), encoding="utf-8")
         except OSError:
             pass
     return {"updated": updated, "skipped": skipped, "failed": failed}
@@ -998,7 +1004,7 @@ def _read_consolidated_postgres(date_ymd: str, symbols: Optional[List[str]]) -> 
         return None
     data = {date_ymd: day}
     return {
-        "schema_version": "postgresql-1", "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "schema_version": "postgresql-1", "generated_at": _now().isoformat(timespec="seconds"),
         "trade_date": date_ymd, "counts": {"dates": 1, "symbol_rows": len(day)},
         "factor_coverage": compute_factor_coverage(data), "data": data,
     }
@@ -1203,7 +1209,7 @@ def list_available_trade_dates() -> List[str]:
                     value for value in (str(dict(row).get("trade_date") or "") for row in rows)
                     if _normalize_ymd(value)
                 ]
-                stamp = datetime.now().isoformat(timespec="seconds")
+                stamp = _now().isoformat(timespec="seconds")
                 for value in dates:
                     conn.execute(
                         """INSERT INTO dc_available_trade_dates(trade_date,source_code,available_time,updated_at)
@@ -1248,7 +1254,7 @@ def get_full_sync_status() -> Dict[str, Any]:
 
 def _write_full_sync_status(data: Dict[str, Any]) -> None:
     path = _full_sync_status_path()
-    data["updated_at"] = datetime.now().isoformat(timespec="seconds")
+    data["updated_at"] = _now().isoformat(timespec="seconds")
     try:
         path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
     except Exception as e:
@@ -1273,7 +1279,7 @@ def run_full_sync_background(skip_existing: bool = True, cleanup_sources: bool =
             total = len(available)
             _write_full_sync_status({
                 "status": "running",
-                "started_at": datetime.now().isoformat(timespec="seconds"),
+                "started_at": _now().isoformat(timespec="seconds"),
                 "total_dates": total,
                 "processed_dates": 0,
                 "current_date": "",
