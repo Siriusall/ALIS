@@ -188,8 +188,18 @@ function frozenDecisionRationale(rebalance: Json, items: Json[]) {
     const budget = pick(rebalance, ["risk_budget"], {}) as Json;
     const actionBudgets = rawValues("risk_budget").filter(value => value && typeof value === "object") as Json[];
     const singleAssetLimits = actionBudgets.map(value => Number(value.max_single_position_pct)).filter(Number.isFinite);
+    const preTradeBlocked = String(budget.status || "") === "blocked";
+    const mandatoryRiskReduction = items.some(item =>
+      Boolean(pick(item, ["controller_obligation.required"], false))
+      && ["reduce_position", "sell_exit"].includes(String(pick(item, ["controller_action", "controller_intent"], "")))
+      && Number(pick(item, ["planned_quantity"], 0)) > 0
+    );
     const parts = [
-      budget.status ? `状态 ${budget.status}` : "",
+      preTradeBlocked
+        ? mandatoryRiskReduction && rebalance.execution_authorized
+          ? "执行前风险告警，已由本计划强制减仓处理"
+          : "执行前风险门阻断"
+        : budget.status ? `状态 ${budget.status}` : "",
       Number.isFinite(Number(budget.equity_budget)) ? `权益预算 ${(Number(budget.equity_budget) * 100).toFixed(2)}%` : "",
       Number.isFinite(Number(budget.cash_target)) ? `现金目标 ${(Number(budget.cash_target) * 100).toFixed(2)}%` : "",
       singleAssetLimits.length ? `单资产上限 ${(Math.max(...singleAssetLimits) * 100).toFixed(2)}%` : "",
