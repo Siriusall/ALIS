@@ -19,6 +19,16 @@ def classify_step_health(step: dict[str, Any]) -> dict[str, str]:
         return {"status": "failed", "reason": str(step.get("error") or "module_returned_not_ok")}
     result = step.get("result") if isinstance(step.get("result"), dict) else {}
     status = str(result.get("status") or "").lower()
+    if (
+        str(step.get("name") or "") == "hard_data_gate"
+        and status == "blocked"
+        and bool(result.get("non_repairable_dates"))
+        and not bool(result.get("repair_dates"))
+    ):
+        # Historical point-in-time availability cannot be repaired by a new
+        # upstream call.  It remains a formal-OOS gate, but is not a live
+        # system failure or an actionable autonomous repair.
+        return {"status": "waiting_condition", "reason": "historical_point_in_time_unavailable"}
     if status in _FAILED:
         return {"status": "failed", "reason": status}
     if status in _DEGRADED:

@@ -14,6 +14,14 @@ def test_classify_step_health_never_reports_timeout_as_healthy() -> None:
     assert healing.classify_step_health({"ok": True, "result": {"status": "timeout"}})["status"] == "failed"
 
 
+def test_classify_step_health_keeps_nonrepairable_oos_gap_as_waiting_condition() -> None:
+    result = healing.classify_step_health({
+        "name": "hard_data_gate", "ok": True,
+        "result": {"status": "blocked", "non_repairable_dates": ["20260701"], "repair_dates": []},
+    })
+    assert result == {"status": "waiting_condition", "reason": "historical_point_in_time_unavailable"}
+
+
 def test_self_healing_repairs_only_explicit_hard_data_gaps(monkeypatch) -> None:
     audits = iter([
         {"status": "blocked", "dates": [{"trade_date": "20260701", "eligible": False, "missing_apis": ["daily"]}]},
@@ -44,12 +52,12 @@ def test_self_healing_does_not_retry_historical_point_in_time_gaps(monkeypatch) 
     )
 
     result = healing.run_autonomous_self_healing([
-        {"name": "hard_data_gate", "ok": True, "result": {"status": "blocked"}},
+        {"name": "hard_data_gate", "ok": True, "result": {"status": "blocked", "non_repairable_dates": ["20260701"], "repair_dates": []}},
     ])
 
-    assert result["status"] == "blocked"
-    assert result["actions"][0]["reason"] == "no_explicit_repairable_dates"
-    assert result["actions"][0]["non_repairable_dates"] == ["20260701"]
+    assert result["status"] == "healthy"
+    assert result["actions"] == []
+    assert result["components"]["hard_data_gate"]["status"] == "waiting_condition"
 
 
 def test_self_healing_repairs_sealed_holdout_in_bounded_batch(monkeypatch) -> None:
