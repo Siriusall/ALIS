@@ -774,12 +774,14 @@ def _execute_step_with_retry(
                 expected_strategy_id=int(task_live.get("strategy_id") or 0),
             )
         except ReplayRiskGateError as exc:
-            block_daily_rebalance_plan_contract(
-                signal_date,
-                execute_date,
-                code=str(getattr(exc, "code", "") or "invalid_authoritative_plan"),
-                message=str(exc),
-            )
+            error_code = str(getattr(exc, "code", "") or "invalid_authoritative_plan")
+            if error_code != "formal_plan_not_due":
+                block_daily_rebalance_plan_contract(
+                    signal_date,
+                    execute_date,
+                    code=error_code,
+                    message=str(exc),
+                )
             raise
     if str(task_live.get("replay_mode") or "") == "autonomous_daily" and authoritative_plan is None:
         raise ReplayRiskGateError(
@@ -1579,6 +1581,18 @@ def run_quant_task_async(task_id: int) -> bool:
                 "invalid_authoritative_plan_hash",
                 "incompatible_frozen_system_release",
             }
+            if mode == "autonomous_daily" and error_code == "formal_plan_not_due":
+                _transition_task_status(
+                    task_id,
+                    "pending",
+                    "schedule_wait",
+                    replay_status="waiting_schedule",
+                    error=None,
+                    finished_at=None,
+                    **_waiting_schedule_projection(),
+                )
+                logger.info("autonomous plan not due yet task_id=%s", task_id)
+                return
             if mode == "autonomous_daily" and error_code in contract_rejections:
                 committed_records = list_quant_run_task_records(task_id, limit=5000)
                 committed_waterline = get_quant_replay_waterline(

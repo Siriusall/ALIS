@@ -114,3 +114,28 @@ def test_plan_terminal_write_failure_rolls_back_ledger_scope(monkeypatch):
         "plan_write_failed",
         "transaction_rollback",
     ]
+
+
+def test_not_due_formal_plan_is_not_quarantined(monkeypatch):
+    blocked = []
+
+    def not_due(*_args, **_kwargs):
+        raise quant_task_runner.ReplayRiskGateError(
+            "正式调仓计划尚未到达冻结执行时刻", code="formal_plan_not_due",
+        )
+
+    monkeypatch.setattr(profit_loop, "claim_daily_rebalance_execution_input", not_due)
+    monkeypatch.setattr(profit_loop, "block_daily_rebalance_plan_contract", lambda *_args, **_kwargs: blocked.append(True))
+
+    with pytest.raises(quant_task_runner.ReplayRiskGateError) as captured:
+        quant_task_runner._execute_step_with_retry(
+            task_id=8,
+            task_live=_task(),
+            signal_date="20260810",
+            execute_date="20260811",
+            progress_callback=lambda _phase: None,
+            scoring_timeout_sec=60,
+        )
+
+    assert captured.value.code == "formal_plan_not_due"
+    assert blocked == []

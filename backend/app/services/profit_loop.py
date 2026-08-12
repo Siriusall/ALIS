@@ -1782,8 +1782,13 @@ def claim_daily_rebalance_execution_input(
         try:
             if not _formal_plan_is_due(record):
                 # A future frozen plan is normal scheduler state, not a
-                # contract failure.  Leave it unclaimed for its exact window.
-                return None
+                # contract failure.  Keep it unclaimed and let the scheduler
+                # retain its normal waiting state rather than treating this
+                # like an already-claimed plan.
+                raise ReplayRiskGateError(
+                    "正式调仓计划尚未到达冻结执行时刻",
+                    code="formal_plan_not_due",
+                )
         except ValueError as exc:
             c.execute(
                 """UPDATE daily_rebalance_plans

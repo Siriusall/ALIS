@@ -110,6 +110,35 @@ def test_formal_plan_due_gate_keeps_historical_contract_rows_compatible():
     ) is True
 
 
+def test_not_due_formal_plan_uses_distinct_non_contract_error(monkeypatch):
+    plan = {
+        "id": 1, "trade_date": "20260811", "planned_execute_date": "20260812",
+        "planned_execute_at": "2026-08-12T15:01:00+08:00", "status": "planned",
+    }
+
+    class Rows:
+        def fetchone(self):
+            return plan
+
+    @contextmanager
+    def fake_conn():
+        class Conn:
+            _is_postgres = False
+            _is_mysql = False
+
+            def execute(self, *_args, **_kwargs):
+                return Rows()
+        yield Conn()
+
+    monkeypatch.setattr(profit_loop, "_ensure_tables", lambda: None)
+    monkeypatch.setattr(profit_loop, "business_conn", fake_conn)
+    monkeypatch.setattr(profit_loop, "_formal_plan_is_due", lambda _record: False)
+
+    with pytest.raises(ReplayRiskGateError) as captured:
+        profit_loop.claim_daily_rebalance_execution_input("20260811", "20260812", claim_token="due-check")
+    assert captured.value.code == "formal_plan_not_due"
+
+
 def test_unified_contract_keeps_small_positive_frozen_weight_as_execution_target(monkeypatch):
     monkeypatch.setattr(
         decision_version_manifest,
