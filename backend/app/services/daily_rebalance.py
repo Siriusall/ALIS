@@ -37,20 +37,23 @@ def _current_price(symbol: str, trade_date: str | None = None) -> float | None:
     compact_date = str(trade_date or "").replace("-", "")[:8]
     cutoff = signal_available_time(compact_date) if compact_date else ""
     if is_exchange_etf(code):
-        ts_code = code if code.endswith((".SH", ".SZ")) else f"{code}.SH"
-        bar = defensive_asset_bar(ts_code, trade_date or datetime.now().strftime("%Y%m%d"))
-        if not bar and trade_date:
-            with data_conn() as c:
-                row = c.execute(
-                    """SELECT trade_date FROM dc_tushare_raw_records
-                       WHERE api_name='fund_daily' AND ts_code=? AND trade_date<=?
-                       ORDER BY trade_date DESC LIMIT 1""",
-                    (ts_code, str(trade_date).replace("-", "")),
-                ).fetchone()
-            if row:
-                bar = defensive_asset_bar(ts_code, str(dict(row).get("trade_date") or ""))
-        if bar:
-            return float(bar.get("close") or 0) or None
+        # A bare ETF code does not encode its exchange.  Do not assume SSE:
+        # SZSE ETFs (notably 15/16 prefixes) otherwise disappear from NAV.
+        etf_codes = [code] if code.endswith((".SH", ".SZ")) else [f"{code}.SH", f"{code}.SZ"]
+        for ts_code in etf_codes:
+            bar = defensive_asset_bar(ts_code, trade_date or datetime.now().strftime("%Y%m%d"))
+            if not bar and trade_date:
+                with data_conn() as c:
+                    row = c.execute(
+                        """SELECT trade_date FROM dc_tushare_raw_records
+                           WHERE api_name='fund_daily' AND ts_code=? AND trade_date<=?
+                           ORDER BY trade_date DESC LIMIT 1""",
+                        (ts_code, str(trade_date).replace("-", "")),
+                    ).fetchone()
+                if row:
+                    bar = defensive_asset_bar(ts_code, str(dict(row).get("trade_date") or ""))
+            if bar:
+                return float(bar.get("close") or 0) or None
     if not code.endswith(".SH") and not code.endswith(".SZ"):
         for suffix in (".SH", ".SZ"):
             with data_conn() as c:
@@ -126,7 +129,10 @@ def _batch_quotes_and_names(symbols: list[str], trade_date: str) -> tuple[dict[s
     stock_codes: set[str] = set()
     for symbol in normalized:
         if is_exchange_etf(symbol):
-            etf_codes.add(symbol if symbol.endswith((".SH", ".SZ")) else f"{symbol}.SH")
+            if symbol.endswith((".SH", ".SZ")):
+                etf_codes.add(symbol)
+            else:
+                etf_codes.update({f"{symbol}.SH", f"{symbol}.SZ"})
         elif symbol.endswith((".SH", ".SZ")):
             stock_codes.add(symbol)
         else:
