@@ -122,6 +122,48 @@ def test_ab_passed_candidate_enrolls_after_current_ready_date(monkeypatch):
     )
 
 
+def test_candidate_enrolls_before_controlled_ab_without_production_authority(
+    monkeypatch,
+):
+    persisted = {}
+    version = _version()
+    version["metrics"] = {}
+    version["validation"]["production_eligibility"]["gates"][
+        "controlled_strategy_ab"
+    ] = False
+    monkeypatch.setattr(shadow, "get_model_version", lambda _version_id: version)
+    monkeypatch.setattr(
+        shadow,
+        "active_production_plan_model_bindings",
+        lambda: {key: None for key in shadow.PLAN_MODELS},
+    )
+    monkeypatch.setattr(shadow, "resolve_production_strategy_champion", _champion)
+    monkeypatch.setattr(
+        shadow,
+        "_latest_ready_trade_date",
+        lambda: ("20260729", {"status": "ready", "experiment_ready": True}),
+    )
+    monkeypatch.setattr(shadow, "_next_trade_date", lambda _date: "20260730")
+    monkeypatch.setattr(
+        shadow,
+        "update_model_version_validation",
+        lambda version_id, **values: persisted.update(
+            {"version_id": version_id, **values}
+        ),
+    )
+
+    result = shadow.enroll_model_shadow_candidate(42)
+
+    assert result["ok"] is True
+    assert result["shadow"]["observation_admission"] == (
+        "immediate_candidate_observation"
+    )
+    assert result["shadow"]["eligibility_evidence"][
+        "controlled_strategy_ab"
+    ] is False
+    assert persisted["validation"]["production_eligible"] is False
+
+
 def test_research_narrative_enrolls_without_ab_but_cannot_open_live_gate(
     monkeypatch,
 ):
@@ -297,6 +339,13 @@ def test_twenty_real_future_returns_can_pass_shadow_gate(monkeypatch):
         "_run_pair",
         lambda *_args, **_kwargs: (reference, candidate),
     )
+    ledger_calls = []
+    monkeypatch.setattr(
+        shadow,
+        "persist_candidate_replay",
+        lambda version_id, replay: ledger_calls.append((version_id, replay))
+        or {"ok": True, "status": "passed", "account_id": 7},
+    )
 
     result = shadow.advance_model_shadow_candidate(
         42,
@@ -304,6 +353,8 @@ def test_twenty_real_future_returns_can_pass_shadow_gate(monkeypatch):
     )
 
     assert result["status"] == "passed"
+    assert ledger_calls == [(42, candidate)]
+    assert result["shadow"]["isolated_ledger_audit"]["account_id"] == 7
     assert result["observed_return_sessions"] == 20
     assert all(result["gates"].values())
     validation = persisted["validation"]

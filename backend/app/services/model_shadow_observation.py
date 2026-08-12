@@ -14,6 +14,7 @@ from app.db.store import (
     update_model_version_validation,
 )
 from app.services.backtest_data_source import BacktestDataSource
+from app.services.candidate_simulation_ledger import persist_candidate_replay
 from app.services.data_health import assess_latest_decision_data_health
 from app.services.plan_model_control import (
     PLAN_MODELS,
@@ -264,15 +265,10 @@ def enroll_model_shadow_candidate(
         return {"ok": False, "status": "blocked_by_model_family"}
     research_only = _research_shadow_only(version)
     impact = (version.get("metrics") or {}).get("strategy_impact_ab")
-    if (
-        not research_only
-        and not controlled_strategy_ab_passed_current_contract(model_key, impact)
-    ):
-        return {
-            "ok": False,
-            "status": "blocked_by_controlled_strategy_ab",
-            "model_version_id": int(model_version_id),
-        }
+    strategy_ab_ready = controlled_strategy_ab_passed_current_contract(
+        model_key,
+        impact,
+    )
     validation = dict(version.get("validation") or {})
     existing = validation.get("model_shadow") if isinstance(
         validation.get("model_shadow"), dict
@@ -320,6 +316,10 @@ def enroll_model_shadow_candidate(
         },
         "reset_reason": "reference_model_bundle_changed" if force_reset else None,
         "production_change_forbidden": True,
+        "observation_admission": "immediate_candidate_observation",
+        "eligibility_evidence": {
+            "controlled_strategy_ab": bool(strategy_ab_ready),
+        },
         "scope": (
             "research_prediction_shadow"
             if research_only
@@ -512,6 +512,9 @@ def advance_model_shadow_candidate(
         through_trade_date=through,
         progress_callback=progress_callback,
     )
+    ledger_audit = persist_candidate_replay(int(model_version_id), candidate)
+    if not bool(ledger_audit.get("ok")):
+        raise RuntimeError("candidate isolated simulation ledger audit failed")
     reference_returns = _daily_returns(reference)
     candidate_returns = _daily_returns(candidate)
     common_dates = sorted(set(reference_returns) & set(candidate_returns))
@@ -610,6 +613,7 @@ def advance_model_shadow_candidate(
         "last_observed_trade_date": through,
         "observations": observations[-MAXIMUM_RETURN_SESSIONS:],
         "latest_evidence": observations[-1],
+        "isolated_ledger_audit": ledger_audit,
         "data_gate": {
             "status": health.get("status"),
             "experiment_ready": True,
@@ -685,17 +689,6 @@ def ensure_model_shadow_tasks() -> dict[str, Any]:
             (
                 item for item in versions
                 if str(item.get("status") or "") == "candidate"
-                and (
-                    _research_shadow_only(item)
-                    or str(
-                        (
-                            (item.get("metrics") or {}).get("strategy_impact_ab")
-                            or {}
-                        ).get("status")
-                        or ""
-                    )
-                    == "passed"
-                )
                 and str(
                     (
                         (item.get("validation") or {}).get("review")
@@ -707,19 +700,8 @@ def ensure_model_shadow_tasks() -> dict[str, Any]:
             ),
             {},
         )
-        impact = (version.get("metrics") or {}).get("strategy_impact_ab")
-        if (
-            not version
-            or str(version.get("status") or "") != "candidate"
-            or (
-                not _research_shadow_only(version)
-                and not controlled_strategy_ab_passed_current_contract(
-                    model_key,
-                    impact,
-                )
-            )
-        ):
-            skipped.append({"model_key": model_key, "reason": "no_ab_passed_candidate"})
+        if not version or str(version.get("status") or "") != "candidate":
+            skipped.append({"model_key": model_key, "reason": "no_candidate"})
             continue
         validation = dict(version.get("validation") or {})
         shadow = validation.get("model_shadow") if isinstance(
@@ -752,7 +734,7 @@ def ensure_model_shadow_tasks() -> dict[str, Any]:
                 "reason": (
                     "research_shadow_candidate_enrolled"
                     if _research_shadow_only(version)
-                    else "ab_passed_candidate_enrolled"
+                    else "candidate_immediately_enrolled"
                 ),
             })
         if str(shadow.get("status") or "") in {"passed", "failed"}:
