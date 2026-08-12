@@ -31,38 +31,25 @@ REQUIRED_SESSIONS = (
 
 
 def _date_api_sets(start_date: str, end_date: str) -> dict[str, set[str]]:
-    result: dict[str, set[str]] = {}
+    result: dict[str, set[str]] = {api: set() for api in HARD_APIS}
     with _conn() as conn:
-        for api in HARD_APIS:
-            if api == "adj_factor":
-                rows = conn.execute(
-                    """SELECT trade_date,MAX(rows_read) AS row_count
-                       FROM dc_tushare_request_coverage
-                      WHERE api_name=? AND trade_date BETWEEN ? AND ?
-                        AND result_status IN ('success','not_applicable','valid_empty','deferred_empty')
-                      GROUP BY trade_date""",
-                    (api, start_date, end_date),
-                ).fetchall()
-            else:
-                # The compact date ledger covers legacy market slices whose
-                # request-coverage rows predate the current audit ledger.
-                rows = conn.execute(
-                    """SELECT available.trade_date,? AS row_count
-                         FROM dc_available_trade_dates available
-                        WHERE available.trade_date BETWEEN ? AND ?
-                          AND EXISTS (
-                              SELECT 1 FROM dc_tushare_raw_records raw
-                               WHERE raw.api_name=? AND raw.trade_date=available.trade_date
-                          )""",
-                    (MINIMUM_HARD_API_ROWS, start_date, end_date, api),
-                ).fetchall()
-            valid: set[str] = set()
-            for row in rows:
-                item = dict(row)
-                trade_date = str(item.get("trade_date") or "")
-                if int(item.get("row_count") or 0) >= MINIMUM_HARD_API_ROWS:
-                    valid.add(trade_date)
-            result[api] = valid
+        try:
+            rows = conn.execute(
+                """SELECT api_name,trade_date,point_in_time_rows
+                     FROM dc_oos_hard_api_stats_live
+                    WHERE api_name IN (?,?,?,?) AND trade_date BETWEEN ? AND ?""",
+                (*HARD_APIS, start_date, end_date),
+            ).fetchall()
+        except Exception:
+            # The persisted summary is part of the hard-data contract. Do not
+            # turn a missing migration into a 1,537-day raw-table scan.
+            return result
+    for row in rows:
+        item = dict(row)
+        api = str(item.get("api_name") or "")
+        trade_date = str(item.get("trade_date") or "")
+        if api in result and trade_date and int(item.get("point_in_time_rows") or 0) >= MINIMUM_HARD_API_ROWS:
+            result[api].add(trade_date)
     return result
 
 

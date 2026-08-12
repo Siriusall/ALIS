@@ -21,13 +21,12 @@ class FakeConn:
                 }
                 for value in ("20260721", "20260722")
             ])
-        if "FROM dc_tushare_raw_records" in sql or "FROM dc_tushare_request_coverage" in sql:
-            api = params[0] if params[0] in oos_hard_data.HARD_APIS else params[-1]
-            dates = ["20260721", "20260722"] if api != "adj_factor" else ["20260721"]
+        if "FROM dc_oos_hard_api_stats_live" in sql:
             return FakeRows([{
-                "trade_date": value, "row_count": 1000,
-                "max_available_time": f"{value[:4]}-{value[4:6]}-{value[6:]}T15:00:00",
-            } for value in dates])
+                "api_name": api, "trade_date": value, "point_in_time_rows": 1000,
+            } for api in oos_hard_data.HARD_APIS for value in (
+                ["20260721", "20260722"] if api != "adj_factor" else ["20260721"]
+            )])
         if "FROM dc_trade_calendar" in sql:
             return FakeRows([{"cal_date": "20260722"}, {"cal_date": "20260721"}])
         if "FROM dc_stock_daily_snapshot" in sql:
@@ -167,6 +166,28 @@ def test_oos_benchmark_set_filters_late_revisions_in_sql(monkeypatch):
 
     assert result == {"20260722"}
     assert "available_time<=" in queries[0][0]
+
+
+def test_oos_hard_api_sets_read_persisted_point_in_time_coverage(monkeypatch):
+    queries: list[tuple[str, tuple]] = []
+
+    class Conn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def execute(self, sql, params=()):
+            queries.append((sql, params))
+            return FakeRows([{"api_name": api, "trade_date": "20260722", "point_in_time_rows": 500} for api in oos_hard_data.HARD_APIS])
+
+    monkeypatch.setattr(oos_hard_data, "_conn", lambda: Conn())
+    result = oos_hard_data._date_api_sets("20260722", "20260722")
+
+    assert all(values == {"20260722"} for values in result.values())
+    assert len(queries) == 1
+    assert "dc_oos_hard_api_stats_live" in queries[0][0]
 
 
 def test_oos_asset_is_permanent_blocking_asset(monkeypatch):

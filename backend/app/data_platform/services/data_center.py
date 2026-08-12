@@ -1511,6 +1511,13 @@ def _upsert_raw_records(api_name: str, df: pd.DataFrame) -> int:
                     }),
                 ),
             )
+        if api_name in {"daily", "daily_basic", "stk_limit", "adj_factor"}:
+            trade_dates = sorted({
+                str(value or "").replace("-", "")[:8]
+                for value in df.get("trade_date", pd.Series(dtype=str)).tolist()
+                if len(str(value or "").replace("-", "")[:8]) == 8
+            })
+            _refresh_oos_hard_api_stats(c, api_name, trade_dates, now)
     return written
 
 
@@ -4388,6 +4395,28 @@ def _refresh_snapshot_stats(c: Any, trade_date: str, updated_at: str) -> None:
                   updated_at=excluded.updated_at""",
         values,
     )
+
+
+def _refresh_oos_hard_api_stats(c: Any, api_name: str, trade_dates: list[str], updated_at: str) -> None:
+    """Persist bounded point-in-time raw coverage for the permanent OOS gate."""
+    for trade_date in trade_dates:
+        row = c.execute(
+            """SELECT COUNT(DISTINCT ts_code) AS point_in_time_rows
+                 FROM dc_tushare_raw_records
+                WHERE api_name=? AND trade_date=? AND ts_code<>''
+                  AND available_time<=
+                      (SUBSTRING(?,1,4)||'-'||SUBSTRING(?,5,2)||'-'||SUBSTRING(?,7,2)||'T15:00:00')""",
+            (api_name, trade_date, trade_date, trade_date, trade_date),
+        ).fetchone()
+        c.execute(
+            """INSERT INTO dc_oos_hard_api_stats_live
+                   (api_name,trade_date,point_in_time_rows,updated_at)
+               VALUES(?,?,?,?)
+               ON CONFLICT(api_name,trade_date) DO UPDATE SET
+                   point_in_time_rows=excluded.point_in_time_rows,
+                   updated_at=excluded.updated_at""",
+            (api_name, trade_date, int(_row_value(row, "point_in_time_rows", 0) or 0), updated_at),
+        )
 
 
 def _upsert_snapshot_row(c: Any, values: tuple[Any, ...]) -> None:
