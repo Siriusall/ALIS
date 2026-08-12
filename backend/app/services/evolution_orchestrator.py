@@ -81,6 +81,7 @@ LONG_RESEARCH_TASK_TYPES = frozenset({
     "strategy_cluster_distillation", "strategy_portfolio_research",
     "strategy_failure_model_training", "model_candidate_research",
     "model_strategy_impact_validation", "hsmm_shadow_training",
+    "controller_candidate_observation",
 })
 _worker_started = False
 _scheduler_started = False
@@ -1960,6 +1961,7 @@ def execute_evolution_task(
         "strategy_shadow_cycle",
         "factor_daily_cycle",
         "model_shadow_observation",
+        "controller_candidate_observation",
     }:
         gate = _experiment_data_gate()
         if not bool(gate.get("experiment_ready")):
@@ -2314,6 +2316,25 @@ def execute_evolution_task(
                 ),
             ),
         )
+    if task_type == "controller_candidate_observation":
+        from app.services.controller_candidate_observation import (
+            run_controller_candidate_observation,
+        )
+
+        payload = task.get("payload") if isinstance(task.get("payload"), dict) else {}
+        model_version_id = int(payload.get("model_version_id") or 0)
+        through_trade_date = str(payload.get("through_trade_date") or "")
+        if model_version_id <= 0 or not through_trade_date:
+            raise ValueError("Controller candidate observation requires version and date")
+        return _run_with_heartbeat_pulse(
+            int(task["id"]),
+            phase="controller_candidate_observation",
+            message="正在运行 StrategyController 候选独立模拟账户",
+            runner=lambda: run_controller_candidate_observation(
+                model_version_id,
+                through_trade_date=through_trade_date,
+            ),
+        )
     if task_type == "plan_model_autonomy":
         from app.services.plan_model_auto_optimizer import run_auto_optimization_once
         from app.services.plan_model_control import request_plan_model_training
@@ -2447,6 +2468,7 @@ def _finish_success(task_id: int, result: dict[str, Any]) -> None:
         "model_strategy_impact_validation": "新模型版本完整策略影响验证完成",
         "hsmm_shadow_training": "HSMM 三窗任务原生评价完成",
         "model_shadow_observation": "模型未来影子观察完成",
+        "controller_candidate_observation": "策略控制器候选独立模拟观察完成",
         "plan_model_autonomy": "任务原生模型单模型自治调度完成",
         "strategy_portfolio_formal_queue": "多策略组合正式验证入队完成",
         "strategy_shadow_cycle": "策略影子观察完成",

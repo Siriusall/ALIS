@@ -440,6 +440,7 @@ def run_system_autonomy_cycle(*, trade_date: str = "") -> dict[str, Any]:
     from app.services.profit_loop import _latest_trade_date, build_profit_loop
     from app.services.simulation_ledger_audit import audit_simulation_ledger
     from app.services.strategy_controller import advance_waiting_strategy_policy_candidates, run_strategy_policy_auto_optimization
+    from app.services.controller_candidate_observation import ensure_controller_candidate_observation_tasks
     from app.services.autonomous_healing import run_autonomous_self_healing
     from app.services.sealed_strategy_holdout import audit_sealed_strategy_holdout
     from app.services.data_health import assess_latest_decision_data_health
@@ -499,6 +500,10 @@ def run_system_autonomy_cycle(*, trade_date: str = "") -> dict[str, Any]:
         ),
         _run_step("periodic_performance_review", run_periodic_performance_review),
         _run_step("review_data_quality_governance", run_review_data_quality_governance),
+        experimental_step(
+            "controller_candidate_observation",
+            ensure_controller_candidate_observation_tasks,
+        ),
         experimental_step("strategy_policy_maturity", advance_waiting_strategy_policy_candidates),
         experimental_step("strategy_policy_candidates", lambda: run_strategy_policy_auto_optimization(force=False)),
         _run_step("research_maintenance", lambda: run_daily_maintenance(max_candidates=50)),
