@@ -212,7 +212,7 @@ def _unified_factor(
     current_volume = float(today.volume) if today else float(hist[-1].volume if hist else 0)
     row = SnapshotRow(
         symbol=symbol,
-        date=str(date.today()),
+        date=get_last_trade_date(for_data_availability=True).isoformat(),
         open=current_close,
         high=current_close,
         low=current_close,
