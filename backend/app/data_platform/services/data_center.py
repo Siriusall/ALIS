@@ -3843,31 +3843,57 @@ def _reconcile_verified_date_coverage(
             if str(dict(row).get("result_status") or "") in terminal
         )
     missing = [trade_date for trade_date in dates if trade_date not in recorded]
-    if not missing:
-        return 0
     now = _now()
+    if missing:
+        with _conn() as c:
+            for trade_date in missing:
+                params = {"trade_date": trade_date}
+                c.execute(
+                    """INSERT INTO dc_tushare_request_coverage
+                       (request_key,api_name,ts_code,trade_date,period,params_json,rows_read,result_status,result_reason,checked_at)
+                       VALUES(?,?,?,?,?,?,?,?,?,?)
+                       ON CONFLICT(request_key) DO UPDATE SET rows_read=excluded.rows_read,
+                           result_status=excluded.result_status,result_reason=excluded.result_reason,
+                           checked_at=excluded.checked_at""",
+                    (
+                        _request_key(api_name, params, None),
+                        api_name,
+                        "",
+                        trade_date,
+                        "",
+                        json.dumps(params, ensure_ascii=False, sort_keys=True),
+                        max(0, int(verified_rows.get(trade_date) or 0)),
+                        "success",
+                        "verified_existing_raw_contract",
+                        now,
+                    ),
+                )
+    # Pagination and fallback requests use different request keys. Once the
+    # date-level raw contract is verified, close only failures for that same
+    # API/date; this cannot hide a partial or unverified slice.
     with _conn() as c:
-        for trade_date in missing:
-            params = {"trade_date": trade_date}
-            c.execute(
-                """INSERT INTO dc_tushare_request_coverage
-                   (request_key,api_name,ts_code,trade_date,period,params_json,rows_read,result_status,result_reason,checked_at)
-                   VALUES(?,?,?,?,?,?,?,?,?,?)
-                   ON CONFLICT(request_key) DO UPDATE SET rows_read=excluded.rows_read,
-                       result_status=excluded.result_status,result_reason=excluded.result_reason,
-                       checked_at=excluded.checked_at""",
-                (
-                    _request_key(api_name, params, None),
-                    api_name,
-                    "",
-                    trade_date,
-                    "",
-                    json.dumps(params, ensure_ascii=False, sort_keys=True),
-                    max(0, int(verified_rows.get(trade_date) or 0)),
-                    "success",
-                    "verified_existing_raw_contract",
-                    now,
-                ),
+        rows = c.execute(
+            """SELECT id,params_json FROM dc_tushare_failed_requests
+                WHERE api_name=? AND status='pending'""",
+            (api_name,),
+        ).fetchall()
+    resolved_ids = []
+    for row in rows:
+        item = dict(row)
+        try:
+            params = json.loads(item.get("params_json") or "{}")
+        except (TypeError, json.JSONDecodeError):
+            continue
+        trade_date = str(params.get("trade_date") or "").replace("-", "")[:8]
+        if trade_date in verified_rows:
+            resolved_ids.append(int(item["id"]))
+    if resolved_ids:
+        with _conn() as c:
+            cursor = c.raw.cursor() if bool(getattr(c, "_is_postgres", False)) else c.raw
+            sql = "UPDATE dc_tushare_failed_requests SET status='resolved',resolved_at=? WHERE id=? AND status='pending'"
+            cursor.executemany(
+                sql.replace("?", "%s") if bool(getattr(c, "_is_postgres", False)) else sql,
+                [(_now(), request_id) for request_id in resolved_ids],
             )
     return len(missing)
 

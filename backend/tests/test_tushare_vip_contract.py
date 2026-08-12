@@ -1,5 +1,7 @@
 import math
 from datetime import datetime, timezone
+from contextlib import contextmanager
+import sqlite3
 
 import pytest
 
@@ -163,6 +165,36 @@ def test_valid_empty_cleanup_batches_coverage_and_resolution(monkeypatch):
     assert data_center._mature_optional_daily_empty(
         "moneyflow", {"trade_date": "20260807"}, today_value=data_center.date(2026, 8, 11)
     ) is False
+
+
+def test_verified_date_coverage_closes_paginated_failures_for_same_date(monkeypatch):
+    connection = sqlite3.connect(":memory:")
+    connection.row_factory = sqlite3.Row
+    connection.executescript("""
+        CREATE TABLE dc_tushare_request_coverage(
+            request_key TEXT PRIMARY KEY,api_name TEXT,ts_code TEXT,trade_date TEXT,period TEXT,
+            params_json TEXT,rows_read INTEGER,result_status TEXT,result_reason TEXT,checked_at TEXT
+        );
+        CREATE TABLE dc_tushare_failed_requests(
+            id INTEGER PRIMARY KEY,api_name TEXT,params_json TEXT,status TEXT,resolved_at TEXT
+        );
+        INSERT INTO dc_tushare_failed_requests VALUES(1,'stk_limit','{"trade_date":"20260724","limit":5800,"offset":0}','pending',NULL);
+        INSERT INTO dc_tushare_failed_requests VALUES(2,'stk_limit','{"trade_date":"20260725","limit":5800,"offset":0}','pending',NULL);
+    """)
+
+    class Wrapper:
+        raw = connection
+        def execute(self, sql, params=()):
+            return connection.execute(sql, params)
+    @contextmanager
+    def open_connection():
+        yield Wrapper()
+        connection.commit()
+    monkeypatch.setattr(data_center, "_conn", open_connection)
+
+    assert data_center._reconcile_verified_date_coverage("stk_limit", {"20260724": 7334}) == 1
+    assert connection.execute("SELECT status FROM dc_tushare_failed_requests WHERE id=1").fetchone()[0] == "resolved"
+    assert connection.execute("SELECT status FROM dc_tushare_failed_requests WHERE id=2").fetchone()[0] == "pending"
 
 
 def test_raw_payload_json_rejects_non_standard_nan():
