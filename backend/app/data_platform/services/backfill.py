@@ -7,6 +7,7 @@ import threading
 from bisect import bisect_right
 from datetime import date, datetime, timedelta
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from app.data_platform.db import _conn
 from app.data_platform.services.assets import (
@@ -70,10 +71,24 @@ _model_backfill_status_cache: dict[str, Any] = {"at": 0.0, "value": None}
 # failures are surfaced to the operator after this many automatic resumes.
 AUTO_RESUME_MAX_ATTEMPTS = 5
 AUTO_RESUME_DELAYS_SECONDS = (15, 30, 60, 120, 180)
+_BUSINESS_TZ = ZoneInfo("Asia/Shanghai")
 
 
 def _now() -> str:
-    return datetime.now().isoformat(timespec="seconds")
+    return datetime.now(_BUSINESS_TZ).isoformat(timespec="seconds")
+
+
+def _resume_due(value: Any, *, now: datetime | None = None) -> bool:
+    try:
+        resume_at = datetime.fromisoformat(str(value or "").replace("Z", "+00:00"))
+        if resume_at.tzinfo is None:
+            resume_at = resume_at.replace(tzinfo=_BUSINESS_TZ)
+        current = now or datetime.now(_BUSINESS_TZ)
+        if current.tzinfo is None:
+            current = current.replace(tzinfo=_BUSINESS_TZ)
+        return resume_at.astimezone(_BUSINESS_TZ) <= current.astimezone(_BUSINESS_TZ)
+    except (TypeError, ValueError):
+        return True
 
 
 def _ymd(d: date) -> str:
@@ -983,10 +998,7 @@ def _ensure_auto_resume_alive(snapshot: dict[str, Any]) -> None:
     resume_at = str(snapshot.get("auto_resume_at") or "")
     due = True
     if resume_at:
-        try:
-            due = datetime.fromisoformat(resume_at) <= datetime.now()
-        except ValueError:
-            due = True
+        due = _resume_due(resume_at)
     if not due:
         return
 
@@ -1144,7 +1156,7 @@ def _schedule_auto_resume(
         )
         return
     delay = max(1, int(delay_override_seconds or _auto_resume_delay(attempt)))
-    resume_at = (datetime.now() + timedelta(seconds=delay)).isoformat(timespec="seconds")
+    resume_at = (datetime.now(_BUSINESS_TZ) + timedelta(seconds=delay)).isoformat(timespec="seconds")
     _set(
         auto_resume=True,
         auto_resume_attempt=attempt,

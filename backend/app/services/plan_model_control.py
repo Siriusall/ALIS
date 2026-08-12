@@ -11,6 +11,7 @@ from collections import Counter
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable
+from zoneinfo import ZoneInfo
 
 import numpy as np
 from sklearn.metrics import f1_score
@@ -32,6 +33,8 @@ from app.db.store import (
 )
 from app.services.model_registry import models_root
 from app.services.model_artifacts import resolve_model_artifact_path
+
+_BUSINESS_TZ = ZoneInfo("Asia/Shanghai")
 from app.services.model_evaluation_contracts import (
     SCHEMA_VERSION as MODEL_EVALUATION_CONTRACT,
     evaluate_capital_multitask,
@@ -7418,7 +7421,10 @@ def _parse_dt(value: Any) -> datetime | None:
     if not value:
         return None
     try:
-        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).replace(tzinfo=None)
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=_BUSINESS_TZ)
+        return parsed.astimezone(_BUSINESS_TZ)
     except Exception:
         return None
 
@@ -7427,12 +7433,12 @@ def _mark_stale_train_run(run: dict[str, Any] | None, *, stale_minutes: int = 20
     if not run or str(run.get("status") or "") not in {"running", "queued"}:
         return run
     updated_at = _parse_dt(run.get("updated_at") or run.get("created_at"))
-    if not updated_at or datetime.now() - updated_at < timedelta(minutes=max(5, stale_minutes)):
+    if not updated_at or datetime.now(_BUSINESS_TZ) - updated_at < timedelta(minutes=max(5, stale_minutes)):
         return run
     metrics = dict(run.get("metrics") or {})
     timeline = list(metrics.get("timeline") or [])
     timeline.append({
-        "at": datetime.now().isoformat(),
+        "at": datetime.now(_BUSINESS_TZ).isoformat(),
         "phase": "failed",
         "progress": 1.0,
         "message": "训练心跳超时：后端进程重启或训练线程中断，已标记为可重训",
@@ -7446,7 +7452,7 @@ def _mark_stale_train_run(run: dict[str, Any] | None, *, stale_minutes: int = 20
         message="训练心跳超时，已标记为可重训",
         metrics=metrics,
         error="stale_plan_model_training_run",
-        finished_at=datetime.now().isoformat(),
+        finished_at=datetime.now(_BUSINESS_TZ).isoformat(),
     )
     model_key = str(metrics.get("model_key") or "")
     context = metrics.get("targeted_training_context") if isinstance(
