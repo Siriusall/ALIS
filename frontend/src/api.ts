@@ -84,7 +84,7 @@ export const endpoints = {
   systemContracts: "/api/system-versions/contracts",
   owner: "/api/model-strategy/evolution/owner-summary",
   decision: "/api/decision/summary",
-  latestPlan: "/api/decision/latest-plan",
+  latestPlan: "/api/decision/latest-plan?compact=true",
   report: "/api/decision/daily-report",
   reportCompact: "/api/decision/daily-report?compact=true",
   ledger: "/api/quant-runs/ledger-summary",

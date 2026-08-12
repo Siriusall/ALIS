@@ -40,6 +40,36 @@ def test_proposal_reason_keeps_cost_hold_when_no_frozen_order_exists():
     ) == "权重偏差不足以覆盖调仓成本"
 
 
+def test_compact_frozen_plan_contract_keeps_console_fields_without_heavy_audit_payloads():
+    contract = {
+        "proposal": [{
+            "symbol": "510880.SH", "name": "红利 ETF", "reason": "defensive_switch",
+            "target_weight": 0.15, "planned_quantity": 200,
+            "planned_cost": {"commission": 5}, "nested_evidence": {"large": "omit"},
+        }],
+        "risk_budget": {"status": "ok", "equity_budget": 0.85, "cash_target": 0.01, "target_weights": {"large": True}},
+        "pretrade_controller": {"schema_version": "controller-v1", "actions": [{
+            "trigger_models": ["base"], "holding_period": "20d", "ignored": {"large": True},
+        }]},
+        "expected_return_contract": {"schema_version": "return-v1", "horizon_sessions": 20, "items": [{"large": True}]},
+        "risk_limit_contract": {"schema_version": "risk-v1", "global_single_asset_limit": 0.15, "items": [{"large": True}]},
+        "decision_version_manifest": {"schema_version": "manifest-v1", "manifest_hash": "hash", "selection": {"large": True}},
+        "selection_snapshot": {"model_signal_snapshot": {"very_large": True}},
+    }
+
+    compact = profit_loop._compact_frozen_plan_contract(contract)
+
+    assert compact["proposal"] == [{
+        "name": "红利 ETF", "symbol": "510880.SH", "reason": "defensive_switch",
+        "target_weight": 0.15, "planned_quantity": 200, "planned_cost": {"commission": 5},
+    }]
+    assert compact["risk_budget"] == {"status": "ok", "equity_budget": 0.85, "cash_target": 0.01}
+    assert compact["pretrade_controller"]["actions"] == [{"trigger_models": ["base"], "holding_period": "20d"}]
+    assert compact["expected_return_contract"] == {"schema_version": "return-v1", "horizon_sessions": 20}
+    assert compact["risk_limit_contract"] == {"schema_version": "risk-v1", "global_single_asset_limit": 0.15}
+    assert "selection_snapshot" not in compact
+
+
 class _Rows:
     def __init__(self, rows):
         self.rows = rows

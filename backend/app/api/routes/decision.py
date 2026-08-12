@@ -525,10 +525,10 @@ def decision_daily_report(compact: bool = Query(default=False)) -> dict[str, Any
 
 
 @router.get("/decision/latest-plan")
-def decision_latest_plan() -> dict[str, Any]:
+def decision_latest_plan(compact: bool = Query(default=False)) -> dict[str, Any]:
     """Return the latest immutable formal plan without running a daily report."""
     try:
-        return get_latest_daily_rebalance_plan()
+        return get_latest_daily_rebalance_plan(compact=compact)
     except Exception as exc:  # noqa: BLE001 - a console read must expose failure
         return degraded_read("latest_daily_rebalance_plan", exc, proposal=[])
 

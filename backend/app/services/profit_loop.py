@@ -2189,15 +2189,74 @@ def recover_interrupted_daily_rebalance_plans() -> int:
     return interrupted + len(legacy_ids)
 
 
+def _compact_plan_proposal_item(item: Any) -> dict[str, Any]:
+    """Project an order for the console without returning nested frozen evidence.
+
+    The immutable JSON contract remains the execution and audit source of
+    truth.  Console pages only need the order fields listed here; sending the
+    complete selection snapshot once per refresh made a small decision card
+    transfer hundreds of kilobytes of unrelated research evidence.
+    """
+    if not isinstance(item, dict):
+        return {}
+    fields = (
+        "name", "symbol_name", "symbol", "ts_code", "reason", "action_reason", "thesis",
+        "controller_action", "controller_intent", "target_weight", "weight", "current_weight",
+        "planned_quantity", "planned_lots", "planned_side", "reference_close",
+        "estimated_execution_amount", "planned_cost", "controller_obligation",
+    )
+    return {field: item[field] for field in fields if field in item}
+
+
+def _compact_frozen_plan_contract(contract: dict[str, Any]) -> dict[str, Any]:
+    proposal = contract.get("proposal")
+    controller = contract.get("pretrade_controller")
+    expected = contract.get("expected_return_contract")
+    risk_budget = contract.get("risk_budget")
+    risk_limits = contract.get("risk_limit_contract")
+    return {
+        "proposal": [_compact_plan_proposal_item(item) for item in proposal] if isinstance(proposal, list) else [],
+        "risk_budget": {
+            field: risk_budget[field]
+            for field in ("status", "equity_budget", "cash_target")
+            if isinstance(risk_budget, dict) and field in risk_budget
+        },
+        "decision_data_gate": contract.get("decision_data_gate") or {},
+        "pretrade_controller": {
+            "actions": [
+                {
+                    field: action[field]
+                    for field in ("trigger_models", "risk_budget", "holding_period", "exit_conditions", "forbidden_conditions")
+                    if field in action
+                }
+                for action in (controller.get("actions") or [])
+                if isinstance(action, dict)
+            ],
+            "schema_version": controller.get("schema_version") if isinstance(controller, dict) else "",
+        },
+        "expected_return_contract": {
+            field: expected[field]
+            for field in ("schema_version", "horizon_sessions")
+            if isinstance(expected, dict) and field in expected
+        },
+        "decision_contract_schema_version": str(contract.get("schema_version") or ""),
+        "risk_limit_contract": {
+            field: risk_limits[field]
+            for field in ("schema_version", "global_single_asset_limit", "contract_hash")
+            if isinstance(risk_limits, dict) and field in risk_limits
+        },
+        "decision_version_manifest": {
+            field: (contract.get("decision_version_manifest") or {}).get(field)
+            for field in ("schema_version", "manifest_hash", "trade_date")
+            if field in (contract.get("decision_version_manifest") or {})
+        },
+    }
+
+
 def get_latest_daily_rebalance_plan(trade_date: str = "", *, compact: bool = False) -> dict[str, Any]:
     """Read the latest persisted plan without generating a new version."""
     _ensure_tables()
     columns = (
-        "id,trade_date,planned_execute_date,planned_execute_at,version,status,"
-        "execution_id,generated_at,executed_at,execution_claim_token,execution_claimed_at,"
-        "validation_error_code,validation_errors_json,validated_at"
-        if compact
-        else
         "id,trade_date,planned_execute_date,planned_execute_at,version,status,proposal_json,"
         "execution_id,generated_at,executed_at,execution_claim_token,execution_claimed_at,"
         "validation_error_code,validation_errors_json,validated_at"
@@ -2212,13 +2271,21 @@ def get_latest_daily_rebalance_plan(trade_date: str = "", *, compact: bool = Fal
     if not row:
         return {"status": "not_generated", "execution_authorized": False}
     item = dict(row)
-    if compact:
+    try:
+        contract = json.loads(item.get("proposal_json") or "{}")
+    except (TypeError, json.JSONDecodeError):
         contract = {}
-    else:
-        try:
-            contract = json.loads(item.get("proposal_json") or "{}")
-        except (TypeError, json.JSONDecodeError):
-            contract = {}
+    projection = _compact_frozen_plan_contract(contract) if compact else {
+        "proposal": contract.get("proposal") or [],
+        "risk_budget": contract.get("risk_budget") or {},
+        "decision_data_gate": contract.get("decision_data_gate") or {},
+        "selection_snapshot": contract.get("selection_snapshot") or {},
+        "pretrade_controller": contract.get("pretrade_controller") or {},
+        "expected_return_contract": contract.get("expected_return_contract") or {},
+        "decision_contract_schema_version": str(contract.get("schema_version") or ""),
+        "risk_limit_contract": contract.get("risk_limit_contract") or {},
+        "decision_version_manifest": contract.get("decision_version_manifest") or {},
+    }
     return {
         "id": int(item["id"]), "trade_date": str(item.get("trade_date") or ""),
         "data_as_of_date": str(item.get("trade_date") or ""),
@@ -2247,20 +2314,20 @@ def get_latest_daily_rebalance_plan(trade_date: str = "", *, compact: bool = Fal
             "blocked_by_contract_validation": "正式决策合同校验失败，已保留候选证据但禁止执行",
             "missed_execution_window": "已错过冻结的 T+1 执行日；仅保留审计证据，禁止跨日补成交",
         }.get(str(item.get("status") or ""), ""),
-        "proposal": contract.get("proposal") or [],
-        "risk_budget": contract.get("risk_budget") or {},
-        "decision_data_gate": contract.get("decision_data_gate") or {},
-        "selection_snapshot": contract.get("selection_snapshot") or {},
+        "proposal": projection["proposal"],
+        "risk_budget": projection["risk_budget"],
+        "decision_data_gate": projection["decision_data_gate"],
+        "selection_snapshot": projection.get("selection_snapshot") or {},
         # These are part of the already-frozen T-day contract.  Expose them
         # for read-only consoles rather than reconstructing decision rationale
         # from a later live controller run.
-        "pretrade_controller": contract.get("pretrade_controller") or {},
-        "expected_return_contract": contract.get("expected_return_contract") or {},
-        "decision_contract_schema_version": str(contract.get("schema_version") or ""),
-        "risk_limit_contract": contract.get("risk_limit_contract") or {},
+        "pretrade_controller": projection["pretrade_controller"],
+        "expected_return_contract": projection["expected_return_contract"],
+        "decision_contract_schema_version": projection["decision_contract_schema_version"],
+        "risk_limit_contract": projection["risk_limit_contract"],
         "validation_error_code": str(item.get("validation_error_code") or ""),
         "validation_errors": json.loads(item.get("validation_errors_json") or "[]") if item.get("validation_errors_json") else [],
-        "decision_version_manifest": contract.get("decision_version_manifest") or {},
+        "decision_version_manifest": projection["decision_version_manifest"],
         "generated_at": item.get("generated_at"), "executed_at": item.get("executed_at"),
         "generation_policy": "计划只由自治周期生成；本接口只读已有版本",
         "execution_policy": "到计划执行时间后由模拟执行调度器检查，每个交易日最多一次",
