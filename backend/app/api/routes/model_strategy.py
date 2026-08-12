@@ -701,6 +701,16 @@ def model_strategy_lab() -> dict:
     return build_strategy_lab()
 
 
+@router.get("/model-strategy/candidate-observations")
+def model_strategy_candidate_observations(limit: int = 200) -> dict:
+    """Unified read-only candidate runtime, eligibility and account view."""
+    from app.services.candidate_observation_center import (
+        build_candidate_observation_center,
+    )
+
+    return build_candidate_observation_center(limit=limit)
+
+
 @router.get("/model-strategy/evolution/tasks")
 def model_strategy_evolution_tasks(limit: int = 20) -> dict:
     try:
