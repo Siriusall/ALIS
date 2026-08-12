@@ -962,7 +962,13 @@ function TaskCategory({ rows, className = "" }: { rows: Json[]; className?: stri
 
 function formatSystemTime(value: unknown, fallback = "未记录") {
   const text = String(value || "");
-  return text ? text.replace("T", " ").replace(/([+-]\d\d:\d\d|Z)$/, "").split(".")[0] : fallback;
+  if (!text) return fallback;
+  const parsed = new Date(text);
+  if (Number.isNaN(parsed.getTime())) return text.replace("T", " ").replace(/([+-]\d\d:\d\d|Z)$/, "").split(".")[0];
+  return new Intl.DateTimeFormat("zh-CN", {
+    timeZone: "Asia/Shanghai", year: "numeric", month: "2-digit", day: "2-digit",
+    hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false,
+  }).format(parsed).replace(/\//g, "-");
 }
 
 function runtimeStatusLabel(value: unknown) {
@@ -996,11 +1002,12 @@ export function SystemObservatory({ data }: { data: ConsoleData }) {
   const recentBusiness = taskRows.filter((task) => pick(task, ["source"], "") !== "runtime").slice(0, 6);
   const activeCount = Number(pick(summary, ["active"], visibleBusinessTasks.length));
   const runningCount = Number(pick(summary, ["running"], 0));
+  const waitingCount = Number(pick(summary, ["waiting"], 0));
   const blockedCount = Number(pick(summary, ["blocked"], 0)) + Number(pick(summary, ["failed"], 0));
   const healthStatus = pick(data.health, ["status"], "unknown");
   const tradingStatus = pick(data.tradingReady, ["status"], "unknown");
   return <><PageHeader eyebrow="SYSTEM OBSERVATORY" title="系统运行" summary="业务推进、运行服务与近期记录。" />
-    <div className="system-hero-grid"><article className={`system-overview-card system-business-card ${blockedCount?"is-blocked":""}`}><header><span className="system-card-icon"><Workflow size={19}/></span><Status tone={blockedCount?"danger":runningCount?"info":"good"}>{blockedCount?"存在阻断":runningCount?"正在推进":"当前空闲"}</Status></header><span>当前业务</span><h2>{activeCount?`${activeCount} 个任务处于活动状态`:"当前没有业务任务"}</h2><p>{blockedCount?`${blockedCount} 个任务阻断或失败，详情保留在下方任务证据。`:runningCount?`${runningCount} 个任务正在实际执行。`:"等待下一次数据、决策、执行或研究调度。"}</p><footer><div><span>活动任务</span><strong>{activeCount}</strong></div><div><span>实际运行</span><strong>{runningCount}</strong></div><div><span>阻断 / 失败</span><strong className={blockedCount?"negative":""}>{blockedCount}</strong></div></footer></article><article className="system-overview-card system-foundation-card"><header><span className="system-card-icon"><ServerCog size={19}/></span><Status>{runtimeStatusLabel(healthStatus)}</Status></header><span>运行底座</span><h2>{visibleRuntime.length} 个服务已登记</h2><p>Worker 与 Scheduler 心跳按后端原始时间展示。</p><dl><div><dt>交易业务</dt><dd><Status>{runtimeStatusLabel(tradingStatus)}</Status></dd></div><div><dt>检查时间</dt><dd>{formatSystemTime(pick(data.health,["checked_at","generated_at"]))}</dd></div></dl></article></div>
+    <div className="system-hero-grid"><article className={`system-overview-card system-business-card ${blockedCount?"is-blocked":""}`}><header><span className="system-card-icon"><Workflow size={19}/></span><Status tone={blockedCount?"danger":runningCount?"info":waitingCount?"watch":"good"}>{blockedCount?"存在阻断":runningCount?"正在推进":waitingCount?"等待中":"当前空闲"}</Status></header><span>当前业务</span><h2>{activeCount?`${activeCount} 个任务处于活动状态`:"当前没有业务任务"}</h2><p>{blockedCount?`${blockedCount} 个任务阻断或失败，详情保留在下方任务证据。`:runningCount?`${runningCount} 个任务正在实际执行。`:waitingCount?`${waitingCount} 个任务正在等待时间窗口、上游数据或调度条件。`:"等待下一次数据、决策、执行或研究调度。"}</p><footer><div><span>活动任务</span><strong>{activeCount}</strong></div><div><span>实际运行</span><strong>{runningCount}</strong></div><div><span>阻断 / 失败</span><strong className={blockedCount?"negative":""}>{blockedCount}</strong></div></footer></article><article className="system-overview-card system-foundation-card"><header><span className="system-card-icon"><ServerCog size={19}/></span><Status>{runtimeStatusLabel(healthStatus)}</Status></header><span>运行底座</span><h2>{visibleRuntime.length} 个服务已登记</h2><p>Worker 与 Scheduler 心跳统一转换为 UTC+8 展示。</p><dl><div><dt>交易业务</dt><dd><Status>{runtimeStatusLabel(tradingStatus)}</Status></dd></div><div><dt>检查时间</dt><dd>{formatSystemTime(pick(data.health,["checked_at","generated_at"]))}</dd></div></dl></article></div>
     <Section title="当前业务推进" className="system-business-section">{visibleBusinessTasks.length ? <TaskCategory rows={visibleBusinessTasks.slice(0, 12)} className="system-business-list"/> : <Empty title="当前没有业务任务" detail="等待下一次调度。" />}</Section>
     <Section title="运行底座" detail="常驻服务不计入正在执行的业务任务。" className="system-runtime-section">{visibleRuntime.length ? <TaskCategory rows={visibleRuntime} className="system-runtime-grid"/> : <Empty title="暂无运行服务记录" />}</Section>
     <Section title="关键组件">{modules.length ? <div className="health-chain system-component-grid">{modules.slice(0, 8).map((module, index) => <article key={String(pick(module, ["key", "name"], index))}><Status>{runtimeStatusLabel(pick(module, ["status"], "unknown"))}</Status><strong>{pick(module, ["name", "key"], "组件")}</strong><p>{pick(module, ["current_step", "next_step", "message"], "等待下一步")}</p></article>)}</div> : <Empty title="暂无组件状态" />}</Section>
