@@ -1165,6 +1165,7 @@ SUPERSEDED_API_REPLACEMENTS = {
     "etf_sh_cons": "exchange_official_pcf",
     "etf_sz_cons": "exchange_official_pcf",
 }
+_LEGACY_PERIOD_ONLY_FINANCIAL_APIS = {"balancesheet", "cashflow", "fina_indicator"}
 
 
 def resolve_legacy_daily_index_weight_requests(*, limit: int = 100) -> dict[str, Any]:
@@ -1200,6 +1201,47 @@ def resolve_legacy_daily_index_weight_requests(*, limit: int = 100) -> dict[str,
         "ok": True, "status": "completed", "examined": len(rows),
         "resolved": resolved, "skipped": skipped,
         "policy": "single_day_index_weight_empty_replaced_by_monthly_window_only",
+    }
+
+
+def resolve_legacy_period_only_financial_requests(*, limit: int = 100) -> dict[str, Any]:
+    """Retire invalid ordinary-statement calls superseded by VIP/stock batch paths."""
+    cap = max(1, min(int(limit), 500))
+    placeholders = ",".join("?" for _ in _LEGACY_PERIOD_ONLY_FINANCIAL_APIS)
+    with _conn() as c:
+        rows = c.execute(
+            f"""SELECT id,api_name,params_json,limit_rows FROM dc_tushare_failed_requests
+                 WHERE status='pending' AND error_category='invalid_request'
+                   AND api_name IN ({placeholders}) ORDER BY id LIMIT ?""",
+            (*sorted(_LEGACY_PERIOD_ONLY_FINANCIAL_APIS), cap),
+        ).fetchall()
+    records_by_api: dict[str, list[tuple[int, dict[str, Any], int | None]]] = {}
+    skipped = 0
+    for row in rows:
+        item = dict(row)
+        try:
+            params = json.loads(item.get("params_json") or "{}")
+        except (TypeError, json.JSONDecodeError):
+            skipped += 1
+            continue
+        period = str(params.get("period") or "")
+        if set(params) == {"period"} and len(period) == 8 and period.isdigit():
+            records_by_api.setdefault(str(item["api_name"]), []).append(
+                (int(item["id"]), params, item.get("limit_rows"))
+            )
+        else:
+            skipped += 1
+    resolved = 0
+    for api_name, records in records_by_api.items():
+        resolved += _bulk_mark_requests_valid_empty(
+            api_name, records,
+            reason="superseded_invalid_period_only_request_by_financial_vip_or_stock_batch",
+            result_status="not_applicable",
+        )
+    return {
+        "ok": True, "status": "completed", "examined": len(rows), "resolved": resolved,
+        "skipped": skipped,
+        "policy": "only_invalid_period_only_ordinary_financial_requests_are_retired",
     }
 
 
@@ -2432,6 +2474,7 @@ def _bulk_mark_requests_valid_empty(
     records: list[tuple[int, dict[str, Any], int | None]],
     *,
     reason: str,
+    result_status: str = "valid_empty",
 ) -> int:
     if not records:
         return 0
@@ -2445,7 +2488,7 @@ def _bulk_mark_requests_valid_empty(
         coverage_rows.append((
             key, api_name, str(params.get("ts_code") or ""), str(params.get("trade_date") or ""),
             str(params.get("period") or params.get("enddate") or ""),
-            json.dumps(params, ensure_ascii=False, sort_keys=True), 0, "valid_empty", reason[:500], now,
+            json.dumps(params, ensure_ascii=False, sort_keys=True), 0, result_status, reason[:500], now,
         ))
         resolved_rows.append((now, int(request_id)))
     with _conn() as c:

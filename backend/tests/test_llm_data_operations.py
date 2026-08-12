@@ -151,6 +151,7 @@ def test_production_data_operations_never_calls_llm(monkeypatch) -> None:
     monkeypatch.setattr(data_ops, "_ensure_table", lambda: None)
     monkeypatch.setattr(data_center, "resolve_covered_failed_tushare_requests", lambda **_kwargs: {"ok": True, "resolved": 0})
     monkeypatch.setattr(data_center, "resolve_legacy_daily_index_weight_requests", lambda **_kwargs: {"ok": True, "resolved": 0})
+    monkeypatch.setattr(data_center, "resolve_legacy_period_only_financial_requests", lambda **_kwargs: {"ok": True, "resolved": 0})
     monkeypatch.setattr(data_center, "resolve_mature_fund_nav_empty_requests", lambda **_kwargs: {"ok": True, "resolved": 0})
     monkeypatch.setattr(data_center, "resolve_mature_optional_daily_empty_requests", lambda **_kwargs: {"ok": True, "resolved": 0})
     monkeypatch.setattr(data_ops, "build_data_operations_evidence", lambda **_kwargs: evidence)
@@ -168,6 +169,7 @@ def test_production_data_operations_never_calls_llm(monkeypatch) -> None:
     assert result["llm_advisory"]["status"] == "detached_from_production_cycle"
     assert result["covered_failure_cleanup"]["resolved"] == 0
     assert result["index_weight_cleanup"]["resolved"] == 0
+    assert result["financial_request_cleanup"]["resolved"] == 0
     assert result["fund_nav_cleanup"]["resolved"] == 0
     assert result["optional_daily_cleanup"]["resolved"] == 0
     assert connection.execute("SELECT model FROM llm_data_operation_cases").fetchone()[0] == "deterministic_governance"

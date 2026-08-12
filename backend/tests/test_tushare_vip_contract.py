@@ -171,6 +171,29 @@ def test_index_weight_cleanup_only_retires_legacy_one_day_empty_requests(monkeyp
     assert captured == [(1, {"start_date": "20260807", "end_date": "20260807"}, None)]
 
 
+def test_financial_cleanup_only_retires_invalid_period_only_requests(monkeypatch):
+    captured = []
+    class Result:
+        def fetchall(self):
+            return [
+                {"id": 1, "api_name": "cashflow", "params_json": '{"period":"20250930"}', "limit_rows": None},
+                {"id": 2, "api_name": "cashflow", "params_json": '{"period":"20250930","ts_code":"000001.SZ"}', "limit_rows": None},
+            ]
+    class Connection:
+        def execute(self, _sql, _params=()): return Result()
+    class Context:
+        def __enter__(self): return Connection()
+        def __exit__(self, *_args): return False
+    monkeypatch.setattr(data_center, "_conn", lambda: Context())
+    monkeypatch.setattr(data_center, "_bulk_mark_requests_valid_empty", lambda api, records, **kwargs: captured.extend((api, row) for row in records) or len(records))
+
+    result = data_center.resolve_legacy_period_only_financial_requests()
+
+    assert result["resolved"] == 1
+    assert result["skipped"] == 1
+    assert captured == [("cashflow", (1, {"period": "20250930"}, None))]
+
+
 def test_mature_empty_cleanup_uses_shanghai_business_date_not_host_timezone():
     # At 17:00 UTC it is already the following Shanghai business date.
     assert data_center._local_business_date_string(
