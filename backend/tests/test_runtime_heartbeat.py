@@ -23,6 +23,15 @@ def test_runtime_heartbeat_exposes_timeout():
     assert state["health_reason"] == "heartbeat_timeout"
 
 
+def test_runtime_heartbeat_invalid_timestamp_is_not_healthy():
+    runtime_heartbeat._states.clear()
+    runtime_heartbeat.mark_started("broken")
+    runtime_heartbeat._states["broken"]["heartbeat_at"] = "not-a-timestamp"
+    state = runtime_heartbeat.status()["broken"]
+    assert state["healthy"] is False
+    assert state["health_reason"] == "heartbeat_timestamp_invalid"
+
+
 def test_auto_simulation_retry_beats_before_waiting():
     events: list[tuple[str, object]] = []
 

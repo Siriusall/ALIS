@@ -37,7 +37,9 @@ def status() -> dict[str, dict[str, Any]]:
             age = None
         state["heartbeat_age_seconds"] = round(age, 3) if age is not None else None
         timeout = int(state.get("interval_seconds") or 300) * 3
-        state["healthy"] = bool(state.get("alive")) and not state.get("last_error") and (age is None or age <= timeout)
+        state["healthy"] = bool(state.get("alive")) and not state.get("last_error") and age is not None and age <= timeout
+        if age is None:
+            state["health_reason"] = "heartbeat_timestamp_invalid"
         if age is not None and age > timeout:
             state["health_reason"] = "heartbeat_timeout"
     return result
