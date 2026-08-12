@@ -49,6 +49,15 @@ def _normalize_symbol_key(symbol: str) -> str:
     return s
 
 
+def _etf_ts_code(symbol: str) -> str:
+    """Resolve the exchange for a bare exchange-traded fund code."""
+    value = str(symbol or "").strip().upper()
+    if value.endswith((".SH", ".SZ")):
+        return value
+    code = value.split(".", 1)[0].zfill(6)
+    return f"{code}.SH" if code.startswith(("50", "51", "52", "56", "58")) else f"{code}.SZ"
+
+
 def _strategy_next_for_position(bought_at: Optional[str], hold_days: Optional[int], rebalance_freq: str) -> Optional[str]:
     """根据持仓买入日和策略 hold_days/rebalance 生成「策略下一步」文案。"""
     if bought_at and hold_days and hold_days > 0:
@@ -174,10 +183,7 @@ def get_positions() -> PositionsListResponse:
             (data_source_time or "")[:10].replace("-", "")
             or get_last_trade_date(for_data_availability=True).strftime("%Y%m%d")
         )
-        fallback_codes = [
-            s if str(s).upper().endswith((".SH", ".SZ")) else f"{s}.SH"
-            for s in fallback_etf_symbols
-        ]
+        fallback_codes = [_etf_ts_code(str(symbol)) for symbol in fallback_etf_symbols]
         try:
             fallback_bars = defensive_asset_bars(fallback_codes, trade_date)
         except Exception:

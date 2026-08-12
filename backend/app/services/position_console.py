@@ -10,6 +10,16 @@ from app.services.defensive_assets import defensive_asset_series_batch
 from app.services.point_in_time import signal_available_time
 
 
+def _etf_ts_code(symbol: str) -> str:
+    """Resolve the exchange for a bare exchange-traded fund code."""
+    value = str(symbol or "").strip().upper()
+    if value.endswith((".SH", ".SZ")):
+        return value
+    code = value.split(".", 1)[0].zfill(6)
+    # 50/51/52/56/58 are SSE ETF namespaces; 15/16 are SZSE.
+    return f"{code}.SH" if code.startswith(("50", "51", "52", "56", "58")) else f"{code}.SZ"
+
+
 def resolve_stock_position_prices(
     symbols: list[str], trade_date: str,
 ) -> tuple[dict[str, float], str]:
@@ -73,7 +83,7 @@ def resolve_position_prices(symbols: list[str], trade_date: str) -> tuple[dict[s
     stock_symbols = [symbol for symbol in normalized if not is_exchange_etf(symbol)]
     prices, source_time = resolve_stock_position_prices(stock_symbols, trade_date)
     etf_by_code = {
-        symbol if symbol.endswith((".SH", ".SZ")) else f"{symbol}.SH": symbol
+        _etf_ts_code(symbol): symbol
         for symbol in normalized if is_exchange_etf(symbol)
     }
     if not etf_by_code:
