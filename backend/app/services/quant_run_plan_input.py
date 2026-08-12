@@ -59,6 +59,15 @@ def _finite_number(value: Any, *, field: str) -> float:
     return parsed
 
 
+def _strict_integer(value: Any, *, field: str) -> int:
+    if isinstance(value, bool):
+        raise ReplayRiskGateError(f"正式调仓计划整数无效：{field}", code="invalid_authoritative_plan")
+    parsed = _finite_number(value, field=field)
+    if not parsed.is_integer():
+        raise ReplayRiskGateError(f"正式调仓计划数量不是整数：{field}", code="invalid_authoritative_plan")
+    return int(parsed)
+
+
 def _unique_symbols(values: Any, *, field: str, allow_empty: bool = True) -> list[str]:
     if not isinstance(values, list):
         raise ReplayRiskGateError(f"统一计划字段格式无效：{field}", code="invalid_authoritative_plan")
@@ -744,10 +753,7 @@ def validate_unified_decision_contract(contract: dict[str, Any]) -> None:
         for item in execution_orders:
             symbol = str(item.get("symbol") or "")
             side = str(item.get("side") or "").upper()
-            try:
-                quantity = int(item.get("planned_quantity"))
-            except (TypeError, ValueError):
-                quantity = 0
+            quantity = _strict_integer(item.get("planned_quantity"), field=f"order.{symbol}.planned_quantity")
             if quantity <= 0 or side not in {"BUY", "SELL"}:
                 raise ReplayRiskGateError(f"冻结订单方向或数量无效：{symbol}", code="invalid_authoritative_plan")
             if side == "BUY" and quantity % 100 != 0:
@@ -777,7 +783,9 @@ def validate_unified_decision_contract(contract: dict[str, Any]) -> None:
                 target_max = _finite_weight(obligation.get("target_max_weight"), field=f"controller.{symbol}.obligation.target")
                 order = orders_by_symbol.get(symbol) or {}
                 residual = (proposal_by_symbol.get(symbol) or {}).get("residual_breach") or {}
-                residual_allowed = bool(residual.get("active")) and int(order.get("planned_quantity") or 0) >= 100
+                residual_allowed = bool(residual.get("active")) and _strict_integer(
+                    order.get("planned_quantity"), field=f"order.{symbol}.planned_quantity"
+                ) >= 100
                 if residual_allowed:
                     remaining = final_weights.get(symbol, 0.0) - target_max
                     if (
@@ -787,21 +795,21 @@ def validate_unified_decision_contract(contract: dict[str, Any]) -> None:
                         or abs(_finite_weight(residual.get("required_max_weight"), field=f"residual.{symbol}.required") - target_max) > 1e-8
                         or abs(_finite_weight(residual.get("projected_post_weight"), field=f"residual.{symbol}.projected") - final_weights.get(symbol, 0.0)) > 1e-8
                         or abs(_finite_weight(residual.get("remaining_excess_weight"), field=f"residual.{symbol}.remaining") - remaining) > 1e-8
-                        or int(residual.get("planned_repair_quantity") or 0) != int(order.get("planned_quantity") or 0)
+                        or _strict_integer(residual.get("planned_repair_quantity"), field=f"residual.{symbol}.planned_repair_quantity") != _strict_integer(order.get("planned_quantity"), field=f"order.{symbol}.planned_quantity")
                         or residual != (order.get("residual_breach") or {})
                         or residual != (competition.get("residual_breaches") or {}).get(symbol)
                     ):
                         raise ReplayRiskGateError(f"剩余风险证据与冻结订单不一致：{symbol}", code="invalid_authoritative_plan")
                 if (
                     str(order.get("side") or "").upper() != "SELL"
-                    or int(order.get("planned_quantity") or 0) <= 0
+                    or _strict_integer(order.get("planned_quantity"), field=f"order.{symbol}.planned_quantity") <= 0
                     or (final_weights.get(symbol, 0.0) > target_max + 1e-8 and not residual_allowed)
                 ):
                     raise ReplayRiskGateError(f"冻结订单未完成 Controller 强制义务：{symbol}", code="invalid_authoritative_plan")
         for symbol, proposal_item in proposal_by_symbol.items():
             order = orders_by_symbol.get(symbol) or {}
-            planned_quantity = int(proposal_item.get("planned_quantity") or 0)
-            if planned_quantity != int(order.get("planned_quantity") or 0):
+            planned_quantity = _strict_integer(proposal_item.get("planned_quantity"), field=f"proposal.{symbol}.planned_quantity")
+            if planned_quantity != _strict_integer(order.get("planned_quantity"), field=f"order.{symbol}.planned_quantity"):
                 raise ReplayRiskGateError(f"页面提案数量与冻结订单不一致：{symbol}", code="invalid_authoritative_plan")
             if planned_quantity <= 0 and str(proposal_item.get("action") or "") not in {"hold", "observe"}:
                 raise ReplayRiskGateError(f"零数量提案不得显示交易动作：{symbol}", code="invalid_authoritative_plan")
