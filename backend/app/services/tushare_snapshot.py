@@ -12,7 +12,8 @@ from __future__ import annotations
 import logging
 from dataclasses import asdict, dataclass
 import json
-from datetime import date, timedelta
+from datetime import date, timedelta, datetime
+from zoneinfo import ZoneInfo
 import os
 from pathlib import Path
 import time
@@ -32,6 +33,7 @@ from app.data_platform.db import _conn
 from app.integrations.tushare_client import get_tushare_client
 
 logger = logging.getLogger("quant.tushare_snapshot")
+_BUSINESS_TZ = ZoneInfo("Asia/Shanghai")
 def _resolve_recent_trade_date(d: date) -> str:
     """计算最近交易日（周末/节假日/当日 15:00 前 -> 前一交易日）。"""
     return get_last_trade_date_str(d, for_data_availability=True)
@@ -477,7 +479,7 @@ def get_daily_snapshot(
     cache_only=True 时仅读缓存，无缓存则返回 {} 且不请求 TuShare（业务侧在非 init 路径传 True）。
     """
     if trade_date is None:
-        trade_date = _resolve_recent_trade_date(date.today())
+        trade_date = _resolve_recent_trade_date(datetime.now(_BUSINESS_TZ).date())
     elif len(str(trade_date)) == 8:
         # 调用方常传 today 字符串，这里统一做“周末 -> 周五”修正，避免先查周末再回退。
         try:
