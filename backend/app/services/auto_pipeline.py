@@ -11,18 +11,23 @@ from app.services.research_engine import build_stock_research, materialize_pool_
 from app.services.thesis_store import generate_watch_pool_theses, generate_thesis_for_stock
 from app.services.decision_store import list_pool_members, transition_position
 from app.db.store import get_positions
+from app.core.a_share_fees import is_exchange_etf
 
 
 def run_daily_maintenance(*, max_candidates: int = 50) -> dict[str, Any]:
     """Run full daily pipeline: research → pool → theses → position states."""
     now = datetime.now().isoformat(timespec="seconds")
     errors = []
+    skipped_etf_research = 0
 
     # Step 1: Research on current positions
     positions = get_positions()
     research_count = 0
     for p in positions:
         code = str(p.get("symbol", "")).strip().upper()
+        if is_exchange_etf(code):
+            skipped_etf_research += 1
+            continue
         candidates = [code] if code.endswith((".SH", ".SZ", ".BJ")) else [
             f"{code}.SH" if code.startswith(("5", "6", "9")) else f"{code}.BJ" if code.startswith(("4", "8")) else f"{code}.SZ"
         ]
@@ -53,6 +58,8 @@ def run_daily_maintenance(*, max_candidates: int = 50) -> dict[str, Any]:
     thesis_count = 0
     for p in positions:
         code = str(p.get("symbol", "")).strip().upper()
+        if is_exchange_etf(code):
+            continue
         if not code.endswith((".SH", ".SZ", ".BJ")):
             code = f"{code}.SH" if code.startswith(("5", "6", "9")) else f"{code}.BJ" if code.startswith(("4", "8")) else f"{code}.SZ"
         try:
@@ -90,6 +97,7 @@ def run_daily_maintenance(*, max_candidates: int = 50) -> dict[str, Any]:
             "pool_theses": pool_added,
             "position_theses": thesis_count,
             "position_states": state_count,
+            "skipped_etf_research": skipped_etf_research,
         },
         "errors": errors[:10],
         "error_count": len(errors),

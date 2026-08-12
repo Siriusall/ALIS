@@ -51,3 +51,20 @@ def test_daily_maintenance_preserves_north_exchange_code(monkeypatch):
     assert result["ok"] is True
     assert seen == ["430001.BJ"]
     assert transitions[0]["ts_code"] == "430001.BJ"
+
+
+def test_daily_maintenance_skips_etf_stock_research_but_keeps_position_state(monkeypatch):
+    monkeypatch.setattr(auto_pipeline, "get_positions", lambda: [{"symbol": "510880.SH"}])
+    monkeypatch.setattr(auto_pipeline, "build_stock_research", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("ETF must not use stock research")))
+    monkeypatch.setattr(auto_pipeline, "generate_thesis_for_stock", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("ETF must not create stock thesis")))
+    monkeypatch.setattr(auto_pipeline, "generate_watch_pool_theses", lambda **_kwargs: {"ok": True, "generated_or_reviewed": []})
+    transitions = []
+    monkeypatch.setattr(auto_pipeline, "transition_position", lambda **kwargs: transitions.append(kwargs))
+
+    result = auto_pipeline.run_daily_maintenance()
+
+    assert result["ok"] is True
+    assert result["results"]["skipped_etf_research"] == 1
+    assert result["results"]["research"] == 0
+    assert result["results"]["position_theses"] == 0
+    assert transitions == [{"ts_code": "510880.SH", "to_state": "hold", "reason": "auto_daily_maintenance", "rule_version": "daily_pipeline_v1", "automatic_decision": True}]
