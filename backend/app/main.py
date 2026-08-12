@@ -337,6 +337,9 @@ def _health_payload() -> dict:
     primary = primary_database_health()
     data_platform = data_platform_database_health()
     databases_ready = primary.get("status") == "ok" and data_platform.get("status") == "ok"
+    current_revisions = database_revisions()
+    expected_revisions = {"sim": SIM_SCHEMA_HEAD, "data": DATA_SCHEMA_HEAD}
+    revisions_ready = current_revisions == expected_revisions
     redis = redis_health()
     evolution = evolution_runtime_status()
     runtime_heartbeats = runtime_heartbeat_status()
@@ -364,6 +367,10 @@ def _health_payload() -> dict:
         runtime_issues.append(f"Background component errors: {', '.join(unhealthy_heartbeats)}")
     issues = (
         ([] if redis.get("available", False) else ["Redis unavailable: durable stream tasks are disabled"])
+        + ([] if revisions_ready else [
+            "Database migration revision mismatch: "
+            f"current={current_revisions}, expected={expected_revisions}"
+        ])
         + component_issues
         + runtime_issues
     )
@@ -373,7 +380,7 @@ def _health_payload() -> dict:
         and (not background_owner or bool(runtime_heartbeats))
         and (not background_owner or not unhealthy_heartbeats)
     )
-    ready = databases_ready and bool(redis.get("available", False)) and runtime_ready
+    ready = databases_ready and revisions_ready and bool(redis.get("available", False)) and runtime_ready
     return {
         "status": "ok" if ready else "error",
         "ready": ready,
@@ -382,6 +389,11 @@ def _health_payload() -> dict:
         "dependencies": {
             "primary_database": primary,
             "data_platform_database": data_platform,
+            "database_schema_revisions": {
+                "current": current_revisions,
+                "expected": expected_revisions,
+                "at_head": revisions_ready,
+            },
             "redis": redis,
             "startup_components": _startup_components,
             "background_runtime": runtime_boundary,

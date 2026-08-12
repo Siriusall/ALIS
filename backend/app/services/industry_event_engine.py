@@ -564,8 +564,9 @@ def _latest_industry_snapshot(as_of_date: str, *, compact: bool = False) -> dict
         definitions = [] if compact else [dict(row) for row in c.execute(
             """SELECT industry_code,industry_name,metric_code,metric_name,unit,frequency,source_code,description
                FROM dc_industry_metric_definition
-              WHERE NOT (source_code='exchange.futures_proxy' AND description NOT LIKE '%transmission_direction=%')
-              ORDER BY industry_name,metric_name"""
+              WHERE NOT (source_code='exchange.futures_proxy' AND description NOT LIKE ?)
+              ORDER BY industry_name,metric_name""",
+            ("%transmission_direction=%",),
         ).fetchall()]
         if compact:
             company_counts = {
@@ -632,9 +633,10 @@ def _list_industries_cached(as_of_time: str, compact: bool = False) -> dict[str,
         definitions = [dict(row) for row in c.execute(
             """SELECT d.*,COUNT(v.metric_code) value_count,MIN(v.data_date) first_date,MAX(v.data_date) last_date
                FROM dc_industry_metric_definition d LEFT JOIN dc_industry_metric_value v ON v.metric_code=d.metric_code
-              WHERE NOT (d.source_code='exchange.futures_proxy' AND d.description NOT LIKE '%transmission_direction=%')
+              WHERE NOT (d.source_code='exchange.futures_proxy' AND d.description NOT LIKE ?)
                GROUP BY d.metric_code,d.industry_code,d.industry_name,d.metric_name,d.unit,d.frequency,d.source_code,d.description,d.created_at,d.updated_at
-               ORDER BY d.industry_name,d.metric_name"""
+               ORDER BY d.industry_name,d.metric_name""",
+            ("%transmission_direction=%",),
         ).fetchall()]
         value_where = "WHERE v.data_date<=?" if as_of_date else ""
         value_params: tuple[Any, ...] = (as_of_date,) if as_of_date else ()

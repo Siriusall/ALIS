@@ -22,6 +22,11 @@ def _healthy_dependencies(monkeypatch):
     monkeypatch.setattr(main, "evolution_runtime_status", lambda: {"ok": True})
     monkeypatch.setattr(main, "_background_runtime_lease", _Lease())
     monkeypatch.setattr(main, "_startup_components", {})
+    monkeypatch.setattr(
+        main,
+        "database_revisions",
+        lambda: {"sim": main.SIM_SCHEMA_HEAD, "data": main.DATA_SCHEMA_HEAD},
+    )
 
 
 def test_health_is_not_ready_when_redis_is_unavailable(monkeypatch):
@@ -59,3 +64,20 @@ def test_health_is_not_ready_when_background_heartbeat_evidence_is_missing(monke
     result = _payload(main.health())
     assert result["ready"] is False
     assert any("heartbeat evidence is missing" in item for item in result["issues"])
+
+
+def test_health_is_not_ready_when_runtime_schema_revision_is_stale(monkeypatch):
+    _healthy_dependencies(monkeypatch)
+    monkeypatch.setattr(main, "redis_health", lambda: {"available": True})
+    monkeypatch.setattr(main, "runtime_heartbeat_status", lambda: {"scheduler": {"healthy": True}})
+    monkeypatch.setattr(
+        main,
+        "database_revisions",
+        lambda: {"sim": main.SIM_SCHEMA_HEAD, "data": "data_0002_release_center"},
+    )
+
+    result = _payload(main.readiness())
+
+    assert result["ready"] is False
+    assert result["dependencies"]["database_schema_revisions"]["at_head"] is False
+    assert any("migration revision mismatch" in item for item in result["issues"])
