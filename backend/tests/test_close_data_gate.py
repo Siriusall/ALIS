@@ -348,7 +348,10 @@ def test_auto_simulation_uses_static_calendar_only_when_calendar_db_is_unavailab
     ) is False
 
 
-def test_trading_session_uses_utc8_not_host_timezone() -> None:
+def test_trading_session_uses_utc8_not_host_timezone(monkeypatch) -> None:
+    # The clock gate shares the exchange-calendar authority with the close
+    # scheduler; this test isolates timezone conversion from database state.
+    monkeypatch.setattr(quant_task_runner, "_is_exchange_trade_day", lambda _value: True)
     # 01:30 UTC is 09:30 in Shanghai and must be an open-session time.
     assert quant_task_runner._is_trading_session_now(
         datetime(2026, 8, 12, 1, 30, tzinfo=timezone.utc),
@@ -356,4 +359,12 @@ def test_trading_session_uses_utc8_not_host_timezone() -> None:
     # 07:30 UTC is 15:30 Shanghai, already outside the execution session.
     assert quant_task_runner._is_trading_session_now(
         datetime(2026, 8, 12, 7, 30, tzinfo=timezone.utc),
+    ) is False
+
+
+def test_trading_session_rejects_explicit_exchange_closure(monkeypatch) -> None:
+    monkeypatch.setattr(quant_task_runner, "_is_exchange_trade_day", lambda _value: False)
+
+    assert quant_task_runner._is_trading_session_now(
+        datetime(2026, 8, 13, 9, 30),
     ) is False

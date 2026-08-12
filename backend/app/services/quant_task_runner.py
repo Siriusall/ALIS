@@ -641,7 +641,7 @@ def _compute_start_index(dates: list[str], task: dict, done_signals: set[str]) -
 def _is_trading_session_now(now: datetime | None = None) -> bool:
     """Evaluate the A-share session in UTC+8 regardless of host timezone."""
     now = (now.astimezone(_BUSINESS_TZ) if now and now.tzinfo else now) or _business_now()
-    if not is_trade_day(now.date()):
+    if not _is_exchange_trade_day(now):
         return False
     t = now.time()
     # 实盘模拟执行窗口：09:25~15:05（午休不做细分）
