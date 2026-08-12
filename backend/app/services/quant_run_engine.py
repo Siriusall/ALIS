@@ -280,7 +280,9 @@ def _sell_position_for_rebalance(
     if execution_volume <= 0:
         blocked_events.append({"date": execute_date, "symbol": sym, "side": "SELL", "code": "liquidity_capacity", "message": "执行日成交量缺失，禁止超过流动性容量的卖出"})
         return False, turnover_remaining, "liquidity_capacity"
-    liquidity_cap = px * execution_volume * 0.01
+    # TuShare daily/fund_daily volume is reported in lots (100 shares), while
+    # order quantity is shares. Cap one order at 1% of notional turnover.
+    liquidity_cap = px * execution_volume * 100.0 * 0.01
     if proposed_turnover > liquidity_cap + 1e-6:
         blocked_events.append({"date": execute_date, "symbol": sym, "side": "SELL", "code": "liquidity_capacity", "message": "卖出数量超过执行日流动性容量"})
         return False, turnover_remaining, "liquidity_capacity"
