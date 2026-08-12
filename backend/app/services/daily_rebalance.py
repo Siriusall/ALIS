@@ -54,8 +54,9 @@ def _current_price(symbol: str, trade_date: str | None = None) -> float | None:
                     bar = defensive_asset_bar(ts_code, str(dict(row).get("trade_date") or ""))
             if bar:
                 return float(bar.get("close") or 0) or None
-    if not code.endswith(".SH") and not code.endswith(".SZ"):
-        for suffix in (".SH", ".SZ"):
+    if not code.endswith((".SH", ".SZ", ".BJ")):
+        suffixes = (".BJ",) if code[:1] in {"4", "8"} else (".SH", ".SZ")
+        for suffix in suffixes:
             with data_conn() as c:
                 sql = "SELECT close FROM dc_stock_daily_snapshot WHERE ts_code=?"
                 params: tuple[Any, ...] = (f"{code}{suffix}",)
@@ -133,10 +134,13 @@ def _batch_quotes_and_names(symbols: list[str], trade_date: str) -> tuple[dict[s
                 etf_codes.add(symbol)
             else:
                 etf_codes.update({f"{symbol}.SH", f"{symbol}.SZ"})
-        elif symbol.endswith((".SH", ".SZ")):
+        elif symbol.endswith((".SH", ".SZ", ".BJ")):
             stock_codes.add(symbol)
         else:
-            stock_codes.update({f"{symbol}.SH", f"{symbol}.SZ"})
+            if symbol[:1] in {"4", "8"}:
+                stock_codes.add(f"{symbol}.BJ")
+            else:
+                stock_codes.update({f"{symbol}.SH", f"{symbol}.SZ"})
     if etf_codes:
         for code, bar in defensive_asset_bars(etf_codes, compact_date or datetime.now().strftime("%Y%m%d")).items():
             close = float(bar.get("close") or 0)

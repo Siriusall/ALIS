@@ -27,3 +27,23 @@ def test_batch_quotes_queries_both_exchanges_for_bare_etf(monkeypatch):
 
     assert requested == ["159001.SH", "159001.SZ"]
     assert prices == {"159001": 1.23}
+
+
+def test_bare_beijing_stock_queries_only_beijing_namespace(monkeypatch):
+    captured = {}
+
+    class Result:
+        def fetchall(self):
+            return []
+
+    class Conn:
+        def __enter__(self): return self
+        def __exit__(self, *_args): return False
+        def execute(self, _sql, params):
+            captured["params"] = params
+            return Result()
+
+    monkeypatch.setattr(daily_rebalance, "data_conn", lambda: Conn())
+    daily_rebalance._batch_quotes_and_names(["430001"], "20260811")
+    assert "430001.BJ" in captured["params"]
+    assert "430001.SH" not in captured["params"]
