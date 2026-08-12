@@ -2154,9 +2154,13 @@ def plan_analyze_rebalance(
                 open_price=px,
                 close_price=float(getattr(px_row, "prev_close", 0) or 0) if px_row else 0.0,
                 change_pct=_open_change_pct(px_row),
-                volume=1.0 if px > 0 else 0.0,
+                volume=_execution_volume(px_row),
             )
             qty = int(pos.get("quantity") or 0)
+            liquidity_cap = px * _execution_volume(px_row) * 100.0 * 0.01
+            if _execution_volume(px_row) <= 0 or px * qty > liquidity_cap + 1e-6:
+                sell_blocked.append({"symbol": sym, "side": "SELL", "code": "liquidity_capacity", "message": "卖出数量超过执行日流动性容量或成交量缺失"})
+                continue
             fee = sell_cost_breakdown(px, qty, sym)
             exec_price = float(fee["executed_price"])
             item = {
