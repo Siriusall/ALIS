@@ -9,7 +9,7 @@ from typing import Any
 
 from app.services.research_engine import build_stock_research, materialize_pool_research_snapshots
 from app.services.thesis_store import generate_watch_pool_theses, generate_thesis_for_stock
-from app.services.decision_store import list_pool_members, transition_position
+from app.services.decision_store import get_position_state
 from app.db.store import get_positions
 from app.core.a_share_fees import is_exchange_etf
 
@@ -56,6 +56,7 @@ def run_daily_maintenance(*, max_candidates: int = 50) -> dict[str, Any]:
 
     # Step 3: Generate theses for current positions
     thesis_count = 0
+    blocked_position_theses = 0
     for p in positions:
         code = str(p.get("symbol", "")).strip().upper()
         if is_exchange_etf(code):
@@ -66,28 +67,35 @@ def run_daily_maintenance(*, max_candidates: int = 50) -> dict[str, Any]:
             r = generate_thesis_for_stock(code, force=True)
             if r.get("ok") or r.get("thesis_id"):
                 thesis_count += 1
+            elif str(r.get("reason") or "") == "risk_hard_veto":
+                # A risk veto is the intended result for a held legacy/ST
+                # security.  Preserve the veto in the thesis service, but do
+                # not turn daily maintenance into an operational failure.
+                blocked_position_theses += 1
             else:
                 errors.append(f"position_thesis_{code}: {str(r.get('error') or r.get('status') or 'not_ok')[:80]}")
         except Exception as e:
             errors.append(f"position_thesis_{code}: {str(e)[:80]}")
 
-    # Step 4: Sync position states
+    # Step 4: Audit position states without rewriting them.
+    #
+    # Position state is a factual lifecycle record.  Only the confirmed
+    # execution synchronizer may advance ``watch -> ... -> holding``.  Daily
+    # research must neither invent that evidence nor use the retired ``hold``
+    # pseudo-state merely because a security is currently in the account.
     state_count = 0
+    missing_position_states = 0
     for p in positions:
         sym = str(p.get("symbol", "")).strip().upper()
         if not sym.endswith((".SH", ".SZ", ".BJ")):
             sym = f"{sym}.SH" if sym.startswith(("5", "6", "9")) else f"{sym}.BJ" if sym.startswith(("4", "8")) else f"{sym}.SZ"
         try:
-            transition_position(
-                ts_code=sym,
-                to_state="hold",
-                reason="auto_daily_maintenance",
-                rule_version="daily_pipeline_v1",
-                automatic_decision=True,
-            )
-            state_count += 1
+            if get_position_state(sym):
+                state_count += 1
+            else:
+                missing_position_states += 1
         except Exception as e:
-            errors.append(f"position_state_{sym}: {str(e)[:80]}")
+            errors.append(f"position_state_audit_{sym}: {str(e)[:80]}")
 
     return {
         "ok": not errors,
@@ -96,7 +104,9 @@ def run_daily_maintenance(*, max_candidates: int = 50) -> dict[str, Any]:
             "research": research_count,
             "pool_theses": pool_added,
             "position_theses": thesis_count,
+            "blocked_position_theses": blocked_position_theses,
             "position_states": state_count,
+            "missing_position_states": missing_position_states,
             "skipped_etf_research": skipped_etf_research,
         },
         "errors": errors[:10],
