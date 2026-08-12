@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, HTTPException, Query
 
@@ -10,6 +11,7 @@ from app.db.store import get_execution, get_positions, list_executions
 from app.services.equity_curve import compute_equity_curve
 
 router = APIRouter()
+_BUSINESS_TZ = ZoneInfo("Asia/Shanghai")
 
 
 @router.get("/positions-equity-curve")
@@ -25,7 +27,7 @@ def get_positions_equity_curve() -> dict:
     ]
     executed_at = min((p.get("updated_at") or "") for p in positions) or None
     if not executed_at:
-        executed_at = datetime.now().isoformat()[:10]
+        executed_at = datetime.now(_BUSINESS_TZ).date().isoformat()
     curve = compute_equity_curve(orders, executed_at)
     add_log("INFO", f"持仓收益曲线：{len(positions)} 只股票，{len(curve)} 个点")
     return {"execution_id": None, "series": curve}
