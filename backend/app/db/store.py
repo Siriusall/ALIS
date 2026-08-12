@@ -1857,10 +1857,22 @@ def create_and_apply_buy_execution(
 
 
 def link_recorded_operations_to_execution(execution_id: int, orders: List[Dict[str, Any]]) -> int:
-    """Attach already-atomic SELL rows to the enclosing execution for navigation."""
+    """Attach every already-atomic SELL row to its enclosing execution.
+
+    A partial link would leave cash/positions changed without an auditable
+    execution binding.  Treat it as a transaction failure instead of silently
+    returning a smaller count to the caller.
+    """
+    eid = int(execution_id or 0)
+    if eid <= 0:
+        raise ValueError("invalid_execution_id_for_operation_link")
+    normalized_orders = [
+        {**dict(order), **_validated_operation_fields(order, default_side="")}
+        for order in orders
+    ]
     linked = 0
     with _conn() as c:
-        for item in orders:
+        for item in normalized_orders:
             operation_at = str(item.get("at") or "")
             uid = _operation_uid(
                 None, item.get("symbol"), item.get("side"), operation_at,
@@ -1869,9 +1881,12 @@ def link_recorded_operations_to_execution(execution_id: int, orders: List[Dict[s
             cur = c.execute(
                 """UPDATE operations SET execution_id=?
                    WHERE operation_uid=? AND execution_id IS NULL""",
-                (int(execution_id), uid),
+                (eid, uid),
             )
-            linked += int(cur.rowcount or 0)
+            linked_count = int(getattr(cur, "rowcount", 0) or 0)
+            if linked_count != 1:
+                raise RuntimeError("卖出成交与执行记录绑定失败，已拒绝将断链执行标记为完成")
+            linked += linked_count
     return linked
 
 

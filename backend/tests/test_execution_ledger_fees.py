@@ -249,6 +249,48 @@ def test_compatibility_execution_writer_rejects_invalid_budget_before_writing(mo
     assert statements == []
 
 
+def test_sell_operation_link_requires_every_row_to_bind_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _Update:
+        rowcount = 1
+
+    class _Conn:
+        def execute(self, _sql, _params=()):
+            return _Update()
+
+    @contextmanager
+    def fake_conn():
+        yield _Conn()
+
+    monkeypatch.setattr(store, "_conn", fake_conn)
+    linked = store.link_recorded_operations_to_execution(7, [{
+        "symbol": "000001", "side": "SELL", "price": 10, "quantity": 100,
+        "at": "2026-02-02T09:30:00",
+    }])
+    assert linked == 1
+
+
+def test_sell_operation_link_rejects_missing_or_partial_binding(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _Update:
+        rowcount = 0
+
+    class _Conn:
+        def execute(self, _sql, _params=()):
+            return _Update()
+
+    @contextmanager
+    def fake_conn():
+        yield _Conn()
+
+    monkeypatch.setattr(store, "_conn", fake_conn)
+    with pytest.raises(RuntimeError, match="绑定失败"):
+        store.link_recorded_operations_to_execution(7, [{
+            "symbol": "000001", "side": "SELL", "price": 10, "quantity": 100,
+            "at": "2026-02-02T09:30:00",
+        }])
+    with pytest.raises(ValueError, match="invalid_execution_id"):
+        store.link_recorded_operations_to_execution(0, [])
+
+
 def test_list_operations_decodes_target_weight_contract(monkeypatch: pytest.MonkeyPatch) -> None:
     class _Conn:
         def execute(self, *_args):
