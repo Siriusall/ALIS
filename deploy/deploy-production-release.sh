@@ -120,6 +120,8 @@ else
   worker_ssh "sed -i 's/^ALIS_BUILD_GIT_SHA=.*/ALIS_BUILD_GIT_SHA=$commit/' /etc/alis/worker.env; grep -q '^ALIS_BUILD_GIT_SHA=$commit\$' /etc/alis/worker.env"
   worker_ssh "systemctl stop alis-evolution-worker; ln -sfn '$worker_release' /opt/alis-worker/backend"
   worker_switched=1
+  # From here an application switch failure must restore the Worker too.
+  switched=1
 fi
 app_ssh "sudo bash -lc 'ln -sfn \"$app_release\" /opt/alis/current; systemctl restart alis-api'"
 switched=1
