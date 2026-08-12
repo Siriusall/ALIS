@@ -291,15 +291,61 @@ def test_weekend_wall_clock_closes_prior_day_plan_without_waiting_for_new_market
     assert captured == ["20260801"]
 
 
-def test_auto_simulation_skips_exchange_holidays_but_runs_on_trade_days() -> None:
+def test_auto_simulation_uses_exchange_calendar_for_holidays_and_trade_days(monkeypatch) -> None:
     close_time = quant_task_runner.dtime(15, 1)
+    class CalendarConnection:
+        def __init__(self, is_open: int):
+            self.is_open = is_open
+        def execute(self, *_args, **_kwargs):
+            return self
+        def fetchone(self):
+            return {"is_open": self.is_open}
+    class CalendarContext:
+        def __init__(self, is_open: int):
+            self.connection = CalendarConnection(is_open)
+        def __enter__(self):
+            return self.connection
+        def __exit__(self, *_args):
+            return False
 
+    monkeypatch.setattr(quant_task_runner, "data_conn", lambda: CalendarContext(0))
     assert quant_task_runner._auto_simulation_check_due(
-        datetime(2026, 10, 1, 15, 2), close_time,
+        datetime(2026, 8, 13, 15, 2), close_time,
     ) is False
+    monkeypatch.setattr(quant_task_runner, "data_conn", lambda: CalendarContext(1))
     assert quant_task_runner._auto_simulation_check_due(
         datetime(2026, 8, 13, 15, 1), close_time,
     ) is True
+
+
+def test_auto_simulation_rejects_unrecorded_calendar_dates(monkeypatch) -> None:
+    class EmptyConnection:
+        def execute(self, *_args, **_kwargs):
+            return self
+        def fetchone(self):
+            return None
+    class EmptyContext:
+        def __enter__(self):
+            return EmptyConnection()
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(quant_task_runner, "data_conn", lambda: EmptyContext())
+
+    assert quant_task_runner._auto_simulation_check_due(
+        datetime(2026, 8, 13, 15, 2), quant_task_runner.dtime(15, 1),
+    ) is False
+
+
+def test_auto_simulation_uses_static_calendar_only_when_calendar_db_is_unavailable(monkeypatch) -> None:
+    def unavailable():
+        raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(quant_task_runner, "data_conn", unavailable)
+
+    assert quant_task_runner._auto_simulation_check_due(
+        datetime(2026, 10, 1, 15, 2), quant_task_runner.dtime(15, 1),
+    ) is False
 
 
 def test_trading_session_uses_utc8_not_host_timezone() -> None:

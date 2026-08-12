@@ -10,6 +10,7 @@ from typing import Any, Callable, Tuple
 
 from app.integrations.tushare_client import reset_tushare_client
 from app.core.trade_calendar import is_trade_day
+from app.data_platform.db import _conn as data_conn
 from app.db.store import (
     _conn as business_conn,
     get_account_balance,
@@ -430,6 +431,30 @@ def _reconcile_missed_plans_by_wall_clock(now: datetime) -> int:
     )
 
 
+def _is_exchange_trade_day(value: datetime) -> bool:
+    """Use the retained exchange calendar before the bundled fallback.
+
+    The scheduler can affect an immutable plan, so an unknown date is not
+    enough evidence to begin execution-data polling.  The static holiday list
+    only protects the system while the calendar database is temporarily
+    unavailable; it must not override an explicit exchange closure.
+    """
+    trade_date = value.strftime("%Y%m%d")
+    try:
+        with data_conn() as conn:
+            row = conn.execute(
+                "SELECT is_open FROM dc_trade_calendar WHERE exchange='SSE' AND cal_date=? LIMIT 1",
+                (trade_date,),
+            ).fetchone()
+        if row is not None:
+            return bool(int(dict(row).get("is_open") or 0))
+        logger.warning("交易所日历缺少执行日期，拒绝启动执行探测 date=%s", trade_date)
+        return False
+    except Exception as exc:  # noqa: BLE001 - static calendar is an outage fallback only
+        logger.warning("交易所日历不可读，使用内置日历回退 date=%s error=%s", trade_date, str(exc)[:160])
+        return is_trade_day(value.date())
+
+
 def _auto_simulation_check_due(now: datetime, close_time: dtime) -> bool:
     """Run close execution probes only on an A-share trading session.
 
@@ -438,7 +463,7 @@ def _auto_simulation_check_due(now: datetime, close_time: dtime) -> bool:
     normal holiday look like an execution-data delay.
     """
     business_now = now.astimezone(_BUSINESS_TZ) if now.tzinfo else now.replace(tzinfo=_BUSINESS_TZ)
-    return is_trade_day(business_now.date()) and business_now.time() >= close_time
+    return _is_exchange_trade_day(business_now) and business_now.time() >= close_time
 
 
 def start_auto_simulation_scheduler() -> bool:
