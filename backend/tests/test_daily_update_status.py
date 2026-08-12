@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import timezone
 from datetime import datetime, timedelta
 
 from app.data_platform.services import daily_update
@@ -75,6 +76,14 @@ def test_scheduler_starts_lightweight_discovery_immediately_after_close() -> Non
     )
     assert daily_update._scheduler_should_check(
         datetime(2026, 7, 29, 15, 1, 0),
+        "20260729",
+    )
+
+
+def test_scheduler_uses_utc8_when_given_utc_clock() -> None:
+    # 07:01 UTC is exactly 15:01 in Shanghai.
+    assert daily_update._scheduler_should_check(
+        datetime(2026, 7, 29, 7, 1, 0, tzinfo=timezone.utc),
         "20260729",
     )
 

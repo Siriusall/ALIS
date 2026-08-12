@@ -6,6 +6,7 @@ import os
 import threading
 from datetime import date, datetime, time as dtime, timedelta
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from app.data_platform.db import _conn
 from app.data_platform.services.data_center import (
@@ -40,6 +41,7 @@ _DAILY_UPDATE_INTERNAL_FAULT_COOLDOWN_SEC = max(
     min(int(os.getenv("ALIS_DAILY_UPDATE_INTERNAL_FAULT_COOLDOWN_SEC", "1800")), 21600),
 )
 logger = logging.getLogger("quant.daily_update")
+_BUSINESS_TZ = ZoneInfo("Asia/Shanghai")
 
 
 class DailyUpdateDataBlocked(RuntimeError):
@@ -50,7 +52,12 @@ class DailyUpdateDataBlocked(RuntimeError):
 
 
 def _now() -> str:
-    return datetime.now().isoformat(timespec="seconds")
+    return datetime.now(_BUSINESS_TZ).isoformat(timespec="seconds")
+
+
+def _business_now() -> datetime:
+    """Return the UTC+8 business clock used by market publication policy."""
+    return datetime.now(_BUSINESS_TZ)
 
 
 def _latest_trade_date() -> str:
@@ -118,7 +125,7 @@ def _daily_update_retry_policy(c: Any, trade_date: str, *, now: datetime | None 
         finished_at = datetime.fromisoformat(str(item.get("finished_at") or ""))
     except ValueError:
         return {"allowed": True, "reason": "invalid_failure_timestamp", "category": category}
-    current = now or datetime.now()
+    current = (now.astimezone(_BUSINESS_TZ) if now and now.tzinfo else now) or _business_now()
     remaining = max(0, int(retry_after_seconds - (current - finished_at).total_seconds()))
     return {
         "allowed": remaining <= 0,
@@ -136,6 +143,8 @@ def _scheduler_should_check(now: datetime, target_trade_date_value: str) -> bool
     would strand an upstream-delayed slice until 16:05 on every following day.
     """
 
+    if now.tzinfo is not None:
+        now = now.astimezone(_BUSINESS_TZ)
     raw = str(target_trade_date_value or "").replace("-", "")[:8]
     if len(raw) != 8 or not raw.isdigit():
         return False
@@ -165,8 +174,9 @@ def _worker(parent_run_id: int) -> None:
             steps.append({"step": "stock_basic", "result": sync_stock_basic()})
 
         _set_state(phase="calendar", message="正在确认最近交易日", progress=35)
-        start = (date.today() - timedelta(days=35)).strftime("%Y%m%d")
-        end = (date.today() + timedelta(days=7)).strftime("%Y%m%d")
+        today = _business_now().date()
+        start = (today - timedelta(days=35)).strftime("%Y%m%d")
+        end = (today + timedelta(days=7)).strftime("%Y%m%d")
         steps.append({"step": "trade_calendar", "result": sync_trade_calendar(start, end)})
         trade_date = _latest_trade_date()
 
@@ -323,8 +333,9 @@ def _worker(parent_run_id: int) -> None:
             )})
 
         _set_state(phase="announcements", message="正在更新最近公告", progress=75)
-        ann_start = (date.today() - timedelta(days=3)).strftime("%Y%m%d")
-        ann_end = date.today().strftime("%Y%m%d")
+        today = _business_now().date()
+        ann_start = (today - timedelta(days=3)).strftime("%Y%m%d")
+        ann_end = today.strftime("%Y%m%d")
         steps.append({"step": "announcements", "result": sync_cninfo_announcements(
             start_date=ann_start, end_date=ann_end, page_size=30, max_pages=3,
         )})
@@ -445,7 +456,7 @@ def start_daily_update_scheduler() -> bool:
         mark_started("daily_update_scheduler", interval_seconds=_DAILY_UPDATE_INTERVAL_SEC)
         while True:
             try:
-                now = datetime.now()
+                now = _business_now()
                 with _conn() as c:
                     target = target_trade_date(c, now=now)
                     should_check = _scheduler_should_check(now, target)
@@ -504,7 +515,7 @@ def start_daily_update_scheduler() -> bool:
             except Exception as exc:  # noqa: BLE001
                 logger.warning("自动收盘日更检查失败: %s", str(exc)[:300])
                 beat("daily_update_scheduler", error=str(exc))
-            _set_state(next_scheduler_check_at=(datetime.now().astimezone() + timedelta(seconds=_DAILY_UPDATE_INTERVAL_SEC)).isoformat(timespec="seconds"))
+            _set_state(next_scheduler_check_at=(_business_now() + timedelta(seconds=_DAILY_UPDATE_INTERVAL_SEC)).isoformat(timespec="seconds"))
             threading.Event().wait(_DAILY_UPDATE_INTERVAL_SEC)
 
     threading.Thread(target=_loop, name="data-platform-daily-update", daemon=True).start()
@@ -582,7 +593,7 @@ def simple_health() -> dict[str, Any]:
             "failed_runs": c.execute("SELECT COUNT(*) cnt FROM data_ingestion_runs WHERE status='failed'").fetchone(),
             "recent_failed_runs": c.execute(
                 "SELECT COUNT(*) cnt FROM data_ingestion_runs WHERE status='failed' AND COALESCE(finished_at,started_at)>=?",
-                ((datetime.now() - timedelta(hours=24)).isoformat(timespec="seconds"),),
+                ((_business_now() - timedelta(hours=24)).isoformat(timespec="seconds"),),
             ).fetchone(),
         }
     data = {key: dict(row) for key, row in values.items()}
