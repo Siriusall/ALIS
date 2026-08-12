@@ -46,6 +46,8 @@ AUTO_WEEKDAY = max(0, min(int(os.getenv("EVOLUTION_AUTO_WEEKDAY", "4")), 6))
 AUTO_HOUR = max(0, min(int(os.getenv("EVOLUTION_AUTO_HOUR", "18")), 23))
 RESEARCH_CUTOFF_HOUR = max(0, min(int(os.getenv("EVOLUTION_RESEARCH_CUTOFF_HOUR", "10")), 23))
 RESEARCH_CUTOFF_MINUTE = max(0, min(int(os.getenv("EVOLUTION_RESEARCH_CUTOFF_MINUTE", "30")), 59))
+RESEARCH_RESUME_HOUR = max(0, min(int(os.getenv("EVOLUTION_RESEARCH_RESUME_HOUR", "16")), 23))
+RESEARCH_RESUME_MINUTE = max(0, min(int(os.getenv("EVOLUTION_RESEARCH_RESUME_MINUTE", "30")), 59))
 MAX_CANDIDATES_PER_CYCLE = max(1, min(int(os.getenv("EVOLUTION_MAX_CANDIDATES", "6")), 20))
 MAX_WINDOWS_PER_CANDIDATE = max(1, min(int(os.getenv("EVOLUTION_MAX_WINDOWS", "5")), 20))
 REQUIRED_OPPORTUNITY_COST_BASELINES = ("multifactor_equal_weight", "simple_momentum")
@@ -180,7 +182,11 @@ def _defer_long_research_claims(value: datetime) -> bool:
         hour=RESEARCH_CUTOFF_HOUR, minute=RESEARCH_CUTOFF_MINUTE,
         second=0, microsecond=0,
     )
-    return value >= cutoff and _is_scheduled_trade_day(value)
+    resume = value.replace(
+        hour=RESEARCH_RESUME_HOUR, minute=RESEARCH_RESUME_MINUTE,
+        second=0, microsecond=0,
+    )
+    return cutoff <= value < resume and _is_scheduled_trade_day(value)
 
 
 def _lease_owner_process_alive(owner: Any) -> bool | None:
@@ -1423,16 +1429,16 @@ def enqueue_strategy_shadow_daily_task(
             "trigger": "daily_system_autonomy",
             "target_trade_date": normalized_date,
             "max_new_sessions": 1,
-            "observation_contract": "alis_strategy_shadow_incremental_task_v4",
+            "observation_contract": "alis_strategy_shadow_incremental_task_v5",
             "data_contract": "current_experiment_gate_and_candidate_frozen_formal_evidence_v1",
         },
-        dedupe_key=f"strategy_shadow_daily:v4:{normalized_date}",
+        dedupe_key=f"strategy_shadow_daily:v5:{normalized_date}",
         max_attempts=3,
         priority=75,
     )
     return {
         "ok": True,
-        "schema_version": "alis_strategy_shadow_dispatch_v4",
+        "schema_version": "alis_strategy_shadow_dispatch_v5",
         "status": str(task.get("status") or "queued"),
         "trade_date": normalized_date,
         "task": {key: task.get(key) for key in ("id", "status", "phase", "progress", "message")},
@@ -3138,6 +3144,18 @@ def start_evolution_scheduler() -> bool:
                         },
                         priority=70,
                     )
+                    from app.services.controller_candidate_observation import (
+                        ensure_controller_candidate_observation_tasks,
+                    )
+                    from app.services.model_shadow_observation import (
+                        ensure_model_shadow_tasks,
+                    )
+                    from app.services.candidate_lifecycle import reconcile_existing_candidates
+
+                    reconcile_existing_candidates()
+                    ensure_controller_candidate_observation_tasks()
+                    ensure_model_shadow_tasks()
+                    enqueue_strategy_shadow_daily_task(now.date().strftime("%Y%m%d"))
                 if (
                     not V10_RESEARCH_ENABLED
                     and _is_scheduled_trade_day(now)

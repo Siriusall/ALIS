@@ -9,10 +9,14 @@ from app.services import evolution_orchestrator as evolution
 def test_long_research_claims_are_deferred_after_trade_day_cutoff(monkeypatch):
     monkeypatch.setattr(evolution, "RESEARCH_CUTOFF_HOUR", 10)
     monkeypatch.setattr(evolution, "RESEARCH_CUTOFF_MINUTE", 30)
+    monkeypatch.setattr(evolution, "RESEARCH_RESUME_HOUR", 16)
+    monkeypatch.setattr(evolution, "RESEARCH_RESUME_MINUTE", 30)
     monkeypatch.setattr(evolution, "_is_scheduled_trade_day", lambda _value: True)
 
     assert evolution._defer_long_research_claims(datetime(2026, 8, 12, 10, 29)) is False
     assert evolution._defer_long_research_claims(datetime(2026, 8, 12, 10, 30)) is True
+    assert evolution._defer_long_research_claims(datetime(2026, 8, 12, 16, 29)) is True
+    assert evolution._defer_long_research_claims(datetime(2026, 8, 12, 16, 30)) is False
 
 
 def test_long_research_claims_continue_on_non_trade_days(monkeypatch):
@@ -105,7 +109,8 @@ def test_shadow_daily_dispatch_is_idempotent_by_date_and_current_data_contract(m
     assert calls[0]["task_type"] == "strategy_shadow_cycle"
     assert calls[0]["payload"]["max_new_sessions"] == 1
     assert calls[0]["payload"]["data_contract"] == "current_experiment_gate_and_candidate_frozen_formal_evidence_v1"
-    assert calls[0]["dedupe_key"] == "strategy_shadow_daily:v4:20260810"
+    assert calls[0]["payload"]["observation_contract"] == "alis_strategy_shadow_incremental_task_v5"
+    assert calls[0]["dedupe_key"] == "strategy_shadow_daily:v5:20260810"
 
 
 def test_plan_model_autonomy_holds_worker_until_training_is_terminal(monkeypatch):

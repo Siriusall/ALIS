@@ -11,9 +11,26 @@ from app.services.backtest_data_source import BacktestDataSource
 from app.services.candidate_simulation_ledger import persist_candidate_replay
 from app.services.data_health import assess_latest_decision_data_health
 from app.services.production_strategy import resolve_production_strategy_champion
+from app.services.factor_platform import registered_factor_bindings
+from app.services.strategy_config import get_replay_required_factor_names
+from app.services.model_signal_fusion import MODEL_KEYS
 
 
 CONTRACT = "alis_controller_candidate_immediate_observation_v1"
+
+
+def _observation_allowed(version: dict[str, Any]) -> bool:
+    if bool(version.get("is_active")) or str(version.get("status") or "") != "candidate":
+        return False
+    validation = version.get("validation") if isinstance(version.get("validation"), dict) else {}
+    review = validation.get("review") if isinstance(validation.get("review"), dict) else {}
+    blocked = {str(item) for item in validation.get("blocked_reasons") or []}
+    return (
+        str(validation.get("status") or "") != "rejected"
+        and str(review.get("status") or "") != "rejected"
+        and "operator_rejected" not in blocked
+        and "human_review_rejected" not in blocked
+    )
 
 
 def _hash(value: Any) -> str:
@@ -62,24 +79,54 @@ def run_controller_candidate_observation(
             "model_version_id": int(model_version_id),
             "production_change_forbidden": True,
         }
+    strategy = champion.get("strategy") or {}
+    factor_bindings = dict(champion.get("factor_bindings") or {})
+    champion_model_bindings = dict(champion.get("model_bindings") or {})
+    replay_model_bindings = {
+        key: champion_model_bindings.get(key)
+        for key in MODEL_KEYS
+    }
+    required_factors = get_replay_required_factor_names(
+        strategy.get("content") or {},
+        str(strategy.get("type") or "formula"),
+        model_bindings=replay_model_bindings,
+    )
+    research_bindings = registered_factor_bindings(
+        required_factors,
+        statuses=("active", "candidate"),
+    )
+    for factor_key in required_factors:
+        if not isinstance(factor_bindings.get(factor_key), dict):
+            binding = research_bindings.get(factor_key)
+            if isinstance(binding, dict):
+                factor_bindings[factor_key] = binding
+    missing_factors = sorted(
+        key for key in required_factors
+        if not isinstance(factor_bindings.get(key), dict)
+    )
+    if missing_factors:
+        raise ValueError(
+            "Controller observation missing replay factor bindings: "
+            + ",".join(missing_factors)
+        )
     frozen = {
         "schema_version": CONTRACT,
         "candidate_version_id": int(model_version_id),
         "champion_id": int(champion["champion_id"]),
         "strategy_id": int(champion["strategy_id"]),
-        "factor_bindings": champion.get("factor_bindings") or {},
-        "model_bindings": champion.get("model_bindings") or {},
+        "factor_bindings": factor_bindings,
+        "model_bindings": replay_model_bindings,
+        "source_model_binding_keys": sorted(champion_model_bindings),
         "market_state_binding": champion.get("market_state_binding") or {},
         "execution_contract": champion.get("execution_contract") or {},
     }
     contract_hash = _hash(frozen)
-    strategy = champion.get("strategy") or {}
     replay = run_strategy_replay(
         strategy_id=int(champion["strategy_id"]),
         start_date=dates[0],
         end_date=dates[-1],
-        factor_bindings=dict(champion.get("factor_bindings") or {}),
-        model_bindings=dict(champion.get("model_bindings") or {}),
+        factor_bindings=factor_bindings,
+        model_bindings=replay_model_bindings,
         market_state_binding=dict(champion.get("market_state_binding") or {}),
         strategy_controller_version_id=int(model_version_id),
         strategy_content=strategy.get("content") or {},
@@ -122,7 +169,7 @@ def ensure_controller_candidate_observation_tasks() -> dict[str, Any]:
         return {"ok": True, "status": "blocked_by_decision_data", "queued": []}
     queued = []
     for version in list_model_versions("strategy_controller", limit=200):
-        if bool(version.get("is_active")) or str(version.get("status") or "") != "candidate":
+        if not _observation_allowed(version):
             continue
         task = create_evolution_task(
             task_type="controller_candidate_observation",
@@ -131,7 +178,7 @@ def ensure_controller_candidate_observation_tasks() -> dict[str, Any]:
                 "through_trade_date": through,
                 "production_change_forbidden": True,
             },
-            dedupe_key=f"controller_candidate_observation:v1:{int(version['id'])}:{through}",
+            dedupe_key=f"controller_candidate_observation:v3:{int(version['id'])}:{through}",
             priority=69,
         )
         queued.append({"model_version_id": int(version["id"]), "task_id": int(task["id"])})

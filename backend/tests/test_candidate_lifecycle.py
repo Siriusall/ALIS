@@ -3,6 +3,7 @@ from uuid import uuid4
 from app.db import store
 from app.services.candidate_lifecycle import (
     get_candidate_lifecycle,
+    reconcile_existing_candidates,
     transition_candidate_lifecycle,
 )
 
@@ -90,6 +91,29 @@ def test_runtime_stop_does_not_overwrite_version_or_grant_production():
         assert result["eligibility_status"] == "ineligible"
         assert result["production_change_forbidden"] in (1, True)
         assert result["events"][-1]["reason"] == "point_in_time_violation"
+        assert store.get_model_version(version_id)["status"] == "candidate"
+    finally:
+        _delete_test_version(version_id)
+
+
+def test_reconcile_stops_rejected_candidate_without_overwriting_version():
+    version_id = store.create_model_version(
+        model_key="test_rejected_candidate",
+        version=f"v-{uuid4().hex}",
+        status="candidate",
+        artifact_path="builtin://test/rejected",
+        config={},
+        metrics={},
+        validation={"status": "rejected", "production_eligible": False},
+        is_active=False,
+    )
+    try:
+        result = reconcile_existing_candidates()
+        lifecycle = get_candidate_lifecycle(version_id)
+
+        assert version_id in result["stopped_model_version_ids"]
+        assert lifecycle["runtime_status"] == "stopped"
+        assert lifecycle["stop_reason"] == "rejected"
         assert store.get_model_version(version_id)["status"] == "candidate"
     finally:
         _delete_test_version(version_id)

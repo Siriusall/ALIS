@@ -23,6 +23,8 @@ def test_controller_candidate_replay_is_isolated_and_keeps_eligibility_false(mon
     persisted = {}
     monkeypatch.setattr(observation, "get_model_version", lambda _id: version)
     monkeypatch.setattr(observation, "resolve_production_strategy_champion", lambda: champion)
+    monkeypatch.setattr(observation, "get_replay_required_factor_names", lambda *_args, **_kwargs: set())
+    monkeypatch.setattr(observation, "registered_factor_bindings", lambda *_args, **_kwargs: {})
     monkeypatch.setattr(
         observation.BacktestDataSource,
         "get_available_trade_dates",
@@ -49,3 +51,19 @@ def test_controller_candidate_replay_is_isolated_and_keeps_eligibility_false(mon
     assert result["ledger_audit"]["account_id"] == 12
     assert result["production_change_forbidden"] is True
     assert persisted["validation"]["production_eligible"] is False
+
+
+def test_rejected_controller_candidate_is_not_observable():
+    assert observation._observation_allowed({
+        "status": "candidate",
+        "is_active": False,
+        "validation": {
+            "status": "rejected",
+            "blocked_reasons": ["operator_rejected"],
+        },
+    }) is False
+    assert observation._observation_allowed({
+        "status": "candidate",
+        "is_active": False,
+        "validation": {"status": "blocked_by_data"},
+    }) is True

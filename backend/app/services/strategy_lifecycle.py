@@ -711,6 +711,32 @@ def _daily_trade_count(replay: dict[str, Any], *, trade_date: str) -> int:
     )
 
 
+def _strategy_observation_allowed(version: dict[str, Any]) -> bool:
+    """Keep research gates separate from admission to isolated simulation."""
+    if bool(version.get("is_active")):
+        return False
+    if str(version.get("status") or "candidate") not in {
+        "candidate", "shadow_observation", "promoted_cooling",
+    }:
+        return False
+    validation = version.get("validation") if isinstance(version.get("validation"), dict) else {}
+    review = validation.get("review") if isinstance(validation.get("review"), dict) else {}
+    blockers = {
+        str(item) for item in (
+            validation.get("blocking_reasons")
+            or validation.get("blocked_reasons")
+            or []
+        )
+    }
+    return (
+        str(validation.get("status") or "") not in {
+            "rejected", "quick_diagnostic_failed", "shadow_rejected", "rolled_back",
+        }
+        and str(review.get("status") or "") != "rejected"
+        and not blockers.intersection({"operator_rejected", "human_review_rejected", "superseded"})
+    )
+
+
 def run_strategy_shadow_cycle(
     *,
     replay_runner: Callable[..., dict[str, Any]] = run_strategy_replay,
@@ -726,24 +752,7 @@ def run_strategy_shadow_cycle(
     target_key = _date_key(target_trade_date)
     active = resolve_production_strategy_champion()
     all_versions = list_model_versions("alis_strategy_challenger", limit=100)
-    candidates = [
-        version for version in all_versions
-        if (
-            str((version.get("validation") or {}).get("status") or "")
-            in {"shadow_observation", "shadow_passed", "promoted_cooling"}
-            or (
-                bool((version.get("validation") or {}).get("parallel_shadow_enabled"))
-                and str((version.get("validation") or {}).get("status") or "")
-                in {
-                    "pending_oos",
-                    "quick_diagnostic_passed",
-                    "formal_oos_blocked_by_reference",
-                    "formal_oos_blocked_by_statistics",
-                    "formal_oos_blocked_by_holdout_data",
-                }
-            )
-        )
-    ]
+    candidates = [version for version in all_versions if _strategy_observation_allowed(version)]
     # Future shadow is an online observation, not a second formal-OOS run.
     # Candidates reach this stage only after formal OOS, statistics and sealed
     # holdout gates have been frozen in their validation evidence. Requiring
@@ -799,7 +808,10 @@ def run_strategy_shadow_cycle(
         candidate_config = candidate.get("config") if isinstance(candidate.get("config"), dict) else {}
         candidate_strategy_id = int(candidate_config.get("strategy_id") or 0)
         observations = list_shadow_observations(int(candidate["id"]))
-        if bool(validation.get("parallel_shadow_enabled")):
+        immediate_observation = lifecycle_status not in {
+            "shadow_observation", "shadow_passed", "promoted_cooling",
+        }
+        if bool(validation.get("parallel_shadow_enabled")) or immediate_observation:
             parallel_floor = _date_key(
                 validation.get("parallel_shadow_started_after")
             )
@@ -819,9 +831,16 @@ def run_strategy_shadow_cycle(
                 or ""
             )
         )
-        pending_dates = [
-            date for date in dates if _date_key(date) > _date_key(last_date)
-        ][:max(1, min(int(max_new_sessions_per_candidate), 1 if target_key else 20))]
+        if target_key:
+            observed_keys = {_date_key(item.get("trade_date")) for item in observations}
+            pending_dates = [
+                date for date in dates
+                if _date_key(date) == target_key and target_key not in observed_keys
+            ]
+        else:
+            pending_dates = [
+                date for date in dates if _date_key(date) > _date_key(last_date)
+            ][:max(1, min(int(max_new_sessions_per_candidate), 20))]
         reference_version_id = int(validation.get("rollback_target_version_id") or active["champion_id"])
         reference_version = get_model_version(reference_version_id)
         reference_config = reference_version.get("config") if reference_version and isinstance(reference_version.get("config"), dict) else {}
@@ -925,9 +944,10 @@ def run_strategy_shadow_cycle(
                 )
                 result_status = "shadow_observation"
             results.append({"model_version_id": int(candidate["id"]), "status": result_status, "gate": gate})
-        elif bool(validation.get("parallel_shadow_enabled")):
+        elif bool(validation.get("parallel_shadow_enabled")) or immediate_observation:
             _merge_validation(
                 int(candidate["id"]),
+                parallel_shadow_enabled=True,
                 parallel_shadow_observation_sessions=len(observations),
                 parallel_shadow_latest_trade_date=(
                     str(observations[-1].get("trade_date") or "")

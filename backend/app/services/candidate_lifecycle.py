@@ -207,7 +207,7 @@ def transition_candidate_lifecycle(
 
 
 def reconcile_existing_candidates(*, limit: int = 1000) -> dict[str, Any]:
-    """Idempotently enroll inactive historical candidates for observation."""
+    """Enroll valid candidates and stop records whose version evidence rejects them."""
     from app.db.store import _conn
 
     with _conn() as conn:
@@ -239,10 +239,58 @@ def reconcile_existing_candidates(*, limit: int = 1000) -> dict[str, Any]:
                 validation=validation if isinstance(validation, dict) else {},
             )
             registered.append(int(row["id"]))
+        current = conn.execute(
+            """SELECT c.model_version_id,c.runtime_status,v.status,v.is_active,
+                      v.validation_json
+                 FROM candidate_lifecycle_records c
+                 JOIN model_versions v ON v.id=c.model_version_id
+                WHERE c.runtime_status='observing'
+                ORDER BY c.model_version_id LIMIT ?""",
+            (max(1, min(int(limit), 5000)),),
+        ).fetchall()
+    stopped: list[int] = []
+    for raw in current:
+        row = dict(raw)
+        try:
+            validation = json.loads(row.get("validation_json") or "{}")
+        except (TypeError, json.JSONDecodeError):
+            validation = {}
+        review = validation.get("review") if isinstance(validation.get("review"), dict) else {}
+        blockers = {
+            str(item) for item in (
+                validation.get("blocking_reasons")
+                or validation.get("blocked_reasons")
+                or []
+            )
+        }
+        validation_status = str(validation.get("status") or "")
+        reason = ""
+        if bool(row.get("is_active")):
+            reason = "promoted_to_active"
+        elif str(row.get("status") or "") not in {"candidate", "shadow_observation", "promoted_cooling"}:
+            reason = str(row.get("status") or "version_not_observable")
+        elif validation_status in {"rejected", "quick_diagnostic_failed", "shadow_rejected", "rolled_back"}:
+            reason = validation_status
+        elif str(review.get("status") or "") == "rejected":
+            reason = "human_review_rejected"
+        elif blockers.intersection({"operator_rejected", "human_review_rejected", "superseded"}):
+            reason = sorted(blockers.intersection({"operator_rejected", "human_review_rejected", "superseded"}))[0]
+        if reason:
+            transition_candidate_lifecycle(
+                int(row["model_version_id"]),
+                runtime_status="stopped",
+                eligibility_status="promoted" if reason == "promoted_to_active" else "ineligible",
+                event_type="candidate_observation_stopped",
+                reason=reason,
+                evidence={"version_status": row.get("status"), "validation_status": validation_status},
+            )
+            stopped.append(int(row["model_version_id"]))
     return {
         "ok": True,
         "schema_version": "alis_candidate_lifecycle_reconciliation_v1",
         "registered_count": len(registered),
         "model_version_ids": registered,
+        "stopped_count": len(stopped),
+        "stopped_model_version_ids": stopped,
         "policy": "inactive_candidates_observe_immediately_without_production_permission",
     }

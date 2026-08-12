@@ -416,6 +416,102 @@ def test_incremental_shadow_task_reuses_frozen_audit_and_processes_only_target_s
     assert checkpoints[0]["last_trade_date"] == "2026-08-02"
 
 
+def test_strategy_observation_admission_is_independent_from_formal_eligibility():
+    base = {"status": "candidate", "is_active": False, "validation": {}}
+
+    for status in ("pending_oos", "formal_oos_failed", "formal_oos_blocked_by_statistics"):
+        assert lifecycle._strategy_observation_allowed({
+            **base, "validation": {"status": status, "production_eligible": False},
+        }) is True
+
+    for status in ("rejected", "quick_diagnostic_failed", "shadow_rejected", "rolled_back"):
+        assert lifecycle._strategy_observation_allowed({
+            **base, "validation": {"status": status, "production_eligible": False},
+        }) is False
+
+
+def test_immediate_strategy_observation_persists_isolated_account_before_oos(monkeypatch):
+    candidate = {
+        "id": 73,
+        "status": "candidate",
+        "is_active": False,
+        "validation": {"status": "pending_oos", "production_eligible": False},
+        "config": {"strategy_id": 7},
+    }
+    recorded = []
+
+    class FakeSource:
+        def get_available_trade_dates(self, *_args):
+            return ["2026-08-11", "2026-08-12"]
+
+    monkeypatch.setattr(lifecycle, "BacktestDataSource", FakeSource)
+    monkeypatch.setattr(lifecycle, "resolve_production_strategy_champion", lambda: {"champion_id": 50, "strategy_id": 1})
+    monkeypatch.setattr(lifecycle, "list_model_versions", lambda *_args, **_kwargs: [candidate])
+    monkeypatch.setattr(lifecycle, "get_model_version", lambda *_args: {"config": {"strategy_id": 1}})
+    monkeypatch.setattr(lifecycle, "list_shadow_observations", lambda *_args, **_kwargs: list(recorded))
+    monkeypatch.setattr(lifecycle, "record_shadow_observation", lambda **kwargs: recorded.append(kwargs))
+    updates = []
+    monkeypatch.setattr(lifecycle, "_merge_validation", lambda model_id, **kwargs: updates.append((model_id, kwargs)) or kwargs)
+
+    replay = {
+        "metrics": {"max_drawdown": 0.0}, "summary": {},
+        "equity_series": [
+            {"date": "2026-08-11", "total_value": 200000.0},
+            {"date": "2026-08-12", "total_value": 200100.0},
+        ],
+        "data_quality": {"point_in_time": {"passed": True}},
+        "blocked_events": [], "trades": [],
+    }
+    ledgers = []
+    result = lifecycle.run_strategy_shadow_cycle(
+        replay_runner=lambda **_kwargs: replay,
+        target_trade_date="20260812",
+        candidate_ledger_persistor=lambda model_id, value: ledgers.append((model_id, value)) or {"ok": True},
+    )
+
+    assert result["results"][0]["status"] == "parallel_shadow_observation"
+    assert ledgers[0][0] == 73
+    assert updates[-1][1]["parallel_shadow_enabled"] is True
+
+
+def test_incremental_strategy_observation_jumps_to_target_instead_of_backfilling_gap(monkeypatch):
+    candidate = {
+        "id": 57, "status": "candidate", "is_active": False,
+        "validation": {"status": "formal_oos_blocked_by_statistics", "parallel_shadow_enabled": True},
+        "config": {"strategy_id": 7},
+    }
+    existing = [{"trade_date": "2026-07-24"}]
+    recorded = []
+
+    class FakeSource:
+        def get_available_trade_dates(self, *_args):
+            return ["2026-07-24", "2026-07-25", "2026-08-12"]
+
+    monkeypatch.setattr(lifecycle, "BacktestDataSource", FakeSource)
+    monkeypatch.setattr(lifecycle, "resolve_production_strategy_champion", lambda: {"champion_id": 50, "strategy_id": 1})
+    monkeypatch.setattr(lifecycle, "list_model_versions", lambda *_args, **_kwargs: [candidate])
+    monkeypatch.setattr(lifecycle, "get_model_version", lambda *_args: {"config": {"strategy_id": 1}})
+    monkeypatch.setattr(lifecycle, "list_shadow_observations", lambda *_args, **_kwargs: existing + recorded)
+    monkeypatch.setattr(lifecycle, "record_shadow_observation", lambda **kwargs: recorded.append(kwargs))
+    monkeypatch.setattr(lifecycle, "_merge_validation", lambda *_args, **kwargs: kwargs)
+    replay = {
+        "metrics": {"max_drawdown": 0.0}, "summary": {},
+        "equity_series": [
+            {"date": "2026-08-11", "total_value": 200000.0},
+            {"date": "2026-08-12", "total_value": 200100.0},
+        ],
+        "data_quality": {"point_in_time": {"passed": True}},
+        "blocked_events": [], "trades": [],
+    }
+    lifecycle.run_strategy_shadow_cycle(
+        replay_runner=lambda **_kwargs: replay,
+        target_trade_date="20260812",
+        candidate_ledger_persistor=lambda *_args: {"ok": True},
+    )
+
+    assert [row["trade_date"] for row in recorded] == ["2026-08-12"]
+
+
 def test_cooling_gate_requests_rollback_on_material_underperformance():
     rows = _shadow_rows(5, delta=-0.011)
     gate = lifecycle.cooling_rollback_gate(rows, promoted_after="2026-07-31")
