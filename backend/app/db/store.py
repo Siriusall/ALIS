@@ -772,6 +772,72 @@ CREATE INDEX IF NOT EXISTS idx_candidate_lifecycle_runtime
 ON candidate_lifecycle_records(runtime_status,candidate_type);
 CREATE INDEX IF NOT EXISTS idx_candidate_lifecycle_events_version
 ON candidate_lifecycle_events(model_version_id,id);
+CREATE TABLE IF NOT EXISTS candidate_simulation_accounts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    model_version_id INTEGER NOT NULL,
+    contract_hash TEXT NOT NULL,
+    status TEXT NOT NULL,
+    initial_cash REAL NOT NULL,
+    latest_cash REAL NOT NULL,
+    latest_equity REAL NOT NULL,
+    latest_trade_date TEXT NOT NULL DEFAULT '',
+    data_contract_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(model_version_id,contract_hash),
+    FOREIGN KEY (model_version_id) REFERENCES model_versions(id)
+);
+CREATE TABLE IF NOT EXISTS candidate_simulation_daily_equity (
+    account_id INTEGER NOT NULL,
+    trade_date TEXT NOT NULL,
+    cash REAL NOT NULL,
+    stock_value REAL NOT NULL,
+    total_value REAL NOT NULL,
+    benchmark_value REAL,
+    positions_json TEXT NOT NULL DEFAULT '{}',
+    point_in_time_passed INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(account_id,trade_date),
+    FOREIGN KEY (account_id) REFERENCES candidate_simulation_accounts(id)
+);
+CREATE TABLE IF NOT EXISTS candidate_simulation_decisions (
+    account_id INTEGER NOT NULL,
+    signal_date TEXT NOT NULL,
+    execute_date TEXT NOT NULL,
+    status TEXT NOT NULL,
+    decision_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(account_id,signal_date),
+    FOREIGN KEY (account_id) REFERENCES candidate_simulation_accounts(id)
+);
+CREATE TABLE IF NOT EXISTS candidate_simulation_operations (
+    account_id INTEGER NOT NULL,
+    operation_uid TEXT NOT NULL,
+    trade_date TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    side TEXT NOT NULL,
+    price REAL NOT NULL,
+    quantity INTEGER NOT NULL,
+    fees REAL NOT NULL DEFAULT 0,
+    operation_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(account_id,operation_uid),
+    FOREIGN KEY (account_id) REFERENCES candidate_simulation_accounts(id)
+);
+CREATE TABLE IF NOT EXISTS candidate_simulation_blocked_events (
+    account_id INTEGER NOT NULL,
+    event_uid TEXT NOT NULL,
+    trade_date TEXT NOT NULL,
+    code TEXT NOT NULL,
+    event_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(account_id,event_uid),
+    FOREIGN KEY (account_id) REFERENCES candidate_simulation_accounts(id)
+);
+CREATE INDEX IF NOT EXISTS idx_candidate_sim_equity_date
+ON candidate_simulation_daily_equity(trade_date,account_id);
+CREATE INDEX IF NOT EXISTS idx_candidate_sim_operations_date
+ON candidate_simulation_operations(trade_date,account_id);
 CREATE TABLE IF NOT EXISTS model_train_runs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     status TEXT NOT NULL,

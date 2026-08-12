@@ -717,7 +717,12 @@ def run_strategy_shadow_cycle(
     max_new_sessions_per_candidate: int = 5,
     target_trade_date: str = "",
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
+    candidate_ledger_persistor: Callable[[int, dict[str, Any]], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
+    if candidate_ledger_persistor is None:
+        from app.services.candidate_simulation_ledger import persist_candidate_replay
+
+        candidate_ledger_persistor = persist_candidate_replay
     target_key = _date_key(target_trade_date)
     active = resolve_production_strategy_champion()
     all_versions = list_model_versions("alis_strategy_challenger", limit=100)
@@ -836,6 +841,13 @@ def run_strategy_shadow_cycle(
                 end_date=trade_date,
                 replay_runner=replay_runner,
             )
+            candidate_ledger_audit = candidate_ledger_persistor(
+                int(candidate["id"]), candidate_replay,
+            )
+            if not bool(candidate_ledger_audit.get("ok")):
+                raise RuntimeError(
+                    f"候选 {candidate['id']} 隔离模拟账本审计失败"
+                )
             candidate_metrics = candidate_replay.get("metrics") or {}
             champion_metrics = champion_replay.get("metrics") or {}
             candidate_return, candidate_equity = _replay_daily_return(candidate_replay, trade_date=trade_date)
@@ -866,6 +878,7 @@ def run_strategy_shadow_cycle(
                     "champion": champion_metrics,
                     "candidate_summary": candidate_replay.get("summary") or {},
                     "champion_summary": champion_replay.get("summary") or {},
+                    "candidate_ledger": candidate_ledger_audit,
                 },
             )
             if progress_callback is not None:

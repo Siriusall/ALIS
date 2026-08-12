@@ -1652,6 +1652,8 @@ ALIS 的目标运行方式调整为“系统自治、结果可见、异常才打
 - [x] 将“候选是否正在观察”和“候选是否有生产资格”拆成两套正交状态。新增 `candidate_lifecycle_records/events`：运行状态固定为 `created/observing/stopped/archived`，生产资格固定为 `ineligible/evaluating/eligible/promoted/rolled_back`；模型、策略、StrategyController、因子和组合候选继续保留各自原生版本状态以兼容现有消费者，但新候选经统一 `create_model_version()` 创建时立即登记为 `observing + ineligible`，默认 `production_change_forbidden=true`。候选无需先通过收益、正式 OOS、A/B、统计或密封集才能开始隔离观察；这些门只决定后续生产权限。
 - [x] 统一保存候选类型、`bugfix/performance_tuning/structural_change` 变更类型、根实验、父版本、替代版本、问题族和变更字段；生命周期事件只追加不覆盖。效果调优的新版本不得继承父版本观察收益，程序修复也生成可追溯的新版本。真实幂等登记当前仍在候选/观察状态的44个历史版本：策略16、StrategyController 9、模型19，全部保持 `observing + ineligible`，未改变 Champion、模型生产绑定、账户、持仓、订单或成交。
 - [x] 修复策略未来 Shadow 错误重复依赖滚动永久 OOS 窗口的问题。32个历史切片在对应T日15:00后才入库，正式 OOS 必须继续严格阻断且不得伪造可用时间；未来 Shadow 改为消费当前实验数据门、候选冻结证据和逐日点时回放，不再因不可逆历史缺口永久死锁。真实 `20260812` 策略 Shadow 入口返回 `completed/candidate_count=0/production_change_forbidden=true`；五业务模型独立未来 Shadow 状态不变。数据库修订头推进到 `sim_0004_candidate_lifecycle`，后端全量回归 `1098 passed、1 skipped、6 subtests passed`。
+- [x] 建立统一候选隔离模拟账本 V1。新增候选账户、逐日权益/现金/持仓、冻结决策、模拟成交/费用和拒单事件五类持久证据，全部以“候选版本 + 冻结组件合同哈希”隔离；持久化由既有 `run_strategy_replay()` 输出派生，继续复用 T日信号/T+1执行、A股交易约束和共享费用滑点，不另造交易引擎。账本审计逐日验证 `现金 + 持仓市值 = 总权益`，并验证最新账户权益与最后权益点一致；写入失败时 Shadow 必须失败，不能只留下收益摘要。
+- [x] 策略 Challenger 的每日未来 Shadow 已接入候选隔离账本；原日收益、回撤和至少4个有效调仓日门继续兼容，但每条观察新增候选账户审计证据。专项测试验证重复重放幂等复用同一账户、成交不重复、主账户 `executions/operations/positions` 行数完全不变。首次迁移修订名超过 Alembic 32字符限制被事务拒绝，缩短后发现一次中断实例可能出现版本头已推进而结构缺失，因此追加 `sim_0006_candidate_ledger_repair` 前向自愈迁移并显式验五张表；当前真实五表齐全。后端全量回归 `1099 passed、1 skipped、6 subtests passed`。
 
 # 2026-08-12：运行健康与正式计划 SQL 修复
 

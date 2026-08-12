@@ -353,7 +353,13 @@ def test_shadow_cycle_records_non_overlapping_daily_returns_from_replay(monkeypa
             "trades": [{"date": "2026-08-02"}] if model_version_id == 11 else [],
         }
 
-    result = lifecycle.run_strategy_shadow_cycle(replay_runner=replay_runner)
+    ledgers = []
+    result = lifecycle.run_strategy_shadow_cycle(
+        replay_runner=replay_runner,
+        candidate_ledger_persistor=lambda model_id, replay: ledgers.append((model_id, replay)) or {
+            "ok": True, "status": "passed", "account_id": 91,
+        },
+    )
 
     assert result["schema_version"] == "alis_strategy_shadow_cycle_v2"
     assert len(recorded) == 1
@@ -361,6 +367,8 @@ def test_shadow_cycle_records_non_overlapping_daily_returns_from_replay(monkeypa
     assert round(recorded[0]["champion_return"], 8) == 0.05
     assert recorded[0]["metrics"]["return_contract"] == lifecycle.SHADOW_RETURN_CONTRACT
     assert recorded[0]["metrics"]["candidate_daily_trade_count"] == 1
+    assert recorded[0]["metrics"]["candidate_ledger"]["account_id"] == 91
+    assert ledgers[0][0] == 11
 
 
 def test_incremental_shadow_task_reuses_frozen_audit_and_processes_only_target_session(monkeypatch):
@@ -399,6 +407,7 @@ def test_incremental_shadow_task_reuses_frozen_audit_and_processes_only_target_s
         max_new_sessions_per_candidate=20,
         target_trade_date="20260802",
         progress_callback=checkpoints.append,
+        candidate_ledger_persistor=lambda *_args: {"ok": True, "status": "passed", "account_id": 92},
     )
 
     assert result["schema_version"] == "alis_strategy_shadow_cycle_v3"
@@ -674,6 +683,7 @@ def test_shadow_cycle_does_not_depend_on_historical_oos_hard_data(monkeypatch):
     result = lifecycle.run_strategy_shadow_cycle(
         replay_runner=lambda **_kwargs: replay,
         target_trade_date="20260802",
+        candidate_ledger_persistor=lambda *_args: {"ok": True, "status": "passed", "account_id": 93},
     )
 
     assert result["status"] == "completed"
