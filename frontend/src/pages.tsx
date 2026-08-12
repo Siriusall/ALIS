@@ -332,7 +332,6 @@ export function Portfolio({ data }: { data: ConsoleData }) {
     && Boolean(pick(action,["controller_obligation.required"],false))
     && ["reduce_position","sell_exit"].includes(String(pick(action,["controller_action","controller_intent"],"")))
     && Number(pick(action,["planned_quantity"],0))>0
-    && firstArray(action,["controller_obligation.reason_codes"]).includes(pick(breach,["code"],""))
   ));
   const allHardBreachesPlanned=hardBreaches.length>0&&remediatedHardBreaches.length===hardBreaches.length&&Boolean(latestPlan.execution_authorized);
   const riskDisplay=allHardBreachesPlanned?"待本次计划修复":pick(data.risk,["status"],"证据缺失");
