@@ -10,7 +10,8 @@ def test_observation_center_separates_runtime_account_and_eligibility(monkeypatc
                 "change_type": "performance_tuning", "problem_family": "ranking",
                 "production_change_forbidden": 1, "model_key": "ranker",
                 "version": "v8", "version_status": "candidate",
-                "validation_json": '{"blocked_reasons":["formal_oos"]}',
+                "stop_reason": "human_review_rejected",
+                "validation_json": '{"blocked_reasons":["formal_oos"],"review":{"reviewer":"auto_optimizer","comment":"auto rejected"}}',
                 "version_created_at": "2026-08-12T16:00:00+08:00",
                 "account_id": 2, "account_status": "observing",
                 "latest_trade_date": "20260812", "initial_cash": 200000,
@@ -41,3 +42,6 @@ def test_observation_center_separates_runtime_account_and_eligibility(monkeypatc
     assert item["account"]["operation_count"] == 3
     assert item["account"]["total_fees"] == 18.5
     assert item["blocked_reasons"] == ["formal_oos"]
+    assert item["stop_reason"] == "human_review_rejected"
+    assert item["reviewer"] == "auto_optimizer"
+    assert item["review_comment"] == "auto rejected"

@@ -49,6 +49,7 @@ def build_candidate_observation_center(*, limit: int = 200) -> dict[str, Any]:
     items = []
     for row in rows:
         validation = _loads(row.pop("validation_json", None), {})
+        review = validation.get("review") if isinstance(validation.get("review"), dict) else {}
         blocked = (
             (validation.get("production_eligibility") or {}).get("blocked_reasons")
             if isinstance(validation.get("production_eligibility"), dict)
@@ -66,6 +67,9 @@ def build_candidate_observation_center(*, limit: int = 200) -> dict[str, Any]:
             "runtime_status": row.get("runtime_status"),
             "eligibility_status": row.get("eligibility_status"),
             "version_status": row.get("version_status"),
+            "stop_reason": row.get("stop_reason") or "",
+            "reviewer": review.get("reviewer") or "",
+            "review_comment": review.get("comment") or "",
             "started_at": row.get("version_created_at") or row.get("created_at"),
             "problem_family": row.get("problem_family"),
             "production_change_forbidden": bool(row.get("production_change_forbidden")),
