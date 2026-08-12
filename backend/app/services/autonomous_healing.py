@@ -35,11 +35,16 @@ def _repair_hard_data() -> dict[str, Any]:
     gaps = {
         str(item.get("trade_date") or ""): item
         for item in detailed.get("dates") or []
-        if isinstance(item, dict) and not bool(item.get("eligible")) and str(item.get("trade_date") or "")
+        if isinstance(item, dict) and not bool(item.get("eligible")) and bool(item.get("repairable", True)) and str(item.get("trade_date") or "")
     }
     dates = sorted(gaps)[:MAX_OOS_REPAIR_DATES]
     if not dates:
-        return {"kind": "oos_hard_data", "status": "blocked", "reason": "no_explicit_repairable_dates"}
+        return {
+            "kind": "oos_hard_data", "status": "blocked",
+            "reason": "no_explicit_repairable_dates",
+            "non_repairable_dates": detailed.get("non_repairable_dates") or [],
+            "verification": audit_oos_hard_data(include_dates=False),
+        }
     repair = repair_oos_hard_data_batch(dates, date_gaps=gaps)
     after = audit_oos_hard_data(include_dates=False)
     return {

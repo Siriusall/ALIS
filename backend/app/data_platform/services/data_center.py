@@ -4401,21 +4401,28 @@ def _refresh_oos_hard_api_stats(c: Any, api_name: str, trade_dates: list[str], u
     """Persist bounded point-in-time raw coverage for the permanent OOS gate."""
     for trade_date in trade_dates:
         row = c.execute(
-            """SELECT COUNT(DISTINCT ts_code) AS point_in_time_rows
+            """SELECT COUNT(DISTINCT ts_code) FILTER (WHERE available_time<=
+                        (SUBSTRING(trade_date,1,4)||'-'||SUBSTRING(trade_date,5,2)||'-'||SUBSTRING(trade_date,7,2)||'T15:00:00')) AS point_in_time_rows,
+                      COUNT(DISTINCT ts_code) AS raw_rows,
+                      COALESCE(MIN(available_time), '') AS first_available_time
                  FROM dc_tushare_raw_records
-                WHERE api_name=? AND trade_date=? AND ts_code<>''
-                  AND available_time<=
-                      (SUBSTRING(?,1,4)||'-'||SUBSTRING(?,5,2)||'-'||SUBSTRING(?,7,2)||'T15:00:00')""",
-            (api_name, trade_date, trade_date, trade_date, trade_date),
+                WHERE api_name=? AND trade_date=? AND ts_code<>''""",
+            (api_name, trade_date),
         ).fetchone()
         c.execute(
             """INSERT INTO dc_oos_hard_api_stats_live
-                   (api_name,trade_date,point_in_time_rows,updated_at)
-               VALUES(?,?,?,?)
+                   (api_name,trade_date,point_in_time_rows,raw_rows,first_available_time,updated_at)
+               VALUES(?,?,?,?,?,?)
                ON CONFLICT(api_name,trade_date) DO UPDATE SET
                    point_in_time_rows=excluded.point_in_time_rows,
+                   raw_rows=excluded.raw_rows,
+                   first_available_time=excluded.first_available_time,
                    updated_at=excluded.updated_at""",
-            (api_name, trade_date, int(_row_value(row, "point_in_time_rows", 0) or 0), updated_at),
+            (
+                api_name, trade_date, int(_row_value(row, "point_in_time_rows", 0) or 0),
+                int(_row_value(row, "raw_rows", 0) or 0),
+                str(_row_value(row, "first_available_time", "") or ""), updated_at,
+            ),
         )
 
 

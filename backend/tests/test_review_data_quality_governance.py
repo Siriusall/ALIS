@@ -43,3 +43,20 @@ def test_data_quality_review_repairs_only_bounded_explicit_hard_gaps(monkeypatch
     assert result["status"] == "repaired"
     assert result["hard_data_after"]["status"] == "ready"
     assert calls == [{"dates": ["20260701"], "date_gaps": {"20260701": {"trade_date": "20260701", "eligible": False, "missing_apis": ["adj_factor"]}, "20260702": {"trade_date": "20260702", "eligible": False, "missing_apis": ["daily"]}}}]
+
+
+def test_data_quality_review_does_not_retry_non_repairable_pit_gap(monkeypatch) -> None:
+    monkeypatch.setattr(governance, "latest_performance_learning_context", _context)
+    audits = iter([
+        {"status": "blocked", "window_end": "20260723"},
+        {"status": "blocked", "window_end": "20260723", "dates": [
+            {"trade_date": "20260701", "eligible": False, "repairable": False},
+        ]},
+    ])
+    monkeypatch.setattr(governance, "audit_oos_hard_data", lambda **_: next(audits))
+    monkeypatch.setattr(governance, "run_data_quality_checks", lambda trade_date=None: {"checks": []})
+    monkeypatch.setattr(governance, "repair_oos_hard_data_batch", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must not retry")))
+
+    result = governance.run_review_data_quality_governance()
+
+    assert result["status"] == "audited_no_repairable_gap"

@@ -338,12 +338,20 @@ def build_backfill_plan(*, market_batch_days: int = 30, financial_batch_size: in
             "status": "needed",
             "gap": {"have": int(oos_hard["eligible_sessions"]), "need": int(oos_hard["required_sessions"]), "missing": int(oos_hard["missing_sessions"]), "dates": batch},
         })
-    else:
+    elif str(oos_hard.get("status") or "") == "ready":
         add({
             "priority": 1, "key": "oos_hard_data", "title": "Champion OOS 永久硬数据",
             "why": "正式五窗口 OOS 数据合同已满足", "action": "sync_oos_hard_data_batch",
             "params": {"trade_dates": []}, "estimated_calls": 0, "estimated_minutes": 0,
             "status": "done", "gap": {"have": int(oos_hard["eligible_sessions"]), "need": int(oos_hard["required_sessions"]), "missing": 0},
+        })
+    else:
+        add({
+            "priority": 1, "key": "oos_hard_data", "title": "Champion OOS 永久硬数据",
+            "why": "历史点时可用性缺口不可通过后补数据修复；正式 OOS 继续阻断，保留审计证据",
+            "action": "manual_or_fallback_required", "params": {"non_repairable_dates": oos_hard.get("non_repairable_dates") or []},
+            "estimated_calls": 0, "estimated_minutes": 0, "status": "blocked",
+            "gap": {"have": int(oos_hard["eligible_sessions"]), "need": int(oos_hard["required_sessions"]), "missing": int(oos_hard["missing_sessions"]), "dates": oos_hard.get("non_repairable_dates") or []},
         })
 
     # 2. Market daily bundles — day by day in batches.

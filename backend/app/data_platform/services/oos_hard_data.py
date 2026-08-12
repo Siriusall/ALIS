@@ -74,6 +74,50 @@ def _benchmark_date_set(start_date: str, end_date: str) -> set[str]:
     return valid
 
 
+def _late_arrival_hard_api_sets(details: list[dict[str, Any]]) -> dict[str, set[str]]:
+    """Identify complete raw slices that arrived after their historical cutoff.
+
+    Those slices are evidence of a real point-in-time gap, not an upstream
+    retrieval gap. Retrying them cannot make an old decision observable, so
+    they must remain blocked without repeatedly consuming repair quota.
+    """
+    candidates = {
+        str(item.get("trade_date") or ""): set(item.get("missing_apis") or []) & set(HARD_APIS)
+        for item in details
+        if isinstance(item, dict) and not bool(item.get("eligible"))
+    }
+    candidates = {date: apis for date, apis in candidates.items() if date and apis}
+    if not candidates:
+        return {}
+    dates = sorted(candidates)
+    placeholders = ",".join("?" for _ in dates)
+    with _conn() as conn:
+        try:
+            rows = conn.execute(
+                f"""SELECT api_name,trade_date,raw_rows,first_available_time
+                      FROM dc_oos_hard_api_stats_live
+                     WHERE api_name IN (?,?,?,?) AND trade_date IN ({placeholders})""",
+                (*HARD_APIS, *dates),
+            ).fetchall()
+        except Exception:
+            # A missing live statistic remains repairable. Never substitute a
+            # large raw-table aggregate into a read-time audit.
+            return {}
+    late: dict[str, set[str]] = {}
+    for row in rows:
+        item = dict(row)
+        api = str(item.get("api_name") or "")
+        trade_date = str(item.get("trade_date") or "")
+        cutoff = f"{trade_date[:4]}-{trade_date[4:6]}-{trade_date[6:]}T15:00:00"
+        if (
+            api in candidates.get(trade_date, set())
+            and int(item.get("raw_rows") or 0) >= MINIMUM_HARD_API_ROWS
+            and str(item.get("first_available_time") or "") > cutoff
+        ):
+            late.setdefault(trade_date, set()).add(api)
+    return late
+
+
 def _repair_benchmark_gaps(
     benchmark_dates: list[str], benchmark_available: set[str]
 ) -> list[dict[str, Any]]:
@@ -149,6 +193,20 @@ def audit_oos_hard_data(*, end_date: str | None = None, include_dates: bool = Tr
             "missing_apis": missing_apis, "point_in_time_passed": pit_ok,
             "max_available_time": snapshot.get("max_available_time"), "reasons": reasons,
         })
+    late_hard_apis = _late_arrival_hard_api_sets(details)
+    for item in details:
+        trade_date = str(item["trade_date"])
+        late = sorted(late_hard_apis.get(trade_date, set()))
+        missing = set(item.get("missing_apis") or [])
+        missing_hard = missing & set(HARD_APIS)
+        repairable_missing = sorted((missing - set(late)))
+        item["late_arrival_apis"] = late
+        item["repairable_missing_apis"] = repairable_missing
+        item["repairable"] = not bool(missing_hard) or bool(missing_hard - set(late))
+        if missing_hard and missing_hard == set(late):
+            item["repairable"] = bool(BENCHMARK_API_KEY in missing)
+            if not item["repairable"]:
+                item["reasons"].append("historical_point_in_time_unavailable")
     trailing_pending_dates: list[str] = []
     if not end_date:
         contiguous_newest_first: list[dict[str, Any]] = []
@@ -173,6 +231,8 @@ def audit_oos_hard_data(*, end_date: str | None = None, include_dates: bool = Tr
     effective_end = required_dates[-1] if required_dates else end
     eligible_dates = [item["trade_date"] for item in details if item["eligible"]]
     missing_dates = [item["trade_date"] for item in details if not item["eligible"]]
+    repair_dates = [item["trade_date"] for item in details if not item["eligible"] and item.get("repairable")]
+    non_repairable_dates = [item["trade_date"] for item in details if not item["eligible"] and not item.get("repairable")]
     calendar_missing = max(0, REQUIRED_SESSIONS - len(required_dates))
     coverage = len(eligible_dates) / REQUIRED_SESSIONS
     result = {
@@ -185,7 +245,8 @@ def audit_oos_hard_data(*, end_date: str | None = None, include_dates: bool = Tr
         "hard_apis": [*HARD_APIS, BENCHMARK_API_KEY],
         "hard_fields": ["close", "volume", "turnover", "total_mv", "circ_mv", "pe_ttm", "pb", "turnover_rate", "up_limit", "down_limit", "benchmark_close", "available_time"],
         "thresholds": {"minimum_daily_rows": MINIMUM_DAILY_ROWS, "minimum_hard_api_rows": MINIMUM_HARD_API_ROWS, "minimum_market_field_ratio": MINIMUM_MARKET_FIELD_RATIO},
-        "repair_dates": missing_dates,
+        "repair_dates": repair_dates,
+        "non_repairable_dates": non_repairable_dates,
         "trailing_pending_dates": list(reversed(trailing_pending_dates)),
         "generated_at": datetime.now().isoformat(timespec="seconds"),
     }
@@ -227,7 +288,7 @@ def repair_oos_hard_data_batch(trade_dates: list[str], *, date_gaps: dict[str, d
     ]
     for trade_date in trade_dates:
         gap = gaps.get(trade_date) or {}
-        missing = set(gap.get("missing_apis") or [])
+        missing = set(gap.get("repairable_missing_apis") or gap.get("missing_apis") or [])
         core = [api for api in ("daily", "daily_basic", "stk_limit") if api in missing]
         reasons = set(gap.get("reasons") or [])
         rebuild_snapshot = bool(reasons & {"snapshot_rows_insufficient", "market_fields_incomplete", "point_in_time_invalid"})

@@ -52,7 +52,7 @@ def run_review_data_quality_governance(*, max_repair_dates: int = MAX_REPAIR_DAT
     gaps = {
         str(item.get("trade_date") or ""): item
         for item in detailed.get("dates") or []
-        if isinstance(item, dict) and not bool(item.get("eligible")) and str(item.get("trade_date") or "")
+        if isinstance(item, dict) and not bool(item.get("eligible")) and bool(item.get("repairable", True)) and str(item.get("trade_date") or "")
     }
     limit = result["repair_limit"]
     dates = sorted(gaps)[:limit]

@@ -135,6 +135,7 @@ class FakeRows(list):
 def test_oos_hard_contract_requires_five_formal_windows(monkeypatch):
     assert oos_hard_data.REQUIRED_SESSIONS == 1537
     monkeypatch.setattr(oos_hard_data, "_conn", lambda: FakeConn())
+    monkeypatch.setattr(oos_hard_data, "_late_arrival_hard_api_sets", lambda _details: {})
     result = oos_hard_data.audit_oos_hard_data(end_date="20260722")
     assert result["status"] == "blocked"
     assert result["eligible_sessions"] == 1
@@ -190,6 +191,49 @@ def test_oos_hard_api_sets_read_persisted_point_in_time_coverage(monkeypatch):
     assert "dc_oos_hard_api_stats_live" in queries[0][0]
 
 
+def test_late_complete_hard_slices_are_blocked_without_repair(monkeypatch):
+    class Conn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def execute(self, sql, params=()):
+            assert "dc_oos_hard_api_stats_live" in sql
+            return FakeRows([{
+                "api_name": "daily", "trade_date": "20260722", "raw_rows": 1000,
+                "first_available_time": "2026-07-23T09:00:00",
+            }])
+
+    monkeypatch.setattr(oos_hard_data, "_conn", lambda: Conn())
+    late = oos_hard_data._late_arrival_hard_api_sets([{
+        "trade_date": "20260722", "eligible": False, "missing_apis": ["daily"],
+    }])
+    assert late == {"20260722": {"daily"}}
+
+
+def test_late_arrival_classification_uses_persisted_timing_stats(monkeypatch):
+    queries: list[str] = []
+
+    class Conn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def execute(self, sql, params=()):
+            queries.append(sql)
+            return FakeRows([])
+
+    monkeypatch.setattr(oos_hard_data, "_conn", lambda: Conn())
+    assert oos_hard_data._late_arrival_hard_api_sets([{
+        "trade_date": "20260722", "eligible": False, "missing_apis": ["daily"],
+    }]) == {}
+    assert "dc_oos_hard_api_stats_live" in queries[0]
+
+
 def test_oos_asset_is_permanent_blocking_asset(monkeypatch):
     monkeypatch.setattr(oos_hard_data, "audit_oos_hard_data", lambda include_dates=False: {
         "consumer": "Champion", "window_start": "20200101", "window_end": "20260722",
@@ -242,6 +286,7 @@ def test_default_audit_keeps_last_complete_frozen_window_when_today_is_pending(m
         "_benchmark_date_set",
         lambda start, end: set(complete),
     )
+    monkeypatch.setattr(oos_hard_data, "_late_arrival_hard_api_sets", lambda _details: {})
     result = oos_hard_data.audit_oos_hard_data(include_dates=False)
     assert result["status"] == "ready"
     assert result["window_end"] == dates[-2]

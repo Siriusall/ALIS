@@ -32,6 +32,26 @@ def test_self_healing_repairs_only_explicit_hard_data_gaps(monkeypatch) -> None:
     assert result["actions"][0]["dates"] == ["20260701"]
 
 
+def test_self_healing_does_not_retry_historical_point_in_time_gaps(monkeypatch) -> None:
+    audit = {
+        "status": "blocked", "non_repairable_dates": ["20260701"],
+        "dates": [{"trade_date": "20260701", "eligible": False, "repairable": False}],
+    }
+    monkeypatch.setattr("app.data_platform.services.oos_hard_data.audit_oos_hard_data", lambda **_: audit)
+    monkeypatch.setattr(
+        "app.data_platform.services.oos_hard_data.repair_oos_hard_data_batch",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must not retry late historical data")),
+    )
+
+    result = healing.run_autonomous_self_healing([
+        {"name": "hard_data_gate", "ok": True, "result": {"status": "blocked"}},
+    ])
+
+    assert result["status"] == "blocked"
+    assert result["actions"][0]["reason"] == "no_explicit_repairable_dates"
+    assert result["actions"][0]["non_repairable_dates"] == ["20260701"]
+
+
 def test_self_healing_repairs_sealed_holdout_in_bounded_batch(monkeypatch) -> None:
     monkeypatch.setattr(
         "app.services.sealed_strategy_holdout.repair_sealed_strategy_holdout",

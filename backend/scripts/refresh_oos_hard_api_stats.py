@@ -36,24 +36,32 @@ def refresh(start: str, end: str, *, batch_size: int = 20) -> dict[str, int]:
         with _conn() as conn:
             for api_name in HARD_APIS:
                 rows = conn.execute(
-                    f"""SELECT trade_date,COUNT(DISTINCT ts_code) AS point_in_time_rows
+                    f"""SELECT trade_date,
+                               COUNT(DISTINCT ts_code) FILTER (WHERE available_time<=
+                                   (SUBSTRING(trade_date,1,4)||'-'||SUBSTRING(trade_date,5,2)||'-'||SUBSTRING(trade_date,7,2)||'T15:00:00')) AS point_in_time_rows,
+                               COUNT(DISTINCT ts_code) AS raw_rows,
+                               COALESCE(MIN(available_time), '') AS first_available_time
                           FROM dc_tushare_raw_records
                          WHERE api_name=? AND trade_date IN ({placeholders}) AND ts_code<>''
-                           AND available_time<=
-                               (SUBSTRING(trade_date,1,4)||'-'||SUBSTRING(trade_date,5,2)||'-'||SUBSTRING(trade_date,7,2)||'T15:00:00')
                          GROUP BY trade_date""",
                     (api_name, *batch),
                 ).fetchall()
-                counts = {str(dict(row).get("trade_date") or ""): int(dict(row).get("point_in_time_rows") or 0) for row in rows}
+                counts = {str(dict(row).get("trade_date") or ""): dict(row) for row in rows}
                 for trade_date in batch:
+                    item = counts.get(trade_date) or {}
                     conn.execute(
                         """INSERT INTO dc_oos_hard_api_stats_live
-                               (api_name,trade_date,point_in_time_rows,updated_at)
-                           VALUES(?,?,?,?)
+                               (api_name,trade_date,point_in_time_rows,raw_rows,first_available_time,updated_at)
+                           VALUES(?,?,?,?,?,?)
                            ON CONFLICT(api_name,trade_date) DO UPDATE SET
                                point_in_time_rows=excluded.point_in_time_rows,
+                               raw_rows=excluded.raw_rows,
+                               first_available_time=excluded.first_available_time,
                                updated_at=excluded.updated_at""",
-                        (api_name, trade_date, counts.get(trade_date, 0), now),
+                        (
+                            api_name, trade_date, int(item.get("point_in_time_rows") or 0),
+                            int(item.get("raw_rows") or 0), str(item.get("first_available_time") or ""), now,
+                        ),
                     )
                     written += 1
         print(f"refreshed {batch[0]}..{batch[-1]} ({offset + len(batch)}/{len(dates)})")
