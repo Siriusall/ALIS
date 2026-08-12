@@ -10,6 +10,7 @@ from typing import Any
 from app.services.research_engine import build_stock_research, materialize_pool_research_snapshots
 from app.services.thesis_store import generate_watch_pool_theses, generate_thesis_for_stock
 from app.services.decision_store import get_position_state
+from app.services.stock_pool_sync import reconcile_missing_position_states_from_confirmed_operations
 from app.db.store import get_positions
 from app.core.a_share_fees import is_exchange_etf
 
@@ -85,6 +86,14 @@ def run_daily_maintenance(*, max_candidates: int = 50) -> dict[str, Any]:
     # pseudo-state merely because a security is currently in the account.
     state_count = 0
     missing_position_states = 0
+    state_reconciliation: dict[str, Any] = {}
+    try:
+        # Recover only absent lifecycle evidence from confirmed immutable
+        # operations.  The reconciler is idempotent and cannot mutate the
+        # account, positions, executions, or frozen plans.
+        state_reconciliation = reconcile_missing_position_states_from_confirmed_operations()
+    except Exception as e:
+        errors.append(f"position_state_reconciliation: {str(e)[:80]}")
     for p in positions:
         sym = str(p.get("symbol", "")).strip().upper()
         if not sym.endswith((".SH", ".SZ", ".BJ")):
@@ -107,6 +116,7 @@ def run_daily_maintenance(*, max_candidates: int = 50) -> dict[str, Any]:
             "blocked_position_theses": blocked_position_theses,
             "position_states": state_count,
             "missing_position_states": missing_position_states,
+            "position_state_reconciliation": state_reconciliation,
             "skipped_etf_research": skipped_etf_research,
         },
         "errors": errors[:10],

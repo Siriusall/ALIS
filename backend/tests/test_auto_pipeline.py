@@ -97,3 +97,24 @@ def test_daily_maintenance_records_risk_veto_without_failing(monkeypatch):
     assert result["ok"] is True
     assert result["errors"] == []
     assert result["results"]["blocked_position_theses"] == 1
+
+
+def test_daily_maintenance_reconciles_missing_state_evidence_before_audit(monkeypatch):
+    monkeypatch.setattr(auto_pipeline, "get_positions", lambda: [{"symbol": "000001.SZ"}])
+    monkeypatch.setattr(auto_pipeline, "build_stock_research", lambda *_args, **_kwargs: {"ok": True})
+    monkeypatch.setattr(auto_pipeline, "generate_watch_pool_theses", lambda **_kwargs: {"ok": True, "generated_or_reviewed": []})
+    monkeypatch.setattr(auto_pipeline, "generate_thesis_for_stock", lambda *_args, **_kwargs: {"ok": True})
+    state = {"value": None}
+    monkeypatch.setattr(auto_pipeline, "get_position_state", lambda _code: state["value"])
+    monkeypatch.setattr(
+        auto_pipeline,
+        "reconcile_missing_position_states_from_confirmed_operations",
+        lambda: state.update(value={"state": "holding"}) or {"ok": True, "operations_replayed": 1, "state_transitions_created": 4},
+    )
+
+    result = auto_pipeline.run_daily_maintenance()
+
+    assert result["ok"] is True
+    assert result["results"]["position_states"] == 1
+    assert result["results"]["missing_position_states"] == 0
+    assert result["results"]["position_state_reconciliation"]["operations_replayed"] == 1
