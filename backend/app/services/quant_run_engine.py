@@ -275,6 +275,15 @@ def _sell_position_for_rebalance(
     px = _row_trade_price(price_row, prefer_open=True)
     if px <= 0:
         return False, turnover_remaining, "price_missing"
+    execution_volume = _execution_volume(price_row)
+    proposed_turnover = px * quantity
+    if execution_volume <= 0:
+        blocked_events.append({"date": execute_date, "symbol": sym, "side": "SELL", "code": "liquidity_capacity", "message": "执行日成交量缺失，禁止超过流动性容量的卖出"})
+        return False, turnover_remaining, "liquidity_capacity"
+    liquidity_cap = px * execution_volume * 0.01
+    if proposed_turnover > liquidity_cap + 1e-6:
+        blocked_events.append({"date": execute_date, "symbol": sym, "side": "SELL", "code": "liquidity_capacity", "message": "卖出数量超过执行日流动性容量"})
+        return False, turnover_remaining, "liquidity_capacity"
     tradable = check_open_trade_constraints(
         side="SELL",
         symbol=sym,
@@ -288,7 +297,6 @@ def _sell_position_for_rebalance(
         blocked_events.append({"date": execute_date, "symbol": sym, "side": "SELL", "code": tradable.code, "message": tradable.message})
         add_log("WARN", f"QuantRun 卖出被交易约束拦截: {tradable.message}")
         return False, turnover_remaining, str(tradable.code or "trade_constraint")
-    proposed_turnover = px * quantity
     if proposed_turnover > turnover_remaining + 1e-6 and not hard_risk_exit:
         blocked_events.append({"date": execute_date, "symbol": sym, "side": "SELL", "code": "monthly_turnover_budget", "message": "月度双边换手预算30%已用尽，非硬风险退出延后"})
         return False, turnover_remaining, "monthly_turnover_budget"
