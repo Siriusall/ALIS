@@ -196,6 +196,31 @@ def build_live_portfolio_risk(
             pass
     for item in exposures:
         item["industry"] = industry_by_symbol.get(str(item["symbol"]), "unclassified")
+    try:
+        from app.services.defensive_assets import defensive_asset_meta
+        for item in exposures:
+            meta = defensive_asset_meta(item["symbol"])
+            if meta:
+                item["risk_group"] = meta.get("risk_group", "true_defensive")
+                item["asset_class"] = meta.get("asset_class", "unknown")
+                item["equity_exposure_factor"] = float(meta.get("equity_exposure") or 0.0)
+            else:
+                item["risk_group"] = "equity"
+                item["asset_class"] = "stock"
+                item["equity_exposure_factor"] = 1.0
+    except Exception:  # noqa: BLE001
+        for item in exposures:
+            item["risk_group"] = "unknown"
+            item["asset_class"] = "unknown"
+            item["equity_exposure_factor"] = None
+    exposure_summary = {
+        "schema_version": "alis_portfolio_underlying_risk_exposure_v1",
+        "equity_exposure": round(sum(_f(item.get("weight")) * _f(item.get("equity_exposure_factor")) for item in exposures), 6),
+        "true_defensive_exposure": round(sum(_f(item.get("weight")) for item in exposures if item.get("risk_group") == "true_defensive"), 6),
+        "equity_like_etf_exposure": round(sum(_f(item.get("weight")) for item in exposures if item.get("risk_group") == "equity_like"), 6),
+        "stock_exposure": round(sum(_f(item.get("weight")) for item in exposures if item.get("risk_group") == "equity"), 6),
+        "cash_exposure": round(cash / equity, 6) if equity > 0 else 0.0,
+    }
     weights = constrained_cvar_weights(returns_by_symbol, max_single=DEFAULT_GLOBAL_SINGLE_ASSET_LIMIT)
     optimizer = "ledoit_wolf_shrinkage_plus_constrained_cvar_v1"
     if returns_by_symbol and not weights:
@@ -337,6 +362,7 @@ def build_live_portfolio_risk(
         "correlated_industry_exposures": correlated_industry_exposures,
         "covariance": ledoit_wolf_covariance(returns_by_symbol) if returns_by_symbol else {},
         "exposures": exposures,
+        "underlying_risk_exposure": exposure_summary,
         "breaches": breaches,
         "stress_tests": stress_tests,
         "deleveraging_actions": deleveraging_actions,

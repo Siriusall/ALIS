@@ -1,4 +1,32 @@
 from app.services import operations_overview
+
+
+def test_live_portfolio_risk_separates_equity_like_etfs_from_true_defense(monkeypatch):
+    monkeypatch.setattr(operations_overview, "get_positions", lambda: [
+        {"symbol": "600000", "name": "浦发银行", "quantity": 100, "price": 10},
+        {"symbol": "510880", "name": "红利ETF", "quantity": 100, "price": 10},
+        {"symbol": "511010", "name": "国债ETF", "quantity": 100, "price": 10},
+    ])
+    monkeypatch.setattr(operations_overview, "get_account_balance", lambda: 1000.0)
+    monkeypatch.setattr(operations_overview, "get_account_baseline", lambda: 4000.0)
+    monkeypatch.setattr(operations_overview, "get_account_high_water_mark", lambda: 4000.0)
+    monkeypatch.setattr(operations_overview, "list_consolidated_trade_dates", lambda: ["20260812"])
+    monkeypatch.setattr(operations_overview, "point_in_time_position_market_series", lambda **_: {"price": 10.0, "returns": [0.01, -0.01]})
+    monkeypatch.setattr(operations_overview, "list_theses_for_symbols", lambda _: [])
+    monkeypatch.setattr(operations_overview, "list_position_states", lambda: [])
+    monkeypatch.setattr(operations_overview, "constrained_cvar_weights", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(operations_overview, "hrp_fallback_weights", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(operations_overview, "historical_cvar", lambda _: {})
+    monkeypatch.setattr(operations_overview, "ledoit_wolf_covariance", lambda _: {})
+
+    result = operations_overview.build_live_portfolio_risk()
+
+    summary = result["underlying_risk_exposure"]
+    assert summary["stock_exposure"] == 0.25
+    assert summary["equity_like_etf_exposure"] == 0.25
+    assert summary["true_defensive_exposure"] == 0.25
+    assert summary["cash_exposure"] == 0.25
+    assert summary["equity_exposure"] == 0.5
 from app.services.review_learning import _outcome_needs_benchmark_recompute
 
 

@@ -207,13 +207,8 @@ def _planned_execute_at(execute_date: str) -> str:
 def _formal_plan_is_due(record: dict[str, Any], *, now: datetime | None = None) -> bool:
     """Check the frozen execution timestamp before any plan claim is written."""
     execute_date = str(record.get("planned_execute_date") or "").replace("-", "")[:8]
-    # Historical replay/cleanup may examine pre-timestamp rows.  The daily
-    # scheduler only needs a wall-clock guard for today's or a future plan;
-    # older rows are governed by their date/expiry state machine instead.
     current = (now.astimezone(_BUSINESS_TZ) if now and now.tzinfo else now) or datetime.now(_BUSINESS_TZ)
     current_date = current.strftime("%Y%m%d")
-    if execute_date and execute_date < current_date:
-        return True
     value = str(record.get("planned_execute_at") or _planned_execute_at(execute_date)).strip()
     if not value:
         raise ValueError("正式调仓计划缺少冻结执行时刻")
@@ -225,6 +220,10 @@ def _formal_plan_is_due(record: dict[str, Any], *, now: datetime | None = None) 
         due_at = due_at.replace(tzinfo=_BUSINESS_TZ)
     else:
         due_at = due_at.astimezone(_BUSINESS_TZ)
+    # Historical rows are already due by date, but their frozen timestamp is
+    # still part of the execution contract and must never bypass validation.
+    if execute_date and execute_date < current_date:
+        return True
     return current >= due_at
 
 

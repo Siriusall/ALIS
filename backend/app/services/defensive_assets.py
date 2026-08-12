@@ -10,11 +10,11 @@ from app.data_platform.services.data_center import sync_tushare_api_raw
 
 
 DEFENSIVE_ASSETS: tuple[dict[str, str], ...] = (
-    {"ts_code": "511880.SH", "name": "银华日利ETF", "asset_class": "money"},
-    {"ts_code": "511010.SH", "name": "国债ETF", "asset_class": "bond"},
-    {"ts_code": "518880.SH", "name": "黄金ETF", "asset_class": "gold"},
-    {"ts_code": "512890.SH", "name": "红利低波ETF", "asset_class": "low_volatility"},
-    {"ts_code": "510880.SH", "name": "红利ETF", "asset_class": "dividend"},
+    {"ts_code": "511880.SH", "name": "银华日利ETF", "asset_class": "money", "risk_group": "true_defensive", "equity_exposure": "0"},
+    {"ts_code": "511010.SH", "name": "国债ETF", "asset_class": "bond", "risk_group": "true_defensive", "equity_exposure": "0"},
+    {"ts_code": "518880.SH", "name": "黄金ETF", "asset_class": "gold", "risk_group": "true_defensive", "equity_exposure": "0"},
+    {"ts_code": "512890.SH", "name": "红利低波ETF", "asset_class": "low_volatility", "risk_group": "equity_like", "equity_exposure": "1"},
+    {"ts_code": "510880.SH", "name": "红利ETF", "asset_class": "dividend", "risk_group": "equity_like", "equity_exposure": "1"},
 )
 _BUSINESS_TZ = ZoneInfo("Asia/Shanghai")
 
@@ -28,6 +28,12 @@ def _registered_assets(ts_codes: Iterable[str] | None = None) -> list[dict[str, 
         asset for asset in DEFENSIVE_ASSETS
         if asset["ts_code"] in requested or asset["ts_code"].split(".")[0] in requested_symbols
     ]
+
+
+def defensive_asset_meta(symbol: str) -> dict[str, str] | None:
+    """Return registered risk metadata without inferring risk from a code prefix."""
+    compact = str(symbol or "").strip().upper().split(".", 1)[0]
+    return next((dict(item) for item in DEFENSIVE_ASSETS if item["ts_code"].split(".", 1)[0] == compact), None)
 
 
 def materialize_defensive_asset_history(
@@ -93,7 +99,7 @@ def defensive_allocation_for_state(
     as_of_date: str,
     equity_target_weight: float | None = None,
 ) -> dict[str, Any]:
-    """Allocate every non-equity yuan to tradable defensive ETFs.
+    """Allocate every non-equity yuan to true defensive assets only.
 
     The market state supplies preferences, while the requested sleeve is the
     exact complement of the admitted equity target. Momentum only tilts the
@@ -112,11 +118,12 @@ def defensive_allocation_for_state(
         "money": .28 if state in defensive_states else .12,
         "bond": .30 if state in defensive_states else .16,
         "gold": .24 if state in defensive_states else .12,
-        "low_volatility": .12 if state in defensive_states else .32,
-        "dividend": .06 if state in defensive_states else .28,
     }
     assets = list_defensive_assets(as_of_date=as_of_date)
-    ready = [item for item in assets["items"] if item["status"] == "ready"]
+    ready = [
+        item for item in assets["items"]
+        if item["status"] == "ready" and item.get("risk_group") == "true_defensive"
+    ]
     scores = {}
     for item in ready:
         momentum = float(item.get("momentum_20d") or 0)
@@ -136,18 +143,31 @@ def defensive_allocation_for_state(
         for code, available in room.items():
             weights[code] += excess * available / room_total
     weights = {code: round(weight, 6) for code, weight in weights.items() if weight > 0}
-    missing = [item["asset_class"] for item in DEFENSIVE_ASSETS if not any(x["asset_class"] == item["asset_class"] for x in ready)]
+    missing = [
+        item["asset_class"] for item in DEFENSIVE_ASSETS
+        if item.get("risk_group") == "true_defensive"
+        and not any(x["asset_class"] == item["asset_class"] for x in ready)
+    ]
     allocated = round(sum(weights.values()), 6)
+    unallocated = round(max(0.0, defensive_target - allocated), 6)
     return {
         "status": "ready" if abs(allocated - defensive_target) <= .001 else "partial" if weights else "missing",
         "market_state": state,
         "as_of_date": str(as_of_date).replace("-", ""),
         "target_weights": weights,
         "target_weight": round(allocated, 6),
+        "unallocated_cash_weight": unallocated,
         "equity_target_weight": round(equity_weight, 6),
         "full_investment_target": round(equity_weight + allocated, 6),
         "missing_asset_classes": missing,
-        "reason": "股票预算之外的资金按市场状态与20日动量动态配置到防御ETF，正常运行不保留闲置现金",
+        "excluded_equity_like_assets": [
+            item["ts_code"] for item in DEFENSIVE_ASSETS if item.get("risk_group") == "equity_like"
+        ],
+        "reason": (
+            "股票风险预算之外的资金只配置到货币、国债和黄金；红利类权益ETF不得作为非权益预算的自动去向"
+            if unallocated <= .001 else
+            "真实防御资产受单资产硬上限约束，未承接部分保留为现金；不得用红利类权益ETF伪装为防御配置"
+        ),
     }
 
 
