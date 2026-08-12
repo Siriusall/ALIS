@@ -76,3 +76,32 @@ def test_multi_day_period_compounds_first_session_and_requires_full_benchmark_co
     assert july["benchmark_return_pct"] is None
     assert july["benchmark_coverage"]["complete"] is False
     assert july["benchmark_coverage"]["return_points"] == 1
+
+
+def test_account_curve_uses_raw_close_not_adjusted_research_bar(monkeypatch) -> None:
+    class DataSource:
+        def load_snapshot(self, _date):
+            return []
+
+        def get_price_on_date(self, _symbol, _date, field="close"):
+            return 3000.0 if field == "close" else None
+
+    monkeypatch.setattr(quant_runs, "list_operations", lambda **_kwargs: [{
+        "symbol": "000001", "side": "BUY", "quantity": 100, "price": 5.0,
+        "at": "2026-08-03T09:30:00", "commission": 0, "transfer_fee": 0, "stamp_tax": 0,
+    }])
+    monkeypatch.setattr(quant_runs, "list_consolidated_trade_dates", lambda: ["2026-08-03", "2026-08-04"])
+    monkeypatch.setattr(quant_runs, "BacktestDataSource", DataSource)
+    monkeypatch.setattr(quant_runs, "get_account_baseline", lambda: 200000.0)
+    monkeypatch.setattr(quant_runs, "_load_index_close_map", lambda *_args: {"2026-08-03": 3000.0, "2026-08-04": 3000.0})
+    monkeypatch.setattr(
+        quant_runs,
+        "_raw_position_close_maps",
+        lambda *_args: ({("000001", "20260803"): 5.0, ("000001", "20260804"): 6.0}, {}),
+    )
+
+    curve = quant_runs.quant_run_curve(limit=30, benchmark="000300", task_id=None)
+
+    assert curve["series"][0]["strategy_equity_cny"] == 200000.0
+    assert curve["series"][1]["strategy_equity_cny"] == 200100.0
+    assert curve["series"][1]["day_return_pct"] == 0.05

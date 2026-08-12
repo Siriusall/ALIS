@@ -21,8 +21,9 @@ from app.api.state import (
     update_quant_run_progress,
 )
 from app.core.exchange_groups import normalize_exchange_group
-from app.core.a_share_fees import sell_cost_breakdown
+from app.core.a_share_fees import is_exchange_etf, sell_cost_breakdown
 from app.core.read_only_diagnostics import degraded_read
+from app.data_platform.db import _conn as data_conn
 from app.db.store import (
     append_operations_to_execution,
     create_execution,
@@ -151,6 +152,83 @@ def _normalize_index_ts_code(symbol: str) -> str:
     # 常见指数：399xxx 为深市，其余默认沪市
     suffix = "SZ" if code.startswith("399") else "SH"
     return f"{code}.{suffix}"
+
+
+def _canonical_market_ts_code(symbol: str) -> str:
+    value = str(symbol or "").strip().upper()
+    if value.endswith((".SH", ".SZ", ".BJ")):
+        return value
+    code = value.split(".", 1)[0].zfill(6)
+    if code.startswith(("5", "6", "9")):
+        return f"{code}.SH"
+    if code.startswith(("4", "8")):
+        return f"{code}.BJ"
+    return f"{code}.SZ"
+
+
+def _raw_position_close_maps(symbols: set[str], dates: list[str]) -> tuple[dict[tuple[str, str], float], dict[tuple[str, str], float]]:
+    """Load unadjusted stock and fund closes for account-value replay.
+
+    ``BacktestDataSource`` intentionally exposes adjusted bars for research
+    returns.  Account equity must instead use the quoted close, otherwise a
+    corporate-action factor is incorrectly treated as an increase in wealth.
+    """
+    if not symbols or not dates:
+        return {}, {}
+    stock_code_by_symbol = {
+        symbol: _canonical_market_ts_code(symbol)
+        for symbol in symbols if not is_exchange_etf(symbol)
+    }
+    etf_code_by_symbol = {
+        symbol: _canonical_market_ts_code(symbol)
+        for symbol in symbols if is_exchange_etf(symbol)
+    }
+    start, end = min(dates).replace("-", ""), max(dates).replace("-", "")
+    stock_prices: dict[tuple[str, str], float] = {}
+    etf_prices: dict[tuple[str, str], float] = {}
+    try:
+        with data_conn() as conn:
+            if stock_code_by_symbol:
+                codes = list(stock_code_by_symbol.values())
+                placeholders = ",".join("?" for _ in codes)
+                rows = conn.execute(
+                    f"""SELECT ts_code,trade_date,close FROM dc_stock_daily_snapshot
+                         WHERE ts_code IN ({placeholders}) AND trade_date BETWEEN ? AND ?
+                           AND close IS NOT NULL""",
+                    (*codes, start, end),
+                ).fetchall()
+                symbol_by_code = {code: symbol for symbol, code in stock_code_by_symbol.items()}
+                for row in rows:
+                    item = dict(row)
+                    symbol = symbol_by_code.get(str(item.get("ts_code") or ""))
+                    price = _safe_float(item.get("close"))
+                    if symbol and price > 0:
+                        stock_prices[(symbol, str(item.get("trade_date") or ""))] = price
+            if etf_code_by_symbol:
+                codes = list(etf_code_by_symbol.values())
+                placeholders = ",".join("?" for _ in codes)
+                rows = conn.execute(
+                    f"""SELECT ts_code,trade_date,payload_json FROM dc_tushare_raw_records
+                         WHERE api_name='fund_daily' AND ts_code IN ({placeholders})
+                           AND trade_date BETWEEN ? AND ?""",
+                    (*codes, start, end),
+                ).fetchall()
+                symbol_by_code = {code: symbol for symbol, code in etf_code_by_symbol.items()}
+                for row in rows:
+                    item = dict(row)
+                    try:
+                        payload = json.loads(item.get("payload_json") or "{}")
+                    except (TypeError, json.JSONDecodeError):
+                        continue
+                    symbol = symbol_by_code.get(str(item.get("ts_code") or ""))
+                    price = _safe_float(payload.get("close"))
+                    if symbol and price > 0:
+                        etf_prices[(symbol, str(item.get("trade_date") or ""))] = price
+    except Exception:
+        # A valuation curve may retain the last quoted price when the raw
+        # history read is unavailable.  Never fall back to adjusted prices.
+        return {}, {}
+    return stock_prices, etf_prices
 
 
 def _load_index_close_map(benchmark: str, dates: list[str]) -> dict[str, float]:
@@ -371,6 +449,7 @@ def quant_run_curve(limit: int = 250, benchmark: str = "000300", task_id: int | 
         sym = str(o.get("symbol", "")).strip()
         if sym:
             symbols.add(sym)
+    stock_close_by_date, etf_close_by_date = _raw_position_close_maps(symbols, dates)
 
     holdings: dict[str, int] = defaultdict(int)
     last_price_by_symbol: dict[str, float] = {}
@@ -407,16 +486,20 @@ def quant_run_curve(limit: int = 250, benchmark: str = "000300", task_id: int | 
                     last_price_by_symbol[sym] = trade_price
 
         stock_value = 0.0
+        compact_date = d.replace("-", "")
         for sym, qty in holdings.items():
             if qty <= 0:
                 continue
-            px_raw = ds.get_price_on_date(sym, d, field="close")
-            px_hist = _safe_float(px_raw) if px_raw is not None else 0.0
-            if px_hist > 0:
-                px = px_hist
+            px = (
+                etf_close_by_date.get((sym, compact_date), 0.0)
+                if is_exchange_etf(sym)
+                else stock_close_by_date.get((sym, compact_date), 0.0)
+            )
+            if px > 0:
                 last_price_by_symbol[sym] = px
             else:
-                # 回放口径优先：若历史K无价，优先使用当日快照收盘价。
+                # Normalized snapshot is a raw-close fallback. Never use the
+                # adjusted research bars for account market value.
                 px_snap = _safe_float(snapshot_close_map.get(sym))
                 if px_snap > 0:
                     px = px_snap
