@@ -113,7 +113,7 @@ worker_ssh "bash -lc 'set -euo pipefail
   \"\$venv/bin/python\" -m compileall -q $worker_release/app $worker_release/migrations
   : 'worker environment is switched only with the active release' '"
 
-worker_protected=$(worker_ssh "set -a; . /etc/alis/worker.env; set +a; psql \"\$DATABASE_URL\" -Atqc \"SELECT 1 FROM evolution_tasks WHERE status='running' AND phase IN ('formal_oos','strategy_backtest','candidate_generation','model_training') LIMIT 1\" 2>/dev/null || true")
+worker_protected=$(worker_ssh "set -a; . /etc/alis/worker.env; set +a; psql \"\$DATABASE_URL\" -Atqc \"SELECT 1 FROM evolution_tasks WHERE status='running' AND (task_type IN ('strategy_evolution_cycle','strategy_controller_oos','factor_research_cycle','strategy_candidate_generation','strategy_environment_backtest','strategy_cluster_distillation','strategy_portfolio_research','strategy_failure_model_training','model_candidate_research','model_strategy_impact_validation','hsmm_shadow_training') OR phase IN ('formal_oos','strategy_backtest','strategy_candidate_generation','strategy_environment_backtest','strategy_cluster_distillation','strategy_portfolio_research','strategy_failure_model_training','model_strategy_impact_validation','hsmm_shadow_training')) LIMIT 1\" 2>/dev/null || true")
 if [[ "$worker_protected" == "1" ]]; then
   echo "worker_protected=1; staged worker release without switching or restarting"
 else
