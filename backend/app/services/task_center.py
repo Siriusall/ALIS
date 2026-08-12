@@ -164,7 +164,7 @@ def _status(value: Any, *, phase: Any = None) -> str:
         return "observing"
     if raw in {"paused", "stopped"}:
         return "paused"
-    if raw in {"failed", "error"}:
+    if raw in {"failed", "error", "timed_out", "timeout", "unhealthy"}:
         return "failed"
     if raw == "cancelled":
         return "cancelled"

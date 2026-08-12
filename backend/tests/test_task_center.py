@@ -3,6 +3,12 @@ from datetime import datetime
 from app.services import task_center
 
 
+def test_status_maps_timeout_and_unhealthy_to_failed():
+    assert task_center._status("timed_out") == "failed"
+    assert task_center._status("timeout") == "failed"
+    assert task_center._status("unhealthy") == "failed"
+
+
 def test_task_center_unifies_modules_tasks_next_time_and_logs(monkeypatch):
     monkeypatch.setattr(task_center, "evolution_schedule_status", lambda: {
         "next_factor_cycle_at": "2026-07-27T16:00:00+08:00",
