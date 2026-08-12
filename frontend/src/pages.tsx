@@ -1008,12 +1008,15 @@ export function SystemVersions({ data }: { data: ConsoleData }) {
 export function Operations({ data }: { data: ConsoleData }) {
   const owner=unwrapOwner(data.owner); const tasks=firstArray(data.tasks,["tasks","items"]); const logs=firstArray(data.tasks,["logs"]); const incidents=ownerIncidents(owner);const apiRows=apiCatalogRows(data.apiCatalog);const readApis=apiRows.filter(row=>row.method==="GET");const coveredApis=readApis.filter(row=>row.covered==="前端已读取");const quantTasks=rowsFrom(data.quantTasks,["items","tasks"]);
   const taskStatus=(row:Json)=>String(pick(row,["status","state"],"unknown")).toLowerCase();
-  const runningTasks=tasks.filter(row=>/^(running|active|in_progress|executing)$/.test(taskStatus(row)));
-  const queuedTasks=tasks.filter(row=>/^(queued|waiting|waiting_schedule|recovery_pending|pending|retry_wait|scheduled)$/.test(taskStatus(row)));
-  const problemTasks=tasks.filter(row=>/^(failed|blocked|error|cancelled)$/.test(taskStatus(row)));
-  const completedTasks=tasks.filter(row=>/^(completed|passed|succeeded|done)$/.test(taskStatus(row)));
+  // Historical task evidence stays inspectable below, but must not make the live
+  // operations summary look like there is a current operational incident.
+  const currentTasks=tasks.filter(row=>pick(row,["activity_scope"],"current")!=="history");
+  const runningTasks=currentTasks.filter(row=>/^(running|active|in_progress|executing)$/.test(taskStatus(row)));
+  const queuedTasks=currentTasks.filter(row=>/^(queued|waiting|waiting_schedule|recovery_pending|pending|retry_wait|scheduled)$/.test(taskStatus(row)));
+  const problemTasks=currentTasks.filter(row=>/^(failed|blocked|error|cancelled)$/.test(taskStatus(row)));
+  const completedTasks=currentTasks.filter(row=>/^(completed|passed|succeeded|done)$/.test(taskStatus(row)));
   const classifiedCount=runningTasks.length+queuedTasks.length+problemTasks.length+completedTasks.length;
-  const recordedTasks=Math.max(0,tasks.length-classifiedCount);
+  const recordedTasks=Math.max(0,currentTasks.length-classifiedCount);
   const liveTasks=[...runningTasks,...queuedTasks].slice(0,5);
   const recentTasks=tasks.filter(row=>!liveTasks.includes(row)).slice(0,8);
   const distribution=[
@@ -1046,7 +1049,7 @@ export function Operations({ data }: { data: ConsoleData }) {
       </section>
       <aside className="ops-distribution-card">
         <header><div><span>任务分布</span><strong>实时状态结构</strong></div><ListTree size={19}/></header>
-        <div className="ops-status-ring" style={{background:distributionGradient}}><div><strong>{tasks.length}</strong><span>任务记录</span></div></div>
+        <div className="ops-status-ring" style={{background:distributionGradient}}><div><strong>{currentTasks.length}</strong><span>当前任务</span></div></div>
         <div className="ops-status-legend">{distribution.filter(item=>item.count>0).map(item=><div key={item.key}><i style={{background:item.color}}/><span>{item.label}</span><strong>{item.count}</strong></div>)}</div>
         <footer><span>量化任务</span><strong>{quantTasks.length}</strong><span>只读接口覆盖</span><strong>{`${coveredApis.length}/${readApis.length}`}</strong></footer>
       </aside>
