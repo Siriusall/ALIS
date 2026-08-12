@@ -118,6 +118,59 @@ def test_optional_hsgt_empty_only_becomes_terminal_after_publish_lag(monkeypatch
     ) is False
 
 
+def test_index_weight_is_a_valid_empty_event_dataset():
+    assert "index_weight" in data_center.VALID_EMPTY_TUSHARE_APIS
+
+
+def test_monthly_index_weight_probe_skips_a_terminal_month_window(monkeypatch):
+    class Result:
+        @staticmethod
+        def fetchone():
+            return {"result_status": "valid_empty"}
+
+    class Connection:
+        def execute(self, _sql, _params=()):
+            return Result()
+
+    class Context:
+        def __enter__(self):
+            return Connection()
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(data_center, "_conn", lambda: Context())
+    monkeypatch.setattr(data_center, "_safe_sync_raw", lambda *_args, **_kwargs: pytest.fail("must not re-query month"))
+
+    result = data_center._sync_monthly_index_weight_if_due("000300.SH", "20260812")
+
+    assert result["status"] == "monthly_window_already_checked"
+    assert result["start_date"] == "20260801"
+
+
+def test_index_weight_cleanup_only_retires_legacy_one_day_empty_requests(monkeypatch):
+    captured = []
+    class Result:
+        def fetchall(self):
+            return [
+                {"id": 1, "params_json": '{"start_date":"20260807","end_date":"20260807"}', "limit_rows": None},
+                {"id": 2, "params_json": '{"start_date":"20260801","end_date":"20260812"}', "limit_rows": None},
+            ]
+    class Connection:
+        def execute(self, _sql, _params=()):
+            return Result()
+    class Context:
+        def __enter__(self): return Connection()
+        def __exit__(self, *_args): return False
+    monkeypatch.setattr(data_center, "_conn", lambda: Context())
+    monkeypatch.setattr(data_center, "_bulk_mark_requests_valid_empty", lambda api, records, **kwargs: captured.extend(records) or len(records))
+
+    result = data_center.resolve_legacy_daily_index_weight_requests()
+
+    assert result["resolved"] == 1
+    assert result["skipped"] == 1
+    assert captured == [(1, {"start_date": "20260807", "end_date": "20260807"}, None)]
+
+
 def test_mature_empty_cleanup_uses_shanghai_business_date_not_host_timezone():
     # At 17:00 UTC it is already the following Shanghai business date.
     assert data_center._local_business_date_string(

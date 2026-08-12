@@ -858,6 +858,9 @@ VALID_EMPTY_TUSHARE_APIS = {
     # Dragon-Tiger and long-form news are event datasets. A successful query
     # with no rows is evidence that no event occurred in the requested window.
     "top_list", "top_inst", "major_news", "report_rc", "repurchase", "stk_holdertrade",
+    # Index constituents/weights change on adjustment events. An empty monthly
+    # window records a valid observation of no adjustment, not a daily outage.
+    "index_weight",
 }
 
 PERIOD_FALLBACK_APIS = {
@@ -1162,6 +1165,42 @@ SUPERSEDED_API_REPLACEMENTS = {
     "etf_sh_cons": "exchange_official_pcf",
     "etf_sz_cons": "exchange_official_pcf",
 }
+
+
+def resolve_legacy_daily_index_weight_requests(*, limit: int = 100) -> dict[str, Any]:
+    """Retire obsolete one-day index-weight probes replaced by monthly windows."""
+    cap = max(1, min(int(limit), 500))
+    with _conn() as c:
+        rows = c.execute(
+            """SELECT id,params_json,limit_rows FROM dc_tushare_failed_requests
+                WHERE api_name='index_weight' AND status='pending' AND error_category='empty_pending'
+                ORDER BY id LIMIT ?""",
+            (cap,),
+        ).fetchall()
+    records: list[tuple[int, dict[str, Any], int | None]] = []
+    skipped = 0
+    for row in rows:
+        item = dict(row)
+        try:
+            params = json.loads(item.get("params_json") or "{}")
+        except (TypeError, json.JSONDecodeError):
+            skipped += 1
+            continue
+        start_date = str(params.get("start_date") or "")
+        end_date = str(params.get("end_date") or "")
+        if start_date and start_date == end_date:
+            records.append((int(item["id"]), params, item.get("limit_rows")))
+        else:
+            skipped += 1
+    resolved = _bulk_mark_requests_valid_empty(
+        "index_weight", records,
+        reason="superseded_single_day_probe_by_monthly_index_weight_window",
+    )
+    return {
+        "ok": True, "status": "completed", "examined": len(rows),
+        "resolved": resolved, "skipped": skipped,
+        "policy": "single_day_index_weight_empty_replaced_by_monthly_window_only",
+    }
 
 
 def resume_safe_failed_tushare_requests_by_id(
@@ -4116,10 +4155,7 @@ def sync_index_bundle(index_code: str = "000300.SH", start_date: str | None = No
 
         def _metadata() -> None:
             _safe_sync_raw("index_basic", {"market": "SSE"})
-            _safe_sync_raw(
-                "index_weight",
-                {"index_code": index_code, "start_date": start_date, "end_date": end_date},
-            )
+            _sync_monthly_index_weight_if_due(index_code, start_date)
 
         if ready:
             threading.Thread(target=_metadata, daemon=True, name=f"index-metadata-{start_date}").start()
@@ -4140,7 +4176,7 @@ def sync_index_bundle(index_code: str = "000300.SH", start_date: str | None = No
     results = [
         _safe_sync_raw("index_basic", {"market": "SSE"}),
         _safe_sync_raw("index_daily", {"ts_code": index_code, "start_date": start_date, "end_date": end_date}),
-        _safe_sync_raw("index_weight", {"index_code": index_code, "start_date": start_date, "end_date": end_date}),
+        _sync_monthly_index_weight_if_due(index_code, end_date),
     ]
     with _conn() as c:
         benchmark_ready = bool(c.execute(
@@ -4156,6 +4192,29 @@ def sync_index_bundle(index_code: str = "000300.SH", start_date: str | None = No
         "results": results,
         "benchmark_ready": benchmark_ready,
     }
+
+
+def _sync_monthly_index_weight_if_due(index_code: str, trade_date: str) -> dict[str, Any]:
+    """Probe an index-weight adjustment at most once per calendar month."""
+    value = str(trade_date or "").replace("-", "")[:8]
+    if len(value) != 8 or not value.isdigit():
+        return {"ok": False, "api": "index_weight", "status": "invalid_trade_date"}
+    month_start = f"{value[:6]}01"
+    params = {"index_code": index_code, "start_date": month_start, "end_date": value}
+    terminal = ("success", "not_applicable", "valid_empty", "deferred_empty")
+    with _conn() as c:
+        existing = c.execute(
+            """SELECT result_status FROM dc_tushare_request_coverage
+                WHERE api_name='index_weight' AND params_json LIKE ?
+                ORDER BY checked_at DESC LIMIT 1""",
+            (f'%"index_code": "{index_code}", "start_date": "{month_start}"%',),
+        ).fetchone()
+    if existing and str(dict(existing).get("result_status") or "") in terminal:
+        return {
+            "ok": True, "api": "index_weight", "status": "monthly_window_already_checked",
+            "index_code": index_code, "start_date": month_start, "end_date": value,
+        }
+    return _safe_sync_raw("index_weight", params)
 
 
 def sync_training_market_date_vip(trade_date: str) -> dict[str, Any]:

@@ -491,11 +491,13 @@ def run_deterministic_data_operations_cycle(
     _ensure_table()
     from app.data_platform.services.data_center import (
         resolve_covered_failed_tushare_requests,
+        resolve_legacy_daily_index_weight_requests,
         resolve_mature_fund_nav_empty_requests,
         resolve_mature_optional_daily_empty_requests,
     )
 
     covered_failure_cleanup = resolve_covered_failed_tushare_requests(limit=500)
+    index_weight_cleanup = resolve_legacy_daily_index_weight_requests(limit=100)
     fund_nav_cleanup = resolve_mature_fund_nav_empty_requests(limit=500)
     optional_daily_cleanup = resolve_mature_optional_daily_empty_requests(limit=100)
     evidence = build_data_operations_evidence(cycle_steps=cycle_steps)
@@ -525,6 +527,7 @@ def run_deterministic_data_operations_cycle(
             "reused": True,
             "execution_mode": "deterministic",
             "covered_failure_cleanup": covered_failure_cleanup,
+            "index_weight_cleanup": index_weight_cleanup,
             "fund_nav_cleanup": fund_nav_cleanup,
             "optional_daily_cleanup": optional_daily_cleanup,
             "execution": cached_result,
@@ -576,6 +579,7 @@ def run_deterministic_data_operations_cycle(
         "case_key": case_key,
         "execution_mode": "deterministic",
         "covered_failure_cleanup": covered_failure_cleanup,
+        "index_weight_cleanup": index_weight_cleanup,
         "fund_nav_cleanup": fund_nav_cleanup,
         "optional_daily_cleanup": optional_daily_cleanup,
         "proposal": proposal,
