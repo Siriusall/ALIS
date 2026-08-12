@@ -9,6 +9,11 @@ def test_classify_step_health_distinguishes_degraded_and_observing() -> None:
     assert healing.classify_step_health({"ok": False, "error": "network"})["status"] == "failed"
 
 
+def test_classify_step_health_never_reports_timeout_as_healthy() -> None:
+    assert healing.classify_step_health({"ok": True, "result": {"status": "timed_out"}})["status"] == "failed"
+    assert healing.classify_step_health({"ok": True, "result": {"status": "timeout"}})["status"] == "failed"
+
+
 def test_self_healing_repairs_only_explicit_hard_data_gaps(monkeypatch) -> None:
     audits = iter([
         {"status": "blocked", "dates": [{"trade_date": "20260701", "eligible": False, "missing_apis": ["daily"]}]},

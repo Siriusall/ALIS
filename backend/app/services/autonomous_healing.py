@@ -8,7 +8,7 @@ from typing import Any
 
 
 MAX_OOS_REPAIR_DATES = 5
-_FAILED = {"failed", "blocked", "error", "rejected", "repair_partial"}
+_FAILED = {"failed", "blocked", "error", "rejected", "repair_partial", "timed_out", "timeout", "unhealthy"}
 _DEGRADED = {"partial", "degraded", "warning", "escalated"}
 _OBSERVING = {"attention", "insufficient_observations", "observing", "not_triggered", "skipped_not_configured", "unchanged"}
 
