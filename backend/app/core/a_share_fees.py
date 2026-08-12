@@ -30,6 +30,21 @@ def is_exchange_etf(symbol: str | None) -> bool:
     return code.startswith(("15", "16", "50", "51", "52", "56", "58"))
 
 
+def normalize_exchange_etf_ts_code(symbol: str | None) -> str:
+    """Return the canonical exchange-qualified code for an exchange ETF.
+
+    Bare 15/16 codes belong to SZSE while 50/51/52/56/58 are SSE namespaces.
+    Callers that already have an exchange suffix retain it verbatim.
+    """
+    value = str(symbol or "").strip().upper()
+    if value.endswith((".SH", ".SZ")):
+        return value
+    code = value.split(".", 1)[0].zfill(6)
+    if not is_exchange_etf(code):
+        return value
+    return f"{code}.SH" if code.startswith(("50", "51", "52", "56", "58")) else f"{code}.SZ"
+
+
 def _round_tick(value: float, decimals: int) -> float:
     quantum = Decimal("1").scaleb(-decimals)
     return float(Decimal(str(value)).quantize(quantum, rounding=ROUND_HALF_UP))

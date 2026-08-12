@@ -3,6 +3,13 @@ from app.services.corporate_actions import (
     build_replay_corporate_actions,
     quantity_entitled,
 )
+from app.services import corporate_actions
+from app.core.a_share_fees import normalize_exchange_etf_ts_code
+
+
+def test_bare_szse_etf_codes_are_not_normalized_as_sse():
+    assert normalize_exchange_etf_ts_code("159001") == "159001.SZ"
+    assert corporate_actions._normalize_ts_code("159001") == "159001.SZ"
 
 
 def test_quantity_entitlement_uses_record_date_ledger():

@@ -9,6 +9,7 @@ from statistics import mean
 from typing import Any
 
 from app.data_platform.db import _conn as data_conn
+from app.core.a_share_fees import is_exchange_etf, normalize_exchange_etf_ts_code
 from app.db.store import _conn as business_conn, get_account_baseline, get_positions
 from app.services.backtest_data_source import BacktestDataSource
 from app.services.decision_store import list_pool_members
@@ -230,7 +231,11 @@ def _position_returns(symbols: list[str], limit: int = 120) -> dict[str, list[fl
     symbol_by_code: dict[str, str] = {}
     for symbol in requested:
         normalized = symbol.split(".", 1)[0]
-        code = symbol if "." in symbol else f"{symbol}.SH" if normalized.startswith(("5", "6", "9")) else f"{symbol}.SZ"
+        code = (
+            symbol if "." in symbol
+            else normalize_exchange_etf_ts_code(symbol) if is_exchange_etf(normalized)
+            else f"{symbol}.SH" if normalized.startswith(("5", "6", "9")) else f"{symbol}.SZ"
+        )
         candidates = list(dict.fromkeys((symbol, code)))
         code_by_symbol[symbol] = candidates
         for candidate in candidates:
@@ -1149,7 +1154,12 @@ def build_portfolio_candles(limit: int = 90) -> dict[str, Any]:
     bars: dict[str, dict[str, dict[str, float]]] = {}
     with data_conn() as c:
         for symbol in symbols:
-            code = symbol if "." in symbol else f"{symbol}.SH" if symbol.startswith(("5", "6", "9")) else f"{symbol}.SZ"
+            bare = symbol.split(".", 1)[0]
+            code = (
+                symbol if "." in symbol
+                else normalize_exchange_etf_ts_code(symbol) if is_exchange_etf(bare)
+                else f"{symbol}.SH" if bare.startswith(("5", "6", "9")) else f"{symbol}.SZ"
+            )
             raw = [dict(row) for row in c.execute("""SELECT trade_date,payload_json
                 FROM dc_tushare_raw_records WHERE api_name IN ('daily','fund_daily') AND ts_code IN (?,?)
                 ORDER BY trade_date DESC LIMIT ?""", (symbol, code, limit)).fetchall()]

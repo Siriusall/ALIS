@@ -7,6 +7,7 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from app.data_platform.db import _conn as data_conn
+from app.core.a_share_fees import is_exchange_etf, normalize_exchange_etf_ts_code
 from app.db.store import (
     _conn as business_conn,
     atomic_business_transaction,
@@ -19,6 +20,8 @@ def _normalize_ts_code(symbol: str) -> str:
     value = str(symbol or "").strip().upper()
     if "." in value:
         return value
+    if is_exchange_etf(value):
+        return normalize_exchange_etf_ts_code(value)
     return f"{value}.SH" if value.startswith(("5", "6", "9")) else f"{value}.SZ"
 
 
