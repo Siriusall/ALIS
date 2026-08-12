@@ -1,4 +1,5 @@
 import math
+from datetime import datetime, timezone
 
 import pytest
 
@@ -113,6 +114,13 @@ def test_optional_hsgt_empty_only_becomes_terminal_after_publish_lag(monkeypatch
     assert data_center._mature_optional_daily_empty(
         "moneyflow_hsgt", {"trade_date": "20260810"}, today_value=data_center.date(2026, 8, 11)
     ) is False
+
+
+def test_mature_empty_cleanup_uses_shanghai_business_date_not_host_timezone():
+    # At 17:00 UTC it is already the following Shanghai business date.
+    assert data_center._local_business_date_string(
+        now=datetime(2026, 8, 11, 17, 0, tzinfo=timezone.utc)
+    ) == "20260812"
 
 
 def test_valid_empty_cleanup_batches_coverage_and_resolution(monkeypatch):

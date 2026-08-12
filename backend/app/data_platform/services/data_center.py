@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import requests
@@ -23,6 +24,7 @@ SOURCE_TUSHARE = "tushare"
 SOURCE_CNINFO = "cninfo"
 SOURCE_MANUAL = "manual"
 SOURCE_EXCHANGE_PCF = "exchange_etf_pcf"
+_BUSINESS_TZ = ZoneInfo("Asia/Shanghai")
 
 _tushare_activity_local = threading.local()
 _tushare_cooldown_lock = threading.Lock()
@@ -352,7 +354,7 @@ def _mature_fund_nav_empty(params: dict[str, Any], *, today_value: date | None =
     end_date = str(params.get("end_date") or params.get("nav_date") or "")
     if len(end_date) != 8 or not end_date.isdigit():
         return False
-    observed = (today_value or date.today()).strftime("%Y%m%d")
+    observed = (today_value or _business_today()).strftime("%Y%m%d")
     cutoff = _etf_nav_publish_cutoff(observed)
     return bool(cutoff and end_date <= cutoff)
 
@@ -363,7 +365,7 @@ def _mature_optional_daily_empty(api_name: str, params: dict[str, Any], *, today
     target_date = str(params.get("trade_date") or params.get("end_date") or "")
     if len(target_date) != 8 or not target_date.isdigit():
         return False
-    observed = (today_value or date.today()).strftime("%Y%m%d")
+    observed = (today_value or _business_today()).strftime("%Y%m%d")
     cutoff = _etf_nav_publish_cutoff(observed)
     return bool(cutoff and target_date <= cutoff)
 
@@ -2394,9 +2396,17 @@ def _bulk_mark_requests_valid_empty(
     return len(records) if not isinstance(updated_count, int) or updated_count < 0 else updated_count
 
 
-def _local_business_date_string() -> str:
-    """Return today's date in the host's configured business timezone."""
-    return datetime.now().astimezone().date().strftime("%Y%m%d")
+def _business_today(*, now: datetime | None = None) -> date:
+    """Return today's date under ALIS's UTC+8 business-time contract."""
+    current = now or datetime.now(_BUSINESS_TZ)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=_BUSINESS_TZ)
+    return current.astimezone(_BUSINESS_TZ).date()
+
+
+def _local_business_date_string(*, now: datetime | None = None) -> str:
+    """Return today's date in ALIS's fixed Asia/Shanghai business timezone."""
+    return _business_today(now=now).strftime("%Y%m%d")
 
 
 def resolve_mature_fund_nav_empty_requests(*, limit: int = 500) -> dict[str, Any]:
