@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Any, Callable
 
 from app.services.cache_consolidation import list_available_trade_dates
@@ -43,8 +44,15 @@ def resolve_execute_date(
 def row_trade_price(row: Any, *, prefer_open: bool = True) -> float:
     if row is None:
         return 0.0
-    open_px = float(getattr(row, "open", 0) or 0)
-    close_px = float(getattr(row, "close", 0) or 0)
+    try:
+        open_px = float(getattr(row, "open", 0) or 0)
+        close_px = float(getattr(row, "close", 0) or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    if not math.isfinite(open_px):
+        open_px = 0.0
+    if not math.isfinite(close_px):
+        close_px = 0.0
     if prefer_open and open_px > 0:
         return open_px
     return close_px if close_px > 0 else open_px

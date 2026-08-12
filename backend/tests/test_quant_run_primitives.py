@@ -26,3 +26,9 @@ def test_price_and_risk_budget_primitives_are_bounded():
     assert primitives.row_trade_price(row, prefer_open=False) == 11.0
     assert primitives.parse_risk_budget({"target_position_pct": 2, "max_single_position_pct": -.1}) == (1.0, 0.0)
     assert primitives.parse_risk_budget({"target_position_pct": "bad"}) == (1.0, .15)
+
+
+def test_trade_price_rejects_non_finite_or_invalid_values():
+    assert primitives.row_trade_price(SimpleNamespace(open=float("nan"), close=10)) == 10
+    assert primitives.row_trade_price(SimpleNamespace(open=float("inf"), close=float("nan"))) == 0
+    assert primitives.row_trade_price(SimpleNamespace(open="bad", close=10)) == 0
