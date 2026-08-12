@@ -6,7 +6,8 @@ import threading
 from typing import Any
 
 import httpx
-from datetime import datetime
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 from app.core.project_env import get_env_value
 from app.core.read_only_diagnostics import degraded_read
@@ -19,6 +20,7 @@ ALLOWED_ERROR_TYPES = {"无错误", "数据质量", "模型失效", "估值判�
 _usage_lock = threading.Lock()
 _usage_table_lock = threading.Lock()
 _usage_table_ready = False
+_BUSINESS_TZ = ZoneInfo("Asia/Shanghai")
 
 
 def _token_limits() -> tuple[int, int]:
@@ -48,12 +50,16 @@ def _ensure_usage_table() -> None:
 
 
 def llm_token_budget_status() -> dict[str, Any]:
-    per_request, daily = _token_limits(); day = datetime.now().strftime("%Y-%m-%d")
+    per_request, daily = _token_limits()
+    now = datetime.now(_BUSINESS_TZ)
+    day = now.strftime("%Y-%m-%d")
+    next_day = (now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)).isoformat()
+    day_start = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
     try:
         _ensure_usage_table()
         with _conn() as c:
             row = c.execute("""SELECT COALESCE(SUM(total_tokens),0) used,COUNT(*) requests
-                FROM llm_token_usage WHERE created_at>=? AND created_at<?""", (day, f"{day}T23:59:59.999999")).fetchone()
+                FROM llm_token_usage WHERE created_at>=? AND created_at<?""", (day_start, next_day)).fetchone()
     except Exception as exc:  # noqa: BLE001 - research-only status must degrade safely
         return degraded_read("llm_token_budget", exc, date=day, per_request_limit=per_request, daily_budget=daily)
     used = int(dict(row).get("used") or 0); requests = int(dict(row).get("requests") or 0)
