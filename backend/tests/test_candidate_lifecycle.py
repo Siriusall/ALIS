@@ -10,6 +10,17 @@ from app.services.candidate_lifecycle import (
 
 def _delete_test_version(version_id: int) -> None:
     with store._conn() as conn:
+        accounts = conn.execute(
+            "SELECT id FROM candidate_simulation_accounts WHERE model_version_id=?", (int(version_id),)
+        ).fetchall()
+        for row in accounts:
+            account_id = int(dict(row)["id"])
+            for table in (
+                "candidate_simulation_daily_equity", "candidate_simulation_decisions",
+                "candidate_simulation_operations", "candidate_simulation_blocked_events",
+            ):
+                conn.execute(f"DELETE FROM {table} WHERE account_id=?", (account_id,))
+        conn.execute("DELETE FROM candidate_simulation_accounts WHERE model_version_id=?", (int(version_id),))
         conn.execute("DELETE FROM candidate_lifecycle_events WHERE model_version_id=?", (int(version_id),))
         conn.execute("DELETE FROM candidate_lifecycle_records WHERE model_version_id=?", (int(version_id),))
         conn.execute("DELETE FROM model_versions WHERE id=?", (int(version_id),))
@@ -45,6 +56,13 @@ def test_new_candidate_starts_observing_without_production_permission():
         assert lifecycle["production_change_forbidden"] in (1, True)
         assert lifecycle["changed_fields"] == ["learning_rate"]
         assert lifecycle["events"][0]["event_type"] == "candidate_observation_started"
+        with store._conn() as conn:
+            account = dict(conn.execute(
+                "SELECT * FROM candidate_simulation_accounts WHERE model_version_id=?", (int(version_id),)
+            ).fetchone())
+        assert account["status"] == "awaiting_first_replay"
+        assert float(account["initial_cash"]) == 200000.0
+        assert float(account["latest_equity"]) == 200000.0
     finally:
         _delete_test_version(version_id)
 

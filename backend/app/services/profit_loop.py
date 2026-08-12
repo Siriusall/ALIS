@@ -50,6 +50,46 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
+def _proposal_reason(
+    *,
+    controller_evidence: dict[str, Any],
+    new_candidate: bool,
+    planned_quantity: int,
+    planned_side: str,
+    full_exit: bool,
+    pnl_pct: float,
+    expected_return: float,
+    target_weight: float,
+    current_weight: float,
+    delta: float,
+    block_reason: str = "",
+) -> str:
+    """Explain the frozen order before falling back to target-weight narration."""
+    intent = str(controller_evidence.get("intent") or "")
+    if intent == "research_only":
+        return str(controller_evidence.get("reason") or "")
+    if new_candidate and planned_quantity <= 0:
+        return block_reason or "核心池候选尚未形成正向收益与风险预算共振"
+    if full_exit and pnl_pct <= -0.06 and expected_return <= -0.05:
+        return "浮亏超过6%且20日预期低于-5%，触发完整退出"
+    if full_exit:
+        return "目标权重归零，退出组合"
+    if planned_quantity > 0:
+        if planned_side == "BUY" and intent == "defensive_switch":
+            return "防御资产预期改善覆盖成本，按冻结最小交易单位补足目标权重"
+        if planned_side == "BUY":
+            return "目标组合提高该资产配置，按冻结最小交易单位执行"
+        if planned_side == "SELL":
+            return "风险预算或组合相关性要求降低配置，按冻结最小交易单位执行"
+    if expected_return < 0 and target_weight >= current_weight:
+        return "负预期收益不新增仓位"
+    if delta > 0.002:
+        return "目标组合提高该资产配置"
+    if delta < -0.002:
+        return "风险预算或组合相关性要求降低配置"
+    return "权重偏差不足以覆盖调仓成本"
+
+
 def _merge_expected_return_items(
     base_items: list[dict[str, Any]],
     override_items: list[dict[str, Any]],
@@ -984,14 +1024,19 @@ def build_portfolio_reoptimization(*, signal_date: str = "") -> dict[str, Any]:
             "estimated_one_way_cost": round(_safe_float(planned_cost.get("total_cost")) / max(account_equity, 1.0), 8),
             "cvar_contribution_after": round(_safe_float(detail.get("cvar_contribution")) * equity_budget, 8),
             "function_bucket": buckets.get(symbol, "narrative"),
-            "reason": str(controller_evidence.get("reason") or "") if str(controller_evidence.get("intent") or "") == "research_only"
-                else str((block_by_symbol.get(symbol) or {}).get("reason") or "核心池候选尚未形成正向收益与风险预算共振") if new_candidate and planned_quantity <= 0
-                else "浮亏超过6%且20日预期低于-5%，触发完整退出" if full_exit and pnl_pct <= -0.06 and expected_return <= -0.05
-                else "目标权重归零，退出组合" if full_exit
-                else "负预期收益不新增仓位" if expected_return < 0 and target_weight >= current_weight
-                else "目标组合提高该资产配置" if delta > 0.002
-                else "风险预算或组合相关性要求降低配置" if delta < -0.002
-                else "权重偏差不足以覆盖调仓成本",
+            "reason": _proposal_reason(
+                controller_evidence=controller_evidence,
+                new_candidate=new_candidate,
+                planned_quantity=planned_quantity,
+                planned_side=planned_side,
+                full_exit=full_exit,
+                pnl_pct=pnl_pct,
+                expected_return=expected_return,
+                target_weight=target_weight,
+                current_weight=current_weight,
+                delta=delta,
+                block_reason=str((block_by_symbol.get(symbol) or {}).get("reason") or ""),
+            ),
             "candidate_source": "unified_full_market_selection" if unified_available and symbol in unified_symbols and symbol not in holding_symbols
                 else "core_pool_compatibility_preview" if symbol in core_symbols and symbol not in holding_symbols
                 else "candidate_pool_compatibility_preview" if symbol in candidate_symbols and symbol not in holding_symbols

@@ -10,6 +10,36 @@ from app.services import decision_version_manifest
 from app.services.quant_run_contracts import ReplayRiskGateError
 
 
+def test_proposal_reason_prefers_frozen_defensive_buy_over_small_weight_delta():
+    assert profit_loop._proposal_reason(
+        controller_evidence={"intent": "defensive_switch"},
+        new_candidate=False,
+        planned_quantity=200,
+        planned_side="BUY",
+        full_exit=False,
+        pnl_pct=0.0,
+        expected_return=0.04,
+        target_weight=0.1498,
+        current_weight=0.1487,
+        delta=0.0011,
+    ) == "防御资产预期改善覆盖成本，按冻结最小交易单位补足目标权重"
+
+
+def test_proposal_reason_keeps_cost_hold_when_no_frozen_order_exists():
+    assert profit_loop._proposal_reason(
+        controller_evidence={},
+        new_candidate=False,
+        planned_quantity=0,
+        planned_side="",
+        full_exit=False,
+        pnl_pct=0.0,
+        expected_return=0.04,
+        target_weight=0.1498,
+        current_weight=0.1487,
+        delta=0.0011,
+    ) == "权重偏差不足以覆盖调仓成本"
+
+
 class _Rows:
     def __init__(self, rows):
         self.rows = rows

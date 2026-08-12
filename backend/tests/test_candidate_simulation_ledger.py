@@ -49,6 +49,9 @@ def test_candidate_replay_persists_isolated_auditable_ledger():
     }
     try:
         with store._conn() as conn:
+            placeholder = dict(conn.execute(
+                "SELECT id,status FROM candidate_simulation_accounts WHERE model_version_id=?", (int(version_id),)
+            ).fetchone())
             production_before = {
                 table: int(dict(conn.execute(f"SELECT COUNT(*) AS n FROM {table}").fetchone())["n"])
                 for table in ("executions", "operations", "positions")
@@ -65,6 +68,7 @@ def test_candidate_replay_persists_isolated_auditable_ledger():
             ).fetchone())["n"])
 
         assert first["status"] == "passed"
+        assert first["account_id"] == int(placeholder["id"])
         assert second["account_id"] == first["account_id"]
         assert second["equity_sessions"] == 2
         assert operation_count == 1

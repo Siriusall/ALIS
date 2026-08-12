@@ -9,6 +9,8 @@ from typing import Any
 
 
 LEDGER_CONTRACT = "alis_candidate_isolated_simulation_ledger_v1"
+AWAITING_FIRST_REPLAY = "awaiting_first_replay"
+DEFAULT_INITIAL_CASH = 200_000.0
 
 
 def _now() -> str:
@@ -17,6 +19,45 @@ def _now() -> str:
 
 def _stable_hash(value: Any) -> str:
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"), default=str).encode()).hexdigest()
+
+
+def initialize_candidate_account(
+    conn: Any,
+    *,
+    model_version_id: int,
+    model_key: str,
+    candidate_version: str,
+) -> dict[str, Any]:
+    """Open the isolated cash account at enrollment, before its first replay."""
+    contract = {
+        "schema_version": LEDGER_CONTRACT,
+        "model_version_id": int(model_version_id),
+        "model_key": str(model_key),
+        "candidate_version": str(candidate_version),
+        "component_contract": {"status": AWAITING_FIRST_REPLAY},
+        "research_package_hash": None,
+        "initial_cash": DEFAULT_INITIAL_CASH,
+    }
+    contract_hash = _stable_hash(contract)
+    row = conn.execute(
+        "SELECT id FROM candidate_simulation_accounts WHERE model_version_id=? AND contract_hash=?",
+        (int(model_version_id), contract_hash),
+    ).fetchone()
+    if row:
+        return {"account_id": int(dict(row)["id"]), "created": False, "contract_hash": contract_hash}
+    now = _now()
+    conn.execute(
+        """INSERT INTO candidate_simulation_accounts(
+               model_version_id,contract_hash,status,initial_cash,latest_cash,latest_equity,
+               latest_trade_date,data_contract_json,created_at,updated_at)
+           VALUES(?,?,?,?,?,?,?,?,?,?)""",
+        (
+            int(model_version_id), contract_hash, AWAITING_FIRST_REPLAY,
+            DEFAULT_INITIAL_CASH, DEFAULT_INITIAL_CASH, DEFAULT_INITIAL_CASH, "",
+            json.dumps(contract, ensure_ascii=False), now, now,
+        ),
+    )
+    return {"account_id": conn.last_insert_id(), "created": True, "contract_hash": contract_hash}
 
 
 def persist_candidate_replay(model_version_id: int, replay: dict[str, Any]) -> dict[str, Any]:
@@ -60,17 +101,35 @@ def persist_candidate_replay(model_version_id: int, replay: dict[str, Any]) -> d
                  str(latest.get("date") or ""), json.dumps(contract, ensure_ascii=False), now, account_id),
             )
         else:
-            conn.execute(
-                """INSERT INTO candidate_simulation_accounts(
-                       model_version_id,contract_hash,status,initial_cash,latest_cash,latest_equity,
-                       latest_trade_date,data_contract_json,created_at,updated_at)
-                   VALUES(?,?,?,?,?,?,?,?,?,?)""",
-                (int(model_version_id), contract_hash, "observing", float(contract["initial_cash"]),
-                 float(latest.get("cash") or contract["initial_cash"]),
-                 float(latest.get("total_value") or contract["initial_cash"]), str(latest.get("date") or ""),
-                 json.dumps(contract, ensure_ascii=False), now, now),
-            )
-            account_id = conn.last_insert_id()
+            awaiting = conn.execute(
+                """SELECT id FROM candidate_simulation_accounts
+                     WHERE model_version_id=? AND status=?
+                     ORDER BY updated_at DESC,id DESC LIMIT 1""",
+                (int(model_version_id), AWAITING_FIRST_REPLAY),
+            ).fetchone()
+            if awaiting:
+                account_id = int(dict(awaiting)["id"])
+                conn.execute(
+                    """UPDATE candidate_simulation_accounts SET contract_hash=?,status='observing',
+                              initial_cash=?,latest_cash=?,latest_equity=?,latest_trade_date=?,
+                              data_contract_json=?,updated_at=? WHERE id=?""",
+                    (contract_hash, float(contract["initial_cash"]),
+                     float(latest.get("cash") or contract["initial_cash"]),
+                     float(latest.get("total_value") or contract["initial_cash"]),
+                     str(latest.get("date") or ""), json.dumps(contract, ensure_ascii=False), now, account_id),
+                )
+            else:
+                conn.execute(
+                    """INSERT INTO candidate_simulation_accounts(
+                           model_version_id,contract_hash,status,initial_cash,latest_cash,latest_equity,
+                           latest_trade_date,data_contract_json,created_at,updated_at)
+                       VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                    (int(model_version_id), contract_hash, "observing", float(contract["initial_cash"]),
+                     float(latest.get("cash") or contract["initial_cash"]),
+                     float(latest.get("total_value") or contract["initial_cash"]), str(latest.get("date") or ""),
+                     json.dumps(contract, ensure_ascii=False), now, now),
+                )
+                account_id = conn.last_insert_id()
         for table in (
             "candidate_simulation_daily_equity", "candidate_simulation_decisions",
             "candidate_simulation_operations", "candidate_simulation_blocked_events",

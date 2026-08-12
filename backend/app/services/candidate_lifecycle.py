@@ -120,6 +120,14 @@ def register_candidate_lifecycle(
                 now,
             ),
         )
+    from app.services.candidate_simulation_ledger import initialize_candidate_account
+
+    account = initialize_candidate_account(
+        conn,
+        model_version_id=int(model_version_id),
+        model_key=str(model_key),
+        candidate_version=str(config.get("version") or "") or str(model_version_id),
+    )
     return {
         "model_version_id": int(model_version_id),
         "candidate_type": candidate_type,
@@ -127,6 +135,7 @@ def register_candidate_lifecycle(
         "eligibility_status": eligibility_status,
         "change_type": change_type,
         "production_change_forbidden": True,
+        "isolated_account_id": int(account["account_id"]),
     }
 
 
@@ -248,6 +257,28 @@ def reconcile_existing_candidates(*, limit: int = 1000) -> dict[str, Any]:
                 ORDER BY c.model_version_id LIMIT ?""",
             (max(1, min(int(limit), 5000)),),
         ).fetchall()
+        missing_accounts = conn.execute(
+            """SELECT c.model_version_id,v.model_key,v.version
+                 FROM candidate_lifecycle_records c
+                 JOIN model_versions v ON v.id=c.model_version_id
+                 LEFT JOIN candidate_simulation_accounts a
+                   ON a.model_version_id=c.model_version_id
+                WHERE c.runtime_status='observing' AND a.id IS NULL
+                ORDER BY c.model_version_id LIMIT ?""",
+            (max(1, min(int(limit), 5000)),),
+        ).fetchall()
+        from app.services.candidate_simulation_ledger import initialize_candidate_account
+
+        initialized_accounts = []
+        for raw in missing_accounts:
+            item = dict(raw)
+            account = initialize_candidate_account(
+                conn,
+                model_version_id=int(item["model_version_id"]),
+                model_key=str(item.get("model_key") or ""),
+                candidate_version=str(item.get("version") or item["model_version_id"]),
+            )
+            initialized_accounts.append(int(account["account_id"]))
     stopped: list[int] = []
     for raw in current:
         row = dict(raw)
@@ -292,5 +323,6 @@ def reconcile_existing_candidates(*, limit: int = 1000) -> dict[str, Any]:
         "model_version_ids": registered,
         "stopped_count": len(stopped),
         "stopped_model_version_ids": stopped,
+        "initialized_account_ids": initialized_accounts,
         "policy": "inactive_candidates_observe_immediately_without_production_permission",
     }

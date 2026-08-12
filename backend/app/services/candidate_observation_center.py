@@ -101,7 +101,8 @@ def build_candidate_observation_center(*, limit: int = 200) -> dict[str, Any]:
         "summary": {
             "total": len(items),
             "observing": sum(item["runtime_status"] == "observing" for item in items),
-            "with_isolated_account": sum(item["account"]["latest_equity"] is not None for item in items),
+            "with_isolated_account": sum(item["account"]["initial_cash"] is not None for item in items),
+            "with_replay_evidence": sum(item["account"]["latest_trade_date"] is not None for item in items),
             "production_eligible": sum(item["eligibility_status"] == "eligible" for item in items),
             "production_authority": 0,
         },
