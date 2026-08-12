@@ -370,6 +370,156 @@ def reconcile_superseded_evolution_tasks(*, limit: int = 200) -> dict[str, Any]:
     }
 
 
+def _historical_contract_incompatibility_reason(task: dict[str, Any]) -> str | None:
+    """Recognise retired frozen bindings that cannot become valid by retrying."""
+    if str(task.get("task_type") or "") not in {
+        "controller_candidate_observation",
+        "model_shadow_observation",
+        "model_strategy_impact_validation",
+        "strategy_shadow_cycle",
+        "strategy_evolution_cycle",
+        "strategy_environment_backtest",
+    }:
+        return None
+    evidence = f"{task.get('phase') or ''} {task.get('message') or ''} {task.get('error') or ''}".lower()
+    if "冻结策略包缺少因子绑定" in evidence or "incomplete_frozen_factor_bindings" in evidence:
+        return "冻结策略合同引用的因子已不在当前注册表，历史版本不可重试"
+    if "未知模型绑定" in evidence:
+        return "冻结策略合同引用的模型已废止，历史版本不可重试"
+    return None
+
+
+def _historical_data_gate_waiting_reason(task: dict[str, Any]) -> str | None:
+    """Recognise exhausted shadow tasks blocked by an old data gate.
+
+    A failed task is only reclassified when its persisted result proves it was
+    waiting for the decision-data contract.  Other failed shadow tasks remain
+    untouched so an operational defect cannot be hidden as historical state.
+    """
+    if str(task.get("task_type") or "") != "strategy_shadow_cycle":
+        return None
+    result = _loads(task.get("result_json"), {})
+    status = str(result.get("status") or "") if isinstance(result, dict) else ""
+    evidence = f"{task.get('phase') or ''} {task.get('message') or ''} {task.get('error') or ''}".lower()
+    if status == "blocked_by_decision_data" and "oos 永久硬数据未就绪" in evidence:
+        return "历史影子任务受当时决策/OOS 数据门阻断，保留等待证据"
+    return None
+
+
+def reconcile_historical_contract_incompatible_tasks(*, limit: int = 200) -> dict[str, Any]:
+    """Quarantine terminal legacy tasks without rewriting their source evidence.
+
+    Only failed, lease-free tasks with retired frozen bindings are updated.  A
+    fresh candidate always receives a new task and remains independently
+    observable; this merely prevents obsolete evidence from masquerading as a
+    current operational incident.
+    """
+    now = _now().isoformat()
+    with _conn() as conn:
+        rows = conn.execute(
+            """SELECT id,task_type,phase,message,error,result_json
+                 FROM evolution_tasks
+                WHERE status='failed'
+                  AND COALESCE(lease_owner,'')=''
+                  AND COALESCE(phase,'')<>'historical_contract_incompatible'
+                ORDER BY id ASC LIMIT ?""",
+            (max(1, min(int(limit), 500)),),
+        ).fetchall()
+        reconciled: list[dict[str, Any]] = []
+        for row in rows:
+            task = dict(row)
+            reason = _historical_contract_incompatibility_reason(task)
+            if not reason:
+                continue
+            result = _loads(task.get("result_json"), {})
+            result = result if isinstance(result, dict) else {}
+            classification = result.get("classification") if isinstance(result.get("classification"), dict) else {}
+            result.update({
+                "schema_version": "alis_evolution_failure_classification_v1",
+                "classification": {
+                    **classification,
+                    "category": "historical_contract_incompatible",
+                    "retryable": False,
+                    "recommended_action": "quarantine_historical_contract",
+                    "reconciliation_reason": reason,
+                },
+            })
+            cursor = conn.execute(
+                """UPDATE evolution_tasks
+                       SET phase='historical_contract_incompatible',
+                           message=?,error=?,result_json=?,updated_at=?
+                     WHERE id=? AND status='failed'
+                       AND COALESCE(lease_owner,'')=''
+                       AND COALESCE(phase,'')<>'historical_contract_incompatible'""",
+                (
+                    "历史冻结合同不兼容，保留证据且不再重试",
+                    reason,
+                    json.dumps(result, ensure_ascii=False, sort_keys=True),
+                    now,
+                    int(task["id"]),
+                ),
+            )
+            if int(cursor.rowcount or 0) > 0:
+                reconciled.append({"id": int(task["id"]), "reason": reason})
+    return {
+        "ok": True,
+        "schema_version": "alis_historical_contract_task_reconciliation_v1",
+        "reconciled": reconciled,
+        "count": len(reconciled),
+    }
+
+
+def reconcile_historical_data_gate_waiting_tasks(*, limit: int = 200) -> dict[str, Any]:
+    """Mark proven historical data-gate waits without changing task outcomes."""
+    now = _now().isoformat()
+    with _conn() as conn:
+        rows = conn.execute(
+            """SELECT id,task_type,phase,message,error,result_json
+                 FROM evolution_tasks
+                WHERE status='failed'
+                  AND COALESCE(lease_owner,'')=''
+                  AND COALESCE(phase,'')<>'historical_data_gate_waiting'
+                ORDER BY id ASC LIMIT ?""",
+            (max(1, min(int(limit), 500)),),
+        ).fetchall()
+        reconciled: list[dict[str, Any]] = []
+        for row in rows:
+            task = dict(row)
+            reason = _historical_data_gate_waiting_reason(task)
+            if not reason:
+                continue
+            result = _loads(task.get("result_json"), {})
+            result = result if isinstance(result, dict) else {}
+            result["historical_reconciliation"] = {
+                "schema_version": "alis_historical_data_gate_reconciliation_v1",
+                "reason": reason,
+                "reconciled_at": now,
+            }
+            cursor = conn.execute(
+                """UPDATE evolution_tasks
+                       SET phase='historical_data_gate_waiting',
+                           message=?,error=?,result_json=?,updated_at=?
+                     WHERE id=? AND status='failed'
+                       AND COALESCE(lease_owner,'')=''
+                       AND COALESCE(phase,'')<>'historical_data_gate_waiting'""",
+                (
+                    "历史数据门等待，保留证据且不再重试",
+                    reason,
+                    json.dumps(result, ensure_ascii=False, sort_keys=True),
+                    now,
+                    int(task["id"]),
+                ),
+            )
+            if int(cursor.rowcount or 0) > 0:
+                reconciled.append({"id": int(task["id"]), "reason": reason})
+    return {
+        "ok": True,
+        "schema_version": "alis_historical_data_gate_reconciliation_v1",
+        "reconciled": reconciled,
+        "count": len(reconciled),
+    }
+
+
 def create_evolution_task(
     *,
     task_type: str = "strategy_evolution_cycle",
@@ -2870,6 +3020,10 @@ def _finish_failure(task: dict[str, Any], exc: Exception) -> None:
         "classification": classification,
         "task_type": str(task.get("task_type") or ""),
     }
+    historical_contract_incompatible = (
+        str(classification.get("category") or "")
+        == "historical_contract_incompatible"
+    )
     if retryable and attempt < maximum:
         delay = min(900, 30 * (2 ** max(0, attempt - 1)))
         _update_active_task(
@@ -2885,9 +3039,12 @@ def _finish_failure(task: dict[str, Any], exc: Exception) -> None:
         _update_active_task(
             task_id, statuses=("running",), require_not_stopped=True,
             expected_lease_owner=WORKER_ID,
-            status="failed", phase="failed", progress=1.0,
+            status="failed",
+            phase="historical_contract_incompatible" if historical_contract_incompatible else "failed",
+            progress=1.0,
             message=(
-                "超过自动重试次数"
+                "历史冻结合同与当前注册表不兼容，保留证据且不再重试"
+                if historical_contract_incompatible else "超过自动重试次数"
                 if retryable else "确定性或未知故障已停止重试，等待所有者异常复核"
             ),
             error=str(exc)[:2000], result=failure_result,
@@ -2973,6 +3130,20 @@ def run_worker_once() -> dict[str, Any] | None:
             "quarantined %s superseded evolution task(s): %s",
             reconciliation["count"],
             [item.get("id") for item in reconciliation.get("quarantined") or []],
+        )
+    historical_reconciliation = reconcile_historical_contract_incompatible_tasks()
+    if historical_reconciliation.get("count"):
+        logger.info(
+            "quarantined %s historical contract-incompatible task(s): %s",
+            historical_reconciliation["count"],
+            [item.get("id") for item in historical_reconciliation.get("reconciled") or []],
+        )
+    historical_data_gate_reconciliation = reconcile_historical_data_gate_waiting_tasks()
+    if historical_data_gate_reconciliation.get("count"):
+        logger.info(
+            "quarantined %s historical data-gate waiting task(s): %s",
+            historical_data_gate_reconciliation["count"],
+            [item.get("id") for item in historical_data_gate_reconciliation.get("reconciled") or []],
         )
     task = _claim_next_task()
     if not task:

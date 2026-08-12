@@ -114,8 +114,6 @@ def _is_terminal_research_contract_failure(task: dict[str, Any]) -> bool:
         max_attempts = int(task.get("max_attempts") or 0)
     except (TypeError, ValueError):
         return False
-    if max_attempts <= 0 or attempts < max_attempts:
-        return False
     task_type = str(task.get("task_type") or "")
     if task_type not in {
         "strategy_shadow_cycle",
@@ -123,9 +121,20 @@ def _is_terminal_research_contract_failure(task: dict[str, Any]) -> bool:
         "strategy_environment_backtest",
         "model_shadow_observation",
         "model_strategy_impact_validation",
+        "controller_candidate_observation",
     }:
         return False
-    evidence = f"{task.get('message') or ''} {task.get('error') or ''} {task.get('result_json') or ''}".lower()
+    evidence = f"{task.get('phase') or ''} {task.get('message') or ''} {task.get('error') or ''} {task.get('result_json') or ''}".lower()
+    historical_contract_incompatible = (
+        "historical_contract_incompatible" in evidence
+        or "冻结策略包缺少因子绑定" in evidence
+        or "未知模型绑定" in evidence
+    )
+    historical_data_gate_waiting = "historical_data_gate_waiting" in evidence
+    if (max_attempts <= 0 or attempts < max_attempts) and not (
+        historical_contract_incompatible or historical_data_gate_waiting
+    ):
+        return False
     return any(marker in evidence for marker in (
         "oos 永久硬数据未就绪",
         "最新决策数据未就绪",
@@ -133,6 +142,8 @@ def _is_terminal_research_contract_failure(task: dict[str, Any]) -> bool:
         "未知模型绑定",
         "blocked_by_decision_data",
         "blocked_incomplete_factor_bindings",
+        "historical_contract_incompatible",
+        "historical_data_gate_waiting",
     ))
 
 

@@ -884,6 +884,54 @@ def test_unknown_evolution_failure_stops_without_blind_retry(monkeypatch):
     assert transition["result"]["classification"]["category"] == "unknown_training_failure"
 
 
+def test_historical_contract_incompatibility_is_terminal_but_not_owner_incident(monkeypatch):
+    task = {
+        "id": 28, "task_type": "controller_candidate_observation", "status": "running",
+        "stop_requested": 0, "lease_owner": evolution.WORKER_ID,
+        "attempt": 1, "max_attempts": 3,
+    }
+    transition = {}
+    monkeypatch.setattr(evolution, "get_evolution_task", lambda _task_id: task)
+    monkeypatch.setattr(
+        evolution, "_update_active_task",
+        lambda task_id, **fields: transition.update({"task_id": task_id, **fields}) or True,
+    )
+
+    evolution._finish_failure(task, ValueError("冻结策略包缺少因子绑定：momentum_60"))
+
+    assert transition["status"] == "failed"
+    assert transition["phase"] == "historical_contract_incompatible"
+    assert transition["result"]["classification"]["category"] == "historical_contract_incompatible"
+
+
+def test_historical_contract_reconciliation_reason_is_limited_to_retired_bindings():
+    assert evolution._historical_contract_incompatibility_reason({
+        "task_type": "controller_candidate_observation",
+        "error": "冻结策略包缺少因子绑定：momentum_60",
+    })
+    assert evolution._historical_contract_incompatibility_reason({
+        "task_type": "controller_candidate_observation",
+        "error": "未知模型绑定：event_surprise_lgbm_v1",
+    })
+    assert evolution._historical_contract_incompatibility_reason({
+        "task_type": "controller_candidate_observation",
+        "error": "database deadlock",
+    }) is None
+
+
+def test_historical_data_gate_reconciliation_requires_persisted_blocked_evidence():
+    assert evolution._historical_data_gate_waiting_reason({
+        "task_type": "strategy_shadow_cycle",
+        "error": "OOS 永久硬数据未就绪，影子观察冻结",
+        "result_json": '{"status": "blocked_by_decision_data"}',
+    })
+    assert evolution._historical_data_gate_waiting_reason({
+        "task_type": "strategy_shadow_cycle",
+        "error": "database deadlock",
+        "result_json": '{"status": "blocked_by_decision_data"}',
+    }) is None
+
+
 def test_transient_connection_failure_keeps_bounded_retry(monkeypatch):
     task = {
         "id": 27, "task_type": "strategy_evolution_cycle", "status": "running",

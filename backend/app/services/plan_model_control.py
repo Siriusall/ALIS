@@ -6901,7 +6901,15 @@ def _latest_run_for_model(model_key: str, runs: list[dict[str, Any]] | None = No
 def classify_plan_model_training_failure(error: Any) -> dict[str, Any]:
     raw = str(error or "").strip()
     message = raw.lower()
-    if any(value in message for value in ("statement timeout", "query timeout", "canceling statement due to statement timeout")):
+    if any(value in message for value in (
+        "冻结策略包缺少因子绑定",
+        "未知模型绑定",
+        "incomplete_frozen_factor_bindings",
+    )):
+        category = "historical_contract_incompatible"
+        retryable = False
+        action = "quarantine_historical_contract"
+    elif any(value in message for value in ("statement timeout", "query timeout", "canceling statement due to statement timeout")):
         category = "transient_query_timeout"
         retryable = True
         action = "bounded_retry"

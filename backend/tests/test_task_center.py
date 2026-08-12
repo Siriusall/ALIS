@@ -100,6 +100,31 @@ def test_failed_waiting_and_blocked_evidence_is_not_internal_error():
     assert task_center._status_with_evidence("failed", error="deadlock detected") == "failed"
 
 
+def test_historical_incompatible_controller_observation_is_not_current_incident():
+    task = {
+        "task_type": "controller_candidate_observation", "status": "failed",
+        "attempt": 1, "max_attempts": 3,
+        "phase": "historical_contract_incompatible",
+        "error": "冻结策略包缺少因子绑定：momentum_60",
+    }
+
+    assert task_center._is_terminal_research_contract_failure(task) is True
+    normalised = task_center._normalise_evolution(task, {})
+    assert normalised["activity_scope"] == "history"
+
+
+def test_historical_data_gate_wait_is_not_current_incident():
+    task = {
+        "task_type": "strategy_shadow_cycle", "status": "failed",
+        "attempt": 3, "max_attempts": 3,
+        "phase": "historical_data_gate_waiting",
+        "error": "历史影子任务受当时决策/OOS 数据门阻断，保留等待证据",
+    }
+
+    assert task_center._is_terminal_research_contract_failure(task) is True
+    assert task_center._normalise_evolution(task, {})["activity_scope"] == "history"
+
+
 def test_activity_scope_keeps_only_latest_contract_in_current_view():
     tasks = [
         {"source": "evolution", "task_type": "factor_daily_cycle"},
