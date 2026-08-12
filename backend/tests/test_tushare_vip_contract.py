@@ -220,6 +220,8 @@ def test_legacy_index_weight_cleanup_closes_ingestion_ledger(monkeypatch):
 
     assert result["resolved"] == 1
     assert any("UPDATE data_ingestion_runs" in sql and "valid_empty" in sql for sql, _ in executed)
+    select = next(params for sql, params in executed if "SELECT id,meta_json FROM data_ingestion_runs" in sql)
+    assert select == ("%返回为空%",)
 
 
 def test_index_weight_cleanup_only_retires_legacy_one_day_empty_requests(monkeypatch):

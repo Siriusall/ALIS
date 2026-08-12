@@ -1230,7 +1230,8 @@ def resolve_legacy_daily_index_weight_requests(*, limit: int = 100) -> dict[str,
         stale_runs = c.execute(
             """SELECT id,meta_json FROM data_ingestion_runs
                 WHERE job_name='tushare.index_weight' AND status='failed'
-                  AND error LIKE '%返回为空%'""",
+                  AND error LIKE ?""",
+            ("%返回为空%",),
         ).fetchall()
         for stale in stale_runs:
             try:
