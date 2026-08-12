@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import math
 import os
 import threading
 from datetime import datetime, time as dtime
@@ -2228,7 +2229,7 @@ def mark_daily_rebalance_plan_executed(
 ) -> None:
     """Bind execution to the immutable plan built from the prior close signal."""
     signal = str(signal_date or "").replace("-", "")[:8]
-    executed_at = datetime.now().astimezone().isoformat(timespec="seconds")
+    executed_at = datetime.now(_BUSINESS_TZ).isoformat(timespec="seconds")
     with business_conn() as c:
         changed = c.execute("""UPDATE daily_rebalance_plans SET status='executed',execution_id=?,executed_at=?
             WHERE id=(SELECT id FROM daily_rebalance_plans
@@ -2272,6 +2273,77 @@ def _plan_execution_authorized(plan: dict[str, Any]) -> bool:
     return bool(contract.get("execution_authorized")) if isinstance(contract, dict) else False
 
 
+def _frozen_execution_order_limits(plan: dict[str, Any]) -> dict[tuple[str, str], int] | None:
+    """Return V2 frozen order quantities, or ``None`` for historical plans.
+
+    A T+1 hard veto may legitimately leave a frozen order unfilled.  It may
+    never create an order outside the frozen set or fill more shares than the
+    frozen quantity, so those two properties remain auditable post-trade.
+    """
+    frozen_orders = plan.get("frozen_execution_orders")
+    if frozen_orders is None:
+        try:
+            contract = json.loads(plan.get("proposal_json") or "{}")
+        except (TypeError, json.JSONDecodeError):
+            return None
+        if str(contract.get("schema_version") or "") != UNIFIED_DAILY_DECISION_SCHEMA_VERSION:
+            return None
+        frozen_orders = contract.get("execution_orders")
+    if isinstance(frozen_orders, str):
+        try:
+            frozen_orders = json.loads(frozen_orders)
+        except json.JSONDecodeError:
+            return {}
+    if not isinstance(frozen_orders, list):
+        return {}
+    limits: dict[tuple[str, str], int] = {}
+    for item in frozen_orders:
+        if not isinstance(item, dict):
+            return None
+        symbol = str(item.get("symbol") or "").strip().upper()
+        side = str(item.get("side") or "").strip().upper()
+        try:
+            quantity_value = float(item.get("planned_quantity"))
+            quantity = int(quantity_value)
+        except (TypeError, ValueError):
+            return {}
+        if not math.isfinite(quantity_value) or quantity_value != quantity:
+            return {}
+        if not symbol or side not in {"BUY", "SELL"} or quantity <= 0:
+            return {}
+        key = (symbol, side)
+        if key in limits:
+            return {}
+        limits[key] = quantity
+    return limits
+
+
+def _execution_operations_within_frozen_limits(
+    plan: dict[str, Any], operations: list[dict[str, Any]], execution_id: int,
+) -> bool:
+    """Check that actual V2 operations cannot exceed or escape frozen orders."""
+    limits = _frozen_execution_order_limits(plan)
+    if limits is None:
+        return True
+    if not limits:
+        return False
+    actual: dict[tuple[str, str], int] = {}
+    for operation in operations:
+        if int(operation.get("execution_id") or 0) != execution_id:
+            continue
+        symbol = str(operation.get("symbol") or "").strip().upper()
+        side = str(operation.get("side") or "").strip().upper()
+        try:
+            quantity = int(operation.get("quantity"))
+        except (TypeError, ValueError):
+            return False
+        if not symbol or side not in {"BUY", "SELL"} or quantity <= 0:
+            return False
+        key = (symbol, side)
+        actual[key] = actual.get(key, 0) + quantity
+    return all(key in limits and quantity <= limits[key] for key, quantity in actual.items())
+
+
 def build_execution_chain_slo(
     plans: list[dict[str, Any]] | None = None,
     operations: list[dict[str, Any]] | None = None,
@@ -2282,7 +2354,7 @@ def build_execution_chain_slo(
 ) -> dict[str, Any]:
     """Measure plan-to-execution integrity from immutable plan and ledger links."""
     _ensure_tables()
-    cutoff = str(as_of_date or datetime.now().astimezone().date().isoformat()).replace("-", "")[:8]
+    cutoff = str(as_of_date or datetime.now(_BUSINESS_TZ).date().isoformat()).replace("-", "")[:8]
     if plans is None:
         with business_conn() as c:
             if compact and getattr(c, "_is_postgres", False):
@@ -2294,6 +2366,7 @@ def build_execution_chain_slo(
                               execution_id,executed_at,
                               COALESCE((proposal_json::jsonb ->> 'execution_authorized') = 'true', false)
                                 AS execution_authorized,
+                              proposal_json::jsonb -> 'execution_orders' AS frozen_execution_orders,
                               EXISTS (
                                   SELECT 1
                                     FROM jsonb_array_elements(
@@ -2333,7 +2406,7 @@ def build_execution_chain_slo(
             placeholders = ",".join("?" for _ in selected_execution_ids)
             with business_conn() as c:
                 rows = c.execute(
-                    f"SELECT execution_id,operation_uid FROM operations WHERE execution_id IN ({placeholders})",
+                    f"SELECT execution_id,operation_uid,symbol,side,quantity FROM operations WHERE execution_id IN ({placeholders})",
                     tuple(sorted(selected_execution_ids)),
                 ).fetchall()
             operations = [dict(row) for row in rows]
@@ -2352,7 +2425,11 @@ def build_execution_chain_slo(
         executed_date = executed_at[:10].replace("-", "") if executed_at else ""
         execute_date = str(plan.get("planned_execute_date") or "").replace("-", "")[:8]
         resolved = status == "executed"
-        binding_valid = bool(resolved and ((actionable and execution_id in operation_execution_ids) or (not actionable and execution_id == 0)))
+        binding_valid = bool(
+            resolved
+            and ((actionable and execution_id in operation_execution_ids) or (not actionable and execution_id == 0))
+            and (not actionable or _execution_operations_within_frozen_limits(plan, scoped_operations, execution_id))
+        )
         # A quarantined plan with no execution id or completion timestamp is a
         # terminal safety state: it cannot be replayed and has no transaction
         # to reconcile. Keep it in the historical SLO sample, but do not call
@@ -2397,6 +2474,14 @@ def build_execution_chain_slo(
             1 for item in observations
             if item.get("status") == "executed" and not item.get("binding_valid")
         ),
+        "frozen_order_integrity_anomaly_count": sum(
+            1 for item in due
+            if str(item.get("status") or "") == "executed"
+            and int(item.get("execution_id") or 0) > 0
+            and not _execution_operations_within_frozen_limits(
+                item, scoped_operations, int(item.get("execution_id") or 0),
+            )
+        ),
     }
     enough_samples = count >= max(1, int(window_plans))
     gates = {
@@ -2418,8 +2503,10 @@ def build_execution_chain_slo(
         current_blockers.append("存在重复的操作 UID")
     if metrics["executed_binding_anomaly_count"]:
         current_blockers.append("已完成计划缺少可验证的成交绑定")
+    if metrics["frozen_order_integrity_anomaly_count"]:
+        current_blockers.append("实际成交超出冻结订单的标的、方向或数量")
     return {
-        "schema_version": "alis_execution_chain_rolling_slo_v2",
+        "schema_version": "alis_execution_chain_rolling_slo_v3",
         "status": status,
         "window_plans": int(window_plans),
         "observed_due_plans": count,
@@ -2429,7 +2516,7 @@ def build_execution_chain_slo(
         "current_blocking": bool(current_blockers),
         "current_blockers": current_blockers,
         "observations": [] if compact else observations,
-        "policy": "latest_execution_authorized_non_superseded_due_plan_per_signal_date; isolated_recovery_without_execution_id_is_historical_only; current_blocking_requires_active_or_unreconciled_execution_or_duplicate_binding",
+        "policy": "latest_execution_authorized_non_superseded_due_plan_per_signal_date; v2_actual_operations_must_not_escape_or_exceed_frozen_orders; isolated_recovery_without_execution_id_is_historical_only; current_blocking_requires_active_or_unreconciled_execution_or_duplicate_binding",
     }
 
 

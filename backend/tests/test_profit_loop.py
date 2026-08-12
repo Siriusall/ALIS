@@ -628,3 +628,26 @@ def test_execution_chain_slo_fails_duplicates_stranded_and_late_execution(monkey
     assert result["metrics"]["duplicate_operation_uid_count"] == 1
     assert result["metrics"]["stranded_execution_count"] == 0
     assert result["gates"]["on_schedule_execution_rate"] is False
+
+
+def test_execution_chain_slo_rejects_operations_outside_v2_frozen_orders(monkeypatch):
+    monkeypatch.setattr(profit_loop, "_ensure_tables", lambda: None)
+    plans = [_slo_plan(index, execution_id=index) for index in range(1, 21)]
+    plans[0]["proposal_json"] = json.dumps({
+        "schema_version": "alis_unified_daily_decision_v2",
+        "execution_authorized": True,
+        "proposal": [{"action": "buy", "weight_change": .1}],
+        "execution_orders": [{"symbol": "510300", "side": "BUY", "planned_quantity": 100}],
+    })
+    operations = [
+        {"execution_id": index, "operation_uid": f"op-{index}", "symbol": "510300", "side": "BUY", "quantity": 100}
+        for index in range(1, 21)
+    ]
+    operations[0]["quantity"] = 200
+
+    result = profit_loop.build_execution_chain_slo(plans, operations, as_of_date="20260731")
+
+    assert result["status"] == "failed"
+    assert result["metrics"]["frozen_order_integrity_anomaly_count"] == 1
+    assert result["metrics"]["executed_binding_anomaly_count"] == 1
+    assert "实际成交超出冻结订单的标的、方向或数量" in result["current_blockers"]
