@@ -12,6 +12,11 @@ def test_bare_szse_etf_codes_are_not_normalized_as_sse():
     assert corporate_actions._normalize_ts_code("159001") == "159001.SZ"
 
 
+def test_bare_beijing_codes_are_normalized_for_corporate_actions():
+    assert corporate_actions._normalize_ts_code("430001") == "430001.BJ"
+    assert corporate_actions._normalize_ts_code("830001") == "830001.BJ"
+
+
 def test_quantity_entitlement_uses_record_date_ledger():
     operations = [
         {"symbol": "000001", "side": "BUY", "quantity": 1000, "at": "2026-06-01T09:30:00"},

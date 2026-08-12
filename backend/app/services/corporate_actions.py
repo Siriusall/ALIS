@@ -22,7 +22,11 @@ def _normalize_ts_code(symbol: str) -> str:
         return value
     if is_exchange_etf(value):
         return normalize_exchange_etf_ts_code(value)
-    return f"{value}.SH" if value.startswith(("5", "6", "9")) else f"{value}.SZ"
+    return (
+        f"{value}.SH" if value.startswith(("5", "6", "9"))
+        else f"{value}.BJ" if value.startswith(("4", "8"))
+        else f"{value}.SZ"
+    )
 
 
 def _base_symbol(symbol: str) -> str:
