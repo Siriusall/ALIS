@@ -125,7 +125,20 @@ def _daily_update_retry_policy(c: Any, trade_date: str, *, now: datetime | None 
         finished_at = datetime.fromisoformat(str(item.get("finished_at") or ""))
     except ValueError:
         return {"allowed": True, "reason": "invalid_failure_timestamp", "category": category}
-    current = (now.astimezone(_BUSINESS_TZ) if now and now.tzinfo else now) or _business_now()
+    current = (
+        now.astimezone(_BUSINESS_TZ)
+        if now and now.tzinfo
+        else now.replace(tzinfo=_BUSINESS_TZ)
+        if now
+        else _business_now()
+    )
+    # Historical rows predate timezone-qualified persistence.  Those naive
+    # timestamps are business timestamps, so never compare them directly to
+    # an aware UTC+8 scheduler clock.
+    if finished_at.tzinfo is None:
+        finished_at = finished_at.replace(tzinfo=_BUSINESS_TZ)
+    else:
+        finished_at = finished_at.astimezone(_BUSINESS_TZ)
     remaining = max(0, int(retry_after_seconds - (current - finished_at).total_seconds()))
     return {
         "allowed": remaining <= 0,

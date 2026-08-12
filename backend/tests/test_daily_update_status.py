@@ -88,6 +88,32 @@ def test_scheduler_uses_utc8_when_given_utc_clock() -> None:
     )
 
 
+def test_retry_cooldown_accepts_aware_now_with_legacy_naive_timestamp() -> None:
+    finished_at = "2026-07-24T16:55:00"
+
+    class _Conn:
+        def execute(self, *_args, **_kwargs):
+            class _Result:
+                @staticmethod
+                def fetchone():
+                    return {
+                        "finished_at": finished_at,
+                        "meta_json": json.dumps({
+                            "trade_date": "20260724",
+                            "failure_category": "upstream_not_ready",
+                            "retry_after_seconds": 600,
+                        }),
+                    }
+            return _Result()
+
+    result = daily_update._daily_update_retry_policy(
+        _Conn(), "20260724", now=datetime(2026, 7, 24, 9, 0, tzinfo=timezone.utc),
+    )
+
+    assert result["allowed"] is False
+    assert result["retry_after_seconds"] == 300
+
+
 def test_scheduler_rejects_invalid_or_future_target_date() -> None:
     now = datetime(2026, 7, 29, 17, 0, 0)
     assert not daily_update._scheduler_should_check(now, "")
