@@ -7,6 +7,7 @@ import threading
 from datetime import datetime, time as dtime
 from statistics import mean
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from app.data_platform.db import _conn as data_conn
 from app.core.a_share_fees import is_exchange_etf, normalize_exchange_etf_ts_code
@@ -33,10 +34,11 @@ UNIFIED_EXECUTION_SAFETY_SCHEMA_VERSION = "alis_t1_execution_safety_v2"
 
 _TABLES_READY = False
 _TABLES_INIT_LOCK = threading.Lock()
+_BUSINESS_TZ = ZoneInfo("Asia/Shanghai")
 
 
 def _now() -> str:
-    return datetime.now().isoformat(timespec="seconds")
+    return datetime.now(_BUSINESS_TZ).isoformat(timespec="seconds")
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -207,8 +209,8 @@ def _formal_plan_is_due(record: dict[str, Any], *, now: datetime | None = None) 
     # Historical replay/cleanup may examine pre-timestamp rows.  The daily
     # scheduler only needs a wall-clock guard for today's or a future plan;
     # older rows are governed by their date/expiry state machine instead.
-    current = now or datetime.now().astimezone()
-    current_date = current.astimezone().strftime("%Y%m%d")
+    current = (now.astimezone(_BUSINESS_TZ) if now and now.tzinfo else now) or datetime.now(_BUSINESS_TZ)
+    current_date = current.strftime("%Y%m%d")
     if execute_date and execute_date < current_date:
         return True
     value = str(record.get("planned_execute_at") or _planned_execute_at(execute_date)).strip()
@@ -219,7 +221,9 @@ def _formal_plan_is_due(record: dict[str, Any], *, now: datetime | None = None) 
     except ValueError as exc:
         raise ValueError("正式调仓计划执行时刻格式无效") from exc
     if due_at.tzinfo is None:
-        due_at = due_at.astimezone()
+        due_at = due_at.replace(tzinfo=_BUSINESS_TZ)
+    else:
+        due_at = due_at.astimezone(_BUSINESS_TZ)
     return current >= due_at
 
 

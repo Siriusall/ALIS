@@ -1,7 +1,7 @@
 from contextlib import contextmanager
 import hashlib
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 
 import pytest
 
@@ -95,6 +95,15 @@ def test_formal_plan_due_gate_respects_frozen_execution_timestamp():
     ) is False
     assert profit_loop._formal_plan_is_due(
         plan, now=datetime.fromisoformat("2026-08-12T15:01:00+08:00"),
+    ) is True
+
+
+def test_formal_plan_due_gate_interprets_legacy_naive_timestamp_as_utc8():
+    plan = {"planned_execute_date": "20260812", "planned_execute_at": "2026-08-12T15:01:00"}
+
+    # This is 15:30 in Shanghai, even if a host/container happens to run UTC.
+    assert profit_loop._formal_plan_is_due(
+        plan, now=datetime(2026, 8, 12, 7, 30, tzinfo=timezone.utc),
     ) is True
 
 
