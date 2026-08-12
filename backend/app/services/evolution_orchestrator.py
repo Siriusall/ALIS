@@ -142,7 +142,15 @@ def evolution_runtime_status() -> dict[str, Any]:
     for value in items.values():
         heartbeat = value.get("heartbeat_at")
         try:
-            age = max(0.0, (now - datetime.fromisoformat(str(heartbeat))).total_seconds()) if heartbeat else None
+            if heartbeat:
+                parsed = datetime.fromisoformat(str(heartbeat).replace("Z", "+00:00"))
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=now.tzinfo)
+                else:
+                    parsed = parsed.astimezone(now.tzinfo)
+                age = max(0.0, (now - parsed).total_seconds())
+            else:
+                age = None
         except (TypeError, ValueError):
             age = None
         value["heartbeat_age_seconds"] = age
