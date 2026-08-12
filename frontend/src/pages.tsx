@@ -134,7 +134,12 @@ function ThemeEvidence({themeCode,asOfDate}:{themeCode:string;asOfDate:string}){
 function rebalanceConclusion(rebalance: Json, isolated: boolean, tradingBlocked = false) {
   if (isolated) return "研究隔离，控制风险敞口";
   if (tradingBlocked) return "交易业务阻断，暂不执行";
-  if (rebalance.execution_authorized) return Number(rebalance.proposal_count || 0) > 0 ? "正式调仓计划已授权" : "今日保持当前组合";
+  if (rebalance.execution_authorized) {
+    const frozenOrders = firstArray(rebalance, ["proposal", "actions"])
+      .filter(item => Number(item.planned_quantity || 0) > 0).length;
+    const orderCount = Number(rebalance.proposal_count ?? frozenOrders);
+    return orderCount > 0 ? "正式调仓计划已授权" : "今日保持当前组合";
+  }
   const status = String(rebalance.status || "");
   if (status === "not_generated" || !status) return "等待正式计划";
   return "正式计划禁止执行";
