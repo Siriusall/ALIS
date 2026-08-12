@@ -767,12 +767,22 @@ def validate_unified_decision_contract(contract: dict[str, Any]) -> None:
             if abs(post_weight - final_weights.get(symbol, 0.0)) > 1e-8:
                 raise ReplayRiskGateError(f"冻结订单与整手后目标权重不一致：{symbol}", code="invalid_authoritative_plan")
             cost = item.get("cost") if isinstance(item.get("cost"), dict) else {}
+            reference_price = _finite_number(item.get("reference_close"), field=f"order.{symbol}.reference_close")
+            estimated_amount = _finite_number(item.get("estimated_execution_amount"), field=f"order.{symbol}.estimated_execution_amount")
+            if reference_price <= 0:
+                raise ReplayRiskGateError(f"冻结订单参考价格无效：{symbol}", code="invalid_authoritative_plan")
             for key in (
                 "gross_amount", "commission", "transfer_fee", "stamp_tax",
                 "slippage_cost", "calibration_buffer", "total_cost",
             ):
                 if _finite_number(cost.get(key), field=f"order.{symbol}.cost.{key}") < 0:
                     raise ReplayRiskGateError(f"冻结订单成本为负：{symbol}", code="invalid_authoritative_plan")
+            gross_amount = _finite_number(cost.get("gross_amount"), field=f"order.{symbol}.cost.gross_amount")
+            planned_execution_price = _finite_number(cost.get("planned_execution_price"), field=f"order.{symbol}.cost.planned_execution_price")
+            if planned_execution_price <= 0 or abs(gross_amount - planned_execution_price * quantity) > 0.02:
+                raise ReplayRiskGateError(f"冻结订单执行价格与金额不一致：{symbol}", code="invalid_authoritative_plan")
+            if abs(estimated_amount - gross_amount) > 0.02:
+                raise ReplayRiskGateError(f"冻结订单展示金额与成本不一致：{symbol}", code="invalid_authoritative_plan")
         for symbol, action_item in action_by_symbol.items():
             current = _finite_weight(action_item.get("current_weight"), field=f"controller.{symbol}.current_weight")
             changed = abs(final_weights.get(symbol, 0.0) - current) > 1e-8
