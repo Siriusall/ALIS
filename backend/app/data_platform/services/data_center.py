@@ -2365,14 +2365,22 @@ def _bulk_mark_requests_valid_empty(
         cursor = c.raw.cursor() if bool(getattr(c, "_is_postgres", False)) else c.raw
         cursor.executemany(coverage_sql.replace("?", "%s") if bool(getattr(c, "_is_postgres", False)) else coverage_sql, coverage_rows)
         cursor.executemany(resolved_sql.replace("?", "%s") if bool(getattr(c, "_is_postgres", False)) else resolved_sql, resolved_rows)
+        updated_count = getattr(cursor, "rowcount", -1)
     for key in request_keys:
         redis_set_remove("alis:data-platform:tushare:failed", key)
-    return len(records)
+    # A concurrent retry/worker may have changed a row after the eligibility
+    # scan.  Report only rows the terminal update actually touched.
+    return len(records) if not isinstance(updated_count, int) or updated_count < 0 else updated_count
+
+
+def _local_business_date_string() -> str:
+    """Return today's date in the host's configured business timezone."""
+    return datetime.now().astimezone().date().strftime("%Y%m%d")
 
 
 def resolve_mature_fund_nav_empty_requests(*, limit: int = 500) -> dict[str, Any]:
     """Close historical ETF NAV empties after the publication lag has elapsed."""
-    cutoff = _etf_nav_publish_cutoff(date.today().strftime("%Y%m%d"))
+    cutoff = _etf_nav_publish_cutoff(_local_business_date_string())
     cap = max(1, min(int(limit), 2_000))
     with _conn() as c:
         rows = c.execute(
@@ -2408,7 +2416,7 @@ def resolve_mature_fund_nav_empty_requests(*, limit: int = 500) -> dict[str, Any
 
 def resolve_mature_optional_daily_empty_requests(*, limit: int = 100) -> dict[str, Any]:
     """Close historical optional daily enrichments without assigning a numeric value."""
-    cutoff = _etf_nav_publish_cutoff(date.today().strftime("%Y%m%d"))
+    cutoff = _etf_nav_publish_cutoff(_local_business_date_string())
     cap = max(1, min(int(limit), 500))
     with _conn() as c:
         rows = c.execute(
