@@ -35,7 +35,7 @@ def resolve_stock_position_prices(
         code = raw.split(".", 1)[0].zfill(6)
         suffix = (
             ".SH" if code.startswith(("6", "9"))
-            else ".BJ" if code.startswith("8")
+            else ".BJ" if code.startswith(("4", "8"))
             else ".SZ"
         )
         symbol_by_code.setdefault(raw if "." in raw else f"{code}{suffix}", raw)

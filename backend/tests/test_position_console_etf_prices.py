@@ -24,3 +24,23 @@ def test_bare_sse_etf_keeps_sh_suffix():
 
 def test_positions_fallback_uses_szse_for_bare_etf():
     assert positions._etf_ts_code("159001") == "159001.SZ"
+
+
+def test_position_price_resolver_keeps_beijing_stock_namespace(monkeypatch):
+    captured = {}
+
+    class FakeConn:
+        def __enter__(self):
+            return self
+        def __exit__(self, *_args):
+            return False
+        def execute(self, query, params):
+            captured["params"] = params
+            class Result:
+                def fetchall(self):
+                    return []
+            return Result()
+
+    monkeypatch.setattr(position_console, "data_conn", lambda: FakeConn())
+    position_console.resolve_stock_position_prices(["430001"], "20260811")
+    assert "430001.BJ" in captured["params"]
