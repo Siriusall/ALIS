@@ -11,7 +11,9 @@ from zoneinfo import ZoneInfo
 from app.data_platform.db import _conn
 from app.data_platform.services.data_center import (
     backfill_etf_daily_incremental,
+    enrich_financial_research_fields,
     ensure_data_center_seeded,
+    financial_research_completeness,
     run_data_quality_checks,
     sync_cninfo_announcements,
     sync_market_bundle,
@@ -168,6 +170,45 @@ def _scheduler_should_check(now: datetime, target_trade_date_value: str) -> bool
     if target_date < now.date():
         return True
     return target_date == now.date() and now.weekday() < 5 and now.time() >= _DAILY_UPDATE_START_TIME
+
+
+def _run_research_maintenance(trade_date: str) -> dict[str, Any]:
+    """Refresh research pools after a durable market snapshot without affecting it."""
+    from app.services.decision_store import list_pool_members
+    from app.services.research_workflow import process_watch_pool, stage_watch_pool_candidates
+    from app.services.stock_screener import run_daily_screener
+
+    research_limit = max(1, min(int(os.getenv("ALIS_DAILY_RESEARCH_LIMIT", "100")), 500))
+    screen = run_daily_screener(
+        top_n=max(100, research_limit * 3),
+        research_limit=research_limit,
+        trade_date=trade_date,
+    )
+    staged = stage_watch_pool_candidates(limit=min(50, research_limit))
+    candidate_enrichment = []
+    enrichment_limit = max(1, min(int(os.getenv("ALIS_DAILY_CANDIDATE_ENRICH_LIMIT", "5")), 20))
+    for member in list_pool_members("candidate"):
+        if len(candidate_enrichment) >= enrichment_limit:
+            break
+        code = str(member.get("ts_code") or "").strip()
+        if not code:
+            continue
+        before = financial_research_completeness(code, period_limit=5)
+        if before.get("status") != "complete":
+            enriched = enrich_financial_research_fields(code, period_limit=5, request_limit=20)
+            candidate_enrichment.append({
+                "ts_code": code,
+                "before": before.get("status"),
+                "after": (enriched.get("after") or {}).get("status"),
+                "requested": enriched.get("requested"),
+            })
+    promote = process_watch_pool(limit=research_limit)
+    return {
+        "screen": screen,
+        "stage": staged,
+        "candidate_enrichment": candidate_enrichment,
+        "promote": promote,
+    }
 
 
 def _worker(parent_run_id: int) -> None:
@@ -362,29 +403,7 @@ def _worker(parent_run_id: int) -> None:
         # misreport a successfully completed market-data update.
         _set_state(phase="research", message="正在更新候选池和核心池研究", progress=95)
         try:
-            from app.services.stock_screener import run_daily_screener
-            from app.services.research_workflow import process_watch_pool, stage_watch_pool_candidates
-
-            research_limit = max(1, min(int(os.getenv("ALIS_DAILY_RESEARCH_LIMIT", "100")), 500))
-            screen = run_daily_screener(
-                top_n=max(100, research_limit * 3),
-                research_limit=research_limit,
-                trade_date=trade_date,
-            )
-            staged = stage_watch_pool_candidates(limit=min(50, research_limit))
-            candidate_enrichment = []
-            enrichment_limit = max(1, min(int(os.getenv("ALIS_DAILY_CANDIDATE_ENRICH_LIMIT", "5")), 20))
-            from app.services.decision_store import list_pool_members
-            for member in list_pool_members("candidate"):
-                if len(candidate_enrichment) >= enrichment_limit:
-                    break
-                code = str(member.get("ts_code") or "")
-                before = financial_research_completeness(code, period_limit=5)
-                if before.get("status") != "complete":
-                    enriched = enrich_financial_research_fields(code, period_limit=5, request_limit=20)
-                    candidate_enrichment.append({"ts_code": code, "before": before.get("status"), "after": (enriched.get("after") or {}).get("status"), "requested": enriched.get("requested")})
-            promote = process_watch_pool(limit=research_limit)
-            steps.append({"step": "research_pool", "result": {"screen": screen, "stage": staged, "candidate_enrichment": candidate_enrichment, "promote": promote}})
+            steps.append({"step": "research_pool", "result": _run_research_maintenance(trade_date)})
         except Exception as exc:  # noqa: BLE001
             logger.warning("daily research maintenance deferred: %s", str(exc)[:300])
             steps.append({"step": "research_pool", "result": error_evidence(
