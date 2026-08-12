@@ -61,7 +61,12 @@ from app.data_platform.services.stream_admin import auto_heal_stream
 from app.data_platform.services.data_center import recover_orphaned_ingestion_runs
 from app.data_platform.services.runtime_logs import write_runtime_log
 from app.services.runtime_heartbeat import status as runtime_heartbeat_status
-from app.services.system_release_center import DATA_SCHEMA_HEAD, SIM_SCHEMA_HEAD, database_revisions
+from app.services.system_release_center import (
+    DATA_SCHEMA_HEAD,
+    SIM_SCHEMA_HEAD,
+    database_revisions,
+    discover_release_change,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -340,6 +345,8 @@ def _health_payload() -> dict:
     current_revisions = database_revisions()
     expected_revisions = {"sim": SIM_SCHEMA_HEAD, "data": DATA_SCHEMA_HEAD}
     revisions_ready = current_revisions == expected_revisions
+    release_drift = discover_release_change()
+    runtime_code_ready = not bool(release_drift.get("restart_required"))
     redis = redis_health()
     evolution = evolution_runtime_status()
     runtime_heartbeats = runtime_heartbeat_status()
@@ -371,6 +378,11 @@ def _health_payload() -> dict:
             "Database migration revision mismatch: "
             f"current={current_revisions}, expected={expected_revisions}"
         ])
+        + ([] if runtime_code_ready else [
+            "Runtime code is stale: "
+            f"runtime_commit={release_drift.get('runtime_commit')}, "
+            f"repository_commit={release_drift.get('repository_commit')}; restart required"
+        ])
         + component_issues
         + runtime_issues
     )
@@ -380,7 +392,7 @@ def _health_payload() -> dict:
         and (not background_owner or bool(runtime_heartbeats))
         and (not background_owner or not unhealthy_heartbeats)
     )
-    ready = databases_ready and revisions_ready and bool(redis.get("available", False)) and runtime_ready
+    ready = databases_ready and revisions_ready and runtime_code_ready and bool(redis.get("available", False)) and runtime_ready
     return {
         "status": "ok" if ready else "error",
         "ready": ready,
@@ -394,6 +406,7 @@ def _health_payload() -> dict:
                 "expected": expected_revisions,
                 "at_head": revisions_ready,
             },
+            "release_runtime": release_drift,
             "redis": redis,
             "startup_components": _startup_components,
             "background_runtime": runtime_boundary,
