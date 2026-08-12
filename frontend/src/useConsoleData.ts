@@ -13,7 +13,7 @@ const routeKeys: Record<string, Array<keyof typeof endpoints>> = {
   "/system": ["health", "tradingReady", "adminTasksLive"],
   "/system/versions": ["systemVersionStatus", "systemReleases", "systemContracts"],
   "/decision": ["owner", "decision", "tradingReady", "latestPlan"],
-  "/portfolio": ["owner", "ledger", "positions", "portfolio", "risk", "research"],
+  "/portfolio": ["owner", "ledger", "positions", "portfolio", "risk", "research", "latestPlan"],
   "/evolution": ["factors", "factorStatus", "factorResearchConsole", "factorLineage", "evolutionTasks", "candidateObservations", "ledger"],
   "/evolution/factors": ["factors", "researchAnalytics", "researchFactorAnalytics"],
   "/evolution/metrics": ["researchAnalytics", "researchTimeseries", "evolutionTasks"],
