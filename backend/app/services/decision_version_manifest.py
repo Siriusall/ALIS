@@ -57,6 +57,7 @@ def build_decision_version_manifest(
         model_snapshot.get("fusion")
         if isinstance(model_snapshot.get("fusion"), dict) else {}
     )
+    has_frozen_fusion = isinstance(fusion.get("production_models"), list)
     frozen_model_versions = {
         str(item.get("model_key") or ""): {
             "id": int(item["version_id"]),
@@ -66,9 +67,14 @@ def build_decision_version_manifest(
         for item in (fusion.get("production_models") or [])
         if isinstance(item, dict)
         and str(item.get("model_key") or "")
+        and item.get("consumed") is True
         and item.get("version_id") is not None
     }
-    model_versions = frozen_model_versions or active_model_versions
+    # An empty consumed set in a frozen selection snapshot is meaningful: all
+    # online candidates are observation-only and the formal decision falls
+    # back to factors/deterministic rules. Do not repopulate it from current
+    # active records after T-day selection has already frozen the authority.
+    model_versions = frozen_model_versions if has_frozen_fusion else active_model_versions
     manifest = {
         "schema_version": "alis_decision_version_manifest_v2",
         "release": {

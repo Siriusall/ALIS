@@ -173,19 +173,20 @@ def _validate_selection_snapshot(snapshot: dict[str, Any]) -> None:
     fusion = model_snapshot.get("fusion") if isinstance(model_snapshot.get("fusion"), dict) else {}
     if str(fusion.get("schema_version") or "") != "model_signal_fusion_v2":
         raise ReplayRiskGateError("统一计划模型融合合同版本无效", code="invalid_authoritative_plan")
-    production_models = [
-        item for item in (fusion.get("production_models") or [])
-        if isinstance(item, dict)
-    ]
+    raw_production_models = fusion.get("production_models") or []
+    if not isinstance(raw_production_models, list) or any(
+        not isinstance(item, dict) for item in raw_production_models
+    ):
+        raise ReplayRiskGateError("统一计划生产模型绑定格式无效", code="invalid_authoritative_plan")
+    production_models = list(raw_production_models)
     model_keys = [str(item.get("model_key") or "") for item in production_models]
     if (
-        not model_keys
-        or any(not key for key in model_keys)
+        any(not key for key in model_keys)
         or len(model_keys) != len(set(model_keys))
         or any(
             not isinstance(item.get("consumed"), bool)
             or not isinstance(item.get("point_in_time_available"), bool)
-            or item.get("consumed") != item.get("point_in_time_available")
+            or (item.get("consumed") is True and item.get("point_in_time_available") is not True)
             for item in production_models
         )
     ):
@@ -278,7 +279,8 @@ def _validate_selection_snapshot(snapshot: dict[str, Any]) -> None:
             if (
                 actual_version_id != expected_version_id
                 or str(model_value.get("version") or "") != str(model_binding.get("version") or "")
-                or model_value.get("point_in_time_available") is not model_binding.get("consumed")
+                or model_value.get("point_in_time_available")
+                is not model_binding.get("point_in_time_available")
             ):
                 raise ReplayRiskGateError(
                     f"统一计划逐股模型版本或消费状态不一致：{symbol}/{key}",
@@ -817,9 +819,15 @@ def validate_unified_decision_contract(contract: dict[str, Any]) -> None:
                 ):
                     raise ReplayRiskGateError(f"冻结订单未完成 Controller 强制义务：{symbol}", code="invalid_authoritative_plan")
         for symbol, proposal_item in proposal_by_symbol.items():
-            order = orders_by_symbol.get(symbol) or {}
             planned_quantity = _strict_integer(proposal_item.get("planned_quantity"), field=f"proposal.{symbol}.planned_quantity")
-            if planned_quantity != _strict_integer(order.get("planned_quantity"), field=f"order.{symbol}.planned_quantity"):
+            order = orders_by_symbol.get(symbol)
+            if order is None:
+                # The dashboard keeps zero-share hold/observe rows for every
+                # reviewed holding and candidate.  They are evidence, not
+                # executable orders, so no frozen order is expected for them.
+                if planned_quantity != 0 or str(proposal_item.get("action") or "") not in {"hold", "observe"}:
+                    raise ReplayRiskGateError(f"页面提案缺少冻结订单：{symbol}", code="invalid_authoritative_plan")
+            elif planned_quantity != _strict_integer(order.get("planned_quantity"), field=f"order.{symbol}.planned_quantity"):
                 raise ReplayRiskGateError(f"页面提案数量与冻结订单不一致：{symbol}", code="invalid_authoritative_plan")
             if planned_quantity <= 0 and str(proposal_item.get("action") or "") not in {"hold", "observe"}:
                 raise ReplayRiskGateError(f"零数量提案不得显示交易动作：{symbol}", code="invalid_authoritative_plan")
@@ -920,7 +928,7 @@ def validate_unified_decision_contract(contract: dict[str, Any]) -> None:
             "version": str(item.get("version") or ""),
         }
         for item in (((selection.get("model_signal_snapshot") or {}).get("fusion") or {}).get("production_models") or [])
-        if isinstance(item, dict) and item.get("version_id") is not None
+        if isinstance(item, dict) and item.get("consumed") is True and item.get("version_id") is not None
     }
     manifest_models = manifest.get("model_versions") if isinstance(manifest.get("model_versions"), dict) else {}
     manifest_model_identity = {
@@ -928,11 +936,11 @@ def validate_unified_decision_contract(contract: dict[str, Any]) -> None:
         for key, item in manifest_models.items()
         if isinstance(item, dict)
     }
-    # A fully quarantined model family is a valid production state: every
-    # model slot remains frozen in the signal snapshot as unavailable, while
-    # the version manifest is intentionally empty and ranking falls back to
-    # factors and deterministic rules.  Equality still rejects any missing,
-    # stale or extra consumed model binding.
+    # A fully quarantined model family is a valid production state. Candidate
+    # models may remain point-in-time observable in the snapshot, but only a
+    # consumed model has decision authority and may enter the version manifest.
+    # An empty manifest therefore means factor/deterministic fallback, while
+    # equality still rejects missing, stale or extra consumed bindings.
     if manifest_model_identity != fusion_models:
         raise ReplayRiskGateError("统一计划模型版本清单与实际融合不一致", code="invalid_authoritative_plan")
     manifest_portfolio = manifest.get("portfolio") if isinstance(manifest.get("portfolio"), dict) else {}

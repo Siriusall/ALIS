@@ -426,6 +426,28 @@ def test_unified_plan_allows_fully_quarantined_model_family_with_factor_fallback
     assert normalized["decision_version_manifest"]["model_versions"] == {}
 
 
+def test_unified_plan_allows_observation_only_models_without_decision_authority():
+    plan = _unified_plan()
+    contract = plan["decision_contract"]
+    selection = contract["selection_snapshot"]
+    fusion = selection["model_signal_snapshot"]["fusion"]
+    model = fusion["production_models"][0]
+    model.update({"consumed": False, "point_in_time_available": True})
+    fusion["policy"]["effective_model_weights"] = {
+        "medium_horizon_lambdarank_v1": 0.0,
+    }
+    per_stock = selection["model_signal_snapshot"]["symbols"]["000001"]["selection"]["model_signals"]
+    per_stock["models"]["medium_horizon_lambdarank_v1"]["point_in_time_available"] = True
+    per_stock["trigger_models"] = []
+    contract["decision_version_manifest"]["model_versions"] = {}
+    _rehash_unified_plan(plan, selection_changed=True, manifest_changed=True)
+
+    normalized = normalize_authoritative_plan(plan)
+
+    assert normalized["is_unified_frozen_plan"] is True
+    assert normalized["decision_version_manifest"]["model_versions"] == {}
+
+
 def test_unified_plan_factor_fallback_rejects_phantom_manifest_model():
     plan = _unified_plan()
     contract = plan["decision_contract"]
