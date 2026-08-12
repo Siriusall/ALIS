@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import hashlib
 import logging
+import math
 import os
 import re
 import sqlite3
@@ -2283,7 +2284,7 @@ def merge_execution_into_positions(
             sym = (o.get("symbol") or "").strip()
             qty = int(o.get("quantity") or 0)
             pr = float(o.get("price") or 0)
-            if not sym or qty <= 0:
+            if not sym or qty <= 0 or not math.isfinite(pr) or pr <= 0:
                 continue
             name = (name_by_symbol.get(sym) or o.get("name") or "").strip()
             bought_date = (executed_at or now)[:10]
