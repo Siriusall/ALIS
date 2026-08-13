@@ -27,6 +27,28 @@ def test_daily_update_status_exposes_latest_decision_ready_trade_date(monkeypatc
     assert result["latest_decision_ready_trade_date"] == "20260717"
 
 
+def test_compact_daily_update_status_omits_large_completed_steps(monkeypatch):
+    monkeypatch.setattr(daily_update, "_state", {
+        "running": False,
+        "phase": "completed",
+        "steps": [{"large_evidence": "x" * 1000}],
+    })
+
+    class _Conn:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    monkeypatch.setattr(daily_update, "_conn", lambda: _Conn())
+    monkeypatch.setattr(daily_update, "_latest_usable_snapshot_date", lambda c: "20260717")
+    monkeypatch.setattr(daily_update, "_latest_decision_ready_trade_date", lambda c: "20260717")
+
+    assert "steps" in daily_update.daily_update_status()
+    assert "steps" not in daily_update.daily_update_status(compact=True)
+
+
 def test_persisted_data_failure_suppresses_minute_level_retry() -> None:
     finished_at = (datetime(2026, 7, 24, 17, 0, 0) - timedelta(minutes=5)).isoformat(timespec="seconds")
 

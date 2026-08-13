@@ -559,7 +559,7 @@ def start_daily_update_scheduler() -> bool:
     return True
 
 
-def daily_update_status() -> dict[str, Any]:
+def daily_update_status(*, compact: bool = False) -> dict[str, Any]:
     with _lock:
         state = {"ok": True, **_state}
     try:
@@ -608,6 +608,11 @@ def daily_update_status() -> dict[str, Any]:
             }
     except Exception as exc:  # noqa: BLE001
         state["status_error"] = str(exc)[:200]
+    if compact:
+        # Completed runs retain potentially large per-step source evidence in
+        # memory. The console only needs the current state and provider
+        # publication summary; full status remains available for diagnostics.
+        state.pop("steps", None)
     return state
 
 

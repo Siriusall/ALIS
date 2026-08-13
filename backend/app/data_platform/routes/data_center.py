@@ -110,9 +110,12 @@ def data_center_simple_health() -> dict[str, Any]:
 
 
 @router.get("/data-center/observability")
-def data_center_observability(limit_logs: int = Query(default=50, ge=1, le=200)) -> dict[str, Any]:
+def data_center_observability(
+    limit_logs: int = Query(default=50, ge=1, le=200),
+    compact: bool = Query(default=False),
+) -> dict[str, Any]:
     try:
-        return get_observability(limit_logs=limit_logs)
+        return get_observability(limit_logs=limit_logs, compact=compact)
     except Exception as exc:  # noqa: BLE001 - optional diagnostic must not become a 500
         return degraded_read("data_center_observability", exc, logs=[], issues=[])
 
@@ -251,8 +254,8 @@ def data_center_start_daily_update() -> dict[str, Any]:
 
 
 @router.get("/data-center/daily-update/status")
-def data_center_daily_update_status() -> dict[str, Any]:
-    return daily_update_status()
+def data_center_daily_update_status(compact: bool = Query(default=False)) -> dict[str, Any]:
+    return daily_update_status(compact=compact)
 
 
 @router.get("/data-center/backfill/plan")

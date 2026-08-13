@@ -273,7 +273,7 @@ def _quality_audit(c: Any) -> dict[str, Any]:
     }
 
 
-def get_observability(limit_logs: int = 50) -> dict[str, Any]:
+def get_observability(limit_logs: int = 50, *, compact: bool = False) -> dict[str, Any]:
     with _conn() as c:
         latest_date = target_trade_date(c)
         stock_count = int(_value(c.execute("SELECT COUNT(*) n FROM dc_stock_master").fetchone(), "n"))
@@ -336,13 +336,14 @@ def get_observability(limit_logs: int = 50) -> dict[str, Any]:
         api_items.append(item)
 
     log_items = []
-    for row in logs:
-        item = _dict(row)
-        try:
-            item["meta"] = json.loads(item.pop("meta_json") or "{}")
-        except Exception:
-            item["meta"] = {}
-        log_items.append(item)
+    if not compact:
+        for row in logs:
+            item = _dict(row)
+            try:
+                item["meta"] = json.loads(item.pop("meta_json") or "{}")
+            except Exception:
+                item["meta"] = {}
+            log_items.append(item)
 
     quality_pass = int(stats.get("quality_pass") or 0)
     return {
