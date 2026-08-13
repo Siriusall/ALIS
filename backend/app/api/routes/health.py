@@ -168,7 +168,13 @@ def trading_readiness(detail: str = Query("full", pattern="^(full|compact)$")) -
     if ledger_gate["status"] != "ready":
         hard_blockers.append("独立账本未通过一致性审计")
     if latest_plan["status"] == "blocked":
-        hard_blockers.append(str(plan.get("blocked_reason") or "正式冻结计划不可执行"))
+        hard_blockers.append(
+            str(plan.get("blocked_reason") or (
+                "到期冻结计划的执行行情未就绪，执行器正在持续重试"
+                if plan_is_due and plan_status == "planned"
+                else "正式冻结计划不可执行"
+            ))
+        )
     if execution_chain_gate["status"] == "blocked":
         hard_blockers.append("执行链审计不可用")
     if pending["status"] != "ready":
