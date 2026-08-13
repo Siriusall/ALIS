@@ -2261,12 +2261,16 @@ def get_latest_daily_rebalance_plan(trade_date: str = "", *, compact: bool = Fal
         "execution_id,generated_at,executed_at,execution_claim_token,execution_claimed_at,"
         "validation_error_code,validation_errors_json,validated_at"
     )
+    today = datetime.now(_BUSINESS_TZ).strftime("%Y%m%d")
     with business_conn() as c:
         row = c.execute(
             f"""SELECT {columns}
                FROM daily_rebalance_plans
-               WHERE (?='' OR trade_date=?) ORDER BY trade_date DESC,version DESC LIMIT 1""",
-            (trade_date, trade_date),
+               WHERE (?='' OR trade_date=?)
+               ORDER BY CASE WHEN status='planned'
+                                  AND replace(planned_execute_date,'-','')<=? THEN 0 ELSE 1 END,
+                        trade_date DESC,version DESC LIMIT 1""",
+            (trade_date, trade_date, today),
         ).fetchone()
     if not row:
         return {"status": "not_generated", "execution_authorized": False}

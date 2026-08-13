@@ -127,6 +127,12 @@ def trading_readiness(detail: str = Query("full", pattern="^(full|compact)$")) -
         latest_plan["status"] = "running"
     elif plan_is_future:
         latest_plan["status"] = "waiting"
+    elif plan_is_due and plan_status == "planned":
+        # A due plan with no execution claim is not a healthy waiting state.
+        # The executor will keep probing its exact T+1 data gate; the console
+        # must expose the unresolved execution error instead of hiding it
+        # behind a newer plan.
+        latest_plan["status"] = "blocked"
     elif plan_status == "planned" and not plan_is_executable:
         latest_plan["status"] = "blocked"
     elif plan_status in {"executed", "superseded", "not_generated"}:
@@ -200,7 +206,7 @@ def trading_readiness(detail: str = Query("full", pattern="^(full|compact)$")) -
                 "label": "正式冻结计划",
                 "status": latest_plan["status"],
                 "summary": {
-                    "planned": "存在可执行的冻结计划" if plan_is_due else "冻结计划尚未到执行日",
+                    "planned": "已到执行日，等待冻结执行数据；执行器持续重试" if plan_is_due else "冻结计划尚未到执行日",
                     "executing": "已有执行租约正在处理",
                     "executed": "最近冻结计划已完成",
                     "not_generated": "当前没有冻结计划",
