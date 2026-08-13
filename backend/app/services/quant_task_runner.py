@@ -1015,7 +1015,11 @@ def _persist_step_result(
         execution_id=result.execution_id,
         message=result.message,
         detail=detail,
-        plan_claim_token=str(provenance.get("execution_claim_token") or ""),
+        # The autonomous execution step has already atomically bound the
+        # frozen plan before this evidence row is created.  Repeating the
+        # transition here would turn a correctly executed plan into a false
+        # lease error.
+        plan_claim_token="",
     )
     if rec_id == 0:
         logger.info("quant task replay idempotent skip task_id=%s signal_date=%s already_replayed", task_id, result.signal_date)
