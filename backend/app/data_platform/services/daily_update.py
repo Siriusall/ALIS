@@ -15,6 +15,7 @@ from app.data_platform.services.data_center import (
     ensure_data_center_seeded,
     financial_research_completeness,
     run_data_quality_checks,
+    sync_tushare_api_raw,
     sync_cninfo_announcements,
     sync_market_bundle,
     sync_index_bundle,
@@ -95,6 +96,59 @@ def _adj_factor_ready_for_date(c: Any, trade_date: str) -> bool:
         (str(trade_date or "").replace("-", "")[:8],),
     ).fetchone()
     return int((dict(row) if row else {}).get("rows_read") or 0) >= 500
+
+
+def _missing_defensive_etf_sessions(c: Any, trade_date: str, ts_codes: list[str], *, limit: int = 10) -> list[str]:
+    """Return recent open sessions lacking a complete defensive ETF slice."""
+    target = str(trade_date or "").replace("-", "")[:8]
+    if len(target) != 8 or not ts_codes:
+        return []
+    placeholders = ",".join("?" for _ in ts_codes)
+    rows = c.execute(
+        """SELECT cal_date FROM dc_trade_calendar
+           WHERE exchange='SSE' AND is_open=1 AND cal_date<=?
+           ORDER BY cal_date DESC LIMIT ?""",
+        (target, max(1, min(int(limit), 30))),
+    ).fetchall()
+    sessions = [str(dict(row).get("cal_date") or "").replace("-", "")[:8] for row in reversed(rows)]
+    missing: list[str] = []
+    for session in sessions:
+        count_row = c.execute(
+            f"""SELECT COUNT(DISTINCT ts_code) AS count
+                FROM dc_tushare_raw_records
+               WHERE api_name='fund_daily' AND trade_date=? AND ts_code IN ({placeholders})""",
+            (session, *ts_codes),
+        ).fetchone()
+        if int((dict(count_row) if count_row else {}).get("count") or 0) != len(ts_codes):
+            missing.append(session)
+    return missing
+
+
+def _repair_defensive_etf_continuity(trade_date: str, ts_codes: list[str]) -> dict[str, Any]:
+    """Repair missing ETF sessions with the only registered historical source.
+
+    Tencent is a current quote source.  It cannot repair a multi-session gap,
+    so it must never win a history-repair decision merely by returning first.
+    """
+    with _conn() as conn:
+        missing = _missing_defensive_etf_sessions(conn, trade_date, ts_codes)
+    if not missing:
+        return {"ok": True, "status": "continuous", "missing_sessions": [], "results": []}
+    results: list[dict[str, Any]] = []
+    for session in missing:
+        try:
+            results.append({"trade_date": session, **sync_tushare_api_raw("fund_daily", {"trade_date": session})})
+        except Exception as exc:  # noqa: BLE001 - preserve exact failed session evidence
+            results.append({"trade_date": session, "ok": False, "error": str(exc)[:300]})
+    with _conn() as conn:
+        remaining = _missing_defensive_etf_sessions(conn, trade_date, ts_codes)
+    return {
+        "ok": not remaining,
+        "status": "repaired" if not remaining else "historical_source_incomplete",
+        "missing_sessions": remaining,
+        "requested_sessions": missing,
+        "results": results,
+    }
 
 
 def _set_state(**values: Any) -> None:
@@ -326,20 +380,22 @@ def _worker(parent_run_id: int) -> None:
             from app.services.defensive_assets import DEFENSIVE_ASSETS
 
             defensive_codes = sorted(str(item["ts_code"]) for item in DEFENSIVE_ASSETS)
-            etf_discovery = discover_first_published("defensive_fund_daily", trade_date)
-            winner = str(etf_discovery.get("winner") or "")
-            if winner == "tushare":
-                provider_result = backfill_etf_daily_incremental(
-                    start_date=trade_date,
-                    end_date=trade_date,
-                    cursor="",
-                    limit_dates=1,
-                    nav_limit_funds=0,
-                )
-            elif winner == "tencent_etf_quote":
-                provider_result = repair_fund_daily_from_tencent(trade_date, defensive_codes)
+            continuity = _repair_defensive_etf_continuity(trade_date, defensive_codes)
+            if continuity.get("ok"):
+                etf_discovery = discover_first_published("defensive_fund_daily", trade_date)
+                winner = str(etf_discovery.get("winner") or "")
+                if winner == "tushare":
+                    provider_result = backfill_etf_daily_incremental(
+                        start_date=trade_date, end_date=trade_date, cursor="", limit_dates=1, nav_limit_funds=0,
+                    )
+                elif winner == "tencent_etf_quote":
+                    provider_result = repair_fund_daily_from_tencent(trade_date, defensive_codes)
+                else:
+                    provider_result = {"ok": False, "status": "no_provider_published"}
             else:
-                provider_result = {"ok": False, "status": "no_provider_published"}
+                etf_discovery = {"ok": False, "status": "historical_etf_gap_requires_tushare", "winner": "tushare"}
+                winner = "tushare"
+                provider_result = continuity
             with _conn() as conn:
                 placeholders = ",".join("?" for _ in defensive_codes)
                 row = conn.execute(
@@ -364,6 +420,7 @@ def _worker(parent_run_id: int) -> None:
                 "provider_discovery_contract": "alis_market_publication_probe_v1",
                 "winner": winner,
                 "discovery": etf_discovery,
+                "continuity": continuity,
                 "provider_result": provider_result,
                 "slice_rows": slice_rows,
                 "required_rows": len(defensive_codes),

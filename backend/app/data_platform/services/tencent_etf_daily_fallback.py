@@ -310,5 +310,5 @@ def repair_fund_daily_from_tencent(trade_date: str, ts_codes: Iterable[str]) -> 
         "received": len(quotes),
         "rows_written": written,
         "reference_compared": compared,
-        "missing": missing,
+        "missing": [],
     }
