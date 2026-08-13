@@ -2,7 +2,15 @@ import math
 
 import pytest
 
-from app.services.simulation_ledger_audit import _ledger_money, _money, _quantity, replay_simulation_ledger
+from app.db.store import atomic_business_transaction
+from app.services.simulation_ledger_audit import (
+    _ledger_money,
+    _money,
+    _quantity,
+    audit_simulation_ledger,
+    invalidate_simulation_ledger_audit_cache,
+    replay_simulation_ledger,
+)
 
 
 class _UnexpectedStringError:
@@ -168,3 +176,13 @@ def test_replay_reports_nonfinite_baseline_without_emitting_nonfinite_results():
     assert issue["code"] == "invalid_baseline_cash"
     assert issue["field"] == "baseline_cash"
     assert math.isnan(issue["value"])
+
+
+def test_ledger_audit_reuses_an_active_execution_transaction():
+    invalidate_simulation_ledger_audit_cache()
+
+    with atomic_business_transaction():
+        result = audit_simulation_ledger(persist=False)
+
+    assert "ok" in result
+    assert result["schema_version"] == "alis_simulation_ledger_audit_v1"

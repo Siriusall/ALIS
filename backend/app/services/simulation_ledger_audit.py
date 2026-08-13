@@ -9,7 +9,12 @@ from datetime import datetime
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Any
 
-from app.db.store import _conn as business_conn, atomic_business_transaction, get_account_baseline
+from app.db.store import (
+    _ACTIVE_BUSINESS_TRANSACTION,
+    _conn as business_conn,
+    atomic_business_transaction,
+    get_account_baseline,
+)
 
 
 _CENT = Decimal("0.01")
@@ -279,9 +284,15 @@ def audit_simulation_ledger(*, persist: bool = True) -> dict[str, Any]:
                 return copy.deepcopy(cached[1])
     if persist:
         _ensure_table()
-    # A shared account advisory lock prevents the audit from mixing rows from
-    # before and after one ledger commit under PostgreSQL READ COMMITTED.
-    with atomic_business_transaction() as conn:
+    # An execution preflight already owns the account lock and transaction.
+    # Reuse it there; independent audits still acquire the same lock so their
+    # reads cannot mix the projections either side of a ledger commit.
+    audit_connection = (
+        business_conn
+        if _ACTIVE_BUSINESS_TRANSACTION.get() is not None
+        else atomic_business_transaction
+    )
+    with audit_connection() as conn:
         operations = [
             dict(row) for row in conn.execute(
                 """SELECT id,symbol,side,price,quantity,at,
