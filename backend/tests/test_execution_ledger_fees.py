@@ -32,6 +32,21 @@ def test_exchange_etf_uses_five_bp_slippage_and_no_transaction_taxes() -> None:
     assert apply_slippage_buy(1.0, "511880.SH") == 1.001
     fee = sell_cost_breakdown(1.0, 10_000, "511880.SH")
     assert fee["executed_price"] == 1.0
+
+
+def test_sell_operation_uid_uses_the_same_cent_price_written_to_ledger() -> None:
+    fee = sell_cost_breakdown(3.14, 100, "510880.SH")
+    unrounded_price = float(fee["executed_price"])
+    persisted_price = round(unrounded_price, 2)
+
+    assert persisted_price == 3.14
+    assert unrounded_price != persisted_price
+    assert store._operation_uid(None, "510880", "SELL", "2026-08-13T09:30:00", 100, persisted_price) == (
+        store._operation_uid(None, "510880", "SELL", "2026-08-13T09:30:00", 100, 3.14)
+    )
+    assert store._operation_uid(None, "510880", "SELL", "2026-08-13T09:30:00", 100, unrounded_price) != (
+        store._operation_uid(None, "510880", "SELL", "2026-08-13T09:30:00", 100, persisted_price)
+    )
     assert fee["stamp_tax"] == 0
     assert fee["transfer_fee"] == 0
     assert fee["fee_schedule_version"] == ETF_FEE_SCHEDULE_VERSION

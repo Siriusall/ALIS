@@ -313,7 +313,10 @@ def _sell_position_for_rebalance(
         return False, turnover_remaining, "monthly_turnover_budget"
     try:
         fee = sell_cost_breakdown(px, quantity, sym)
-        exec_price = float(fee["executed_price"])
+        # sell_position persists prices to cents, and the operation UID used
+        # for the later execution binding is derived from that persisted
+        # value.  Keep the payload on the same representation.
+        exec_price = round(float(fee["executed_price"]), 2)
         sell_position(
             int(pos["id"]),
             quantity=quantity,
