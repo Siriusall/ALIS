@@ -1216,7 +1216,7 @@ def run_for_trade_date(
                 })
             continue
         if sym in defensive_weights:
-            from app.services.defensive_assets import defensive_asset_returns
+            from app.services.defensive_assets import defensive_asset_bar, defensive_asset_returns
             returns = defensive_asset_returns(next(code for code in (defensive_policy.get("target_weights") or {}) if str(code).split(".")[0] == sym), signal_date)
             average_amount_thousand = float((defensive_asset_bar(next(code for code in (defensive_policy.get("target_weights") or {}) if str(code).split(".")[0] == sym), signal_date) or {}).get("amount") or 0)
         else:
