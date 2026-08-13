@@ -150,7 +150,16 @@ def _defensive_execution_row(
     """Build an ETF execution row without relabeling a stale market record."""
     from app.services.defensive_assets import defensive_asset_bar
 
-    bar = defensive_asset_bar(ts_code, execute_date, exact_date=require_exact_date)
+    # The scheduler has already passed the frozen execution-data gate.  Read
+    # the exact session using the actual observation time so a valid fallback
+    # bar published after the session is not filtered by an unrelated fixed
+    # 15:00 cutoff.  The stored available_time remains immutable evidence.
+    bar = defensive_asset_bar(
+        ts_code,
+        execute_date,
+        exact_date=require_exact_date,
+        available_as_of_time=datetime.now().astimezone().isoformat(timespec="seconds"),
+    )
     if not bar:
         return None
     actual_date = str(bar.get("trade_date") or "").replace("-", "")[:8]

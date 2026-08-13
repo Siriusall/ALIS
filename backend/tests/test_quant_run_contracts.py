@@ -85,6 +85,23 @@ def test_execution_suspension_check_consumes_real_volume():
     assert quant_run_engine._execution_volume(suspended) == 0.0
 
 
+def test_defensive_execution_row_reads_exact_fallback_bar_available_now(monkeypatch):
+    captured = {}
+
+    def fake_bar(*args, **kwargs):
+        captured.update(kwargs)
+        return {"trade_date": "20260813", "open": 1.0, "pre_close": 0.99, "vol": 100}
+
+    monkeypatch.setattr("app.services.defensive_assets.defensive_asset_bar", fake_bar)
+    row = quant_run_engine._defensive_execution_row(
+        "510880", ts_code="510880.SH", name="ETF", execute_date="20260813",
+        require_exact_date=True,
+    )
+    assert row is not None
+    assert captured["exact_date"] is True
+    assert captured["available_as_of_time"]
+
+
 @pytest.mark.parametrize(
     ("frozen_strategy_id", "frozen_signal_date", "frozen_execute_date"),
     [
@@ -272,7 +289,7 @@ def test_unified_t1_execution_does_not_rerun_investment_opinion(monkeypatch):
 def test_defensive_execution_row_never_relabels_stale_bar(monkeypatch):
     captured = {}
 
-    def stale_bar(ts_code, trade_date, *, exact_date=False):
+    def stale_bar(ts_code, trade_date, *, exact_date=False, available_as_of_time=None):
         captured.update(ts_code=ts_code, trade_date=trade_date, exact_date=exact_date)
         return {
             "trade_date": "20260730",
