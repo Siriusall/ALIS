@@ -5,7 +5,7 @@
 > 范围：投资研究、策略、组合、模拟交易和复盘；不包含实盘接入、自动备份与服务器运维。  
 > 本文正文给出当前真实状态；附录保留 2026-07-19 详细设计，所有变更均标注而不直接抹除。
 
-> 最近完成记录（2026-08-18）：完成四机研究计算分流的代码与部署准备。`evolution_tasks` 新增 `worker_pool` 及 `sim_0008_worker_pools`，重型因子、策略、OOS 和候选验证任务默认进入 `research` 池，旧阿里 Worker 保持 `control` 池，新腾讯 `124.223.225.117` 只运行独立 `alis-research-worker.service`，初始并发固定为1，不承载 API、调度器、Redis、模拟交易、账本或数据库备份。定向 Worker 路由测试 `3 passed`，后端相关回归测试通过；新机 WireGuard 和 PostgreSQL 白名单已配置，但数据库云安全组尚未收到新 peer 的 UDP 51820，故未启动新 Worker、未执行迁移或改变任务状态。
+> 最近完成记录（2026-08-18）：完成四机研究计算分流并发布控制面。`evolution_tasks` 新增 `worker_pool` 及 `sim_0008_worker_pools`，重型因子、策略、OOS 和候选验证任务默认进入 `research` 池，旧阿里 Worker 保持 `control` 池，新腾讯 `124.223.225.117` 只运行独立 `alis-research-worker.service`，初始并发固定为1，不承载 API、调度器、Redis、模拟交易、账本或数据库备份。定向 Worker 路由测试 `3 passed`、四组相关回归 `82 passed`；应用机已发布 `a26aeb8`，数据库迁移和系统发布治理完成，应用/旧 Worker 均 active，`/api/ready=true`。新机 WireGuard 和 PostgreSQL 白名单已配置，但数据库云安全组仍未收到新 peer 的 UDP 51820，故研究 Worker 尚未启动。
 
 > 最近完成记录（2026-08-17）：修复线上 PostgreSQL qmark 适配器把 SQL 百分号字面量误识别为占位符的问题。根因为业务 SQL 使用 `LIKE '%transmission_direction=%'`，旧 `sql.replace("?", "%s")` 交给 psycopg 后触发 `only '%s', '%b', '%t' are allowed as placeholders`，正式调仓生成器因此失败并重复重试。新增 `backend/app/core/sql_compat.py` 做词法安全转换，两个数据库连接包装器统一使用；行业事件查询改为参数化 `LIKE ?`。基于线上 `30ff763` 构建最小制品 `98471ab`，仅发布该修复到腾讯 API 与阿里 Worker，未带入其他本地改动。发布后双机服务 active，`/api/health`、`/api/live`、`/api/ready` 均通过，双库只读百分号 SQL 实测通过，发布治理任务完成；发布后日志未再出现该占位符错误。未修改账户、持仓、账本、成交、冻结计划、Champion 或模型权限。
 
