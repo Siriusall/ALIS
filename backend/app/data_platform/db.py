@@ -9,6 +9,7 @@ from app.core.project_env import load_project_env
 from app.core.runtime_guard import assert_data_platform_path_boundary, assert_database_boundary
 from app.core.db_connection_gate import DatabaseConnectionGate
 from app.core.db_connect import connect_postgres
+from app.core.sql_compat import qmark_to_pyformat
 
 load_project_env()
 
@@ -614,7 +615,7 @@ class Connection:
     def execute(self, sql: str, params: tuple | None = None):
         if self._is_postgres:
             self._last = self.raw.cursor()
-            self._last.execute(sql.replace("?", "%s"), params or ())
+            self._last.execute(qmark_to_pyformat(sql), params or ())
             return self._last
         self._last = self.raw.execute(sql, params or ())
         return self._last

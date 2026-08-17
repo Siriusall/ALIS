@@ -34,6 +34,7 @@ from app.core.trade_calendar import get_last_trade_date
 from app.core.runtime_guard import assert_database_boundary
 from app.core.db_connection_gate import DatabaseConnectionGate
 from app.core.db_connect import connect_postgres
+from app.core.sql_compat import qmark_to_pyformat
 
 logger = logging.getLogger("quant")
 
@@ -136,7 +137,7 @@ class _ConnWrapper:
 
     def execute(self, sql: str, params: Optional[tuple] = None):
         if self._is_postgres:
-            sql = sql.replace("?", "%s")
+            sql = qmark_to_pyformat(sql)
             self._last_cursor = self._conn.cursor()
             self._last_cursor.execute(sql, params or ())
             return self._last_cursor
