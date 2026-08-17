@@ -282,6 +282,141 @@ def test_unified_path_does_not_consume_legacy_pools(monkeypatch):
     assert status == "not_consumed_non_authoritative"
 
 
+def test_portfolio_passes_the_strict_gate_observation_cutoff_into_live_selection(monkeypatch):
+    captured = {}
+    cutoff = "2026-08-14T18:10:00+08:00"
+
+    monkeypatch.setattr(profit_loop, "get_positions", lambda: [])
+    monkeypatch.setattr(
+        profit_loop,
+        "_latest_decision_data_gate",
+        lambda _date: {
+            "decision_ready": True,
+            "readiness": {
+                "latest_decision_ready_trade_date": "20260814",
+                "target_trade_date": "20260814",
+                "decision_contract": {
+                    "observation_contract": {"cutoff": cutoff},
+                },
+            },
+        },
+    )
+
+    def selected(**kwargs):
+        captured.update(kwargs)
+        raise RuntimeError("cutoff captured")
+
+    monkeypatch.setattr(profit_loop, "_build_formal_unified_selection", selected)
+    with pytest.raises(RuntimeError, match="cutoff captured"):
+        profit_loop.build_portfolio_reoptimization(signal_date="20260814")
+
+    assert captured["trade_date"] == "20260814"
+    assert captured["observation_cutoff"] == cutoff
+
+
+def test_portfolio_stops_before_selection_when_target_data_gate_is_not_ready(monkeypatch):
+    monkeypatch.setattr(profit_loop, "get_positions", lambda: [])
+    monkeypatch.setattr(
+        profit_loop,
+        "_latest_decision_data_gate",
+        lambda _date: {
+            "status": "blocked",
+            "decision_ready": False,
+            "issues": [{"message": "daily_basic missing"}],
+            "readiness": {
+                "target_trade_date": "20260814",
+                "latest_decision_ready_trade_date": "20260813",
+            },
+        },
+    )
+    monkeypatch.setattr(
+        profit_loop,
+        "_build_formal_unified_selection",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("selection must not run without target data")),
+    )
+
+    result = profit_loop.build_portfolio_reoptimization(signal_date="20260814")
+
+    assert result["ok"] is False
+    assert result["status"] == "blocked"
+    assert result["selection_source"] == "market_data_blocked"
+    assert result["execution_checks"] == [
+        {
+            "key": "market_data",
+            "label": "最新决策数据门",
+            "status": "block",
+            "detail": "目标交易日决策数据未就绪；禁止用旧快照、前收或成本价构造组合",
+        }
+    ]
+
+
+def test_portfolio_blocks_before_cost_price_weight_or_selection_when_position_quote_missing(monkeypatch):
+    cutoff = "2026-08-14T18:10:00+08:00"
+    monkeypatch.setattr(
+        profit_loop,
+        "get_positions",
+        lambda: [{"symbol": "000001", "name": "平安银行", "quantity": 100, "price": 10.0}],
+    )
+    monkeypatch.setattr(
+        profit_loop,
+        "_latest_decision_data_gate",
+        lambda _date: {
+            "status": "ready",
+            "decision_ready": True,
+            "readiness": {
+                "target_trade_date": "20260814",
+                "latest_decision_ready_trade_date": "20260814",
+                "decision_contract": {"observation_contract": {"cutoff": cutoff}},
+            },
+        },
+    )
+    monkeypatch.setattr(
+        profit_loop,
+        "build_position_market_series_cache",
+        lambda *_args, **_kwargs: {
+            "000001": {
+                "price": 10.0,
+                "price_source": "position_cost_fallback",
+                "trade_date": "20260814",
+            },
+        },
+    )
+    monkeypatch.setattr(
+        profit_loop,
+        "missing_exact_position_valuations",
+        lambda *_args, **_kwargs: {"000001": "strict_snapshot_trade_date_missing"},
+    )
+    monkeypatch.setattr(
+        profit_loop,
+        "_build_formal_unified_selection",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("selection must not run without held-position quote")),
+    )
+    monkeypatch.setattr(
+        profit_loop,
+        "build_live_portfolio_risk",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("risk must not run with cost-price fallback")),
+    )
+
+    result = profit_loop.build_portfolio_reoptimization(signal_date="20260814")
+
+    assert result["ok"] is False
+    assert result["status"] == "blocked"
+    assert result["selection_source"] == "position_valuation_blocked"
+    assert result["current_weights"] == {}
+    assert result["missing_position_market_data"] == ["000001"]
+    assert result["execution_checks"][0]["key"] == "position_valuation"
+    assert "成本价" in result["execution_checks"][0]["detail"]
+
+    monkeypatch.setattr(
+        profit_loop,
+        "business_conn",
+        lambda: (_ for _ in ()).throw(AssertionError("blocked portfolio must not write a plan")),
+    )
+    plan = profit_loop.materialize_daily_rebalance_plan(result)
+    assert plan["status"] == "blocked_by_position_valuation"
+    assert plan["persisted"] is False
+
+
 def test_legacy_portfolio_is_preview_only_and_never_opens_formal_plan_store(monkeypatch):
     monkeypatch.setattr(
         profit_loop,
@@ -304,6 +439,115 @@ def test_legacy_portfolio_is_preview_only_and_never_opens_formal_plan_store(monk
     assert result["status"] == "compatibility_preview_only"
     assert result["persisted"] is False
     assert result["execution_authorized"] is False
+
+
+def test_missing_decision_target_cannot_fall_back_to_snapshot_max_for_formal_plan(monkeypatch):
+    monkeypatch.setattr(
+        profit_loop,
+        "business_conn",
+        lambda: (_ for _ in ()).throw(AssertionError("formal plan store must not be opened")),
+    )
+
+    result = profit_loop.materialize_daily_rebalance_plan({
+        "selection_source": "unified_full_market_selection",
+        "decision_data_gate": {},
+    })
+
+    assert result["status"] == "blocked_by_decision_data"
+    assert result["retryable"] is True
+    assert result["persisted"] is False
+
+
+def test_missing_market_context_has_its_own_formal_plan_block_status():
+    status, reason = profit_loop._plan_block_status({
+        "execution_checks": [{"key": "market_context", "status": "block"}],
+    })
+
+    assert status == "blocked_by_market_context"
+    assert "点时证据" in reason
+
+
+def test_sell_diagnostics_do_not_write_cost_price_fallback_as_zero_return(monkeypatch):
+    monkeypatch.setattr(
+        profit_loop,
+        "get_positions",
+        lambda: [{"symbol": "000001", "quantity": 100, "price": 10.0}],
+    )
+    monkeypatch.setattr(
+        profit_loop,
+        "build_position_market_series_cache",
+        lambda *_args, **_kwargs: {
+            "000001": {
+                "price": 10.0,
+                "price_source": "position_cost_fallback",
+                "trade_date": "20260814",
+            },
+        },
+    )
+    monkeypatch.setattr(
+        profit_loop,
+        "missing_exact_position_valuations",
+        lambda *_args, **_kwargs: {"000001": "strict_snapshot_trade_date_missing"},
+    )
+    monkeypatch.setattr(
+        profit_loop,
+        "business_conn",
+        lambda: (_ for _ in ()).throw(AssertionError("missing market data must not write learning labels")),
+    )
+
+    result = profit_loop.build_sell_rebalance_diagnostics(
+        portfolio={"decision_data_gate": {"target_trade_date": "20260814"}},
+        persist=True,
+    )
+
+    assert result["ok"] is False
+    assert result["status"] == "blocked_by_position_market_data"
+    assert result["missing_symbols"] == ["000001"]
+    assert result["learning_labels_written"] == 0
+
+
+def test_portfolio_candles_block_instead_of_skipping_a_missing_held_position_bar(monkeypatch):
+    @contextmanager
+    def fake_business_conn():
+        class Conn:
+            def execute(self, sql, _params=()):
+                assert "FROM operations" in sql
+                return _Rows([{
+                    "symbol": "000001", "side": "BUY", "quantity": 100,
+                    "price": 10.0, "at": "2026-08-14T09:30:00+08:00",
+                    "commission": 0.0, "transfer_fee": 0.0, "stamp_tax": 0.0,
+                }])
+
+        yield Conn()
+
+    @contextmanager
+    def fake_data_conn():
+        class Conn:
+            def execute(self, sql, _params=()):
+                if "FROM dc_trade_calendar" in sql:
+                    return _Rows([{"cal_date": "20260814"}, {"cal_date": "20260815"}])
+                if "FROM dc_tushare_raw_records" in sql:
+                    return _Rows([{
+                        "trade_date": "20260814",
+                        "payload_json": json.dumps({"open": 10, "high": 11, "low": 9, "close": 10}),
+                    }])
+                raise AssertionError(f"unexpected data query: {sql}")
+
+        yield Conn()
+
+    monkeypatch.setattr(profit_loop, "business_conn", fake_business_conn)
+    monkeypatch.setattr(profit_loop, "data_conn", fake_data_conn)
+    monkeypatch.setattr(profit_loop, "target_trade_date", lambda _conn: "20260815")
+    monkeypatch.setattr("app.services.corporate_actions.load_dividend_events", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr("app.services.corporate_actions.build_replay_corporate_actions", lambda *_args, **_kwargs: [])
+
+    result = profit_loop.build_portfolio_candles(limit=20)
+
+    assert result["ok"] is False
+    assert result["status"] == "blocked"
+    assert result["reason"] == "exact_account_ohlc_missing"
+    assert result["series"] == []
+    assert result["missing_ohlc_by_date"] == {"20260815": ["000001"]}
 
 
 def test_planned_signal_date_reuses_frozen_plan_when_research_evidence_changes(monkeypatch):

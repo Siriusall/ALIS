@@ -51,6 +51,18 @@ def test_future_only_signal_snapshot_is_a_hard_block():
     assert exc.value.code == "future_guard_signal_snapshot"
 
 
+def test_formal_selection_requires_a_passed_point_in_time_source_audit():
+    source = quant_run_engine.BacktestDataSource()
+    source._record_pit_failure(  # noqa: SLF001 - hard-gate contract
+        "snapshot.daily_structured", "normalized_snapshot_version_missing",
+    )
+    with pytest.raises(contracts.ReplayRiskGateError) as exc:
+        quant_run_engine._require_formal_pit_source(
+            source, "snapshot.daily_structured", signal_date="20260722",
+        )
+    assert exc.value.code == "point_in_time_source_unavailable"
+
+
 def test_open_change_uses_open_and_previous_close_only():
     row = SnapshotRow(
         symbol="000001",
@@ -85,6 +97,29 @@ def test_execution_suspension_check_consumes_real_volume():
     assert quant_run_engine._execution_volume(suspended) == 0.0
 
 
+def test_portfolio_state_blocks_cost_price_when_execution_market_data_is_missing(monkeypatch):
+    monkeypatch.setattr(quant_run_engine, "get_account_balance", lambda: 100_000.0)
+    monkeypatch.setattr(
+        quant_run_engine,
+        "get_positions",
+        lambda: [{"symbol": "000001", "quantity": 100, "price": 9.8}],
+    )
+    monkeypatch.setattr(
+        quant_run_engine,
+        "point_in_time_position_market_series",
+        lambda **_kwargs: {
+            "price": 9.8,
+            "price_source": "position_cost_fallback",
+            "observation_error": "strict_snapshot_trade_date_missing",
+        },
+    )
+
+    with pytest.raises(contracts.ReplayRiskGateError) as exc:
+        quant_run_engine._portfolio_state(object(), "20260815", execution_rows={})
+
+    assert exc.value.code == "paused_position_market_data_not_ready"
+
+
 def test_defensive_execution_row_reads_exact_fallback_bar_available_now(monkeypatch):
     captured = {}
 
@@ -96,10 +131,11 @@ def test_defensive_execution_row_reads_exact_fallback_bar_available_now(monkeypa
     row = quant_run_engine._defensive_execution_row(
         "510880", ts_code="510880.SH", name="ETF", execute_date="20260813",
         require_exact_date=True,
+        observation_cutoff="2026-08-13T16:00:00+08:00",
     )
     assert row is not None
     assert captured["exact_date"] is True
-    assert captured["available_as_of_time"]
+    assert captured["available_as_of_time"] == "2026-08-13T16:00:00+08:00"
 
 
 @pytest.mark.parametrize(
@@ -129,6 +165,8 @@ def test_unified_plan_identity_mismatch_rejects_before_market_or_execution(
         "target_weights": {},
         "pretrade_controller": {},
         "decision_contract": {
+            "schema_version": "alis_unified_daily_decision_v2",
+            "data_as_of_time": "2026-07-24T15:00:00+08:00",
             "selection_snapshot": {"strategy_id": frozen_strategy_id},
             "signal_date": frozen_signal_date,
             "planned_execute_date": frozen_execute_date,
@@ -206,6 +244,8 @@ def test_unified_t1_execution_does_not_rerun_investment_opinion(monkeypatch):
         "risk_budget": {},
         "pretrade_controller": frozen_controller,
         "decision_contract": {
+            "schema_version": "alis_unified_daily_decision_v2",
+            "data_as_of_time": "2026-07-24T15:00:00+08:00",
             "selection_snapshot": {
                 "strategy_id": 1,
                 "signal_date": "20260724",
@@ -264,6 +304,15 @@ def test_unified_t1_execution_does_not_rerun_investment_opinion(monkeypatch):
 
     monkeypatch.setattr(quant_run_engine, "simulate_open_execution", capture_execution)
     monkeypatch.setattr(quant_run_engine, "add_log", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        "app.services.profit_loop.audit_frozen_execution_orders",
+        lambda *_args, **_kwargs: {
+            "ok": True,
+            "checked_at": "2026-07-27T09:30:00+08:00",
+            "orders": [],
+            "missing": [],
+        },
+    )
 
     result = quant_run_engine.run_for_trade_date(
         strategy_id=1,
@@ -290,7 +339,12 @@ def test_defensive_execution_row_never_relabels_stale_bar(monkeypatch):
     captured = {}
 
     def stale_bar(ts_code, trade_date, *, exact_date=False, available_as_of_time=None):
-        captured.update(ts_code=ts_code, trade_date=trade_date, exact_date=exact_date)
+        captured.update(
+            ts_code=ts_code,
+            trade_date=trade_date,
+            exact_date=exact_date,
+            available_as_of_time=available_as_of_time,
+        )
         return {
             "trade_date": "20260730",
             "open": 3.2,
@@ -307,6 +361,7 @@ def test_defensive_execution_row_never_relabels_stale_bar(monkeypatch):
         name="红利ETF",
         execute_date="20260731",
         require_exact_date=True,
+        observation_cutoff="2026-07-31T16:00:00+08:00",
     )
 
     assert row is None
@@ -314,4 +369,5 @@ def test_defensive_execution_row_never_relabels_stale_bar(monkeypatch):
         "ts_code": "510880.SH",
         "trade_date": "20260731",
         "exact_date": True,
+        "available_as_of_time": "2026-07-31T16:00:00+08:00",
     }

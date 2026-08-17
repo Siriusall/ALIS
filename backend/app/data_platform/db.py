@@ -319,6 +319,11 @@ CREATE TABLE dc_stock_daily_snapshot (
             quality_flags_json TEXT NOT NULL,
             source_code TEXT NOT NULL,
             available_time TEXT NOT NULL,
+            economic_available_time TEXT NOT NULL DEFAULT '',
+            observed_at TEXT NOT NULL DEFAULT '',
+            first_observed_at TEXT NOT NULL DEFAULT '',
+            observation_provenance TEXT NOT NULL DEFAULT 'legacy_unknown',
+            content_hash TEXT NOT NULL DEFAULT '',
             updated_at TEXT NOT NULL,
             PRIMARY KEY (ts_code, trade_date)
         );
@@ -384,8 +389,45 @@ CREATE TABLE dc_tushare_raw_records (
             payload_json TEXT NOT NULL,
             source_code TEXT NOT NULL,
             available_time TEXT NOT NULL,
+            economic_available_time TEXT NOT NULL DEFAULT '',
+            observed_at TEXT NOT NULL DEFAULT '',
+            first_observed_at TEXT NOT NULL DEFAULT '',
+            observation_provenance TEXT NOT NULL DEFAULT 'legacy_unknown',
+            content_hash TEXT NOT NULL DEFAULT '',
             updated_at TEXT NOT NULL,
             UNIQUE (api_name, record_key)
+        );
+CREATE TABLE dc_tushare_raw_record_version (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            api_name TEXT NOT NULL,
+            record_key TEXT NOT NULL,
+            ts_code TEXT NOT NULL DEFAULT '',
+            trade_date TEXT NOT NULL DEFAULT '',
+            period TEXT NOT NULL DEFAULT '',
+            ann_date TEXT NOT NULL DEFAULT '',
+            payload_json TEXT NOT NULL,
+            source_code TEXT NOT NULL,
+            economic_available_time TEXT NOT NULL DEFAULT '',
+            observed_at TEXT NOT NULL DEFAULT '',
+            first_observed_at TEXT NOT NULL DEFAULT '',
+            observation_provenance TEXT NOT NULL DEFAULT '',
+            content_hash TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE (api_name, record_key, content_hash)
+        );
+CREATE TABLE dc_stock_daily_snapshot_version (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts_code TEXT NOT NULL,
+            trade_date TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            source_code TEXT NOT NULL,
+            economic_available_time TEXT NOT NULL DEFAULT '',
+            observed_at TEXT NOT NULL DEFAULT '',
+            first_observed_at TEXT NOT NULL DEFAULT '',
+            observation_provenance TEXT NOT NULL DEFAULT '',
+            content_hash TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE (ts_code, trade_date, content_hash)
         );
 CREATE TABLE dc_etf_pcf_header (
             exchange TEXT NOT NULL,
@@ -709,6 +751,10 @@ def _conn():
 def init_db() -> None:
     with _conn() as conn:
         if _is_postgres():
+            # Every runtime process checks the data schema at startup.  Keep
+            # the long idempotent DDL sequence serialized so concurrent
+            # workers cannot deadlock on different ALTER TABLE locks.
+            conn.execute("SELECT pg_advisory_xact_lock(?)", (1095522645,))
             schema = SCHEMA_SQL.replace(
                 "INTEGER PRIMARY KEY AUTOINCREMENT", "BIGSERIAL PRIMARY KEY"
             )
@@ -759,6 +805,60 @@ def init_db() -> None:
             for column in ("change_pct", "volume", "turnover", "open", "high", "low", "pre_close", "adj_factor"):
                 if column not in existing_snapshot_columns:
                     conn.execute(f"ALTER TABLE dc_stock_daily_snapshot ADD COLUMN {column} DOUBLE PRECISION")
+            # Observation-clock columns are mandatory for new strict PIT
+            # reads.  Keep this idempotent for databases created before the
+            # Alembic migration; legacy rows remain explicitly unverifiable.
+            observation_columns = {
+                "economic_available_time": "VARCHAR(64) NOT NULL DEFAULT ''",
+                "observed_at": "VARCHAR(64) NOT NULL DEFAULT ''",
+                "first_observed_at": "VARCHAR(64) NOT NULL DEFAULT ''",
+                "observation_provenance": "VARCHAR(128) NOT NULL DEFAULT 'legacy_unknown'",
+                "content_hash": "VARCHAR(128) NOT NULL DEFAULT ''",
+            }
+            for table in ("dc_stock_daily_snapshot", "dc_tushare_raw_records"):
+                if bool(getattr(conn, "_is_postgres", False)):
+                    existing = {
+                        str(row["column_name"])
+                        for row in conn.execute(
+                            "SELECT column_name FROM information_schema.columns WHERE table_schema='public' AND table_name=?",
+                            (table,),
+                        ).fetchall()
+                    }
+                else:
+                    existing = {
+                        str(row["name"])
+                        for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+                    }
+                for column, definition in observation_columns.items():
+                    if column not in existing:
+                        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+            raw_version_sql = """CREATE TABLE IF NOT EXISTS dc_tushare_raw_record_version (
+                id BIGSERIAL PRIMARY KEY,
+                api_name VARCHAR(64) NOT NULL, record_key VARCHAR(255) NOT NULL,
+                ts_code VARCHAR(32) NOT NULL DEFAULT '', trade_date VARCHAR(16) NOT NULL DEFAULT '',
+                period VARCHAR(32) NOT NULL DEFAULT '', ann_date VARCHAR(16) NOT NULL DEFAULT '',
+                payload_json TEXT NOT NULL, source_code VARCHAR(128) NOT NULL,
+                economic_available_time VARCHAR(64) NOT NULL DEFAULT '', observed_at VARCHAR(64) NOT NULL DEFAULT '',
+                first_observed_at VARCHAR(64) NOT NULL DEFAULT '', observation_provenance VARCHAR(128) NOT NULL DEFAULT '',
+                content_hash VARCHAR(128) NOT NULL, created_at VARCHAR(64) NOT NULL,
+                UNIQUE(api_name,record_key,content_hash))""" if bool(getattr(conn, "_is_postgres", False)) else """CREATE TABLE IF NOT EXISTS dc_tushare_raw_record_version (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, api_name TEXT NOT NULL, record_key TEXT NOT NULL,
+                ts_code TEXT NOT NULL DEFAULT '', trade_date TEXT NOT NULL DEFAULT '', period TEXT NOT NULL DEFAULT '', ann_date TEXT NOT NULL DEFAULT '',
+                payload_json TEXT NOT NULL, source_code TEXT NOT NULL, economic_available_time TEXT NOT NULL DEFAULT '', observed_at TEXT NOT NULL DEFAULT '',
+                first_observed_at TEXT NOT NULL DEFAULT '', observation_provenance TEXT NOT NULL DEFAULT '', content_hash TEXT NOT NULL, created_at TEXT NOT NULL,
+                UNIQUE(api_name,record_key,content_hash))"""
+            conn.execute(raw_version_sql)
+            snapshot_version_sql = """CREATE TABLE IF NOT EXISTS dc_stock_daily_snapshot_version (
+                id BIGSERIAL PRIMARY KEY,
+                ts_code VARCHAR(32) NOT NULL, trade_date VARCHAR(16) NOT NULL, payload_json TEXT NOT NULL,
+                source_code VARCHAR(128) NOT NULL, economic_available_time VARCHAR(64) NOT NULL DEFAULT '', observed_at VARCHAR(64) NOT NULL DEFAULT '',
+                first_observed_at VARCHAR(64) NOT NULL DEFAULT '', observation_provenance VARCHAR(128) NOT NULL DEFAULT '', content_hash VARCHAR(128) NOT NULL,
+                created_at VARCHAR(64) NOT NULL, UNIQUE(ts_code,trade_date,content_hash))""" if bool(getattr(conn, "_is_postgres", False)) else """CREATE TABLE IF NOT EXISTS dc_stock_daily_snapshot_version (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, ts_code TEXT NOT NULL, trade_date TEXT NOT NULL, payload_json TEXT NOT NULL,
+                source_code TEXT NOT NULL, economic_available_time TEXT NOT NULL DEFAULT '', observed_at TEXT NOT NULL DEFAULT '',
+                first_observed_at TEXT NOT NULL DEFAULT '', observation_provenance TEXT NOT NULL DEFAULT '', content_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL, UNIQUE(ts_code,trade_date,content_hash))"""
+            conn.execute(snapshot_version_sql)
             conn.execute("CREATE INDEX IF NOT EXISTS idx_dc_snapshot_ts_date_bars ON dc_stock_daily_snapshot (ts_code,trade_date) INCLUDE (close,volume,turnover)")
             # History replay only accepts rows with a real point-in-time
             # adjustment factor. Keep that predicate in the index so a

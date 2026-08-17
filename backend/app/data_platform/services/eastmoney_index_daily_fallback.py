@@ -18,6 +18,7 @@ from typing import Any
 import requests
 
 from app.data_platform.db import _conn
+from app.data_platform.services.observation_clock import upsert_raw_record
 
 
 BENCHMARK_CODE = "000300.SH"
@@ -267,7 +268,7 @@ def repair_hs300_index_daily_from_eastmoney(
     source_code = str(bar.get("source_code") or "")
     _ensure_source(source_code)
     observed_at = _now()
-    economic_available_time = f"{target[:4]}-{target[4:6]}-{target[6:]}T15:00:00"
+    economic_available_time = f"{target[:4]}-{target[4:6]}-{target[6:]}T15:00:00+08:00"
     payload = dict(bar)
     payload.update({
         "verification_status": "previous_tushare_close_and_provider_fields_cross_checked",
@@ -279,31 +280,18 @@ def repair_hs300_index_daily_from_eastmoney(
         "pending_primary_reconciliation": True,
     })
     with _conn() as conn:
-        cursor = conn.execute(
-            """INSERT INTO dc_tushare_raw_records
-               (api_name,record_key,ts_code,trade_date,period,ann_date,payload_json,
-                source_code,available_time,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)
-               ON CONFLICT(api_name,record_key) DO NOTHING""",
-            (
-                "index_daily",
-                f"{BENCHMARK_CODE}|{target}",
-                BENCHMARK_CODE,
-                target,
-                "",
-                "",
-                json.dumps(payload, ensure_ascii=False, separators=(",", ":"), allow_nan=False),
-                source_code,
-                economic_available_time,
-                observed_at,
-            ),
+        written = upsert_raw_record(
+            conn, api_name="index_daily", record_key=f"{BENCHMARK_CODE}|{target}",
+            ts_code=BENCHMARK_CODE, trade_date=target, payload=payload, source_code=source_code,
+            observed_at=observed_at, economic_time=economic_available_time,
+            provenance=f"{source_code}:validated_exact_session",
         )
-        written = max(0, int(cursor.rowcount or 0))
     return {
         "ok": written == 1,
         "status": "completed" if written == 1 else "partial_or_raced",
         "rows_written": written,
         "trade_date": target,
         "source_code": source_code,
-        "available_time": economic_available_time,
+        "available_time": observed_at,
         "observed_at": observed_at,
     }

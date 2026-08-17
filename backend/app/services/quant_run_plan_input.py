@@ -9,6 +9,7 @@ from typing import Any
 
 from app.services.quant_run_contracts import ReplayRiskGateError
 from app.services.risk_limit_contract import RISK_LIMIT_CONTRACT_SCHEMA_VERSION
+from app.services.point_in_time import normalize_explicit_timestamp
 
 UNIFIED_DAILY_DECISION_SCHEMA_VERSION = "alis_unified_daily_decision_v2"
 LEGACY_UNIFIED_DAILY_DECISION_SCHEMA_VERSION = "alis_unified_daily_decision_v1"
@@ -98,6 +99,48 @@ def _same_weights(left: Any, right: Any, *, left_field: str, right_field: str) -
         abs(left_weights[symbol] - right_weights[symbol]) <= 1e-8
         for symbol in left_weights
     )
+
+
+def _formal_cutoff(value: Any, *, field: str) -> str:
+    """Return the canonical explicit-offset cutoff used by V2 contracts."""
+
+    raw = str(value or "").strip()
+    normalized = normalize_explicit_timestamp(raw)
+    # Formal artifacts use one stable representation so hashes and equality
+    # checks cannot depend on a database/session timezone or a ``Z`` alias.
+    if not raw or not normalized or raw != normalized:
+        raise ReplayRiskGateError(
+            f"统一计划 {field} 必须使用显式时区的规范截止时间",
+            code="invalid_authoritative_plan",
+        )
+    return normalized
+
+
+def _validate_formal_cutoff_alignment(contract: dict[str, Any]) -> None:
+    """Require every frozen artifact to consume one identical PIT instant."""
+
+    selection = contract.get("selection_snapshot") if isinstance(contract.get("selection_snapshot"), dict) else {}
+    manifest = contract.get("decision_version_manifest") if isinstance(contract.get("decision_version_manifest"), dict) else {}
+    manifest_data = manifest.get("data_contract") if isinstance(manifest.get("data_contract"), dict) else {}
+    gate = contract.get("decision_data_gate") if isinstance(contract.get("decision_data_gate"), dict) else {}
+    values = {
+        "data_as_of_time": _formal_cutoff(contract.get("data_as_of_time"), field="data_as_of_time"),
+        "selection_snapshot.data_as_of_time": _formal_cutoff(
+            selection.get("data_as_of_time"), field="selection_snapshot.data_as_of_time",
+        ),
+        "decision_version_manifest.data_contract.point_in_time_cutoff": _formal_cutoff(
+            manifest_data.get("point_in_time_cutoff"),
+            field="decision_version_manifest.data_contract.point_in_time_cutoff",
+        ),
+        "decision_data_gate.observation_cutoff": _formal_cutoff(
+            gate.get("observation_cutoff"), field="decision_data_gate.observation_cutoff",
+        ),
+    }
+    if len(set(values.values())) != 1:
+        raise ReplayRiskGateError(
+            "统一计划四份冻结截止时间不一致",
+            code="invalid_authoritative_plan",
+        )
 
 
 def _validate_selection_snapshot(snapshot: dict[str, Any]) -> None:
@@ -429,6 +472,8 @@ def validate_unified_decision_contract(contract: dict[str, Any]) -> None:
             "统一计划缺少冻结合同：" + ",".join(missing),
             code="invalid_authoritative_plan",
         )
+    if not legacy:
+        _validate_formal_cutoff_alignment(contract)
     risk_limits = contract.get("risk_limit_contract") if isinstance(contract.get("risk_limit_contract"), dict) else {}
     if not legacy:
         if (

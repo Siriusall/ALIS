@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any, Dict, List
 
+from app.services.point_in_time import normalize_explicit_timestamp
+
 
 def normalize_ts_code(symbol: str) -> str:
     value = str(symbol or "").strip().upper()
@@ -19,6 +21,7 @@ def normalize_ts_code(symbol: str) -> str:
 def production_market_context_as_of(
     as_of_time: str,
     *,
+    trade_date: str | None = None,
     market_state_binding: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     from app.services import market_context as market_context_service
@@ -26,7 +29,33 @@ def production_market_context_as_of(
     from app.services.hsmm_shadow import infer_hsmm_state_as_of
     from app.services.production_strategy import resolve_production_strategy_champion
 
-    market = dict(market_context_service.market_context_as_of(as_of_time) or {})
+    try:
+        market = dict(
+            market_context_service.market_context_as_of(
+                as_of_time,
+                trade_date=trade_date,
+            ) or {}
+        )
+    except TypeError:
+        # Keep isolated legacy fixtures that monkeypatch the one-argument
+        # reader compatible while production uses the split clocks.
+        market = dict(market_context_service.market_context_as_of(as_of_time) or {})
+    # A blocked market-context read is itself a hard PIT failure. Do not try to
+    # synthesize a transparent/HSMM fallback from another clock or silently
+    # turn the missing state into an executable ``unknown`` regime.
+    if market.get("ok") is False:
+        market.setdefault("as_of_time", as_of_time)
+        market.setdefault("market_state_runtime", {
+            "requested_model": "",
+            "effective_model": "",
+            "transparent_state": "",
+            "effective_state": "",
+            "fallback_reason": str(market.get("reason") or market.get("status") or "market_context_unavailable"),
+            "hsmm_evidence": {},
+            "hsmm_sidecar": {},
+            "hsmm_sidecar_controls_risk_budget": False,
+        })
+        return market
     binding = (
         dict(market_state_binding)
         if isinstance(market_state_binding, dict)
@@ -194,6 +223,40 @@ def apply_dynamic_strategy_gate(
     from app.services.theme_engine import best_theme_for_stock
 
     market = production_market_context_as_of(as_of_time)
+    market_state_payload = (
+        market.get("market_state")
+        if isinstance(market.get("market_state"), dict)
+        else {}
+    )
+    if not market.get("ok", True) or not str(market_state_payload.get("state") or ""):
+        reason = str(
+            market.get("reason") or market.get("status") or "market_context_state_missing"
+        )
+        blocked = [
+            {
+                "symbol": symbol,
+                "ts_code": normalize_ts_code(symbol),
+                "side": "BUY",
+                "code": "market_context_pit_unavailable",
+                "message": f"市场状态点时证据不可用：{reason}",
+                "market_context": market,
+            }
+            for symbol in target_symbols
+        ]
+        return [], blocked, {
+            "as_of_time": as_of_time,
+            "market_context": market,
+            "items": [],
+            "risk_budget_multiplier": 0.0,
+            "cash_target": 1.0,
+            "defensive_allocation": defensive_allocation_for_state(
+                "unknown",
+                as_of_date=str(as_of_time)[:10],
+                equity_target_weight=0.0,
+            ),
+            "status": "blocked",
+            "reason": reason,
+        }
     market_state = str((market.get("market_state") or {}).get("state") or "unknown")
     market_profile_multiplier = float(
         (market.get("market_profile") or {}).get("risk_budget_multiplier") or 1.0
@@ -296,12 +359,18 @@ def frozen_research_evidence(
     from app.services.thesis_store import list_theses
 
     code = normalize_ts_code(symbol)
+    cutoff = normalize_explicit_timestamp(as_of_time)
     research = build_stock_research(code, persist=True, as_of_time=as_of_time)
     valuation = build_valuation_state(code, persist=True, as_of_time=as_of_time)
+
+    def visible_timestamp(value: Any) -> bool:
+        normalized = normalize_explicit_timestamp(value)
+        return bool(cutoff and normalized and normalized <= cutoff)
+
     theses = [
         item
         for item in list_theses(ts_code=code, limit=20)
-        if not item.get("created_at") or str(item.get("created_at")) <= as_of_time
+        if visible_timestamp(item.get("created_at"))
     ]
     thesis = next(
         (
@@ -319,13 +388,11 @@ def frozen_research_evidence(
                 "evidence": [
                     evidence
                     for evidence in hypothesis.get("evidence") or []
-                    if not evidence.get("checked_at")
-                    or str(evidence.get("checked_at")) <= as_of_time
+                    if visible_timestamp(evidence.get("checked_at"))
                 ],
             }
             for hypothesis in thesis.get("hypotheses") or []
-            if not hypothesis.get("created_at")
-            or str(hypothesis.get("created_at")) <= as_of_time
+            if visible_timestamp(hypothesis.get("created_at"))
         ]
     research_payload = {
         "ts_code": code,

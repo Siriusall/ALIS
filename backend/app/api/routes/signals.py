@@ -4,7 +4,7 @@ from app.api.state import add_log
 from app.integrations.market_data_client import fetch_symbol_detail
 from app.schemas.signal import SignalDetailResponse
 from app.services.factor_engine import score_factors
-from app.services.stock_selector import select_affordable_stocks
+from app.services.stock_selector import StockSelectionDataNotReadyError, select_affordable_stocks
 
 
 router = APIRouter()
@@ -24,7 +24,18 @@ def _extract_realtime(detail: dict) -> dict | None:
 
 @router.get("/signals/{symbol}", response_model=SignalDetailResponse)
 def get_signal_detail(symbol: str) -> SignalDetailResponse:
-    quotes = select_affordable_stocks(limit=None)
+    try:
+        quotes = select_affordable_stocks(limit=None)
+    except StockSelectionDataNotReadyError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "decision_data_not_ready",
+                "trade_date": exc.trade_date,
+                "message": str(exc),
+                "contract": exc.contract,
+            },
+        ) from exc
     if not quotes:
         raise HTTPException(
             status_code=503,

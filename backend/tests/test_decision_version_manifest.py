@@ -95,3 +95,42 @@ def test_frozen_observation_only_models_do_not_fall_back_to_active_manifest(monk
     )
 
     assert manifest["model_versions"] == {}
+
+
+def test_manifest_uses_selection_observation_clock_with_explicit_utc8_offset(monkeypatch):
+    monkeypatch.setattr(
+        decision_version_manifest,
+        "resolve_production_strategy_champion",
+        lambda: {"champion_id": 50, "champion_version": "champion-v1", "strategy_id": 1},
+    )
+    monkeypatch.setattr(decision_version_manifest, "active_strategy_policy_context", lambda: {})
+    monkeypatch.setattr(decision_version_manifest, "get_active_model_version", lambda _key: None)
+    monkeypatch.setattr(decision_version_manifest, "active_factor_bindings", lambda: {})
+    monkeypatch.setattr(decision_version_manifest, "active_execution_cost_contract", lambda: {})
+    monkeypatch.setattr(decision_version_manifest, "active_release", lambda: None)
+
+    manifest = decision_version_manifest.build_decision_version_manifest(
+        trade_date="20260814",
+        portfolio={"selection_snapshot": {"data_as_of_time": "2026-08-14T18:10:00+08:00"}},
+    )
+
+    assert manifest["data_contract"]["point_in_time_cutoff"] == "2026-08-14T18:10:00+08:00"
+
+
+def test_manifest_does_not_synthesize_t15_when_selection_clock_is_missing(monkeypatch):
+    monkeypatch.setattr(
+        decision_version_manifest,
+        "resolve_production_strategy_champion",
+        lambda: {"champion_id": 50, "champion_version": "champion-v1", "strategy_id": 1},
+    )
+    monkeypatch.setattr(decision_version_manifest, "active_strategy_policy_context", lambda: {})
+    monkeypatch.setattr(decision_version_manifest, "get_active_model_version", lambda _key: None)
+    monkeypatch.setattr(decision_version_manifest, "active_factor_bindings", lambda: {})
+    monkeypatch.setattr(decision_version_manifest, "active_execution_cost_contract", lambda: {})
+    monkeypatch.setattr(decision_version_manifest, "active_release", lambda: None)
+
+    manifest = decision_version_manifest.build_decision_version_manifest(
+        trade_date="20260814", portfolio={"selection_snapshot": {}}
+    )
+
+    assert manifest["data_contract"]["point_in_time_cutoff"] == ""

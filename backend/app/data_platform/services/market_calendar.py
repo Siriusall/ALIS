@@ -1,10 +1,28 @@
 from __future__ import annotations
 
-from datetime import date, datetime, time as dt_time, timedelta
+from datetime import date, datetime, time as dt_time
 from typing import Any
 
 
 AFTER_CLOSE_DATA_READY_TIME = dt_time(16, 0, 0)
+
+
+class TradeCalendarNotReady(RuntimeError):
+    """The exchange calendar cannot prove the requested target session.
+
+    A weekday is not an exchange session.  Callers must surface this state and
+    retry the calendar sync instead of silently selecting a guessed date.
+    """
+
+    code = "calendar_not_ready"
+
+    def __init__(self, *, today: str, include_today: bool):
+        self.today = today
+        self.include_today = bool(include_today)
+        super().__init__(
+            f"交易所日历未就绪，无法确定目标交易日 today={today} "
+            f"include_today={int(include_today)}"
+        )
 
 
 def _row_value(row: Any, key: str, default: str = "") -> str:
@@ -37,12 +55,10 @@ def target_trade_date(c: Any, *, now: datetime | None = None) -> str:
     value = _row_value(row, "value")
     if value:
         return value
-    # Calendar may be empty during first bootstrap; use a conservative weekday
-    # fallback so the system still starts.
-    fallback = now.date() if include_today else now.date() - timedelta(days=1)
-    while fallback.weekday() >= 5:
-        fallback -= timedelta(days=1)
-    return fallback.strftime("%Y%m%d")
+    # Do not infer an exchange session from the Gregorian weekday.  During
+    # bootstrap, a calendar outage, or a partially published calendar, a
+    # guessed date can make a missing market bundle look like a real empty day.
+    raise TradeCalendarNotReady(today=today_s, include_today=include_today)
 
 
 def target_trade_day(c: Any, *, now: datetime | None = None) -> date:

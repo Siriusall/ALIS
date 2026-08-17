@@ -518,7 +518,23 @@ def compete_portfolio_methods(
     requested_budget = max(0.0, min(1.0, _safe(equity_budget)))
     budget = max(minimum_budget, min(maximum_budget, requested_budget)) if bounds_enabled else requested_budget
     equal = {symbol: 1.0 / len(symbols) for symbol in symbols} if symbols else {}
-    hrp = hrp_fallback_weights({symbol: returns_by_symbol[symbol] for symbol in symbols}, max_single=DEFAULT_GLOBAL_SINGLE_ASSET_LIMIT)
+    # Current holdings and Controller bounds must remain in the candidate
+    # universe even when a symbol has no return history.  Risk estimators,
+    # however, may only consume symbols with an actual series; indexing the
+    # full execution universe here used to raise KeyError for such holdings.
+    valid_returns_by_symbol = {
+        symbol: list(values)
+        for symbol in symbols
+        for values in [returns_by_symbol.get(symbol)]
+        if values
+    }
+    missing_return_history_symbols = [
+        symbol for symbol in symbols if symbol not in valid_returns_by_symbol
+    ]
+    hrp = hrp_fallback_weights(
+        valid_returns_by_symbol,
+        max_single=DEFAULT_GLOBAL_SINGLE_ASSET_LIMIT,
+    )
     raw_candidates = {
         "empirical_cvar": _normalise_to_budget(cvar_weights, budget),
         "equal_weight": _normalise_to_budget(equal, budget),
@@ -589,6 +605,8 @@ def compete_portfolio_methods(
         ) | {"constraint_hash": constraint_hash}
         for method, weights in candidates.items()
     ]
+    for evaluation in evaluations:
+        evaluation["missing_return_history_symbols"] = list(missing_return_history_symbols)
     eligible = [item for item in evaluations if item["eligible"]]
     hold = next((item for item in evaluations if item["method"] == "minimum_turnover_feasible"), None)
     winner = max(eligible, key=lambda item: (item["objective"], -item["turnover"], item["method"])) if eligible else hold
@@ -609,6 +627,17 @@ def compete_portfolio_methods(
         "execution_cost_contract": cost_contract,
         "risk_limit_contract": risk_limit_contract or {},
         "residual_breaches": dict((winner or {}).get("residual_breaches") or {}),
+        "data_diagnostics": {
+            "valid_return_history_symbols": sorted(valid_returns_by_symbol),
+            "missing_return_history_symbols": missing_return_history_symbols,
+            "hrp_input_symbols": sorted(valid_returns_by_symbol),
+            "no_valid_return_history": not bool(valid_returns_by_symbol),
+            "fallback_policy": (
+                "minimum_turnover_feasible_when_no_method_is_eligible"
+                if not valid_returns_by_symbol
+                else "standard_method_competition"
+            ),
+        },
         "industry_budget": {
             "schema_version": "alis_portfolio_industry_budget_v1",
             "symbol_industries": frozen_symbol_industries,

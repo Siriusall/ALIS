@@ -12,7 +12,11 @@ except ImportError:  # lightweight contract-test store shim
     update_account_high_water_mark = lambda equity: equity
 from app.services.backtest_data_source import BacktestDataSource
 from app.services.data_health import build_data_health_report
-from app.services.position_valuation import build_position_market_series_cache
+from app.services.position_valuation import (
+    build_position_market_series_cache,
+    current_live_valuation_trade_date,
+    missing_exact_position_valuations,
+)
 from app.services.risk_limit_contract import DEFAULT_GLOBAL_SINGLE_ASSET_LIMIT
 
 REQUIRED_MARKET_DAY_APIS = ("daily", "daily_basic", "stk_limit")
@@ -293,27 +297,37 @@ def evaluate_account_drawdown_gate(*, max_drawdown: float = 0.10) -> RiskPauseDe
     """
     baseline = max(0.0, _safe_float(get_account_baseline()))
     cash = max(0.0, _safe_float(get_account_balance()))
-    position_value = 0.0
     try:
         positions = get_positions()
-        dates = []
-        try:
-            from app.services.quant_run_engine import list_consolidated_trade_dates
-            dates = list_consolidated_trade_dates()
-        except Exception:
-            dates = []
+        as_of = current_live_valuation_trade_date()
         valuation = build_position_market_series_cache(
             positions,
-            as_of=dates[-1] if dates else "",
+            as_of=as_of,
         )
+        missing = missing_exact_position_valuations(positions, valuation, as_of=as_of)
+        if missing:
+            return pause_decision(
+                code="paused_position_market_data_not_ready",
+                message="当前持仓缺少目标交易日精确行情，暂停自动调仓。",
+                recovery_condition="补齐目标交易日行情并通过精确日期复核。",
+                exit_condition="数据契约恢复后重新计算账户风险。",
+                severity="error",
+                evidence={"trade_date": as_of, "missing_positions": missing},
+            )
+        position_value = 0.0
         for pos in positions:
             symbol = str(pos.get("symbol") or "")
             price = _safe_float((valuation.get(symbol) or {}).get("price"))
-            if price <= 0:
-                price = _safe_float(pos.get("price"))
             position_value += max(0.0, _safe_float(pos.get("quantity"))) * max(0.0, price)
-    except Exception:
-        position_value = 0.0
+    except Exception as exc:
+        return pause_decision(
+            code="paused_position_market_data_not_ready",
+            message="当前持仓行情读取失败，暂停自动调仓。",
+            recovery_condition="恢复交易日历和目标交易日行情后重新计算。",
+            exit_condition="数据读取恢复且精确日期校验通过。",
+            severity="error",
+            evidence={"error": str(exc)[:300]},
+        )
     equity = cash + position_value
     peak = max(baseline, get_account_high_water_mark(), equity)
     update_account_high_water_mark(equity)

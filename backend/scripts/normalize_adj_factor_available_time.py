@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Audit or normalize adj_factor economic availability for point-in-time replay."""
+"""Audit adj_factor observation times for point-in-time replay.
+
+The historical ``--execute`` flag is retained only for CLI compatibility.  It
+is intentionally refused: an observed response that arrived after a decision
+cutoff must never be rewritten as if it had been available earlier.
+"""
 
 from __future__ import annotations
 
@@ -11,7 +16,11 @@ from app.data_platform.db import _conn
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--execute", action="store_true")
+    parser.add_argument(
+        "--execute",
+        action="store_true",
+        help="deprecated; refuse instead of rewriting immutable observation times",
+    )
     parser.add_argument("--start-date", default="20200320")
     parser.add_argument("--end-date", default="20260722")
     args = parser.parse_args()
@@ -37,19 +46,18 @@ def main() -> int:
             if count <= 0:
                 continue
             changed_dates.append({"trade_date": trade_date, "rows": count})
-            if args.execute:
-                conn.execute(
-                    """UPDATE dc_tushare_raw_records SET available_time=?
-                       WHERE api_name='adj_factor' AND trade_date=? AND available_time>?""",
-                    (cutoff, trade_date, cutoff),
-                )
-    print(json.dumps({
-        "status": "normalized" if args.execute else "audit",
+    result = {
+        "status": "refused_immutable_rewrite" if args.execute else "audit",
         "date_count": len(changed_dates),
         "row_count": sum(int(item["rows"]) for item in changed_dates),
         "dates": changed_dates,
-    }, ensure_ascii=False, indent=2))
-    return 0 if args.execute or not changed_dates else 2
+    }
+    if args.execute:
+        result["reason"] = "adj_factor_available_time_is_immutable"
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    if args.execute:
+        return 3
+    return 0 if not changed_dates else 2
 
 
 if __name__ == "__main__":

@@ -44,6 +44,7 @@ def _readiness(*, ok: bool = True) -> dict:
     return {
         "ok": ok,
         "summary": "数据状态正常" if ok else "目标交易日未完成",
+        "target_trade_date": "20260706",
         "latest_decision_ready_trade_date": "20260706" if ok else "20260705",
     }
 
@@ -102,6 +103,20 @@ def test_latest_decision_data_gate_pauses_experiments_until_benchmark_is_ready(m
     assert "latest_benchmark_not_ready" in {item["code"] for item in result["issues"]}
 
 
+def test_latest_decision_data_gate_never_substitutes_previous_snapshot_for_target(monkeypatch):
+    readiness = _readiness()
+    readiness["target_trade_date"] = "20260707"
+    readiness["latest_decision_ready_trade_date"] = "20260706"
+    monkeypatch.setattr("app.data_platform.services.daily_update.simple_health", lambda: readiness)
+    monkeypatch.setattr(data_health, "build_data_health_report", lambda **_: _report([1000, 1005, 995, 1002, 1001, 1004]))
+
+    result = data_health.assess_latest_decision_data_health()
+
+    assert result["decision_ready"] is False
+    assert result["latest_snapshot"]["trade_date"] == "20260707"
+    assert "latest_snapshot_missing" in {item["code"] for item in result["issues"]}
+
+
 def test_recovery_gate_keeps_the_frozen_trade_date_after_midnight(monkeypatch):
     monkeypatch.setattr(
         "app.data_platform.services.decision_data_contract.decision_data_contract",
@@ -134,31 +149,31 @@ def test_recovery_gate_keeps_the_frozen_trade_date_after_midnight(monkeypatch):
     assert result["latest_snapshot"]["trade_date"] == "20260705"
 
 
-def test_benchmark_coverage_reads_only_versions_available_by_close(monkeypatch):
-    queries: list[tuple[str, tuple]] = []
+def test_benchmark_coverage_requires_immutable_version_evidence(monkeypatch):
+    from app.data_platform.services import data_center
 
-    class _Rows:
-        def fetchone(self):
-            # Represents the 15:00 version after SQL filters a later repair.
-            return {
-                "rows_read": 1,
-                "max_available_time": "2026-07-06T15:00:00",
-                "source_code": "tushare",
-            }
+    monkeypatch.setattr(data_health, "_latest_benchmark_coverage", _REAL_LATEST_BENCHMARK_COVERAGE)
+    monkeypatch.setattr(data_center, "_strict_benchmark_bar", lambda _conn, trade_date: {
+        "trade_date": trade_date,
+        "source_code": "sina_index_daily_fallback",
+        "open": 3900.0,
+        "high": 3920.0,
+        "low": 3890.0,
+        "close": 3910.0,
+        "pre_close": 3901.0,
+        "vol": 1.0,
+    })
 
     class _Conn:
-        def execute(self, sql, params=()):
-            queries.append((sql, params))
-            return _Rows()
+        pass
 
     @contextmanager
     def fake_conn():
         yield _Conn()
 
-    monkeypatch.setattr(data_health, "_latest_benchmark_coverage", _REAL_LATEST_BENCHMARK_COVERAGE)
     monkeypatch.setattr("app.data_platform.db._conn", fake_conn)
     result = data_health._latest_benchmark_coverage("20260706")
 
     assert result["ready"] is True
-    assert "available_time<=?" in queries[0][0]
-    assert queries[0][1] == ("20260706", "2026-07-06T15:00:00")
+    assert result["evidence_source"] == "immutable_observation_versions"
+    assert result["source_code"] == "sina_index_daily_fallback"

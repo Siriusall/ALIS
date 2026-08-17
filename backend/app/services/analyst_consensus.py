@@ -11,6 +11,7 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from app.data_platform.db import _conn
+from app.data_platform.services.observation_clock import load_raw_record_versions
 from app.services.event_impact_features import (
     ANALYST_CONSENSUS_CONTRACT,
     ANALYST_MULTI_METRIC_CONSENSUS_CONTRACT,
@@ -40,14 +41,28 @@ def build_analyst_consensus(ts_code: str, *, as_of_time: str | None = None) -> d
     params: tuple[Any, ...] = (cutoff, cutoff_time) if cutoff else ()
 
     with _conn() as c:
-        rows = [dict(row) for row in c.execute(
-            f"""SELECT ts_code,payload_json,trade_date,available_time,id
-                FROM dc_tushare_raw_records
-                WHERE api_name='report_rc' AND ts_code=?
-                {cutoff_clause}
-                ORDER BY trade_date DESC,id DESC LIMIT 4000""",
-            (ts_code,) + params
-        ).fetchall()]
+        rows = None
+        if cutoff:
+            versioned = load_raw_record_versions(
+                c, "report_rc", cutoff=cutoff_time, ts_codes=[ts_code],
+                trade_date_end=cutoff,
+            )
+            if versioned is not None:
+                rows = [
+                    {**dict(row), "available_time": row.get("observed_at")}
+                    for row in versioned
+                ]
+        if rows is None and bool(getattr(c, "_is_postgres", False)):
+            return {"ok": False, "reason": "observation_clock_unavailable", "ts_code": ts_code}
+        if rows is None:
+            rows = [dict(row) for row in c.execute(
+                f"""SELECT ts_code,payload_json,trade_date,available_time,id
+                    FROM dc_tushare_raw_records
+                    WHERE api_name='report_rc' AND ts_code=?
+                    {cutoff_clause}
+                    ORDER BY trade_date DESC,id DESC LIMIT 4000""",
+                (ts_code,) + params
+            ).fetchall()]
 
     if not rows:
         return {"ok": False, "reason": "no_report_data", "ts_code": ts_code}

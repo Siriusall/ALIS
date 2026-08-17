@@ -8,6 +8,8 @@ from datetime import datetime
 from typing import Any
 
 from app.data_platform.db import _conn
+from app.data_platform.services.observation_clock import load_raw_record_versions
+from app.core.sql_compat import qmark_to_pyformat
 from app.services.news_theme_cluster import INDUSTRY_KEYWORDS
 
 
@@ -110,6 +112,15 @@ def _company_exposures(segments: list[dict[str, Any]]) -> tuple[dict[str, dict[s
 
 def _initial_company_rows(conn: Any, *, limit: int) -> list[dict[str, Any]]:
     """Discover initial companies from the PIT index without grouping all segments."""
+    versioned = load_raw_record_versions(conn, "fina_mainbz", limit=int(limit) + 1)
+    if versioned is not None:
+        return [
+            {"ts_code": str(row.get("ts_code") or "")}
+            for row in versioned
+            if str(row.get("ts_code") or "")
+        ][: int(limit) + 1]
+    if bool(getattr(conn, "_is_postgres", False)):
+        return []
     return [dict(row) for row in conn.execute(
         """SELECT DISTINCT ts_code
              FROM dc_tushare_raw_records
@@ -131,6 +142,17 @@ def _latest_segment_rows(
     size = max(25, min(int(batch_size), 500))
     for offset in range(0, len(codes), size):
         batch = codes[offset:offset + size]
+        versioned = load_raw_record_versions(
+            conn, "fina_mainbz", cutoff=cutoff, ts_codes=batch,
+        )
+        if versioned is not None:
+            result.extend({
+                **dict(row),
+                "available_time": str(row.get("observed_at") or ""),
+            } for row in versioned)
+            continue
+        if bool(getattr(conn, "_is_postgres", False)):
+            continue
         placeholders = ",".join("?" for _ in batch)
         cutoff_filter = "AND available_time<=?" if cutoff else ""
         cutoff_params: tuple[Any, ...] = (cutoff,) if cutoff else ()
@@ -157,10 +179,10 @@ def _execute_many(conn: Any, sql: str, rows: list[tuple[Any, ...]]) -> None:
         return
     if getattr(conn, "_is_postgres", False):
         cursor = conn.raw.cursor()
-        cursor.executemany(sql.replace("?", "%s"), rows)
+        cursor.executemany(qmark_to_pyformat(sql), rows)
     elif getattr(conn, "_is_mysql", False):
         cursor = conn.raw.cursor()
-        cursor.executemany(sql.replace("?", "%s"), rows)
+        cursor.executemany(qmark_to_pyformat(sql), rows)
     else:
         conn.raw.executemany(sql, rows)
 
@@ -209,6 +231,30 @@ def materialize_theme_revenue_exposure(*, as_of_time: str | None = None, limit_c
             change_params.extend((cursor_time, cursor_time, cursor_id))
         if not cutoff and not last_run:
             changed_rows = _initial_company_rows(conn, limit=company_limit)
+        elif cutoff:
+            # Historical materialization must discover companies from the
+            # immutable observation log.  The current projection can contain
+            # a later replacement whose availability is no longer replayable.
+            versioned = load_raw_record_versions(
+                conn, "fina_mainbz", cutoff=cutoff,
+                limit=company_limit + 1,
+            )
+            if versioned is not None:
+                changed_rows = [
+                    {"ts_code": str(row.get("ts_code") or "")}
+                    for row in versioned
+                    if str(row.get("ts_code") or "")
+                ]
+            elif bool(getattr(conn, "_is_postgres", False)):
+                changed_rows = []
+            else:
+                changed_rows = [dict(row) for row in conn.execute(
+                    f"""SELECT ts_code,MAX(updated_at) source_updated_at,MAX(id) source_id
+                           FROM dc_tushare_raw_records
+                          WHERE api_name='fina_mainbz' {change_clause}
+                          GROUP BY ts_code ORDER BY ts_code LIMIT ?""",
+                    tuple(change_params + [company_limit + 1]),
+                ).fetchall()]
         else:
             changed_rows = [dict(row) for row in conn.execute(
                 f"""SELECT ts_code,MAX(updated_at) source_updated_at,MAX(id) source_id

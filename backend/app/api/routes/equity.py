@@ -1,17 +1,26 @@
 from __future__ import annotations
 
-from datetime import datetime
 from typing import Optional
-from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, HTTPException, Query
 
 from app.api.state import add_log
 from app.db.store import get_execution, get_positions, list_executions
+from app.services.daily_data import DailyCacheNotReadyError
 from app.services.equity_curve import compute_equity_curve
 
 router = APIRouter()
-_BUSINESS_TZ = ZoneInfo("Asia/Shanghai")
+
+
+def _curve_or_unavailable(orders: list[dict], executed_at: str) -> list[dict]:
+    try:
+        return compute_equity_curve(orders, executed_at)
+    except DailyCacheNotReadyError as exc:
+        raise HTTPException(status_code=503, detail={
+            "code": "equity_curve_data_not_ready",
+            "message": str(exc),
+            "retryable": True,
+        }) from exc
 
 
 @router.get("/positions-equity-curve")
@@ -25,10 +34,8 @@ def get_positions_equity_curve() -> dict:
         {"symbol": p["symbol"], "quantity": p["quantity"], "price": p["price"]}
         for p in positions
     ]
-    executed_at = min((p.get("updated_at") or "") for p in positions) or None
-    if not executed_at:
-        executed_at = datetime.now(_BUSINESS_TZ).date().isoformat()
-    curve = compute_equity_curve(orders, executed_at)
+    executed_at = min((str(p.get("updated_at") or "") for p in positions), default="")
+    curve = _curve_or_unavailable(orders, executed_at)
     add_log("INFO", f"持仓收益曲线：{len(positions)} 只股票，{len(curve)} 个点")
     return {"execution_id": None, "series": curve}
 
@@ -43,7 +50,7 @@ def get_equity_curve(
         raise HTTPException(status_code=404, detail="Execution not found")
     orders = ex.get("orders", [])
     executed_at = ex.get("executed_at", "")
-    curve = compute_equity_curve(orders, executed_at)
+    curve = _curve_or_unavailable(orders, executed_at)
     add_log("INFO", f"收益曲线请求：execution_id={execution_id}，{len(curve)} 个点")
     return {"execution_id": execution_id, "series": curve}
 
@@ -60,7 +67,7 @@ def get_strategy_equity_curve(
             raise HTTPException(status_code=404, detail="Execution not found")
         orders = ex.get("orders", [])
         executed_at = ex.get("executed_at", "")
-        curve = compute_equity_curve(orders, executed_at)
+        curve = _curve_or_unavailable(orders, executed_at)
         return {"execution_id": execution_id, "strategy_id": ex.get("strategy_id"), "series": curve}
     # Latest execution for strategy
     all_ex = list_executions(limit=100)
@@ -73,5 +80,5 @@ def get_strategy_equity_curve(
         return {"execution_id": None, "strategy_id": strategy_id, "series": []}
     orders = ex.get("orders", [])
     executed_at = ex.get("executed_at", "")
-    curve = compute_equity_curve(orders, executed_at)
+    curve = _curve_or_unavailable(orders, executed_at)
     return {"execution_id": ex["id"], "strategy_id": strategy_id, "series": curve}

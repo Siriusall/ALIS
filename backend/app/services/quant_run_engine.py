@@ -44,7 +44,7 @@ from app.services.quant_risk import cvar_position_multiplier, constrained_cvar_w
 from app.services.industry_allocator import apply_industry_targets, build_industry_allocation
 from app.services.strategy_controller import build_strategy_action_contracts, build_strategy_rebalance_actions, build_target_weight_explanations
 from app.services.production_strategy import champion_execution_gate, champion_strategy_policy_context, resolve_production_strategy_champion
-from app.services.point_in_time import signal_available_time
+from app.services.point_in_time import normalize_explicit_timestamp, signal_available_time
 from app.services.quant_run_contracts import (
     HistoricalDataMissingError,
     QuantRunExecResult,
@@ -72,10 +72,12 @@ def _ts_code(symbol: str) -> str:
 def _production_market_context_as_of(
     as_of_time: str,
     *,
+    trade_date: str | None = None,
     market_state_binding: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     return _research_gates.production_market_context_as_of(
         as_of_time,
+        trade_date=trade_date,
         market_state_binding=market_state_binding,
     )
 
@@ -146,19 +148,19 @@ def _defensive_execution_row(
     name: str,
     execute_date: str,
     require_exact_date: bool,
+    observation_cutoff: str,
 ) -> Any | None:
     """Build an ETF execution row without relabeling a stale market record."""
     from app.services.defensive_assets import defensive_asset_bar
 
-    # The scheduler has already passed the frozen execution-data gate.  Read
-    # the exact session using the actual observation time so a valid fallback
-    # bar published after the session is not filtered by an unrelated fixed
-    # 15:00 cutoff.  The stored available_time remains immutable evidence.
+    # The order audit has already selected the immutable execution observation.
+    # Reuse its clock; querying "now" here could pick a later fallback or
+    # primary revision than the one that passed the frozen-plan gate.
     bar = defensive_asset_bar(
         ts_code,
         execute_date,
         exact_date=require_exact_date,
-        available_as_of_time=datetime.now().astimezone().isoformat(timespec="seconds"),
+        available_as_of_time=observation_cutoff,
     )
     if not bar:
         return None
@@ -235,10 +237,20 @@ def _portfolio_state(
                 as_of=valuation_date,
                 fallback_price=float(pos.get("price") or 0),
                 data_source=ds,
+                exact_date=True,
             )
+            if str(valuation.get("price_source") or "") == "position_cost_fallback":
+                raise ReplayRiskGateError(
+                    f"执行日 {valuation_date} 持仓 {sym} 缺少精确行情："
+                    f"{valuation.get('observation_error') or 'market_slice_missing'}",
+                    code="paused_position_market_data_not_ready",
+                )
             px = float(valuation.get("price") or 0)
         if px <= 0:
-            px = float(pos.get("price") or 0)
+            raise ReplayRiskGateError(
+                f"执行日 {valuation_date} 持仓 {sym} 缺少可用价格",
+                code="paused_position_market_data_not_ready",
+            )
         val = round(px * qty, 2)
         position_value_by_symbol[sym] = val
         market_value += val
@@ -466,6 +478,37 @@ def _selection_explanation(
     )
 
 
+def _require_formal_pit_source(
+    data_source: Any,
+    source: str,
+    *,
+    signal_date: str,
+) -> None:
+    """Fail closed when the production replay source has no valid PIT audit."""
+
+    # Small unit-test data sources intentionally do not implement the
+    # production audit surface. They retain their isolated compatibility
+    # behavior; the real BacktestDataSource must prove every read.
+    if not isinstance(data_source, BacktestDataSource):
+        return
+    audits = data_source.point_in_time_sources()
+    matches = [
+        item for item in audits
+        if isinstance(item, dict) and str(item.get("source") or "") == source
+    ]
+    audit = matches[-1] if matches else {}
+    if not audit or not bool(audit.get("passed")):
+        reason = str(
+            audit.get("error")
+            or audit.get("reason")
+            or "missing_or_failed_point_in_time_audit"
+        )
+        raise ReplayRiskGateError(
+            f"{signal_date} {source} 点时证据不可用：{reason}",
+            code="point_in_time_source_unavailable",
+        )
+
+
 def _build_target_symbols(
     *,
     ds: BacktestDataSource,
@@ -477,6 +520,7 @@ def _build_target_symbols(
     scoring_timeout_sec: Optional[int] = None,
     explain_symbols: List[str] | None = None,
     model_inference_mode: str = "frozen_production_bundle",
+    as_of_time: str | None = None,
 ) -> tuple[List[str], Dict[str, Any]]:
     strategy = get_strategy(strategy_id)
     if not strategy:
@@ -493,6 +537,17 @@ def _build_target_symbols(
     config = parse_strategy_content(strategy_content, strategy_type)
     top_n = max(1, min(int(top_n), int(config.rebalance.get("top_n") or top_n)))
     exchange_group = normalize_exchange_group(exchange_group)
+    cutoff = normalize_explicit_timestamp(as_of_time) if as_of_time else signal_available_time(signal_date)
+    if not cutoff:
+        raise ReplayRiskGateError(
+            "选股数据截止时间无效，禁止生成正式选股结果",
+            code="invalid_observation_cutoff",
+        )
+    # Do this before *any* trend or factor access.  The previous placement
+    # allowed trend analysis to depend on whichever clock a caller happened
+    # to have left on the data source.
+    if hasattr(ds, "set_as_of_time"):
+        ds.set_as_of_time(cutoff)
     trend_analysis = analyze_trend(ds=ds, signal_date=signal_date, exchange_group=exchange_group)
     strategy_template = recommend_strategy_template(trend_analysis, requested_top_n=top_n)
     # The frozen strategy bundle is the authority for selection. Market trend
@@ -505,9 +560,23 @@ def _build_target_symbols(
         else {"production_model": "transparent_four_state_v1"}
     )
     market_context = _production_market_context_as_of(
-        signal_available_time(signal_date),
+        cutoff,
+        trade_date=signal_date,
         market_state_binding=champion_market_binding,
     )
+    if not market_context.get("ok", True):
+        raise ReplayRiskGateError(
+            "市场状态点时证据不可用，禁止生成正式选股结果："
+            f"{market_context.get('reason') or market_context.get('status') or 'unknown'}",
+            code="market_context_pit_unavailable",
+        )
+    if not isinstance(market_context.get("market_state"), dict) or not str(
+        (market_context.get("market_state") or {}).get("state") or ""
+    ):
+        raise ReplayRiskGateError(
+            "市场状态缺少可审计状态值，禁止生成正式选股结果",
+            code="market_context_state_missing",
+        )
     market_runtime = (
         market_context.get("market_state_runtime")
         if isinstance(market_context.get("market_state_runtime"), dict) else {}
@@ -542,8 +611,18 @@ def _build_target_symbols(
     if progress_callback is not None:
         progress_callback("正在加载快照")
     snapshot = ds.load_snapshot(signal_date.replace("-", ""))
+    _require_formal_pit_source(
+        ds,
+        "snapshot.daily_structured",
+        signal_date=signal_date,
+    )
     # 数据容错：过滤掉晚于 signal_date 的脏行，避免未来数据污染评分。
     snapshot = [r for r in snapshot if str(getattr(r, "date", "")) <= str(signal_date)]
+    if isinstance(ds, BacktestDataSource) and not snapshot:
+        raise ReplayRiskGateError(
+            f"{signal_date} 标准化行情快照为空，禁止继续选股",
+            code="snapshot_data_unavailable",
+        )
     if exchange_group != "ALL":
         snapshot = [r for r in snapshot if matches_exchange_group(r.symbol, exchange_group)]
     if not snapshot:
@@ -559,6 +638,16 @@ def _build_target_symbols(
         if fn:
             required_factors.add(fn)
     daily_basic_map = ds.get_daily_basic_map(signal_date.replace("-", ""))
+    _require_formal_pit_source(
+        ds,
+        "snapshot.daily_basic",
+        signal_date=signal_date,
+    )
+    if isinstance(ds, BacktestDataSource) and not daily_basic_map:
+        raise ReplayRiskGateError(
+            f"{signal_date} daily_basic 点时截面为空，禁止用零值替代估值和市值因子",
+            code="daily_basic_data_unavailable",
+        )
     max_lookback = max(int(config.lookback_days or 60), 20)
     factor_values: Dict[str, Dict[str, float]] = {}
     if progress_callback is not None:
@@ -651,19 +740,29 @@ def _build_target_symbols(
     # Theme evidence is a bounded bonus or an explicit risk veto. A stock with
     # no theme may still enter research recall through fundamentals, capital
     # confirmation and price structure.
-    from app.services.theme_engine import list_themes, materialize_theme_snapshots
-    materialize_theme_snapshots(as_of_time=signal_available_time(signal_date))
+    from app.services.theme_engine import list_themes
+    # Formal selection may only consume a theme snapshot that was already
+    # materialized and observable at the frozen cutoff.  Materializing here
+    # would stamp ``created_at=now`` and either leak future evidence or make a
+    # missing historical slice look like a successful current refresh.
     theme_result = list_themes(
-        as_of_time=signal_available_time(signal_date),
+        as_of_time=cutoff,
         promotable_only=False,
         limit=500,
     )
+    theme_data_warning = ""
     if not theme_result.get("ok", True):
-        raise ReplayRiskGateError(
-            f"叙事准入数据不可用：{theme_result.get('reason') or theme_result.get('status') or 'unknown'}",
-            code="narrative_admission_data_unavailable",
+        # Themes are an optional ranking bonus/risk explanation.  A missing
+        # theme snapshot must be visible and non-promotable, but it must not
+        # discard an otherwise complete daily factor/price selection.  The
+        # historical PIT and OOS paths remain strict because they cannot use
+        # a later refresh as evidence for an earlier cutoff.
+        theme_data_warning = str(
+            theme_result.get("reason") or theme_result.get("status") or "unknown"
         )
-    themes = theme_result.get("items") or []
+        themes = []
+    else:
+        themes = theme_result.get("items") or []
     theme_mapped_codes = {
         str(company.get("ts_code") or "").split(".")[0]
         for theme in themes
@@ -684,7 +783,7 @@ def _build_target_symbols(
         themes=themes,
         model_bindings=frozen_model_bindings,
         use_live_health=True,
-        as_of_time=signal_available_time(signal_date),
+        as_of_time=cutoff,
         market_state=market_state,
     )
     model_fusion["inference_mode"] = (
@@ -748,7 +847,12 @@ def _build_target_symbols(
             ],
             "mapped_symbols": len(theme_mapped_codes),
             "unmapped_stock_allowed": True,
-            "status": "ready" if themes else "no_theme_evidence_full_market_allowed",
+            "status": (
+                "degraded_theme_snapshot_unavailable"
+                if theme_data_warning
+                else "ready" if themes else "no_theme_evidence_full_market_allowed"
+            ),
+            "warning": theme_data_warning,
         },
     }
     return [x[0].symbol for x in ranked[:recall_n]], detail
@@ -767,6 +871,19 @@ def run_for_trade_date(
     scoring_timeout_sec: Optional[int] = None,
     authoritative_plan: Dict[str, Any] | None = None,
 ) -> QuantRunExecResult:
+    # Every ledger-mutating execution must be bound to a persisted, immutable
+    # daily rebalance plan.  The old caller-supplied selection path could read
+    # whatever mutable projection happened to be available and then write a
+    # shared-account execution without a frozen data/version contract.  Keep
+    # research/replay callers on their independent engines; this function is
+    # the production execution primitive and therefore fails closed when the
+    # authoritative plan is absent.
+    if authoritative_plan is None:
+        raise ReplayRiskGateError(
+            "正式执行必须绑定已授权的冻结调仓计划；旧直接执行入口已停用",
+            code="authoritative_plan_required",
+        )
+
     def _report(phase: str) -> None:
         if progress_callback is not None:
             try:
@@ -774,9 +891,12 @@ def run_for_trade_date(
             except Exception:
                 pass
 
-    ds = BacktestDataSource()
-    if strict_no_future and hasattr(ds, "set_as_of_time"):
-        ds.set_as_of_time(signal_available_time(signal_date))
+    # Execution accepts only the current immutable V2 contract.  Do this
+    # before constructing or reading a market data source so direct Python
+    # callers cannot bypass the claim layer with an old or unclocked payload.
+    observation_cutoff = ""
+    execution_observation_cutoff = ""
+    ds: BacktestDataSource | None = None
     portfolio_method = ""
     exchange_group = normalize_exchange_group(exchange_group)
     if strict_no_future and str(signal_date) >= str(execute_date):
@@ -809,16 +929,24 @@ def run_for_trade_date(
             authoritative_plan.get("decision_contract")
             if isinstance(authoritative_plan.get("decision_contract"), dict) else {}
         )
-        frozen_exact_quantity_orders = (
-            str(frozen_decision_contract.get("schema_version") or "")
-            == "alis_unified_daily_decision_v2"
-        )
-        if frozen_exact_quantity_orders:
-            frozen_order_by_symbol = {
-                str(item.get("symbol") or ""): dict(item)
-                for item in (frozen_decision_contract.get("execution_orders") or [])
-                if isinstance(item, dict) and str(item.get("symbol") or "")
-            }
+        if str(frozen_decision_contract.get("schema_version") or "") != "alis_unified_daily_decision_v2":
+            raise ReplayRiskGateError(
+                "正式执行只接受 V2 冻结日决策合同；旧合同仅保留审计证据",
+                code="legacy_authoritative_plan",
+            )
+        frozen_cutoff = normalize_explicit_timestamp(frozen_decision_contract.get("data_as_of_time"))
+        if not frozen_cutoff:
+            raise ReplayRiskGateError(
+                "冻结正式计划缺少有效数据截止时间，禁止执行",
+                code="invalid_observation_cutoff",
+            )
+        observation_cutoff = frozen_cutoff
+        ds = BacktestDataSource()
+        if strict_no_future and hasattr(ds, "set_as_of_time"):
+            ds.set_as_of_time(observation_cutoff)
+        # Validate static plan identity before any data audit. Apart from
+        # returning the correct contract error to a caller, this prevents a
+        # malformed task from reading data or consuming a publication probe.
         if frozen_unified_plan:
             selection_snapshot = (
                 frozen_decision_contract.get("selection_snapshot")
@@ -840,6 +968,49 @@ def run_for_trade_date(
                     "统一正式计划的信号日或执行日与任务不一致",
                     code="invalid_authoritative_plan",
                 )
+        frozen_exact_quantity_orders = (
+            str(frozen_decision_contract.get("schema_version") or "")
+            == "alis_unified_daily_decision_v2"
+        )
+        if frozen_exact_quantity_orders:
+            frozen_order_by_symbol = {
+                str(item.get("symbol") or ""): dict(item)
+                for item in (frozen_decision_contract.get("execution_orders") or [])
+                if isinstance(item, dict) and str(item.get("symbol") or "")
+            }
+            # Keep the hard gate inside the execution engine as well as in the
+            # task runner.  Direct callers must not be able to bypass the
+            # exact-date, field-level audit before any sell/buy projection or
+            # ledger mutation is attempted.
+            from app.services.profit_loop import audit_frozen_execution_orders, frozen_order_data_gate_error
+
+            evidence = (
+                authoritative_plan.get("execution_data_evidence")
+                if isinstance(authoritative_plan.get("execution_data_evidence"), dict)
+                else {}
+            )
+            claimed_execution_cutoff = str(
+                authoritative_plan.get("execution_observation_cutoff")
+                or evidence.get("checked_at")
+                or ""
+            ).strip()
+            frozen_order_audit = audit_frozen_execution_orders(
+                frozen_decision_contract,
+                execute_date,
+                observed_at=claimed_execution_cutoff or None,
+            )
+            if not frozen_order_audit.get("ok"):
+                raise frozen_order_data_gate_error(frozen_order_audit)
+            execution_observation_cutoff = normalize_explicit_timestamp(
+                frozen_order_audit.get("checked_at"),
+            )
+            if not execution_observation_cutoff:
+                raise ReplayRiskGateError(
+                    "冻结订单审计缺少有效观测截止时间，禁止执行",
+                    code="invalid_execution_observation_cutoff",
+                )
+            authoritative_plan["execution_observation_cutoff"] = execution_observation_cutoff
+            authoritative_plan["execution_data_evidence"] = frozen_order_audit
         target_symbols = list(authoritative_plan["target_symbols"])
         selection_detail = build_authoritative_selection_detail(
             authoritative_plan,
@@ -847,6 +1018,10 @@ def run_for_trade_date(
             exchange_group=exchange_group,
         )
     else:
+        # Kept for type completeness; authoritative_plan is required above.
+        ds = BacktestDataSource()
+        if strict_no_future and hasattr(ds, "set_as_of_time"):
+            ds.set_as_of_time(signal_available_time(signal_date))
         target_symbols, selection_detail = _build_target_symbols(
             ds=ds,
             strategy_id=int(strategy_id),
@@ -855,6 +1030,7 @@ def run_for_trade_date(
             exchange_group=exchange_group,
             progress_callback=_report,
             scoring_timeout_sec=scoring_timeout_sec,
+            as_of_time=observation_cutoff,
         )
     if not frozen_unified_plan:
         portfolio_method = _strategy_portfolio_method(strategy_id)
@@ -909,9 +1085,9 @@ def run_for_trade_date(
             if str(item.get("symbol") or "")
         }
     else:
-        target_symbols, research_blocks = _apply_research_admission(target_symbols, as_of_time=signal_available_time(signal_date))
+        target_symbols, research_blocks = _apply_research_admission(target_symbols, as_of_time=observation_cutoff)
         target_symbols, dynamic_blocks, dynamic_gate = _apply_dynamic_strategy_gate(
-            target_symbols, as_of_time=signal_available_time(signal_date)
+            target_symbols, as_of_time=observation_cutoff
         )
         if champion_quarantined:
             target_symbols = []
@@ -932,8 +1108,14 @@ def run_for_trade_date(
             symbol_scores=score_map,
             equity_budget=float(dynamic_gate.get("risk_budget_multiplier") or 0),
             market_state=market_state,
-            as_of_time=signal_available_time(signal_date),
+            as_of_time=observation_cutoff,
         )
+        if not industry_allocation.get("ok", True) or str(industry_allocation.get("status") or "") == "blocked":
+            raise ReplayRiskGateError(
+                "行业/主题点时证据不可用，禁止生成正式调仓："
+                f"{industry_allocation.get('reason') or industry_allocation.get('status') or 'unknown'}",
+                code="industry_allocation_pit_unavailable",
+            )
         admitted_industries = set((industry_allocation.get("industry_targets") or {}).keys())
         symbol_industries = industry_allocation.get("symbol_industries") or {}
         industry_rejected = [symbol for symbol in equity_target_symbols if symbol_industries.get(symbol) not in admitted_industries]
@@ -994,8 +1176,9 @@ def run_for_trade_date(
         strict_no_future=strict_no_future,
     )
     # T+1 开盘行情只用于成交观察；风险历史仍显式截止到 signal_date。
+    # It must stay on the same immutable timestamp that passed the order audit.
     if hasattr(ds, "set_as_of_time"):
-        ds.set_as_of_time("")
+        ds.set_as_of_time(execution_observation_cutoff if frozen_exact_quantity_orders else "")
     exec_rows = ds.load_snapshot(execute_date.replace("-", ""))
     if strict_no_future:
         if not exec_rows:
@@ -1036,6 +1219,10 @@ def run_for_trade_date(
                 name=str(meta.get("name") or symbol),
                 execute_date=execute_date,
                 require_exact_date=frozen_unified_plan,
+                observation_cutoff=(
+                    execution_observation_cutoff
+                    if frozen_exact_quantity_orders else datetime.now().astimezone().isoformat(timespec="seconds")
+                ),
             )
             if row is None:
                 missing_defensive_execution_rows.append(symbol)
@@ -1052,6 +1239,27 @@ def run_for_trade_date(
         if frozen_unified_plan and missing_defensive_execution_rows:
             raise ReplayRiskGateError(
                 "冻结计划所需防御ETF缺少执行日精确行情：" + ",".join(missing_defensive_execution_rows),
+                code="paused_frozen_execution_data_not_ready",
+            )
+    if frozen_exact_quantity_orders:
+        # A cost-price fallback is not a market observation.  Every existing
+        # holding that participates in T+1 sizing must have an exact-date
+        # execution row before the frozen plan can mutate the ledger.
+        missing_position_rows = []
+        target_execute_date = str(execute_date or "").replace("-", "")[:8]
+        for position in get_positions():
+            symbol = str(position.get("symbol") or "").strip()
+            if int(position.get("quantity") or 0) <= 0 or not symbol:
+                continue
+            row = exec_map.get(symbol) or exec_map.get(symbol.split(".", 1)[0])
+            if row is None or (
+                str(getattr(row, "date", "") or "").replace("-", "")[:8] != target_execute_date
+                or _row_trade_price(row, prefer_open=True) <= 0
+            ):
+                missing_position_rows.append(symbol)
+        if missing_position_rows:
+            raise ReplayRiskGateError(
+                "冻结计划现有持仓缺少执行日精确行情：" + ",".join(sorted(set(missing_position_rows))),
                 code="paused_frozen_execution_data_not_ready",
             )
     executed_at = f"{execute_date}T09:30:00"
@@ -1220,8 +1428,32 @@ def run_for_trade_date(
             continue
         if sym in defensive_weights:
             from app.services.defensive_assets import defensive_asset_bar, defensive_asset_returns
-            returns = defensive_asset_returns(next(code for code in (defensive_policy.get("target_weights") or {}) if str(code).split(".")[0] == sym), signal_date)
-            average_amount_thousand = float((defensive_asset_bar(next(code for code in (defensive_policy.get("target_weights") or {}) if str(code).split(".")[0] == sym), signal_date) or {}).get("amount") or 0)
+            defensive_code = next(
+                code for code in (defensive_policy.get("target_weights") or {})
+                if str(code).split(".")[0] == sym
+            )
+            returns = defensive_asset_returns(
+                defensive_code,
+                signal_date,
+                available_as_of_time=observation_cutoff or None,
+                require_exact_latest=frozen_unified_plan,
+            )
+            history_bar = defensive_asset_bar(
+                defensive_code,
+                signal_date,
+                exact_date=frozen_unified_plan,
+                available_as_of_time=observation_cutoff or None,
+            )
+            average_amount_thousand = float((history_bar or {}).get("amount") or 0)
+            if frozen_unified_plan and (not history_bar or average_amount_thousand <= 0):
+                blocked_events.append({
+                    "date": signal_date,
+                    "symbol": sym,
+                    "side": "BUY",
+                    "code": "missing_frozen_defensive_history",
+                    "message": "冻结计划缺少信号日防御ETF精确历史成交额，禁止重新估算买单",
+                })
+                continue
         else:
             hist = ds.get_hist_window(sym, signal_date, 60)
             closes = [float(getattr(x, "close", 0) or 0) for x in hist]
@@ -1425,7 +1657,7 @@ def run_for_trade_date(
         }
     else:
         position_limits = _pretrade_symbol_limits(
-            [str(order.symbol) for order in order_requests], cutoff=signal_available_time(signal_date), max_single=max_single_position_pct,
+            [str(order.symbol) for order in order_requests], cutoff=observation_cutoff, max_single=max_single_position_pct,
         )
         for symbol in defensive_weights:
             position_limits[symbol] = DEFAULT_GLOBAL_SINGLE_ASSET_LIMIT
@@ -1825,7 +2057,7 @@ def run_for_trade_date(
         model_version = str(template.get("id") or "rule_fallback_v1")
         market_state = selection_detail.get("trend_analysis") or {}
         decision_time = f"{execute_date}T09:30:00"
-        data_as_of = signal_available_time(signal_date)
+        data_as_of = observation_cutoff
         for action in buy_actions:
             symbol = str(action.get("symbol") or "")
             evidence = selection_by_symbol.get(symbol) or {}
@@ -2036,7 +2268,14 @@ def plan_analyze_rebalance(
     """预览或执行分析调仓：次日开盘价口径、总权益仓位、单票上限、先卖后买。"""
     sig = str(signal_date or "").strip()
     if not dry_run:
-        _require_consistent_simulation_ledger()
+        # This compatibility helper predates the immutable daily-plan
+        # contract.  It remains available for read-only previews only; its
+        # write mode could otherwise mutate the shared account without a
+        # claim token, exact frozen order set, or publication evidence.
+        raise ReplayRiskGateError(
+            "旧分析调仓执行入口已停用；成交只能由自治任务领取冻结调仓计划",
+            code="legacy_execution_path_retired",
+        )
     execution_guard = champion_execution_gate()
     champion_quarantined = str(execution_guard.get("status") or "") == "quarantined"
     dates = list_consolidated_trade_dates()

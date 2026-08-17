@@ -11,6 +11,13 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from app.data_platform.db import _conn
+from app.data_platform.services.observation_clock import (
+    _explicit_timestamp_sql,
+    _timestamp_value_sql,
+    _valid_provenance_sql,
+    load_raw_record_versions,
+)
+from app.services.point_in_time import normalize_explicit_timestamp
 
 _BUSINESS_TZ = ZoneInfo("Asia/Shanghai")
 
@@ -203,8 +210,101 @@ def _derived_industry_proxies(c, *, as_of_time: str | None = None) -> dict[str, 
     """Build auditable P1 industry proxies from company financial and valuation facts."""
     target_rows: dict[str, list[dict[str, Any]]] | None = None
 
+    def immutable_ranked() -> dict[str, list[dict[str, Any]]]:
+        """Select financial periods from append-only rows at the cutoff.
+
+        The mutable raw projection is an overwrite cache.  Historical industry
+        states must use the same four-clock immutable contract as the stock
+        research path, then choose the latest common annual/comparable periods
+        in Python so this remains portable across PostgreSQL and SQLite.
+        """
+        cutoff = normalize_explicit_timestamp(as_of_time)
+        if not cutoff:
+            raise RuntimeError("industry_financial_pit_cutoff_invalid")
+        by_api: dict[str, list[dict[str, Any]]] = {"income": [], "balancesheet": []}
+        for api_name in by_api:
+            rows = load_raw_record_versions(c, api_name, cutoff=cutoff)
+            if rows is None:
+                raise RuntimeError(
+                    "industry_financial_pit_unavailable: immutable raw version required"
+                )
+            for raw in rows:
+                item = dict(raw)
+                code = str(item.get("ts_code") or "").strip()
+                if code not in master_codes:
+                    continue
+                try:
+                    payload = json.loads(item.get("payload_json") or "{}")
+                except (TypeError, json.JSONDecodeError):
+                    payload = {}
+                if not isinstance(payload, dict):
+                    continue
+                period = str(item.get("period") or payload.get("period") or payload.get("end_date") or "")
+                if not period:
+                    continue
+                value = {
+                    "ts_code": code,
+                    "_period": period,
+                    "total_revenue": payload.get("total_revenue"),
+                    "n_income": payload.get("n_income"),
+                    "inventories": payload.get("inventories"),
+                    "observed_at": item.get("observed_at"),
+                }
+                by_api[api_name].append(value)
+        # Keep one row per symbol/period and only the bounded periods used by
+        # the proxy calculations.  All candidate rows are already cutoff-safe.
+        deduped: dict[str, list[dict[str, Any]]] = {}
+        for api_name, rows in by_api.items():
+            chosen: dict[tuple[str, str], dict[str, Any]] = {}
+            for row in rows:
+                key = (str(row.get("ts_code") or ""), str(row.get("_period") or ""))
+                current = chosen.get(key)
+                if current is None or str(row.get("observed_at") or "") > str(current.get("observed_at") or ""):
+                    chosen[key] = row
+            for code in master_codes:
+                values = [item for (item_code, _period), item in chosen.items() if item_code == code]
+                values.sort(key=lambda item: str(item.get("_period") or ""), reverse=True)
+                deduped.setdefault(api_name, []).extend(values[:8])
+        income_by_code: dict[str, dict[str, dict[str, Any]]] = {}
+        balance_by_code: dict[str, dict[str, dict[str, Any]]] = {}
+        for item in deduped.get("income", []):
+            income_by_code.setdefault(item["ts_code"], {})[item["_period"]] = item
+        for item in deduped.get("balancesheet", []):
+            balance_by_code.setdefault(item["ts_code"], {})[item["_period"]] = item
+        selected: dict[str, set[tuple[str, str]]] = {"income": set(), "balancesheet": set()}
+        for code in master_codes:
+            income_periods = income_by_code.get(code, {})
+            balance_periods = balance_by_code.get(code, {})
+            if income_periods:
+                latest = max(income_periods)
+                selected["income"].add((code, latest))
+                if len(latest) == 8 and latest.isdigit():
+                    selected["income"].add((code, f"{int(latest[:4]) - 1:04d}{latest[4:]}"))
+            common = set(income_periods) & set(balance_periods)
+            common = {
+                period for period in common
+                if len(period) == 8 and period.isdigit()
+                and f"{int(period[:4]) - 1:04d}{period[4:]}" in common
+            }
+            if common:
+                latest_common = max(common)
+                prior = f"{int(latest_common[:4]) - 1:04d}{latest_common[4:]}"
+                for api_name in selected:
+                    selected[api_name].update({(code, latest_common), (code, prior)})
+        result: dict[str, list[dict[str, Any]]] = {"income": [], "balancesheet": []}
+        for api_name, lookup in (("income", income_by_code), ("balancesheet", balance_by_code)):
+            for code, period in sorted(selected[api_name]):
+                item = lookup.get(code, {}).get(period)
+                if item is not None:
+                    result[api_name].append(item)
+        return result
+
     def ranked(api_name: str) -> list[dict[str, Any]]:
         nonlocal target_rows
+        if as_of_time:
+            if target_rows is None:
+                target_rows = immutable_ranked()
+            return list(target_rows.get(api_name, []))
         if target_rows is None:
             # Preserve the existing eight-period contract for target selection,
             # but send only the two-year comparison periods used below.
@@ -293,31 +393,105 @@ def _derived_industry_proxies(c, *, as_of_time: str | None = None) -> dict[str, 
             target_rows = grouped
         return list(target_rows.get(api_name, []))
 
-    master = {str(row["ts_code"]): str(row["industry"] or "").strip() for row in c.execute(
+    master_query = (
+        "SELECT ts_code,industry,list_date,available_time,updated_at,source_code "
+        "FROM dc_stock_master WHERE COALESCE(industry,'')<>''"
+        if as_of_time else
         "SELECT ts_code,industry FROM dc_stock_master WHERE COALESCE(industry,'')<>''"
-    ).fetchall()}
-    source_signature = _financial_proxy_source_signature(c, as_of_time=as_of_time)
-    financial_derived = _load_financial_proxy_cache(c, source_signature)
+    )
+    try:
+        master_rows = [dict(row) for row in c.execute(master_query).fetchall()]
+    except Exception as exc:
+        if as_of_time:
+            raise RuntimeError("industry_stock_master_pit_unavailable") from exc
+        raise
+    if as_of_time:
+        cutoff = normalize_explicit_timestamp(as_of_time)
+        if not cutoff:
+            raise RuntimeError("industry_stock_master_cutoff_invalid")
+        visible_master: list[dict[str, Any]] = []
+        for row in master_rows:
+            available = normalize_explicit_timestamp(row.get("available_time"))
+            updated = normalize_explicit_timestamp(row.get("updated_at"))
+            list_date = str(row.get("list_date") or "").replace("-", "")[:8]
+            cutoff_date = cutoff[:10].replace("-", "")
+            if (
+                not str(row.get("source_code") or "").strip()
+                or not available or not updated
+                or available > cutoff or updated > cutoff
+                or (list_date and list_date > cutoff_date)
+            ):
+                raise RuntimeError("industry_stock_master_not_visible_at_cutoff")
+            visible_master.append(row)
+        master_rows = visible_master
+    master = {
+        str(row["ts_code"]): str(row["industry"] or "").strip()
+        for row in master_rows
+    }
+    master_codes = set(master)
+    source_signature = _financial_proxy_source_signature(c, as_of_time=as_of_time) if not as_of_time else ""
+    # A cache derived from the mutable projection is not valid evidence for a
+    # historical cutoff. Recompute from immutable versions instead.
+    financial_derived = _load_financial_proxy_cache(c, source_signature) if source_signature else None
     if financial_derived is None:
         income_rows, balance_rows = ranked("income"), ranked("balancesheet")
     else:
         income_rows, balance_rows = [], []
     as_of_date = str(as_of_time or "")[:10].replace("-", "")
-    latest_date_clause = "AND s.available_time<=? AND s.trade_date<=?" if as_of_time else ""
-    date_params: tuple[Any, ...] = (str(as_of_time), as_of_date) if as_of_time else ()
-    # A window over every stock/date is prohibitively expensive for historical
-    # replay. The lateral lookup is backed by the point-in-time index and
-    # reads one latest eligible valuation row per company instead.
-    snapshots = [dict(row) for row in c.execute(
-        f"""SELECT m.ts_code,s.pe_ttm
-               FROM dc_stock_master m
-               JOIN LATERAL (
-                    SELECT pe_ttm FROM dc_stock_daily_snapshot s
-                    WHERE s.ts_code=m.ts_code {latest_date_clause}
-                    ORDER BY s.trade_date DESC LIMIT 1
-               ) s ON TRUE
-               WHERE COALESCE(m.industry,'')<>''""", date_params
-    ).fetchall()]
+    # Valuation is part of the formal industry state.  The mutable snapshot
+    # projection can be overwritten by a late repair, so it must not be used
+    # when deriving a state that carries an explicit observation cutoff.
+    # Select the latest immutable row per company only after all four clocks
+    # have been constrained to that cutoff.
+    try:
+        is_postgres = bool(getattr(c, "_is_postgres", False))
+        observed_sql = _timestamp_value_sql("v.observed_at", is_postgres=is_postgres)
+        first_observed_sql = _timestamp_value_sql("v.first_observed_at", is_postgres=is_postgres)
+        economic_sql = _timestamp_value_sql("v.economic_available_time", is_postgres=is_postgres)
+        created_sql = _timestamp_value_sql("v.created_at", is_postgres=is_postgres)
+        predicates = [
+            "v.content_hash<>''",
+            "NULLIF(TRIM(COALESCE(v.source_code,'')),'') IS NOT NULL",
+            _valid_provenance_sql("v.observation_provenance"),
+            _explicit_timestamp_sql("v.observed_at", is_postgres=is_postgres),
+            _explicit_timestamp_sql("v.first_observed_at", is_postgres=is_postgres),
+            _explicit_timestamp_sql("v.economic_available_time", is_postgres=is_postgres),
+            _explicit_timestamp_sql("v.created_at", is_postgres=is_postgres),
+        ]
+        params: list[Any] = []
+        if as_of_date:
+            predicates.append("v.trade_date<=?")
+            params.append(as_of_date)
+        if as_of_time:
+            predicates.extend([
+                f"{observed_sql}<=?", f"{first_observed_sql}<=?",
+                f"{economic_sql}<=?", f"{created_sql}<=?",
+            ])
+            params.extend([str(as_of_time)] * 4)
+        pe_expr = (
+            "CASE WHEN jsonb_typeof(v.payload_json::jsonb->'pe_ttm')='number' "
+            "THEN (v.payload_json::jsonb->>'pe_ttm')::double precision END"
+            if is_postgres else
+            "CAST(json_extract(v.payload_json,'$.pe_ttm') AS REAL)"
+        )
+        snapshots = [dict(row) for row in c.execute(
+            f"""WITH ranked AS (
+                       SELECT v.ts_code,{pe_expr} AS pe_ttm,v.trade_date,
+                              ROW_NUMBER() OVER (
+                                  PARTITION BY v.ts_code
+                                  ORDER BY v.trade_date DESC,{observed_sql} DESC,
+                                           {created_sql} DESC,v.id DESC
+                              ) AS row_rank
+                         FROM dc_stock_daily_snapshot_version v
+                        WHERE {' AND '.join(predicates)}
+                   )
+                   SELECT ts_code,pe_ttm FROM ranked WHERE row_rank=1""",
+            tuple(params),
+        ).fetchall()]
+    except Exception as exc:
+        raise RuntimeError(
+            "industry_valuation_pit_unavailable: immutable snapshot version required"
+        ) from exc
 
     def payloads(rows: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
         result: dict[str, list[dict[str, Any]]] = {}
@@ -387,9 +561,10 @@ def _derived_industry_proxies(c, *, as_of_time: str | None = None) -> dict[str, 
                     "company_profit_points": len(profit), "company_inventory_points": len(inventory),
                 },
             }
-        _store_financial_proxy_cache(
-            c, source_signature=source_signature, as_of_time=as_of_time, proxies=financial_derived,
-        )
+        if source_signature:
+            _store_financial_proxy_cache(
+                c, source_signature=source_signature, as_of_time=as_of_time, proxies=financial_derived,
+            )
 
     derived = json.loads(json.dumps(financial_derived))
     pe_by_industry: dict[str, list[float]] = {}
@@ -540,25 +715,56 @@ def _normalize_materialized_state(state: dict[str, Any]) -> dict[str, Any]:
         "missing": normalized.get("missing", state.get("missing", [])),
     }
 
-def _latest_industry_snapshot(as_of_date: str, *, compact: bool = False) -> dict[str, Any] | None:
-    """Read the materialized industry contract without recomputing 112 states."""
+def _latest_industry_snapshot(
+    as_of_date: str, *, as_of_time: str = "", compact: bool = False,
+) -> dict[str, Any] | None:
+    """Read only an industry state visible at the requested observation cutoff."""
     snapshot_where = "WHERE as_of_date<=?" if as_of_date else ""
     snapshot_params: tuple[Any, ...] = (as_of_date,) if as_of_date else ()
+    cutoff = normalize_explicit_timestamp(as_of_time) if as_of_time else ""
+    if as_of_time and not cutoff:
+        return None
     with _conn() as c:
         snapshot_columns = (
-            "industry_name,as_of_date,model_version,state_json"
+            "industry_name,as_of_date,model_version,state_json,available_time,created_at,updated_at"
             if compact
             else "*"
         )
-        snapshots = [dict(row) for row in c.execute(
-            f"""SELECT {snapshot_columns} FROM (
-                   SELECT s.*,ROW_NUMBER() OVER(
-                       PARTITION BY industry_name ORDER BY as_of_date DESC,available_time DESC
-                   ) rn
-                   FROM dc_industry_state_snapshot s """ + snapshot_where + """
-               ) ranked WHERE rn=1""",
-            snapshot_params,
-        ).fetchall()]
+        if cutoff:
+            # Filter every observation clock before selecting the latest row
+            # for an industry.  Ranking first would let a late repair hide an
+            # older version that was genuinely visible at the replay cutoff.
+            candidates = [dict(row) for row in c.execute(
+                f"""SELECT {snapshot_columns}
+                      FROM dc_industry_state_snapshot s
+                     {snapshot_where}
+                     ORDER BY industry_name,as_of_date DESC,available_time DESC""",
+                snapshot_params,
+            ).fetchall()]
+            snapshots = []
+            seen_industries: set[str] = set()
+            for row in candidates:
+                industry = str(row.get("industry_name") or "")
+                if industry in seen_industries:
+                    continue
+                if not all(
+                    (value := normalize_explicit_timestamp(row.get(column)))
+                    and value <= cutoff
+                    for column in ("available_time", "created_at", "updated_at")
+                ):
+                    continue
+                seen_industries.add(industry)
+                snapshots.append(row)
+        else:
+            snapshots = [dict(row) for row in c.execute(
+                f"""SELECT {snapshot_columns} FROM (
+                       SELECT s.*,ROW_NUMBER() OVER(
+                           PARTITION BY industry_name ORDER BY as_of_date DESC,available_time DESC
+                       ) rn
+                       FROM dc_industry_state_snapshot s """ + snapshot_where + """
+                   ) ranked WHERE rn=1""",
+                snapshot_params,
+            ).fetchall()]
         if not snapshots:
             return None
         definitions = [] if compact else [dict(row) for row in c.execute(
@@ -626,9 +832,20 @@ def _latest_industry_snapshot(as_of_date: str, *, compact: bool = False) -> dict
 @lru_cache(maxsize=64)
 def _list_industries_cached(as_of_time: str, compact: bool = False) -> dict[str, Any]:
     as_of_date = str(as_of_time or "")[:10].replace("-", "")
-    snapshot_result = _latest_industry_snapshot(as_of_date, compact=compact)
+    snapshot_result = _latest_industry_snapshot(as_of_date, as_of_time=as_of_time, compact=compact)
     if snapshot_result:
         return snapshot_result
+    # An explicit cutoff is a formal/replay read. Falling back to mutable
+    # metric projections here would admit values written after that cutoff.
+    if as_of_time:
+        return {
+            "ok": False,
+            "status": "blocked",
+            "reason": "no_industry_state_visible_at_cutoff",
+            "as_of_time": as_of_time,
+            "items": [],
+            "count": 0,
+        }
     with _conn() as c:
         definitions = [dict(row) for row in c.execute(
             """SELECT d.*,COUNT(v.metric_code) value_count,MIN(v.data_date) first_date,MAX(v.data_date) last_date
@@ -758,8 +975,28 @@ def _materialize_industry_state_snapshots_once(*, as_of_time: str | None = None)
         if cutoff:
             as_of_date = cutoff[:10].replace("-", "")
         else:
-            row = c.execute("SELECT MAX(trade_date) latest FROM dc_stock_daily_snapshot").fetchone()
+            # The current projection is mutable; use the immutable observation
+            # archive even for the latest materialization anchor.
+            try:
+                is_postgres = bool(getattr(c, "_is_postgres", False))
+                row = c.execute(
+                    """SELECT MAX(trade_date) latest
+                         FROM dc_stock_daily_snapshot_version v
+                        WHERE v.content_hash<>''
+                          AND NULLIF(TRIM(COALESCE(v.source_code,'')),'') IS NOT NULL
+                          AND """ + _valid_provenance_sql("v.observation_provenance") + """
+                          AND """ + _explicit_timestamp_sql("v.observed_at", is_postgres=is_postgres) + """
+                          AND """ + _explicit_timestamp_sql("v.first_observed_at", is_postgres=is_postgres) + """
+                          AND """ + _explicit_timestamp_sql("v.economic_available_time", is_postgres=is_postgres) + """
+                          AND """ + _explicit_timestamp_sql("v.created_at", is_postgres=is_postgres),
+                ).fetchone()
+            except Exception as exc:
+                raise RuntimeError(
+                    "industry_state_anchor_pit_unavailable: immutable snapshot version required"
+                ) from exc
             as_of_date = str(dict(row).get("latest") or "") if row else ""
+        if not as_of_date:
+            raise RuntimeError("industry_state_anchor_missing")
         proxies = _derived_industry_proxies(c, as_of_time=cutoff or None)
         now = datetime.now().isoformat(timespec="seconds")
         written = 0
@@ -825,12 +1062,30 @@ def materialize_industry_state_history(*, anchor_sessions: int = 20, max_points:
     cannot leak into a historical industry observation.
     """
     with _conn() as c:
-        rows = [dict(row) for row in c.execute(
-            """SELECT trade_date,MAX(available_time) AS available_time
-               FROM dc_stock_daily_snapshot
-               WHERE available_time IS NOT NULL AND available_time<>''
-               GROUP BY trade_date ORDER BY trade_date"""
-        ).fetchall()]
+        try:
+            is_postgres = bool(getattr(c, "_is_postgres", False))
+            rows = [dict(row) for row in c.execute(
+                """SELECT trade_date
+                     FROM dc_stock_daily_snapshot_version v
+                    WHERE v.content_hash<>''
+                      AND NULLIF(TRIM(COALESCE(v.source_code,'')),'') IS NOT NULL
+                      AND """ + _valid_provenance_sql("v.observation_provenance") + """
+                      AND """ + _explicit_timestamp_sql("v.observed_at", is_postgres=is_postgres) + """
+                      AND """ + _explicit_timestamp_sql("v.first_observed_at", is_postgres=is_postgres) + """
+                      AND """ + _explicit_timestamp_sql("v.economic_available_time", is_postgres=is_postgres) + """
+                      AND """ + _explicit_timestamp_sql("v.created_at", is_postgres=is_postgres) + """
+                    GROUP BY trade_date ORDER BY trade_date"""
+            ).fetchall()]
+        except Exception as exc:
+            raise RuntimeError(
+                "industry_state_history_pit_unavailable: immutable snapshot version required"
+            ) from exc
+    for row in rows:
+        trade_date = str(row.get("trade_date") or "").replace("-", "")[:8]
+        row["available_time"] = (
+            f"{trade_date[:4]}-{trade_date[4:6]}-{trade_date[6:8]}T15:00:00+08:00"
+            if len(trade_date) == 8 and trade_date.isdigit() else ""
+        )
     anchors = _history_anchor_rows(rows, anchor_sessions=anchor_sessions, max_points=max_points)
     results: list[dict[str, Any]] = []
     failed: list[dict[str, Any]] = []
@@ -930,7 +1185,134 @@ def score_event(item: dict[str, Any], *, as_of_date: str | None = None) -> dict[
     }
 
 
+def _structured_raw_events_from_versions(
+    c,
+    *,
+    ts_code: str,
+    limit: int,
+    as_of_time: str,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Read structured disclosure events from immutable PIT raw versions.
+
+    The ordinary raw table is an overwrite projection.  It is suitable for a
+    current dashboard, but it cannot prove what was visible at a historical
+    cutoff.  ``load_raw_record_versions`` returns ``None`` when the immutable
+    schema is absent and an empty list when the schema is present but no
+    eligible record exists; keeping those outcomes distinct prevents a data
+    outage from becoming a harmless-looking empty event list.
+    """
+    cutoff = normalize_explicit_timestamp(as_of_time)
+    if not cutoff:
+        return [], {
+            "ok": False,
+            "status": "blocked",
+            "reason": "event_pit_cutoff_invalid",
+            "as_of_time": as_of_time,
+        }
+    apis = ("forecast", "express", "dividend", "pledge_stat", "fina_audit", "namechange")
+    per_api_limit = max(5, min(100, math.ceil(limit / len(apis)) * 4))
+    rows: list[dict[str, Any]] = []
+    unavailable: list[str] = []
+    for api_name in apis:
+        versions = load_raw_record_versions(
+            c,
+            api_name,
+            cutoff=cutoff,
+            ts_codes=[ts_code] if ts_code else None,
+            limit=per_api_limit,
+        )
+        if versions is None:
+            unavailable.append(api_name)
+            continue
+        rows.extend(dict(row) for row in versions)
+    if unavailable:
+        return [], {
+            "ok": False,
+            "status": "blocked",
+            "reason": "immutable_event_schema_unavailable",
+            "missing_apis": unavailable,
+            "as_of_time": cutoff,
+        }
+
+    result: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str, str]] = set()
+    for row in rows:
+        try:
+            payload = json.loads(row.get("payload_json") or "{}")
+        except (TypeError, json.JSONDecodeError):
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+        api = str(row.get("api_name") or "")
+        event_type, direction, severity, title = api, "neutral", "medium", api
+        metrics: dict[str, Any] = {}
+        if api == "forecast":
+            event_type, title = "earnings_forecast", "业绩预告"
+            changes = [float(payload[key]) for key in ("p_change_min", "p_change_max") if payload.get(key) is not None]
+            change = sum(changes) / len(changes) if changes else None
+            direction = "positive" if change is not None and change > 10 else "negative" if change is not None and change < -10 else "neutral"
+            severity = "high" if change is not None and abs(change) >= 50 else "medium"
+            metrics = {"profit_change_pct": change, "range": changes, "summary": payload.get("summary")}
+        elif api == "express":
+            event_type, title = "earnings_flash", "业绩快报"
+            income = payload.get("n_income")
+            direction = "positive" if income is not None and float(income) > 0 else "negative" if income is not None and float(income) < 0 else "neutral"
+            metrics = {key: payload.get(key) for key in ("revenue", "total_profit", "n_income", "total_assets")}
+        elif api == "dividend":
+            event_type, title, direction = "dividend", "分红方案", "positive"
+            severity = "low"
+            metrics = {key: payload.get(key) for key in ("cash_div_tax", "stk_div", "div_proc", "ex_date")}
+        elif api == "pledge_stat":
+            event_type, title = "pledge", "股权质押统计"
+            try:
+                ratio = float(payload.get("pledge_ratio") or 0)
+            except (TypeError, ValueError):
+                ratio = 0.0
+            direction = "negative" if ratio >= 30 else "neutral"
+            severity = "high" if ratio >= 50 else "medium" if ratio >= 30 else "low"
+            metrics = {"pledge_ratio": ratio, "pledge_count": payload.get("pledge_count")}
+        elif api == "fina_audit":
+            event_type, title = "audit_opinion", "审计意见"
+            audit_result = str(payload.get("audit_result") or "")
+            standard = "标准无保留意见" in audit_result or audit_result == "无保留意见"
+            direction, severity = ("neutral", "low") if standard else ("negative", "critical")
+            metrics = {"audit_result": audit_result, "audit_agency": payload.get("audit_agency")}
+        elif api == "namechange":
+            event_type, title = "name_change", "名称或ST状态变更"
+            is_st = "ST" in str(payload.get("name") or "").upper()
+            direction, severity = ("negative", "high") if is_st else ("neutral", "low")
+            metrics = {key: payload.get(key) for key in ("name", "start_date", "end_date", "change_reason")}
+        event_date = str(row.get("ann_date") or payload.get("ann_date") or payload.get("end_date") or row.get("period") or "")
+        identity = (api, str(row.get("ts_code") or ""), event_date, event_type)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        observed_at = str(row.get("observed_at") or "")
+        result.append({
+            "id": f"raw:{api}:{row.get('id')}", "announcement_id": None,
+            "event_type": event_type, "impact_direction": direction, "severity": severity,
+            "confidence": .98, "event_date": event_date,
+            "entities": [row.get("ts_code")], "metrics": metrics, "summary": title,
+            "ts_code": row.get("ts_code"), "title": title, "publish_time": observed_at,
+            "url": "", "source_code": str(row.get("source_code") or "tushare"),
+            "available_time": observed_at,
+            "evidence": {
+                "api_name": api, "record_id": row.get("id"),
+                "available_time": observed_at,
+                "observation_provenance": row.get("observation_provenance"),
+                "content_hash": row.get("content_hash"),
+            },
+        })
+    return result, {"ok": True, "status": "ready", "as_of_time": cutoff}
+
+
 def _structured_raw_events(c, *, ts_code: str, limit: int, as_of_time: str | None) -> list[dict[str, Any]]:
+    """Build structured events, using immutable versions for explicit PIT reads."""
+    if as_of_time:
+        result, _status = _structured_raw_events_from_versions(
+            c, ts_code=ts_code, limit=limit, as_of_time=as_of_time,
+        )
+        return result
     apis = ("forecast", "express", "dividend", "pledge_stat", "fina_audit", "namechange")
     per_api_limit = max(5, min(100, math.ceil(limit / len(apis)) * 4))
     rows: list[dict[str, Any]] = []
@@ -1008,28 +1390,68 @@ def _structured_raw_events(c, *, ts_code: str, limit: int, as_of_time: str | Non
 
 
 def list_events(*, ts_code: str = "", limit: int = 100, as_of_time: str | None = None) -> dict[str, Any]:
+    if as_of_time:
+        cutoff = normalize_explicit_timestamp(as_of_time)
+        if not cutoff:
+            return {
+                "ok": False,
+                "status": "blocked",
+                "reason": "event_pit_cutoff_invalid",
+                "as_of_time": as_of_time,
+                "items": [],
+                "count": 0,
+            }
+        # ``dc_announcement_raw`` is mutable and has no immutable four-clock
+        # version contract.  Do not query it for a formal/replay cutoff.
+        with _conn() as c:
+            rows, event_status = _structured_raw_events_from_versions(
+                c, ts_code=ts_code, limit=limit, as_of_time=cutoff,
+            )
+        if not event_status.get("ok"):
+            return {
+                **event_status,
+                "items": [],
+                "count": 0,
+                "event_contract": {
+                    "supported_types": sorted(V1_EVENT_TYPES),
+                    "observed_types": [],
+                    "unobserved_types": sorted(V1_EVENT_TYPES),
+                    "schema_fields": [
+                        "event_type", "direction", "severity", "confidence",
+                        "impact_horizon", "impact_dimensions", "evidence", "followup_date",
+                    ],
+                },
+            }
+    else:
+        rows = []
     clauses, params = [], []
     if ts_code:
         clauses.append("r.ts_code=?"); params.append(ts_code)
-    if as_of_time:
-        clauses.append("r.available_time<=?"); params.append(str(as_of_time))
     where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-    with _conn() as c:
-        rows = [dict(row) for row in c.execute(
-            f"""SELECT e.*,r.ts_code,r.title,r.publish_time,r.url,r.source_code,r.available_time,r.raw_text
-                FROM dc_announcement_event e JOIN dc_announcement_raw r ON r.id=e.announcement_id
-                {where} ORDER BY COALESCE(NULLIF(e.event_date,''),r.publish_time) DESC,e.id DESC LIMIT ?""",
-            tuple(params + [limit]),
-        ).fetchall()]
-        rows.extend(_structured_raw_events(c, ts_code=ts_code, limit=limit, as_of_time=as_of_time))
-    try:
-        from app.services.thesis_store import list_theses
-        thesis_by_code = {
-            str(x.get("ts_code") or ""): x
-            for x in list_theses(limit=500, include_hypotheses=False)
-        }
-    except Exception:
+    if not as_of_time:
+        with _conn() as c:
+            rows.extend([dict(row) for row in c.execute(
+                f"""SELECT e.*,r.ts_code,r.title,r.publish_time,r.url,r.source_code,r.available_time,r.raw_text
+                    FROM dc_announcement_event e JOIN dc_announcement_raw r ON r.id=e.announcement_id
+                    {where} ORDER BY COALESCE(NULLIF(e.event_date,''),r.publish_time) DESC,e.id DESC LIMIT ?""",
+                tuple(params + [limit]),
+            ).fetchall()])
+            rows.extend(_structured_raw_events(c, ts_code=ts_code, limit=limit, as_of_time=None))
+    # Thesis rows are a mutable research projection.  They are useful for a
+    # live follow-up queue, but do not have a versioned PIT contract yet, so a
+    # historical event read must not attach today's thesis state as if it were
+    # known at the cutoff.
+    if as_of_time:
         thesis_by_code = {}
+    else:
+        try:
+            from app.services.thesis_store import list_theses
+            thesis_by_code = {
+                str(x.get("ts_code") or ""): x
+                for x in list_theses(limit=500, include_hypotheses=False)
+            }
+        except Exception:
+            thesis_by_code = {}
     for item in rows:
         if "entities_json" in item:
             item["entities"] = json.loads(item.pop("entities_json") or "[]")
@@ -1062,7 +1484,11 @@ def list_events(*, ts_code: str = "", limit: int = 100, as_of_time: str | None =
     rows = rows[:limit]
     observed = sorted({str(item.get("event_type") or "") for item in rows if item.get("event_type")})
     return {
-        "ok": True, "items": rows, "count": len(rows),
+        "ok": True,
+        "status": "ready",
+        "items": rows,
+        "count": len(rows),
+        **({"as_of_time": normalize_explicit_timestamp(as_of_time), "point_in_time_method": "immutable_raw_record_versions_v1"} if as_of_time else {}),
         "event_contract": {
             "supported_types": sorted(V1_EVENT_TYPES), "observed_types": observed,
             "unobserved_types": sorted(V1_EVENT_TYPES - set(observed)),

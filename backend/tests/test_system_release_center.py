@@ -31,6 +31,12 @@ def test_release_manifest_is_stable_and_compatibility_gated(monkeypatch):
     assert validation["gates"]["component_compatibility"] is False
 
 
+def test_release_catalog_publishes_immutable_sealed_holdout_contract():
+    assert releases.CONTRACT_CATALOG["contract.sealed_holdout"]["version"] == (
+        "alis_sealed_strategy_holdout_v4_immutable_observation"
+    )
+
+
 def test_release_creation_is_idempotent_and_only_validated_release_activates(monkeypatch):
     monkeypatch.setattr(releases, "_component_payloads", _components)
     with releases.business_conn() as conn:
@@ -69,6 +75,25 @@ def test_governance_cycle_is_noop_when_release_is_unchanged(monkeypatch):
     assert result["status"] == "unchanged"
     assert result["production_change"] is False
     assert result["active_release"]["id"] == 7
+
+
+def test_governance_cycle_does_not_create_candidate_for_dirty_worktree(monkeypatch):
+    monkeypatch.setattr(releases, "discover_release_change", lambda: {
+        "changed": True,
+        "restart_required": False,
+        "repository_dirty": True,
+    })
+
+    def fail_create_release(**kwargs):
+        raise AssertionError("dirty worktree must be rejected before candidate creation")
+
+    monkeypatch.setattr(releases, "create_release", fail_create_release)
+    result = releases.run_release_governance_cycle()
+
+    assert result["ok"] is False
+    assert result["status"] == "worktree_dirty"
+    assert result["production_change"] is False
+    assert result["reason"] == "repository_worktree_must_be_clean_before_release"
 
 
 def test_governance_cycle_activates_only_after_preflight(monkeypatch):

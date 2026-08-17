@@ -11,24 +11,42 @@ MAX_OOS_REPAIR_DATES = 5
 _FAILED = {"failed", "blocked", "error", "rejected", "repair_partial", "timed_out", "timeout", "unhealthy"}
 _DEGRADED = {"partial", "degraded", "warning", "escalated"}
 _OBSERVING = {"attention", "insufficient_observations", "observing", "not_triggered", "skipped_not_configured", "unchanged"}
+_RETRYABLE_DATA_CATEGORIES = {
+    "upstream_not_ready", "upstream_not_published", "execution_slice_blocked",
+    "execution_slice_check_failed", "provider_bulk_contract_failed",
+    "waiting_stk_limit_gap_repair", "bulk_slice_contract_failed",
+}
 
 
 def classify_step_health(step: dict[str, Any]) -> dict[str, str]:
     """Normalise heterogeneous service results into one health contract."""
-    if step.get("error") or not bool(step.get("ok", True)):
-        return {"status": "failed", "reason": str(step.get("error") or "module_returned_not_ok")}
     result = step.get("result") if isinstance(step.get("result"), dict) else {}
     status = str(result.get("status") or "").lower()
+    # Historical OOS/sealed PIT evidence is a durable research wait, not a
+    # current-cycle code failure.  Audit functions correctly return
+    # ``ok=false`` while the evidence is unavailable, so classify this before
+    # the generic step-error branch below.  Otherwise the same condition is
+    # misreported as an internal outage and its repair loop keeps firing.
     if (
-        str(step.get("name") or "") == "hard_data_gate"
+        str(step.get("name") or "") in {"hard_data_gate", "sealed_holdout_data_gate"}
         and status == "blocked"
         and bool(result.get("non_repairable_dates"))
         and not bool(result.get("repair_dates"))
     ):
-        # Historical point-in-time availability cannot be repaired by a new
-        # upstream call.  It remains a formal-OOS gate, but is not a live
-        # system failure or an actionable autonomous repair.
         return {"status": "waiting_condition", "reason": "historical_point_in_time_unavailable"}
+    if step.get("error") or not bool(step.get("ok", True)):
+        return {"status": "failed", "reason": str(step.get("error") or "module_returned_not_ok")}
+    failure_category = str(
+        result.get("failure_category")
+        or step.get("failure_category")
+        or result.get("error_category")
+        or ""
+    ).strip().lower()
+    if failure_category in _RETRYABLE_DATA_CATEGORIES:
+        # A producer may have persisted a partial/completed result while the
+        # upstream slice is still absent.  Keep the autonomous cycle blocked
+        # until a later read proves the exact data contract complete.
+        return {"status": "failed", "reason": failure_category}
     if status in _FAILED:
         return {"status": "failed", "reason": status}
     if status in _DEGRADED:
@@ -175,7 +193,22 @@ def run_autonomous_self_healing(steps: list[dict[str, Any]]) -> dict[str, Any]:
 
     factor_step = by_name.get("factor_daily_cycle")
     hard_data_ready = components.get("hard_data_gate", {}).get("status") in {"healthy", "recovered"}
-    if factor_step and hard_data_ready and _factor_repair_needed(factor_step):
+    decision_step = by_name.get("decision_data_gate")
+    decision_result = (
+        decision_step.get("result")
+        if isinstance(decision_step, dict) and isinstance(decision_step.get("result"), dict)
+        else {}
+    )
+    current_experiment_ready = (
+        decision_step is not None
+        and components.get("decision_data_gate", {}).get("status") in {"healthy", "recovered"}
+        and bool(decision_result.get("experiment_ready"))
+    )
+    # Factor repair follows the current experiment contract.  The historical
+    # OOS gate is deliberately not a prerequisite; retain the hard-data
+    # fallback only for legacy callers that did not include a decision step.
+    factor_gate_ready = current_experiment_ready or (decision_step is None and hard_data_ready)
+    if factor_step and factor_gate_ready and _factor_repair_needed(factor_step):
         from app.services.factor_platform import run_factor_daily_cycle
 
         try:

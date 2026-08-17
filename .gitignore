@@ -47,6 +47,9 @@ outputs/
 .cache/
 cache/
 data/
+!backend/migrations/data/
+!backend/migrations/data/versions/
+!backend/migrations/data/versions/*.py
 *.db
 *.sqlite
 *.sqlite3

@@ -10,7 +10,6 @@ from zoneinfo import ZoneInfo
 
 from app.data_platform.db import _conn
 from app.data_platform.services.data_center import (
-    backfill_etf_daily_incremental,
     enrich_financial_research_fields,
     ensure_data_center_seeded,
     financial_research_completeness,
@@ -23,8 +22,9 @@ from app.data_platform.services.data_center import (
     sync_trade_calendar,
 )
 from app.data_platform.services.decision_data_contract import decision_data_contract, latest_decision_ready_trade_date
-from app.data_platform.services.market_calendar import target_trade_date
+from app.data_platform.services.market_calendar import TradeCalendarNotReady, target_trade_date
 from app.data_platform.services.snapshot_health import estimated_table_count, latest_usable_snapshot_date
+from app.data_platform.tushare_client import is_tushare_compatible_source
 from app.data_platform.services.exchange_etf_pcf import sync_exchange_etf_pcf
 from app.data_platform.services.oos_hard_data import audit_oos_hard_data
 from app.core.error_evidence import error_evidence
@@ -78,70 +78,163 @@ def _latest_decision_ready_trade_date(c: Any) -> str:
 
 
 def _benchmark_ready_for_date(c: Any, trade_date: str) -> bool:
-    """Return whether the point-in-time benchmark has a raw close for T."""
-    row = c.execute(
-        """SELECT 1 FROM dc_tushare_raw_records
-           WHERE api_name='index_daily' AND ts_code='000300.SH'
-             AND trade_date=? AND COALESCE(payload_json,'')<>''
-           LIMIT 1""",
-        (str(trade_date or "").replace("-", "")[:8],),
-    ).fetchone()
-    return bool(row)
+    """Return whether the benchmark has a complete exact-session bar for T.
+
+    Row presence alone is not enough: a partial raw response used to make the
+    daily updater look healthy while attribution could not calculate a daily
+    benchmark return. Real observation-time qualification belongs to the PIT
+    version migration; this is the field-level safety gate before that change.
+    """
+    from app.data_platform.services.data_center import _strict_benchmark_bar
+
+    return _strict_benchmark_bar(c, trade_date) is not None
 
 
 def _adj_factor_ready_for_date(c: Any, trade_date: str) -> bool:
-    row = c.execute(
-        """SELECT MAX(rows_read) AS rows_read FROM dc_tushare_request_coverage
-           WHERE api_name='adj_factor' AND trade_date=? AND result_status='success'""",
-        (str(trade_date or "").replace("-", "")[:8],),
-    ).fetchone()
-    return int((dict(row) if row else {}).get("rows_read") or 0) >= 500
+    """Require at least 500 valid immutable factor observations."""
+    from app.data_platform.services.data_center import _strict_adj_factor_codes
+
+    return len(_strict_adj_factor_codes(c, trade_date)) >= 500
 
 
-def _missing_defensive_etf_sessions(c: Any, trade_date: str, ts_codes: list[str], *, limit: int = 10) -> list[str]:
-    """Return recent open sessions lacking a complete defensive ETF slice."""
+def _fund_daily_execution_fields_ready(payload_json: Any) -> bool:
+    """Return whether a raw ETF record can support an exact open execution.
+
+    Row presence is not enough: a partial response can retain a valid key while
+    omitting the prices or volume required by the frozen execution contract.
+    Keep this parser local to the historical continuity audit so it can inspect
+    the caller's connection without accidentally treating a later row as ready.
+    """
+    if isinstance(payload_json, dict):
+        payload = payload_json
+    else:
+        try:
+            payload = json.loads(payload_json or "{}")
+        except (TypeError, json.JSONDecodeError):
+            return False
+    if not isinstance(payload, dict):
+        return False
+    from app.services.defensive_assets import defensive_asset_execution_missing_fields
+
+    return not defensive_asset_execution_missing_fields(payload)
+
+
+def _missing_defensive_etf_sessions(
+    c: Any,
+    trade_date: str,
+    ts_codes: list[str],
+    *,
+    limit: int = 10,
+    include_target: bool = True,
+) -> list[str]:
+    """Return recent open sessions lacking an executable defensive ETF slice."""
     target = str(trade_date or "").replace("-", "")[:8]
     if len(target) != 8 or not ts_codes:
         return []
-    placeholders = ",".join("?" for _ in ts_codes)
+    required = {str(code or "").strip().upper() for code in ts_codes if str(code or "").strip()}
+    if not required:
+        return []
+    placeholders = ",".join("?" for _ in required)
+    target_operator = "<=" if include_target else "<"
     rows = c.execute(
-        """SELECT cal_date FROM dc_trade_calendar
-           WHERE exchange='SSE' AND is_open=1 AND cal_date<=?
+        f"""SELECT cal_date FROM dc_trade_calendar
+           WHERE exchange='SSE' AND is_open=1 AND cal_date{target_operator}?
            ORDER BY cal_date DESC LIMIT ?""",
         (target, max(1, min(int(limit), 30))),
     ).fetchall()
     sessions = [str(dict(row).get("cal_date") or "").replace("-", "")[:8] for row in reversed(rows)]
     missing: list[str] = []
     for session in sessions:
-        count_row = c.execute(
-            f"""SELECT COUNT(DISTINCT ts_code) AS count
+        records = c.execute(
+            f"""SELECT ts_code,payload_json
                 FROM dc_tushare_raw_records
                WHERE api_name='fund_daily' AND trade_date=? AND ts_code IN ({placeholders})""",
-            (session, *ts_codes),
-        ).fetchone()
-        if int((dict(count_row) if count_row else {}).get("count") or 0) != len(ts_codes):
+            (session, *sorted(required)),
+        ).fetchall()
+        valid_codes = {
+            str(dict(row).get("ts_code") or "").strip().upper()
+            for row in records
+            if _fund_daily_execution_fields_ready(dict(row).get("payload_json"))
+        }
+        if valid_codes != required:
             missing.append(session)
     return missing
 
 
 def _repair_defensive_etf_continuity(trade_date: str, ts_codes: list[str]) -> dict[str, Any]:
-    """Repair missing ETF sessions with the only registered historical source.
+    """Repair missing ETF sessions through the same provider race as T+1 data.
 
-    Tencent is a current quote source.  It cannot repair a multi-session gap,
-    so it must never win a history-repair decision merely by returning first.
+    Historical recovery must not pin itself to the default TuShare endpoint.
+    Tencent is still accepted only when it can prove the exact requested bar;
+    otherwise the race selects one of the configured TuShare-compatible
+    endpoints and retains that provider on every raw record.
     """
+    from app.data_platform.services.market_data_discovery import (
+        discover_first_published,
+        mark_provider_bulk_result,
+    )
+    from app.data_platform.services.tencent_etf_daily_fallback import repair_fund_daily_from_tencent
+
     with _conn() as conn:
-        missing = _missing_defensive_etf_sessions(conn, trade_date, ts_codes)
+        # The current session is not history. It may safely use the narrowly
+        # verified Tencent quote fallback after a partial TuShare response.
+        # Only older sessions are restricted to canonical TuShare repair.
+        missing = _missing_defensive_etf_sessions(
+            conn, trade_date, ts_codes, include_target=False,
+        )
     if not missing:
         return {"ok": True, "status": "continuous", "missing_sessions": [], "results": []}
     results: list[dict[str, Any]] = []
     for session in missing:
+        discovery = discover_first_published("defensive_fund_daily", session)
+        winner = str(discovery.get("winner") or "")
         try:
-            results.append({"trade_date": session, **sync_tushare_api_raw("fund_daily", {"trade_date": session})})
+            if is_tushare_compatible_source(winner):
+                result = sync_tushare_api_raw(
+                    "fund_daily", {"trade_date": session}, provider=winner,
+                )
+            elif winner == "tencent_etf_quote":
+                result = repair_fund_daily_from_tencent(session, ts_codes)
+            else:
+                result = {
+                    "ok": False,
+                    "status": str(discovery.get("status") or "no_provider_published"),
+                    "failure_category": str(discovery.get("failure_category") or ""),
+                }
+            if winner:
+                mark_provider_bulk_result(
+                    "defensive_fund_daily",
+                    session,
+                    winner,
+                    ok=bool(result.get("ok")),
+                    evidence={"status": result.get("status"), "historical_continuity": True},
+                )
+            results.append({
+                "trade_date": session,
+                "winner": winner,
+                "discovery": discovery,
+                **result,
+            })
         except Exception as exc:  # noqa: BLE001 - preserve exact failed session evidence
-            results.append({"trade_date": session, "ok": False, "error": str(exc)[:300]})
+            if winner:
+                mark_provider_bulk_result(
+                    "defensive_fund_daily",
+                    session,
+                    winner,
+                    ok=False,
+                    evidence={"status": "bulk_fetch_failed", "error": str(exc)[:300], "historical_continuity": True},
+                )
+            results.append({
+                "trade_date": session,
+                "winner": winner,
+                "discovery": discovery,
+                "ok": False,
+                "error": str(exc)[:300],
+            })
     with _conn() as conn:
-        remaining = _missing_defensive_etf_sessions(conn, trade_date, ts_codes)
+        remaining = _missing_defensive_etf_sessions(
+            conn, trade_date, ts_codes, include_target=False,
+        )
     return {
         "ok": not remaining,
         "status": "repaired" if not remaining else "historical_source_incomplete",
@@ -154,6 +247,29 @@ def _repair_defensive_etf_continuity(trade_date: str, ts_codes: list[str]) -> di
 def _set_state(**values: Any) -> None:
     with _lock:
         _state.update(values)
+
+
+_NON_RETRYABLE_DISCOVERY_FAILURES = frozenset({
+    "authentication", "permission", "invalid_request", "unknown",
+})
+
+
+def _discovery_state(target: str, discovery: dict[str, Any]) -> dict[str, Any]:
+    """Expose provider failures as errors instead of an endless probe spinner."""
+    category = str(discovery.get("failure_category") or "").strip().lower()
+    if category in _NON_RETRYABLE_DISCOVERY_FAILURES:
+        return {
+            "phase": "blocked",
+            "message": f"{target} 数据源探针失败：{category}，等待外部依赖修复",
+            "failure_category": category,
+            "retry_after_seconds": int(discovery.get("retry_after_seconds") or 86400),
+            "discovery": discovery,
+        }
+    return {
+        "phase": "discovering",
+        "message": f"正在探测 {target} 各行情源发布时间",
+        "discovery": discovery,
+    }
 
 
 def _daily_update_retry_policy(c: Any, trade_date: str, *, now: datetime | None = None) -> dict[str, Any]:
@@ -201,6 +317,7 @@ def _daily_update_retry_policy(c: Any, trade_date: str, *, now: datetime | None 
         "reason": "cooldown_elapsed" if remaining <= 0 else "data_refresh_cooldown",
         "category": category,
         "retry_after_seconds": remaining,
+        "next_retry_at": (current + timedelta(seconds=remaining)).isoformat(timespec="seconds"),
     }
 
 
@@ -345,13 +462,28 @@ def _worker(parent_run_id: int) -> None:
         with _conn() as c:
             adj_factor_ready = _adj_factor_ready_for_date(c, trade_date)
         if not adj_factor_ready:
-            adj_result = sync_market_bundle(trade_date, apis=["adj_factor"])
+            from app.data_platform.services.market_data_discovery import discover_first_published
+
+            adj_discovery = discover_first_published("adj_factor", trade_date)
+            adj_provider = str(adj_discovery.get("winner") or "")
+            if adj_discovery.get("ok") and adj_provider:
+                adj_result = sync_market_bundle(
+                    trade_date, apis=["adj_factor"], provider=adj_provider,
+                )
+            else:
+                adj_result = {
+                    "ok": False,
+                    "api": "adj_factor",
+                    "status": adj_discovery.get("status") or "provider_failed",
+                    "failure_category": adj_discovery.get("failure_category") or "upstream_not_ready",
+                    "discovery": adj_discovery,
+                }
             steps.append({"step": "adj_factor", "result": adj_result})
             from app.data_platform.services.market_data_discovery import mark_provider_bulk_result
             mark_provider_bulk_result(
                 "adj_factor",
                 trade_date,
-                "tushare",
+                adj_provider or "tushare",
                 ok=bool(adj_result.get("ok")),
                 evidence={"status": adj_result.get("failure_category") or "completed"},
             )
@@ -377,17 +509,19 @@ def _worker(parent_run_id: int) -> None:
                 discover_first_published,
                 mark_provider_bulk_result,
             )
-            from app.services.defensive_assets import DEFENSIVE_ASSETS
+            from app.services.defensive_assets import DEFENSIVE_ASSETS, defensive_asset_execution_status
 
             defensive_codes = sorted(str(item["ts_code"]) for item in DEFENSIVE_ASSETS)
             continuity = _repair_defensive_etf_continuity(trade_date, defensive_codes)
             if continuity.get("ok"):
                 etf_discovery = discover_first_published("defensive_fund_daily", trade_date)
                 winner = str(etf_discovery.get("winner") or "")
-                if winner == "tushare":
-                    provider_result = backfill_etf_daily_incremental(
-                        start_date=trade_date, end_date=trade_date, cursor="", limit_dates=1, nav_limit_funds=0,
-                    )
+                if is_tushare_compatible_source(winner):
+                    # A successful coverage row can coexist with a retained
+                    # ETF bar that misses an execution field.  Do not route
+                    # that exact repair through the incremental cursor: it
+                    # would skip the request again and strand the gap.
+                    provider_result = sync_tushare_api_raw("fund_daily", {"trade_date": trade_date}, provider=winner)
                 elif winner == "tencent_etf_quote":
                     provider_result = repair_fund_daily_from_tencent(trade_date, defensive_codes)
                 else:
@@ -396,24 +530,27 @@ def _worker(parent_run_id: int) -> None:
                 etf_discovery = {"ok": False, "status": "historical_etf_gap_requires_tushare", "winner": "tushare"}
                 winner = "tushare"
                 provider_result = continuity
-            with _conn() as conn:
-                placeholders = ",".join("?" for _ in defensive_codes)
-                row = conn.execute(
-                    f"""SELECT COUNT(DISTINCT ts_code) AS count
-                        FROM dc_tushare_raw_records
-                        WHERE api_name='fund_daily' AND trade_date=?
-                          AND ts_code IN ({placeholders})""",
-                    (trade_date, *defensive_codes),
-                ).fetchone()
-            slice_rows = int((dict(row) if row else {}).get("count") or 0)
-            slice_ready = slice_rows == len(defensive_codes)
+            # This is intentionally the same field-level contract the frozen
+            # T+1 executor uses. A retained raw record without open/pre_close/
+            # volume must remain a visible, retryable gap rather than making
+            # daily ingestion appear healthy until execution discovers it.
+            execution_slice = defensive_asset_execution_status(trade_date, defensive_codes)
+            slice_rows = len(execution_slice.get("ready") or [])
+            slice_ready = bool(execution_slice.get("ok"))
             if winner:
                 mark_provider_bulk_result(
                     "defensive_fund_daily",
                     trade_date,
                     winner,
                     ok=slice_ready,
-                    evidence={"status": provider_result.get("status"), "rows": slice_rows},
+                    coverage=(slice_rows / len(defensive_codes)) if defensive_codes else 0.0,
+                    evidence={
+                        "status": provider_result.get("status"),
+                        "rows": slice_rows,
+                        "required_rows": len(defensive_codes),
+                        "missing": execution_slice.get("missing") or [],
+                        "execution_contract": execution_slice.get("schema_version"),
+                    },
                 )
             steps.append({"step": "etf_daily", "result": {
                 "ok": slice_ready,
@@ -424,13 +561,28 @@ def _worker(parent_run_id: int) -> None:
                 "provider_result": provider_result,
                 "slice_rows": slice_rows,
                 "required_rows": len(defensive_codes),
+                "execution_slice": execution_slice,
             }})
+            if not slice_ready:
+                raise DailyUpdateDataBlocked(
+                    f"{trade_date} 注册防御ETF执行切片未就绪："
+                    + ",".join(execution_slice.get("missing") or ["unknown"]),
+                    category="execution_slice_blocked",
+                    retry_after_seconds=60,
+                )
         except Exception as exc:  # noqa: BLE001
+            if isinstance(exc, DailyUpdateDataBlocked):
+                raise
             logger.warning("daily ETF market update deferred: %s", str(exc)[:300])
             steps.append({"step": "etf_daily", "result": error_evidence(
                 exc, operation="daily_update:etf_daily", source="data_platform", deferred=True,
                 context={"trade_date": trade_date},
             )})
+            raise DailyUpdateDataBlocked(
+                f"{trade_date} 注册防御ETF执行切片检查失败：{type(exc).__name__}",
+                category="execution_slice_check_failed",
+                retry_after_seconds=60,
+            ) from exc
 
         _set_state(phase="etf_pcf", message=f"正在更新 {trade_date} ETF 申购赎回篮子", progress=72)
         try:
@@ -467,9 +619,20 @@ def _worker(parent_run_id: int) -> None:
                 exc, operation="daily_update:research_pool", source="research", deferred=True,
                 context={"trade_date": trade_date},
             )})
+        # The market updater is successful only after the same strict decision
+        # contract used by the executor passes.  A raw fetch/coverage row by
+        # itself must never produce a healthy completion.
+        with _conn() as c:
+            final_contract = decision_data_contract(trade_date, conn=c)
+        if not final_contract.get("ok"):
+            raise DailyUpdateDataBlocked(
+                str(final_contract.get("reason") or f"{trade_date} 决策数据严格合同未通过"),
+                category="decision_contract_incomplete",
+                retry_after_seconds=60,
+            )
         final_status = "completed"
         _set_state(running=False, phase="completed", message=f"数据已更新到 {trade_date}", progress=100,
-                   finished_at=_now(), steps=steps)
+                   finished_at=_now(), steps=steps, decision_contract=final_contract)
     except Exception as exc:  # noqa: BLE001
         final_status, error = "failed", str(exc)[:1000]
         failure_category = str(getattr(exc, "category", "internal_fault"))
@@ -505,8 +668,22 @@ def start_daily_update() -> dict[str, Any]:
     with _lock:
         if _state.get("running"):
             return {"ok": False, "reason": "already_running", **_state}
+        try:
+            with _conn() as c:
+                target = target_trade_date(c)
+        except TradeCalendarNotReady as exc:
+            blocked = {
+                "ok": False,
+                "reason": exc.code,
+                "failure_category": exc.code,
+                "phase": "blocked",
+                "message": str(exc),
+                "error": str(exc),
+                "retry_after_seconds": 60,
+            }
+            _set_state(running=False, **blocked)
+            return {**blocked, **_state}
         with _conn() as c:
-            target = target_trade_date(c)
             retry_policy = _daily_update_retry_policy(c, target)
             if not retry_policy.get("allowed"):
                 return {
@@ -553,14 +730,23 @@ def start_daily_update_scheduler() -> bool:
                         ready = _latest_decision_ready_trade_date(c)
                         benchmark_ready = _benchmark_ready_for_date(c, target)
                         adj_factor_ready = _adj_factor_ready_for_date(c, target)
+                        from app.services.defensive_assets import DEFENSIVE_ASSETS, defensive_asset_execution_status
+                        defensive_codes = [str(item["ts_code"]) for item in DEFENSIVE_ASSETS]
+                        defensive_execution_slice = defensive_asset_execution_status(target, defensive_codes)
                         retry_policy = _daily_update_retry_policy(c, target, now=now)
                     else:
                         ready = ""
                         benchmark_ready = False
                         adj_factor_ready = False
+                        defensive_execution_slice = {"ok": False, "missing": []}
                         retry_policy = {"allowed": False, "reason": "before_close_data_window"}
                 if should_check:
-                    if target and (ready != target or not benchmark_ready or not adj_factor_ready) and retry_policy.get("allowed"):
+                    if target and (
+                        ready != target
+                        or not benchmark_ready
+                        or not adj_factor_ready
+                        or not defensive_execution_slice.get("ok")
+                    ) and retry_policy.get("allowed"):
                         from app.data_platform.services.market_data_discovery import (
                             discover_first_published,
                             discover_market_core,
@@ -570,8 +756,10 @@ def start_daily_update_scheduler() -> bool:
                             discovery = discover_market_core(target)
                         elif not benchmark_ready:
                             discovery = discover_first_published("index_daily", target)
-                        else:
+                        elif not adj_factor_ready:
                             discovery = discover_first_published("adj_factor", target)
+                        else:
+                            discovery = discover_first_published("defensive_fund_daily", target)
                         if discovery.get("ok"):
                             result = start_daily_update()
                             if result.get("ok"):
@@ -586,21 +774,35 @@ def start_daily_update_scheduler() -> bool:
                         else:
                             _set_state(
                                 running=False,
-                                phase="discovering",
-                                message=f"正在探测 {target} 各行情源发布时间",
                                 trade_date=target,
-                                discovery=discovery,
+                                **_discovery_state(target, discovery),
                             )
-                    elif target and ready != target and retry_policy.get("reason") == "data_refresh_cooldown":
+                    elif target and (
+                        ready != target or not benchmark_ready or not adj_factor_ready or not defensive_execution_slice.get("ok")
+                    ) and retry_policy.get("reason") == "data_refresh_cooldown":
                         _set_state(
                             running=False,
                             phase="cooldown",
-                            message="检测到相同数据切片故障，系统按冷却窗口自主复核",
+                            message="检测到同一数据或执行切片故障，系统按冷却窗口自主复核",
                             trade_date=target,
                             failure_category=retry_policy.get("category"),
                             retry_after_seconds=retry_policy.get("retry_after_seconds"),
+                            next_retry_at=retry_policy.get("next_retry_at"),
+                            defensive_execution_slice=defensive_execution_slice,
                         )
                 beat("daily_update_scheduler")
+            except TradeCalendarNotReady as exc:
+                _set_state(
+                    running=False,
+                    phase="blocked",
+                    message=str(exc),
+                    error=str(exc),
+                    failure_category=exc.code,
+                    retry_after_seconds=60,
+                    trade_date="",
+                )
+                logger.warning("自动收盘日更因交易日历未就绪而阻断: %s", exc)
+                beat("daily_update_scheduler", error=str(exc))
             except Exception as exc:  # noqa: BLE001
                 logger.warning("自动收盘日更检查失败: %s", str(exc)[:300])
                 beat("daily_update_scheduler", error=str(exc))
@@ -619,6 +821,22 @@ def start_daily_update_scheduler() -> bool:
 def daily_update_status(*, compact: bool = False) -> dict[str, Any]:
     with _lock:
         state = {"ok": True, **_state}
+    if str(state.get("phase") or "") in {"failed", "blocked"}:
+        state["ok"] = False
+    retry_after_seconds = max(0, int(state.get("retry_after_seconds") or 0))
+    if retry_after_seconds and not str(state.get("next_retry_at") or "").strip():
+        origin = state.get("finished_at") or state.get("updated_at")
+        try:
+            parsed_origin = datetime.fromisoformat(str(origin or "").replace("Z", "+00:00"))
+            if parsed_origin.tzinfo is None:
+                parsed_origin = parsed_origin.replace(tzinfo=_BUSINESS_TZ)
+            else:
+                parsed_origin = parsed_origin.astimezone(_BUSINESS_TZ)
+        except ValueError:
+            parsed_origin = _business_now()
+        state["next_retry_at"] = (
+            parsed_origin + timedelta(seconds=retry_after_seconds)
+        ).isoformat(timespec="seconds")
     try:
         with _conn() as c:
             state["latest_usable_snapshot_date"] = _latest_usable_snapshot_date(c)
@@ -663,6 +881,15 @@ def daily_update_status(*, compact: bool = False) -> dict[str, Any]:
                 "items": recent_execution_status(target),
                 "contract": "alis_market_bulk_checkpoint_v1",
             }
+    except TradeCalendarNotReady as exc:
+        state.update({
+            "ok": False,
+            "phase": "blocked",
+            "failure_category": exc.code,
+            "error": str(exc),
+            "message": str(exc),
+            "trade_date": "",
+        })
     except Exception as exc:  # noqa: BLE001
         state["status_error"] = str(exc)[:200]
     if compact:
@@ -674,21 +901,33 @@ def daily_update_status(*, compact: bool = False) -> dict[str, Any]:
 
 
 def simple_health() -> dict[str, Any]:
-    with _conn() as c:
-        target = target_trade_date(c)
-        contract = decision_data_contract(target, conn=c)
-        snapshot_count, snapshot_count_estimated = estimated_table_count(c, "dc_stock_daily_snapshot")
-        values = {
-            "stock_count": c.execute("SELECT COUNT(*) cnt FROM dc_stock_master").fetchone(),
-            "snapshot_count": {"cnt": snapshot_count},
-            "latest_trade_date": {"value": _latest_usable_snapshot_date(c)},
-            "latest_decision_ready_trade_date": {"value": _latest_decision_ready_trade_date(c)},
-            "latest_announcement": c.execute("SELECT MAX(publish_time) value FROM dc_announcement_raw").fetchone(),
-            "failed_runs": c.execute("SELECT COUNT(*) cnt FROM data_ingestion_runs WHERE status='failed'").fetchone(),
-            "recent_failed_runs": c.execute(
-                "SELECT COUNT(*) cnt FROM data_ingestion_runs WHERE status='failed' AND COALESCE(finished_at,started_at)>=?",
-                ((_business_now() - timedelta(hours=24)).isoformat(timespec="seconds"),),
-            ).fetchone(),
+    try:
+        with _conn() as c:
+            target = target_trade_date(c)
+            contract = decision_data_contract(target, conn=c)
+            snapshot_count, snapshot_count_estimated = estimated_table_count(c, "dc_stock_daily_snapshot")
+            values = {
+                "stock_count": c.execute("SELECT COUNT(*) cnt FROM dc_stock_master").fetchone(),
+                "snapshot_count": {"cnt": snapshot_count},
+                "latest_trade_date": {"value": _latest_usable_snapshot_date(c)},
+                "latest_decision_ready_trade_date": {"value": _latest_decision_ready_trade_date(c)},
+                "latest_announcement": c.execute("SELECT MAX(publish_time) value FROM dc_announcement_raw").fetchone(),
+                "failed_runs": c.execute("SELECT COUNT(*) cnt FROM data_ingestion_runs WHERE status='failed'").fetchone(),
+                "recent_failed_runs": c.execute(
+                    "SELECT COUNT(*) cnt FROM data_ingestion_runs WHERE status='failed' AND COALESCE(finished_at,started_at)>=?",
+                    ((_business_now() - timedelta(hours=24)).isoformat(timespec="seconds"),),
+                ).fetchone(),
+            }
+    except TradeCalendarNotReady as exc:
+        return {
+            "ok": False,
+            "level": "blocked",
+            "summary": str(exc),
+            "target_trade_date": "",
+            "latest_trade_date": "",
+            "latest_decision_ready_trade_date": "",
+            "decision_contract": {"ok": False, "error_code": exc.code, "error": str(exc)},
+            "calendar": {"status": "blocked", "error_code": exc.code},
         }
     data = {key: dict(row) for key, row in values.items()}
     latest = str(data["latest_trade_date"].get("value") or "")

@@ -120,3 +120,59 @@ def test_dynamic_gate_freeze_removes_refresh_clocks_but_keeps_point_in_time_evid
             },
         }],
     }
+
+
+def test_live_selection_uses_the_same_observation_cutoff_for_market_and_model_inputs(monkeypatch):
+    observed = {}
+    cutoff = "2026-07-24T18:10:00+08:00"
+
+    monkeypatch.setattr(
+        unified_stock_selection,
+        "resolve_production_strategy_champion",
+        lambda: {"strategy_id": 1, "champion_id": 50, "champion_version": "v50"},
+    )
+    monkeypatch.setattr(
+        unified_stock_selection,
+        "BacktestDataSource",
+        lambda: type("DS", (), {"set_as_of_time": lambda self, value: observed.setdefault("data_source", value)})(),
+    )
+
+    def rank(**kwargs):
+        observed["ranker"] = kwargs.get("as_of_time")
+        return ["000001"], {
+            "selections": [{"symbol": "000001", "score": 90}],
+            "filter_summary": {"universe": 500},
+        }
+
+    monkeypatch.setattr(unified_stock_selection, "_rank_full_market", rank)
+
+    def research(_code, **kwargs):
+        observed["research"] = kwargs.get("as_of_time")
+        return {"ok": True}, {
+            "eligible_for_core": True,
+            "gates": [],
+            "research_dimensions": {},
+            "raw_metrics": {},
+            "valuation": {},
+        }
+
+    monkeypatch.setattr(unified_stock_selection, "_prepare_research_admission", research)
+
+    def dynamic(symbols, **kwargs):
+        observed["dynamic"] = kwargs.get("as_of_time")
+        return list(symbols), [], {"status": "ready", "as_of_time": kwargs.get("as_of_time")}
+
+    monkeypatch.setattr(unified_stock_selection, "_apply_dynamic_admission", dynamic)
+
+    result = unified_stock_selection.build_unified_stock_selection(
+        signal_date="20260724",
+        observation_cutoff=cutoff,
+    )
+
+    assert result["data_as_of_time"] == cutoff
+    assert {key: observed[key] for key in ("data_source", "ranker", "research", "dynamic")} == {
+        "data_source": cutoff,
+        "ranker": cutoff,
+        "research": cutoff,
+        "dynamic": cutoff,
+    }

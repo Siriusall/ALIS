@@ -5,7 +5,7 @@ import json
 from typing import Any
 
 from app.services.backtest_data_source import BacktestDataSource
-from app.services.point_in_time import signal_available_time
+from app.services.point_in_time import normalize_explicit_timestamp, signal_available_time
 from app.services.production_strategy import resolve_production_strategy_champion
 
 
@@ -28,6 +28,7 @@ def _rank_full_market(
     exchange_group: str,
     scoring_timeout_sec: int | None,
     explain_symbols: list[str] | None = None,
+    as_of_time: str | None = None,
 ) -> tuple[list[str], dict[str, Any]]:
     from app.services.quant_run_engine import _build_target_symbols
 
@@ -40,6 +41,7 @@ def _rank_full_market(
         scoring_timeout_sec=scoring_timeout_sec,
         explain_symbols=explain_symbols,
         model_inference_mode="online_limited_live",
+        as_of_time=as_of_time,
     )
 
 
@@ -131,11 +133,20 @@ def build_unified_stock_selection(
     exchange_group: str = "HS",
     scoring_timeout_sec: int | None = None,
     holding_symbols: list[str] | None = None,
+    observation_cutoff: str | None = None,
 ) -> dict[str, Any]:
     """Build the sole formal equity-selection input without executing trades."""
 
     compact_date = _compact_date(signal_date)
-    cutoff = signal_available_time(compact_date)
+    # Historical replay keeps the strict T-day 15:00 cutoff.  A newly created
+    # current-day plan, however, is frozen when the complete close slice is
+    # actually received; using a guessed 15:00 wall clock here would reject
+    # valid post-close observations and make the plan disagree with its data
+    # contract.  The caller must provide the captured observation cutoff for
+    # that live path; absent it we preserve the replay-safe historical default.
+    cutoff = normalize_explicit_timestamp(observation_cutoff) if observation_cutoff else signal_available_time(compact_date)
+    if not cutoff:
+        raise ValueError("invalid observation cutoff")
     champion = resolve_production_strategy_champion()
     strategy_id = int(champion.get("strategy_id") or 0)
     if strategy_id <= 0:
@@ -156,6 +167,7 @@ def build_unified_stock_selection(
         exchange_group=str(exchange_group or "HS"),
         scoring_timeout_sec=scoring_timeout_sec,
         explain_symbols=holdings,
+        as_of_time=cutoff,
     )
     ranked_symbols = list(dict.fromkeys(
         str(value or "").strip() for value in ranked_symbols if str(value or "").strip()

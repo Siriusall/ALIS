@@ -43,15 +43,8 @@ def _latest_ready_date() -> str:
     health = assess_latest_decision_data_health()
     if not bool(health.get("experiment_ready")):
         return ""
-    latest = health.get("latest_snapshot") if isinstance(health.get("latest_snapshot"), dict) else {}
     readiness = health.get("readiness") if isinstance(health.get("readiness"), dict) else {}
-    return str(
-        latest.get("trade_date")
-        or latest.get("date")
-        or readiness.get("latest_decision_ready_trade_date")
-        or readiness.get("target_trade_date")
-        or ""
-    ).replace("-", "")[:8]
+    return str(readiness.get("target_trade_date") or "").replace("-", "")[:8]
 
 
 def run_controller_candidate_observation(

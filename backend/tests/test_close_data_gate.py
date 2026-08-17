@@ -22,6 +22,79 @@ def test_t1_execution_slice_does_not_require_new_decision_valuation_data() -> No
     assert not _market_slice_ready(stock_count, counts)
 
 
+def _close_status_counts() -> dict[str, int]:
+    return {
+        "stock_count": 1_000,
+        "daily_n": 1_000,
+        "execution_price_n": 1_000,
+        "valuation_n": 1_000,
+        "limit_n": 1_000,
+    }
+
+
+def test_close_data_status_uses_strict_decision_contract(monkeypatch) -> None:
+    monkeypatch.setattr(
+        quant_task_runner,
+        "_snapshot_data_status",
+        lambda: ("20260731", _close_status_counts()),
+    )
+    monkeypatch.setattr(
+        "app.data_platform.services.decision_data_contract.decision_data_contract",
+        lambda trade_date: {"ok": False, "latest_trade_date": trade_date},
+    )
+
+    target, ready, counts = quant_task_runner._close_data_status()
+
+    assert target == "20260731"
+    assert ready is False
+    assert counts["valuation_n"] == 1_000
+
+
+def test_close_data_status_accepts_only_a_passing_strict_decision_contract(monkeypatch) -> None:
+    monkeypatch.setattr(
+        quant_task_runner,
+        "_snapshot_data_status",
+        lambda: ("20260731", _close_status_counts()),
+    )
+    calls = []
+
+    def strict_contract(trade_date):
+        calls.append(trade_date)
+        return {"ok": True, "latest_trade_date": trade_date}
+
+    monkeypatch.setattr(
+        "app.data_platform.services.decision_data_contract.decision_data_contract",
+        strict_contract,
+    )
+
+    target, ready, _counts = quant_task_runner._close_data_status()
+
+    assert target == "20260731"
+    assert ready is True
+    assert calls == ["20260731"]
+
+
+def test_close_data_status_fails_closed_when_strict_contract_raises(monkeypatch) -> None:
+    monkeypatch.setattr(
+        quant_task_runner,
+        "_snapshot_data_status",
+        lambda: ("20260731", _close_status_counts()),
+    )
+
+    def broken_contract(_trade_date):
+        raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(
+        "app.data_platform.services.decision_data_contract.decision_data_contract",
+        broken_contract,
+    )
+
+    target, ready, _counts = quant_task_runner._close_data_status()
+
+    assert target == "20260731"
+    assert ready is False
+
+
 def test_frozen_t1_worker_uses_execution_gate_without_daily_basic(monkeypatch) -> None:
     monkeypatch.setattr(
         quant_task_runner,
@@ -125,7 +198,7 @@ def test_frozen_t1_worker_blocks_stale_defensive_asset_slice(monkeypatch) -> Non
     )
 
     assert decision.should_pause is True
-    assert decision.evidence["schema_version"] == "alis_frozen_t1_execution_data_gate_v2"
+    assert decision.evidence["schema_version"] == "alis_frozen_t1_execution_data_gate_v3"
     assert decision.evidence["defensive_assets"]["missing"] == ["510880.SH"]
 
 
@@ -199,8 +272,41 @@ def test_frozen_t1_refresh_only_requests_missing_defensive_assets(monkeypatch) -
         "start_date": "20260731",
         "end_date": "20260731",
         "ts_codes": ["510880.SH"],
+        "provider": "tushare",
     }
     assert result["fallback_result"] is None
+
+
+def test_frozen_t1_refresh_passes_compatible_provider_to_primary_refresh(monkeypatch) -> None:
+    statuses = iter([
+        {"ok": False, "missing": ["510880.SH"], "required": ["510880.SH"]},
+        {"ok": True, "missing": [], "required": ["510880.SH"]},
+    ])
+    captured = {}
+    quant_task_runner._defensive_execution_refresh_attempts.clear()
+    monkeypatch.setattr(
+        "app.services.defensive_assets.defensive_asset_execution_status",
+        lambda *_args, **_kwargs: next(statuses),
+    )
+    monkeypatch.setattr(
+        "app.services.defensive_assets.materialize_defensive_asset_history",
+        lambda **kwargs: captured.update(kwargs) or {"ok": True},
+    )
+    monkeypatch.setattr(
+        "app.data_platform.services.market_data_discovery.discover_first_published",
+        lambda *_args: {"ok": True, "winner": "tushare_proxy"},
+    )
+    monkeypatch.setattr(
+        "app.data_platform.services.market_data_discovery.mark_provider_bulk_result",
+        lambda *_args, **_kwargs: None,
+    )
+
+    result = quant_task_runner._refresh_missing_frozen_defensive_assets(
+        "20260731", ["510880.SH"],
+    )
+
+    assert result["ok"] is True
+    assert captured["provider"] == "tushare_proxy"
 
 
 def test_frozen_t1_refresh_uses_verified_fallback_after_primary_stays_partial(monkeypatch) -> None:

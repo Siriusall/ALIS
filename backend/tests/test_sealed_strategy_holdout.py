@@ -64,8 +64,15 @@ def test_audit_blocks_when_retained_hard_api_slices_are_missing(monkeypatch):
     monkeypatch.setattr(holdout, "SEALED_HOLDOUT_DATES", ("20190910", "20190911"))
     monkeypatch.setattr(holdout, "MINIMUM_DAILY_ROWS", 1)
     monkeypatch.setattr(holdout, "MINIMUM_MARKET_FIELD_RATIO", 1.0)
-    monkeypatch.setattr(holdout, "_date_api_sets", lambda *_args: {api: {"20190910"} for api in holdout.HARD_APIS})
-    monkeypatch.setattr(holdout, "_benchmark_date_set", lambda *_args: {"20190910"})
+    monkeypatch.setattr(holdout, "_strict_date_api_sets", lambda *_args: (
+        {api: {"20190910"} for api in holdout.HARD_APIS},
+        {(api, "20190910"): {"point_in_time_rows": 1, "raw_rows": 1, "first_observed_at": "2019-09-10T14:00:00+08:00"}
+         for api in holdout.HARD_APIS},
+    ))
+    monkeypatch.setattr(holdout, "_strict_benchmark_date_set", lambda *_args: {"20190910"})
+    monkeypatch.setattr(holdout, "_strict_snapshot_stats", lambda *_args: {
+        "20190910": {"rows_total": 1, "market_rows": 1, "max_observed_at": "2019-09-10T14:00:00+08:00"}
+    })
     monkeypatch.setattr(holdout, "audit_trade_calendar_range", lambda *_args, **_kwargs: {
         "present_dates": ["20190910", "20190911"],
         "present_sessions": 2,
@@ -77,17 +84,20 @@ def test_audit_blocks_when_retained_hard_api_slices_are_missing(monkeypatch):
 
     assert result["status"] == "blocked"
     assert result["eligible_sessions"] == 1
-    assert result["repair_dates"] == ["20190911"]
-    assert result["dates"][1]["reasons"] == [
-        "missing_hard_api_slices",
-        "benchmark_index_missing",
-    ]
+    assert result["repair_dates"] == []
+    assert result["non_repairable_dates"] == ["20190911"]
+    assert "missing_hard_api_slices" in result["dates"][1]["reasons"]
+    assert "benchmark_index_missing" in result["dates"][1]["reasons"]
     assert holdout.BENCHMARK_API_KEY in result["dates"][1]["missing_apis"]
 
 
 def test_repair_is_bounded_and_passes_exact_gap_details(monkeypatch):
     details = [
-        {"trade_date": f"201909{day:02d}", "eligible": False, "missing_apis": ["daily"], "reasons": ["missing_hard_api_slices"]}
+        {
+            "trade_date": f"201909{day:02d}", "eligible": False,
+            "missing_apis": ["daily"], "repairable_missing_apis": ["daily"],
+            "repairable": True, "reasons": ["missing_hard_api_slices"],
+        }
         for day in range(10, 18)
     ]
     monkeypatch.setattr(holdout, "audit_sealed_strategy_holdout", lambda **_kwargs: {
@@ -110,6 +120,41 @@ def test_repair_is_bounded_and_passes_exact_gap_details(monkeypatch):
     assert result["calendar_repair"]["status"] == "repaired"
 
 
+def test_repair_reports_non_repairable_block_instead_of_already_ready(monkeypatch):
+    monkeypatch.setattr(holdout, "audit_sealed_strategy_holdout", lambda **_kwargs: {
+        "status": "blocked", "repair_dates": [], "non_repairable_dates": ["20190910"],
+        "dates": [{"trade_date": "20190910", "eligible": False, "repairable": False}],
+        "eligible_sessions": 125,
+    })
+    monkeypatch.setattr(holdout, "repair_trade_calendar_range", lambda *_args, **_kwargs: {"ok": True})
+
+    result = holdout.repair_sealed_strategy_holdout()
+
+    assert result["status"] == "blocked_non_repairable"
+    assert result["repair"]["status"] == "no_repairable_dates"
+
+
+def test_adj_factor_bulk_gap_refuses_late_or_unrepairable_evidence(monkeypatch):
+    monkeypatch.setattr(holdout, "audit_sealed_strategy_holdout", lambda **_kwargs: {
+        "eligible_sessions": 125,
+        "required_sessions": 126,
+        "missing_sessions": 1,
+        "dates": [{
+            "trade_date": "20190910", "eligible": False,
+            "missing_apis": ["adj_factor"], "repairable_missing_apis": [],
+            "repairable": False, "late_arrival_apis": ["adj_factor"],
+            "snapshot_late_arrival": False,
+            "reasons": ["missing_hard_api_slices", "historical_point_in_time_unavailable"],
+        }],
+    })
+
+    result = holdout.sealed_holdout_adj_factor_only_gap()
+
+    assert result["homogeneous"] is False
+    assert result["repair_dates"] == []
+    assert result["gap_type"] == "mixed_or_non_repairable"
+
+
 def test_calendar_gap_is_separate_from_retained_api_gap(monkeypatch):
     connection = sqlite3.connect(":memory:")
     connection.row_factory = sqlite3.Row
@@ -124,8 +169,15 @@ def test_calendar_gap_is_separate_from_retained_api_gap(monkeypatch):
     monkeypatch.setattr(holdout, "SEALED_HOLDOUT_DATES", ("20190910",))
     monkeypatch.setattr(holdout, "MINIMUM_DAILY_ROWS", 1)
     monkeypatch.setattr(holdout, "MINIMUM_MARKET_FIELD_RATIO", 1.0)
-    monkeypatch.setattr(holdout, "_date_api_sets", lambda *_args: {api: {"20190910"} for api in holdout.HARD_APIS})
-    monkeypatch.setattr(holdout, "_benchmark_date_set", lambda *_args: {"20190910"})
+    monkeypatch.setattr(holdout, "_strict_date_api_sets", lambda *_args: (
+        {api: {"20190910"} for api in holdout.HARD_APIS},
+        {(api, "20190910"): {"point_in_time_rows": 1, "raw_rows": 1, "first_observed_at": "2019-09-10T14:00:00+08:00"}
+         for api in holdout.HARD_APIS},
+    ))
+    monkeypatch.setattr(holdout, "_strict_benchmark_date_set", lambda *_args: {"20190910"})
+    monkeypatch.setattr(holdout, "_strict_snapshot_stats", lambda *_args: {
+        "20190910": {"rows_total": 1, "market_rows": 1, "max_observed_at": "2019-09-10T14:00:00+08:00"}
+    })
     monkeypatch.setattr(holdout, "audit_trade_calendar_range", lambda *_args, **_kwargs: {
         "present_dates": [], "present_sessions": 0, "missing_sessions": 1, "missing_dates": ["20190910"],
     })

@@ -18,62 +18,62 @@ import threading
 from typing import Any
 
 from app.data_platform.db import _conn as data_conn
+from app.data_platform.services.market_calendar import target_trade_date
 from app.db.store import get_account_balance, get_account_baseline, get_positions
 from app.services.market_context import live_market_context
 from app.services.operations_overview import build_live_portfolio_risk
-from app.services.position_valuation import build_position_market_series_cache
-from app.services.quant_run_engine import list_consolidated_trade_dates
+from app.services.position_valuation import (
+    PositionMarketDataNotReadyError,
+    build_position_market_series_cache,
+    missing_exact_position_valuations,
+)
 from app.services.model_registry import get_model_status
 from app.services.thesis_store import list_theses
 from app.services.decision_store import list_pool_members
 from app.core.a_share_fees import is_exchange_etf
 from app.services.defensive_assets import defensive_asset_bar, defensive_asset_bars
-from app.services.point_in_time import signal_available_time
 
 
 def _current_price(symbol: str, trade_date: str | None = None) -> float | None:
-    """Get latest close price from snapshot."""
+    """Read an exact-session close for a report; never relabel a prior bar."""
     code = symbol.strip().upper()
     compact_date = str(trade_date or "").replace("-", "")[:8]
-    cutoff = signal_available_time(compact_date) if compact_date else ""
+    if not compact_date:
+        return None
+    cutoff = datetime.now().astimezone().isoformat(timespec="seconds")
     if is_exchange_etf(code):
         # A bare ETF code does not encode its exchange.  Do not assume SSE:
         # SZSE ETFs (notably 15/16 prefixes) otherwise disappear from NAV.
         etf_codes = [code] if code.endswith((".SH", ".SZ")) else [f"{code}.SH", f"{code}.SZ"]
         for ts_code in etf_codes:
-            bar = defensive_asset_bar(ts_code, trade_date or datetime.now().strftime("%Y%m%d"))
-            if not bar and trade_date:
-                with data_conn() as c:
-                    row = c.execute(
-                        """SELECT trade_date FROM dc_tushare_raw_records
-                           WHERE api_name='fund_daily' AND ts_code=? AND trade_date<=?
-                           ORDER BY trade_date DESC LIMIT 1""",
-                        (ts_code, str(trade_date).replace("-", "")),
-                    ).fetchone()
-                if row:
-                    bar = defensive_asset_bar(ts_code, str(dict(row).get("trade_date") or ""))
+            bar = defensive_asset_bar(
+                ts_code,
+                compact_date,
+                exact_date=True,
+                available_as_of_time=cutoff,
+            )
             if bar:
                 return float(bar.get("close") or 0) or None
     if not code.endswith((".SH", ".SZ", ".BJ")):
         suffixes = (".BJ",) if code[:1] in {"4", "8"} else (".SH", ".SZ")
         for suffix in suffixes:
             with data_conn() as c:
-                sql = "SELECT close FROM dc_stock_daily_snapshot WHERE ts_code=?"
-                params: tuple[Any, ...] = (f"{code}{suffix}",)
-                if compact_date:
-                    sql += " AND trade_date<=? AND available_time<=?"
-                    params += (compact_date, cutoff)
-                row = c.execute(sql + " ORDER BY trade_date DESC LIMIT 1", params).fetchone()
+                row = c.execute(
+                    """SELECT close FROM dc_stock_daily_snapshot
+                         WHERE ts_code=? AND trade_date=? AND available_time<=?
+                         ORDER BY available_time DESC LIMIT 1""",
+                    (f"{code}{suffix}", compact_date, cutoff),
+                ).fetchone()
                 if row:
                     return float(dict(row).get("close") or 0) or None
         return None
     with data_conn() as c:
-        sql = "SELECT close FROM dc_stock_daily_snapshot WHERE ts_code=?"
-        params = (code,)
-        if compact_date:
-            sql += " AND trade_date<=? AND available_time<=?"
-            params += (compact_date, cutoff)
-        row = c.execute(sql + " ORDER BY trade_date DESC LIMIT 1", params).fetchone()
+        row = c.execute(
+            """SELECT close FROM dc_stock_daily_snapshot
+                 WHERE ts_code=? AND trade_date=? AND available_time<=?
+                 ORDER BY available_time DESC LIMIT 1""",
+            (code, compact_date, cutoff),
+        ).fetchone()
         return float(dict(row).get("close") or 0) if row else None
 
 
@@ -93,12 +93,18 @@ def build_daily_rebalance_summary() -> dict[str, Any]:
     positions = get_positions()
     balance = get_account_balance()
     baseline = get_account_baseline()
-    trade_dates = list_consolidated_trade_dates()
-    trade_date = trade_dates[-1] if trade_dates else ""
-    total_equity = float(balance) + sum(
-        float(item.get("quantity") or 0) * float(item.get("price") or 0)
+    with data_conn() as conn:
+        trade_date = target_trade_date(conn)
+    valuation = build_position_market_series_cache(positions, as_of=trade_date)
+    missing = missing_exact_position_valuations(positions, valuation, as_of=trade_date)
+    if missing:
+        raise PositionMarketDataNotReadyError(missing, trade_date, missing)
+    position_value = sum(
+        float(item.get("quantity") or 0)
+        * float((valuation.get(str(item.get("symbol") or "")) or {}).get("price") or 0)
         for item in positions
     )
+    total_equity = float(balance) + position_value
     return {
         "ok": True,
         "status": "available",
@@ -109,6 +115,7 @@ def build_daily_rebalance_summary() -> dict[str, Any]:
         "sections": [],
         "summary": {
             "total_equity": round(total_equity, 2),
+            "position_market_value": round(position_value, 2),
             "cash_balance": round(float(balance), 2),
             "position_count": len(positions),
             "total_return_pct": round((total_equity - float(baseline)) / float(baseline) * 100, 2) if float(baseline) > 0 else 0.0,
@@ -123,7 +130,9 @@ def _batch_quotes_and_names(symbols: list[str], trade_date: str) -> tuple[dict[s
     if not normalized:
         return {}, {}
     compact_date = str(trade_date or "").replace("-", "")[:8]
-    cutoff = signal_available_time(compact_date) if compact_date else "9999-12-31T23:59:59"
+    if not compact_date:
+        return {}, {}
+    cutoff = datetime.now().astimezone().isoformat(timespec="seconds")
     prices: dict[str, float] = {}
     names: dict[str, str] = {}
     etf_codes: set[str] = set()
@@ -142,7 +151,12 @@ def _batch_quotes_and_names(symbols: list[str], trade_date: str) -> tuple[dict[s
             else:
                 stock_codes.update({f"{symbol}.SH", f"{symbol}.SZ"})
     if etf_codes:
-        for code, bar in defensive_asset_bars(etf_codes, compact_date or datetime.now().strftime("%Y%m%d")).items():
+        for code, bar in defensive_asset_bars(
+            etf_codes,
+            compact_date,
+            exact_date=True,
+            available_as_of_time=cutoff,
+        ).items():
             close = float(bar.get("close") or 0)
             if close > 0:
                 prices[code] = close
@@ -150,10 +164,8 @@ def _batch_quotes_and_names(symbols: list[str], trade_date: str) -> tuple[dict[s
         sorted_codes = tuple(sorted(stock_codes))
         value_placeholders = ",".join("(?)" for _ in sorted_codes)
         params: tuple[Any, ...] = sorted_codes
-        date_clause = ""
-        if compact_date:
-            date_clause = " AND snapshot.trade_date<=? AND snapshot.available_time<=?"
-            params += (compact_date, cutoff)
+        date_clause = " AND snapshot.trade_date=? AND snapshot.available_time<=?"
+        params += (compact_date, cutoff)
         with data_conn() as c:
             rows = c.execute(
                 f"""SELECT requested.ts_code,latest.close
@@ -200,8 +212,8 @@ def _build_daily_rebalance_report() -> dict[str, Any]:
     positions_raw = get_positions()
     report_trade_date = str(market.get("trade_date") or "").replace("-", "")[:8]
     if len(report_trade_date) != 8 or not report_trade_date.isdigit():
-        trade_dates = list_consolidated_trade_dates()
-        report_trade_date = trade_dates[-1] if trade_dates else ""
+        with data_conn() as conn:
+            report_trade_date = target_trade_date(conn)
     valuation_cache = build_position_market_series_cache(
         positions_raw,
         as_of=report_trade_date,

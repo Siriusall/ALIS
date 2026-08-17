@@ -8,6 +8,27 @@ import pytest
 from app.data_platform.services import data_center
 
 
+def test_training_market_batch_uses_discovered_compatible_provider(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        "app.data_platform.services.market_data_discovery.discover_first_published",
+        lambda api_name, trade_date: {"ok": True, "winner": "tushare_proxy", "api": api_name, "trade_date": trade_date},
+    )
+    monkeypatch.setattr(
+        data_center,
+        "sync_tushare_api_raw",
+        lambda api_name, params, **kwargs: calls.append((api_name, params, kwargs))
+        or {"ok": True, "rows_read": 5_500, "rows_written": 5_500},
+    )
+
+    result = data_center.sync_training_market_date_vip("20260814")
+
+    assert result["ok"] is True
+    assert result["mode"] == "tushare_compatible_trade_date_batch_v2"
+    assert [item[0] for item in calls] == ["daily", "daily_basic", "stk_limit"]
+    assert all(item[2] == {"provider": "tushare_proxy"} for item in calls)
+
+
 def test_supported_vip_data_catalog_is_complete():
     names = {item.api_name for item in data_center.TUSHARE_CATALOG}
     assert {

@@ -121,7 +121,7 @@ def test_plan_model_moneyflow_backfill_requeues_without_global_plan(monkeypatch)
     assert states[-1]["next_message_id"] == "next-1"
 
 
-def test_moneyflow_available_time_normalization_uses_bounded_transactions(monkeypatch):
+def test_moneyflow_available_time_normalization_never_fabricates_observation_clock(monkeypatch):
     batches = []
 
     class Result:
@@ -146,8 +146,8 @@ def test_moneyflow_available_time_normalization_uses_bounded_transactions(monkey
         chunk_size=10,
     )
 
-    assert [len(batch) for batch in batches] == [10, 10, 5]
-    assert normalized == 15
+    assert batches == []
+    assert normalized == 0
 
 
 def test_event_disclosure_normalization_stops_when_id_cursor_cannot_advance(monkeypatch):

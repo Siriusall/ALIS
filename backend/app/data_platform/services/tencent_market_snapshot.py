@@ -28,6 +28,7 @@ from app.data_platform.services.market_bulk_execution import (
     finish_execution,
     record_batch,
 )
+from app.data_platform.services.observation_clock import upsert_raw_record
 
 
 SOURCE_CODE = "tencent_market_snapshot"
@@ -365,7 +366,9 @@ def sync_tencent_market_bundle(trade_date: str, apis: list[str] | tuple[str, ...
             "incomplete": incomplete,
         }
     observed_at = _now()
-    available_time = f"{target[:4]}-{target[4:6]}-{target[6:]}T15:00:00"
+    # The quote belongs to the target session economically, but it was
+    # actually observed now.  Never write a synthetic T15 observation time.
+    economic_time = f"{target[:4]}-{target[4:6]}-{target[6:]}T15:00:00+08:00"
     with _conn() as conn:
         continuity = _previous_close_sample(conn, target, quotes)
         if not continuity.get("ok"):
@@ -381,7 +384,7 @@ def sync_tencent_market_bundle(trade_date: str, apis: list[str] | tuple[str, ...
                 "source_url": QUOTE_URL,
                 "quote_time": quote["quote_time"],
                 "observed_at": observed_at,
-                "economic_available_time": available_time,
+                "economic_available_time": economic_time,
                 "verification_status": "full_slice_and_previous_close_sample_validated",
                 "continuity_sample_size": int(continuity["compared"]),
                 "pending_primary_reconciliation": True,
@@ -410,25 +413,12 @@ def sync_tencent_market_bundle(trade_date: str, apis: list[str] | tuple[str, ...
                 }
                 payload["_field_source_contract"] = "alis_market_field_lineage_v1"
                 payload.update(common)
-                cursor = conn.execute(
-                    """INSERT INTO dc_tushare_raw_records
-                       (api_name,record_key,ts_code,trade_date,period,ann_date,payload_json,
-                        source_code,available_time,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)
-                       ON CONFLICT(api_name,record_key) DO NOTHING""",
-                    (
-                        api_name,
-                        f"{code}|{target}",
-                        code,
-                        target,
-                        "",
-                        "",
-                        json.dumps(payload, ensure_ascii=False, separators=(",", ":"), allow_nan=False),
-                        SOURCE_CODE,
-                        available_time,
-                        observed_at,
-                    ),
+                inserted[api_name] += upsert_raw_record(
+                    conn, api_name=api_name, record_key=f"{code}|{target}", ts_code=code,
+                    trade_date=target, payload=payload, source_code=SOURCE_CODE,
+                    observed_at=observed_at, economic_time=economic_time,
+                    provenance="tencent_market_snapshot:validated_fallback",
                 )
-                inserted[api_name] += max(0, int(cursor.rowcount or 0))
     finish_execution(
         target, SOURCE_CODE, EXECUTION_SCOPE, status="validated",
         elapsed_ms=int(transfer.get("elapsed_ms") or 0), evidence={"received": len(quotes), "apis": list(selected_apis)},
@@ -444,7 +434,7 @@ def sync_tencent_market_bundle(trade_date: str, apis: list[str] | tuple[str, ...
         "inserted": inserted,
         "eligible_rows": {api: len(value) for api, value in eligible_by_api.items()},
         "continuity": continuity,
-        "available_time": available_time,
+        "available_time": observed_at,
         "observed_at": observed_at,
         "progress": transfer,
     }

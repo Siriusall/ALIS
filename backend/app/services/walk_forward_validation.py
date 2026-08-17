@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from app.data_platform.db import _conn
+from app.data_platform.services.observation_clock import load_snapshot_market_aggregates
 from app.db.store import get_model_version
 from app.services.backtest_data_source import BacktestDataSource
 from app.services.market_context import _transparent_regime, score_market_sentiment
@@ -13,7 +14,10 @@ from app.services.strategy_statistics import compare_strategy_windows
 
 
 PAIRED_DAILY_RETURN_CONTRACT = "alis_oos_paired_daily_returns_v1"
+MARKET_STATE_ATTRIBUTION_CONTRACT = "alis_oos_market_state_attribution_v2_immutable_snapshot"
 MINIMUM_ANNUALIZED_RELATIVE_EXCESS_RETURN = 0.03
+MINIMUM_MARKET_STATE_ROWS = 500
+MINIMUM_MARKET_STATE_FIELD_RATIO = 0.80
 
 
 @dataclass(frozen=True)
@@ -54,27 +58,33 @@ def build_purged_walk_forward_windows(dates: list[str], config: WalkForwardConfi
 def _market_states(dates: list[str]) -> dict[str, str]:
     if not dates:
         return {}
-    compact = [value.replace("-", "") for value in dates]
-    rows: list[dict[str, Any]] = []
-    with _conn() as conn:
-        for offset in range(0, len(compact), 300):
-            batch = compact[offset:offset + 300]
-            placeholders = ",".join("?" for _ in batch)
-            rows.extend(dict(row) for row in conn.execute(
-                f"""SELECT trade_date,COUNT(*) AS total,
-                           AVG(CASE WHEN change_pct>0 THEN 1.0 ELSE 0.0 END) AS breadth,
-                           AVG(change_pct)/100.0 AS average_return,SUM(COALESCE(turnover,0)) AS amount,
-                           AVG(CASE WHEN change_pct>=9.7 THEN 1.0 ELSE 0.0 END) AS limit_up_ratio,
-                           AVG(CASE WHEN change_pct<=-9.7 THEN 1.0 ELSE 0.0 END) AS limit_down_ratio
-                    FROM dc_stock_daily_snapshot
-                    WHERE trade_date IN ({placeholders}) AND available_time<=trade_date||'T15:00:00'
-                    GROUP BY trade_date ORDER BY trade_date""", tuple(batch),
-            ).fetchall())
-    rows.sort(key=lambda item: str(item.get("trade_date") or ""))
+    compact = sorted({
+        str(value or "").replace("-", "")[:8]
+        for value in dates
+        if len(str(value or "").replace("-", "")[:8]) == 8
+        and str(value or "").replace("-", "")[:8].isdigit()
+    })
+    if not compact:
+        return {}
+    try:
+        with _conn() as conn:
+            by_date = load_snapshot_market_aggregates(conn, trade_dates=compact)
+    except Exception:  # noqa: BLE001 - OOS must fail closed through coverage below
+        return {}
+    if by_date is None:
+        return {}
     amounts: list[float] = []
     previous = ""
     states: dict[str, str] = {}
-    for row in rows:
+    for trade_date in compact:
+        row = dict(by_date.get(trade_date) or {})
+        total = int(row.get("rows_total") or 0)
+        market_rows = int(row.get("market_rows") or 0)
+        if (
+            total < MINIMUM_MARKET_STATE_ROWS
+            or market_rows / total < MINIMUM_MARKET_STATE_FIELD_RATIO
+        ):
+            continue
         amount = float(row.get("amount") or 0)
         baseline = sum(amounts[-20:]) / len(amounts[-20:]) if amounts else amount
         observations = {
@@ -88,11 +98,29 @@ def _market_states(dates: list[str]) -> dict[str, str]:
         }
         score = float(score_market_sentiment(**observations)["score"])
         state = _transparent_regime(score, observations["average_return"], previous)
-        trade_date = str(row.get("trade_date") or "")
         states[f"{trade_date[:4]}-{trade_date[4:6]}-{trade_date[6:]}"] = state
         previous = state
         amounts.append(amount)
     return states
+
+
+def _market_state_coverage(replay_dates: list[str], states: dict[str, str]) -> dict[str, Any]:
+    expected = sorted({
+        f"{compact[:4]}-{compact[4:6]}-{compact[6:]}"
+        for compact in (
+            str(item or "").replace("-", "")[:8] for item in replay_dates
+        )
+        if len(compact) == 8 and compact.isdigit()
+    })
+    missing = [date for date in expected if str(states.get(date) or "") not in {"S0", "S1", "S2", "S3"}]
+    return {
+        "contract": MARKET_STATE_ATTRIBUTION_CONTRACT,
+        "expected_sessions": len(expected),
+        "available_sessions": len(expected) - len(missing),
+        "missing_dates": missing,
+        "passed": bool(expected) and not missing,
+        "reason": None if expected and not missing else "immutable_snapshot_market_state_missing_or_incomplete",
+    }
 
 
 def _state_attribution(replay: dict[str, Any], states: dict[str, str]) -> dict[str, Any]:
@@ -363,6 +391,7 @@ def run_purged_walk_forward_validation(
             "split_policy": "rolling_origin_with_fixed_train_span",
             "estimator_policy": "frozen_champion_no_refit_inside_evaluation",
             "cost_policy": "A-share fees and slippage included by strategy replay",
+            "market_state_attribution_contract": MARKET_STATE_ATTRIBUTION_CONTRACT,
             "minimum_annualized_relative_excess_return": MINIMUM_ANNUALIZED_RELATIVE_EXCESS_RETURN,
         },
         "available_sessions": len(dates), "available_window_count": len(windows),
@@ -373,7 +402,10 @@ def run_purged_walk_forward_validation(
     selected_indexes = {int(item["index"]) for item in selected}
     results = [
         dict(item) for item in (checkpoint_results or [])
-        if int(item.get("index") or 0) in selected_indexes
+        if (
+            int(item.get("index") or 0) in selected_indexes
+            and item.get("market_state_data_contract") == MARKET_STATE_ATTRIBUTION_CONTRACT
+        )
     ]
     completed_indexes = {int(item.get("index") or 0) for item in results}
     for window in selected:
@@ -406,6 +438,7 @@ def run_purged_walk_forward_validation(
         )
         replay_dates = [str(item.get("date") or "") for item in replay.get("equity_series") or []]
         states = state_loader(replay_dates)
+        market_state_coverage = _market_state_coverage(replay_dates, states)
         benchmark_quality = (
             (replay.get("data_quality") or {}).get("benchmark")
             if isinstance(replay.get("data_quality"), dict)
@@ -429,6 +462,9 @@ def run_purged_walk_forward_validation(
             "benchmark_data_quality": benchmark_quality,
             "point_in_time_passed": bool(((replay.get("data_quality") or {}).get("point_in_time") or {}).get("passed")),
             "production_strategy_version": replay.get("production_strategy_version"),
+            "market_state_data_contract": MARKET_STATE_ATTRIBUTION_CONTRACT,
+            "market_state_data_complete": bool(market_state_coverage["passed"]),
+            "market_state_data_quality": market_state_coverage,
             "market_state_attribution": _state_attribution(replay, states),
             "failure_attribution": _failure_attribution(replay, states),
             "paired_daily_returns": _paired_daily_returns(replay),
@@ -445,7 +481,13 @@ def run_purged_walk_forward_validation(
                 "message": f"正式 OOS 窗口 {len(results)}/{len(selected)} 已完成",
                 "checkpoint_results": results,
             })
-    valid = [item for item in results if item["data_complete"] and item["point_in_time_passed"] and item["production_strategy_version"] == champion["champion_version"]]
+    valid = [
+        item for item in results
+        if item["data_complete"]
+        and item["point_in_time_passed"]
+        and item.get("market_state_data_complete") is True
+        and item["production_strategy_version"] == champion["champion_version"]
+    ]
     wins = [item for item in valid if float((item["metrics"] or {}).get("excess_return") or 0) > 0]
     covered_states = sorted({state for item in valid for state, value in item["market_state_attribution"].items() if int(value.get("sessions") or 0) > 0 and state != "unknown"})
     aggregate_return = 1.0
@@ -469,6 +511,9 @@ def run_purged_walk_forward_validation(
         "aggregate_cost_after_excess_positive": aggregate_return > aggregate_benchmark,
         "annualized_relative_excess_at_least_3pct": annualized_relative_excess >= MINIMUM_ANNUALIZED_RELATIVE_EXCESS_RETURN,
         "all_four_market_states_covered": set(covered_states) == {"S0", "S1", "S2", "S3"},
+        "market_state_data_all_windows": all(
+            item.get("market_state_data_complete") is True for item in results
+        ),
         "point_in_time_all_passed": all(item["point_in_time_passed"] for item in results),
         "same_champion_all_windows": all(item["production_strategy_version"] == champion["champion_version"] for item in results),
         "complete_test_data_all_windows": all(item["data_complete"] for item in results),

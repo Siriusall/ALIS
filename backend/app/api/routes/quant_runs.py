@@ -47,7 +47,6 @@ from app.db.store import (
     update_quant_run_task,
     sell_position,
 )
-from app.integrations.tushare_client import get_tushare_client
 from app.services.backtest_data_source import BacktestDataSource
 from app.services.cache_consolidation import trigger_backfill_merge_meta_async
 from app.services.defensive_assets import defensive_asset_bar
@@ -225,37 +224,46 @@ def _raw_position_close_maps(symbols: set[str], dates: list[str]) -> tuple[dict[
                     if symbol and price > 0:
                         etf_prices[(symbol, str(item.get("trade_date") or ""))] = price
     except Exception:
-        # A valuation curve may retain the last quoted price when the raw
-        # history read is unavailable.  Never fall back to adjusted prices.
+        # A missing source-traced close is a valuation gap.  Callers must
+        # surface it instead of extending a curve with a prior quote.
         return {}, {}
     return stock_prices, etf_prices
 
 
 def _load_index_close_map(benchmark: str, dates: list[str]) -> dict[str, float]:
+    """Read benchmark closes from the source-traced data platform only.
+
+    Performance reporting is read-only.  It must surface a missing benchmark
+    instead of making an untracked, point-in-time-ambiguous network request.
+    """
     if not dates:
         return {}
     ts_code = _normalize_index_ts_code(benchmark)
     start = min(dates).replace("-", "")
     end = max(dates).replace("-", "")
     try:
-        client = get_tushare_client()
-        # 直接走 TuShare Pro 指数日线，补齐基准净值曲线数据源。
-        df = client.pro.index_daily(  # type: ignore[attr-defined]
-            ts_code=ts_code,
-            start_date=start,
-            end_date=end,
-            fields="trade_date,close",
-        )
+        with data_conn() as conn:
+            rows = conn.execute(
+                """SELECT trade_date,payload_json
+                   FROM dc_tushare_raw_records
+                   WHERE api_name='index_daily' AND ts_code=?
+                     AND trade_date BETWEEN ? AND ?
+                   ORDER BY trade_date""",
+                (ts_code, start, end),
+            ).fetchall()
     except Exception:
         return {}
-    if df is None or df.empty:
-        return {}
     out: dict[str, float] = {}
-    for _, r in df.iterrows():
-        td = str(r.get("trade_date", "")).strip()
+    for raw in rows:
+        row = dict(raw)
+        td = str(row.get("trade_date") or "").strip()
         if len(td) == 8 and td.isdigit():
             d = f"{td[:4]}-{td[4:6]}-{td[6:8]}"
-            px = _safe_float(r.get("close"))
+            try:
+                payload = json.loads(str(row.get("payload_json") or "{}"))
+            except (TypeError, json.JSONDecodeError):
+                continue
+            px = _safe_float(payload.get("close"))
             if px > 0:
                 out[d] = px
     return out
@@ -452,7 +460,6 @@ def quant_run_curve(limit: int = 250, benchmark: str = "000300", task_id: int | 
     stock_close_by_date, etf_close_by_date = _raw_position_close_maps(symbols, dates)
 
     holdings: dict[str, int] = defaultdict(int)
-    last_price_by_symbol: dict[str, float] = {}
     # Replay cash from the fixed simulation baseline instead of valuing only
     # the currently held shares. This keeps idle cash and partial allocations
     # in the performance curve and prevents false 100% losses when positions
@@ -461,6 +468,7 @@ def quant_run_curve(limit: int = 250, benchmark: str = "000300", task_id: int | 
     benchmark_raw: list[float] = []
     strategy_raw: list[float] = []
     series: list[dict] = []
+    missing_close_by_date: dict[str, list[str]] = {}
 
     for d in dates:
         snapshot_rows = ds.load_snapshot(d.replace("-", ""))
@@ -477,16 +485,13 @@ def quant_run_curve(limit: int = 250, benchmark: str = "000300", task_id: int | 
             if side == "BUY":
                 holdings[sym] += qty
                 replay_cash -= trade_price * qty + trade_fees
-                if trade_price > 0:
-                    last_price_by_symbol[sym] = trade_price
             elif side == "SELL":
                 holdings[sym] = max(0, holdings[sym] - qty)
                 replay_cash += trade_price * qty - trade_fees
-                if trade_price > 0:
-                    last_price_by_symbol[sym] = trade_price
 
         stock_value = 0.0
         compact_date = d.replace("-", "")
+        missing_symbols: list[str] = []
         for sym, qty in holdings.items():
             if qty <= 0:
                 continue
@@ -495,19 +500,19 @@ def quant_run_curve(limit: int = 250, benchmark: str = "000300", task_id: int | 
                 if is_exchange_etf(sym)
                 else stock_close_by_date.get((sym, compact_date), 0.0)
             )
-            if px > 0:
-                last_price_by_symbol[sym] = px
-            else:
+            if px <= 0:
                 # Normalized snapshot is a raw-close fallback. Never use the
                 # adjusted research bars for account market value.
                 px_snap = _safe_float(snapshot_close_map.get(sym))
                 if px_snap > 0:
                     px = px_snap
-                    last_price_by_symbol[sym] = px
                 else:
-                    # 仍缺价时沿用最近有效价格，避免估值被错误打到 0。
-                    px = _safe_float(last_price_by_symbol.get(sym))
+                    # An account curve may not relabel a prior close, order
+                    # price, or cost basis as this session's market value.
+                    missing_symbols.append(sym)
             stock_value += px * qty
+        if missing_symbols:
+            missing_close_by_date[d] = sorted(set(missing_symbols))
 
         bm_raw = ds.get_price_on_date(benchmark, d, field="close")
         bm = _safe_float(bm_raw) if bm_raw is not None else 0.0
@@ -517,6 +522,25 @@ def quant_run_curve(limit: int = 250, benchmark: str = "000300", task_id: int | 
             bm = _safe_float(index_close_map.get(d))
         strategy_raw.append(max(0.0, replay_cash) + stock_value)
         benchmark_raw.append(_safe_float(bm))
+
+    if missing_close_by_date:
+        missing_dates = sorted(missing_close_by_date)
+        return {
+            "ok": False,
+            "status": "blocked",
+            "reason": "exact_account_close_missing",
+            "series": [],
+            "summary": {
+                "period_return": None,
+                "max_drawdown": None,
+                "points": 0,
+                "benchmark": benchmark,
+                "task_id": task_id,
+                "missing_close_by_date": missing_close_by_date,
+                "missing_close_dates": missing_dates,
+                "message": "账户曲线缺少持仓的精确交易日收盘价；禁止用前收、成交价或成本价补点。",
+            },
+        }
 
     # 归一化为指数
     base_strategy = next((x for x in strategy_raw if x > 0), 0.0)
@@ -557,6 +581,8 @@ def quant_run_curve(limit: int = 250, benchmark: str = "000300", task_id: int | 
     period_return = round(strategy_eq[-1] / strategy_eq[0] - 1.0, 4) if len(strategy_eq) >= 2 else 0.0
     max_drawdown = round(min(drawdown), 2) if drawdown else 0.0
     return {
+        "ok": True,
+        "status": "ready",
         "series": series,
         "summary": {
             "period_return": period_return,
@@ -631,7 +657,13 @@ def quant_run_execute_preview(req: QuantRebalancePreviewRequest) -> dict:
 
 @router.post("/quant-runs/execute-buy")
 def quant_run_execute_buy(req: QuantExecuteBuyRequest) -> dict:
-    """执行分析调仓模拟（默认完整调仓：先卖后买）。"""
+    """Retired shared-account write path; use the autonomous frozen-plan worker."""
+    raise HTTPException(
+        status_code=410,
+        detail="旧直接成交入口已关闭；成交只能由自治任务领取已授权冻结调仓计划",
+    )
+    # Kept below for source compatibility with old deployments; unreachable by
+    # design so request payloads can never mutate the shared account.
     try:
         ensure_manual_trade_allowed("开仓")
     except RuntimeError as e:
@@ -854,26 +886,32 @@ def quant_run_task_create(req: QuantTaskCreateRequest) -> dict:
 @router.get("/quant-runs/ledger-summary")
 def quant_run_ledger_summary() -> dict:
     try:
-        from app.services.position_valuation import build_position_market_series_cache
+        from app.data_platform.services.market_calendar import target_trade_date
+        from app.services.position_valuation import (
+            PositionMarketDataNotReadyError,
+            build_position_market_series_cache,
+            missing_exact_position_valuations,
+        )
 
         cash_balance = float(get_account_balance() or 0)
         baseline = float(get_account_baseline() or 0)
         positions = get_positions()
-        latest_trade_dates = list_consolidated_trade_dates()
-        latest_date = latest_trade_dates[-1] if latest_trade_dates else datetime.now().astimezone().date().isoformat()
+        with data_conn() as conn:
+            latest_date = target_trade_date(conn)
         valuation_cache = build_position_market_series_cache(
             positions,
             as_of=latest_date,
         )
+        missing = missing_exact_position_valuations(positions, valuation_cache, as_of=latest_date)
+        if missing:
+            raise PositionMarketDataNotReadyError(missing, latest_date, missing)
         market_value = 0.0
         for p in positions:
             sym = str(p.get("symbol") or "").strip()
             qty = int(p.get("quantity") or 0)
             if not sym or qty <= 0:
                 continue
-            valuation = valuation_cache.get(sym) or {
-                "price": _safe_float(p.get("price")),
-            }
+            valuation = valuation_cache.get(sym) or {}
             px = _safe_float(valuation.get("price"))
             market_value += px * qty
         market_value = round(market_value, 2)
@@ -912,6 +950,21 @@ def build_quant_run_performance(
 ) -> dict:
     """Return weekly/monthly/yearly performance aggregates for the simulator."""
     curve = quant_run_curve(limit=1000, benchmark=benchmark, task_id=task_id)
+    if str(curve.get("status") or "") == "blocked":
+        return {
+            "ok": False,
+            "status": "blocked",
+            "reason": str(curve.get("reason") or "exact_account_close_missing"),
+            "task_id": task_id,
+            "benchmark": benchmark,
+            "daily": [],
+            "weekly": [],
+            "monthly": [],
+            "yearly": [],
+            "source_summary": curve.get("summary") or {},
+            "persisted_reports": None,
+            "read_only": not persist_reports,
+        }
     series = [x for x in (curve.get("series") or []) if x.get("date") and x.get("strategy_equity") is not None]
     previous_point: dict | None = None
     for point in series:
@@ -1292,6 +1345,11 @@ def quant_run_stop() -> dict:
 
 @router.post("/quant-runs/run-once")
 def quant_run_once() -> dict:
+    """Retired legacy runner; autonomous_daily is the only production writer."""
+    raise HTTPException(
+        status_code=410,
+        detail="旧 run-once 入口已关闭；请使用 autonomous_daily 冻结计划执行器",
+    )
     state = get_quant_run_state()
     if not state.running:
         raise HTTPException(status_code=400, detail="量化任务未启动，请先调用 /api/quant-runs/start")
@@ -1345,7 +1403,11 @@ def quant_run_once() -> dict:
 
 @router.post("/quant-runs/execute-risk-rebalance")
 def quant_run_execute_risk_rebalance(req: QuantRiskRebalanceRequest | None = None) -> dict:
-    """按最近交易日直接执行一次纯卖出风险再平衡，主要用于风险收缩/超配降权。"""
+    """Retired direct risk writer; risk reductions must be frozen in a plan."""
+    raise HTTPException(
+        status_code=410,
+        detail="旧风险再平衡入口已关闭；减仓也必须绑定冻结调仓计划",
+    )
     body = req or QuantRiskRebalanceRequest()
     try:
         ensure_manual_trade_allowed("风险再平衡")
@@ -1461,6 +1523,11 @@ def quant_run_execute_risk_rebalance(req: QuantRiskRebalanceRequest | None = Non
 
 @router.post("/quant-runs/catch-up")
 def quant_run_catch_up(req: QuantRunCatchUpRequest) -> dict:
+    """Retired catch-up writer; historical work must use isolated replay."""
+    raise HTTPException(
+        status_code=410,
+        detail="旧 catch-up 入口已关闭；历史回放只能使用隔离账本 replay",
+    )
     state = get_quant_run_state()
     if not state.running:
         raise HTTPException(status_code=400, detail="量化任务未启动，请先调用 /api/quant-runs/start")

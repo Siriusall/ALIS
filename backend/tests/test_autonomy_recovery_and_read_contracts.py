@@ -43,6 +43,21 @@ def test_recovery_cycle_rejects_unready_contract(monkeypatch):
     assert evolution_orchestrator.enqueue_system_autonomy_recovery("20260724", {"ok": False})["reason"] == "decision_data_not_ready"
 
 
+def test_current_cycle_does_not_recover_a_previous_ready_session_when_target_is_blocked(monkeypatch):
+    monkeypatch.setattr(
+        "app.services.data_health.assess_latest_decision_data_health",
+        lambda: {
+            "ok": False,
+            "decision_ready": False,
+            "readiness": {"target_trade_date": "20260725", "latest_decision_ready_trade_date": "20260724"},
+        },
+    )
+
+    result = evolution_orchestrator.ensure_latest_ready_system_cycle()
+
+    assert result == {"ok": False, "reason": "decision_data_not_ready", "trade_date": "20260725"}
+
+
 def test_latest_ready_date_is_recovered_when_prior_cycle_stopped_at_data_gate(monkeypatch):
     monkeypatch.setattr(
         "app.services.data_health.assess_latest_decision_data_health",
@@ -249,6 +264,42 @@ def test_experiment_recovery_requires_successful_model_and_strategy_shadow_steps
 
     assert result == {
         "ok": True, "status": "already_completed", "trade_date": "20260724", "task_id": 45,
+    }
+
+
+def test_historical_oos_gap_does_not_requeue_current_experiment_recovery(monkeypatch):
+    monkeypatch.setattr(
+        "app.services.data_health.assess_latest_decision_data_health",
+        lambda: {
+            "decision_ready": True,
+            "experiment_ready": True,
+            "readiness": {"target_trade_date": "20260724"},
+        },
+    )
+    complete_steps = [
+        {"name": "hard_data_gate", "ok": False, "result": {
+            "status": "blocked", "non_repairable_dates": ["20260701"], "repair_dates": [],
+        }},
+        {"name": "decision_data_gate", "ok": True, "result": {
+            "decision_ready": True, "experiment_ready": True,
+            "readiness": {"target_trade_date": "20260724"},
+        }},
+        {"name": "profit_and_portfolio", "ok": True, "result": {"rebalance_plan": {
+            "id": 9, "status": "planned", "persisted": True,
+            "decision_contract_schema_version": "alis_unified_daily_decision_v1",
+        }}},
+        {"name": "plan_model_autonomy", "ok": True, "result": {"ok": True}},
+        {"name": "strategy_shadow_recovery", "ok": True, "result": {"status": "queued"}},
+    ]
+    monkeypatch.setattr(evolution_orchestrator, "list_evolution_tasks", lambda limit=200: [{
+        "id": 46, "task_type": "system_autonomy_cycle", "status": "completed",
+        "result": {"steps": complete_steps},
+    }])
+
+    result = evolution_orchestrator.ensure_latest_ready_system_cycle()
+
+    assert result == {
+        "ok": True, "status": "already_completed", "trade_date": "20260724", "task_id": 46,
     }
 
 

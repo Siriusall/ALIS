@@ -4,8 +4,9 @@ from app.services import daily_rebalance
 def test_current_price_tries_szse_for_bare_etf(monkeypatch):
     requested = []
 
-    def fake_bar(code, _trade_date):
+    def fake_bar(code, _trade_date, **kwargs):
         requested.append(code)
+        assert kwargs["exact_date"] is True
         return {"close": 1.23} if code == "159001.SZ" else None
 
     monkeypatch.setattr(daily_rebalance, "defensive_asset_bar", fake_bar)
@@ -17,8 +18,9 @@ def test_current_price_tries_szse_for_bare_etf(monkeypatch):
 def test_batch_quotes_queries_both_exchanges_for_bare_etf(monkeypatch):
     requested = []
 
-    def fake_bars(codes, _trade_date):
+    def fake_bars(codes, _trade_date, **kwargs):
         requested.extend(sorted(codes))
+        assert kwargs["exact_date"] is True
         return {"159001.SZ": {"close": 1.23}}
 
     monkeypatch.setattr(daily_rebalance, "defensive_asset_bars", fake_bars)

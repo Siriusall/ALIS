@@ -58,6 +58,44 @@ def test_hold_current_preserves_existing_weights_when_new_equity_budget_is_zero(
     assert "equity_budget" in hold["breaches"]
 
 
+def test_method_competition_handles_execution_symbol_without_return_history():
+    result = compete_portfolio_methods(
+        returns_by_symbol={"000001": [0.001] * 60},
+        expected_returns={"000001": 0.01, "510880": 0.01},
+        current_weights={"510880": 0.20},
+        trading_costs={},
+        equity_budget=1.0,
+        cvar_weights={"000001": 0.80, "510880": 0.20},
+        weight_bounds={
+            "000001": {"min_weight": 0.0, "max_weight": 0.80},
+            "510880": {"min_weight": 0.20, "max_weight": 0.20},
+        },
+    )
+
+    assert result["ok"] is True
+    assert result["data_diagnostics"]["hrp_input_symbols"] == ["000001"]
+    assert result["data_diagnostics"]["missing_return_history_symbols"] == ["510880"]
+    assert all(
+        evaluation["missing_return_history_symbols"] == ["510880"]
+        for evaluation in result["evaluations"]
+    )
+
+
+def test_method_competition_without_any_return_history_degrades_to_hold_without_error():
+    result = compete_portfolio_methods(
+        returns_by_symbol={},
+        expected_returns={"510880": 0.01},
+        current_weights={"510880": 0.20},
+        trading_costs={},
+        equity_budget=1.0,
+        cvar_weights={},
+    )
+
+    assert result["selected_method"] == "minimum_turnover_feasible"
+    assert result["data_diagnostics"]["no_valid_return_history"] is True
+    assert result["weights"] == {"510880": 0.20}
+
+
 def test_every_competing_method_obeys_controller_action_bounds():
     bounds = {
         "000001": {"min_weight": 0.0, "max_weight": 0.0, "action": "sell_exit"},

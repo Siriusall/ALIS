@@ -49,7 +49,6 @@ class ReplayPosition:
     quantity: int
     avg_cost: float
     buy_date: str
-    last_close: float
     name: str = ""
 
 
@@ -194,7 +193,7 @@ def _apply_challenger_controls(
 
 def _weights(positions: dict[str, ReplayPosition], prices: dict[str, float], cash: float) -> dict[str, float]:
     values = {
-        symbol: position.quantity * max(float(prices.get(symbol) or position.last_close), 0.0)
+        symbol: position.quantity * max(float(prices.get(symbol) or 0.0), 0.0)
         for symbol, position in positions.items()
     }
     total = cash + sum(values.values())
@@ -317,9 +316,12 @@ def _execute_target(
     trades: list[dict[str, Any]],
     blocked: list[dict[str, Any]],
 ) -> float:
-    open_prices = {symbol: float(row.open or 0.0) for symbol, row in rows.items()}
+    execution_prices = {
+        symbol: float(row.open or row.close or 0.0)
+        for symbol, row in rows.items()
+    }
     equity = cash + sum(
-        position.quantity * max(open_prices.get(symbol, 0.0), position.last_close)
+        position.quantity * max(execution_prices.get(symbol, 0.0), 0.0)
         for symbol, position in positions.items()
     )
     if equity <= 0:
@@ -386,7 +388,13 @@ def _execute_target(
         cash -= total_cost
         previous_cost = position.avg_cost * position.quantity if position else 0.0
         new_quantity = current_quantity + quantity
-        positions[symbol] = ReplayPosition(symbol=symbol, quantity=new_quantity, avg_cost=(previous_cost + total_cost) / new_quantity, buy_date=position.buy_date if position else date, last_close=row.close, name=row.name)
+        positions[symbol] = ReplayPosition(
+            symbol=symbol,
+            quantity=new_quantity,
+            avg_cost=(previous_cost + total_cost) / new_quantity,
+            buy_date=position.buy_date if position else date,
+            name=row.name,
+        )
         trades.append({"date": date, "symbol": symbol, "side": "BUY", "price": round(price, 4), "quantity": quantity, "gross_amount": round(gross, 2), "fees": fees, "pnl": None, "reason": "strategy_replay_target_delta"})
     return cash
 
@@ -455,6 +463,7 @@ def run_strategy_replay(
     benchmark_series: list[dict[str, Any]] = []
     benchmark_observed_dates: list[str] = []
     benchmark_missing_dates: list[str] = []
+    position_market_missing_dates: dict[str, list[str]] = {}
     pending: dict[str, Any] | None = None
     previous_rebalance: str | None = None
     benchmark_base: float | None = None
@@ -586,6 +595,24 @@ def run_strategy_replay(
             rows.update({row.symbol: row for row in fund_rows})
         if not rows:
             blocked.append({"date": date, "side": "SYSTEM", "code": "empty_snapshot", "message": "当日行情截面为空"})
+            # A frozen T+1 order belongs to this exact session. It cannot be
+            # silently executed at a later open after a missing-data day.
+            pending = None
+            continue
+        missing_positions = sorted(
+            symbol for symbol in positions
+            if symbol not in rows or float(rows[symbol].close or 0.0) <= 0.0
+        )
+        if missing_positions:
+            position_market_missing_dates[date] = missing_positions
+            blocked.extend({
+                "date": date,
+                "symbol": symbol,
+                "side": "SYSTEM",
+                "code": "position_close_missing",
+                "message": "持仓缺少当日精确收盘价，禁止沿用前收、估值或执行 T+1 订单",
+            } for symbol in missing_positions)
+            pending = None
             continue
         if uses_market_state:
             latest_market_risk = _market_risk_context(
@@ -646,9 +673,7 @@ def run_strategy_replay(
         stock_value = 0.0
         by_symbol: dict[str, float] = {}
         for symbol, position in positions.items():
-            if symbol in rows and rows[symbol].close > 0:
-                position.last_close = rows[symbol].close
-            value = position.quantity * position.last_close
+            value = position.quantity * float(rows[symbol].close)
             stock_value += value
             by_symbol[symbol] = round(value, 2)
         total_value = cash + stock_value
@@ -1062,7 +1087,7 @@ def run_strategy_replay(
             },
             "point_in_time": {
                 "schema_version": "strategy_replay_point_in_time_audit_v1",
-                "passed": all(item.get("passed") for item in pit_audits),
+                "passed": all(item.get("passed") for item in pit_audits) and not position_market_missing_dates,
                 "decision_count": len(pit_audits),
                 "audits": pit_audits,
                 "source_scope": {
@@ -1070,6 +1095,12 @@ def run_strategy_replay(
                     "upstream_as_of_contract": ["financial", "announcement", "event", "news", "theme", "expectation", "valuation", "industry"],
                     "not_consumed_by_replay_v1": ["financial", "announcement", "event", "news", "expectation", "valuation", "industry"],
                 },
+            },
+            "held_position_market_data": {
+                "schema_version": "strategy_replay_held_position_market_data_v1",
+                "passed": not position_market_missing_dates,
+                "missing_dates": position_market_missing_dates,
+                "policy": "持仓必须有当日精确收盘价；缺口不得用前收、成本价或后续交易日替代。",
             },
             "limitations": ["生产重放固定 Champion；历史版本自动切换仅保留为可选审计模式"],
         },

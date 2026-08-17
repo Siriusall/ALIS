@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from datetime import date, timedelta
 
 from app.services import walk_forward_validation as wf
@@ -16,6 +17,46 @@ class FakeDates:
 
     def get_available_trade_dates(self, start: str, end: str) -> list[str]:
         return self.dates
+
+
+def test_market_state_reader_uses_immutable_snapshot_aggregate(monkeypatch):
+    calls: list[list[str]] = []
+
+    @contextmanager
+    def fake_conn():
+        yield object()
+
+    def immutable_aggregate(_conn, *, trade_dates):
+        calls.append(list(trade_dates))
+        return {
+            "20260813": {
+                "rows_total": 500,
+                "market_rows": 500,
+                "breadth": .60,
+                "average_return": .01,
+                "amount": 1000.0,
+                "limit_up_ratio": .02,
+                "limit_down_ratio": 0.0,
+            },
+            "20260814": {
+                "rows_total": 500,
+                "market_rows": 500,
+                "breadth": .40,
+                "average_return": -.01,
+                "amount": 900.0,
+                "limit_up_ratio": 0.0,
+                "limit_down_ratio": .02,
+            },
+        }
+
+    monkeypatch.setattr(wf, "_conn", fake_conn)
+    monkeypatch.setattr(wf, "load_snapshot_market_aggregates", immutable_aggregate)
+
+    states = wf._market_states(["2026-08-14", "2026-08-13"])
+
+    assert calls == [["20260813", "20260814"]]
+    assert set(states) == {"2026-08-13", "2026-08-14"}
+    assert set(states.values()).issubset({"S0", "S1", "S2", "S3"})
 
 
 def test_failure_attribution_measures_cash_drag_and_blocked_order_codes():
@@ -183,6 +224,52 @@ def test_walk_forward_blocks_any_window_with_incomplete_benchmark(monkeypatch):
     assert result["promotion_gates"]["benchmark_data_all_windows"] is False
     assert result["windows"][0]["benchmark_data_complete"] is False
     assert "benchmark_data_all_windows" in result["blocking_reasons"]
+
+
+def test_walk_forward_blocks_when_immutable_market_state_is_missing(monkeypatch):
+    dates = _dates(90)
+    monkeypatch.setattr(wf, "resolve_production_strategy_champion", lambda: {
+        "champion_id": 42,
+        "champion_version": "champion-v1",
+        "strategy_controller_version": "controller-v1",
+    })
+
+    def replay_runner(**kwargs):
+        test_dates = [
+            value for value in dates
+            if kwargs["start_date"] <= value <= kwargs["end_date"]
+        ]
+        return {
+            "production_strategy_version": "champion-v1",
+            "metrics": {"total_return": .02, "benchmark_return": .01, "excess_return": .01, "max_drawdown": -.03},
+            "summary": {"total_fees": 20, "trading_days": len(test_dates), "decision_count": len(test_dates) - 1},
+            "equity_series": [
+                {"date": value, "total_value": 100_000 + index * 100}
+                for index, value in enumerate(test_dates)
+            ],
+            "data_quality": {"point_in_time": {"passed": True}, "benchmark": {"passed": True}},
+        }
+
+    result = wf.run_purged_walk_forward_validation(
+        config=wf.WalkForwardConfig(
+            train_sessions=20,
+            validation_sessions=5,
+            test_sessions=8,
+            purge_sessions=2,
+            embargo_sessions=1,
+            step_sessions=8,
+            minimum_windows=2,
+        ),
+        max_windows=2,
+        data_source=FakeDates(dates),
+        replay_runner=replay_runner,
+        state_loader=lambda values: {values[0]: "S1"},
+    )
+
+    assert result["status"] == "insufficient_data"
+    assert result["promotion_gates"]["market_state_data_all_windows"] is False
+    assert result["windows"][0]["market_state_data_complete"] is False
+    assert result["windows"][0]["market_state_data_quality"]["missing_dates"]
 
 
 def test_default_protocol_reports_insufficient_history_for_fewer_than_five_windows(monkeypatch):

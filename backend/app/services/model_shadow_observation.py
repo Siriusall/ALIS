@@ -89,17 +89,10 @@ def _latest_ready_trade_date() -> tuple[str, dict[str, Any]]:
     health = assess_latest_decision_data_health()
     if not bool(health.get("experiment_ready")):
         return "", health
-    latest = health.get("latest_snapshot") if isinstance(
-        health.get("latest_snapshot"), dict
-    ) else {}
     readiness = health.get("readiness") if isinstance(
         health.get("readiness"), dict
     ) else {}
-    trade_date = _ymd(
-        latest.get("trade_date")
-        or readiness.get("latest_decision_ready_trade_date")
-        or readiness.get("target_trade_date")
-    )
+    trade_date = _ymd(readiness.get("target_trade_date"))
     return trade_date, health
 
 

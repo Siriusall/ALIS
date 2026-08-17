@@ -92,22 +92,29 @@ def test_champion_hsmm_state_replaces_transparent_state_at_same_cutoff(monkeypat
 
     assert result["market_state"]["state"] == "S2"
     assert result["market_profile"]["parent_state"] == "S2"
-    assert result["market_state_runtime"] == {
-        "requested_model": "market_regime_hsmm_v1",
-        "effective_model": "market_regime_hsmm_v1",
-        "transparent_state": "S1",
-        "effective_state": "S2",
-        "fallback_reason": "",
-        "hsmm_evidence": {
-            "ok": True,
-            "status": "ready",
-            "state": "S2",
-            "confidence": 0.79,
-            "version_id": 41,
-        },
-        "hsmm_sidecar": {},
-        "hsmm_sidecar_controls_risk_budget": False,
+    runtime = result["market_state_runtime"]
+    assert runtime["requested_model"] == "market_regime_hsmm_v1"
+    assert runtime["effective_model"] == "market_regime_hsmm_v1"
+    assert runtime["transparent_state"] == "S1"
+    assert runtime["effective_state"] == "S2"
+    assert runtime["fallback_reason"] == ""
+    assert runtime["hsmm_evidence"] == {
+        "ok": True,
+        "status": "ready",
+        "state": "S2",
+        "confidence": 0.79,
+        "version_id": 41,
     }
+    sidecar = runtime["hsmm_sidecar"]
+    if sidecar:
+        assert sidecar["ok"] is True
+        assert sidecar["status"] == "ready"
+        assert sidecar["state"] == "S2"
+        assert sidecar["confidence"] == 0.79
+        assert sidecar["version_id"] == 41
+        assert sidecar["authorization_scope"] == "observation_only"
+        assert sidecar["controls_risk_budget"] is False
+    assert runtime["hsmm_sidecar_controls_risk_budget"] is False
 
 
 def test_champion_hsmm_failure_keeps_transparent_state(monkeypatch):

@@ -1,18 +1,19 @@
 from __future__ import annotations
 
 """
-基于 TuShare 的每日截面快照服务：
+基于规范数据平台的每日截面快照服务：
 - 市值：float_mv / total_mv
 - 估值：pe_ttm / pb
 - 状态：is_suspended / is_st / is_limit_up / is_limit_down
 
-注意：本模块只负责从 TuShare 拉取并在进程内缓存，不直接落库。
+注意：本模块只读取数据平台已留痕的规范快照；需要刷新时委托数据
+平台执行多源发现和全量同步，绝不在业务进程直连某个行情源。
 """
 
 import logging
 from dataclasses import asdict, dataclass
 import json
-from datetime import date, timedelta, datetime
+from datetime import date, datetime
 from zoneinfo import ZoneInfo
 import os
 from pathlib import Path
@@ -21,16 +22,14 @@ import threading
 from typing import Dict, Optional, Tuple
 import uuid
 
-import pandas as pd
 try:
     import redis
 except Exception:  # pragma: no cover - 运行环境未安装 redis 时兜底
     redis = None
 
-from app.core.trade_calendar import get_last_trade_date, get_last_trade_date_str
+from app.core.trade_calendar import get_last_trade_date_str
 from app.core.runtime_paths import backend_cache_root
 from app.data_platform.db import _conn
-from app.integrations.tushare_client import get_tushare_client
 
 logger = logging.getLogger("quant.tushare_snapshot")
 _BUSINESS_TZ = ZoneInfo("Asia/Shanghai")
@@ -39,16 +38,8 @@ def _resolve_recent_trade_date(d: date) -> str:
     return get_last_trade_date_str(d, for_data_availability=True)
 
 
-def _daily_basic_with_timeout(client, trade_date: str) -> pd.DataFrame:
-    """
-    严格使用 TuShare Pro daily_basic（遵循 ts.pro_api + _DataApi__token/_DataApi__http_url）。
-    """
-    fields = "ts_code,trade_date,close,total_mv,circ_mv,turnover_rate,pe_ttm,pb"
-    try:
-        df = client.daily_basic_resilient(trade_date=trade_date, ts_code="", fields=fields)
-        return df if isinstance(df, pd.DataFrame) else pd.DataFrame()
-    except Exception as e:  # noqa: BLE001
-        raise RuntimeError(f"daily_basic failed for {trade_date}: {str(e)[:160]}") from e
+class DailySnapshotUnavailableError(RuntimeError):
+    """Exact-date normalized market snapshot is not available."""
 
 
 @dataclass
@@ -71,14 +62,13 @@ class DailySnapshotRow:
 
 _snapshot_cache: Dict[str, Dict[str, DailySnapshotRow]] = {}
 _snapshot_lock = threading.Lock()
-_SNAPSHOT_DISK_CACHE_DIR = backend_cache_root() / "tushare_snapshot"
+_SNAPSHOT_LOCK_DIR = backend_cache_root() / "tushare_snapshot"
 _LOCK_WAIT_SEC = 20.0
 _LOCK_STALE_SEC = 60.0
 _LOCK_POLL_SEC = 0.2
 _REDIS_LOCK_TTL_SEC = 30
 _REDIS_CACHE_TTL_SEC = 6 * 60 * 60
 _REDIS_EMPTY_CACHE_TTL_SEC = 5 * 60
-_DISK_EMPTY_CACHE_TTL_SEC = 5 * 60
 _redis_client = None
 _redis_disabled = False
 _SNAPSHOT_FAIL_BACKOFF_SEC = 60.0
@@ -201,47 +191,12 @@ end
         pass
 
 
-def _ensure_disk_cache_dir() -> None:
-    _SNAPSHOT_DISK_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-
-
-def _snapshot_cache_file(trade_date: str) -> Path:
-    return _SNAPSHOT_DISK_CACHE_DIR / f"{trade_date}.json"
-
-
-def get_latest_cached_snapshot_date(*, on_or_before: str | None = None) -> Optional[str]:
-    """
-    返回磁盘快照缓存中已有的最新交易日 YYYYMMDD；无有效缓存时返回 None。
-    指定 on_or_before 时只允许回退到目标日或更早，防止历史研究读取未来截面。
-    """
-    if not _SNAPSHOT_DISK_CACHE_DIR.exists():
-        return None
-    latest: Optional[str] = None
-    for p in _SNAPSHOT_DISK_CACHE_DIR.glob("*.json"):
-        if ".tmp." in p.name or p.name.endswith(".lock"):
-            continue
-        stem = p.stem
-        if len(stem) == 8 and stem.isdigit():
-            if on_or_before and stem > str(on_or_before).replace("-", "")[:8]:
-                continue
-            if latest is None or stem > latest:
-                latest = stem
-    return latest
+def _ensure_snapshot_lock_dir() -> None:
+    _SNAPSHOT_LOCK_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def _snapshot_lock_file(trade_date: str) -> Path:
-    return _SNAPSHOT_DISK_CACHE_DIR / f"{trade_date}.lock"
-
-
-def _load_snapshot_from_disk(trade_date: str) -> Optional[Dict[str, DailySnapshotRow]]:
-    """
-    读取磁盘快照缓存（跨进程共享）：
-    - 返回 None：无缓存或损坏
-    - 返回 {}：缓存存在但快照不可用（降级结果）
-    """
-    p = _snapshot_cache_file(trade_date)
-    if not p.exists():
-        return None
+    return _SNAPSHOT_LOCK_DIR / f"{trade_date}.lock"
 
 
 def _load_snapshot_from_postgres(trade_date: str) -> Optional[Dict[str, DailySnapshotRow]]:
@@ -280,64 +235,23 @@ def _load_snapshot_from_postgres(trade_date: str) -> Optional[Dict[str, DailySna
         )
         out[symbol] = item
     return out or None
-    try:
-        payload = json.loads(p.read_text(encoding="utf-8"))
-        rows = payload.get("rows") if isinstance(payload, dict) else None
-        if not isinstance(rows, list):
-            return None
-        if len(rows) == 0:
-            # 空快照仅短时间有效，避免一次异常后长期“粘住”导致持续跳过市值/估值过滤。
-            try:
-                age = time.time() - p.stat().st_mtime
-                if age > _DISK_EMPTY_CACHE_TTL_SEC:
-                    return None
-            except OSError:
-                return None
-        out: Dict[str, DailySnapshotRow] = {}
-        for item in rows:
-            if not isinstance(item, dict):
-                continue
-            row = DailySnapshotRow(**item)
-            out[row.symbol] = row
-        return out
-    except Exception:
-        logger.warning("TuShare 快照: 磁盘缓存读取失败，将忽略并重拉（trade_date=%s）", trade_date)
-        return None
-
-
-def _save_snapshot_to_disk(trade_date: str, data: Dict[str, DailySnapshotRow]) -> None:
-    _ensure_disk_cache_dir()
-    p = _snapshot_cache_file(trade_date)
-    tmp = _SNAPSHOT_DISK_CACHE_DIR / f"{trade_date}.json.tmp.{os.getpid()}"
-    payload = {
-        "trade_date": trade_date,
-        "rows": [asdict(v) for v in data.values()],
-    }
-    tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-    tmp.replace(p)
 
 
 def _load_existing_non_empty_snapshot(trade_date: str) -> Optional[Dict[str, DailySnapshotRow]]:
     """
-    读取已有的非空快照（内存/Redis/磁盘），用于远端失败时避免把有效缓存覆盖为空。
+    读取已有的非空规范快照，用于刷新失败时避免把已验证的精确日期数据覆盖为空。
     """
     mem = _snapshot_cache.get(trade_date)
     if mem:
         return mem
-    redis_cached = _load_snapshot_from_redis(trade_date)
-    if redis_cached:
-        return redis_cached
-    disk_cached = _load_snapshot_from_disk(trade_date)
-    if disk_cached:
-        return disk_cached
-    return None
+    return _load_snapshot_from_postgres(trade_date)
 
 
 def _try_acquire_file_lock(trade_date: str) -> Tuple[Optional[int], Path]:
     """
     跨进程锁：用 O_EXCL 创建 lock 文件，成功返回 fd；失败返回 None。
     """
-    _ensure_disk_cache_dir()
+    _ensure_snapshot_lock_dir()
     lock_path = _snapshot_lock_file(trade_date)
     try:
         fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_RDWR)
@@ -373,98 +287,32 @@ def _infer_is_st(name: str) -> bool:
 
 
 def _build_snapshot_for_date(trade_date: str) -> Dict[str, DailySnapshotRow]:
+    """Refresh one exact trading session through the data platform only.
+
+    ``sync_market_bundle`` owns provider discovery, bounded hedging, raw
+    evidence and coverage validation.  The business-layer snapshot must not
+    reconstruct a date from a direct provider response, because that bypasses
+    both source provenance and the decision-data contract.
     """
-    实际从 TuShare 拉取并构建某个交易日的快照字典：symbol(6位) -> DailySnapshotRow。
-    """
-    client = get_tushare_client()
-
-    # 基础估值/市值/换手
-    basic_df = _daily_basic_with_timeout(client, trade_date)
-    if basic_df.empty:
-        return {}
-
-    # 当日涨跌停价
-    limit_df = client.stk_limit(
-        trade_date=trade_date,
-        fields="ts_code,trade_date,up_limit,down_limit",
+    from app.data_platform.services.data_center import (
+        build_stock_daily_snapshot,
+        sync_market_bundle,
+        sync_stock_basic,
     )
-    limit_map: Dict[str, Dict[str, float]] = {}
-    if not limit_df.empty:
-        for _, row in limit_df.iterrows():
-            ts_code = str(row.get("ts_code", ""))
-            limit_map[ts_code] = {
-                "up": float(row.get("up_limit", 0) or 0),
-                "down": float(row.get("down_limit", 0) or 0),
-            }
 
-    # 停牌列表
-    susp_df = client.suspend_d(trade_date=trade_date)
-    suspended_set = set()
-    if not susp_df.empty:
-        suspended_set = set(str(x) for x in susp_df["ts_code"].dropna().tolist())
-
-    # 基础信息（名称 + symbol，用来识别 ST）
-    stock_df = client.stock_basic(
-        list_status="L",
-        fields="ts_code,symbol,name",
-    )
-    name_map: Dict[str, Dict[str, str]] = {}
-    if not stock_df.empty:
-        for _, row in stock_df.iterrows():
-            ts_code = str(row.get("ts_code", ""))
-            name_map[ts_code] = {
-                "symbol": str(row.get("symbol", "")).zfill(6),
-                "name": str(row.get("name", "")),
-            }
-
-    out: Dict[str, DailySnapshotRow] = {}
-    for _, row in basic_df.iterrows():
-        ts_code = str(row.get("ts_code", ""))
-        symbol = _normalize_symbol_from_ts_code(ts_code)
-        if not symbol:
-            continue
-        close = float(row.get("close", 0) or 0)
-        total_mv = float(row.get("total_mv", 0) or 0)
-        float_mv = float(row.get("circ_mv", 0) or 0)
-        turnover_rate = float(row.get("turnover_rate", 0) or 0)
-        pe_ttm = float(row.get("pe_ttm", 0) or 0)
-        pb = float(row.get("pb", 0) or 0)
-
-        info = name_map.get(ts_code, {})
-        name = info.get("name", "")
-        symbol_from_basic = info.get("symbol") or symbol
-
-        is_st = _infer_is_st(name)
-        is_suspended = ts_code in suspended_set
-
-        lim = limit_map.get(ts_code, {})
-        up_limit = float(lim.get("up", 0) or 0)
-        down_limit = float(lim.get("down", 0) or 0)
-        is_limit_up = up_limit > 0 and close >= up_limit * 0.9999
-        is_limit_down = down_limit > 0 and close <= down_limit * 1.0001
-
-        actual_trade_date = str(row.get("trade_date", trade_date) or trade_date)
-        if len(actual_trade_date) != 8 or not actual_trade_date.isdigit():
-            actual_trade_date = trade_date
-        row_obj = DailySnapshotRow(
-            trade_date=actual_trade_date,
-            ts_code=ts_code,
-            symbol=symbol_from_basic,
-            name=name,
-            close=close,
-            total_mv=total_mv,
-            float_mv=float_mv,
-            turnover_rate=turnover_rate,
-            pe_ttm=pe_ttm,
-            pb=pb,
-            is_st=is_st,
-            is_suspended=is_suspended,
-            is_limit_up=is_limit_up,
-            is_limit_down=is_limit_down,
+    master = sync_stock_basic()
+    bundle = sync_market_bundle(trade_date)
+    if not bundle.get("ok"):
+        category = str(bundle.get("failure_category") or bundle.get("status") or "market_bundle_not_ready")
+        raise DailySnapshotUnavailableError(f"market_bundle_not_ready:{trade_date}:{category}")
+    build_stock_daily_snapshot(trade_date)
+    snapshot = _load_snapshot_from_postgres(trade_date)
+    if not snapshot:
+        master_rows = int(master.get("rows_written") or 0)
+        raise DailySnapshotUnavailableError(
+            f"normalized_snapshot_missing:{trade_date}:stock_master_rows={master_rows}"
         )
-        out[row_obj.symbol] = row_obj
-
-    return out
+    return snapshot
 
 
 def get_daily_snapshot(
@@ -474,37 +322,30 @@ def get_daily_snapshot(
 ) -> Dict[str, DailySnapshotRow]:
     """
     获取某个交易日的快照字典（symbol -> DailySnapshotRow），结果按 trade_date 缓存。
-    trade_date 默认为今日；若当日无数据（如周末、节假日），自动向前取最近有数据的交易日（最多 3 天）。
-    force_refresh=True 时忽略已有缓存/退避窗，强制发起一次拉取（用于初始化预热）。
-    cache_only=True 时仅读缓存，无缓存则返回 {} 且不请求 TuShare（业务侧在非 init 路径传 True）。
+    trade_date 默认为最近可用交易日；显式日期只接受该精确日期，绝不借用前日切片。
+    force_refresh=True 时通过数据平台发起多源同步。
+    cache_only=True 时只读规范 PostgreSQL；无数据返回空，由调用方的硬门阻断业务。
     """
     if trade_date is None:
         trade_date = _resolve_recent_trade_date(datetime.now(_BUSINESS_TZ).date())
     elif len(str(trade_date)) == 8:
-        # 调用方常传 today 字符串，这里统一做“周末 -> 周五”修正，避免先查周末再回退。
+        # 显式日期是 PIT 合同的一部分：只规范格式，不把周末/节假日
+        # 静默改写成前一交易日。调用方若需要最近交易日必须显式计算。
         try:
             d = date(int(trade_date[:4]), int(trade_date[4:6]), int(trade_date[6:8]))
-            trade_date = _resolve_recent_trade_date(d)
+            trade_date = d.strftime("%Y%m%d")
         except (ValueError, IndexError):
             pass
     if cache_only:
-        # 仅缓存模式：只读内存/Redis/磁盘，无缓存则返回 {}，不请求 TuShare。
+        # 仅缓存模式：只读内存和规范 PostgreSQL，无缓存则返回 {}，不触发同步。
         if trade_date in _snapshot_cache:
             return _snapshot_cache[trade_date]
         postgres_cached = _load_snapshot_from_postgres(trade_date)
         if postgres_cached is not None:
             _snapshot_cache[trade_date] = postgres_cached
             return postgres_cached
-        redis_cached = _load_snapshot_from_redis(trade_date)
-        if redis_cached is not None:
-            _snapshot_cache[trade_date] = redis_cached
-            return redis_cached
-        disk_cached = _load_snapshot_from_disk(trade_date)
-        if disk_cached is not None:
-            _snapshot_cache[trade_date] = disk_cached
-            return disk_cached
         logger.info(
-            "TuShare 快照: cache_only=True 且无缓存（trade_date=%s），返回空；请先执行初始化 POST /api/init",
+            "规范快照: cache_only=True 且无精确日期数据（trade_date=%s），返回空；请先执行数据初始化",
             trade_date,
         )
         return {}
@@ -512,23 +353,15 @@ def get_daily_snapshot(
         now = time.time()
         fail_until = _snapshot_fail_until.get(trade_date, 0.0)
         if fail_until > now:
-            # 失败退避窗：短时间内不再重复打远端，避免并发雪崩重试导致日志刷屏与上游超时。
-            return _snapshot_cache.get(trade_date, {})
+            # 退避只抑制重复同步，不能把一次失败伪装成空快照或成功结果。
+            raise DailySnapshotUnavailableError(f"snapshot_refresh_backoff:{trade_date}")
         if trade_date in _snapshot_cache:
             return _snapshot_cache[trade_date]
         postgres_cached = _load_snapshot_from_postgres(trade_date)
         if postgres_cached is not None:
             _snapshot_cache[trade_date] = postgres_cached
             return postgres_cached
-        redis_cached = _load_snapshot_from_redis(trade_date)
-        if redis_cached is not None:
-            _snapshot_cache[trade_date] = redis_cached
-            return redis_cached
-        disk_cached = _load_snapshot_from_disk(trade_date)
-        if disk_cached is not None:
-            _snapshot_cache[trade_date] = disk_cached
-            return disk_cached
-    # 单飞：同一 trade_date 只允许一个线程真正发起远端请求，避免并发击穿镜像站导致超时。
+    # 单飞：同一 trade_date 只允许一个线程真正发起数据平台同步。
     with _snapshot_lock:
         if not force_refresh:
             if trade_date in _snapshot_cache:
@@ -537,28 +370,20 @@ def get_daily_snapshot(
             if postgres_cached is not None:
                 _snapshot_cache[trade_date] = postgres_cached
                 return postgres_cached
-            redis_cached = _load_snapshot_from_redis(trade_date)
-            if redis_cached is not None:
-                _snapshot_cache[trade_date] = redis_cached
-                return redis_cached
-            disk_cached = _load_snapshot_from_disk(trade_date)
-            if disk_cached is not None:
-                _snapshot_cache[trade_date] = disk_cached
-                return disk_cached
         redis_lock_token = _acquire_redis_lock(trade_date)
         if redis_lock_token is None and _get_redis_client() is not None:
             wait_start = time.time()
             while time.time() - wait_start <= _LOCK_WAIT_SEC:
-                redis_cached = _load_snapshot_from_redis(trade_date)
-                if redis_cached is not None:
-                    _snapshot_cache[trade_date] = redis_cached
-                    return redis_cached
+                postgres_cached = _load_snapshot_from_postgres(trade_date)
+                if postgres_cached is not None:
+                    _snapshot_cache[trade_date] = postgres_cached
+                    return postgres_cached
                 time.sleep(_LOCK_POLL_SEC)
             logger.warning(
-                "TuShare 快照: 等待 Redis 分布式锁超时（trade_date=%s），将回退本地锁",
+                "规范快照: 等待 Redis 分布式锁超时（trade_date=%s），将检查本地锁",
                 trade_date,
             )
-        # 单机多进程单飞：一个进程拉取，其它进程等待并复用磁盘缓存。
+        # 单机多进程单飞：一个进程同步，其它进程等待后只复用 PostgreSQL 精确切片。
         lock_fd: Optional[int] = None
         lock_path: Optional[Path] = None
         if redis_lock_token is None:
@@ -567,7 +392,7 @@ def get_daily_snapshot(
                 lock_fd, lock_path = _try_acquire_file_lock(trade_date)
                 if lock_fd is not None:
                     break
-                cached = _load_snapshot_from_disk(trade_date)
+                cached = _load_snapshot_from_postgres(trade_date)
                 if cached is not None:
                     _snapshot_cache[trade_date] = cached
                     return cached
@@ -586,75 +411,25 @@ def get_daily_snapshot(
                         pass
                 if time.time() - wait_start > _LOCK_WAIT_SEC:
                     logger.warning(
-                        "TuShare 快照: 等待本地锁超时（trade_date=%s），当前进程将继续拉取",
+                        "规范快照: 等待本地锁超时（trade_date=%s），当前进程将继续同步",
                         trade_date,
                     )
                     break
                 time.sleep(_LOCK_POLL_SEC)
-        logger.info("TuShare 快照: 拉取 trade_date=%s（市值/估值过滤依赖）", trade_date)
+        logger.info("规范快照: 同步 trade_date=%s（市值/估值过滤依赖）", trade_date)
         try:
-            try:
-                data = _build_snapshot_for_date(trade_date)
-            except RuntimeError as e:
-                # daily_basic 链路失败（网络超时/服务端错误/SDK 兜底失败）：快速降级，不阻塞主流程。
-                if "daily_basic" in str(e):
-                    existing = _load_existing_non_empty_snapshot(trade_date)
-                    if existing:
-                        logger.warning(
-                            "TuShare 快照不可用：%s；复用已有快照（trade_date=%s, rows=%d）",
-                            str(e),
-                            trade_date,
-                            len(existing),
-                        )
-                        _snapshot_cache[trade_date] = existing
-                        _snapshot_fail_until[trade_date] = time.time() + _SNAPSHOT_FAIL_BACKOFF_SEC
-                        return existing
-                    logger.warning("TuShare 快照不可用：%s；将跳过市值/估值过滤", str(e))
-                    _snapshot_cache[trade_date] = {}
-                    _snapshot_fail_until[trade_date] = time.time() + _SNAPSHOT_FAIL_BACKOFF_SEC
-                    _save_snapshot_to_redis(trade_date, {})
-                    _save_snapshot_to_disk(trade_date, {})
-                    return {}
-                raise
-            if not data and trade_date == get_last_trade_date_str(for_data_availability=True):
-                for d in range(1, 4):
-                    fallback = (get_last_trade_date(for_data_availability=True) - timedelta(days=d)).strftime("%Y%m%d")
-                    logger.info("TuShare 快照: 当日无数据，尝试 %s", fallback)
-                    data = _build_snapshot_for_date(fallback)
-                    if data:
-                        _snapshot_cache[trade_date] = data
-                        _save_snapshot_to_redis(trade_date, data)
-                        _save_snapshot_to_disk(trade_date, data)
-                        logger.info("TuShare 快照: 完成，共 %d 条（来自 %s）", len(data), fallback)
-                        return data
-            persist_trade_date = trade_date
-            if data:
-                first_row = next(iter(data.values()))
-                if first_row.trade_date and first_row.trade_date != trade_date:
-                    # TuShare 在非交易时段可能返回上一交易日数据；此时按真实交易日落缓存，避免出现“未来日期文件名”。
-                    persist_trade_date = first_row.trade_date
-                    logger.info(
-                        "TuShare 快照: 请求 %s 实际返回 %s，按 %s 落缓存（共 %d 条）",
-                        trade_date,
-                        first_row.trade_date,
-                        persist_trade_date,
-                        len(data),
-                    )
-                else:
-                    logger.info("TuShare 快照: 完成，共 %d 条", len(data))
-
-            _snapshot_cache[persist_trade_date] = data
-            # 兼容调用方：请求 key 也指向同一份数据（仅内存别名，不再写磁盘）
+            data = _build_snapshot_for_date(trade_date)
+            if not data:
+                raise DailySnapshotUnavailableError(f"normalized_snapshot_empty:{trade_date}")
             _snapshot_cache[trade_date] = data
             _snapshot_fail_until.pop(trade_date, None)
-            _save_snapshot_to_redis(persist_trade_date, data)
-            _save_snapshot_to_disk(persist_trade_date, data)
+            logger.info("规范快照: 完成，trade_date=%s rows=%d", trade_date, len(data))
             return data
         except Exception as e:
             existing = _load_existing_non_empty_snapshot(trade_date)
             if existing:
                 logger.warning(
-                    "TuShare 快照异常：%s；复用已有快照（trade_date=%s, rows=%d）",
+                    "规范快照刷新异常：%s；保留已有精确日期快照（trade_date=%s, rows=%d）",
                     str(e),
                     trade_date,
                     len(existing),
@@ -663,15 +438,14 @@ def get_daily_snapshot(
                 _snapshot_fail_until[trade_date] = time.time() + _SNAPSHOT_FAIL_BACKOFF_SEC
                 return existing
             logger.warning(
-                "TuShare 快照异常：%s；将在 %.0fs 内跳过市值/估值过滤",
+                "规范快照不可用：%s；将在 %.0fs 内拒绝重复同步",
                 str(e),
                 _SNAPSHOT_FAIL_BACKOFF_SEC,
             )
-            _snapshot_cache[trade_date] = {}
             _snapshot_fail_until[trade_date] = time.time() + _SNAPSHOT_FAIL_BACKOFF_SEC
-            _save_snapshot_to_redis(trade_date, {})
-            _save_snapshot_to_disk(trade_date, {})
-            return {}
+            if isinstance(e, DailySnapshotUnavailableError):
+                raise
+            raise DailySnapshotUnavailableError(f"snapshot_refresh_failed:{trade_date}:{str(e)[:160]}") from e
         finally:
             _release_redis_lock(trade_date, redis_lock_token)
             _release_file_lock(lock_fd, lock_path)

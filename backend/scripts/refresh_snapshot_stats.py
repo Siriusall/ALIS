@@ -37,10 +37,12 @@ def refresh(start: str, end: str, *, batch_size: int = 20) -> dict[str, int]:
             rows = conn.execute(
                 f"""SELECT trade_date,COUNT(*) AS rows_total,
                            COUNT(*) FILTER (WHERE close IS NOT NULL AND volume IS NOT NULL AND turnover IS NOT NULL) AS market_rows,
-                           COALESCE(MIN(available_time), '') AS min_available_time,
-                           COALESCE(MAX(available_time), '') AS max_available_time
+                           COALESCE(MIN(observed_at), '') AS min_available_time,
+                           COALESCE(MAX(observed_at), '') AS max_available_time
                       FROM dc_stock_daily_snapshot
                      WHERE trade_date IN ({placeholders})
+                       AND observed_at<>'' AND content_hash<>''
+                       AND LOWER(COALESCE(observation_provenance,'')) NOT LIKE 'legacy_%'
                      GROUP BY trade_date""",
                 tuple(batch),
             ).fetchall()

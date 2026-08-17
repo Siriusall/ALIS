@@ -57,19 +57,24 @@ def refresh_market_regime_training_history(*, years: int = 10) -> dict[str, Any]
 def refresh_compact_training_history_from_api(*, years: int = 10) -> dict[str, Any]:
     """Refresh the compact index anchors used by older HSMM callers."""
     from datetime import date, timedelta
-    from app.data_platform.services.data_center import sync_tushare_api_raw
+    from app.data_platform.services.data_center import sync_index_bundle
     from app.services.market_context import materialize_market_training_history
 
     business_today = datetime.now(_BUSINESS_TZ).date()
     end = business_today.strftime("%Y%m%d")
     start = (business_today - timedelta(days=max(1, min(int(years), 10)) * 366)).strftime("%Y%m%d")
-    results = [
-        {
+    results = []
+    for code in ("000300.SH", "000905.SH", "000852.SH"):
+        bundle = sync_index_bundle(index_code=code, start_date=start, end_date=end)
+        index_result = next(
+            (item for item in bundle.get("results") or [] if str(item.get("api") or "") == "index_daily"),
+            {},
+        )
+        results.append({
             "ts_code": code,
-            **sync_tushare_api_raw("index_daily", {"ts_code": code, "start_date": start, "end_date": end}),
-        }
-        for code in ("000300.SH", "000905.SH", "000852.SH")
-    ]
+            **bundle,
+            "rows_written": int(index_result.get("rows_written") or index_result.get("rows_read") or 0),
+        })
     materialized = materialize_market_training_history()
     return {
         "ok": all(int(item.get("rows_written") or 0) > 0 for item in results) and bool(materialized.get("ok", True)),

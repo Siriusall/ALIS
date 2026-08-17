@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -99,16 +100,44 @@ TASK_TYPE_LABEL = {
 RETIRED_TASK_TYPES = {"factor_research_cycle"}
 
 
-def _is_terminal_research_contract_failure(task: dict[str, Any]) -> bool:
-    """Do not turn an exhausted, non-retriable research contract into a live outage.
+# A source can publish after the market closes.  That is not a successful
+# update merely because the scheduler knows when it will try again: the raw
+# failure and the missing-data block must remain visible until the exact
+# contract is actually complete.
+_RETRYABLE_DATA_FAILURE_CATEGORIES = {
+    "upstream_not_ready",
+    "upstream_not_published",
+    "execution_slice_blocked",
+    "execution_slice_check_failed",
+    "provider_bulk_contract_failed",
+    "waiting_stk_limit_gap_repair",
+    "bulk_slice_contract_failed",
+}
 
-    These failures remain visible in the task/evidence history.  They are
-    already terminal and the scheduler must create a fresh task after the
-    governing data or contract changes; presenting them as the current module
-    state makes the health console stay red forever.
+_RETRYABLE_DATA_FAILURE_MARKERS = (
+    "尚未发布",
+    "等待上游",
+    "冷却后",
+    "等待更新",
+    "retry_wait",
+    "cooldown",
+    "upstream_not_published",
+    "upstream_not_ready",
+    "execution_slice_blocked",
+    "执行切片未就绪",
+    "执行切片检查失败",
+)
+
+
+def _is_terminal_research_contract_failure(task: dict[str, Any]) -> bool:
+    """Keep historical research-contract evidence out of the live outage view.
+
+    Exhausted contract failures and explicit historical PIT waits remain
+    visible in task/evidence history.  The scheduler may retain a long-lived
+    wait for an external archival proof, but presenting it as the current
+    module state makes the health console stay red forever.
     """
-    if str(task.get("status") or "").lower() not in {"failed", "error"}:
-        return False
+    raw_status = str(task.get("status") or "").lower()
     try:
         attempts = int(task.get("attempt") or 0)
         max_attempts = int(task.get("max_attempts") or 0)
@@ -130,20 +159,28 @@ def _is_terminal_research_contract_failure(task: dict[str, Any]) -> bool:
         or "冻结策略包缺少因子绑定" in evidence
         or "未知模型绑定" in evidence
     )
-    historical_data_gate_waiting = "historical_data_gate_waiting" in evidence
+    historical_data_gate_waiting = any(marker in evidence for marker in (
+        "historical_data_gate_waiting",
+        "waiting_for_historical_pit_evidence",
+    ))
+    # A generic ``blocked_by_decision_data`` is a *current* close-data wait
+    # for Shadow/factor tasks and must remain visible in the current view.  It
+    # only becomes historical when the producer persisted an explicit
+    # historical-wait phase.
+    if raw_status not in {"failed", "error", "retry_wait"}:
+        return False
     if (max_attempts <= 0 or attempts < max_attempts) and not (
         historical_contract_incompatible or historical_data_gate_waiting
     ):
         return False
     return any(marker in evidence for marker in (
         "oos 永久硬数据未就绪",
-        "最新决策数据未就绪",
         "冻结策略包缺少因子绑定",
         "未知模型绑定",
-        "blocked_by_decision_data",
         "blocked_incomplete_factor_bindings",
         "historical_contract_incompatible",
         "historical_data_gate_waiting",
+        "waiting_for_historical_pit_evidence",
     ))
 
 
@@ -160,6 +197,134 @@ def _parse(value: Any) -> datetime | None:
         return datetime.fromisoformat(text.replace("Z", "+00:00"))
     except ValueError:
         return None
+
+
+def _mapping(value: Any) -> dict[str, Any]:
+    """Read compact JSON evidence without letting malformed history hide state."""
+    if isinstance(value, dict):
+        return value
+    if not isinstance(value, str):
+        return {}
+    try:
+        parsed = json.loads(value)
+    except (TypeError, json.JSONDecodeError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _non_negative_int(value: Any) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        return max(0, int(float(value)))
+    except (TypeError, ValueError):
+        return None
+
+
+def _infer_retryable_data_failure_category(
+    category: Any,
+    *,
+    message: Any = None,
+    error: Any = None,
+) -> str | None:
+    explicit = str(category or "").strip().lower()
+    if explicit:
+        return explicit
+    evidence = f"{message or ''} {error or ''}".lower()
+    if "execution_slice" in evidence or "执行切片" in evidence:
+        return "execution_slice_blocked"
+    if "stk_limit" in evidence and ("缺" in evidence or "incomplete" in evidence):
+        return "waiting_stk_limit_gap_repair"
+    if any(marker in evidence for marker in (
+        "upstream_not_published", "upstream_not_ready", "尚未发布", "等待上游",
+    )):
+        return "upstream_not_ready"
+    return None
+
+
+def _is_retryable_data_failure(
+    category: Any = None,
+    *,
+    message: Any = None,
+    error: Any = None,
+) -> bool:
+    inferred = _infer_retryable_data_failure_category(
+        category,
+        message=message,
+        error=error,
+    )
+    if inferred in _RETRYABLE_DATA_FAILURE_CATEGORIES:
+        return True
+    evidence = f"{message or ''} {error or ''}".lower()
+    return any(marker in evidence for marker in _RETRYABLE_DATA_FAILURE_MARKERS)
+
+
+def _retry_metadata(
+    *sources: Any,
+    message: Any = None,
+    error: Any = None,
+    fallback_finished_at: Any = None,
+    fallback_next_retry_at: Any = None,
+    generated_at: datetime | None = None,
+) -> dict[str, Any]:
+    """Project retry evidence from an authoritative task/run record.
+
+    Never manufacture a future retry timestamp.  When the producer persisted a
+    delay we can derive it from the recorded finish time; a live scheduler
+    status may instead provide a remaining delay, in which case the task-center
+    generation timestamp is the honest clock origin.
+    """
+    mappings = [_mapping(source) for source in sources]
+
+    def first_value(*keys: str) -> Any:
+        for source in mappings:
+            for key in keys:
+                value = source.get(key)
+                if value not in (None, ""):
+                    return value
+        return None
+
+    category = _infer_retryable_data_failure_category(
+        first_value("failure_category", "error_category"),
+        message=message,
+        error=error,
+    )
+    retry_after_seconds = _non_negative_int(
+        first_value("retry_after_seconds", "retry_seconds")
+    )
+    explicit_next_retry_at = _iso(
+        first_value("next_retry_at", "next_run_at") or fallback_next_retry_at
+    )
+    next_retry_at = explicit_next_retry_at
+    if not next_retry_at and retry_after_seconds is not None:
+        origin = _parse(
+            first_value("finished_at", "updated_at") or fallback_finished_at
+        )
+        if origin is None and generated_at is not None:
+            origin = generated_at
+        if origin is not None:
+            next_retry_at = (origin + timedelta(seconds=retry_after_seconds)).isoformat()
+
+    retrying = _is_retryable_data_failure(
+        category,
+        message=message,
+        error=error,
+    )
+    return {
+        "failure_category": category,
+        "retry_after_seconds": retry_after_seconds,
+        "next_retry_at": next_retry_at,
+        "retrying": retrying,
+    }
+
+
+def _retry_next_step(metadata: dict[str, Any], fallback: str) -> str:
+    if not metadata.get("retrying"):
+        return fallback
+    next_retry_at = _iso(metadata.get("next_retry_at"))
+    if next_retry_at:
+        return f"保持数据消费阻断；{next_retry_at} 后仅重试该精确缺口并重新验证完整性"
+    return "保持数据消费阻断；由日更/自愈重试精确缺口后重新验证完整性"
 
 
 def _status(value: Any, *, phase: Any = None) -> str:
@@ -190,14 +355,41 @@ def _status(value: Any, *, phase: Any = None) -> str:
     return raw or "unknown"
 
 
-def _status_with_evidence(value: Any, *, phase: Any = None, message: Any = None, error: Any = None) -> str:
+def _status_with_evidence(
+    value: Any,
+    *,
+    phase: Any = None,
+    message: Any = None,
+    error: Any = None,
+    failure_category: Any = None,
+) -> str:
     state = _status(value, phase=phase)
+    if str(phase or "") in {
+        "waiting_for_historical_pit_evidence",
+        "historical_data_gate_waiting",
+    }:
+        # The scheduler retains the task so an independently verifiable
+        # archival import can wake it later.  That is not a normal retry or a
+        # healthy wait: formal research is explicitly blocked today.
+        return "blocked"
+    # A source publication delay is operationally retryable, but not healthy:
+    # the exact data contract is still false.  Keep it visibly blocked until a
+    # later run proves the slice complete.
+    if _is_retryable_data_failure(
+        failure_category,
+        message=message,
+        error=error,
+    ) and state != "cancelled":
+        # Producers may have acknowledged a cycle after persisting a partial
+        # result.  A retryable data category is stronger evidence than that
+        # projection: until the contract is re-read and passes, the item is
+        # never allowed to appear healthy/completed.
+        return "blocked"
     if state != "failed":
         return state
     evidence = f"{message or ''} {error or ''}".lower()
     waiting_markers = (
-        "尚未发布", "等待上游", "冷却后", "等待更新", "自然前移", "未来样本",
-        "retry_wait", "cooldown", "upstream_not_published",
+        "自然前移", "未来样本", "waiting_for_natural_oos_cohort_advance",
     )
     blocked_markers = (
         "未就绪", "冻结", "安全阻断", "禁止", "blocked", "not_ready",
@@ -237,6 +429,8 @@ def _evolution_next_step(task: dict[str, Any]) -> str:
             "plan_model_autonomy": "按资源预算启动下一模型训练或等待数据",
         }.get(phase, "继续当前步骤并写入检查点")
     if status == "retry_wait":
+        if phase == "waiting_for_historical_pit_evidence":
+            return "正式历史 OOS 等待可追溯点时证据；不重试刷历史，不影响当前隔离观察"
         return "到达重试时间后从检查点恢复"
     if status == "queued":
         return "单 worker 领取后开始执行"
@@ -253,28 +447,58 @@ def _normalise_evolution(task: dict[str, Any], schedule: dict[str, Any]) -> dict
     task_type = str(task.get("task_type") or "")
     module = TASK_TYPE_MODULE.get(task_type, "autonomy")
     activity_scope = "history" if task_type in RETIRED_TASK_TYPES else None
+    history_reason = "V10 事件驱动研究已替代旧连续因子任务" if activity_scope else None
     if _is_terminal_research_contract_failure(task):
         activity_scope = "history"
-    next_at = _iso(task.get("next_run_at")) if str(task.get("status")) in {"queued", "retry_wait"} else _schedule_for(module, schedule)
+        history_reason = "formal_oos_or_historical_contract_wait"
+    checkpoint = task.get("checkpoint") if isinstance(task.get("checkpoint"), dict) else {}
+    result = task.get("result") if isinstance(task.get("result"), dict) else {}
+    retry = _retry_metadata(
+        checkpoint,
+        result,
+        task,
+        message=task.get("message"),
+        error=task.get("error"),
+        fallback_finished_at=task.get("finished_at"),
+        fallback_next_retry_at=task.get("next_run_at"),
+    )
+    retry_next_at = _iso(retry.get("next_retry_at"))
+    next_at = (
+        retry_next_at
+        if retry.get("retrying") and retry_next_at
+        else _iso(task.get("next_run_at"))
+        if str(task.get("status")) in {"queued", "retry_wait"}
+        else _schedule_for(module, schedule)
+    )
+    raw_status = str(task.get("status") or "")
+    display_status = _status_with_evidence(
+        raw_status,
+        phase=task.get("phase"),
+        message=task.get("message"),
+        error=task.get("error"),
+        failure_category=retry.get("failure_category"),
+    )
     return {
         "id": f"evolution:{task.get('id')}", "source": "evolution", "source_id": int(task.get("id") or 0),
         "module": module, "task_type": task_type, "name": TASK_TYPE_LABEL.get(task_type, task_type or "自治任务"),
-        "status": _status_with_evidence(
-            task.get("status"), phase=task.get("phase"), message=task.get("message"), error=task.get("error"),
-        ), "raw_status": str(task.get("status") or ""),
+        "status": display_status, "raw_status": raw_status,
         "phase": str(task.get("phase") or ""), "progress": float(task.get("progress") or 0),
         "message": str(task.get("message") or ""), "error": _iso(task.get("error")),
         "current_step": str(task.get("message") or task.get("phase") or "等待调度"),
-        "next_step": _evolution_next_step(task), "next_run_at": next_at,
+        "next_step": _retry_next_step(retry, _evolution_next_step(task)), "next_run_at": next_at,
         "created_at": _iso(task.get("created_at")), "started_at": _iso(task.get("started_at")),
         "heartbeat_at": _iso(task.get("heartbeat_at")), "updated_at": _iso(task.get("updated_at")),
         "finished_at": _iso(task.get("finished_at")), "attempt": int(task.get("attempt") or 0),
         "max_attempts": int(task.get("max_attempts") or 0),
-        "checkpoint": task.get("checkpoint") if isinstance(task.get("checkpoint"), dict) else {},
+        "checkpoint": checkpoint,
         "estimated_remaining_seconds": task.get("estimated_remaining_seconds"),
+        "failure_category": retry.get("failure_category"),
+        "retry_after_seconds": retry.get("retry_after_seconds"),
+        "next_retry_at": retry_next_at,
+        "retrying": bool(retry.get("retrying")),
         **({
             "activity_scope": activity_scope,
-            "history_reason": "V10 事件驱动研究已替代旧连续因子任务",
+            "history_reason": history_reason,
         } if activity_scope else {}),
     }
 
@@ -302,28 +526,77 @@ def _normalise_cycle_steps(task: dict[str, Any], schedule: dict[str, Any]) -> li
         health = step.get("health") if isinstance(step.get("health"), dict) else {}
         result_status = str(result_item.get("status") or "")
         raw_status = str(health.get("status") or result_status or ("completed" if step.get("ok") else "failed"))
+        message = str(health.get("reason") or result_item.get("reason") or raw_status)
+        historical_pit_wait = (
+            name in {"hard_data_gate", "sealed_holdout_data_gate"}
+            and (
+                str(health.get("reason") or "") == "historical_point_in_time_unavailable"
+                or (
+                    result_status == "blocked"
+                    and bool(result_item.get("non_repairable_dates"))
+                    and not bool(result_item.get("repair_dates"))
+                )
+            )
+        )
+        retry = _retry_metadata(
+            result_item,
+            health,
+            step,
+            message=message,
+            error=step.get("error"),
+            fallback_finished_at=step.get("finished_at"),
+        )
         display_status = (
-            _status(result_status)
+            # A retryable source gap wins over every producer projection,
+            # including an optimistic ``observing``/``completed`` result.
+            "blocked"
+            if retry.get("retrying") and _status(raw_status) != "cancelled"
+            else _status(result_status)
             if result_status in {"blocked", "observing", "degraded", "partial", "cooldown"}
             else _status_with_evidence(
                 raw_status,
-                message=health.get("reason") or result_item.get("reason"),
+                message=message,
                 error=step.get("error"),
+                failure_category=retry.get("failure_category"),
             )
         )
         started_at, finished_at, cursor = _step_times(step, cursor)
+        next_step = (
+            "正式 OOS/密封验证集等待可追溯历史点时证据；不影响当前决策与隔离 Shadow"
+            if historical_pit_wait
+            else _retry_next_step(retry, "下一自治周期按冻结合同重新复核")
+        )
+        step_progress = 1.0
+        if historical_pit_wait:
+            eligible = result_item.get("eligible_sessions")
+            required = result_item.get("required_sessions")
+            try:
+                step_progress = max(0.0, min(1.0, float(eligible) / float(required))) if float(required or 0) > 0 else 0.0
+            except (TypeError, ValueError):
+                step_progress = 0.0
         items.append({
             "id": f"cycle:{task.get('id')}:{name}", "source": "autonomy_step", "source_id": int(task.get("id") or 0),
             "module": module, "task_type": name, "name": STEP_LABELS.get(name, name.replace("_", " ")),
             "status": display_status, "raw_status": raw_status, "phase": name,
-            "progress": 1.0, "message": str(health.get("reason") or result_item.get("reason") or raw_status),
+            "progress": step_progress, "message": message,
             "error": _iso(step.get("error")), "current_step": "本周期步骤已完成" if step.get("ok") else "步骤保留隔离证据",
-            "next_step": "下一自治周期按冻结合同重新复核", "next_run_at": _schedule_for(module, schedule),
+            "next_step": next_step,
+            "next_run_at": _iso(retry.get("next_retry_at")) or _schedule_for(module, schedule),
             "created_at": started_at, "started_at": started_at, "heartbeat_at": finished_at,
             "updated_at": finished_at, "finished_at": finished_at, "attempt": int(task.get("attempt") or 0),
             "max_attempts": int(task.get("max_attempts") or 0), "duration_seconds": float(step.get("duration_seconds") or 0),
             "time_source": "recorded" if step.get("started_at") else "derived_from_cycle_duration",
-            "activity_scope": "current_cycle",
+            "failure_category": retry.get("failure_category"),
+            "retry_after_seconds": retry.get("retry_after_seconds"),
+            "next_retry_at": _iso(retry.get("next_retry_at")),
+            "retrying": bool(retry.get("retrying")),
+            # Keep an irreversible historical gate visible in the task list,
+            # but out of the current business/module health view.  Today's
+            # decision and isolated Shadow tasks have an independent gate.
+            "activity_scope": "history" if historical_pit_wait else "current_cycle",
+            **({
+                "history_reason": "formal_oos_or_sealed_holdout_only",
+            } if historical_pit_wait else {}),
         })
     return items
 
@@ -338,8 +611,19 @@ def _data_runs(limit: int) -> list[dict[str, Any]]:
     items = []
     for row in rows:
         item = dict(row)
+        meta = _mapping(item.get("meta_json"))
+        retry = _retry_metadata(
+            meta,
+            item,
+            message=item.get("meta_json"),
+            error=item.get("error"),
+            fallback_finished_at=item.get("finished_at"),
+        )
         state = _status_with_evidence(
-            item.get("status"), message=item.get("meta_json"), error=item.get("error"),
+            item.get("status"),
+            message=item.get("meta_json"),
+            error=item.get("error"),
+            failure_category=retry.get("failure_category"),
         )
         items.append({
             "id": f"data:{item.get('id')}", "source": "data_ingestion", "source_id": int(item.get("id") or 0),
@@ -348,11 +632,18 @@ def _data_runs(limit: int) -> list[dict[str, Any]]:
             "phase": str(item.get("source_code") or ""), "progress": 1.0 if state in {"completed", "failed", "cancelled"} else 0.5,
             "message": f"读取 {int(item.get('rows_read') or 0):,}，写入 {int(item.get('rows_written') or 0):,}",
             "error": _iso(item.get("error")), "current_step": str(item.get("source_code") or "数据采集与落库"),
-            "next_step": "完成后运行覆盖率与质量复核" if state == "running" else "由日更、自愈或补全计划按缺口决定是否重试",
-            "next_run_at": None, "created_at": _iso(item.get("started_at")), "started_at": _iso(item.get("started_at")),
+            "next_step": _retry_next_step(
+                retry,
+                "完成后运行覆盖率与质量复核" if state == "running" else "由日更、自愈或补全计划按缺口决定是否重试",
+            ),
+            "next_run_at": _iso(retry.get("next_retry_at")), "created_at": _iso(item.get("started_at")), "started_at": _iso(item.get("started_at")),
             "heartbeat_at": _iso(item.get("finished_at")) or _iso(item.get("started_at")),
             "updated_at": _iso(item.get("finished_at")) or _iso(item.get("started_at")), "finished_at": _iso(item.get("finished_at")),
             "attempt": 1, "max_attempts": 1,
+            "failure_category": retry.get("failure_category"),
+            "retry_after_seconds": retry.get("retry_after_seconds"),
+            "next_retry_at": _iso(retry.get("next_retry_at")),
+            "retrying": bool(retry.get("retrying")),
         })
     return items
 
@@ -362,17 +653,40 @@ def _daily_task(status: dict[str, Any], generated_at: datetime) -> dict[str, Any
     next_at = (generated_at + timedelta(seconds=retry_seconds)).isoformat() if retry_seconds else _iso(status.get("next_scheduler_check_at"))
     phase = str(status.get("phase") or "idle")
     raw_status = "running" if status.get("running") else phase
+    retry = _retry_metadata(
+        status,
+        message=status.get("message"),
+        error=status.get("error"),
+        fallback_finished_at=status.get("finished_at"),
+        fallback_next_retry_at=next_at,
+        generated_at=generated_at,
+    )
+    retry_next_at = _iso(retry.get("next_retry_at"))
+    display_status = _status_with_evidence(
+        raw_status,
+        phase=phase,
+        message=status.get("message"),
+        error=status.get("error"),
+        failure_category=retry.get("failure_category"),
+    )
     return {
         "id": f"daily:{status.get('run_id') or 'scheduler'}", "source": "daily_update", "source_id": int(status.get("run_id") or 0),
         "module": "data", "task_type": "daily_market_update", "name": "每日收盘数据更新",
-        "status": _status(raw_status, phase=phase), "raw_status": raw_status, "phase": phase,
+        "status": display_status, "raw_status": raw_status, "phase": phase,
         "progress": float(status.get("progress") or 0) / 100.0, "message": str(status.get("message") or "等待调度"),
         "error": _iso(status.get("error")), "current_step": str(status.get("message") or phase),
-        "next_step": "冷却结束后重新拉取并复核决策数据门" if phase == "cooldown" else "完成当前数据切片并运行质量复核" if status.get("running") else "等待下一个收盘日更周期",
-        "next_run_at": next_at, "created_at": _iso(status.get("started_at")), "started_at": _iso(status.get("started_at")),
+        "next_step": _retry_next_step(
+            retry,
+            "冷却结束后重新拉取并复核决策数据门" if phase == "cooldown" else "完成当前数据切片并运行质量复核" if status.get("running") else "等待下一个收盘日更周期",
+        ),
+        "next_run_at": retry_next_at or next_at, "created_at": _iso(status.get("started_at")), "started_at": _iso(status.get("started_at")),
         "heartbeat_at": _iso(status.get("finished_at")) or _iso(status.get("started_at")),
         "updated_at": _iso(status.get("finished_at")) or _iso(status.get("started_at")), "finished_at": _iso(status.get("finished_at")),
         "attempt": 1, "max_attempts": 1,
+        "failure_category": retry.get("failure_category"),
+        "retry_after_seconds": retry.get("retry_after_seconds"),
+        "next_retry_at": retry_next_at,
+        "retrying": bool(retry.get("retrying")),
     }
 
 
@@ -408,8 +722,21 @@ def _model_data_backfill_task() -> dict[str, Any] | None:
             f"；新闻源已检查 {int(current.get('processed_calendar_days') or 0):,}/"
             f"{int(current.get('target_calendar_days') or 0):,} 日"
         )
-    normalized = _status(raw_status)
     intervention = payload.get("intervention") if isinstance(payload.get("intervention"), dict) else {}
+    retry = _retry_metadata(
+        payload,
+        intervention,
+        message=payload.get("error") or intervention.get("current"),
+        error=payload.get("error"),
+        fallback_finished_at=payload.get("updated_at"),
+    )
+    normalized = _status_with_evidence(
+        raw_status,
+        phase=payload.get("phase"),
+        message=payload.get("error") or intervention.get("current"),
+        error=payload.get("error"),
+        failure_category=retry.get("failure_category"),
+    )
     return {
         "id": f"model-data-backfill:{payload.get('work_order_id') or 'current'}",
         "source": "data_work_order",
@@ -428,12 +755,13 @@ def _model_data_backfill_task() -> dict[str, Any] | None:
         ),
         "error": _iso(payload.get("error")),
         "current_step": current_label,
-        "next_step": (
+        "next_step": _retry_next_step(
+            retry,
             str(intervention.get("current") or "检查异常并保持模型 N/A")
             if normalized == "failed"
-            else "完成当前清单项后自动推进下一项并重新计算模型数据门"
+            else "完成当前清单项后自动推进下一项并重新计算模型数据门",
         ),
-        "next_run_at": None,
+        "next_run_at": _iso(retry.get("next_retry_at")),
         "created_at": None,
         "started_at": None,
         "heartbeat_at": _iso(payload.get("updated_at")),
@@ -444,6 +772,10 @@ def _model_data_backfill_task() -> dict[str, Any] | None:
         "attempt": int(payload.get("attempt") or 0),
         "max_attempts": int(payload.get("max_attempts") or 0),
         "checkpoint": payload,
+        "failure_category": retry.get("failure_category"),
+        "retry_after_seconds": retry.get("retry_after_seconds"),
+        "next_retry_at": _iso(retry.get("next_retry_at")),
+        "retrying": bool(retry.get("retrying")),
         "activity_scope": "current",
     }
 
@@ -464,17 +796,31 @@ def _decision_data_task(health: dict[str, Any], daily: dict[str, Any], generated
         f"；stk_limit {limit_count:,}/{stock_count:,}（{limit_count / stock_count * 100:.2f}%）"
         if stock_count else ""
     )
+    retry = _retry_metadata(
+        daily,
+        health,
+        message=health.get("summary") or daily.get("message"),
+        error=daily.get("error"),
+        fallback_finished_at=daily.get("finished_at"),
+        fallback_next_retry_at=next_at,
+        generated_at=generated_at,
+    )
+    retry_next_at = _iso(retry.get("next_retry_at"))
     return {
         "id": f"decision-data:{target or 'latest'}", "source": "decision_data_gate", "source_id": 0,
         "module": "data", "task_type": "latest_decision_data_gate", "name": "最新交易日决策数据门",
         "status": "completed" if ready else "blocked", "raw_status": str(health.get("level") or ""), "phase": "decision_ready" if ready else "blocked",
         "progress": 1.0 if ready else 0.0, "message": str(health.get("summary") or "等待决策数据门"), "error": None,
         "current_step": f"目标 {target or '未知'}；最近可决策 {latest or '无'}{coverage_text}",
-        "next_step": "允许生成正式计划" if ready else "日更补齐缺失切片后重新计算数据门",
-        "next_run_at": next_at, "created_at": None, "started_at": _iso(daily.get("started_at")),
+        "next_step": "允许生成正式计划" if ready else _retry_next_step(retry, "日更补齐缺失切片后重新计算数据门"),
+        "next_run_at": retry_next_at or next_at, "created_at": None, "started_at": _iso(daily.get("started_at")),
         "heartbeat_at": _iso(daily.get("finished_at")) or generated_at.isoformat(), "updated_at": generated_at.isoformat(),
         "finished_at": _iso(daily.get("finished_at")) if ready else None, "attempt": 1, "max_attempts": 1,
         "checkpoint": contract,
+        "failure_category": retry.get("failure_category") if not ready else None,
+        "retry_after_seconds": retry.get("retry_after_seconds") if not ready else None,
+        "next_retry_at": retry_next_at if not ready else None,
+        "retrying": bool(retry.get("retrying")) if not ready else False,
     }
 
 

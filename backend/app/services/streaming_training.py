@@ -2,8 +2,8 @@
 
 This module plans older API training slices with the feature/label overlap
 required by the ranking model. Callers may retain the completed history for
-local reuse or use the original fail-closed cleanup mode; cleanup may never
-delete dates inside the online window.
+local reuse.  The historical market data is shared with replay and decision
+consumers, so the post-slice cleanup hook is audit-only and never deletes it.
 """
 from __future__ import annotations
 
@@ -51,7 +51,7 @@ def consume_api_training_slice(
     consume: Callable[[tuple[str, ...]], Any],
     retain_history: bool = False,
 ) -> Any:
-    """Fetch one old slice, build snapshots, consume it, then always clean it.
+    """Fetch one old slice, build snapshots, consume it, then audit retention.
 
     Imports are delayed so planning/tests do not initialise the data platform.
     The callback receives only core dates; overlap exists solely for rolling
@@ -74,7 +74,8 @@ def consume_api_training_slice(
                 raise RuntimeError(f"训练切片 {trade_date} 本地数据不完整；严格本地训练禁止调用 TuShare")
         return consume(training_slice.core_dates)
     finally:
-        # Cleanup is deliberately in finally: a rate-limit, feature failure,
-        # or model exception must not turn into retained old market history.
+        # The compatibility hook is deliberately in finally so failures leave
+        # an explicit retention audit.  Shared authoritative market history is
+        # never deleted; isolated scratch storage must be cleaned separately.
         if not retain_history:
             purge_temporary_training_market_data(fetched_dates=fetched, online_window_start=online_window_start)

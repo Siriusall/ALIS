@@ -73,6 +73,36 @@ def _capped_weights(scores: dict[str, float], total: float, cap: float) -> dict[
     return {key: round(value, 6) for key, value in result.items() if value > 0}
 
 
+def _blocked_allocation(
+    *,
+    reason: str,
+    symbols: list[str] | None,
+    equity_budget: float,
+    market_state: str,
+    as_of_time: str | None,
+) -> dict[str, Any]:
+    """Keep an unavailable industry/ theme source explicit for the plan gate."""
+    requested = max(0.0, min(1.0, float(equity_budget)))
+    return {
+        "ok": False,
+        "status": "blocked",
+        "reason": str(reason),
+        "schema_version": "alis_industry_allocation_v1",
+        "as_of_time": as_of_time or "",
+        "market_state": market_state,
+        "weak_market": str(market_state) in WEAK_MARKET_STATES,
+        "requested_equity_budget": requested,
+        "allocated_equity_budget": 0.0,
+        "unallocated_equity_budget": requested,
+        "max_industry_weight": MAX_INDUSTRY_WEIGHT,
+        "industry_targets": {},
+        "symbol_industries": {},
+        "items": [],
+        "candidates": list(symbols or []),
+        "method": "market_then_industry_then_stock_v1",
+    }
+
+
 def build_industry_allocation(
     *,
     symbols: list[str] | None = None,
@@ -83,20 +113,55 @@ def build_industry_allocation(
 ) -> dict[str, Any]:
     """Rank industries and allocate the equity sleeve before stock weighting."""
     score_by_symbol = {_symbol(key): float(value or 0) for key, value in (symbol_scores or {}).items()}
-    # A page-level allocation over all industries does not need the stock
-    # membership map. Only production calls with an explicit symbol universe
-    # need that table, so the read-only console path avoids scanning it.
-    by_symbol, candidates_by_industry = _industry_members(symbols) if symbols else ({}, {})
-    research = list_industries(as_of_time=as_of_time).get("items") or []
+    research_result = list_industries(as_of_time=as_of_time)
+    if not isinstance(research_result, dict):
+        return _blocked_allocation(
+            reason="industry_state_contract_invalid",
+            symbols=symbols,
+            equity_budget=equity_budget,
+            market_state=market_state,
+            as_of_time=as_of_time,
+        )
+    if research_result.get("ok") is False or str(research_result.get("status") or "") == "blocked":
+        return _blocked_allocation(
+            reason=str(research_result.get("reason") or research_result.get("status") or "industry_state_unavailable"),
+            symbols=symbols,
+            equity_budget=equity_budget,
+            market_state=market_state,
+            as_of_time=as_of_time,
+        )
+    research = research_result.get("items") or []
     # Allocation only needs the narrative score and lifecycle. Company mapping
     # evidence is already exposed by the research page's themes endpoint.
-    themes = list_themes(
+    theme_result = list_themes(
         as_of_time=as_of_time,
         limit=300,
         include_companies=False,
         compact=True,
         include_company_counts=False,
-    ).get("items") or []
+    )
+    if not isinstance(theme_result, dict):
+        return _blocked_allocation(
+            reason="theme_snapshot_contract_invalid",
+            symbols=symbols,
+            equity_budget=equity_budget,
+            market_state=market_state,
+            as_of_time=as_of_time,
+        )
+    if theme_result.get("ok") is False or str(theme_result.get("status") or "") == "blocked":
+        return _blocked_allocation(
+            reason=str(theme_result.get("reason") or theme_result.get("status") or "theme_snapshot_unavailable"),
+            symbols=symbols,
+            equity_budget=equity_budget,
+            market_state=market_state,
+            as_of_time=as_of_time,
+        )
+    themes = theme_result.get("items") or []
+    # A page-level allocation over all industries does not need the stock
+    # membership map. Only production calls with an explicit symbol universe
+    # need that table, so the read-only console path avoids scanning it. Do it
+    # only after the PIT source gates above have passed.
+    by_symbol, candidates_by_industry = _industry_members(symbols) if symbols else ({}, {})
     narrative_by_industry = {
         str((item.get("payload") or {}).get("knowledge_graph", {}).get("industry") or str(item.get("theme_code") or "").removeprefix("industry:")): item
         for item in themes

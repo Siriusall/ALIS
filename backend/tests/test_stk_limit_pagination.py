@@ -20,6 +20,31 @@ def test_stk_limit_full_page_uses_bounded_offset_pagination(monkeypatch):
     assert result["coverage"]["ready"] is True
 
 
+def test_stk_limit_proxy_winner_keeps_bounded_pagination_and_source(monkeypatch):
+    calls = []
+    coverage = [
+        {"retained_rows": 0, "expected_stock_rows": 5500, "covered_stock_rows": 0, "coverage": 0.0, "ready": False},
+        {"retained_rows": 5800, "expected_stock_rows": 5500, "covered_stock_rows": 5500, "coverage": 1.0, "ready": True},
+    ]
+    monkeypatch.setattr(data_center, "_stk_limit_stock_coverage", lambda _date: coverage.pop(0))
+    monkeypatch.setattr(
+        data_center,
+        "_safe_sync_raw",
+        lambda api, params, **kwargs: calls.append((api, params, kwargs)) or {
+            "ok": True, "rows_read": 5800, "rows_written": 5800,
+        },
+    )
+
+    result = data_center.sync_complete_stk_limit_slice("20260724", provider="tushare_proxy")
+
+    assert result["ok"] is True
+    assert calls == [(
+        "stk_limit",
+        {"trade_date": "20260724", "limit": data_center.STK_LIMIT_PAGE_SIZE, "offset": 0},
+        {"provider": "tushare_proxy"},
+    )]
+
+
 def test_stk_limit_repeated_full_page_is_classified_as_truncated(monkeypatch):
     coverage = [
         {"retained_rows": 6000, "expected_stock_rows": 5500, "covered_stock_rows": 3800, "coverage": 0.69, "ready": False},

@@ -5,7 +5,7 @@ import hashlib
 import math
 import os
 import threading
-from datetime import datetime, time as dtime
+from datetime import datetime, time as dtime, timedelta
 from statistics import mean
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -13,12 +13,17 @@ from zoneinfo import ZoneInfo
 from app.data_platform.db import _conn as data_conn
 from app.core.a_share_fees import is_exchange_etf, normalize_exchange_etf_ts_code
 from app.db.store import _conn as business_conn, get_account_baseline, get_positions
+from app.data_platform.services.market_calendar import target_trade_date
 from app.services.backtest_data_source import BacktestDataSource
 from app.services.decision_store import list_pool_members
 from app.services.industry_allocator import build_industry_allocation
 from app.services.market_context import live_market_context
 from app.services.operations_overview import build_live_portfolio_risk
-from app.services.position_valuation import build_position_market_series_cache
+from app.services.position_valuation import (
+    build_position_market_series_cache,
+    missing_exact_position_valuations,
+)
+from app.services.point_in_time import normalize_explicit_timestamp
 from app.services.plan_model_control import model_family_status
 from app.services.review_learning import materialize_decision_outcomes, model_feedback_gate, review_learning_overview
 from app.services.risk_limit_contract import (
@@ -32,6 +37,11 @@ from app.services.two_group_optimizer import two_group_cvar_optimizer
 UNIFIED_DAILY_DECISION_SCHEMA_VERSION = "alis_unified_daily_decision_v2"
 LEGACY_UNIFIED_DAILY_DECISION_SCHEMA_VERSION = "alis_unified_daily_decision_v1"
 UNIFIED_EXECUTION_SAFETY_SCHEMA_VERSION = "alis_t1_execution_safety_v2"
+FROZEN_ORDER_DATA_GATE_SCHEMA_VERSION = "alis_frozen_order_execution_data_gate_v1"
+_FROZEN_ORDER_PROBE_INTERVAL_SECONDS = max(
+    60,
+    min(int(os.getenv("ALIS_FROZEN_ORDER_DATA_PROBE_INTERVAL_SECONDS", "300")), 3600),
+)
 
 _TABLES_READY = False
 _TABLES_INIT_LOCK = threading.Lock()
@@ -126,6 +136,78 @@ def _risk_execution_check(
     }
 
 
+def _blocked_portfolio_reoptimization(
+    *,
+    key: str,
+    label: str,
+    detail: str,
+    decision_data_gate: dict[str, Any],
+    target_trade_date: str,
+    ready_trade_date: str,
+    observation_cutoff: str,
+    missing_symbols: list[str] | None = None,
+) -> dict[str, Any]:
+    """Return a non-computable portfolio result without inventing inputs.
+
+    Formal portfolio construction must not fall through to current cost basis,
+    a prior close, or a mutable latest snapshot when its authoritative T-day
+    input is unavailable.  Keep this shape stable for the autonomy bus and
+    plan endpoint, but leave all portfolio calculations empty.
+    """
+    blocked = {
+        "key": key,
+        "label": label,
+        "status": "block",
+        "detail": detail,
+    }
+    return {
+        "ok": False,
+        "status": "blocked",
+        "blocked_reasons": [{"key": key, "detail": detail}],
+        "schema_version": "portfolio_reoptimization_v1",
+        "optimizer": {
+            "ok": False,
+            "status": f"blocked_by_{key}",
+            "blocked_reasons": [detail],
+        },
+        "current_weights": {},
+        "rebalance_proposal": [],
+        "portfolio_comparison": {},
+        "execution_checks": [blocked],
+        "execution_authorized": False,
+        "risk_reducing_only": False,
+        "selection_source": f"{key}_blocked",
+        "unified_selection": {
+            "ok": False,
+            "status": "blocked",
+            "error": f"{key}_unavailable",
+        },
+        "selection_snapshot": {},
+        "expected_return_contract": {},
+        "pretrade_controller": {},
+        "risk_limit_contract": {},
+        "industry_allocation": {},
+        "portfolio_method_competition": {},
+        "execution_orders": [],
+        "final_target_weights": {},
+        "decision_data_gate": {
+            "status": str(decision_data_gate.get("status") or "blocked"),
+            "decision_ready": bool(decision_data_gate.get("decision_ready")),
+            "target_trade_date": target_trade_date,
+            "latest_decision_ready_trade_date": ready_trade_date,
+            "observation_cutoff": observation_cutoff or None,
+            "issues": decision_data_gate.get("issues") or [],
+        },
+        "missing_position_market_data": sorted(set(missing_symbols or [])),
+        "proposal_unit": "portfolio_fraction",
+        "candidate_universe": {
+            "holding_count": 0,
+            "optimization_count": 0,
+            "admission_policy": "关键目标交易日输入缺失；禁止用成本价、前收或旧快照构造组合预览",
+        },
+    }
+
+
 def _legacy_pool_preview_inputs(
     *, unified_available: bool,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], str]:
@@ -199,6 +281,395 @@ def _ensure_tables_once() -> None:
         c.execute("ALTER TABLE daily_rebalance_plans ADD COLUMN IF NOT EXISTS validation_errors_json TEXT NOT NULL DEFAULT '[]'")
         c.execute("ALTER TABLE daily_rebalance_plans ADD COLUMN IF NOT EXISTS validated_at VARCHAR(64)")
         c.execute("ALTER TABLE daily_rebalance_plans ADD COLUMN IF NOT EXISTS release_id BIGINT")
+        c.execute("ALTER TABLE daily_rebalance_plans ADD COLUMN IF NOT EXISTS execution_data_evidence_json TEXT NOT NULL DEFAULT '{}'")
+        c.execute("ALTER TABLE daily_rebalance_plans ADD COLUMN IF NOT EXISTS next_probe_at VARCHAR(64)")
+
+
+def _normalize_execution_ts_code(symbol: str) -> str:
+    """Map a frozen order symbol to the raw data platform's qualified code."""
+    value = str(symbol or "").strip().upper()
+    if value.endswith((".SH", ".SZ", ".BJ")):
+        return value
+    bare = value.split(".", 1)[0].zfill(6)
+    if is_exchange_etf(bare):
+        return normalize_exchange_etf_ts_code(bare)
+    if bare.startswith(("6", "9")):
+        return f"{bare}.SH"
+    if bare.startswith(("8", "4")):
+        return f"{bare}.BJ"
+    return f"{bare}.SZ"
+
+
+def _positive_execution_number(value: Any) -> bool:
+    if isinstance(value, bool):
+        return False
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(parsed) and parsed > 0
+
+
+def _present_execution_number(value: Any) -> bool:
+    """Limit prices may be zero for an unrestricted/newly listed security."""
+    if isinstance(value, bool):
+        return False
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(parsed)
+
+
+def _nonnegative_execution_number(value: Any) -> bool:
+    if isinstance(value, bool):
+        return False
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(parsed) and parsed >= 0
+
+
+def _strict_execution_timestamp(value: Any) -> datetime | None:
+    """Parse an explicit observation timestamp without inventing a timezone."""
+
+    raw = str(value or "").strip().replace("Z", "+00:00")
+    if not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed.astimezone(_BUSINESS_TZ)
+
+
+def _canonical_execution_timestamp(value: Any) -> str:
+    parsed = _strict_execution_timestamp(value)
+    return parsed.isoformat(timespec="seconds") if parsed is not None else ""
+
+
+def _observation_evidence_missing(record: dict[str, Any], *, checked_at: str) -> list[str]:
+    checked = _strict_execution_timestamp(checked_at)
+    if checked is None:
+        return ["audit.checked_at:invalid"]
+    missing: list[str] = []
+    for field in (
+        "observed_at", "first_observed_at", "economic_available_time",
+        "observation_provenance", "content_hash", "source_code", "created_at",
+    ):
+        if not str(record.get(field) or "").strip():
+            missing.append(field)
+    provenance = str(record.get("observation_provenance") or "").strip().lower()
+    if provenance.startswith("legacy_"):
+        missing.append("observation_provenance:not_legacy")
+    observed = _strict_execution_timestamp(record.get("observed_at"))
+    first_observed = _strict_execution_timestamp(record.get("first_observed_at"))
+    economic = _strict_execution_timestamp(record.get("economic_available_time"))
+    created = _strict_execution_timestamp(record.get("created_at"))
+    for field, value in (
+        ("observed_at", observed),
+        ("first_observed_at", first_observed),
+        ("economic_available_time", economic),
+        ("created_at", created),
+    ):
+        if value is None:
+            missing.append(f"{field}:invalid")
+    if observed is not None and observed > checked:
+        missing.append("observed_at:after_check")
+    if created is not None and created > checked:
+        missing.append("created_at:after_check")
+    if first_observed is not None and observed is not None and first_observed > observed:
+        missing.append("first_observed_at:after_observed")
+    if economic is not None and observed is not None and economic > observed:
+        missing.append("economic_available_time:after_observed")
+    return list(dict.fromkeys(missing))
+
+
+def _raw_record_for_execution(
+    c: Any,
+    api_name: str,
+    ts_code: str,
+    trade_date: str,
+    *,
+    observation_cutoff: str,
+) -> dict[str, Any]:
+    # A current raw row is only a mutable projection.  Formal T+1 execution
+    # evidence must come from the append-only observation versions, otherwise
+    # a later fallback/primary rewrite could make an old order appear valid.
+    from app.data_platform.services.observation_clock import load_raw_record_versions
+
+    versioned = load_raw_record_versions(
+        c,
+        api_name,
+        cutoff=observation_cutoff,
+        ts_codes=[ts_code],
+        trade_date_start=trade_date,
+        trade_date_end=trade_date,
+    )
+    if versioned is None:
+        # This helper is only used by the frozen execution audit.  A mutable
+        # projection cannot prove what was visible at ``observation_cutoff``;
+        # fail closed on every backend, including SQLite test databases.
+        return {}
+    if not versioned:
+        return {}
+    item = dict(versioned[-1])
+    item.setdefault("available_time", item.get("observed_at", ""))
+    try:
+        payload = json.loads(item.get("payload_json") or "{}")
+    except (TypeError, json.JSONDecodeError):
+        payload = {}
+    return {"payload": payload if isinstance(payload, dict) else {}, **item}
+
+
+def _snapshot_record_for_execution(
+    c: Any,
+    ts_code: str,
+    trade_date: str,
+    *,
+    observation_cutoff: str,
+) -> dict[str, Any]:
+    from app.data_platform.services.observation_clock import (
+        load_raw_record_versions,
+        load_snapshot_versions,
+    )
+
+    versioned = load_snapshot_versions(
+        c,
+        cutoff=observation_cutoff,
+        ts_codes=[ts_code],
+        trade_date=trade_date,
+    )
+    if versioned is None:
+        # The mutable normalized projection is never an execution evidence
+        # source.  Missing observation versions must remain a hard block.
+        return {}
+    if not versioned:
+        return {}
+    item = dict(versioned[-1])
+    try:
+        payload = json.loads(item.get("payload_json") or "{}")
+    except (TypeError, json.JSONDecodeError):
+        payload = {}
+    if not isinstance(payload, dict):
+        return {}
+    item.update(payload)
+    item.setdefault("available_time", item.get("observed_at", ""))
+    return item
+
+
+def audit_frozen_execution_orders(
+    contract: dict[str, Any] | None,
+    execute_date: str,
+    *,
+    observed_at: str | None = None,
+) -> dict[str, Any]:
+    """Verify every frozen order has an exact, executable market slice.
+
+    This is deliberately independent of the broad market coverage gate.  A
+    99% universe can still omit one held position or one ETF in the frozen
+    order set.  The audit is read-only and returns field-level evidence for
+    both the claim-time and pre-transaction checks.
+    """
+    target = str(execute_date or "").replace("-", "")[:8]
+    checked_at = _canonical_execution_timestamp(
+        observed_at or datetime.now(_BUSINESS_TZ).isoformat(timespec="seconds"),
+    )
+    orders = [
+        item for item in (contract or {}).get("execution_orders") or []
+        if isinstance(item, dict) and int(item.get("planned_quantity") or item.get("quantity") or 0) > 0
+    ]
+    if not orders:
+        return {
+            "schema_version": FROZEN_ORDER_DATA_GATE_SCHEMA_VERSION,
+            "execute_date": target,
+            "checked_at": checked_at,
+            "ok": True,
+            "orders": [],
+            "missing": [],
+            "next_probe_at": None,
+        }
+    if not checked_at:
+        return {
+            "schema_version": FROZEN_ORDER_DATA_GATE_SCHEMA_VERSION,
+            "execute_date": target,
+            "checked_at": str(observed_at or ""),
+            "ok": False,
+            "orders": [],
+            "missing": ["audit_observation_clock"],
+            "next_probe_at": None,
+        }
+    items: list[dict[str, Any]] = []
+    with data_conn() as c:
+        for order in orders:
+            symbol = str(order.get("symbol") or order.get("ts_code") or "").strip().upper()
+            ts_code = _normalize_execution_ts_code(symbol)
+            is_etf = is_exchange_etf(symbol)
+            required = (
+                ["open", "high", "low", "close", "pre_close", "vol", "amount"]
+                if is_etf
+                else ["open", "high", "low", "close", "pre_close", "vol", "amount", "up_limit", "down_limit"]
+            )
+            missing: list[str] = []
+            evidence: dict[str, Any] = {
+                "symbol": symbol,
+                "ts_code": ts_code,
+                "side": str(order.get("side") or "").upper(),
+                "is_etf": is_etf,
+                "required_fields": required,
+            }
+            if len(target) != 8 or not symbol:
+                missing.extend(required)
+            elif is_etf:
+                raw = _raw_record_for_execution(
+                    c, "fund_daily", ts_code, target, observation_cutoff=checked_at,
+                )
+                payload = raw.get("payload") or {}
+                for field in required:
+                    if not _positive_execution_number(payload.get(field)):
+                        missing.append(f"fund_daily.{field}")
+                if str(payload.get("ts_code") or raw.get("ts_code") or "").strip().upper() != ts_code:
+                    missing.append("fund_daily.ts_code")
+                if str(payload.get("trade_date") or raw.get("trade_date") or "").replace("-", "")[:8] != target:
+                    missing.append("fund_daily.trade_date")
+                missing.extend(
+                    f"fund_daily.{field}" for field in _observation_evidence_missing(raw, checked_at=checked_at)
+                )
+                evidence.update({
+                    "source": raw.get("source_code") or "",
+                    "available_time": raw.get("available_time") or "",
+                    "record_present": bool(raw),
+                })
+            else:
+                daily = _raw_record_for_execution(
+                    c, "daily", ts_code, target, observation_cutoff=checked_at,
+                )
+                limit = _raw_record_for_execution(
+                    c, "stk_limit", ts_code, target, observation_cutoff=checked_at,
+                )
+                snapshot = _snapshot_record_for_execution(
+                    c, ts_code, target, observation_cutoff=checked_at,
+                )
+                daily_payload = daily.get("payload") or {}
+                limit_payload = limit.get("payload") or {}
+                for field in ("open", "high", "low", "close", "pre_close"):
+                    if not _positive_execution_number(daily_payload.get(field)):
+                        missing.append(f"daily.{field}")
+                for field in ("vol", "amount"):
+                    checker = _nonnegative_execution_number
+                    if not checker(daily_payload.get(field)):
+                        missing.append(f"daily.{field}")
+                for field in ("up_limit", "down_limit"):
+                    if not _present_execution_number(limit_payload.get(field)):
+                        missing.append(f"stk_limit.{field}")
+                for prefix, raw, payload in (
+                    ("daily", daily, daily_payload),
+                    ("stk_limit", limit, limit_payload),
+                ):
+                    if str(payload.get("ts_code") or raw.get("ts_code") or "").strip().upper() != ts_code:
+                        missing.append(f"{prefix}.ts_code")
+                    if str(payload.get("trade_date") or raw.get("trade_date") or "").replace("-", "")[:8] != target:
+                        missing.append(f"{prefix}.trade_date")
+                snapshot_checks = {
+                    "open": _positive_execution_number,
+                    "high": _positive_execution_number,
+                    "low": _positive_execution_number,
+                    "close": _positive_execution_number,
+                    "pre_close": _positive_execution_number,
+                    "volume": _nonnegative_execution_number,
+                    "turnover": _nonnegative_execution_number,
+                    "up_limit": _present_execution_number,
+                    "down_limit": _present_execution_number,
+                }
+                for field, checker in snapshot_checks.items():
+                    if not checker(snapshot.get(field)):
+                        missing.append(f"snapshot.{field}")
+                if str(snapshot.get("ts_code") or "").strip().upper() != ts_code:
+                    missing.append("snapshot.ts_code")
+                if str(snapshot.get("trade_date") or "").replace("-", "")[:8] != target:
+                    missing.append("snapshot.trade_date")
+                missing.extend(
+                    f"daily.{field}" for field in _observation_evidence_missing(daily, checked_at=checked_at)
+                )
+                missing.extend(
+                    f"stk_limit.{field}" for field in _observation_evidence_missing(limit, checked_at=checked_at)
+                )
+                missing.extend(
+                    f"snapshot.{field}" for field in _observation_evidence_missing(snapshot, checked_at=checked_at)
+                )
+                evidence.update({
+                    "daily_source": daily.get("source_code") or "",
+                    "limit_source": limit.get("source_code") or "",
+                    "daily_available_time": daily.get("available_time") or "",
+                    "limit_available_time": limit.get("available_time") or "",
+                    "snapshot_available_time": snapshot.get("available_time") or "",
+                    "daily_content_hash": daily.get("content_hash") or "",
+                    "limit_content_hash": limit.get("content_hash") or "",
+                    "snapshot_content_hash": snapshot.get("content_hash") or "",
+                    "daily_record_present": bool(daily),
+                    "limit_record_present": bool(limit),
+                    "snapshot_record_present": bool(snapshot),
+                })
+            evidence["missing_fields"] = missing
+            evidence["ready"] = not missing
+            items.append(evidence)
+    missing_items = [item for item in items if not item.get("ready")]
+    next_probe = (
+        datetime.now(_BUSINESS_TZ) + timedelta(seconds=_FROZEN_ORDER_PROBE_INTERVAL_SECONDS)
+    ).isoformat(timespec="seconds") if missing_items else None
+    return {
+        "schema_version": FROZEN_ORDER_DATA_GATE_SCHEMA_VERSION,
+        "execute_date": target,
+        "checked_at": checked_at,
+        "ok": not missing_items,
+        "orders": items,
+        "missing": [item["symbol"] for item in missing_items],
+        "next_probe_at": next_probe,
+    }
+
+
+def _persist_frozen_order_audit(
+    *, plan_id: int, audit: dict[str, Any], next_probe_at: str | None = None,
+    conn: Any | None = None,
+) -> None:
+    """Keep the latest field-level gate evidence on the immutable plan row."""
+    payload = (
+        json.dumps(audit or {}, ensure_ascii=False, sort_keys=True),
+        next_probe_at if next_probe_at is not None else audit.get("next_probe_at"),
+        int(plan_id),
+    )
+    if conn is not None:
+        conn.execute(
+            """UPDATE daily_rebalance_plans
+                  SET execution_data_evidence_json=?,next_probe_at=?
+                WHERE id=?""",
+            payload,
+        )
+        return
+    with business_conn() as c:
+        c.execute(
+            """UPDATE daily_rebalance_plans
+                  SET execution_data_evidence_json=?,next_probe_at=?
+                WHERE id=?""",
+            payload,
+        )
+
+
+def frozen_order_data_gate_error(audit: dict[str, Any]):
+    """Build the retryable error used by both claim-time and T+1 checks."""
+    from app.services.quant_run_contracts import ReplayRiskGateError
+
+    missing = ",".join(str(value) for value in audit.get("missing") or [])
+    error = ReplayRiskGateError(
+        f"冻结计划订单行情未就绪：{missing or 'unknown'}",
+        code="paused_frozen_execution_order_data_not_ready",
+    )
+    # The worker persists this evidence after rolling back the ledger scope.
+    error.execution_data_evidence = audit
+    return error
 
 
 def _fallback_execution_clock() -> dtime:
@@ -282,13 +753,13 @@ def _latest_report(period_type: str = "daily") -> dict[str, Any]:
         return {}
 
 
-def _latest_trade_date() -> str:
-    with data_conn() as c:
-        row = c.execute("SELECT MAX(trade_date) trade_date FROM dc_stock_daily_snapshot").fetchone()
-    return str(dict(row).get("trade_date") or "") if row else ""
-
-
-def _position_returns(symbols: list[str], limit: int = 120) -> dict[str, list[float]]:
+def _position_returns(
+    symbols: list[str],
+    limit: int = 120,
+    *,
+    as_of_time: str | None = None,
+    trade_date_end: str | None = None,
+) -> dict[str, list[float]]:
     requested = [str(value or "").strip() for value in symbols if str(value or "").strip()]
     if not requested:
         return {}
@@ -308,21 +779,59 @@ def _position_returns(symbols: list[str], limit: int = 120) -> dict[str, list[fl
             symbol_by_code.setdefault(candidate, symbol)
 
     result: dict[str, list[float]] = {}
+    # Formal plans must use the same frozen observation clock as selection and
+    # valuation.  The old ``now`` default remains for non-formal diagnostics,
+    # but a caller that supplies a cutoff never silently widens it.
+    cutoff = normalize_explicit_timestamp(as_of_time) if as_of_time else datetime.now(_BUSINESS_TZ).isoformat(timespec="seconds")
+    if as_of_time and not cutoff:
+        return {}
+    end_date = str(trade_date_end or "").replace("-", "")[:8]
     placeholders = ",".join("?" for _ in symbol_by_code)
+    from app.data_platform.services.observation_clock import (
+        load_raw_record_versions,
+        load_snapshot_versions,
+    )
     with data_conn() as c:
-        rows = c.execute(
-            f"""WITH ranked AS (
-                    SELECT ts_code,trade_date,change_pct,
-                           ROW_NUMBER() OVER(PARTITION BY ts_code ORDER BY trade_date DESC) AS series_rank
-                      FROM dc_stock_daily_snapshot
-                     WHERE ts_code IN ({placeholders}) AND change_pct IS NOT NULL
-                )
-                SELECT ts_code,trade_date,change_pct
-                  FROM ranked
-                 WHERE series_rank<=?
-                 ORDER BY ts_code,trade_date""",
-            tuple(symbol_by_code) + (history_limit,),
-        ).fetchall()
+        versioned = load_snapshot_versions(
+            c,
+            cutoff=cutoff,
+            ts_codes=list(symbol_by_code),
+            trade_date_end=end_date,
+            limit=max(history_limit * len(symbol_by_code), history_limit),
+        )
+        if versioned is None and as_of_time:
+            # A formal cutoff cannot fall back to the mutable snapshot
+            # projection.  It has no immutable observation proof and may have
+            # been overwritten by a late refresh.
+            return {}
+        rows = []
+        if versioned is not None:
+            for item in versioned:
+                try:
+                    payload = json.loads(item.get("payload_json") or "{}")
+                except (TypeError, json.JSONDecodeError):
+                    payload = {}
+                if isinstance(payload, dict) and payload.get("change_pct") is not None:
+                    rows.append({
+                        "ts_code": item.get("ts_code"),
+                        "trade_date": item.get("trade_date"),
+                        "change_pct": payload.get("change_pct"),
+                    })
+        else:
+            rows = c.execute(
+                f"""WITH ranked AS (
+                        SELECT ts_code,trade_date,change_pct,
+                               ROW_NUMBER() OVER(PARTITION BY ts_code ORDER BY trade_date DESC) AS series_rank
+                          FROM dc_stock_daily_snapshot
+                         WHERE ts_code IN ({placeholders}) AND change_pct IS NOT NULL
+                           AND (?='' OR trade_date<=?)
+                    )
+                    SELECT ts_code,trade_date,change_pct
+                      FROM ranked
+                     WHERE series_rank<=?
+                     ORDER BY ts_code,trade_date""",
+                tuple(symbol_by_code) + (end_date, end_date, history_limit),
+            ).fetchall()
         grouped: dict[str, list[float]] = {}
         for row in rows:
             item = dict(row)
@@ -336,19 +845,33 @@ def _position_returns(symbols: list[str], limit: int = 120) -> dict[str, list[fl
         missing_codes = [code for symbol in missing for code in code_by_symbol[symbol] if code in symbol_by_code]
         if missing_codes:
             raw_placeholders = ",".join("?" for _ in missing_codes)
-            raw_rows = c.execute(
-                f"""WITH ranked AS (
-                        SELECT ts_code,trade_date,payload_json,
-                               ROW_NUMBER() OVER(PARTITION BY ts_code ORDER BY trade_date DESC) AS series_rank
-                          FROM dc_tushare_raw_records
-                         WHERE api_name='fund_daily' AND ts_code IN ({raw_placeholders})
-                    )
-                    SELECT ts_code,trade_date,payload_json
-                      FROM ranked
-                     WHERE series_rank<=?
-                     ORDER BY ts_code,trade_date""",
-                tuple(missing_codes) + (history_limit,),
-            ).fetchall()
+            raw_versions = load_raw_record_versions(
+                c,
+                "fund_daily",
+                cutoff=cutoff,
+                ts_codes=missing_codes,
+                trade_date_end=end_date,
+                limit=max(history_limit * len(missing_codes), history_limit),
+            )
+            if raw_versions is None and as_of_time:
+                raw_rows = []
+            elif raw_versions is not None:
+                raw_rows = raw_versions
+            else:
+                raw_rows = c.execute(
+                    f"""WITH ranked AS (
+                            SELECT ts_code,trade_date,payload_json,
+                                   ROW_NUMBER() OVER(PARTITION BY ts_code ORDER BY trade_date DESC) AS series_rank
+                             FROM dc_tushare_raw_records
+                             WHERE api_name='fund_daily' AND ts_code IN ({raw_placeholders})
+                               AND (?='' OR trade_date<=?)
+                        )
+                        SELECT ts_code,trade_date,payload_json
+                          FROM ranked
+                         WHERE series_rank<=?
+                         ORDER BY ts_code,trade_date""",
+                    tuple(missing_codes) + (end_date, end_date, history_limit),
+                ).fetchall()
             raw_grouped: dict[str, list[float]] = {}
             for row in raw_rows:
                 item = dict(row)
@@ -385,7 +908,27 @@ def _latest_decision_data_gate(trade_date: str = "") -> dict[str, Any]:
         }
 
 
-def _build_formal_unified_selection(*, trade_date: str, holding_symbols: list[str] | None = None) -> dict[str, Any]:
+def _decision_observation_cutoff(decision_data_gate: dict[str, Any]) -> str:
+    """Return the exact observation cutoff captured by the strict data gate."""
+    readiness = decision_data_gate.get("readiness") if isinstance(decision_data_gate.get("readiness"), dict) else {}
+    contract = readiness.get("decision_contract") if isinstance(readiness.get("decision_contract"), dict) else {}
+    observation = contract.get("observation_contract") if isinstance(contract.get("observation_contract"), dict) else {}
+    cutoff = str(observation.get("cutoff") or contract.get("observation_cutoff") or "").strip()
+    if cutoff:
+        return normalize_explicit_timestamp(cutoff)
+    direct_contract = decision_data_gate.get("decision_contract") if isinstance(decision_data_gate.get("decision_contract"), dict) else {}
+    direct_observation = direct_contract.get("observation_contract") if isinstance(direct_contract.get("observation_contract"), dict) else {}
+    return normalize_explicit_timestamp(
+        direct_observation.get("cutoff") or direct_contract.get("observation_cutoff") or ""
+    )
+
+
+def _build_formal_unified_selection(
+    *,
+    trade_date: str,
+    holding_symbols: list[str] | None = None,
+    observation_cutoff: str | None = None,
+) -> dict[str, Any]:
     if not trade_date:
         return {
             "ok": False,
@@ -401,6 +944,7 @@ def _build_formal_unified_selection(*, trade_date: str, holding_symbols: list[st
             top_n=20,
             exchange_group="HS",
             holding_symbols=holding_symbols or [],
+            observation_cutoff=observation_cutoff,
         )
     except Exception as exc:
         return {
@@ -527,15 +1071,101 @@ def build_portfolio_reoptimization(*, signal_date: str = "") -> dict[str, Any]:
     readiness = decision_data_gate.get("readiness") if isinstance(decision_data_gate.get("readiness"), dict) else {}
     ready_trade_date = str(readiness.get("latest_decision_ready_trade_date") or "")
     target_trade_date = str(readiness.get("target_trade_date") or "")
-    selection_trade_date = target_trade_date or ready_trade_date or _latest_trade_date()
+    # A completed prior-session bundle cannot represent the current target
+    # session. Keep the gate's target date or leave it empty for an explicit
+    # data-not-ready result; never derive it from a mutable snapshot maximum.
+    selection_trade_date = target_trade_date
+    observation_cutoff = _decision_observation_cutoff(decision_data_gate)
+    decision_gate_ready = bool(decision_data_gate.get("decision_ready"))
+    decision_clock_ready = bool(observation_cutoff)
+    if not decision_gate_ready or not decision_clock_ready:
+        detail = (
+            "决策数据门虽返回 ready，但缺少可解析的实际观测截止时间；不得用默认 T 日15:00替代"
+            if decision_gate_ready
+            else "目标交易日决策数据未就绪；禁止用旧快照、前收或成本价构造组合"
+        )
+        return _blocked_portfolio_reoptimization(
+            key="market_data",
+            label="最新决策数据门",
+            detail=detail,
+            decision_data_gate=decision_data_gate,
+            target_trade_date=target_trade_date,
+            ready_trade_date=ready_trade_date,
+            observation_cutoff=observation_cutoff,
+        )
+
+    # Current holdings are authoritative T-day inputs, just like the selection
+    # universe.  Validate them before running selection, optimisation, or any
+    # cost-basis-derived preview calculation.
+    try:
+        valuation_cache = build_position_market_series_cache(
+            positions,
+            as_of=selection_trade_date,
+            lookback=120,
+            observation_cutoff=observation_cutoff,
+        )
+        missing_position_valuations = missing_exact_position_valuations(
+            positions,
+            valuation_cache,
+            as_of=selection_trade_date,
+        )
+    except Exception as exc:  # noqa: BLE001 - a read failure is a hard input gap
+        return _blocked_portfolio_reoptimization(
+            key="position_valuation",
+            label="持仓点时估值",
+            detail=f"读取持仓目标交易日行情失败；禁止用成本价继续计算：{str(exc)[:300]}",
+            decision_data_gate=decision_data_gate,
+            target_trade_date=target_trade_date,
+            ready_trade_date=ready_trade_date,
+            observation_cutoff=observation_cutoff,
+        )
+    if missing_position_valuations:
+        missing_symbols = sorted(missing_position_valuations)
+        return _blocked_portfolio_reoptimization(
+            key="position_valuation",
+            label="持仓点时估值",
+            detail=(
+                f"持仓缺少 {selection_trade_date} 截止 {observation_cutoff} 可见的精确行情："
+                f"{', '.join(missing_symbols)}；禁止用成本价、前收或旧快照继续计算"
+            ),
+            decision_data_gate=decision_data_gate,
+            target_trade_date=target_trade_date,
+            ready_trade_date=ready_trade_date,
+            observation_cutoff=observation_cutoff,
+            missing_symbols=missing_symbols,
+        )
+    try:
+        risk = build_live_portfolio_risk(
+            valuation_cache=valuation_cache,
+            positions=positions,
+            as_of=selection_trade_date,
+        )
+    except Exception as exc:  # noqa: BLE001 - keep an explicit non-executable result
+        return _blocked_portfolio_reoptimization(
+            key="position_valuation",
+            label="持仓点时估值",
+            detail=f"持仓目标交易日估值校验失败；禁止继续计算：{str(exc)[:300]}",
+            decision_data_gate=decision_data_gate,
+            target_trade_date=target_trade_date,
+            ready_trade_date=ready_trade_date,
+            observation_cutoff=observation_cutoff,
+        )
     unified_selection = (
-        _build_formal_unified_selection(trade_date=selection_trade_date, holding_symbols=holding_symbols)
-        if decision_data_gate.get("decision_ready")
+        _build_formal_unified_selection(
+            trade_date=selection_trade_date,
+            holding_symbols=holding_symbols,
+            observation_cutoff=observation_cutoff,
+        )
+        if decision_gate_ready and decision_clock_ready
         else {
             "ok": False,
             "status": "blocked",
             "schema_version": "alis_unified_stock_selection_v1",
-            "error": "latest_decision_data_gate_not_ready",
+            "error": (
+                "decision_observation_cutoff_missing_or_invalid"
+                if decision_gate_ready and not decision_clock_ready
+                else "latest_decision_data_gate_not_ready"
+            ),
         }
     )
     unified_available = bool(unified_selection.get("ok")) and str(unified_selection.get("status") or "") in {"ready", "empty_opportunity"}
@@ -564,17 +1194,7 @@ def build_portfolio_reoptimization(*, signal_date: str = "") -> dict[str, Any]:
     # Existing holdings always remain in the optimisation set so the unified
     # selector can express hold/reduce/exit without losing account continuity.
     symbols = list(dict.fromkeys(holding_symbols + selection_candidate_symbols))
-    valuation_as_of = ready_trade_date or _latest_trade_date()
-    valuation_cache = build_position_market_series_cache(
-        positions,
-        as_of=valuation_as_of,
-        lookback=120,
-    )
-    risk = build_live_portfolio_risk(
-        valuation_cache=valuation_cache,
-        positions=positions,
-        as_of=valuation_as_of,
-    )
+    valuation_as_of = selection_trade_date
     # The selection payload is immutable once hashed. Portfolio and holding
     # scope belong to the containing daily-decision contract, never inside it.
     missing_names = [symbol for symbol in symbols if not names.get(symbol)]
@@ -584,15 +1204,27 @@ def build_portfolio_reoptimization(*, signal_date: str = "") -> dict[str, Any]:
             for row in c.execute(f"SELECT split_part(ts_code,'.',1) symbol,name FROM dc_stock_master WHERE split_part(ts_code,'.',1) IN ({placeholders})", tuple(missing_names)).fetchall():
                 item = dict(row)
                 names[str(item.get("symbol") or "")] = str(item.get("name") or "")
-    returns = _position_returns(symbols)
+    returns = _position_returns(
+        symbols,
+        as_of_time=observation_cutoff or None,
+        trade_date_end=valuation_as_of,
+    )
     current_weights = {
         str(item.get("symbol") or ""): _safe_float(item.get("weight"))
         for item in (risk.get("exposures") or [])
         if str(item.get("symbol") or "")
     }
-    if not current_weights:
-        total_cost = sum(_safe_float(p.get("quantity")) * _safe_float(p.get("price")) for p in positions) or 1.0
-        current_weights = {str(p.get("symbol")): _safe_float(p.get("quantity")) * _safe_float(p.get("price")) / total_cost for p in positions}
+    if positions and not current_weights:
+        return _blocked_portfolio_reoptimization(
+            key="position_valuation",
+            label="持仓点时估值",
+            detail="持仓存在但风险估值没有返回任何目标日权重；禁止以成本价权重替代。",
+            decision_data_gate=decision_data_gate,
+            target_trade_date=target_trade_date,
+            ready_trade_date=ready_trade_date,
+            observation_cutoff=observation_cutoff,
+            missing_symbols=holding_symbols,
+        )
     contracts = risk.get("target_weight_contracts") or []
     buckets = {str(c.get("symbol") or ""): str(c.get("function_bucket") or "narrative") for c in contracts}
     exposures = {str(item.get("symbol") or ""): item for item in (risk.get("exposures") or [])}
@@ -612,8 +1244,8 @@ def build_portfolio_reoptimization(*, signal_date: str = "") -> dict[str, Any]:
         state = str(
             environment_snapshot.get("selection_market_state")
             or environment_snapshot.get("production_market_state")
-            or "S1"
-        )
+            or ""
+        ).strip()
         context = {
             "market_state": {"state": state},
             "market_profile": environment_snapshot.get("market_profile") or {},
@@ -624,8 +1256,14 @@ def build_portfolio_reoptimization(*, signal_date: str = "") -> dict[str, Any]:
             context = live_market_context(persist=True)
         except Exception:
             context = {}
-        state = str((context.get("market_state") or {}).get("state") or "S1")
-    market_budget = {"S0": 1.0, "S1": 0.85, "S2": 0.55, "S3": 0.70}.get(state, 0.55)
+        state = str((context.get("market_state") or {}).get("state") or "").strip()
+    market_context_ready = state in {"S0", "S1", "S2", "S3"}
+    if not market_context_ready:
+        # Keep a visible unknown input rather than inventing an S1 regime.
+        # Downstream preview calculations may still run for diagnosis, but the
+        # dedicated execution check below makes the output non-executable.
+        state = "unknown"
+    market_budget = {"S0": 1.0, "S1": 0.85, "S2": 0.55, "S3": 0.70}.get(state, 0.0)
     profile_budget = max(0.85, min(1.0, _safe_float((context.get("market_profile") or {}).get("risk_budget_multiplier"), 1.0)))
     risk_status = str(risk.get("status") or "unknown")
     error_breaches = [
@@ -706,7 +1344,11 @@ def build_portfolio_reoptimization(*, signal_date: str = "") -> dict[str, Any]:
             symbols.append(symbol)
         names[symbol] = str((defensive_meta.get(symbol) or {}).get("name") or names.get(symbol) or symbol)
         trading_costs[symbol] = one_way_cost
-    defensive_returns = _position_returns(list(defensive_weights))
+    defensive_returns = _position_returns(
+        list(defensive_weights),
+        as_of_time=observation_cutoff or None,
+        trade_date_end=valuation_as_of,
+    )
     returns.update(defensive_returns)
     expected_items = (
         expected_return_contract.get("items")
@@ -767,9 +1409,22 @@ def build_portfolio_reoptimization(*, signal_date: str = "") -> dict[str, Any]:
     position_pnl_by_symbol: dict[str, float] = {}
     for symbol, position in position_map.items():
         quantity = _safe_float(position.get("quantity"))
+        if quantity <= 0:
+            continue
         cost_basis = _safe_float(position.get("price"))
         market_value = _safe_float((exposures.get(symbol) or {}).get("market_value"))
-        live_price = market_value / quantity if quantity > 0 and market_value > 0 else cost_basis
+        if market_value <= 0:
+            return _blocked_portfolio_reoptimization(
+                key="position_valuation",
+                label="持仓点时估值",
+                detail=f"持仓 {symbol} 缺少有效目标日市值；禁止以成本价计算盈亏。",
+                decision_data_gate=decision_data_gate,
+                target_trade_date=target_trade_date,
+                ready_trade_date=ready_trade_date,
+                observation_cutoff=observation_cutoff,
+                missing_symbols=[symbol],
+            )
+        live_price = market_value / quantity
         position_pnl_by_symbol[symbol] = live_price / cost_basis - 1.0 if cost_basis > 0 else 0.0
     position_weight_caps = {
         str(item.get("symbol") or ""): max(0.0, _safe_float(item.get("single_name_limit"), DEFAULT_GLOBAL_SINGLE_ASSET_LIMIT))
@@ -897,6 +1552,7 @@ def build_portfolio_reoptimization(*, signal_date: str = "") -> dict[str, Any]:
             as_of=selection_trade_date,
             lookback=20,
             data_source=valuation_source,
+            observation_cutoff=observation_cutoff or None,
         )
         reference_prices[symbol] = _safe_float(valuation.get("price"))
     from app.services.portfolio_method_competition import compete_portfolio_methods
@@ -1102,12 +1758,36 @@ def build_portfolio_reoptimization(*, signal_date: str = "") -> dict[str, Any]:
     decision_issue_text = "；".join(
         str(item.get("message") or "") for item in decision_data_gate.get("issues") or [] if item.get("message")
     )
+    valuation_fallbacks = [
+        {
+            "symbol": str(item.get("symbol") or ""),
+            "source": str(item.get("price_source") or ""),
+            "as_of": valuation_as_of,
+        }
+        for item in (risk.get("exposures") or [])
+        if str(item.get("price_source") or "") == "position_cost_fallback"
+    ]
     execution_checks = [
-        {"key": "market_data", "label": "最新决策数据门", "status": "pass" if decision_data_gate.get("decision_ready") else "block", "detail": (
-            f"{ready_trade_date or target_trade_date} 收盘数据已通过完整性检查"
-            if decision_data_gate.get("decision_ready")
-            else decision_issue_text or f"目标交易日 {target_trade_date or '未知'} 未完成，最近可用 {ready_trade_date or '无'}"
+        {"key": "market_data", "label": "最新决策数据门", "status": "pass" if decision_gate_ready and decision_clock_ready else "block", "detail": (
+            f"{ready_trade_date or target_trade_date} 收盘数据已通过完整性检查；冻结观测截止 {observation_cutoff}"
+            if decision_gate_ready and decision_clock_ready
+            else (
+                "决策数据门虽返回 ready，但缺少可解析的实际观测截止时间；不得用默认 T 日15:00替代"
+                if decision_gate_ready
+                else decision_issue_text or f"目标交易日 {target_trade_date or '未知'} 未完成，最近可用 {ready_trade_date or '无'}"
+            )
         )},
+        {"key": "market_context", "label": "市场状态点时证据", "status": "pass" if market_context_ready else "block", "detail": (
+            f"{selection_trade_date} 已冻结市场状态 {state}"
+            if market_context_ready
+            else "市场状态缺失或不可识别；禁止以 S1、上一交易日或默认风险预算代替"
+        )},
+        {"key": "position_valuation", "label": "持仓点时估值", "status": "block" if valuation_fallbacks else "pass", "detail": (
+            "以下持仓没有冻结行情，只能使用成本价；正式计划和成交已禁止："
+            + ", ".join(item["symbol"] for item in valuation_fallbacks)
+            if valuation_fallbacks
+            else f"全部持仓均使用 {valuation_as_of} 截止、{observation_cutoff or '无'} 可见的行情估值"
+        ), "fallbacks": valuation_fallbacks},
         {"key": "unified_selection", "label": "统一正式选股链路", "status": "pass" if unified_available else "block", "detail": (
             f"全市场因子模型、研究硬门和动态门已冻结，入选 {len(unified_symbols)} 只"
             if unified_available
@@ -1141,8 +1821,25 @@ def build_portfolio_reoptimization(*, signal_date: str = "") -> dict[str, Any]:
         },
         {"key": "cost_benefit", "label": "收益改善覆盖成本", "status": "pass" if expected_improvement > estimated_cost else "warn", "detail": f"预期改善 {expected_improvement:.2%}，单边成本 {estimated_cost:.2%}"},
     ]
+    blocked_execution_checks = [
+        item for item in execution_checks
+        if str(item.get("status") or "") == "block"
+    ]
+    execution_authorized = not blocked_execution_checks
     return {
-        "ok": True,
+        # A preview can still be returned for diagnosis, but it is not a
+        # successful portfolio step when any deterministic execution gate is
+        # blocked.  This prevents the autonomy bus from collapsing a missing
+        # data/ledger/selection contract into a healthy ``ok=True`` result.
+        "ok": not blocked_execution_checks,
+        "status": "blocked" if blocked_execution_checks else "ready",
+        "blocked_reasons": [
+            {
+                "key": str(item.get("key") or ""),
+                "detail": str(item.get("detail") or ""),
+            }
+            for item in blocked_execution_checks
+        ],
         "schema_version": "portfolio_reoptimization_v1",
         "optimizer": optimizer,
         "current_weights": {key: round(value, 6) for key, value in current_weights.items()},
@@ -1155,7 +1852,7 @@ def build_portfolio_reoptimization(*, signal_date: str = "") -> dict[str, Any]:
             "method": "A股20日预期收益合同乘以整手投影后的当前/目标权重；佣金、印花税、过户费、滑点和校准缓冲按冻结订单逐笔扣除",
         },
         "execution_checks": execution_checks,
-        "execution_authorized": not any(item["status"] == "block" for item in execution_checks),
+        "execution_authorized": execution_authorized,
         "risk_reducing_only": risk_reducing_only,
         "selection_source": selection_source,
         "unified_selection": unified_selection,
@@ -1172,6 +1869,7 @@ def build_portfolio_reoptimization(*, signal_date: str = "") -> dict[str, Any]:
             "decision_ready": bool(decision_data_gate.get("decision_ready")),
             "target_trade_date": target_trade_date,
             "latest_decision_ready_trade_date": ready_trade_date,
+            "observation_cutoff": observation_cutoff or None,
             "issues": decision_data_gate.get("issues") or [],
         },
         "proposal_unit": "portfolio_fraction",
@@ -1223,7 +1921,31 @@ def build_portfolio_candles(limit: int = 90) -> dict[str, Any]:
             "methodology": "无模拟成交账本记录。"}
     symbols = sorted({str(item.get("symbol") or "") for item in operations if item.get("symbol")})
     bars: dict[str, dict[str, dict[str, float]]] = {}
+    first_date = str(operations[0].get("at") or "")[:10].replace("-", "")
     with data_conn() as c:
+        target_date = target_trade_date(c)
+        calendar_rows = c.execute(
+            """SELECT cal_date FROM dc_trade_calendar
+               WHERE is_open=1 AND cal_date>=? AND cal_date<=?
+               ORDER BY cal_date DESC LIMIT ?""",
+            (first_date, target_date, limit),
+        ).fetchall()
+        dates = sorted({
+            str(dict(row).get("cal_date") or "").replace("-", "")[:8]
+            for row in calendar_rows
+            if len(str(dict(row).get("cal_date") or "").replace("-", "")[:8]) == 8
+        })
+        if not dates:
+            return {
+                "ok": False,
+                "status": "blocked",
+                "data_available": False,
+                "reason": "portfolio_trade_calendar_missing",
+                "series": [],
+                "position_count": 0,
+                "data_as_of_date": target_date,
+                "message": "账户曲线无法取得权威交易日列表，禁止按现有行情日期拼接曲线。",
+            }
         for symbol in symbols:
             bare = symbol.split(".", 1)[0]
             code = (
@@ -1231,9 +1953,11 @@ def build_portfolio_candles(limit: int = 90) -> dict[str, Any]:
                 else normalize_exchange_etf_ts_code(symbol) if is_exchange_etf(bare)
                 else f"{symbol}.SH" if bare.startswith(("5", "6", "9")) else f"{symbol}.SZ"
             )
+            api_name = "fund_daily" if is_exchange_etf(bare) else "daily"
             raw = [dict(row) for row in c.execute("""SELECT trade_date,payload_json
-                FROM dc_tushare_raw_records WHERE api_name IN ('daily','fund_daily') AND ts_code IN (?,?)
-                ORDER BY trade_date DESC LIMIT ?""", (symbol, code, limit)).fetchall()]
+                FROM dc_tushare_raw_records
+                WHERE api_name=? AND ts_code IN (?,?) AND trade_date>=? AND trade_date<=?
+                ORDER BY trade_date""", (api_name, symbol, code, dates[0], dates[-1])).fetchall()]
             rows = []
             for item in raw:
                 try:
@@ -1243,8 +1967,6 @@ def build_portfolio_candles(limit: int = 90) -> dict[str, Any]:
                     continue
             bars[symbol] = {str(row.get("trade_date") or ""): {field: _safe_float(row.get(field)) for field in ("open", "high", "low", "close")}
                 for row in rows if row.get("trade_date") and all(_safe_float(row.get(field)) > 0 for field in ("open", "high", "low", "close"))}
-    first_date = str(operations[0].get("at") or "")[:10].replace("-", "")
-    dates = sorted({date for symbol_bars in bars.values() for date in symbol_bars if date >= first_date})[-limit:]
     from app.services.corporate_actions import build_replay_corporate_actions, load_dividend_events
     dividend_events = load_dividend_events(
         symbols,
@@ -1257,6 +1979,7 @@ def build_portfolio_candles(limit: int = 90) -> dict[str, Any]:
     op_index = 0
     action_index = 0
     raw_series: list[tuple[str, dict[str, float]]] = []
+    missing_ohlc_by_date: dict[str, list[str]] = {}
     for date in dates:
         while op_index < len(operations) and str(operations[op_index].get("at") or "")[:10].replace("-", "") <= date:
             operation = operations[op_index]
@@ -1280,18 +2003,32 @@ def build_portfolio_candles(limit: int = 90) -> dict[str, Any]:
                 quantities[symbol] = quantities.get(symbol, 0.0) + int(action.get("share_quantity") or 0)
             action_index += 1
         point = {field: cash for field in ("open", "high", "low", "close")}
-        complete = True
+        missing_symbols: list[str] = []
         for symbol, quantity in quantities.items():
             if quantity <= 0:
                 continue
             bar = bars.get(symbol, {}).get(date)
             if not bar:
-                complete = False
-                break
+                missing_symbols.append(symbol)
+                continue
             for field in point:
                 point[field] += bar[field] * quantity
-        if complete:
+        if missing_symbols:
+            missing_ohlc_by_date[date] = sorted(set(missing_symbols))
+        else:
             raw_series.append((date, point))
+    if missing_ohlc_by_date:
+        return {
+            "ok": False,
+            "status": "blocked",
+            "data_available": False,
+            "reason": "exact_account_ohlc_missing",
+            "series": [],
+            "position_count": len([quantity for quantity in quantities.values() if quantity > 0]),
+            "data_as_of_date": target_date,
+            "missing_ohlc_by_date": missing_ohlc_by_date,
+            "message": "账户曲线缺少持仓的精确交易日 OHLC；禁止跳过缺口或沿用旧行情。",
+        }
     base = raw_series[0][1]["close"] if raw_series else 0.0
     series = [{
         "date": date,
@@ -1302,7 +2039,7 @@ def build_portfolio_candles(limit: int = 90) -> dict[str, Any]:
     series, latest_comparison = _attach_benchmark_series(series, benchmark_closes)
     return {
         "ok": True,
-        "schema_version": "portfolio_candles_v2",
+        "schema_version": "portfolio_candles_v3",
         "series": series,
         "position_count": len([quantity for quantity in quantities.values() if quantity > 0]),
         "unit": "indexed_account_equity",
@@ -1493,6 +2230,10 @@ def _plan_block_status(portfolio: dict[str, Any]) -> tuple[str, str]:
         return "blocked_by_system_release", "当前运行组件与已激活系统发布不一致，禁止生成可执行计划"
     if "market_data" in keys:
         return "blocked_by_decision_data", "最新交易日决策数据门未通过，当前方案仅作为不可执行预览"
+    if "market_context" in keys:
+        return "blocked_by_market_context", "市场状态缺少目标交易日点时证据，禁止用默认或旧状态生成可执行计划"
+    if "position_valuation" in keys:
+        return "blocked_by_position_valuation", "持仓缺少冻结点时行情，仅有成本价估值；禁止生成可执行计划"
     if "unified_selection" in keys:
         return "blocked_by_selection", "统一全市场选股链路未完成，旧研究池结果仅作为不可执行预览"
     if "simulation_ledger" in keys:
@@ -1644,7 +2385,47 @@ def materialize_daily_rebalance_plan(portfolio: dict[str, Any] | None = None) ->
     """Persist one immutable plan version per materially different daily input."""
     portfolio = portfolio or build_portfolio_reoptimization()
     decision_gate = portfolio.get("decision_data_gate") if isinstance(portfolio.get("decision_data_gate"), dict) else {}
-    trade_date = str(decision_gate.get("target_trade_date") or _latest_trade_date())
+    trade_date = str(decision_gate.get("target_trade_date") or "")
+    if not trade_date:
+        return {
+            "id": None,
+            "trade_date": "",
+            "data_as_of_date": "",
+            "planned_execute_date": "",
+            "planned_execute_at": "",
+            "version": None,
+            "plan_version": "",
+            "status": "blocked_by_decision_data",
+            "persisted": False,
+            "is_executed": False,
+            "execution_authorized": False,
+            "retryable": True,
+            "blocked_reason": "决策数据门没有提供权威目标交易日，禁止从历史快照推断并创建正式计划",
+            "proposal": [],
+            "selection_snapshot": {},
+            "decision_contract_schema_version": UNIFIED_DAILY_DECISION_SCHEMA_VERSION,
+        }
+    if str(portfolio.get("status") or "") == "blocked":
+        plan_status, blocked_reason = _plan_block_status(portfolio)
+        return {
+            "id": None,
+            "trade_date": trade_date,
+            "data_as_of_date": trade_date,
+            "planned_execute_date": "",
+            "planned_execute_at": "",
+            "version": None,
+            "plan_version": "",
+            "status": plan_status,
+            "persisted": False,
+            "is_executed": False,
+            "execution_authorized": False,
+            "retryable": True,
+            "blocked_reason": blocked_reason,
+            "proposal": [],
+            "selection_snapshot": {},
+            "decision_contract_schema_version": UNIFIED_DAILY_DECISION_SCHEMA_VERSION,
+            "generation_policy": "关键输入未就绪；不创建不完整冻结计划，等待下一次真实数据探测。",
+        }
     if str(portfolio.get("selection_source") or "") != "unified_full_market_selection":
         return {
             "id": None,
@@ -1681,6 +2462,16 @@ def materialize_daily_rebalance_plan(portfolio: dict[str, Any] | None = None) ->
     if latest_same_day_status in {
         "blocked_by_contract_revision",
         "blocked_by_contract_validation",
+        "blocked_by_system_release",
+        "blocked_by_decision_data",
+        "blocked_by_market_context",
+        "blocked_by_position_valuation",
+        "blocked_by_selection",
+        "blocked_by_ledger",
+        "blocked_by_risk",
+        "blocked_by_optimizer",
+        "blocked_by_execution_checks",
+        "blocked_by_execution_recovery",
     }:
         blocked_plan = get_latest_daily_rebalance_plan(trade_date)
         blocked_plan["generation_policy"] = (
@@ -1811,6 +2602,7 @@ def claim_daily_rebalance_execution_input(
     if not token:
         raise ValueError("execution claim token is required")
     claimed_at = datetime.now().astimezone().isoformat(timespec="seconds")
+    order_audit_error: ReplayRiskGateError | None = None
     with business_conn() as c:
         query = """SELECT * FROM daily_rebalance_plans
                    WHERE trade_date=?
@@ -1923,14 +2715,21 @@ def claim_daily_rebalance_execution_input(
         proposal = contract.get("proposal") if isinstance(contract, dict) else None
         if not isinstance(proposal, list):
             reject_contract("正式调仓计划缺少冻结提案", "invalid_authoritative_plan")
-        changed = c.execute(
-            """UPDATE daily_rebalance_plans
-               SET status='executing',execution_claim_token=?,execution_claimed_at=?
-               WHERE id=? AND status='planned'""",
-            (token, claimed_at, int(row["id"])),
-        )
-        if int(getattr(changed, "rowcount", 1) or 0) != 1:
-            return None
+        order_audit = audit_frozen_execution_orders(contract, execute)
+        _persist_frozen_order_audit(plan_id=int(row["id"]), audit=order_audit, conn=c)
+        if not order_audit.get("ok"):
+            order_audit_error = frozen_order_data_gate_error(order_audit)
+        if order_audit_error is None:
+            changed = c.execute(
+                """UPDATE daily_rebalance_plans
+                   SET status='executing',execution_claim_token=?,execution_claimed_at=?
+                   WHERE id=? AND status='planned'""",
+                (token, claimed_at, int(row["id"])),
+            )
+            if int(getattr(changed, "rowcount", 1) or 0) != 1:
+                return None
+    if order_audit_error is not None:
+        raise order_audit_error
     if str(contract.get("schema_version") or "") in {
         UNIFIED_DAILY_DECISION_SCHEMA_VERSION,
         LEGACY_UNIFIED_DAILY_DECISION_SCHEMA_VERSION,
@@ -1962,6 +2761,11 @@ def claim_daily_rebalance_execution_input(
         "decision_contract": contract,
         "decision_contract_schema_version": str(contract.get("schema_version") or ""),
         "execution_claim_token": token,
+        # The claim-time audit is the execution clock. The engine reuses this
+        # cutoff so a later source revision cannot change the prices that were
+        # just approved for this immutable plan.
+        "execution_observation_cutoff": str(order_audit.get("checked_at") or ""),
+        "execution_data_evidence": order_audit,
     }
 
 
@@ -2051,12 +2855,24 @@ def list_pending_daily_rebalance_execution_inputs() -> list[dict[str, Any]]:
             and str(proposal.get("symbol") or "").split(".")[0] in registered
         }
         required_symbols = held_defensive_symbols | plan_symbols | proposal_symbols
-        latest_by_signal[signal_date] = {
+        pending_item = {
             "plan_id": int(item.get("id") or 0),
             "signal_date": signal_date,
             "execute_date": execute_date,
             "required_defensive_ts_codes": sorted(registered[symbol] for symbol in required_symbols),
         }
+        execution_orders = [
+            order for order in (contract.get("execution_orders") or [])
+            if isinstance(order, dict)
+        ]
+        if execution_orders:
+            # Keep only the exact order slice for the execution-data probe;
+            # broad research evidence remains private to the frozen contract.
+            pending_item["execution_contract"] = {
+                "schema_version": str(contract.get("schema_version") or ""),
+                "execution_orders": execution_orders,
+            }
+        latest_by_signal[signal_date] = pending_item
     return [item for item in latest_by_signal.values() if item.get("plan_id")]
 
 
@@ -2119,14 +2935,34 @@ def mark_missed_daily_rebalance_execution_inputs(current_execute_date: str) -> i
     return int(getattr(changed, "rowcount", 0) or 0)
 
 
-def release_daily_rebalance_execution_claim(signal_date: str, *, claim_token: str, reason: str) -> bool:
+def release_daily_rebalance_execution_claim(signal_date: str, *, claim_token: str, reason: Any) -> bool:
     signal = str(signal_date or "").replace("-", "")[:8]
+    detail = str(reason or "execution_data_not_ready")[:500]
+    evidence = getattr(reason, "execution_data_evidence", None)
+    if not isinstance(evidence, dict):
+        evidence = {
+            "schema_version": FROZEN_ORDER_DATA_GATE_SCHEMA_VERSION,
+            "status": "retryable_execution_data_gap",
+            "reason": detail,
+            "checked_at": _now(),
+        }
+    next_probe = evidence.get("next_probe_at")
     with business_conn() as c:
         changed = c.execute(
             """UPDATE daily_rebalance_plans
-               SET status='planned',execution_claim_token='',execution_claimed_at=NULL
+               SET status='planned',execution_claim_token='',execution_claimed_at=NULL,
+                   execution_data_evidence_json=?,next_probe_at=?,
+                   validation_error_code='paused_frozen_execution_order_data_not_ready',
+                   validation_errors_json=?,validated_at=?
                WHERE trade_date=? AND status='executing' AND execution_claim_token=?""",
-            (signal, str(claim_token or "")),
+            (
+                json.dumps(evidence, ensure_ascii=False, sort_keys=True),
+                next_probe,
+                json.dumps([detail], ensure_ascii=False),
+                _now(),
+                signal,
+                str(claim_token or ""),
+            ),
         )
     return int(getattr(changed, "rowcount", 0) or 0) == 1
 
@@ -2259,7 +3095,8 @@ def get_latest_daily_rebalance_plan(trade_date: str = "", *, compact: bool = Fal
     columns = (
         "id,trade_date,planned_execute_date,planned_execute_at,version,status,proposal_json,"
         "execution_id,generated_at,executed_at,execution_claim_token,execution_claimed_at,"
-        "validation_error_code,validation_errors_json,validated_at"
+        "validation_error_code,validation_errors_json,validated_at,"
+        "execution_data_evidence_json,next_probe_at"
     )
     today = datetime.now(_BUSINESS_TZ).strftime("%Y%m%d")
     with business_conn() as c:
@@ -2301,13 +3138,18 @@ def get_latest_daily_rebalance_plan(trade_date: str = "", *, compact: bool = Fal
         "status": str(item.get("status") or ""),
         "persisted": True,
         "is_executed": str(item.get("status") or "") == "executed",
-        "execution_authorized": str(item.get("status") or "") in {"planned", "executed"},
+        "execution_authorized": (
+            str(item.get("status") or "") in {"planned", "executed"}
+            and bool(contract.get("execution_authorized"))
+        ),
         "execution_id": item.get("execution_id"),
         "execution_claim_token_present": bool(str(item.get("execution_claim_token") or "")),
         "execution_claimed_at": item.get("execution_claimed_at"),
         "blocked_reason": {
             "executing": "正式计划已被唯一执行器领取，正在原子落账",
+            "blocked_by_system_release": "当前运行组件与已激活系统发布不一致，禁止执行",
             "blocked_by_decision_data": "最新交易日决策数据门未通过",
+            "blocked_by_position_valuation": "持仓缺少冻结点时行情，仅有成本价估值；禁止执行",
             "blocked_by_selection": "统一全市场选股链路未完成",
             "blocked_by_ledger": "模拟账户账本不一致",
             "blocked_by_risk": "风险门拒绝会增加风险的方案",
@@ -2331,6 +3173,11 @@ def get_latest_daily_rebalance_plan(trade_date: str = "", *, compact: bool = Fal
         "risk_limit_contract": projection["risk_limit_contract"],
         "validation_error_code": str(item.get("validation_error_code") or ""),
         "validation_errors": json.loads(item.get("validation_errors_json") or "[]") if item.get("validation_errors_json") else [],
+        "execution_data_evidence": (
+            json.loads(item.get("execution_data_evidence_json") or "{}")
+            if item.get("execution_data_evidence_json") else {}
+        ),
+        "next_probe_at": item.get("next_probe_at"),
         "decision_version_manifest": projection["decision_version_manifest"],
         "generated_at": item.get("generated_at"), "executed_at": item.get("executed_at"),
         "generation_policy": "计划只由自治周期生成；本接口只读已有版本",
@@ -2641,8 +3488,44 @@ def build_sell_rebalance_diagnostics(
     *, persist: bool = True,
 ) -> dict[str, Any]:
     positions = get_positions()
-    ds = BacktestDataSource()
-    trade_date = _latest_trade_date()
+    decision_gate = (portfolio or {}).get("decision_data_gate") if isinstance(portfolio, dict) else {}
+    trade_date = str((decision_gate or {}).get("target_trade_date") or "")
+    if not trade_date:
+        return {
+            "ok": False,
+            "status": "blocked_by_position_market_data",
+            "retryable": True,
+            "schema_version": "sell_rebalance_diagnostics_v2",
+            "items": [],
+            "learning_labels_written": 0,
+            "missing_symbols": [],
+            "detail": "缺少权威目标交易日，禁止从历史快照或成本价计算持仓盈亏。",
+        }
+    try:
+        valuation_cache = build_position_market_series_cache(positions, as_of=trade_date, exact_date=True)
+        missing = missing_exact_position_valuations(positions, valuation_cache, as_of=trade_date)
+    except Exception as exc:  # noqa: BLE001 - return a retryable diagnostic data gap
+        return {
+            "ok": False,
+            "status": "blocked_by_position_market_data",
+            "retryable": True,
+            "schema_version": "sell_rebalance_diagnostics_v2",
+            "items": [],
+            "learning_labels_written": 0,
+            "missing_symbols": [],
+            "detail": f"读取持仓目标日行情失败：{str(exc)[:300]}",
+        }
+    if missing:
+        return {
+            "ok": False,
+            "status": "blocked_by_position_market_data",
+            "retryable": True,
+            "schema_version": "sell_rebalance_diagnostics_v2",
+            "items": [],
+            "learning_labels_written": 0,
+            "missing_symbols": sorted(missing),
+            "detail": "持仓缺少目标交易日精确行情，禁止用成本价或前收计算盈亏。",
+        }
     model_degraded = bool((model_monitor or {}).get("degraded_count"))
     target_weights = ((portfolio or {}).get("optimizer") or {}).get("weights") or {}
     current_weights = (portfolio or {}).get("current_weights") or {}
@@ -2651,7 +3534,7 @@ def build_sell_rebalance_diagnostics(
     for pos in positions:
         symbol = str(pos.get("symbol") or "")
         cost = _safe_float(pos.get("price"))
-        current = _safe_float(ds.get_price_on_date(symbol, trade_date, field="close"), cost)
+        current = _safe_float((valuation_cache.get(symbol) or {}).get("price"))
         pnl_pct = current / cost - 1.0 if cost > 0 else 0.0
         current_weight = _safe_float(current_weights.get(symbol))
         target_weight = _safe_float(target_weights.get(symbol), current_weight)
@@ -2682,7 +3565,13 @@ def build_sell_rebalance_diagnostics(
             "action": action,
             "reasons": reasons or [{"code": "thesis_intact", "label": "继续持有", "detail": "未触发模型、风险或亏损退出条件"}],
         })
-    return {"ok": True, "schema_version": "sell_rebalance_diagnostics_v1", "items": items, "learning_labels_written": learning_written}
+    return {
+        "ok": True,
+        "schema_version": "sell_rebalance_diagnostics_v2",
+        "items": items,
+        "learning_labels_written": learning_written,
+        "missing_symbols": [],
+    }
 
 
 def build_simulation_learning_loop(*, persist: bool = True) -> dict[str, Any]:
@@ -2710,8 +3599,38 @@ def build_profit_loop(*, persist: bool = True, signal_date: str = "") -> dict[st
     sells = build_sell_rebalance_diagnostics(monitor, portfolio, persist=persist)
     learning = build_simulation_learning_loop(persist=persist)
     model_contribution = build_model_return_contribution()
+    portfolio = portfolio if isinstance(portfolio, dict) else {
+        "ok": False,
+        "status": "blocked",
+        "execution_authorized": False,
+        "blocked_reasons": [{"key": "portfolio", "detail": "组合重优化没有返回结构化结果"}],
+    }
+    rebalance_plan = rebalance_plan if isinstance(rebalance_plan, dict) else {
+        "status": "blocked_by_plan_result",
+        "execution_authorized": False,
+        "blocked_reason": "正式计划没有返回结构化结果",
+    }
+    portfolio_blocked = str(portfolio.get("status") or "") == "blocked" or not bool(portfolio.get("execution_authorized"))
+    plan_blocked = str(rebalance_plan.get("status") or "").startswith("blocked") or (
+        rebalance_plan.get("execution_authorized") is False
+        and str(rebalance_plan.get("status") or "") not in {"executed", "superseded"}
+    )
+    blocked_reasons = list(portfolio.get("blocked_reasons") or [])
+    sells_blocked = not bool(sells.get("ok"))
+    if sells_blocked:
+        blocked_reasons.append({
+            "key": "sell_rebalance_diagnostics",
+            "detail": str(sells.get("detail") or sells.get("status") or "持仓卖出诊断数据不可用"),
+        })
+    if plan_blocked:
+        blocked_reasons.append({
+            "key": "rebalance_plan",
+            "detail": str(rebalance_plan.get("blocked_reason") or rebalance_plan.get("status") or "正式计划不可执行"),
+        })
     return {
-        "ok": True,
+        "ok": not (portfolio_blocked or plan_blocked or sells_blocked),
+        "status": "blocked" if (portfolio_blocked or plan_blocked or sells_blocked) else "ready",
+        "blocked_reasons": blocked_reasons,
         "schema_version": "profit_loop_v1",
         "generated_at": _now(),
         "attribution": attribution,

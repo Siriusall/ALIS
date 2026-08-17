@@ -43,6 +43,42 @@ def test_owner_summary_cannot_hide_deterministic_failure_behind_incident_supervi
     assert summary["questions"]["anomalies"][0]["module"] == "theme_revenue_exposure"
 
 
+def test_owner_summary_cannot_hide_incident_supervisor_timeout(monkeypatch):
+    monkeypatch.setattr(
+        "app.services.production_strategy.champion_execution_gate",
+        lambda: {"status": "allowed", "mode": "normal"},
+    )
+    summary = _owner_summary([
+        {
+            "name": "llm_incident_supervisor",
+            "ok": False,
+            "error": "autonomy_step_timeout:120s",
+            "health": {"status": "degraded", "reason": "timed_out"},
+        },
+    ])
+
+    assert summary["healthy"] is False
+    assert summary["questions"]["anomalies"][0]["module"] == "llm_incident_supervisor"
+
+
+def test_owner_summary_keeps_completed_cycle_visible_when_live_champion_gate_read_fails(monkeypatch):
+    def unavailable_gate():
+        raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(
+        "app.services.production_strategy.champion_execution_gate",
+        unavailable_gate,
+    )
+
+    summary = _owner_summary([])
+
+    gate = summary["questions"]["system_changes"]["champion_execution_gate"]
+    assert summary["healthy"] is False
+    assert gate["status"] == "unavailable"
+    assert gate["mode"] == "fail_closed"
+    assert summary["questions"]["anomalies"][0]["module"] == "champion_execution_gate"
+
+
 def test_owner_summary_uses_current_profit_and_autonomy_contracts():
     summary = _owner_summary(
         [
@@ -258,6 +294,81 @@ def test_autonomy_runs_production_decision_when_experiments_are_not_ready(monkey
     assert steps["factor_daily_cycle"]["result"]["status"] == "observing"
 
 
+def test_historical_oos_block_does_not_stop_current_isolated_experiments(monkeypatch):
+    invoked = []
+
+    def controlled_run_step(name, fn):
+        invoked.append(name)
+        if name == "hard_data_gate":
+            result = {
+                "ok": False,
+                "status": "blocked",
+                "non_repairable_dates": ["20260701"],
+                "repair_dates": [],
+            }
+        elif name == "sealed_holdout_data_gate":
+            result = {"ok": False, "status": "blocked", "non_repairable_dates": ["20190910"], "repair_dates": []}
+        elif name == "decision_data_gate":
+            result = {"ok": True, "status": "ready", "decision_ready": True, "experiment_ready": True}
+        elif name == "autonomous_self_healing":
+            result = {"ok": True, "status": "completed", "components": {}}
+        elif name == "llm_incident_supervisor":
+            result = {"ok": True, "status": "self_managed", "owner_action_required_count": 0}
+        else:
+            result = {"ok": True, "status": "completed"}
+        return {"name": name, "ok": True, "result": result, "health": {"status": "healthy"}}
+
+    monkeypatch.setattr(system_autonomy, "_run_step", controlled_run_step)
+    monkeypatch.setattr(
+        "app.services.production_strategy.champion_execution_gate",
+        lambda: {"status": "allowed", "mode": "normal"},
+    )
+
+    system_autonomy.run_system_autonomy_cycle()
+
+    assert "factor_daily_cycle" in invoked
+    assert "strategy_shadow_recovery" in invoked
+
+
+def test_historical_gate_is_visible_as_research_wait_without_disabling_shadow(monkeypatch):
+    def controlled_run_step(name, fn):
+        if name == "hard_data_gate":
+            result = {
+                "ok": False, "status": "blocked",
+                "non_repairable_dates": ["20260701"], "repair_dates": [],
+            }
+        elif name == "sealed_holdout_data_gate":
+            result = {
+                "ok": False, "status": "blocked",
+                "non_repairable_dates": ["20190910"], "repair_dates": [],
+            }
+        elif name == "decision_data_gate":
+            result = {"ok": True, "status": "ready", "decision_ready": True, "experiment_ready": True}
+        elif name == "strategy_shadow_recovery":
+            result = {"ok": True, "status": "queued"}
+        elif name == "autonomous_self_healing":
+            result = {"ok": True, "status": "completed", "components": {}}
+        elif name == "llm_incident_supervisor":
+            result = {"ok": True, "status": "self_managed", "owner_action_required_count": 0}
+        else:
+            result = {"ok": True, "status": "completed"}
+        return {"name": name, "ok": bool(result.get("ok", True)), "result": result}
+
+    monkeypatch.setattr(system_autonomy, "_run_step", controlled_run_step)
+    monkeypatch.setattr(
+        "app.services.production_strategy.champion_execution_gate",
+        lambda: {"status": "allowed", "mode": "normal"},
+    )
+
+    result = system_autonomy.run_system_autonomy_cycle(trade_date="20260813")
+    summary = result["owner_summary"]["questions"]
+    assert result["status"] == "completed_with_anomalies"
+    assert summary["historical_research_waits"][0]["scope"] == "formal_oos_or_sealed_holdout_only"
+    assert summary["today_rebalance"] is not None
+    shadow = next(item for item in result["steps"] if item["name"] == "strategy_shadow_recovery")
+    assert shadow["result"]["status"] == "queued"
+
+
 def test_autonomy_freezes_production_plan_before_long_experiments(monkeypatch):
     invoked = []
 
@@ -432,6 +543,23 @@ def test_autonomy_slo_observes_until_twenty_sessions_then_passes():
     assert passed["status"] == "passed"
     assert passed["metrics"]["cycle_completion_rate"] == 1.0
     assert passed["metrics"]["duplicate_successful_cycle_count"] == 0
+
+
+def test_autonomy_slo_ignores_historical_oos_gate_for_current_cycle_health():
+    tasks = [_slo_task(index, f"202607{index:02d}") for index in range(1, 21)]
+    for task in tasks:
+        hard = next(item for item in task["result"]["steps"] if item["name"] == "hard_data_gate")
+        hard["ok"] = False
+        hard["result"] = {
+            "status": "blocked",
+            "non_repairable_dates": ["20260701"],
+            "repair_dates": [],
+        }
+
+    result = system_autonomy.build_autonomy_slo(tasks)
+
+    assert result["status"] == "passed"
+    assert result["metrics"]["critical_data_gate_rate"] == 1.0
 
 
 def test_autonomy_slo_fails_duplicate_success_and_ledger_drift():

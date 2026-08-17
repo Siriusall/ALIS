@@ -10,6 +10,8 @@ from typing import Any
 import requests
 
 from app.data_platform.db import _conn
+from app.data_platform.services.observation_clock import upsert_raw_record
+from app.data_platform.tushare_client import tushare_compatible_source_codes
 
 SOURCE_TENCENT_QUOTE = "tencent_quote_fallback"
 TENCENT_QUOTE_URL = "https://qt.gtimg.cn/q="
@@ -103,11 +105,14 @@ def _missing_codes(c: Any, trade_date: str) -> list[str]:
 
 
 def _reference_values(c: Any, trade_date: str, limit: int = 12) -> dict[str, tuple[float, float]]:
+    source_codes = tushare_compatible_source_codes()
+    source_placeholders = ",".join("?" for _ in source_codes)
     rows = c.execute(
-        """SELECT ts_code,payload_json FROM dc_tushare_raw_records
-           WHERE api_name='stk_limit' AND trade_date=? AND source_code='tushare'
+        f"""SELECT ts_code,payload_json FROM dc_tushare_raw_records
+           WHERE api_name='stk_limit' AND trade_date=?
+             AND source_code IN ({source_placeholders})
            ORDER BY ts_code LIMIT ?""",
-        (trade_date, limit),
+        (trade_date, *source_codes, limit),
     ).fetchall()
     values: dict[str, tuple[float, float]] = {}
     for row in rows:
@@ -153,22 +158,17 @@ def repair_stk_limit_from_tencent(trade_date: str) -> dict[str, Any]:
                 continue
             payload["verification_status"] = "cross_checked"
             payload["reference_sample_size"] = compared
-            values = (
-                "stk_limit", f"stk_limit:{trade_date}:{code}", code, trade_date, "", "",
-                json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
-                SOURCE_TENCENT_QUOTE, now, now,
+            written += upsert_raw_record(
+                c, api_name="stk_limit", record_key=f"stk_limit:{trade_date}:{code}",
+                ts_code=code, trade_date=trade_date, payload=payload, source_code=SOURCE_TENCENT_QUOTE,
+                observed_at=now, economic_time=f"{trade_date[:4]}-{trade_date[4:6]}-{trade_date[6:]}T15:00:00+08:00",
+                # ``missing`` was computed before the provider request.  A
+                # concurrent primary/fallback winner may have filled this key
+                # by now, so this late response must remain evidence-only.
+                provenance="tencent_quote_fallback:cross_checked",
             )
-            c.execute(
-                """INSERT INTO dc_tushare_raw_records
-                   (api_name,record_key,ts_code,trade_date,period,ann_date,payload_json,
-                    source_code,available_time,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)
-                   ON CONFLICT(api_name,record_key) DO UPDATE SET
-                    payload_json=excluded.payload_json,source_code=excluded.source_code,
-                    available_time=excluded.available_time,updated_at=excluded.updated_at""",
-                values,
-            )
-            written += 1
-    return {"ok": written > 0, "status": "completed" if written else "fallback_empty",
+    return {"ok": written == len(missing), "status": "completed" if written == len(missing) else "partial_or_empty",
             "source_code": SOURCE_TENCENT_QUOTE, "requested": len(missing),
             "received": len(quotes), "rows_written": written,
-            "reference_compared": compared, "reference_mismatches": mismatches}
+            "reference_compared": compared, "reference_mismatches": mismatches,
+            "missing": [code for code in missing if code not in quotes or not quotes.get(code)]}

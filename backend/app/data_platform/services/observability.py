@@ -5,7 +5,7 @@ from datetime import date
 from typing import Any
 
 from app.data_platform.db import _conn
-from app.data_platform.services.market_calendar import target_trade_date
+from app.data_platform.services.market_calendar import TradeCalendarNotReady, target_trade_date
 from app.data_platform.services.runtime_logs import list_runtime_logs
 from app.data_platform.redis_store import health as redis_health, stream_health
 from app.data_platform.services.snapshot_health import latest_usable_snapshot_date
@@ -274,6 +274,29 @@ def _quality_audit(c: Any) -> dict[str, Any]:
 
 
 def get_observability(limit_logs: int = 50, *, compact: bool = False) -> dict[str, Any]:
+    try:
+        with _conn() as c:
+            target_trade_date(c)
+    except TradeCalendarNotReady as exc:
+        return {
+            "ok": False,
+            "status": "blocked",
+            "error_code": exc.code,
+            "error": str(exc),
+            "latest_trade_date": "",
+            "quality": {"sample_rows": 0, "checks": []},
+            "quality_audit": {"status": "error", "issues": [{
+                "code": exc.code, "severity": "error", "status": "error", "count": 1, "message": str(exc),
+            }]},
+            "missingness": [],
+            "interfaces": [],
+            "interface_summary": {"total": 0, "healthy": 0, "warning": 0, "failed": 0},
+            "source_stats": [],
+            "logs": [],
+            "runtime_logs": list_runtime_logs(limit_logs),
+            "redis": redis_health(),
+            "redis_stream": stream_health(),
+        }
     with _conn() as c:
         latest_date = target_trade_date(c)
         stock_count = int(_value(c.execute("SELECT COUNT(*) n FROM dc_stock_master").fetchone(), "n"))

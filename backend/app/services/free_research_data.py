@@ -156,7 +156,11 @@ def materialize_financial_industry_series(*, max_periods: int = 12) -> dict[str,
             query_attempts += 1
             try:
                 with _conn() as conn:
-                    derived = _derived_industry_proxies(conn, as_of_time=f"{cutoff}T23:59:59")
+                    # Formal industry proxies use the shared explicit-clock
+                    # contract.  A date-only/naive timestamp could otherwise
+                    # be interpreted in the host timezone and silently
+                    # backdate evidence.
+                    derived = _derived_industry_proxies(conn, as_of_time=f"{cutoff}T23:59:59+08:00")
                 break
             except Exception as exc:
                 if attempt or not _is_statement_timeout(exc):
@@ -201,7 +205,7 @@ def materialize_financial_industry_series(*, max_periods: int = 12) -> dict[str,
                     "value": float(value),
                     "raw_value": json.dumps(item.get("evidence") or {}, ensure_ascii=False),
                     "source_code": FINANCIAL_SOURCE,
-                    "available_time": f"{cutoff}T23:59:59",
+                    "available_time": f"{cutoff}T23:59:59+08:00",
                 })
     return {
         "ok": True,

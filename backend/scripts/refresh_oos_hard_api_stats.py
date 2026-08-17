@@ -37,12 +37,14 @@ def refresh(start: str, end: str, *, batch_size: int = 20) -> dict[str, int]:
             for api_name in HARD_APIS:
                 rows = conn.execute(
                     f"""SELECT trade_date,
-                               COUNT(DISTINCT ts_code) FILTER (WHERE available_time<=
+                               COUNT(DISTINCT ts_code) FILTER (WHERE observed_at<=
                                    (SUBSTRING(trade_date,1,4)||'-'||SUBSTRING(trade_date,5,2)||'-'||SUBSTRING(trade_date,7,2)||'T15:00:00')) AS point_in_time_rows,
                                COUNT(DISTINCT ts_code) AS raw_rows,
-                               COALESCE(MIN(available_time), '') AS first_available_time
+                               COALESCE(MIN(first_observed_at), '') AS first_available_time
                           FROM dc_tushare_raw_records
                          WHERE api_name=? AND trade_date IN ({placeholders}) AND ts_code<>''
+                           AND observed_at<>'' AND first_observed_at<>'' AND content_hash<>''
+                           AND LOWER(COALESCE(observation_provenance,'')) NOT LIKE 'legacy_%'
                          GROUP BY trade_date""",
                     (api_name, *batch),
                 ).fetchall()

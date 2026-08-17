@@ -93,7 +93,7 @@ def test_ppi_refresh_persists_first_valid_provider(monkeypatch) -> None:
     )
     monkeypatch.setattr(data_center, "start_ingestion_run", lambda *_args, **_kwargs: 7)
     monkeypatch.setattr(data_center, "finish_ingestion_run", lambda *args, **kwargs: finished.append((args, kwargs)))
-    monkeypatch.setattr(data_center, "_upsert_raw_records", lambda *_args: 1)
+    monkeypatch.setattr(data_center, "_upsert_raw_records", lambda *_args, **_kwargs: 1)
     monkeypatch.setattr(data_center, "_record_probe", lambda *_args: None)
     monkeypatch.setattr(data_center, "_record_request_coverage", lambda *_args: None)
     monkeypatch.setattr(data_center, "_resolve_failed_tushare_request", lambda *_args: None)
@@ -123,7 +123,11 @@ def test_ppi_refresh_retains_independent_headline_without_claiming_components(mo
         "app.data_platform.services.independent_research_sources.fetch_eastmoney_ppi_headline",
         lambda *_args, **_kwargs: pd.DataFrame([{"month": "202607", "ppi_yoy": 3.5}]),
     )
-    monkeypatch.setattr(data_center, "_upsert_raw_records", lambda api, _frame: 1 if api == "cn_ppi_headline" else 0)
+    monkeypatch.setattr(
+        data_center,
+        "_upsert_raw_records",
+        lambda api, _frame, **_kwargs: 1 if api == "cn_ppi_headline" else 0,
+    )
     monkeypatch.setattr(
         "app.data_platform.services.research_source_discovery.race_tushare_sources",
         lambda **_kwargs: {"ok": False, "status": "not_published", "completed": []},

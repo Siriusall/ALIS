@@ -96,7 +96,11 @@ def test_hsmm_live_probability_is_filtered_terminal_distribution():
 
 def test_training_refresh_calls_only_three_compact_index_apis(monkeypatch):
     calls = []
-    monkeypatch.setattr("app.data_platform.services.data_center.sync_tushare_api_raw", lambda api, params: calls.append((api, params)) or {"rows_written": 10})
+    def sync_index_bundle(*, index_code, start_date, end_date):
+        calls.append(("index_daily", {"ts_code": index_code, "start_date": start_date, "end_date": end_date}))
+        return {"ok": True, "results": [{"api": "index_daily", "rows_written": 10}]}
+
+    monkeypatch.setattr("app.data_platform.services.data_center.sync_index_bundle", sync_index_bundle)
     monkeypatch.setattr("app.services.market_context.materialize_market_training_history", lambda: {"written": 20})
     result = hsmm_shadow.refresh_compact_training_history_from_api(years=10)
     assert len(calls) == 3

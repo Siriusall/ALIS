@@ -159,7 +159,7 @@ class PlanningAndBundleCorrectnessTest(unittest.TestCase):
     @patch("app.data_platform.services.data_center._safe_sync_raw")
     def test_market_bundle_propagates_sub_api_failure_and_only_calls_requested(self, sync, _snapshot) -> None:
         sync.return_value = {"ok": False, "api": "daily_basic", "error": "timeout"}
-        result = sync_market_bundle("20260710", apis=["daily_basic"])
+        result = sync_market_bundle("20260710", apis=["daily_basic"], provider="tushare")
         self.assertFalse(result["ok"])
         self.assertEqual(result["apis"], ["daily_basic"])
         sync.assert_called_once_with("daily_basic", {"trade_date": "20260710"})
@@ -194,7 +194,7 @@ class PlanningAndBundleCorrectnessTest(unittest.TestCase):
     @patch("app.data_platform.services.data_center.build_stock_daily_snapshot", return_value={"ok": True})
     @patch("app.data_platform.services.data_center._safe_sync_raw", return_value={"ok": True})
     def test_market_bundle_allows_targeted_adj_factor_repair(self, sync, _snapshot) -> None:
-        result = sync_market_bundle("20260710", apis=["adj_factor"])
+        result = sync_market_bundle("20260710", apis=["adj_factor"], provider="tushare")
 
         self.assertTrue(result["ok"])
         self.assertEqual(result["apis"], ["adj_factor"])

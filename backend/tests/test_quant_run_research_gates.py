@@ -1,5 +1,6 @@
 from app.services import (
     decision_store,
+    defensive_assets,
     market_context,
     quant_run_research_gates as gates,
     research_workflow,
@@ -31,6 +32,32 @@ def test_unsupported_market_model_falls_back_without_changing_transparent_state(
     assert result["market_state_runtime"]["fallback_reason"] == (
         "unsupported_market_state_model:unregistered_model"
     )
+
+
+def test_dynamic_gate_blocks_all_candidates_when_market_context_pit_is_missing(monkeypatch):
+    monkeypatch.setattr(market_context, "market_context_as_of", lambda _cutoff: {
+        "ok": False,
+        "status": "blocked",
+        "reason": "market_context_exact_trade_date_missing",
+    })
+    monkeypatch.setattr(
+        defensive_assets,
+        "defensive_allocation_for_state",
+        lambda *_args, **_kwargs: {"target_weights": {}},
+    )
+
+    admitted, blocked, summary = gates.apply_dynamic_strategy_gate(
+        ["000001", "600000"],
+        as_of_time="2026-08-14T15:00:00+08:00",
+    )
+
+    assert admitted == []
+    assert [item["code"] for item in blocked] == [
+        "market_context_pit_unavailable",
+        "market_context_pit_unavailable",
+    ]
+    assert summary["status"] == "blocked"
+    assert summary["risk_budget_multiplier"] == 0.0
 
 
 def test_research_admission_excludes_pool_members_entered_after_cutoff(monkeypatch):

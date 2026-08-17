@@ -3,10 +3,10 @@ from __future__ import annotations
 """
 TuShare 集成客户端。
 
-严格按照用户提供的初始化方式：
+严格按照 TuShare Pro 初始化方式：
     pro = ts.pro_api(token)
     pro._DataApi__token = token
-    pro._DataApi__http_url = 'http://lianghua.nanyangqiankun.top'
+    pro._DataApi__http_url = configured endpoint
 
 token 从项目根目录的 `.env` 中读取：TUSHARE_TOKEN=...
 """
@@ -14,7 +14,6 @@ token 从项目根目录的 `.env` 中读取：TUSHARE_TOKEN=...
 import os
 import threading
 import time
-from urllib.parse import urlparse
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -48,12 +47,6 @@ def load_tushare_token_from_env() -> str:
 
 def create_tushare_pro_for_endpoint(token: str, endpoint: str, *, timeout_seconds: float = 12.0):
     """Create an isolated TuShare client for one bounded provider probe."""
-    host = str(urlparse(endpoint).hostname or "")
-    for env_name in ("NO_PROXY", "no_proxy"):
-        values = [item.strip() for item in os.getenv(env_name, "").split(",") if item.strip()]
-        if host and host not in values:
-            values.append(host)
-            os.environ[env_name] = ",".join(values)
     pro = ts.pro_api(token)
     pro._DataApi__token = token  # type: ignore[attr-defined]
     pro._DataApi__http_url = str(endpoint).rstrip("/")  # type: ignore[attr-defined]
@@ -64,7 +57,7 @@ def create_tushare_pro_for_endpoint(token: str, endpoint: str, *, timeout_second
 def configured_tushare_probe_endpoints() -> tuple[tuple[str, str], ...]:
     configured = os.getenv(
         "TUSHARE_PROBE_ENDPOINTS",
-        "tushare_official=http://api.waditu.com/dataapi,tushare_proxy=http://lianghua.nanyangqiankun.top",
+        "tushare_official=https://api.tushare.pro,tushare_waditu=http://api.waditu.com/dataapi,tushare_proxy=http://lianghua.nanyangqiankun.top",
     )
     result: list[tuple[str, str]] = []
     for item in configured.split(","):
@@ -74,16 +67,42 @@ def configured_tushare_probe_endpoints() -> tuple[tuple[str, str], ...]:
     return tuple(dict.fromkeys(result))
 
 
+def tushare_compatible_source_codes() -> tuple[str, ...]:
+    """Return source identifiers backed by a TuShare-compatible endpoint.
+
+    Raw records retain the actual winning provider name (for example
+    ``tushare_proxy``), so downstream cross-checks must accept every
+    configured compatible endpoint rather than assuming the primary source
+    is always available.
+    """
+    return ("tushare",) + tuple(
+        name for name, _endpoint in configured_tushare_probe_endpoints()
+        if name and name != "tushare"
+    )
+
+
+def is_tushare_compatible_source(provider: str) -> bool:
+    """Whether a retained source is one of the configured TuShare endpoints."""
+    return str(provider or "").strip() in set(tushare_compatible_source_codes())
+
+
+def tushare_endpoint_for_provider(provider: str) -> str:
+    """Resolve a named TuShare-compatible provider without exposing credentials."""
+    name = str(provider or "tushare").strip()
+    if name == "tushare":
+        return str(os.getenv("TUSHARE_HTTP_URL") or "https://api.tushare.pro").strip().rstrip("/")
+    configured = dict(configured_tushare_probe_endpoints())
+    endpoint = str(configured.get(name) or "").strip()
+    if not endpoint:
+        raise ValueError(f"unknown_tushare_provider:{name}")
+    return endpoint.rstrip("/")
+
+
 def create_strict_tushare_pro(token: str):
-    """
-    严格按固定方式初始化 TuShare Pro：
-      import tushare as ts
-      pro = ts.pro_api(token)
-      pro._DataApi__token = token
-      pro._DataApi__http_url = "http://lianghua.nanyangqiankun.top"
-    """
+    """Create the primary client without hard-coding a fragile proxy host."""
+    endpoint = tushare_endpoint_for_provider("tushare")
     return create_tushare_pro_for_endpoint(
-        token, "http://lianghua.nanyangqiankun.top", timeout_seconds=30,
+        token, endpoint, timeout_seconds=30,
     )
 
 
@@ -98,26 +117,11 @@ class TushareClient:
       - index_weight
     """
 
-    def __init__(self) -> None:
-        # 在 Windows 下 requests 可能继承系统代理（如 127.0.0.1:11223），
-        # 会导致 TuShare 偶发走本地代理超时；这里默认对 TuShare 域名直连。
-        no_proxy = os.getenv("NO_PROXY", "")
-        bypass_hosts = ["lianghua.nanyangqiankun.top", "api.waditu.com", "127.0.0.1", "localhost"]
-        tokens = [x.strip() for x in no_proxy.split(",") if x.strip()]
-        changed = False
-        for host in bypass_hosts:
-            if host not in tokens:
-                tokens.append(host)
-                changed = True
-        if changed:
-            merged = ",".join(tokens)
-            os.environ["NO_PROXY"] = merged
-            os.environ["no_proxy"] = merged
-
+    def __init__(self, *, endpoint: str | None = None) -> None:
         token = _load_token_from_env()
         self.token = token
-        self.http_url = "http://lianghua.nanyangqiankun.top"
-        self.pro = create_strict_tushare_pro(token)
+        self.http_url = str(endpoint or tushare_endpoint_for_provider("tushare")).strip().rstrip("/")
+        self.pro = create_tushare_pro_for_endpoint(token, self.http_url, timeout_seconds=30)
 
     # ---- 轻量封装 TuShare 接口，统一 DataFrame 返回 ----
 
@@ -192,7 +196,15 @@ def get_tushare_client() -> TushareClient:
     with _client_lock:
         if _client is None:
             _client = TushareClient()
-    return _client
+        return _client
+
+
+def get_tushare_client_for_provider(provider: str) -> TushareClient:
+    """Return an isolated client for a configured TuShare-compatible endpoint."""
+    name = str(provider or "tushare").strip()
+    if name == "tushare":
+        return get_tushare_client()
+    return TushareClient(endpoint=tushare_endpoint_for_provider(name))
 
 
 def reset_tushare_client() -> TushareClient:

@@ -20,25 +20,25 @@ from app.services.strategy_controller import active_strategy_policy_context
 
 
 RELEASE_SCHEMA_VERSION = "alis_system_release_manifest_v1"
-DECISION_MANIFEST_SCHEMA_VERSION = "alis_decision_version_manifest_v2"
-SIM_SCHEMA_HEAD = "sim_0006_candidate_ledger_repair"
-DATA_SCHEMA_HEAD = "data_0010_oos_api_timing"
+DECISION_MANIFEST_SCHEMA_VERSION = "alis_decision_version_manifest_v3"
+SIM_SCHEMA_HEAD = "sim_0007_autonomous_singleton"
+DATA_SCHEMA_HEAD = "data_0011_pit_observation_clock"
 REPO_ROOT = Path(__file__).resolve().parents[3]
 
 CONTRACT_CATALOG: dict[str, dict[str, Any]] = {
-    "contract.decision_data": {"version": "alis_decision_data_contract_v2", "critical": True},
+    "contract.decision_data": {"version": "alis_decision_data_contract_v3", "critical": True},
     "contract.market_ingestion": {"version": "alis_market_progress_aware_hedged_checkpoint_v3", "critical": True},
     "contract.market_field_lineage": {"version": "alis_market_field_lineage_v1", "critical": True},
     "contract.decision_manifest": {"version": DECISION_MANIFEST_SCHEMA_VERSION, "critical": True},
-    "contract.point_in_time": {"version": "point_in_time_v1", "critical": True},
+    "contract.point_in_time": {"version": "alis_market_observation_clock_v1", "critical": True},
     "contract.execution": {"version": "alis_t1_execution_safety_v2", "critical": True},
     "contract.unified_decision": {"version": "alis_unified_daily_decision_v2", "critical": True},
-    "contract.oos_hard_data": {"version": "alis_oos_hard_data_v2", "critical": False},
-    "contract.sealed_holdout": {"version": "alis_sealed_strategy_holdout_v2", "critical": False},
+    "contract.oos_hard_data": {"version": "alis_oos_hard_data_v4_immutable_observation", "critical": False},
+    "contract.sealed_holdout": {"version": "alis_sealed_strategy_holdout_v4_immutable_observation", "critical": False},
 }
 COMPATIBILITY_RULES = (
-    ("contract.market_ingestion", "contract.decision_data", "exact_version", "alis_decision_data_contract_v2"),
-    ("contract.market_field_lineage", "contract.decision_data", "exact_version", "alis_decision_data_contract_v2"),
+    ("contract.market_ingestion", "contract.decision_data", "exact_version", "alis_decision_data_contract_v3"),
+    ("contract.market_field_lineage", "contract.decision_data", "exact_version", "alis_decision_data_contract_v3"),
     ("contract.decision_manifest", "contract.execution", "exact_version", "alis_t1_execution_safety_v2"),
 )
 
@@ -557,6 +557,16 @@ def run_release_governance_cycle(*, actor: str = "system_release_governance") ->
         return {
             "ok": False, "status": "restart_required", "discovery": discovery,
             "production_change": False,
+        }
+    # A dirty worktree cannot produce a valid immutable release.  Stop before
+    # creating a blocked database candidate; the discovery result itself is the
+    # auditable evidence and avoids filling the release list with duplicates of
+    # the same operator action.
+    if discovery.get("repository_dirty"):
+        return {
+            "ok": False, "status": "worktree_dirty", "discovery": discovery,
+            "production_change": False,
+            "reason": "repository_worktree_must_be_clean_before_release",
         }
     if not discovery["changed"]:
         return {

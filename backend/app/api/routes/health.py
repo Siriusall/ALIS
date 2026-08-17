@@ -121,7 +121,10 @@ def trading_readiness(detail: str = Query("full", pattern="^(full|compact)$")) -
     if latest_plan["status"] != "ready":
         latest_plan["status"] = "blocked"
         plan_status = "diagnostic_error"
-    elif plan_status in {"blocked_by_contract_validation", "blocked_by_contract_revision", "blocked_by_execution_recovery", "missed_execution_window"}:
+    elif plan_status.startswith("blocked_") or plan_status == "missed_execution_window":
+        # A new explicit plan blocker must never be forgotten here and then
+        # rendered as a healthy waiting plan merely because its code was not
+        # in a hand-maintained allowlist.
         latest_plan["status"] = "blocked"
     elif plan_status == "executing":
         latest_plan["status"] = "running"

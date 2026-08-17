@@ -49,3 +49,27 @@ def test_stock_weights_follow_industry_budget(monkeypatch):
     assert round(weights["000001"] + weights["000002"], 6) == .25
     assert "000003" not in weights
     assert round(sum(weights.values()), 6) == .25
+
+
+def test_blocked_industry_snapshot_is_not_reported_as_empty_healthy_allocation(monkeypatch):
+    monkeypatch.setattr(
+        industry_allocator,
+        "list_industries",
+        lambda **_: {
+            "ok": False,
+            "status": "blocked",
+            "reason": "industry_snapshot_not_visible_at_cutoff",
+        },
+    )
+
+    result = industry_allocator.build_industry_allocation(
+        symbols=["000001"],
+        equity_budget=.4,
+        market_state="S0",
+        as_of_time="2026-08-14T15:00:00+08:00",
+    )
+
+    assert result["ok"] is False
+    assert result["status"] == "blocked"
+    assert result["reason"] == "industry_snapshot_not_visible_at_cutoff"
+    assert result["allocated_equity_budget"] == 0.0

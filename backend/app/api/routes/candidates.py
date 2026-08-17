@@ -9,7 +9,7 @@ from app.db.store import get_default_strategy_id, get_strategy
 from app.schemas.candidate import CandidateResponse, CandidatesListResponse
 from app.services.daily_data import DailyCacheNotReadyError
 from app.services.factor_engine import score_factors_with_strategy
-from app.services.stock_selector import select_affordable_stocks
+from app.services.stock_selector import StockSelectionDataNotReadyError, select_affordable_stocks
 
 
 router = APIRouter()
@@ -65,7 +65,20 @@ def get_candidates(
             return entry.response
         if entry.error is not None:
             add_log("ERROR", str(entry.error))
-            return CandidatesListResponse(candidates=[], warnings=[])
+            if isinstance(entry.error, StockSelectionDataNotReadyError):
+                raise HTTPException(
+                    status_code=503,
+                    detail={
+                        "code": "decision_data_not_ready",
+                        "trade_date": entry.error.trade_date,
+                        "message": str(entry.error),
+                        "contract": entry.error.contract,
+                    },
+                )
+            raise HTTPException(
+                status_code=503,
+                detail={"code": "candidate_score_failed", "message": str(entry.error)[:500]},
+            )
         return CandidatesListResponse(candidates=[], warnings=["请求等待超时，请重试"])
 
     try:
@@ -131,10 +144,25 @@ def get_candidates(
         return resp
     except HTTPException:
         raise
+    except StockSelectionDataNotReadyError as exc:
+        entry.error = exc
+        add_log("ERROR", f"选股 503：目标交易日 {exc.trade_date} 数据未就绪")
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "decision_data_not_ready",
+                "trade_date": exc.trade_date,
+                "message": str(exc),
+                "contract": exc.contract,
+            },
+        ) from exc
     except Exception as e:
         entry.error = e
         add_log("ERROR", str(e))
-        return CandidatesListResponse(candidates=[], warnings=[])
+        raise HTTPException(
+            status_code=503,
+            detail={"code": "candidate_score_failed", "message": str(e)[:500]},
+        ) from e
     finally:
         entry.event.set()
         with _inflight_lock:

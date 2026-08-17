@@ -36,7 +36,6 @@ class Position:
     quantity: int
     avg_cost: float
     buy_date: str
-    last_close: float = 0.0
 
 
 def _norm(values: List[float]) -> List[float]:
@@ -219,6 +218,7 @@ def run_backtest(
     benchmark_series: List[Dict[str, Any]] = []
     warnings: List[str] = []
     constraint_events: List[Dict[str, Any]] = []
+    position_market_missing_dates: Dict[str, List[str]] = {}
 
     prev_rebalance_date: Optional[str] = None
     pending_target: Optional[List[str]] = None
@@ -277,6 +277,7 @@ def run_backtest(
         snapshot_all = ds.load_snapshot(d.replace("-", ""))
         if not snapshot_all:
             logger.warning("backtest day=%s snapshot empty, skip", d)
+            pending_target = None
             continue
         snapshot_map = {x.symbol: x for x in snapshot_all}
         snapshot = snapshot_all
@@ -285,6 +286,25 @@ def run_backtest(
         if not snapshot:
             logger.warning("backtest day=%s exchange_group=%s 后无可用样本", d, exchange_group)
             pending_target = []
+            continue
+        missing_holdings = sorted(
+            symbol for symbol in holdings
+            if symbol not in snapshot_map or float(snapshot_map[symbol].close or 0.0) <= 0.0
+        )
+        if missing_holdings:
+            position_market_missing_dates[d] = missing_holdings
+            pending_target = None
+            warnings.append(
+                f"{d} 持仓缺少精确收盘价：{','.join(missing_holdings)}；"
+                "已停止当日估值和冻结 T+1 执行，不使用前收或成本价。"
+            )
+            constraint_events.extend({
+                "date": d,
+                "symbol": symbol,
+                "side": "SYSTEM",
+                "code": "position_close_missing",
+                "message": "持仓缺少当日精确收盘价，禁止沿用前收、估值或执行 T+1 订单",
+            } for symbol in missing_holdings)
             continue
 
         # 执行前一日调仓信号（T+1 开盘成交）
@@ -383,7 +403,6 @@ def run_backtest(
                         quantity=qty,
                         avg_cost=round(total_cost / qty, 4),
                         buy_date=d,
-                        last_close=row.close,
                     )
                     trades.append(
                         {
@@ -404,10 +423,7 @@ def run_backtest(
         stock_value = 0.0
         by_symbol: Dict[str, float] = {}
         for sym, pos in holdings.items():
-            row = snapshot_map.get(sym)
-            if row and row.close > 0:
-                pos.last_close = row.close
-            mv = pos.last_close * pos.quantity
+            mv = float(snapshot_map[sym].close) * pos.quantity
             stock_value += mv
             by_symbol[sym] = round(mv, 2)
         total_value = cash + stock_value
@@ -639,6 +655,11 @@ def run_backtest(
             "used_fallback": bool(fallback_events),
             "fallback_events": fallback_events[:100],
             "warnings": list(getattr(ds, "data_warnings", []))[:100],
+            "held_position_market_data": {
+                "passed": not position_market_missing_dates,
+                "missing_dates": position_market_missing_dates,
+                "policy": "持仓必须有当日精确收盘价；缺口不得用前收、成本价或后续交易日替代。",
+            },
         },
         "trade_constraints": {
             "policy": {

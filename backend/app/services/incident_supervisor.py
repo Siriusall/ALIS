@@ -11,6 +11,7 @@ from app.services.llm_review_assistant import _call_deepseek_json, llm_token_bud
 
 
 _AUTO_POLICIES: dict[str, tuple[str, str]] = {
+    "hard_data_gate": ("historical_oos_gate", "历史点时证据只阻断正式 OOS；不影响当天决策、隔离模拟或未来 Shadow"),
     "sealed_holdout_data_gate": ("data_backfill", "系统按每周期上限继续补齐密封验证集，完成前禁止消费"),
     "decision_data_gate": ("daily_refresh", "系统已暂停正式计划和实验，并委托收盘数据刷新后复核"),
     "periodic_performance_review": ("research_iteration", "系统将复盘信号转成受约束候选并继续验证"),
@@ -44,6 +45,24 @@ def _healing_action(steps: list[dict[str, Any]], kind: str) -> dict[str, Any]:
 
 def _sealed_holdout_resolution(step: dict[str, Any], steps: list[dict[str, Any]]) -> tuple[str, dict[str, Any]]:
     before = _result(step).get("eligible_sessions")
+    audit = _result(step)
+    if (
+        str(audit.get("status") or "") == "blocked"
+        and bool(audit.get("non_repairable_dates"))
+        and not bool(audit.get("repair_dates"))
+    ):
+        return "waiting_condition", {
+            "waiting_for": "密封验证集缺少不可追溯的历史点时证据",
+            "progress": {
+                "before": before,
+                "after": before,
+                "delta": 0,
+                "required": audit.get("required_sessions"),
+                "unit": "交易日",
+            },
+            "failure_signature": "historical_observation_evidence_missing",
+            "retry_policy": "禁止向上游重抓历史切片；仅在具备原始采集时间的外部归档证据导入后重新审计",
+        }
     healing = _healing_action(steps, "sealed_strategy_holdout")
     verification = healing.get("verification") if isinstance(healing.get("verification"), dict) else {}
     after = verification.get("eligible_sessions")
@@ -71,6 +90,46 @@ def _sealed_holdout_resolution(step: dict[str, Any], steps: list[dict[str, Any]]
         "failure_signature": "sealed_holdout_repair_no_progress",
         "progress": progress,
         "retry_policy": "执行补数后完整率未增长，必须先诊断点时合同或缺失字段，不能只等待下周期",
+    }
+
+
+def _historical_pit_resolution(step: dict[str, Any]) -> tuple[str, dict[str, Any]] | None:
+    """Classify an irreversible historical gate without inventing a repair fault."""
+    name = str(step.get("name") or "")
+    if name not in {"hard_data_gate", "sealed_holdout_data_gate"}:
+        return None
+    result = _result(step)
+    health = step.get("health") if isinstance(step.get("health"), dict) else {}
+    historical_wait = (
+        str(health.get("reason") or "") == "historical_point_in_time_unavailable"
+        or (
+            str(result.get("status") or "") == "blocked"
+            and bool(result.get("non_repairable_dates"))
+            and not bool(result.get("repair_dates"))
+        )
+    )
+    if not historical_wait:
+        return None
+    if name == "sealed_holdout_data_gate":
+        waiting_for = "密封验证集缺少不可追溯的历史点时证据"
+        signature = "historical_observation_evidence_missing"
+        policy = "禁止向上游重抓历史切片；仅在导入带原始采集时间的外部归档证据后重新审计"
+    else:
+        waiting_for = "正式 OOS 硬数据缺少不可追溯的历史点时证据"
+        signature = "historical_observation_evidence_missing"
+        policy = "禁止把晚到数据改写成 T 日可用；仅在导入带原始采集时间的外部归档证据后重新审计"
+    return "waiting_condition", {
+        "waiting_for": waiting_for,
+        "failure_signature": signature,
+        "formal_scope": "formal_oos_or_sealed_holdout_only",
+        "progress": {
+            "before": result.get("eligible_sessions"),
+            "after": result.get("eligible_sessions"),
+            "delta": 0,
+            "required": result.get("required_sessions"),
+            "unit": "交易日",
+        },
+        "retry_policy": policy,
     }
 
 
@@ -117,6 +176,9 @@ def _transient_read_failure(step: dict[str, Any]) -> str:
 
 def _resolution(step: dict[str, Any], steps: list[dict[str, Any]]) -> tuple[str, dict[str, Any]]:
     name = str(step.get("name") or "")
+    historical = _historical_pit_resolution(step)
+    if historical is not None:
+        return historical
     if name == "sealed_holdout_data_gate":
         return _sealed_holdout_resolution(step, steps)
     if name == "research_data_assets":
@@ -198,10 +260,21 @@ def _step_cases(steps: list[dict[str, Any]]) -> list[dict[str, Any]]:
             continue
         health = step.get("health") if isinstance(step.get("health"), dict) else classify_step_health(step)
         status = str(health.get("status") or "")
-        if status not in {"failed", "degraded"}:
+        historical_pit_gate = (
+            name in {"hard_data_gate", "sealed_holdout_data_gate"}
+            and status == "waiting_condition"
+            and str(health.get("reason") or "") == "historical_point_in_time_unavailable"
+        )
+        if status not in {"failed", "degraded"} and not historical_pit_gate:
             continue
         action, policy = _AUTO_POLICIES.get(name, ("bounded_recheck", "系统保留隔离并在后续周期重新诊断，未授权任何危险修改"))
         resolution_class, resolution_evidence = _resolution(step, steps)
+        if resolution_evidence.get("formal_scope") == "formal_oos_or_sealed_holdout_only":
+            action = "historical_pit_wait"
+            policy = str(
+                resolution_evidence.get("retry_policy")
+                or "等待可追溯历史证据；禁止重复刷历史切片"
+            )
         if resolution_class == "internal_fault" and name == "sealed_holdout_data_gate":
             action = "diagnose_backfill_contract"
             policy = "补数已经执行但完整率没有增长，系统转入点时合同与缺失字段诊断"

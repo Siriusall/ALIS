@@ -11,6 +11,7 @@ from app.services.plan_model_control import PLAN_MODELS
 from app.services.production_strategy import resolve_production_strategy_champion
 from app.services.strategy_controller import active_strategy_policy_context
 from app.services.system_release_center import active_release
+from app.services.point_in_time import normalize_explicit_timestamp
 
 
 def build_decision_version_manifest(
@@ -75,6 +76,12 @@ def build_decision_version_manifest(
     # back to factors/deterministic rules. Do not repopulate it from current
     # active records after T-day selection has already frozen the authority.
     model_versions = frozen_model_versions if has_frozen_fusion else active_model_versions
+    # A formal selection snapshot owns the observation clock.  Never synthesize
+    # a T15 timestamp when that snapshot is absent: doing so would make a late
+    # response look like evidence available at the market close.  Legacy
+    # callers may still build a manifest before selection; the resulting empty
+    # cutoff is deliberately rejected when a V2 contract is validated.
+    selection_cutoff = normalize_explicit_timestamp(selection.get("data_as_of_time"))
     manifest = {
         "schema_version": "alis_decision_version_manifest_v2",
         "release": {
@@ -85,10 +92,12 @@ def build_decision_version_manifest(
         },
         "trade_date": str(trade_date).replace("-", "")[:8],
         "data_contract": {
-            "schema_version": "alis_decision_data_contract_v2",
-            "oos_hard_data_schema": "alis_oos_hard_data_v2",
+            "schema_version": "alis_decision_data_contract_v3",
+            "oos_hard_data_schema": "alis_oos_hard_data_v4_immutable_observation",
             "market_ingestion_schema": "alis_market_progress_aware_hedged_checkpoint_v3",
-            "point_in_time_cutoff": f"{str(trade_date).replace('-', '')[:4]}-{str(trade_date).replace('-', '')[4:6]}-{str(trade_date).replace('-', '')[6:8]}T15:00:00",
+            "point_in_time_cutoff": selection_cutoff,
+            "observation_clock_schema": "alis_market_observation_clock_v1",
+            "observation_policy": "actual_observed_at_required_no_synthetic_t15",
         },
         "factor_contract": {
             "schema_version": FACTOR_SCHEMA_VERSION,

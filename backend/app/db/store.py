@@ -1354,6 +1354,12 @@ def init_db() -> None:
 
     try:
         with _conn() as c:
+            # Schema creation is invoked by every API/worker process.  An
+            # advisory transaction lock makes the idempotent ALTER/INDEX
+            # sequence single-writer, preventing PostgreSQL DDL deadlocks
+            # during concurrent startup or test collection.
+            if _is_postgres():
+                c.execute("SELECT pg_advisory_xact_lock(?)", (1095522644,))
             logger.info("数据库连接成功，正在建表...")
             if _is_postgres():
                 logger.info("数据库: PostgreSQL；校验并补齐运行 schema")
@@ -1404,6 +1410,30 @@ def init_db() -> None:
                 CREATE INDEX IF NOT EXISTS idx_ops_symbol_at ON operations (symbol, at);
                 CREATE INDEX IF NOT EXISTS idx_task_runs_task_execute ON quant_run_task_runs (task_id, execute_date);
                 CREATE INDEX IF NOT EXISTS idx_tasks_status_updated ON quant_run_tasks (status, updated_at);
+                WITH ranked_autonomous AS (
+                    SELECT id, ROW_NUMBER() OVER (
+                        ORDER BY CASE status
+                            WHEN 'running' THEN 1
+                            WHEN 'stopping' THEN 2
+                            WHEN 'pending' THEN 3
+                            WHEN 'paused' THEN 4
+                            ELSE 5
+                        END, id DESC
+                    ) AS rn
+                    FROM quant_run_tasks
+                    WHERE replay_mode='autonomous_daily'
+                      AND status IN ('pending','running','paused','stopping')
+                )
+                UPDATE quant_run_tasks
+                   SET status='stopped', stop_requested=1,
+                       finished_at=COALESCE(finished_at, CURRENT_TIMESTAMP::text),
+                       updated_at=CURRENT_TIMESTAMP::text,
+                       last_message='历史重复自治任务已由启动恢复隔离'
+                 WHERE id IN (SELECT id FROM ranked_autonomous WHERE rn > 1);
+                CREATE UNIQUE INDEX IF NOT EXISTS uq_quant_run_tasks_one_active_autonomous_daily
+                ON quant_run_tasks (replay_mode)
+                WHERE replay_mode='autonomous_daily'
+                  AND status IN ('pending','running','paused','stopping');
                 WITH ranked AS (
                     SELECT id,ROW_NUMBER() OVER (PARTITION BY model_key ORDER BY id DESC) AS rn
                     FROM model_versions WHERE is_active=1
@@ -2648,6 +2678,49 @@ def create_quant_run_task(
     max_steps: int = 5,
     replay_mode: str = "pragmatic_recover",
 ) -> int:
+    task_id, _created = _create_quant_run_task_record(
+        strategy_id=strategy_id,
+        top_n=top_n,
+        budget_ratio=budget_ratio,
+        exchange_group=exchange_group,
+        start_date=start_date,
+        max_steps=max_steps,
+        replay_mode=replay_mode,
+    )
+    return task_id
+
+
+def create_or_reuse_autonomous_quant_run_task(
+    *,
+    strategy_id: int,
+    top_n: int,
+    budget_ratio: float,
+    exchange_group: str = "HS",
+    start_date: Optional[str] = None,
+    max_steps: int = 1,
+) -> tuple[int, bool]:
+    """Atomically create or reuse the one scheduler-owned autonomous task."""
+    return _create_quant_run_task_record(
+        strategy_id=strategy_id,
+        top_n=top_n,
+        budget_ratio=budget_ratio,
+        exchange_group=exchange_group,
+        start_date=start_date,
+        max_steps=max_steps,
+        replay_mode="autonomous_daily",
+    )
+
+
+def _create_quant_run_task_record(
+    *,
+    strategy_id: int,
+    top_n: int,
+    budget_ratio: float,
+    exchange_group: str,
+    start_date: Optional[str],
+    max_steps: int,
+    replay_mode: str,
+) -> tuple[int, bool]:
     now = datetime.now().isoformat()
     norm_exchange_group = str(exchange_group or "HS")
     norm_start_date = str(start_date) if start_date else None
@@ -2660,28 +2733,50 @@ def create_quant_run_task(
             except Exception:
                 pass
 
-        # 防重：同参数的活动任务（未终态）只保留一条，避免外部重复触发导致任务雪崩。
-        cur = c.execute(
-            """SELECT id
-               FROM quant_run_tasks
-               WHERE strategy_id = ?
-                 AND top_n = ?
-                 AND budget_ratio = ?
-                 AND exchange_group = ?
-                 AND COALESCE(start_date, '') = COALESCE(?, '')
-                 AND replay_mode = ?
-                 AND status IN ('pending', 'running', 'paused', 'stopping')
-               ORDER BY id DESC
-               LIMIT 1""",
-            (
-                int(strategy_id),
-                int(top_n),
-                float(budget_ratio),
-                norm_exchange_group,
-                norm_start_date,
-                norm_replay_mode,
-            ),
-        )
+        # The process-local scheduler lock is not a cross-process boundary.
+        # Serialize the autonomous read/insert pair at the database level;
+        # sim_0007 also installs a partial unique index as the durable guard.
+        if getattr(c, "_is_postgres", False) and norm_replay_mode == "autonomous_daily":
+            c.execute("SELECT pg_advisory_xact_lock(?)", (1095522645,))
+
+        if norm_replay_mode == "autonomous_daily":
+            cur = c.execute(
+                """SELECT id FROM quant_run_tasks
+                   WHERE replay_mode = ?
+                     AND status IN ('pending', 'running', 'paused', 'stopping')
+                   ORDER BY CASE status
+                                WHEN 'running' THEN 1
+                                WHEN 'stopping' THEN 2
+                                WHEN 'pending' THEN 3
+                                WHEN 'paused' THEN 4
+                                ELSE 5
+                            END, id DESC
+                   LIMIT 1""",
+                (norm_replay_mode,),
+            )
+        else:
+            # Generic task callers retain same-parameter deduplication.
+            cur = c.execute(
+                """SELECT id
+                   FROM quant_run_tasks
+                   WHERE strategy_id = ?
+                     AND top_n = ?
+                     AND budget_ratio = ?
+                     AND exchange_group = ?
+                     AND COALESCE(start_date, '') = COALESCE(?, '')
+                     AND replay_mode = ?
+                     AND status IN ('pending', 'running', 'paused', 'stopping')
+                   ORDER BY id DESC
+                   LIMIT 1""",
+                (
+                    int(strategy_id),
+                    int(top_n),
+                    float(budget_ratio),
+                    norm_exchange_group,
+                    norm_start_date,
+                    norm_replay_mode,
+                ),
+            )
         existed = cur.fetchone()
         if existed is not None:
             task_id = int(existed["id"])
@@ -2689,16 +2784,22 @@ def create_quant_run_task(
                 "UPDATE quant_run_tasks SET updated_at = ?, last_message = ? WHERE id = ?",
                 (now, "检测到重复创建请求，复用已有任务", task_id),
             )
-            return task_id
+            return task_id, False
 
-        c.execute(
-            """INSERT INTO quant_run_tasks (
+        insert_sql = """INSERT INTO quant_run_tasks (
                    status, strategy_id, top_n, budget_ratio, exchange_group, start_date, max_steps,
                    stop_requested, processed_steps, total_steps,
                    last_signal_date, last_execute_date, last_message, error,
                    replay_mode, replay_status, replay_gap_days, replay_current_execute_date, replay_target_execute_date,
                    started_at, finished_at, created_at, updated_at
-               ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, 0, NULL, NULL, ?, NULL, ?, '', 0, NULL, NULL, NULL, NULL, ?, ?)""",
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, 0, NULL, NULL, ?, NULL, ?, '', 0, NULL, NULL, NULL, NULL, ?, ?)"""
+        if getattr(c, "_is_postgres", False) and norm_replay_mode == "autonomous_daily":
+            # The partial unique index remains authoritative if an older
+            # process enters during a rolling restart.  Do not surface that
+            # expected race as a failed scheduler launch; re-read the winner.
+            insert_sql += " ON CONFLICT DO NOTHING"
+        cur = c.execute(
+            insert_sql,
             (
                 "pending",
                 int(strategy_id),
@@ -2713,7 +2814,22 @@ def create_quant_run_task(
                 now,
             ),
         )
-        return c.last_insert_id()
+        if (
+            getattr(c, "_is_postgres", False)
+            and norm_replay_mode == "autonomous_daily"
+            and int(getattr(cur, "rowcount", 1) or 0) == 0
+        ):
+            winner = c.execute(
+                """SELECT id FROM quant_run_tasks
+                   WHERE replay_mode = ?
+                     AND status IN ('pending', 'running', 'paused', 'stopping')
+                   ORDER BY id DESC LIMIT 1""",
+                (norm_replay_mode,),
+            ).fetchone()
+            if winner is not None:
+                task_id = int(winner["id"])
+                return task_id, False
+        return c.last_insert_id(), True
 
 
 def upsert_quant_run_task_meta(
@@ -3094,6 +3210,37 @@ def update_quant_run_task(task_id: int, **fields: Any) -> bool:
     return cur.rowcount > 0
 
 
+def claim_quant_run_task_start(task_id: int, **fields: Any) -> bool:
+    """Atomically claim a queued task for one worker process.
+
+    The old read/validate/write transition allowed two processes to observe
+    ``pending`` and both enter the worker.  This conditional update makes the
+    database row the ownership boundary; exactly one caller can move it to
+    ``running``.
+    """
+    allowed = {
+        "replay_mode",
+        "replay_status",
+        "started_at",
+        "error",
+        "last_message",
+        "stop_requested",
+    }
+    data = {k: v for k, v in fields.items() if k in allowed}
+    data.update({"status": "running", "updated_at": datetime.now().isoformat()})
+    cols = ", ".join(f"{k} = ?" for k in data)
+    params = tuple(data.values()) + (int(task_id),)
+    with _conn() as c:
+        cur = c.execute(
+            f"""UPDATE quant_run_tasks SET {cols}
+                WHERE id = ?
+                  AND status IN ('pending', 'paused')
+                  AND COALESCE(stop_requested, 0) = 0""",
+            params,
+        )
+    return cur.rowcount == 1
+
+
 def list_active_quant_run_tasks() -> List[Dict[str, Any]]:
     with _conn() as c:
         cur = c.execute(
@@ -3103,7 +3250,7 @@ def list_active_quant_run_tasks() -> List[Dict[str, Any]]:
                       replay_current_execute_date, replay_target_execute_date,
                       started_at, finished_at, created_at, updated_at
                FROM quant_run_tasks
-               WHERE status IN ('pending', 'running', 'paused')
+               WHERE status IN ('pending', 'running', 'paused', 'stopping')
                ORDER BY id ASC"""
         )
         rows = cur.fetchall()

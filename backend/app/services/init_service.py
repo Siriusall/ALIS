@@ -52,8 +52,8 @@ def run_data_initialization(
         from app.data_platform.services.data_center import (
             build_stock_daily_snapshot,
             run_data_quality_checks,
+            sync_market_bundle,
             sync_stock_basic,
-            sync_tushare_api_raw,
         )
 
         t0 = time.perf_counter()
@@ -65,11 +65,13 @@ def run_data_initialization(
         t0 = time.perf_counter()
         master = sync_stock_basic()
         mark("postgres_stock_master", t0)
-        ingestion: dict[str, Any] = {}
-        for api_name in ("daily", "daily_basic", "stk_limit", "suspend_d"):
-            t0 = time.perf_counter()
-            ingestion[api_name] = sync_tushare_api_raw(api_name, {"trade_date": today_ymd})
-            mark(f"postgres_{api_name}", t0)
+        t0 = time.perf_counter()
+        market_bundle = sync_market_bundle(today_ymd)
+        mark("postgres_market_bundle", t0)
+        ingestion: dict[str, Any] = {
+            "market_bundle": market_bundle,
+            "providers": dict(market_bundle.get("winners") or {}),
+        }
 
         t0 = time.perf_counter()
         snapshot_result = build_stock_daily_snapshot(today_ymd)
@@ -89,13 +91,28 @@ def run_data_initialization(
             ],
             "trade_date": today_ymd,
         }
-        status = "completed" if quality["ok"] or not strict_mode else "failed"
+        market_bundle_ok = bool(market_bundle.get("ok"))
+        if not market_bundle_ok:
+            category = str(
+                market_bundle.get("failure_category")
+                or market_bundle.get("status")
+                or "market_bundle_not_ready"
+            )
+            quality["ok"] = False
+            quality["errors"].append(f"Market bundle incomplete: {category}")
+            errors.append(f"market_bundle:{category}")
+        # A non-strict invocation only controls whether this is the first-load
+        # policy; it must never turn a missing market slice into a successful
+        # initialization.  Downstream callers rely on this result as a hard
+        # data-availability signal.
+        status = "completed" if quality["ok"] and market_bundle_ok else "failed"
         payload = {
             "status": status, "trade_date": today_ymd, "strict_first_load": strict_mode,
             "first_load_for_today": first_load_for_today, "stage_costs": stage_costs,
             "total_cost_sec": round(time.perf_counter() - started, 3), "spot_count": snapshot_count,
             "snapshot_count": snapshot_count, "basic_info_count": master_count, "quality": quality,
             "ingestion": ingestion, "snapshot": snapshot_result, "errors": errors,
+            "market_bundle_failure_category": market_bundle.get("failure_category") or "",
             "message": "PostgreSQL data initialization completed" if status == "completed" else "PostgreSQL data initialization quality check failed",
         }
         write_init_status(payload)

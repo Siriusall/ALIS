@@ -13,7 +13,6 @@ from app.core.trade_calendar import get_last_trade_date
 from app.integrations.market_data_client import StockQuote
 
 logger = logging.getLogger("quant.factor_engine")
-from app.services.cache_consolidation import read_consolidated_cache
 from app.services.daily_data import DailyBar, get_daily_bars_lookback  # DailyCacheNotReadyError 由调用方捕获
 from app.services.strategy_config import (
     ParsedStrategyConfig,
@@ -24,7 +23,8 @@ from app.services.strategy_config import (
 from app.services.factor_platform import compute_registered_factor
 from app.services.backtest_data_source import HistBar, SnapshotRow
 from app.db.store import _conn as business_conn
-from app.services.tushare_snapshot import get_daily_snapshot, get_latest_cached_snapshot_date
+from app.data_platform.db import _conn as data_conn
+from app.services.tushare_snapshot import get_daily_snapshot
 from app.services.tushare_snapshot import DailySnapshotRow
 from app.services.tushare_universe import build_index_membership_set
 from app.services.backtest_engine import _apply_universe_controls, _rank_percentiles
@@ -92,23 +92,64 @@ def _norm_symbol(symbol: str) -> str:
     return s
 
 
-def _load_consolidated_rows(symbols: List[str]) -> Dict[str, Dict[str, Any]]:
-    """
-    从 all_in_one 读取当日（最近交易日）聚合行：symbol -> factors。
+def _load_exact_session_factor_rows(symbols: List[str]) -> Dict[str, Dict[str, Any]]:
+    """Read only the target session's normalized snapshot and factor values.
+
+    This compatibility scorer is not allowed to obtain values from the retired
+    all-in-one file cache, a prior session, or a spot quote. Missing fields are
+    left absent so the caller's existing exact-snapshot gate blocks the score.
     """
     trade_date = get_last_trade_date(for_data_availability=True).strftime("%Y%m%d")
-    payload = read_consolidated_cache(date=trade_date, symbols=symbols)
-    data = payload.get("data") if isinstance(payload, dict) else None
-    per_day = data.get(trade_date) if isinstance(data, dict) else None
     out: Dict[str, Dict[str, Any]] = {}
-    if isinstance(per_day, dict):
-        for sym, row in per_day.items():
-            if isinstance(row, dict):
-                out[_norm_symbol(str(sym))] = row
-    # The versioned materialization is the authoritative source when present.
-    # Legacy all-in-one fields remain a compatibility fallback during rollout.
+    normalized = sorted({_norm_symbol(symbol) for symbol in symbols if _norm_symbol(symbol)})
+    if not normalized:
+        return out
+    for offset in range(0, len(normalized), 500):
+        batch = normalized[offset: offset + 500]
+        placeholders = ",".join("?" for _ in batch)
+        try:
+            with data_conn() as conn:
+                rows = conn.execute(
+                    f"""SELECT symbol,name,close,change_pct,volume,turnover,total_mv,circ_mv,pe_ttm,pb,
+                               turnover_rate,is_suspended,up_limit,down_limit
+                        FROM dc_stock_daily_snapshot
+                        WHERE trade_date=? AND symbol IN ({placeholders})
+                          AND COALESCE(observed_at,'')<>''
+                          AND LOWER(COALESCE(observation_provenance,'')) NOT LIKE 'legacy_%'""",
+                    (trade_date, *batch),
+                ).fetchall()
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("normalized factor snapshot unavailable: %s", str(exc)[:120])
+            continue
+        for raw in rows:
+            item = dict(raw)
+            symbol = _norm_symbol(str(item.get("symbol") or ""))
+            if not symbol:
+                continue
+            close = item.get("close")
+            out[symbol] = {
+                "name": str(item.get("name") or ""),
+                "price": close,
+                "close": close,
+                "change_pct": item.get("change_pct"),
+                "volume": item.get("volume"),
+                "turnover": item.get("turnover"),
+                "float_mv": item.get("circ_mv"),
+                "total_mv": item.get("total_mv"),
+                "pe_ttm": item.get("pe_ttm"),
+                "pb": item.get("pb"),
+                "turnover_rate": item.get("turnover_rate"),
+                "is_suspended": bool(item.get("is_suspended")),
+                "is_limit_up": bool(
+                    item.get("up_limit") is not None and close is not None
+                    and float(close) >= float(item.get("up_limit")) * 0.9999
+                ),
+                "is_limit_down": bool(
+                    item.get("down_limit") is not None and close is not None
+                    and float(close) <= float(item.get("down_limit")) * 1.0001
+                ),
+            }
     try:
-        normalized = sorted({_norm_symbol(symbol) for symbol in symbols if _norm_symbol(symbol)})
         for offset in range(0, len(normalized), 500):
             batch = normalized[offset: offset + 500]
             placeholders = ",".join("?" for _ in batch)
@@ -300,21 +341,17 @@ def _factor_industry_candidate(symbol: str, hist: List[DailyBar], today: Optiona
 # ---------- TuShare 截面因子（市值/估值/状态/指数成分）----------
 def _ensure_snapshot(symbol: str, context: FactorContext):
     """
-    工具函数：按当前自然日从 TuShare 获取快照（带缓存），并返回该 symbol 对应记录（可能为 None）。
-    cache_only 时若请求的交易日无缓存，只允许回退到该日或更早的快照。
+    读取当前决策日的规范快照，并返回该 symbol 对应记录（可能为 None）。
+    截面因子必须与决策日严格一致，不能在数据未发布时拿前日估值或交易状态代替。
     """
     trade_date = get_last_trade_date(for_data_availability=True).strftime("%Y%m%d")
     snapshot_map = get_daily_snapshot(trade_date, cache_only=True)
     if not snapshot_map:
-        fallback_date = get_latest_cached_snapshot_date(on_or_before=trade_date)
-        if fallback_date:
-            snapshot_map = get_daily_snapshot(fallback_date, cache_only=True)
-        if not snapshot_map:
-            logger.warning(
-                "[选股] _ensure_snapshot: trade_date=%s 无缓存且 fallback 后仍为空，symbol=%s 将得 float_mv=0",
-                trade_date,
-                symbol,
-            )
+        logger.warning(
+            "[选股] _ensure_snapshot: trade_date=%s 无规范快照，symbol=%s 截面因子不可用",
+            trade_date,
+            symbol,
+        )
     row = snapshot_map.get(symbol) if snapshot_map else None
     if snapshot_map and row is None and logger.isEnabledFor(logging.DEBUG):
         logger.debug("[选股] _ensure_snapshot: symbol=%s 不在快照中（快照共 %d 只）", symbol, len(snapshot_map))
@@ -682,14 +719,23 @@ def score_factors_with_strategy(
             try:
                 trade_date = get_last_trade_date(for_data_availability=True).strftime("%Y%m%d")
                 members = build_index_membership_set(index_code, trade_date, cache_only=True)
-                if members:
-                    quotes = [q for q in quotes if members.get(q.symbol)]
-                    logger.info("universe 指数 %s: 成分内 %d 只", index_code, len(quotes))
+                if not members:
+                    warning = f"指数成分点时数据不可用，已阻断策略 {strategy_id} 的 universe={index_code} 选股。"
+                    logger.error(warning)
+                    if out_warnings is not None:
+                        out_warnings.append(warning)
+                    return []
+                quotes = [q for q in quotes if members.get(q.symbol)]
+                logger.info("universe 指数 %s: 成分内 %d 只", index_code, len(quotes))
                 if not quotes:
                     logger.info("[选股] strategy_id=%s universe 指数成分后 quotes=0，直接返回", strategy_id)
                     return []
             except Exception as e:
-                logger.warning("universe 指数 %s 拉取失败，使用全池: %s", index_code, e)
+                warning = f"指数成分点时数据读取失败，已阻断策略 {strategy_id} 的 universe={index_code} 选股: {e}"
+                logger.error(warning)
+                if out_warnings is not None:
+                    out_warnings.append(warning)
+                return []
 
     # 所需因子名：打分用 + 过滤用
     required_factors = get_strategy_factor_names(content, strategy_type)
@@ -699,7 +745,7 @@ def score_factors_with_strategy(
         fn = f.get("factor")
         if fn:
             required_factors.add(fn)
-    consolidated_rows = _load_consolidated_rows([q.symbol for q in quotes])
+    consolidated_rows = _load_exact_session_factor_rows([q.symbol for q in quotes])
     consolidated_fields: set[str] = set()
     for row in consolidated_rows.values():
         consolidated_fields.update(row.keys())
@@ -714,19 +760,12 @@ def score_factors_with_strategy(
         try:
             trade_date = get_last_trade_date(for_data_availability=True).strftime("%Y%m%d")
             snap = get_daily_snapshot(trade_date, cache_only=True)
-            used_fallback = False
-            if not snap:
-                fallback = get_latest_cached_snapshot_date(on_or_before=trade_date)
-                if fallback:
-                    snap = get_daily_snapshot(fallback, cache_only=True)
-                    used_fallback = True
             snapshot_available = bool(snap)
             logger.info(
-                "[选股] strategy_id=%s 快照 trade_date=%s snapshot_available=%s used_fallback=%s",
+                "[选股] strategy_id=%s 快照 trade_date=%s snapshot_available=%s",
                 strategy.get("id"),
                 trade_date,
                 snapshot_available,
-                used_fallback,
             )
         except Exception as e:
             snapshot_available = False
@@ -750,10 +789,6 @@ def score_factors_with_strategy(
     if need_hist and snapshot_available and pre_filters:
         trade_date = get_last_trade_date(for_data_availability=True).strftime("%Y%m%d")
         snapshot_map = get_daily_snapshot(trade_date, cache_only=True)
-        if not snapshot_map:
-            fallback_date = get_latest_cached_snapshot_date(on_or_before=trade_date)
-            if fallback_date:
-                snapshot_map = get_daily_snapshot(fallback_date, cache_only=True)
         if snapshot_map:
             factor_values_snapshot = {
                 q.symbol: _snapshot_only_vals(q.symbol, snapshot_map) for q in quotes

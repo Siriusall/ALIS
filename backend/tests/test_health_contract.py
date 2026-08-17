@@ -98,3 +98,21 @@ def test_health_is_not_ready_when_runtime_code_is_behind_repository(monkeypatch)
     assert result["ready"] is False
     assert result["dependencies"]["release_runtime"]["restart_required"] is True
     assert any("Runtime code is stale" in item for item in result["issues"])
+
+
+def test_health_is_not_ready_when_active_release_manifest_drifts(monkeypatch):
+    _healthy_dependencies(monkeypatch)
+    monkeypatch.setattr(main, "redis_health", lambda: {"available": True})
+    monkeypatch.setattr(main, "runtime_heartbeat_status", lambda: {"scheduler": {"healthy": True}})
+    monkeypatch.setattr(main, "discover_release_change", lambda: {
+        "changed": True,
+        "restart_required": False,
+        "active_release_id": 67,
+        "active_manifest_hash": "old",
+        "observed_manifest_hash": "new",
+    })
+
+    result = _payload(main.readiness())
+
+    assert result["ready"] is False
+    assert any("Active system release does not match" in item for item in result["issues"])

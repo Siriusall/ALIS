@@ -2376,81 +2376,29 @@ def _normalize_moneyflow_available_time(
     *,
     chunk_size: int = 10,
 ) -> int:
-    """Normalize historical economic availability without one oversized UPDATE."""
-    normalized = 0
-    size = max(1, min(int(chunk_size), 20))
-    for offset in range(0, len(trade_dates), size):
-        batch = trade_dates[offset:offset + size]
-        if not batch:
-            continue
-        placeholders = ",".join("?" for _ in batch)
-        with _conn() as c:
-            result = c.execute(
-                f"""UPDATE dc_tushare_raw_records
-                    SET available_time=SUBSTRING(trade_date,1,4)||'-'||
-                                       SUBSTRING(trade_date,5,2)||'-'||
-                                       SUBSTRING(trade_date,7,2)||'T15:00:00'
-                    WHERE api_name='moneyflow'
-                      AND trade_date IN ({placeholders})
-                      AND available_time<>SUBSTRING(trade_date,1,4)||'-'||
-                                          SUBSTRING(trade_date,5,2)||'-'||
-                                          SUBSTRING(trade_date,7,2)||'T15:00:00'""",
-                tuple(batch),
-            )
-            normalized += max(0, int(getattr(result, "rowcount", 0) or 0))
-    return normalized
+    """Retain historical ingestion clocks; never rewrite them to T 15:00.
+
+    Older code converted the economic trade date into an apparent observation
+    timestamp.  That made a row fetched weeks later look available at the
+    historical decision cutoff.  The observation-clock migration deliberately
+    treats such rows as unverifiable, so this compatibility hook is now a
+    no-op.  Keeping the function preserves the resumable backfill contract and
+    makes the audit explicit to callers.
+    """
+    del trade_dates, chunk_size
+    return 0
 
 
 def _normalize_event_disclosure_available_time(*, chunk_size: int = 50_000) -> int:
-    """Repair legacy analyst-report rows written with ingestion-time availability.
+    """Do not infer disclosure observation time from the economic date.
 
-    ``report_rc`` is published on its ``trade_date``.  Older ingestion code did
-    not classify it as a disclosure API, so historical rows carried the fetch
-    timestamp and became unusable to point-in-time event training.  The update
-    is monotonic to the source publication date and leaves raw payloads intact.
+    Historical rows without an immutable observation version remain
+    ``legacy_unknown`` and are excluded by strict PIT consumers.  A future
+    fetch through the normal ingestion path records the real ``observed_at``;
+    this maintenance hook must never alter old evidence in place.
     """
-    normalized = 0
-    size = max(1_000, min(int(chunk_size), 100_000))
-    last_id = 0
-    while True:
-        with _conn() as c:
-            date_clause = (
-                "trade_date ~ '^[0-9]{8}$'"
-                if getattr(c, "_is_postgres", False)
-                else "trade_date GLOB '[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]'"
-            )
-            target_time = (
-                "SUBSTRING(trade_date,1,4)||'-'||"
-                "SUBSTRING(trade_date,5,2)||'-'||"
-                "SUBSTRING(trade_date,7,2)||'T23:59:59'"
-            )
-            ids = c.execute(
-                """SELECT id FROM dc_tushare_raw_records
-                   WHERE api_name='report_rc' AND id>?
-                   ORDER BY id LIMIT ?""",
-                (last_id, size),
-            ).fetchall()
-            values = [
-                int(dict(row).get("id") or 0)
-                for row in ids
-                if int(dict(row).get("id") or 0) > last_id
-            ]
-            if not values:
-                return normalized
-            upper_id = values[-1]
-            if upper_id <= last_id:
-                return normalized
-            result = c.execute(
-                f"""UPDATE dc_tushare_raw_records
-                    SET available_time={target_time}
-                    WHERE api_name='report_rc'
-                      AND id>? AND id<=? AND {date_clause}
-                      AND available_time<>{target_time}""",
-                (last_id, upper_id),
-            )
-            changed = max(0, int(getattr(result, "rowcount", 0) or 0))
-            normalized += changed
-            last_id = upper_id
+    del chunk_size
+    return 0
 
 
 def _process_plan_model_data_backfill(payload: dict[str, Any]) -> dict[str, Any]:

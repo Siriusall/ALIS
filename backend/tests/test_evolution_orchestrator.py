@@ -410,29 +410,86 @@ def test_latest_failure_attribution_uses_newest_persisted_version(monkeypatch):
     }
 
 
-def test_direct_experiment_tasks_are_safely_skipped_when_current_data_is_degraded(monkeypatch):
+def test_future_shadow_tasks_are_safely_skipped_when_current_data_is_degraded(monkeypatch):
     monkeypatch.setattr(evolution, "_experiment_data_gate", lambda: {
         "status": "degraded", "experiment_ready": False,
         "issues": [{"code": "latest_adj_factor_not_ready"}],
     })
     monkeypatch.setattr(
         evolution, "_execute_strategy_cycle",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must not run OOS")),
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must not run shadow")),
     )
 
-    result = evolution.execute_evolution_task({"id": 9, "task_type": "strategy_evolution_cycle"})
+    result = evolution.execute_evolution_task({"id": 9, "task_type": "strategy_shadow_cycle"})
 
     assert result["status"] == "blocked_by_decision_data"
     assert result["data_gate"]["issues"] == [{"code": "latest_adj_factor_not_ready"}]
 
 
-def test_direct_experiment_tasks_continue_when_current_data_is_ready(monkeypatch):
+def test_formal_oos_uses_historical_gate_not_current_close_gate(monkeypatch):
     monkeypatch.setattr(evolution, "_experiment_data_gate", lambda: {"status": "ready", "experiment_ready": True})
     monkeypatch.setattr(evolution, "_execute_strategy_cycle", lambda *_args, **_kwargs: {"status": "completed"})
 
     result = evolution.execute_evolution_task({"id": 9, "task_type": "strategy_evolution_cycle"})
 
     assert result == {"status": "completed"}
+
+
+def test_current_experiment_gate_fails_closed_on_optimistic_result(monkeypatch):
+    monkeypatch.setattr(evolution, "_experiment_data_gate", lambda: {
+        "ok": False, "status": "ready", "experiment_ready": True,
+    })
+
+    result = evolution.execute_evolution_task({"id": 9, "task_type": "strategy_shadow_cycle"})
+
+    assert result["status"] == "blocked_by_decision_data"
+
+
+def test_formal_oos_is_not_blocked_by_latest_close_gap(monkeypatch):
+    monkeypatch.setattr(evolution, "_experiment_data_gate", lambda: {
+        "status": "blocked", "experiment_ready": False,
+        "issues": [{"code": "latest_adj_factor_not_ready"}],
+    })
+    monkeypatch.setattr(evolution, "_execute_strategy_cycle", lambda *_args, **_kwargs: {"status": "completed"})
+
+    result = evolution.execute_evolution_task({"id": 9, "task_type": "strategy_controller_oos"})
+
+    assert result == {"status": "completed"}
+
+
+def test_formal_oos_is_blocked_by_historical_pit_gap(monkeypatch):
+    monkeypatch.setattr(evolution, "audit_oos_hard_data", lambda **_kwargs: {
+        "status": "blocked",
+        "non_repairable_dates": ["20260701"],
+        "repair_dates": [],
+    })
+
+    result = evolution.execute_evolution_task({
+        "id": 9,
+        "task_type": "strategy_evolution_cycle",
+        "payload": {},
+    })
+
+    assert result["status"] == "blocked_by_oos_hard_data"
+    assert result["hard_data_audit"]["non_repairable_dates"] == ["20260701"]
+
+
+def test_model_strategy_ab_is_blocked_by_the_same_historical_pit_gate(monkeypatch):
+    monkeypatch.setattr(evolution, "audit_oos_hard_data", lambda **_kwargs: {
+        "status": "blocked",
+        "non_repairable_dates": ["20260701"],
+        "repair_dates": [],
+    })
+
+    result = evolution.execute_evolution_task({
+        "id": 9,
+        "task_type": "model_strategy_impact_validation",
+        "payload": {"model_version_id": 17},
+    })
+
+    assert result["status"] == "blocked_by_oos_hard_data"
+    assert result["scope"] == "formal_oos"
+    assert result["hard_data_audit"]["non_repairable_dates"] == ["20260701"]
 
 
 def test_worker_defers_data_block_without_creating_lineage_tasks(monkeypatch):
@@ -511,7 +568,7 @@ def test_data_gate_deferral_reuses_task_id_and_does_not_consume_attempt(monkeypa
     assert transition["deadline_at"] is None
 
 
-def test_oos_hard_data_deferral_reuses_task_id_and_does_not_consume_attempt(monkeypatch):
+def test_nonrepairable_oos_deferral_reuses_task_id_without_retrying_every_few_minutes(monkeypatch):
     transition = {}
     monkeypatch.setattr(
         evolution,
@@ -527,10 +584,11 @@ def test_oos_hard_data_deferral_reuses_task_id_and_does_not_consume_attempt(monk
 
     assert transition["task_id"] == 92
     assert transition["status"] == "retry_wait"
-    assert transition["phase"] == "waiting_for_oos_hard_data"
+    assert transition["phase"] == "waiting_for_historical_pit_evidence"
     assert transition["attempt"] == 0
     assert transition["result"] == blocked
     assert transition["lease_owner"] is None
+    assert datetime.fromisoformat(transition["next_run_at"]) >= datetime.now().astimezone() + timedelta(hours=23)
 
 
 def test_cycle_uses_checkpoint_and_reports_overall_progress(monkeypatch):

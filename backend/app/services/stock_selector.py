@@ -4,11 +4,33 @@ from datetime import date
 from typing import List, Optional
 
 from app.core.exchange_groups import matches_exchange_group, normalize_exchange_group
-from app.core.trade_calendar import get_last_trade_date
-from app.integrations.market_data_client import StockQuote, fetch_a_share_spot
-from app.services.cache_consolidation import read_consolidated_cache
+from app.integrations.market_data_client import StockQuote
+from app.data_platform.db import _conn as data_conn
+from app.data_platform.services.decision_data_contract import decision_data_contract
+from app.data_platform.services.market_calendar import target_trade_date
 
 from app.core.a_share_fees import LOT_SIZE
+
+
+class StockSelectionDataNotReadyError(RuntimeError):
+    """The current exchange-calendar session cannot safely feed a score."""
+
+    def __init__(self, trade_date: str, contract: dict):
+        self.trade_date = str(trade_date or "")
+        self.contract = dict(contract or {})
+        super().__init__(
+            str(self.contract.get("reason") or f"{self.trade_date} 决策数据未就绪")
+        )
+
+
+def _current_selection_trade_date() -> str:
+    """Require the full current data contract before exposing a stock score."""
+    with data_conn() as conn:
+        trade_date = target_trade_date(conn)
+        contract = decision_data_contract(trade_date, conn=conn)
+    if not bool(contract.get("ok")):
+        raise StockSelectionDataNotReadyError(trade_date, contract)
+    return trade_date
 
 
 def select_affordable_stocks(
@@ -23,31 +45,35 @@ def select_affordable_stocks(
     - 价格 > 1 元。
     - 若传 max_one_lot_cost（总金额）：只保留 1 手价格 <= 该金额的股票（1手=100股）。
     """
-    # 优先使用 all_in_one 聚合缓存，避免每次请求都触发分散缓存读取链路。
+    # The selector is a research/read path, but it still must not turn a
+    # stale aggregate cache or realtime quote into a T-day close.  Read only
+    # the exact target-session normalized snapshot and retain its evidence.
     quotes: List[StockQuote] = []
-    try:
-        trade_date = get_last_trade_date(for_data_availability=True).strftime("%Y%m%d")
-        payload = read_consolidated_cache(date=trade_date)
-        data = payload.get("data") if isinstance(payload, dict) else None
-        day = data.get(trade_date) if isinstance(data, dict) else None
-        if isinstance(day, dict):
-            for symbol, row in day.items():
-                if not isinstance(row, dict):
-                    continue
-                quotes.append(
-                    StockQuote(
-                        symbol=str(symbol),
-                        name=str(row.get("name", "")),
-                        price=float(row.get("price", row.get("close", 0)) or 0),
-                        change_pct=float(row.get("change_pct", 0) or 0),
-                        volume=float(row.get("volume", 0) or 0),
-                        turnover=float(row.get("turnover", 0) or 0),
-                    )
-                )
-    except Exception:
-        quotes = []
-    if not quotes and allow_realtime_fallback:
-        quotes = fetch_a_share_spot(limit=limit)
+    trade_date = _current_selection_trade_date()
+    with data_conn() as c:
+        rows = c.execute(
+            """SELECT ts_code,symbol,name,close,change_pct,volume,turnover
+                 FROM dc_stock_daily_snapshot
+                WHERE trade_date=? AND close IS NOT NULL AND close>0
+                  AND COALESCE(observed_at,'')<>''
+                  AND LOWER(COALESCE(observation_provenance,'')) NOT LIKE 'legacy_%'""",
+            (trade_date,),
+        ).fetchall()
+    for row in rows:
+        item = dict(row)
+        symbol = str(item.get("symbol") or item.get("ts_code") or "").split(".", 1)[0]
+        if not symbol:
+            continue
+        quotes.append(
+            StockQuote(
+                symbol=symbol,
+                name=str(item.get("name") or ""),
+                price=float(item.get("close") or 0),
+                change_pct=float(item.get("change_pct") or 0),
+                volume=float(item.get("volume") or 0),
+                turnover=float(item.get("turnover") or 0),
+            )
+        )
 
     out = [q for q in quotes if q.price > 1.0]
     exchange_norm = normalize_exchange_group(exchange)

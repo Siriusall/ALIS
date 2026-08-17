@@ -16,6 +16,16 @@ from app.data_platform.services.oos_hard_data import (
     MINIMUM_HARD_API_ROWS,
     MINIMUM_MARKET_FIELD_RATIO,
     _date_api_sets,
+    _strict_date_api_sets,
+    _strict_observation_schema_available,
+    _strict_benchmark_date_set,
+    _strict_snapshot_stats,
+    _late_arrival_hard_api_sets,
+    _classify_snapshot_late_arrivals,
+    _classify_repairable_missing_apis,
+    _timestamp_at_or_before,
+    _trade_cutoff_elapsed,
+    _business_cutoff,
     _benchmark_date_set,
     repair_oos_hard_data_batch,
 )
@@ -29,7 +39,7 @@ from app.services.production_strategy import resolve_production_strategy_champio
 from app.services.strategy_replay import run_strategy_replay
 
 
-SEALED_HOLDOUT_CONTRACT = "alis_sealed_strategy_holdout_v2"
+SEALED_HOLDOUT_CONTRACT = "alis_sealed_strategy_holdout_v4_immutable_observation"
 SEALED_HOLDOUT_START = "20190910"
 SEALED_HOLDOUT_END = "20200320"
 SEALED_HOLDOUT_SESSIONS = 126
@@ -51,6 +61,24 @@ SEALED_HOLDOUT_DATES = (
     "20200303", "20200304", "20200305", "20200306", "20200309", "20200310", "20200311", "20200312",
     "20200313", "20200316", "20200317", "20200318", "20200319", "20200320",
 )
+
+
+def _benchmark_dates_with_evidence() -> tuple[set[str], dict[str, dict[str, Any]]]:
+    """Strict benchmark evidence with a local seam for holdout tests."""
+
+    try:
+        value = _strict_benchmark_date_set(
+            SEALED_HOLDOUT_START,
+            SEALED_HOLDOUT_END,
+            include_evidence=True,
+        )
+    except TypeError:
+        value = _strict_benchmark_date_set(SEALED_HOLDOUT_START, SEALED_HOLDOUT_END)
+    if isinstance(value, tuple) and len(value) == 2:
+        dates, evidence = value
+        if isinstance(dates, set) and isinstance(evidence, dict):
+            return dates, evidence
+    return set(value or ()), {}
 
 
 def _ensure_table() -> None:
@@ -118,23 +146,34 @@ def audit_sealed_strategy_holdout(*, include_dates: bool = False) -> dict[str, A
         if snapshots is None:
             snapshots = {}
     compact = list(SEALED_HOLDOUT_DATES)
-    api_dates = _date_api_sets(SEALED_HOLDOUT_START, SEALED_HOLDOUT_END)
-    benchmark_dates = _benchmark_date_set(
-        SEALED_HOLDOUT_START,
-        SEALED_HOLDOUT_END,
-    )
+    api_dates, api_evidence = _strict_date_api_sets(SEALED_HOLDOUT_START, SEALED_HOLDOUT_END)
+    benchmark_dates, benchmark_evidence = _benchmark_dates_with_evidence()
+    strict_snapshots = _strict_snapshot_stats(SEALED_HOLDOUT_START, SEALED_HOLDOUT_END)
+    # A queryable append-only backend is distinct from having at least one
+    # historical row.  The classifier must not infer that every absent date
+    # was observed late merely because the version tables happen to be empty;
+    # the audit remains blocked, while concrete late-arrival evidence is still
+    # classified independently below.
+    strict_evidence_backend_available = bool(_strict_observation_schema_available())
     details: list[dict[str, Any]] = []
     for trade_date in compact:
-        snapshot = snapshots.get(trade_date) or {}
+        snapshot = strict_snapshots.get(trade_date) or {}
+        if not snapshot:
+            snapshot = dict(snapshots.get(trade_date) or {})
+            snapshot["rows_total"] = 0
+            snapshot["market_rows"] = 0
+            snapshot["max_available_time"] = ""
         rows_total = int(snapshot.get("rows_total") or 0)
         market_rows = int(snapshot.get("market_rows") or 0)
         ratio = market_rows / rows_total if rows_total else 0.0
-        cutoff = f"{trade_date[:4]}-{trade_date[4:6]}-{trade_date[6:]}T15:00:00"
+        cutoff = _business_cutoff(trade_date)
         missing_apis = [api for api in HARD_APIS if trade_date not in api_dates[api]]
         if trade_date not in benchmark_dates:
             missing_apis.append(BENCHMARK_API_KEY)
         calendar_ok = trade_date in calendar_dates
-        pit_ok = bool(snapshot.get("max_available_time")) and str(snapshot.get("max_available_time")) <= cutoff
+        pit_ok = bool(snapshot.get("max_observed_at")) and _timestamp_at_or_before(
+            snapshot.get("max_observed_at"), cutoff,
+        )
         eligible = (
             calendar_ok
             and
@@ -156,6 +195,13 @@ def audit_sealed_strategy_holdout(*, include_dates: bool = False) -> dict[str, A
             reasons.append("benchmark_index_missing")
         if not pit_ok:
             reasons.append("point_in_time_invalid")
+        date_observation_complete = all(
+            int((api_evidence.get((api, trade_date)) or {}).get("point_in_time_rows") or 0)
+            >= MINIMUM_HARD_API_ROWS
+            for api in HARD_APIS
+        ) and trade_date in benchmark_dates and trade_date in strict_snapshots
+        if calendar_ok and not date_observation_complete and _trade_cutoff_elapsed(trade_date):
+            reasons.append("historical_observation_evidence_missing")
         details.append({
             "trade_date": trade_date,
             "eligible": eligible,
@@ -164,10 +210,40 @@ def audit_sealed_strategy_holdout(*, include_dates: bool = False) -> dict[str, A
             "missing_apis": missing_apis,
             "trade_calendar_present": calendar_ok,
             "point_in_time_passed": pit_ok,
+            "observation_evidence": {
+                api: dict(api_evidence.get((api, trade_date)) or {})
+                for api in HARD_APIS
+            },
+            "benchmark_observation_evidence": dict(benchmark_evidence.get(trade_date) or {}),
+            "observation_evidence_complete": date_observation_complete,
             "reasons": reasons,
         })
+    late_hard_apis = _late_arrival_hard_api_sets(details)
+    late_snapshot_dates = _classify_snapshot_late_arrivals(details, strict_snapshots)
+    for item in details:
+        trade_date = str(item.get("trade_date") or "")
+        late = sorted(late_hard_apis.get(trade_date, set()))
+        missing = set(item.get("missing_apis") or [])
+        snapshot_late = trade_date in late_snapshot_dates
+        repairable_missing, repairable, permanently_late = _classify_repairable_missing_apis(
+            item,
+            late_hard_apis=set(late),
+            snapshot_late_arrival=snapshot_late,
+            strict_evidence_backend_available=strict_evidence_backend_available,
+            historical_cutoff_elapsed=_trade_cutoff_elapsed(trade_date),
+        )
+        item["late_arrival_apis"] = late
+        item["snapshot_late_arrival"] = snapshot_late
+        item["repairable_missing_apis"] = repairable_missing
+        item["repairable"] = repairable
+        if permanently_late:
+            if "historical_point_in_time_unavailable" not in item["reasons"]:
+                item["reasons"].append("historical_point_in_time_unavailable")
+            if snapshot_late and "historical_snapshot_materialized_after_cutoff" not in item["reasons"]:
+                item["reasons"].append("historical_snapshot_materialized_after_cutoff")
     eligible_dates = [item["trade_date"] for item in details if item["eligible"]]
-    repair_dates = [item["trade_date"] for item in details if not item["eligible"]]
+    repair_dates = [item["trade_date"] for item in details if not item["eligible"] and item.get("repairable")]
+    non_repairable_dates = [item["trade_date"] for item in details if not item["eligible"] and item["trade_date"] not in set(repair_dates)]
     ready = len(compact) == SEALED_HOLDOUT_SESSIONS and len(eligible_dates) == SEALED_HOLDOUT_SESSIONS
     result = {
         "schema_version": SEALED_HOLDOUT_CONTRACT,
@@ -182,11 +258,18 @@ def audit_sealed_strategy_holdout(*, include_dates: bool = False) -> dict[str, A
         "eligible_sessions": len(eligible_dates),
         "missing_sessions": max(0, SEALED_HOLDOUT_SESSIONS - len(eligible_dates)),
         "repair_dates": repair_dates,
+        "non_repairable_dates": non_repairable_dates,
         "hard_apis": [*HARD_APIS, BENCHMARK_API_KEY],
         "thresholds": {
             "minimum_daily_rows": MINIMUM_DAILY_ROWS,
             "minimum_hard_api_rows": MINIMUM_HARD_API_ROWS,
             "minimum_market_field_ratio": MINIMUM_MARKET_FIELD_RATIO,
+        },
+        "observation_evidence": {
+            "required": True,
+            "append_only_versions_present": bool(api_evidence and strict_snapshots),
+            "legacy_rows_allowed": False,
+            "missing_reason": None if api_evidence and strict_snapshots else "historical_observation_evidence_missing",
         },
         "policy": "details_are_not_consumable_by_candidate_generation_or_failure_attribution",
     }
@@ -205,11 +288,25 @@ def repair_sealed_strategy_holdout(*, limit: int = 5) -> dict[str, Any]:
     audit = audit_sealed_strategy_holdout(include_dates=True)
     dates = list(audit.get("repair_dates") or [])[:max(1, min(int(limit), 20))]
     detail_by_date = {item["trade_date"]: item for item in audit.get("dates") or []}
-    repair = repair_oos_hard_data_batch(dates, date_gaps=detail_by_date) if dates else {"ok": True, "results": []}
+    repair = (
+        repair_oos_hard_data_batch(dates, date_gaps=detail_by_date)
+        if dates
+        else {"ok": False, "status": "no_repairable_dates", "results": []}
+    )
     verification = audit_sealed_strategy_holdout(include_dates=False)
+    if not dates and verification.get("status") != "ready":
+        status = "blocked_non_repairable"
+    elif not dates:
+        status = "already_ready"
+    elif repair.get("ok") and verification.get("status") == "ready":
+        status = "repaired_ready"
+    elif repair.get("ok"):
+        status = "repaired_batch"
+    else:
+        status = "repair_partial"
     return {
-        "schema_version": "alis_sealed_strategy_holdout_repair_v2",
-        "status": "repaired_batch" if dates and repair.get("ok") else "already_ready" if not dates else "repair_partial",
+        "schema_version": "alis_sealed_strategy_holdout_repair_v3_immutable_observation",
+        "status": status,
         "dates": dates,
         "calendar_repair": calendar_repair,
         "repair": repair,
@@ -228,6 +325,10 @@ def sealed_holdout_adj_factor_only_gap() -> dict[str, Any]:
     gaps = [item for item in audit.get("dates") or [] if not bool(item.get("eligible"))]
     homogeneous = bool(gaps) and all(
         set(item.get("missing_apis") or []) == {"adj_factor"}
+        and bool(item.get("repairable"))
+        and set(item.get("repairable_missing_apis") or []) == {"adj_factor"}
+        and not set(item.get("late_arrival_apis") or [])
+        and not bool(item.get("snapshot_late_arrival"))
         and set(item.get("reasons") or []) == {"missing_hard_api_slices"}
         for item in gaps
     )
@@ -238,7 +339,7 @@ def sealed_holdout_adj_factor_only_gap() -> dict[str, Any]:
         "required_sessions": int(audit.get("required_sessions") or SEALED_HOLDOUT_SESSIONS),
         "missing_sessions": int(audit.get("missing_sessions") or 0),
         "repair_dates": [str(item.get("trade_date") or "") for item in gaps] if homogeneous else [],
-        "gap_type": "adj_factor_only" if homogeneous else "mixed_or_unknown",
+        "gap_type": "adj_factor_only" if homogeneous else "mixed_or_non_repairable",
     }
 
 
@@ -276,7 +377,13 @@ def run_sealed_holdout_adj_factor_backfill(
         batch = dates[:size]
         before = int(gap.get("eligible_sessions") or 0)
         detail = {
-            value: {"trade_date": value, "missing_apis": ["adj_factor"], "reasons": ["missing_hard_api_slices"]}
+            value: {
+                "trade_date": value,
+                "missing_apis": ["adj_factor"],
+                "repairable_missing_apis": ["adj_factor"],
+                "repairable": True,
+                "reasons": ["missing_hard_api_slices"],
+            }
             for value in batch
         }
         batch_started = monotonic()

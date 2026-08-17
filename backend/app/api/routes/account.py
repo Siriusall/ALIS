@@ -3,9 +3,14 @@ from __future__ import annotations
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
+from app.data_platform.services.market_calendar import TradeCalendarNotReady
 from app.db.store import get_account_balance, get_positions, set_account_balance
-from app.services.position_valuation import build_position_market_series_cache
-from app.services.quant_run_engine import list_consolidated_trade_dates
+from app.services.position_valuation import (
+    PositionMarketDataNotReadyError,
+    build_position_market_series_cache,
+    current_live_valuation_trade_date,
+    missing_exact_position_valuations,
+)
 
 router = APIRouter()
 
@@ -31,10 +36,13 @@ class SetBalanceRequest(BaseModel):
 def _position_total_value() -> float:
     """持仓当前市值（使用未复权点时收盘价，不使用成本价）。"""
     positions = get_positions()
-    dates = list_consolidated_trade_dates()
-    valuation = build_position_market_series_cache(positions, as_of=dates[-1] if dates else "")
+    as_of = current_live_valuation_trade_date()
+    valuation = build_position_market_series_cache(positions, as_of=as_of)
+    missing = missing_exact_position_valuations(positions, valuation, as_of=as_of)
+    if missing:
+        raise PositionMarketDataNotReadyError(missing, as_of, missing)
     return sum(
-        float(p.get("quantity", 0)) * float((valuation.get(str(p.get("symbol") or "")) or {}).get("price") or p.get("price", 0))
+        float(p.get("quantity", 0)) * float((valuation.get(str(p.get("symbol") or "")) or {}).get("price") or 0)
         for p in positions
     )
 
@@ -43,7 +51,18 @@ def _position_total_value() -> float:
 def get_account() -> AccountResponse:
     """获取模拟账户：余额、持仓总金额、资产（余额+持仓总金额）。"""
     balance = get_account_balance()
-    position_value = round(_position_total_value(), 2)
+    try:
+        position_value = round(_position_total_value(), 2)
+    except (PositionMarketDataNotReadyError, TradeCalendarNotReady) as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": getattr(exc, "code", "position_market_data_not_ready"),
+                "trade_date": getattr(exc, "as_of", ""),
+                "missing_symbols": getattr(exc, "symbols", []),
+                "message": str(exc),
+            },
+        ) from exc
     assets = round(balance + position_value, 2)
     return AccountResponse(balance=balance, position_value=position_value, assets=assets)
 

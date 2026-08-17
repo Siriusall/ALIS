@@ -86,11 +86,11 @@ def test_strategy_replay_uses_t_plus_one_and_isolated_ledger(monkeypatch):
     assert all(trade["date"] != "2026-07-01" for trade in result["trades"])
     assert result["summary"]["ending_equity"] > 0
     assert result["summary"]["total_fees"] > 0
-    assert result["decisions"][0]["data_cutoff"] == "2026-07-01T15:00:00"
+    assert result["decisions"][0]["data_cutoff"] == "2026-07-01T15:00:00+08:00"
     assert result["data_quality"]["point_in_time"]["passed"] is True
     assert result["data_quality"]["benchmark"]["passed"] is True
     assert result["data_quality"]["benchmark"]["observed_sessions"] == 3
-    assert result["data_quality"]["point_in_time"]["audits"][0]["decision_cutoff"] == "2026-07-01T15:00:00"
+    assert result["data_quality"]["point_in_time"]["audits"][0]["decision_cutoff"] == "2026-07-01T15:00:00+08:00"
     assert events[0]["completed_days"] == 0
     assert events[-1]["completed_days"] == 3
     assert events[-1]["progress"] == 1.0
@@ -136,6 +136,41 @@ def test_strategy_replay_marks_carried_benchmark_as_incomplete(monkeypatch):
     assert quality["missing_sessions"] == 1
     assert quality["missing_dates"] == ["2026-07-03"]
     assert quality["carry_forward_for_display_only"] is True
+
+
+def test_strategy_replay_rejects_missing_held_position_close_without_carrying_prior_price(monkeypatch):
+    class MissingHeldPositionSource(FakeReplayDataSource):
+        def load_snapshot(self, date_ymd: str) -> list[SnapshotRow]:
+            rows = super().load_snapshot(date_ymd)
+            if date_ymd == "20260703":
+                return [row for row in rows if row.symbol != "000001"]
+            return rows
+
+    monkeypatch.setattr(strategy_replay, "resolve_production_strategy_champion", lambda: {
+        "champion_id": 99, "champion_version": "alis-champion-test", "strategy_id": 1,
+        "strategy_controller_version_id": 31, "strategy_controller_version": "controller-test", "strategy_policy": {},
+    })
+    monkeypatch.setattr(strategy_replay, "get_strategy", lambda strategy_id: {
+        "id": strategy_id,
+        "name": "持仓行情缺口测试",
+        "type": "formula",
+        "content": {"score": {"factors": {"momentum_20": 1.0}}, "rebalance": {"freq": "daily", "top_n": 2}, "lookback_days": 30},
+    })
+
+    result = strategy_replay.run_strategy_replay(
+        strategy_id=1,
+        start_date="2026-07-01",
+        end_date="2026-07-03",
+        data_source=MissingHeldPositionSource(),
+    )
+
+    assert [item["date"] for item in result["equity_series"]] == ["2026-07-01", "2026-07-02"]
+    assert any(
+        item["code"] == "position_close_missing" and item["symbol"] == "000001"
+        for item in result["blocked_events"]
+    )
+    assert result["data_quality"]["held_position_market_data"]["passed"] is False
+    assert result["data_quality"]["point_in_time"]["passed"] is False
 
 
 def test_replay_consumes_full_frozen_package_and_routes_model_evidence(monkeypatch):

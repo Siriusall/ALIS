@@ -14,10 +14,30 @@ def test_classify_step_health_never_reports_timeout_as_healthy() -> None:
     assert healing.classify_step_health({"ok": True, "result": {"status": "timeout"}})["status"] == "failed"
 
 
+def test_classify_step_health_never_reports_retryable_data_gap_as_healthy() -> None:
+    for status in ("completed", "observing", "ready"):
+        result = healing.classify_step_health({
+            "ok": True,
+            "result": {
+                "status": status,
+                "failure_category": "execution_slice_blocked",
+            },
+        })
+        assert result == {"status": "failed", "reason": "execution_slice_blocked"}
+
+
 def test_classify_step_health_keeps_nonrepairable_oos_gap_as_waiting_condition() -> None:
     result = healing.classify_step_health({
         "name": "hard_data_gate", "ok": True,
         "result": {"status": "blocked", "non_repairable_dates": ["20260701"], "repair_dates": []},
+    })
+    assert result == {"status": "waiting_condition", "reason": "historical_point_in_time_unavailable"}
+
+
+def test_classify_step_health_keeps_nonrepairable_sealed_gap_as_waiting_condition() -> None:
+    result = healing.classify_step_health({
+        "name": "sealed_holdout_data_gate", "ok": False,
+        "result": {"status": "blocked", "non_repairable_dates": ["20190910"], "repair_dates": []},
     })
     assert result == {"status": "waiting_condition", "reason": "historical_point_in_time_unavailable"}
 
@@ -58,6 +78,33 @@ def test_self_healing_does_not_retry_historical_point_in_time_gaps(monkeypatch) 
     assert result["status"] == "healthy"
     assert result["actions"] == []
     assert result["components"]["hard_data_gate"]["status"] == "waiting_condition"
+
+
+def test_factor_repair_uses_current_experiment_gate_not_historical_oos_gate(monkeypatch) -> None:
+    calls = []
+    monkeypatch.setattr(
+        "app.services.factor_platform.run_factor_daily_cycle",
+        lambda: calls.append("factor") or {"materialization": {"point_in_time": {"passed": True}}},
+    )
+
+    result = healing.run_autonomous_self_healing([
+        {
+            "name": "hard_data_gate", "ok": False,
+            "result": {"status": "blocked", "non_repairable_dates": ["20260701"], "repair_dates": []},
+        },
+        {
+            "name": "decision_data_gate", "ok": True,
+            "result": {"status": "ready", "decision_ready": True, "experiment_ready": True},
+        },
+        {
+            "name": "factor_daily_cycle", "ok": False,
+            "error": "point_in_time_contract_failed",
+            "result": {"status": "failed"},
+        },
+    ])
+
+    assert calls == ["factor"]
+    assert result["components"]["factor_daily_cycle"]["status"] == "recovered"
 
 
 def test_self_healing_repairs_sealed_holdout_in_bounded_batch(monkeypatch) -> None:

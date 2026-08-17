@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from app.data_platform.db import _conn as _data_conn
+from app.data_platform.services.market_calendar import target_trade_date
 from app.data_platform.services.observability import get_observability
 from app.data_platform.services.readiness import readiness_overview
 from app.db.store import (
@@ -23,10 +24,13 @@ from app.services.quant_risk import (
     hrp_fallback_weights,
     ledoit_wolf_covariance,
 )
-from app.services.quant_run_engine import list_consolidated_trade_dates
 from app.services.rebalance_allocator import correlated_industry_group
 from app.services.five_bucket_contract import build_target_weight_contract, summarize_bucket_contracts
-from app.services.position_valuation import point_in_time_position_market_series
+from app.services.position_valuation import (
+    PositionMarketDataNotReadyError,
+    missing_exact_position_valuations,
+    point_in_time_position_market_series,
+)
 from app.services.research_engine import capability_registry
 from app.services.risk_limit_contract import (
     DEFAULT_CORRELATED_INDUSTRY_LIMIT,
@@ -139,8 +143,8 @@ def build_live_portfolio_risk(
 ) -> dict[str, Any]:
     positions = [x for x in (positions if positions is not None else get_positions()) if int(x.get("quantity") or 0) > 0]
     if as_of is None:
-        dates = list_consolidated_trade_dates()
-        as_of = dates[-1] if dates else ""
+        with _data_conn() as conn:
+            as_of = target_trade_date(conn)
     ds = BacktestDataSource()
     returns_by_symbol: dict[str, list[float]] = {}
     exposures: list[dict[str, Any]] = []
@@ -157,7 +161,11 @@ def build_live_portfolio_risk(
                 fallback_price=_f(item.get("price")),
                 lookback=lookback,
                 data_source=ds,
+                exact_date=True,
             )
+        missing = missing_exact_position_valuations([item], {symbol: valuation}, as_of=as_of or "")
+        if missing:
+            raise PositionMarketDataNotReadyError(missing, as_of or "", missing)
         price = _f(valuation.get("price"))
         returns = list(valuation.get("returns") or [])
         price_source = str(valuation.get("price_source") or "")

@@ -5,6 +5,7 @@ import pytest
 
 from app.services.quant_run_contracts import ReplayRiskGateError
 from app.services.quant_run_plan_input import (
+    _validate_formal_cutoff_alignment,
     build_authoritative_selection_detail,
     normalize_authoritative_plan,
     validate_unified_decision_contract,
@@ -674,3 +675,58 @@ def test_selection_hash_freezes_thesis_content():
 def test_public_unified_validator_rejects_legacy_contract():
     with pytest.raises(ReplayRiskGateError):
         validate_unified_decision_contract({"schema_version": "alis_legacy_daily_plan_v1"})
+
+
+def test_formal_cutoff_alignment_requires_one_canonical_explicit_instant():
+    cutoff = "2026-07-24T15:00:00+08:00"
+    contract = {
+        "data_as_of_time": cutoff,
+        "selection_snapshot": {"data_as_of_time": cutoff},
+        "decision_version_manifest": {
+            "data_contract": {"point_in_time_cutoff": cutoff},
+        },
+        "decision_data_gate": {"observation_cutoff": cutoff},
+    }
+    _validate_formal_cutoff_alignment(contract)
+
+    contract["decision_data_gate"]["observation_cutoff"] = "2026-07-24T15:00:00"
+    with pytest.raises(ReplayRiskGateError) as exc:
+        _validate_formal_cutoff_alignment(contract)
+    assert exc.value.code == "invalid_authoritative_plan"
+
+
+def test_formal_cutoff_alignment_rejects_mismatched_manifest_clock():
+    cutoff = "2026-07-24T15:00:00+08:00"
+    contract = {
+        "data_as_of_time": cutoff,
+        "selection_snapshot": {"data_as_of_time": cutoff},
+        "decision_version_manifest": {
+            "data_contract": {"point_in_time_cutoff": "2026-07-24T18:00:00+08:00"},
+        },
+        "decision_data_gate": {"observation_cutoff": cutoff},
+    }
+    with pytest.raises(ReplayRiskGateError) as exc:
+        _validate_formal_cutoff_alignment(contract)
+    assert "截止时间不一致" in str(exc.value)
+
+
+def test_v2_validator_wires_formal_cutoff_alignment_before_other_contract_checks():
+    cutoff = "2026-07-24T15:00:00+08:00"
+    contract = {
+        "schema_version": "alis_unified_daily_decision_v2",
+        "data_as_of_time": cutoff,
+        "selection_snapshot": {"data_as_of_time": cutoff},
+        "decision_version_manifest": {
+            "data_contract": {"point_in_time_cutoff": "2026-07-24T15:01:00+08:00"},
+        },
+        "decision_data_gate": {"observation_cutoff": cutoff},
+        "pretrade_controller": {"_present": True},
+        "industry_allocation": {"_present": True},
+        "expected_return_contract": {"_present": True},
+        "portfolio_method_competition": {"_present": True},
+        "execution_safety_contract": {"_present": True},
+        "risk_limit_contract": {"_present": True},
+    }
+    with pytest.raises(ReplayRiskGateError) as exc:
+        validate_unified_decision_contract(contract)
+    assert "截止时间" in str(exc.value)

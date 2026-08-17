@@ -31,6 +31,29 @@ def test_ensure_autonomous_simulation_task_reuses_scheduler_owned_task(monkeypat
     assert result["task"] == existing
 
 
+def test_startup_reconciles_abandoned_stopping_task(monkeypatch):
+    stopping = {
+        "id": 93,
+        "status": "stopping",
+        "replay_mode": "autonomous_daily",
+        "strategy_id": 1,
+        "top_n": 20,
+    }
+    transitions = []
+    monkeypatch.setattr(runner, "list_active_quant_run_tasks", lambda: [stopping])
+    monkeypatch.setattr(
+        runner,
+        "_transition_task_status",
+        lambda task_id, target, event, **fields: transitions.append((task_id, target, event, fields)) or True,
+    )
+
+    result = runner.reconcile_quant_tasks_on_startup()
+
+    assert result["stopping_finalized"] == 1
+    assert transitions[0][0:3] == (93, "stopped", "manual_stop_finalize")
+    assert transitions[0][3]["replay_status"] == "stopped_after_restart"
+
+
 def test_ensure_autonomous_simulation_task_starts_from_latest_data(monkeypatch):
     captured = {}
     monkeypatch.setattr(runner, "list_active_quant_run_tasks", lambda: [])
@@ -50,7 +73,7 @@ def test_ensure_autonomous_simulation_task_starts_from_latest_data(monkeypatch):
         captured.update(kwargs)
         return 92
 
-    monkeypatch.setattr(runner, "create_quant_run_task", fake_create)
+    monkeypatch.setattr(runner, "create_or_reuse_autonomous_quant_run_task", lambda **kwargs: (fake_create(**kwargs), True))
     monkeypatch.setattr(
         runner,
         "get_quant_run_task",
@@ -68,7 +91,6 @@ def test_ensure_autonomous_simulation_task_starts_from_latest_data(monkeypatch):
         "exchange_group": "HS",
         "start_date": "20260722",
         "max_steps": 1,
-        "replay_mode": "autonomous_daily",
     }
 
 
@@ -224,3 +246,97 @@ def test_successful_progress_ignores_uncommitted_task_fields():
 def test_autonomous_daily_mode_is_not_downgraded_to_replay():
     assert runner._normalized_replay_mode("autonomous_daily") == "autonomous_daily"
     assert runner._normalized_replay_mode("unknown") == "pragmatic_recover"
+
+
+def test_autonomous_execution_data_gate_cannot_be_disabled_by_runtime_config(monkeypatch):
+    task_id = 97
+    task = {
+        "id": task_id,
+        "status": "pending",
+        "strategy_id": 3,
+        "top_n": 10,
+        "budget_ratio": 1.0,
+        "exchange_group": "HS",
+        "replay_mode": "autonomous_daily",
+    }
+    gate_calls = []
+    pauses = []
+    execution_attempted = []
+
+    class ImmediateThread:
+        def __init__(self, *, target, **_kwargs):
+            self._target = target
+
+        def start(self):
+            self._target()
+
+    monkeypatch.setattr(runner.threading, "Thread", ImmediateThread)
+    monkeypatch.setattr(runner, "get_quant_run_task", lambda _task_id: dict(task))
+    monkeypatch.setattr(
+        runner,
+        "get_quant_run_task_runtime_config",
+        lambda _task_id: {"enable_data_health_gate": False},
+    )
+    monkeypatch.setattr(runner, "upsert_quant_run_task_health", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        runner,
+        "get_quant_run_task_health",
+        lambda _task_id: {
+            "last_step_latency_ms": 0,
+            "avg_step_latency_ms": 0,
+            "step_count": 0,
+            "risk_hit_count": 0,
+            "consecutive_pause_count": 0,
+        },
+    )
+    monkeypatch.setattr(runner, "_transition_task_status", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(runner, "claim_quant_run_task_start", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(runner, "evaluate_model_readiness_gate", runner.no_pause)
+    monkeypatch.setattr(runner, "require_consolidated_trade_dates", lambda **_kwargs: ["20260810", "20260811"])
+    monkeypatch.setattr(runner, "list_quant_run_task_records", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(runner, "get_quant_replay_waterline", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        runner,
+        "_build_autonomous_plan_context",
+        lambda _dates: {
+            "ok": True,
+            "start_idx": 0,
+            "batch_end_idx": 0,
+            "target_end_idx": 0,
+            "gap_days": 1,
+            "batch_steps": 1,
+            "current_execute_date": "20260811",
+            "target_execute_date": "20260811",
+            "required_defensive_ts_codes": ["510880.SH"],
+        },
+    )
+
+    def blocked_execution_gate(execute_date, defensive_ts_codes):
+        gate_calls.append((execute_date, list(defensive_ts_codes)))
+        return runner.pause_decision(
+            code="paused_frozen_execution_data_not_ready",
+            message="冻结执行数据未就绪",
+            recovery_condition="补齐冻结执行数据后自动重试",
+            exit_condition="当日无法补齐则记录漏跑",
+        )
+
+    monkeypatch.setattr(runner, "_evaluate_frozen_execution_data_gate", blocked_execution_gate)
+    monkeypatch.setattr(runner, "_ensure_close_data_ready", lambda: None)
+    monkeypatch.setattr(runner, "_refresh_missing_frozen_defensive_assets", lambda *_args: None)
+    monkeypatch.setattr(
+        runner,
+        "_handle_pause",
+        lambda _task_id, **kwargs: pauses.append(kwargs),
+    )
+    monkeypatch.setattr(runner, "_preflight_check_step", lambda **_kwargs: runner.no_pause())
+
+    def attempted_execution(**_kwargs):
+        execution_attempted.append(True)
+        raise AssertionError("frozen plan must not be claimed when T+1 data is incomplete")
+
+    monkeypatch.setattr(runner, "_execute_step_with_retry", attempted_execution)
+
+    assert runner.run_quant_task_async(task_id) is True
+    assert gate_calls == [("20260811", ["510880.SH"])]
+    assert [item["replay_status"] for item in pauses] == ["paused_frozen_execution_data_not_ready"]
+    assert execution_attempted == []

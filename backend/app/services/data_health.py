@@ -179,8 +179,9 @@ def build_data_health_report(limit_days: int = 30) -> dict[str, Any]:
 
 
 def _latest_adj_factor_coverage(trade_date: str) -> dict[str, Any]:
-    """Read the compact coverage ledger instead of scanning raw factor rows."""
+    """Read immutable, field-valid adj-factor observations for experiment gating."""
     from app.data_platform.db import _conn
+    from app.data_platform.services.data_center import _strict_adj_factor_codes
 
     with _conn() as conn:
         row = conn.execute(
@@ -189,50 +190,48 @@ def _latest_adj_factor_coverage(trade_date: str) -> dict[str, Any]:
                WHERE api_name='adj_factor' AND trade_date=? AND result_status='success'""",
             (str(trade_date),),
         ).fetchone()
+        valid_codes = _strict_adj_factor_codes(conn, trade_date)
     rows_read = int((dict(row) if row else {}).get("rows_read") or 0)
     return {
         "trade_date": str(trade_date),
-        "rows_read": rows_read,
-        "ready": rows_read >= 500,
+        "rows_read": len(valid_codes),
+        "request_rows_read": rows_read,
+        "ready": len(valid_codes) >= 500,
         "minimum_rows": 500,
+        "evidence_source": "immutable_observation_versions",
     }
 
 
 def _latest_benchmark_coverage(trade_date: str) -> dict[str, Any]:
-    """Require the point-in-time HS300 close used by OOS and attribution."""
+    """Require a valid immutable HS300 close for current experimentation.
+
+    This is intentionally *not* a historical T15 query.  A T-day benchmark
+    that arrived after close may support today's attribution once observed,
+    but it cannot rewrite history for OOS/sealed PIT checks; those consumers
+    have their own fixed-cutoff readers.
+    """
     from app.data_platform.db import _conn
+    from app.data_platform.services.data_center import _strict_benchmark_bar
 
     value = str(trade_date or "").replace("-", "")[:8]
-    cutoff = (
-        f"{value[:4]}-{value[4:6]}-{value[6:]}T15:00:00"
-        if len(value) == 8
-        else ""
-    )
     with _conn() as conn:
-        row = conn.execute(
-            """SELECT COUNT(*) AS rows_read,MAX(available_time) AS max_available_time,
-                      MAX(source_code) AS source_code
-               FROM dc_tushare_raw_records
-               WHERE api_name='index_daily' AND ts_code='000300.SH'
-                 AND trade_date=? AND available_time<=?""",
-            (value, cutoff),
-        ).fetchone()
-    item = dict(row) if row else {}
-    rows_read = int(item.get("rows_read") or 0)
-    max_available_time = str(item.get("max_available_time") or "")
-    ready = rows_read > 0 and bool(cutoff) and bool(max_available_time) and max_available_time <= cutoff
+        bar = _strict_benchmark_bar(conn, value)
     return {
         "trade_date": value,
         "ts_code": "000300.SH",
-        "rows_read": rows_read,
-        "max_available_time": max_available_time or None,
-        "source_code": str(item.get("source_code") or "") or None,
-        "cutoff": cutoff or None,
-        "ready": ready,
+        "rows_read": 1 if bar else 0,
+        "source_code": str((bar or {}).get("source_code") or "") or None,
+        "ready": bool(bar),
+        "evidence_source": "immutable_observation_versions",
+        "historical_point_in_time_policy": "oos_and_sealed_use_fixed_t15_readers",
     }
 
 
-def assess_latest_decision_data_health(trade_date: str = "") -> dict[str, Any]:
+def assess_latest_decision_data_health(
+    trade_date: str = "",
+    *,
+    observation_cutoff: str | None = None,
+) -> dict[str, Any]:
     """Decide whether one completed data slice may feed research and simulation.
 
     Daily execution already has its own hard gate. This broader read-only
@@ -253,7 +252,10 @@ def assess_latest_decision_data_health(trade_date: str = "") -> dict[str, Any]:
     if requested_trade_date:
         from app.data_platform.services.decision_data_contract import decision_data_contract
 
-        contract = decision_data_contract(requested_trade_date)
+        contract_args: dict[str, Any] = {}
+        if observation_cutoff is not None:
+            contract_args["as_of_time"] = observation_cutoff
+        contract = decision_data_contract(requested_trade_date, **contract_args)
         readiness = {
             "ok": bool(contract.get("ok")),
             "level": "healthy" if contract.get("ok") else "blocked",
@@ -275,12 +277,15 @@ def assess_latest_decision_data_health(trade_date: str = "") -> dict[str, Any]:
     report = build_data_health_report(limit_days=_DECISION_DRIFT_LOOKBACK_DAYS + 1)
     snapshots = report.get("market_snapshots") if isinstance(report.get("market_snapshots"), dict) else {}
     recent_days = snapshots.get("recent_days") if isinstance(snapshots.get("recent_days"), list) else []
-    latest = (
-        next((item for item in recent_days if str(item.get("date") or "") == requested_trade_date), {})
-        if requested_trade_date
-        else recent_days[-1] if recent_days else {}
+    target_date = requested_trade_date or str(readiness.get("target_trade_date") or "").replace("-", "")[:8]
+    # Health must evaluate the exchange-calendar target.  Choosing the newest
+    # stored snapshot can silently turn an incomplete current session into a
+    # healthy historical one.
+    latest = next(
+        (item for item in recent_days if str(item.get("date") or "").replace("-", "")[:8] == target_date),
+        {},
     )
-    latest_date = str(latest.get("date") or readiness.get("latest_decision_ready_trade_date") or "")
+    latest_date = target_date
     latest_rows = int(latest.get("symbol_rows") or 0)
     baseline_candidates = [
         item for item in recent_days
@@ -355,6 +360,20 @@ def assess_latest_decision_data_health(trade_date: str = "") -> dict[str, Any]:
         "schema_version": "alis_latest_decision_data_health_v1",
         "decision_ready": decision_ready,
         "experiment_ready": experiment_ready,
+        # Promote the immutable observation instant to the gate root.  Formal
+        # plans must align this value with the selection snapshot and version
+        # manifest; keeping it only under ``readiness`` made every V2 plan
+        # appear to have a missing fourth clock.
+        "observation_cutoff": (
+            ((readiness.get("decision_contract") or {}).get("observation_cutoff"))
+            if isinstance(readiness.get("decision_contract"), dict)
+            else None
+        ),
+        "observation_contract": (
+            ((readiness.get("decision_contract") or {}).get("observation_contract"))
+            if isinstance(readiness.get("decision_contract"), dict)
+            else {}
+        ),
         "readiness": readiness,
         "latest_snapshot": {
             "trade_date": latest_date,

@@ -16,6 +16,7 @@ from app.db.store import (
     list_model_versions,
 )
 from app.data_platform.db import _conn as data_conn
+from app.data_platform.services.observation_clock import load_raw_record_versions
 from app.services.backtest_data_source import HistBar, SnapshotRow
 from app.services.model_artifacts import resolve_model_artifact_path
 from app.services.event_impact_features import (
@@ -99,6 +100,43 @@ _EVENT_FEATURE_CACHE: dict[
 _EVENT_FEATURE_CACHE_LIMIT = 32
 
 
+def _versioned_event_rows(
+    conn: Any,
+    api_name: str,
+    *,
+    cutoff: str,
+    ts_codes: list[str] | None = None,
+    trade_date_start: str = "",
+    trade_date_end: str = "",
+    observed_start: str = "",
+) -> list[dict[str, Any]] | None:
+    """Return immutable PIT raw rows with payload columns expanded.
+
+    A missing version table is distinct from an installed table with no rows.
+    Production callers must not fall back to the mutable projection in the
+    former case, otherwise a repaired/current row can leak into historical
+    model features.
+    """
+    rows = load_raw_record_versions(
+        conn, api_name, cutoff=cutoff, observed_start=observed_start,
+        ts_codes=ts_codes, trade_date_start=trade_date_start,
+        trade_date_end=trade_date_end,
+    )
+    if rows is None:
+        return None
+    result: list[dict[str, Any]] = []
+    for row in rows:
+        item = dict(row)
+        try:
+            payload = json.loads(item.get("payload_json") or "{}")
+        except (TypeError, json.JSONDecodeError):
+            payload = {}
+        item["available_time"] = str(item.get("observed_at") or "")
+        item.update({key: value for key, value in payload.items() if key not in item})
+        result.append(item)
+    return result
+
+
 def _safe(value: Any) -> float:
     try:
         number = float(value or 0.0)
@@ -150,19 +188,25 @@ def _point_in_time_event_features(
             trade_dates.append(compact_date)
             trade_dates.sort()
         try:
-            announcement_rows = conn.execute(
-                f"""SELECT r.ts_code,r.publish_time AS event_time,
-                           r.available_time,r.title,r.raw_text,e.event_type,
-                           e.impact_direction,e.severity,e.confidence,e.metrics_json
-                    FROM dc_announcement_event e
-                    JOIN dc_announcement_raw r
-                      ON r.source_code=e.source_code
-                     AND r.announcement_id=e.announcement_id
-                    WHERE r.ts_code IN ({placeholders})
-                      AND r.available_time<=?
-                      AND REPLACE(SUBSTRING(r.publish_time,1,10),'-','')>=?""",
-                (*unique_symbols, cutoff, start_date),
-            ).fetchall()
+            # Announcement tables predate the immutable raw-version contract.
+            # A PostgreSQL replay must not use their mutable availability
+            # projection; legacy SQLite fixtures may retain the old query.
+            if bool(getattr(conn, "_is_postgres", False)):
+                announcement_rows = []
+            else:
+                announcement_rows = conn.execute(
+                    f"""SELECT r.ts_code,r.publish_time AS event_time,
+                               r.available_time,r.title,r.raw_text,e.event_type,
+                               e.impact_direction,e.severity,e.confidence,e.metrics_json
+                        FROM dc_announcement_event e
+                        JOIN dc_announcement_raw r
+                          ON r.source_code=e.source_code
+                         AND r.announcement_id=e.announcement_id
+                        WHERE r.ts_code IN ({placeholders})
+                          AND r.available_time<=?
+                          AND REPLACE(SUBSTRING(r.publish_time,1,10),'-','')>=?""",
+                    (*unique_symbols, cutoff, start_date),
+                ).fetchall()
         except Exception:
             announcement_rows = []
         structured_event_rows: list[Any] = []
@@ -171,73 +215,105 @@ def _point_in_time_event_features(
                 datetime.strptime(compact_date, "%Y%m%d") - timedelta(days=400)
             ).strftime("%Y-%m-%d")
             for api_name in STRUCTURED_DISCLOSURE_APIS:
-                structured_event_rows.extend(
-                    conn.execute(
-                        f"""SELECT api_name,ts_code,ann_date,period,available_time,payload_json
-                            FROM dc_tushare_raw_records
-                            WHERE api_name=?
-                              AND ts_code IN ({placeholders})
-                              AND available_time>=? AND available_time<=?
-                            ORDER BY available_time,id""",
-                        (api_name, *unique_symbols, structured_start, cutoff),
-                    ).fetchall()
+                versioned = _versioned_event_rows(
+                    conn, api_name, cutoff=cutoff, ts_codes=unique_symbols,
+                    trade_date_start=structured_start[:10].replace("-", ""),
                 )
+                if versioned is not None:
+                    structured_event_rows.extend(versioned)
+                elif not bool(getattr(conn, "_is_postgres", False)):
+                    structured_event_rows.extend(
+                        conn.execute(
+                            f"""SELECT api_name,ts_code,ann_date,period,available_time,payload_json
+                                FROM dc_tushare_raw_records
+                                WHERE api_name=?
+                                  AND ts_code IN ({placeholders})
+                                  AND available_time>=? AND available_time<=?
+                                ORDER BY available_time,id""",
+                            (api_name, *unique_symbols, structured_start, cutoff),
+                        ).fetchall()
+                    )
         except Exception:
             structured_event_rows = []
         try:
-            news_rows = conn.execute(
-                """SELECT available_time,payload_json
-                   FROM dc_tushare_raw_records
-                   WHERE api_name='major_news'
-                     AND available_time<=?
-                     AND available_time>=?
-                   ORDER BY available_time""",
-                (
-                    cutoff,
-                    f"{start_date[:4]}-{start_date[4:6]}-{start_date[6:]}",
-                ),
-            ).fetchall()
+            news_rows = _versioned_event_rows(
+                conn, "major_news", cutoff=cutoff,
+                observed_start=f"{start_date[:4]}-{start_date[4:6]}-{start_date[6:]}T00:00:00",
+            )
+            if news_rows is None and not bool(getattr(conn, "_is_postgres", False)):
+                news_rows = conn.execute(
+                    """SELECT available_time,payload_json
+                       FROM dc_tushare_raw_records
+                       WHERE api_name='major_news'
+                         AND available_time<=?
+                         AND available_time>=?
+                       ORDER BY available_time""",
+                    (
+                        cutoff,
+                        f"{start_date[:4]}-{start_date[4:6]}-{start_date[6:]}",
+                    ),
+                ).fetchall()
+            news_rows = news_rows or []
         except Exception:
             news_rows = []
         try:
-            top_list_rows = conn.execute(
-                f"""SELECT ts_code,trade_date,available_time,payload_json
-                    FROM dc_tushare_raw_records
-                    WHERE api_name='top_list'
-                      AND ts_code IN ({placeholders})
-                      AND trade_date>=? AND trade_date<=?
-                      AND available_time<=?
-                    ORDER BY trade_date,ts_code""",
-                (*unique_symbols, start_date, compact_date, cutoff),
-            ).fetchall()
+            top_list_rows = _versioned_event_rows(
+                conn, "top_list", cutoff=cutoff, ts_codes=unique_symbols,
+                trade_date_start=start_date, trade_date_end=compact_date,
+            )
+            if top_list_rows is None and not bool(getattr(conn, "_is_postgres", False)):
+                top_list_rows = conn.execute(
+                    f"""SELECT ts_code,trade_date,available_time,payload_json
+                        FROM dc_tushare_raw_records
+                        WHERE api_name='top_list'
+                          AND ts_code IN ({placeholders})
+                          AND trade_date>=? AND trade_date<=?
+                          AND available_time<=?
+                        ORDER BY trade_date,ts_code""",
+                    (*unique_symbols, start_date, compact_date, cutoff),
+                ).fetchall()
+            top_list_rows = top_list_rows or []
         except Exception:
             top_list_rows = []
         try:
-            benchmark_rows = conn.execute(
-                """SELECT trade_date,payload_json
-                   FROM dc_tushare_raw_records
-                   WHERE api_name='index_daily'
-                     AND ts_code IN ('000300.SH','000300')
-                     AND trade_date<=?
-                   ORDER BY trade_date DESC LIMIT 2""",
-                (compact_date,),
-            ).fetchall()
+            benchmark_rows = _versioned_event_rows(
+                conn, "index_daily", cutoff=cutoff,
+                ts_codes=["000300.SH", "000300"],
+                trade_date_end=compact_date,
+            )
+            if benchmark_rows is None and not bool(getattr(conn, "_is_postgres", False)):
+                benchmark_rows = conn.execute(
+                    """SELECT trade_date,payload_json
+                       FROM dc_tushare_raw_records
+                       WHERE api_name='index_daily'
+                         AND ts_code IN ('000300.SH','000300')
+                         AND trade_date<=?
+                       ORDER BY trade_date DESC LIMIT 2""",
+                    (compact_date,),
+                ).fetchall()
+            benchmark_rows = sorted(benchmark_rows or [], key=lambda row: str(dict(row).get("trade_date") or ""))[-2:]
         except Exception:
             benchmark_rows = []
         try:
             report_start = (
                 datetime.strptime(compact_date, "%Y%m%d") - timedelta(days=200)
             ).strftime("%Y%m%d")
-            analyst_report_rows = conn.execute(
-                f"""SELECT ts_code,trade_date,available_time,payload_json
-                    FROM dc_tushare_raw_records
-                    WHERE api_name='report_rc'
-                      AND ts_code IN ({placeholders})
-                      AND trade_date>=? AND trade_date<=?
-                      AND available_time<=?
-                    ORDER BY ts_code,trade_date,id""",
-                (*unique_symbols, report_start, compact_date, cutoff),
-            ).fetchall()
+            analyst_report_rows = _versioned_event_rows(
+                conn, "report_rc", cutoff=cutoff, ts_codes=unique_symbols,
+                trade_date_start=report_start, trade_date_end=compact_date,
+            )
+            if analyst_report_rows is None and not bool(getattr(conn, "_is_postgres", False)):
+                analyst_report_rows = conn.execute(
+                    f"""SELECT ts_code,trade_date,available_time,payload_json
+                        FROM dc_tushare_raw_records
+                        WHERE api_name='report_rc'
+                          AND ts_code IN ({placeholders})
+                          AND trade_date>=? AND trade_date<=?
+                          AND available_time<=?
+                        ORDER BY ts_code,trade_date,id""",
+                    (*unique_symbols, report_start, compact_date, cutoff),
+                ).fetchall()
+            analyst_report_rows = analyst_report_rows or []
         except Exception:
             analyst_report_rows = []
 

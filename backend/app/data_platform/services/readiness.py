@@ -8,7 +8,7 @@ from typing import Any
 from app.data_platform.contracts import CONTRACTS
 from app.data_platform.db import _conn
 from app.data_platform.redis_store import delete as redis_delete, get_json, set_json
-from app.data_platform.services.market_calendar import target_trade_date
+from app.data_platform.services.market_calendar import TradeCalendarNotReady, target_trade_date
 from app.data_platform.services.assets import _report_periods
 from app.data_platform.services.snapshot_health import latest_usable_snapshot_date
 
@@ -128,15 +128,24 @@ def _metrics() -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
         ).fetchone(), "n"))
         announcement_count = int(_value(c.execute("SELECT COUNT(*) n FROM dc_announcement_raw").fetchone(), "n"))
         latest_ann = str(_value(c.execute("SELECT MAX(publish_time) value FROM dc_announcement_raw").fetchone(), "value", ""))
-        has_available_time = c.execute(
-            """
-            SELECT 1 n
-            FROM dc_tushare_raw_records
-            WHERE api_name IN ('income','balancesheet','cashflow','fina_indicator','daily','daily_basic','stk_limit')
-              AND available_time <> ''
-            LIMIT 1
-            """
-        ).fetchone() is not None
+        # A current-row ``available_time`` is not historical PIT evidence. The
+        # readiness card is only green when the observation-clock migration has
+        # retained at least one real version; missing migration/evidence is an
+        # explicit unknown/blocked state rather than a legacy success.
+        try:
+            has_available_time = c.execute(
+                """
+                SELECT 1 n
+                FROM dc_tushare_raw_record_version
+                WHERE api_name IN ('income','balancesheet','cashflow','fina_indicator','daily','daily_basic','stk_limit')
+                  AND observed_at <> '' AND first_observed_at <> ''
+                  AND content_hash <> ''
+                  AND LOWER(COALESCE(observation_provenance,'')) NOT LIKE 'legacy_%'
+                LIMIT 1
+                """
+            ).fetchone() is not None
+        except Exception:
+            has_available_time = False
         pcf_latest_date = str(_value(c.execute(
             "SELECT MAX(trade_date) value FROM dc_etf_pcf_header WHERE trade_date<=?", (today,)
         ).fetchone(), "value", ""))
@@ -198,7 +207,7 @@ def _metrics() -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
             f"候选池与核心池研究字段 {candidate_field_present}/{candidate_field_expected}；完全通过 {candidate_field_complete}/{len(candidate_field_states)} 只",
         ),
         "announcements": (1.0 if ann_fresh and announcement_count else (0.5 if announcement_count else 0.0), announcement_count, announcement_count, f"最新公告 {latest_ann or '无'}"),
-        "point_in_time": (1.0 if has_available_time else 0.0, 1 if has_available_time else 0, 1, "核心原始记录已保存 available_time；严格未来函数审计另列质量项"),
+        "point_in_time": (1.0 if has_available_time else 0.0, 1 if has_available_time else 0, 1, "仅以不可变 observed_at 版本证明点时可用性；缺失证据即阻断"),
         "capital_structure": (
             float(vip["capital"]["coverage"]), int(vip["capital"]["completed_slices"]),
             int(vip["capital"]["expected_slices"]), "北向、两融和龙虎榜精确请求切片覆盖",
@@ -231,6 +240,46 @@ def _metrics() -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
 
 
 def readiness_overview() -> dict[str, Any]:
+    # Validate the authoritative exchange calendar before serving either a
+    # Redis or process-cache snapshot.  A cached green readiness result must
+    # never survive a calendar outage/bootstrap gap.
+    try:
+        with _conn() as c:
+            target_trade_date(c)
+    except TradeCalendarNotReady as exc:
+        blocked = {
+            "ok": False,
+            "status": "blocked",
+            "error_code": exc.code,
+            "error": str(exc),
+            "scope": {"target_trade_date": "", "calendar_status": "blocked"},
+            "consumers": [{
+                "key": "trade_calendar",
+                "name": "交易日历",
+                "description": "无法证明当前目标交易日，所有日期型数据消费者暂停",
+                "status": "blocked",
+                "blocked_count": 1,
+                "degraded_count": 0,
+                "requirements": [{
+                    "key": "trade_calendar",
+                    "label": "交易所交易日历",
+                    "threshold": 1.0,
+                    "status": "blocked",
+                    "coverage": 0.0,
+                    "available": 0,
+                    "expected": 1,
+                    "evidence": str(exc),
+                }],
+            }],
+            "status_definition": {
+                "ready": "满足正式运行要求",
+                "degraded": "可运行但必须标注数据风险",
+                "blocked": "关键数据不足，应禁止正式运行",
+                "unknown": "尚无足够证据",
+            },
+        }
+        _refresh_state.update({"last_result": blocked, "last_finished_at": datetime.now().isoformat(timespec="seconds"), "last_error": str(exc)})
+        return blocked
     redis_cached = get_json("alis:data-platform:readiness:v2")
     if isinstance(redis_cached, dict):
         return redis_cached

@@ -5,23 +5,28 @@ import threading
 import time
 from typing import Any
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, HTTPException, Query
 
 from app.data_platform.db import _conn as data_conn
 from app.data_platform.services.decision_data_contract import decision_data_contract
+from app.data_platform.services.market_calendar import TradeCalendarNotReady, target_trade_date
 from app.db.store import get_account_balance, get_account_baseline, get_account_high_water_mark, get_backtest_result, get_positions, list_backtests, list_executions, list_operations_for_execution_ids
 from app.services.backtest_data_source import BacktestDataSource
 from app.services.data_health import build_data_health_report
 from app.services.market_context import live_market_context
 from app.services.model_registry import get_model_status
-from app.services.quant_run_engine import list_consolidated_trade_dates
 from app.services.operations_overview import build_live_portfolio_risk
 from app.services.theme_engine import list_themes
 from app.services.daily_rebalance import build_daily_rebalance_report, build_daily_rebalance_summary
 from app.services.profit_loop import get_latest_daily_rebalance_plan
 from app.services.decision_enhancement import build_decision_enhancement
 from app.services.quant_risk import evaluate_model_readiness_gate
-from app.services.position_valuation import build_position_market_series_cache, point_in_time_position_market_series
+from app.services.position_valuation import (
+    PositionMarketDataNotReadyError,
+    build_position_market_series_cache,
+    missing_exact_position_valuations,
+    point_in_time_position_market_series,
+)
 from app.core.read_only_diagnostics import degraded_read
 
 router = APIRouter()
@@ -73,8 +78,8 @@ def _ledger_summary(
     baseline = float(get_account_baseline() or 0)
     positions = positions if positions is not None else get_positions()
     if latest_date is None:
-        latest_trade_dates = list_consolidated_trade_dates()
-        latest_date = latest_trade_dates[-1] if latest_trade_dates else ""
+        with data_conn() as conn:
+            latest_date = target_trade_date(conn)
     ds = BacktestDataSource()
     market_value = 0.0
     by_symbol_value: dict[str, float] = {}
@@ -90,7 +95,10 @@ def _ledger_summary(
                 as_of=latest_date,
                 fallback_price=float(p.get("price") or 0),
                 data_source=ds,
+                exact_date=True,
             )
+        if str(valuation.get("price_source") or "") == "position_cost_fallback":
+            raise PositionMarketDataNotReadyError([sym], str(latest_date or ""), [sym])
         px = float(valuation.get("price") or 0)
         mv = round(px * qty, 2)
         market_value += mv
@@ -545,9 +553,24 @@ def decision_summary(limit_days: int = Query(30, ge=1, le=250)) -> dict[str, Any
     data_health = build_data_health_report(limit_days=limit_days)
     latest_data_contract = _latest_decision_data_contract()
     positions = get_positions()
-    latest_trade_dates = list_consolidated_trade_dates()
-    latest_date = latest_trade_dates[-1] if latest_trade_dates else ""
+    try:
+        with data_conn() as conn:
+            latest_date = target_trade_date(conn)
+    except TradeCalendarNotReady as exc:
+        raise HTTPException(status_code=503, detail={
+            "code": exc.code,
+            "message": str(exc),
+        }) from exc
     valuation_cache = build_position_market_series_cache(positions, as_of=latest_date)
+    missing = missing_exact_position_valuations(positions, valuation_cache, as_of=latest_date)
+    if missing:
+        exc = PositionMarketDataNotReadyError(missing, latest_date, missing)
+        raise HTTPException(status_code=503, detail={
+            "code": "position_market_data_not_ready",
+            "trade_date": latest_date,
+            "missing_symbols": exc.symbols,
+            "message": str(exc),
+        })
     ledger = _ledger_summary(
         positions=positions,
         latest_date=latest_date,

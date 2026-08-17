@@ -2,6 +2,7 @@ from app.services import streaming_training
 from app.services import model_training
 from app.services.streaming_training import build_training_slices, temporary_dates_for_cleanup
 from app.services.backtest_data_source import SnapshotRow
+from app.data_platform.services import data_center
 
 
 def test_training_slices_keep_feature_and_label_overlap() -> None:
@@ -18,6 +19,26 @@ def test_cleanup_never_targets_online_window() -> None:
     assert temporary_dates_for_cleanup(
         fetched_dates=["20231229", "20240102", "20240103"], online_window_start="20240102",
     ) == ["20231229"]
+
+
+def test_cleanup_hook_retains_shared_market_data_without_opening_connection(monkeypatch) -> None:
+    """Training cleanup must be an audit; shared PIT evidence is immutable."""
+
+    def fail_if_called():
+        raise AssertionError("shared market data cleanup must not open a write connection")
+
+    monkeypatch.setattr(data_center, "_conn", fail_if_called)
+    result = data_center.purge_temporary_training_market_data(
+        fetched_dates=["20231229", "20240102"], online_window_start="20240102",
+    )
+
+    assert result["status"] == "shared_market_data_retained"
+    assert result["retained_dates"] == ["20231229"]
+    assert result["retained_count"] == 1
+    assert result["deleted"] == 0
+    assert result["deleted_dates"] == []
+    assert result["raw_records_deleted"] == 0
+    assert result["snapshots_deleted"] == 0
 
 
 def test_slice_materializes_locally_then_consumes_then_always_cleans(monkeypatch) -> None:

@@ -10,6 +10,9 @@ import httpx
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 
+from app.data_platform.db import _conn as data_conn
+from app.data_platform.services.decision_data_contract import decision_data_contract
+from app.data_platform.services.market_calendar import target_trade_date
 from app.db.store import get_positions
 from app.services.research_engine import (
     CONTRACTS,
@@ -29,7 +32,6 @@ from app.services.market_context import live_market_context
 from app.services.decision_store import build_review_outcome_suggestion, create_decision_snapshot, create_review, diff_decision_snapshots, get_decision_snapshot, list_decision_snapshot_summaries, list_decision_snapshots, list_pool_members, list_position_state_history, list_position_states, list_reviews, remove_pool_member, transition_pool_member, transition_position, upsert_pool_member, verify_decision_snapshot
 from app.services.operations_overview import build_decision_audit, build_governance_overview, build_live_portfolio_risk
 from app.services.position_valuation import build_position_market_series_cache
-from app.services.quant_run_engine import list_consolidated_trade_dates
 from app.services.stock_pool_sync import stage_candidates_in_watch_pool
 from app.services.research_workflow import build_console_stock_evidence, evaluate_core_pool_eligibility, process_watch_pool
 from app.services.advanced_controls import bayesian_update, freeze_evidence, trade_attribution
@@ -678,6 +680,25 @@ def research_position_state_history(
 def research_live_portfolio_risk(lookback: int = Query(120, ge=20, le=252)) -> dict[str, Any]:
     try:
         cache_key = max(20, min(int(lookback or 120), 252))
+        with data_conn() as conn:
+            as_of = target_trade_date(conn)
+            contract = decision_data_contract(as_of, conn=conn)
+        if not bool(contract.get("ok")):
+            return {
+                "ok": False,
+                "status": "blocked",
+                "data_available": False,
+                "component": "portfolio_risk",
+                "target_trade_date": as_of,
+                "error": {
+                    "code": "decision_data_not_ready",
+                    "message": "目标交易日决策数据未就绪，风险页不使用上一交易日持仓估值。",
+                    "issues": list(contract.get("issues") or []),
+                },
+                "target_weights": [],
+                "exposures": [],
+                "breaches": [],
+            }
         now = time.monotonic()
         with _portfolio_risk_cache_lock:
             cached = _portfolio_risk_cache.get(cache_key)
@@ -685,8 +706,6 @@ def research_live_portfolio_risk(lookback: int = Query(120, ge=20, le=252)) -> d
             return copy.deepcopy(cached[1])
 
         positions = get_positions()
-        trade_dates = list_consolidated_trade_dates()
-        as_of = trade_dates[-1] if trade_dates else ""
         valuation_cache = build_position_market_series_cache(
             positions,
             as_of=as_of,

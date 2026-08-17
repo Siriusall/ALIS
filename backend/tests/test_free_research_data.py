@@ -54,7 +54,7 @@ def test_materialize_financial_series_keeps_cutoff_availability(monkeypatch) -> 
     result = service.materialize_financial_industry_series(max_periods=4)
 
     assert result["values"] == 4
-    assert {row["available_time"] for row in written_values} == {"2026-03-31T23:59:59"}
+    assert {row["available_time"] for row in written_values} == {"2026-03-31T23:59:59+08:00"}
     assert {row["source_code"] for row in written_defs} == {service.FINANCIAL_SOURCE}
     assert {row["metric_name"] for row in written_defs} == {
         "行业需求/销量（点时营收扩散代理）",

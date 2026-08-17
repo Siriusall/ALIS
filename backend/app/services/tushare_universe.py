@@ -1,19 +1,19 @@
 from __future__ import annotations
 
 """
-基于 TuShare 的基础信息与指数成分服务：
+基于规范数据平台的基础信息与指数成分服务：
 - basic_info: ts_code/symbol/name/industry/list_date/list_status
 - index_constituents: 指数成分及权重
 
-同样只在内存中缓存，不直接操作数据库。
+读取 PostgreSQL 的可追溯投影；刷新由数据平台执行，不允许业务进程直连供应商。
 """
 
+import json
 import logging
-import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
-from app.integrations.tushare_client import get_tushare_client
+from app.data_platform.db import _conn
 
 logger = logging.getLogger("quant.tushare_universe")
 
@@ -41,60 +41,101 @@ _basic_info_cache: Dict[str, BasicInfo] = {}
 _index_constituents_cache: Dict[str, List[IndexConstituent]] = {}
 _basic_cache_warning_logged = False
 _index_cache_warning_logged: set[str] = set()
-_RETRY_DELAYS_SEC = (0.8, 1.5)
+
+
+def _read_basic_info() -> Dict[str, BasicInfo]:
+    try:
+        with _conn() as conn:
+            rows = conn.execute(
+                """SELECT ts_code,symbol,name,area,industry,list_date
+                   FROM dc_stock_master
+                   ORDER BY symbol"""
+            ).fetchall()
+    except Exception as exc:  # noqa: BLE001 - callers receive an empty, explicit unavailable result
+        logger.warning("规范证券主表读取失败: %s", str(exc)[:160])
+        return {}
+    out: Dict[str, BasicInfo] = {}
+    for raw in rows:
+        row = dict(raw)
+        symbol = str(row.get("symbol") or row.get("ts_code") or "").split(".", 1)[0].zfill(6)
+        if not symbol:
+            continue
+        out[symbol] = BasicInfo(
+            ts_code=str(row.get("ts_code") or ""), symbol=symbol,
+            name=str(row.get("name") or ""), area=str(row.get("area") or ""),
+            industry=str(row.get("industry") or ""), list_date=str(row.get("list_date") or ""),
+            list_status="L",
+        )
+    return out
+
+
+def _read_index_constituents(index_code: str, start_date: str, end_date: str) -> List[IndexConstituent]:
+    start = str(start_date or "").replace("-", "")[:8]
+    end = str(end_date or "").replace("-", "")[:8]
+    if len(start) != 8 or len(end) != 8:
+        return []
+    try:
+        with _conn() as conn:
+            rows = conn.execute(
+                """SELECT trade_date,payload_json
+                   FROM dc_tushare_raw_records
+                   WHERE api_name='index_weight' AND trade_date<=?
+                   ORDER BY trade_date DESC""",
+                (end,),
+            ).fetchall()
+    except Exception as exc:  # noqa: BLE001 - caller's universe gate handles absence
+        logger.warning("规范指数成分读取失败 index=%s: %s", index_code, str(exc)[:160])
+        return []
+
+    # Index weights are published periodically.  Use the newest published
+    # constituent date at or before the requested end date, never a later one.
+    target_date = ""
+    parsed: list[tuple[str, dict]] = []
+    for raw in rows:
+        row = dict(raw)
+        try:
+            payload = json.loads(str(row.get("payload_json") or "{}"))
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if str(payload.get("index_code") or "") != index_code:
+            continue
+        trade_date = str(payload.get("trade_date") or row.get("trade_date") or "")
+        if len(trade_date) != 8 or not trade_date.isdigit() or trade_date > end:
+            continue
+        if not target_date:
+            target_date = trade_date
+        if trade_date == target_date:
+            parsed.append((trade_date, payload))
+    return [
+        IndexConstituent(
+            index_code=index_code,
+            ts_code=str(payload.get("con_code") or ""),
+            weight=float(payload.get("weight") or 0.0),
+            trade_date=trade_date,
+        )
+        for trade_date, payload in parsed
+        if str(payload.get("con_code") or "")
+    ]
 
 
 def get_basic_info_map(refresh: bool = False, cache_only: bool = False) -> Dict[str, BasicInfo]:
     """
     获取全市场基础信息映射：symbol(6位) -> BasicInfo。
     默认缓存结果，如需强制刷新传 refresh=True。
-    cache_only=True 时仅读缓存，无缓存则返回 {} 且不请求 TuShare（业务侧在非 init 路径传 True）。
+    cache_only=True 时不发起同步，但仍可读取规范 PostgreSQL。
     """
     global _basic_info_cache, _basic_cache_warning_logged
     if _basic_info_cache and not refresh:
         return _basic_info_cache
-    if cache_only:
-        if not _basic_cache_warning_logged:
-            logger.warning("TuShare 基础信息缓存未初始化；请通过已登录会话执行 POST /api/init（后续请求不再重复刷屏）")
-            _basic_cache_warning_logged = True
-        return {}
-    client = get_tushare_client()
-    df = None
-    last_err: Exception | None = None
-    for i in range(len(_RETRY_DELAYS_SEC) + 1):
-        try:
-            df = client.stock_basic(
-                list_status="L",
-                fields="ts_code,symbol,name,area,industry,list_date,list_status",
-            )
-            break
-        except Exception as e:  # noqa: BLE001
-            last_err = e
-            if i < len(_RETRY_DELAYS_SEC):
-                time.sleep(_RETRY_DELAYS_SEC[i])
-                continue
-    if df is None:
-        logger.warning(
-            "TuShare 基础信息拉取失败（%s），回退到已有缓存（%d 条）",
-            str(last_err)[:120] if last_err else "unknown",
-            len(_basic_info_cache),
-        )
-        return _basic_info_cache
-    out: Dict[str, BasicInfo] = {}
-    if not df.empty:
-        for _, row in df.iterrows():
-            ts_code = str(row.get("ts_code", ""))
-            symbol = str(row.get("symbol", "")).zfill(6)
-            info = BasicInfo(
-                ts_code=ts_code,
-                symbol=symbol,
-                name=str(row.get("name", "")),
-                area=str(row.get("area", "")),
-                industry=str(row.get("industry", "")),
-                list_date=str(row.get("list_date", "")),
-                list_status=str(row.get("list_status", "")),
-            )
-            out[symbol] = info
+    out = _read_basic_info()
+    if not out and not cache_only:
+        from app.data_platform.services.data_center import sync_stock_basic
+
+        sync_stock_basic()
+        out = _read_basic_info()
+    if not out and cache_only and not _basic_cache_warning_logged:
+        logger.warning("规范证券主表未初始化；业务读取将保持不可用")
+        _basic_cache_warning_logged = True
     _basic_info_cache = out
     return out
 
@@ -109,47 +150,23 @@ def get_index_constituents(
     """
     获取某指数在给定区间内的成分股及权重。
     结果缓存键为 index_code(start_date,end_date) 简单合成。
-    cache_only=True 时仅读缓存，无缓存则返回 [] 且不请求 TuShare。
+    cache_only=True 时不发起同步，但仍可读取规范 PostgreSQL。
     """
     key = f"{index_code}:{start_date}:{end_date}"
     if use_cache and key in _index_constituents_cache:
         return _index_constituents_cache[key]
-    if cache_only:
-        if key not in _index_cache_warning_logged:
-            logger.warning("TuShare 指数成分缓存未初始化（%s）；请通过已登录会话执行 POST /api/init", key)
-            _index_cache_warning_logged.add(key)
-        return []
-    client = get_tushare_client()
-    df = None
-    last_err: Exception | None = None
-    for i in range(len(_RETRY_DELAYS_SEC) + 1):
-        try:
-            df = client.index_weight(index_code=index_code, start_date=start_date, end_date=end_date)
-            break
-        except Exception as e:  # noqa: BLE001
-            last_err = e
-            if i < len(_RETRY_DELAYS_SEC):
-                time.sleep(_RETRY_DELAYS_SEC[i])
-                continue
-    if df is None:
-        logger.warning(
-            "TuShare 指数成分拉取失败（%s），回退缓存 key=%s（%d 条）",
-            str(last_err)[:120] if last_err else "unknown",
-            key,
-            len(_index_constituents_cache.get(key, [])),
+    out = _read_index_constituents(index_code, start_date, end_date)
+    if not out and not cache_only:
+        from app.data_platform.services.data_center import sync_tushare_api_raw
+
+        sync_tushare_api_raw(
+            "index_weight",
+            {"index_code": index_code, "start_date": start_date, "end_date": end_date},
         )
-        return _index_constituents_cache.get(key, [])
-    out: List[IndexConstituent] = []
-    if not df.empty:
-        for _, row in df.iterrows():
-            out.append(
-                IndexConstituent(
-                    index_code=str(row.get("index_code", index_code)),
-                    ts_code=str(row.get("con_code", "")),
-                    weight=float(row.get("weight", 0) or 0.0),
-                    trade_date=str(row.get("trade_date", "")),
-                )
-            )
+        out = _read_index_constituents(index_code, start_date, end_date)
+    if not out and cache_only and key not in _index_cache_warning_logged:
+        logger.warning("规范指数成分未初始化（%s）；业务读取将保持不可用", key)
+        _index_cache_warning_logged.add(key)
     _index_constituents_cache[key] = out
     return out
 
@@ -177,4 +194,3 @@ def build_index_membership_set(
         if symbol:
             members[symbol] = True
     return members
-

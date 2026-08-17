@@ -69,7 +69,7 @@ def test_verified_fallback_records_economic_and_observation_times(monkeypatch):
         "SELECT * FROM dc_tushare_raw_records WHERE trade_date='20260810'"
     ).fetchone())
     assert row["source_code"] == fallback.SOURCE_EASTMONEY_INDEX
-    assert row["available_time"] == "2026-08-10T15:00:00"
+    assert row["available_time"] == "2026-08-11T10:30:00+08:00"
     payload = json.loads(row["payload_json"])
     assert payload["observed_at"] == "2026-08-11T10:30:00+08:00"
     assert payload["pending_primary_reconciliation"] is True

@@ -2,9 +2,12 @@ from __future__ import annotations
 
 from datetime import datetime
 import json
+from math import ceil
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from app.data_platform.db import _conn
+from app.data_platform.services.observation_clock import load_snapshot_versions
 from app.services.market_context import score_theme_narratives
 from app.services.narrative_lifecycle_contract import (
     ALLOWED_TRANSITIONS as NARRATIVE_LIFECYCLE_ALLOWED_TRANSITIONS,
@@ -15,6 +18,255 @@ from app.services.narrative_lifecycle_contract import (
     crowding_risk as _crowding_risk,
     transition_state as _transition_lifecycle_state,
 )
+from app.services.point_in_time import is_available_at, normalize_explicit_timestamp
+
+
+_BUSINESS_TZ = ZoneInfo("Asia/Shanghai")
+_THEME_PIT_CONTRACT = "alis_theme_snapshot_pit_v1"
+
+
+def _theme_pit_marker(cutoff: str, *, rows: int, sessions: list[str]) -> dict[str, Any]:
+    return {
+        "contract": _THEME_PIT_CONTRACT,
+        "source": "dc_stock_daily_snapshot_version",
+        "source_observation_cutoff": cutoff,
+        "source_rows": int(rows),
+        "source_sessions": list(sessions),
+    }
+
+
+def _theme_snapshot_visible_at(
+    payload: Any,
+    cutoff: str,
+    *,
+    row: dict[str, Any] | None = None,
+) -> bool:
+    """Accept only a derived snapshot whose source and row clocks are visible."""
+
+    if not isinstance(payload, dict):
+        return False
+    marker = payload.get("point_in_time")
+    if not isinstance(marker, dict) or marker.get("contract") != _THEME_PIT_CONTRACT:
+        return False
+    source_cutoff = normalize_explicit_timestamp(marker.get("source_observation_cutoff"))
+    boundary = normalize_explicit_timestamp(cutoff)
+    if not (
+        source_cutoff
+        and boundary
+        and is_available_at(source_cutoff, boundary, require_explicit_offset=True)
+    ):
+        return False
+    # ``point_in_time`` proves the inputs used by the derivation.  The
+    # materialized row still has its own observation, creation and update
+    # clocks; accepting a row written after the requested cutoff would turn a
+    # current recomputation into historical evidence.
+    if row is None:
+        return True
+    return all(
+        (clock := normalize_explicit_timestamp(row.get(field)))
+        and is_available_at(clock, boundary, require_explicit_offset=True)
+        for field in ("available_time", "created_at", "updated_at")
+    )
+
+
+def _theme_mapping_visible_at(row: dict[str, Any], cutoff: str) -> bool:
+    """Validate the mutable mapping projection's write clock for PIT reads.
+
+    Theme mappings are keyed by ``(as_of_date, theme_code, ts_code)`` and are
+    updated in place.  The snapshot envelope alone therefore cannot prove
+    that a company association existed at an earlier cutoff.
+    """
+    if not cutoff:
+        return True
+    updated = normalize_explicit_timestamp(row.get("updated_at"))
+    return bool(updated and is_available_at(updated, cutoff, require_explicit_offset=True))
+
+
+def _decode_snapshot_version(item: dict[str, Any]) -> dict[str, Any] | None:
+    try:
+        payload = json.loads(item.get("payload_json") or "{}")
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    row = dict(payload)
+    row["ts_code"] = str(item.get("ts_code") or row.get("ts_code") or "")
+    row["trade_date"] = str(item.get("trade_date") or row.get("trade_date") or "").replace("-", "")[:8]
+    return row
+
+
+def _number(value: Any) -> float | None:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed == parsed and abs(parsed) != float("inf") else None
+
+
+def _pit_theme_inputs(
+    c: Any,
+    *,
+    cutoff: str,
+    cutoff_date: str,
+    lookback: int,
+) -> dict[str, Any]:
+    """Load bounded immutable market inputs for a historical theme materialization."""
+
+    calendar_rows = c.execute(
+        """SELECT cal_date FROM dc_trade_calendar
+           WHERE is_open=1 AND cal_date<=?
+           ORDER BY cal_date DESC LIMIT ?""",
+        (cutoff_date, max(5, min(int(lookback), 60))),
+    ).fetchall()
+    calendar_dates = sorted({
+        str(dict(row).get("cal_date") or "").replace("-", "")[:8]
+        for row in calendar_rows
+        if len(str(dict(row).get("cal_date") or "").replace("-", "")[:8]) == 8
+    })
+    if len(calendar_dates) < 3:
+        return {"ok": False, "status": "insufficient_data", "reason": "fewer_than_three_market_sessions"}
+    versions = load_snapshot_versions(
+        c,
+        cutoff=cutoff,
+        trade_date_start=calendar_dates[0],
+        trade_date_end=calendar_dates[-1],
+    )
+    if versions is None:
+        return {
+            "ok": False,
+            "status": "blocked_point_in_time",
+            "reason": "snapshot_version_schema_unavailable",
+            "contract": _THEME_PIT_CONTRACT,
+        }
+    visible_rows = [
+        row for item in versions
+        if (row := _decode_snapshot_version(dict(item))) is not None
+    ]
+    rows_by_date: dict[str, list[dict[str, Any]]] = {}
+    for row in visible_rows:
+        if row.get("trade_date") in calendar_dates:
+            rows_by_date.setdefault(str(row["trade_date"]), []).append(row)
+    missing_dates = [date for date in calendar_dates if not rows_by_date.get(date)]
+    if missing_dates:
+        return {
+            "ok": False,
+            "status": "blocked_point_in_time",
+            "reason": "snapshot_versions_missing_dates",
+            "missing_dates": missing_dates,
+            "contract": _THEME_PIT_CONTRACT,
+        }
+    stock_count_row = c.execute("SELECT COUNT(*) cnt FROM dc_stock_master").fetchone()
+    stock_count = int(dict(stock_count_row).get("cnt") or 0) if stock_count_row else 0
+    minimum_rows = max(1, int(ceil(stock_count * .80))) if stock_count else 1
+    undercovered = {
+        date: len(rows_by_date[date])
+        for date in calendar_dates
+        if len(rows_by_date[date]) < minimum_rows
+    }
+    if undercovered:
+        return {
+            "ok": False,
+            "status": "blocked_point_in_time",
+            "reason": "snapshot_versions_incomplete",
+            "minimum_rows": minimum_rows,
+            "undercovered": undercovered,
+            "contract": _THEME_PIT_CONTRACT,
+        }
+
+    aggregates_by_key: dict[tuple[str, str], dict[str, Any]] = {}
+    for row in visible_rows:
+        industry = str(row.get("industry") or "").strip()
+        trade_date = str(row.get("trade_date") or "")
+        if not industry or trade_date not in calendar_dates:
+            continue
+        key = (industry, trade_date)
+        aggregate = aggregates_by_key.setdefault(key, {
+            "industry": industry,
+            "trade_date": trade_date,
+            "company_count": 0,
+            "change_sum": 0.0,
+            "change_count": 0,
+            "positive_count": 0,
+            "turnover": 0.0,
+        })
+        aggregate["company_count"] += 1
+        change = _number(row.get("change_pct"))
+        if change is not None:
+            aggregate["change_sum"] += change
+            aggregate["change_count"] += 1
+            aggregate["positive_count"] += int(change > 0)
+        turnover = _number(row.get("turnover"))
+        if turnover is not None:
+            aggregate["turnover"] += turnover
+    aggregates = []
+    for item in sorted(aggregates_by_key.values(), key=lambda value: (value["industry"], value["trade_date"])):
+        count = max(1, int(item["company_count"]))
+        aggregates.append({
+            "industry": item["industry"],
+            "trade_date": item["trade_date"],
+            "company_count": item["company_count"],
+            "average_change_pct": item["change_sum"] / item["change_count"] if item["change_count"] else None,
+            "breadth": item["positive_count"] / count,
+            "turnover": item["turnover"],
+        })
+    latest_date = calendar_dates[-1]
+    latest_companies = [
+        {
+            key: row.get(key)
+            for key in ("ts_code", "name", "industry", "change_pct", "turnover", "total_mv", "pe_ttm", "pb")
+        }
+        for row in rows_by_date[latest_date]
+        if str(row.get("industry") or "").strip()
+    ]
+    state_candidates = [dict(row) for row in c.execute(
+        """SELECT industry_name,state_json,evidence_json,as_of_date,available_time,created_at,updated_at,model_version
+             FROM dc_industry_state_snapshot WHERE as_of_date<=?
+             ORDER BY industry_name,as_of_date DESC""",
+        (latest_date,),
+    ).fetchall()]
+    state_rows: list[dict[str, Any]] = []
+    seen_industries: set[str] = set()
+    for row in state_candidates:
+        industry = str(row.get("industry_name") or "").strip()
+        available = normalize_explicit_timestamp(row.get("available_time"))
+        if not industry or industry in seen_industries or not available:
+            continue
+        created = normalize_explicit_timestamp(row.get("created_at"))
+        updated = normalize_explicit_timestamp(row.get("updated_at"))
+        if not (
+            is_available_at(available, cutoff, require_explicit_offset=True)
+            and created
+            and updated
+            and is_available_at(created, cutoff, require_explicit_offset=True)
+            and is_available_at(updated, cutoff, require_explicit_offset=True)
+        ):
+            continue
+        seen_industries.add(industry)
+        state_rows.append(row)
+    return {
+        "ok": True,
+        "dates": calendar_dates,
+        "aggregates": aggregates,
+        "latest_companies": latest_companies,
+        "state_rows": state_rows,
+        "point_in_time": _theme_pit_marker(cutoff, rows=len(visible_rows), sessions=calendar_dates),
+    }
+
+
+def _theme_query_cutoff(value: str | None, *, default_now: bool = False) -> str:
+    """Normalize a theme query boundary; date-only input means end of day."""
+    text = str(value or "").strip()
+    if not text and default_now:
+        return normalize_explicit_timestamp(datetime.now(_BUSINESS_TZ).isoformat(timespec="seconds"))
+    normalized = normalize_explicit_timestamp(text)
+    if normalized:
+        return normalized
+    compact = text.replace("-", "")[:8]
+    if len(compact) == 8 and compact.isdigit():
+        return normalize_explicit_timestamp(
+            f"{compact[:4]}-{compact[4:6]}-{compact[6:]}T23:59:59+08:00"
+        )
+    return ""
 
 
 
@@ -52,44 +304,19 @@ def _lifecycle(
 
 
 def materialize_theme_snapshots(*, as_of_time: str | None = None, lookback: int = 20) -> dict[str, Any]:
-    cutoff = str(as_of_time or "")
+    cutoff = _theme_query_cutoff(as_of_time, default_now=True)
     cutoff_date = cutoff[:10].replace("-", "")
     with _conn() as c:
-        if cutoff_date:
-            date_rows = c.execute(
-                "SELECT DISTINCT trade_date FROM dc_stock_daily_snapshot WHERE trade_date<=? ORDER BY trade_date DESC LIMIT ?",
-                (cutoff_date, max(5, min(int(lookback), 60))),
-            ).fetchall()
-        else:
-            date_rows = c.execute(
-                "SELECT DISTINCT trade_date FROM dc_stock_daily_snapshot ORDER BY trade_date DESC LIMIT ?",
-                (max(5, min(int(lookback), 60)),),
-            ).fetchall()
-        dates = sorted(str(dict(row).get("trade_date") or "") for row in date_rows)
-        if len(dates) < 3:
-            return {"ok": False, "status": "insufficient_data", "reason": "fewer_than_three_market_sessions"}
-        placeholders = ",".join("?" for _ in dates)
-        aggregates = [dict(row) for row in c.execute(
-            f"""SELECT industry,trade_date,COUNT(*) company_count,
-                       AVG(change_pct) average_change_pct,
-                       SUM(CASE WHEN change_pct>0 THEN 1 ELSE 0 END)::double precision/NULLIF(COUNT(*),0) breadth,
-                       SUM(COALESCE(turnover,0)) turnover
-                FROM dc_stock_daily_snapshot
-                WHERE trade_date IN ({placeholders}) AND COALESCE(industry,'')<>''
-                GROUP BY industry,trade_date ORDER BY industry,trade_date""", tuple(dates),
-        ).fetchall()]
-        state_rows = [dict(row) for row in c.execute(
-            """SELECT * FROM (
-                   SELECT industry_name,state_json,evidence_json,as_of_date,
-                          ROW_NUMBER() OVER(PARTITION BY industry_name ORDER BY as_of_date DESC) rn
-                   FROM dc_industry_state_snapshot WHERE as_of_date<=?
-               ) ranked WHERE rn=1""", (dates[-1],),
-        ).fetchall()]
-        latest_companies = [dict(row) for row in c.execute(
-            """SELECT ts_code,name,industry,change_pct,turnover,total_mv,pe_ttm,pb
-               FROM dc_stock_daily_snapshot WHERE trade_date=? AND COALESCE(industry,'')<>''""",
-            (dates[-1],),
-        ).fetchall()]
+        pit = _pit_theme_inputs(
+            c, cutoff=cutoff, cutoff_date=cutoff_date, lookback=lookback,
+        )
+        if not pit.get("ok"):
+            return pit
+        dates = list(pit["dates"])
+        aggregates = list(pit["aggregates"])
+        state_rows = list(pit["state_rows"])
+        latest_companies = list(pit["latest_companies"])
+        point_in_time = dict(pit["point_in_time"])
 
         by_industry: dict[str, list[dict[str, Any]]] = {}
         for row in aggregates:
@@ -145,6 +372,7 @@ def materialize_theme_snapshots(*, as_of_time: str | None = None, lookback: int 
                 "source_types": source_types,
                 "related_instruments": len(companies),
                 "sessions": len(sessions),
+                "point_in_time": point_in_time,
             }
             candidates.append(item)
             raw_by_name[item["theme"]] = {
@@ -158,7 +386,7 @@ def materialize_theme_snapshots(*, as_of_time: str | None = None, lookback: int 
             }
 
         scored = score_theme_narratives(candidates)
-        now = datetime.now().isoformat(timespec="seconds")
+        now = datetime.now(_BUSINESS_TZ).isoformat(timespec="seconds")
         written = mappings = 0
         for item in scored:
             raw = raw_by_name[item["theme"]]
@@ -246,7 +474,7 @@ def materialize_theme_snapshots(*, as_of_time: str | None = None, lookback: int 
             for company in sorted(raw["companies"], key=lambda value: float(value.get("turnover") or 0), reverse=True)[:50]:
                 leadership = _clip(float(company.get("turnover") or 0) / max(max_turnover, 1e-9))
                 exposure = round((.6 + .4 * leadership) * 100, 4)
-                evidence = {"industry_membership": raw["industry"], "price_leadership": leadership, "trade_date": dates[-1], "source": "dc_stock_daily_snapshot"}
+                evidence = {"industry_membership": raw["industry"], "price_leadership": leadership, "trade_date": dates[-1], "source": "dc_stock_daily_snapshot_version", "point_in_time": point_in_time}
                 c.execute(
                     """INSERT INTO dc_theme_company_mapping(as_of_date,theme_code,ts_code,exposure_score,evidence_json,updated_at)
                        VALUES(?,?,?,?,?,?) ON CONFLICT(as_of_date,theme_code,ts_code) DO UPDATE SET
@@ -377,8 +605,19 @@ def list_themes(
     include_company_counts: bool | None = None,
 ) -> dict[str, Any]:
     cutoff = str(as_of_time or "")[:10].replace("-", "")
+    visibility_cutoff = _theme_query_cutoff(as_of_time, default_now=not bool(as_of_time))
+    if as_of_time and not visibility_cutoff:
+        return {
+            "ok": False,
+            "status": "blocked",
+            "reason": "invalid_theme_observation_cutoff",
+            "as_of_time": as_of_time,
+            "items": [],
+            "count": 0,
+        }
     if include_company_counts is None:
         include_company_counts = bool(compact)
+    mapping_cutoff = visibility_cutoff if as_of_time else ""
     with _conn() as c:
         clauses = []
         params: list[Any] = []
@@ -387,25 +626,57 @@ def list_themes(
         if promotable_only:
             clauses.append("promotable=1")
         where = "WHERE " + " AND ".join(clauses) if clauses else ""
-        rows = [dict(row) for row in c.execute(
-            f"""SELECT * FROM (
-                   SELECT s.*,ROW_NUMBER() OVER(PARTITION BY theme_code ORDER BY as_of_date DESC) rn
-                   FROM dc_theme_snapshot s {where}
-               ) ranked WHERE rn=1 ORDER BY promotable DESC,score DESC LIMIT ?""", tuple(params + [max(1, min(int(limit), 500))]),
+        candidates = [dict(row) for row in c.execute(
+            f"""SELECT * FROM dc_theme_snapshot s {where}
+                ORDER BY as_of_date DESC,promotable DESC,score DESC""", tuple(params),
         ).fetchall()]
+        visible_by_theme: dict[str, dict[str, Any]] = {}
+        for row in candidates:
+            try:
+                payload = json.loads(row.get("payload_json") or "{}")
+            except (TypeError, json.JSONDecodeError):
+                payload = {}
+            if not _theme_snapshot_visible_at(payload, visibility_cutoff, row=row):
+                continue
+            theme_code = str(row.get("theme_code") or "")
+            if not theme_code or theme_code in visible_by_theme:
+                continue
+            row["_decoded_payload"] = payload
+            visible_by_theme[theme_code] = row
+        rows = sorted(
+            visible_by_theme.values(),
+            key=lambda item: (
+                -int(item.get("promotable") or 0),
+                -float(item.get("score") or 0),
+                str(item.get("as_of_date") or ""),
+            ),
+        )[:max(1, min(int(limit), 500))]
+        if as_of_time and not rows:
+            return {
+                "ok": False,
+                "status": "blocked",
+                "reason": "no_theme_snapshot_visible_at_cutoff",
+                "as_of_time": as_of_time,
+                "items": [],
+                "count": 0,
+                "candidate_rows": len(candidates),
+                "point_in_time_contract": _THEME_PIT_CONTRACT,
+            }
         company_counts: dict[tuple[str, str], int] = {}
         if rows and include_company_counts:
             count_where = " OR ".join("(as_of_date=? AND theme_code=?)" for _ in rows)
             count_params = tuple(value for row in rows for value in (row.get("as_of_date"), row.get("theme_code")))
-            company_counts = {
-                (str(item.get("as_of_date") or ""), str(item.get("theme_code") or "")): int(item.get("company_count") or 0)
-                for item in c.execute(
-                    f"SELECT as_of_date,theme_code,COUNT(*) company_count FROM dc_theme_company_mapping WHERE {count_where} GROUP BY as_of_date,theme_code",
-                    count_params,
-                ).fetchall()
-            }
+            mapping_rows = [dict(item) for item in c.execute(
+                f"SELECT as_of_date,theme_code,updated_at FROM dc_theme_company_mapping WHERE {count_where}",
+                count_params,
+            ).fetchall()]
+            for mapping in mapping_rows:
+                if not _theme_mapping_visible_at(mapping, mapping_cutoff):
+                    continue
+                key = (str(mapping.get("as_of_date") or ""), str(mapping.get("theme_code") or ""))
+                company_counts[key] = company_counts.get(key, 0) + 1
         for row in rows:
-            row["payload"] = json.loads(row.pop("payload_json") or "{}")
+            row["payload"] = row.pop("_decoded_payload", None) or json.loads(row.pop("payload_json") or "{}")
             row["company_count"] = company_counts.get(
                 (str(row.get("as_of_date") or ""), str(row.get("theme_code") or "")),
                 0,
@@ -415,12 +686,14 @@ def list_themes(
                 row["payload"] = {"knowledge_graph": payload.get("knowledge_graph") or {}}
             mappings = []
             if include_companies:
-                mappings = [dict(item) for item in c.execute(
-                    """SELECT ts_code,exposure_score,evidence_json FROM dc_theme_company_mapping
+                mapping_rows = [dict(item) for item in c.execute(
+                    """SELECT ts_code,exposure_score,evidence_json,updated_at FROM dc_theme_company_mapping
                        WHERE as_of_date=? AND theme_code=? ORDER BY exposure_score DESC LIMIT 50""",
                     (row["as_of_date"], row["theme_code"]),
                 ).fetchall()]
+                mappings = [item for item in mapping_rows if _theme_mapping_visible_at(item, mapping_cutoff)]
                 for mapping in mappings:
+                    mapping.pop("updated_at", None)
                     mapping["evidence"] = json.loads(mapping.pop("evidence_json") or "{}")
             if include_companies:
                 row["companies"] = mappings
@@ -431,26 +704,41 @@ def get_theme(theme_code: str, *, as_of_date: str = "") -> dict[str, Any] | None
     """Return one theme snapshot with its full company evidence on demand."""
     code = str(theme_code or "").strip()
     cutoff = str(as_of_date or "")[:10].replace("-", "")
+    visibility_cutoff = _theme_query_cutoff(as_of_date, default_now=not bool(as_of_date))
     with _conn() as c:
         if cutoff:
-            row = c.execute(
-                "SELECT * FROM dc_theme_snapshot WHERE theme_code=? AND as_of_date<=? ORDER BY as_of_date DESC LIMIT 1",
+            candidates = c.execute(
+                "SELECT * FROM dc_theme_snapshot WHERE theme_code=? AND as_of_date<=? ORDER BY as_of_date DESC",
                 (code, cutoff),
-            ).fetchone()
+            ).fetchall()
         else:
-            row = c.execute(
-                "SELECT * FROM dc_theme_snapshot WHERE theme_code=? ORDER BY as_of_date DESC LIMIT 1",
+            candidates = c.execute(
+                "SELECT * FROM dc_theme_snapshot WHERE theme_code=? ORDER BY as_of_date DESC",
                 (code,),
-            ).fetchone()
+            ).fetchall()
+        row = None
+        for candidate in candidates:
+            candidate_dict = dict(candidate)
+            try:
+                payload = json.loads(candidate_dict.get("payload_json") or "{}")
+            except (TypeError, json.JSONDecodeError):
+                payload = {}
+            if _theme_snapshot_visible_at(payload, visibility_cutoff, row=candidate_dict):
+                row = candidate_dict
+                row["_decoded_payload"] = payload
+                break
         if not row:
             return None
         item = dict(row)
-        item["payload"] = json.loads(item.pop("payload_json") or "{}")
-        mappings = [dict(mapping) for mapping in c.execute(
-            "SELECT ts_code,exposure_score,evidence_json FROM dc_theme_company_mapping WHERE as_of_date=? AND theme_code=? ORDER BY exposure_score DESC LIMIT 200",
+        item["payload"] = item.pop("_decoded_payload", None) or json.loads(item.pop("payload_json") or "{}")
+        mapping_rows = [dict(mapping) for mapping in c.execute(
+            "SELECT ts_code,exposure_score,evidence_json,updated_at FROM dc_theme_company_mapping WHERE as_of_date=? AND theme_code=? ORDER BY exposure_score DESC LIMIT 200",
             (item.get("as_of_date"), code),
         ).fetchall()]
+        mapping_cutoff = visibility_cutoff if as_of_date else ""
+        mappings = [mapping for mapping in mapping_rows if _theme_mapping_visible_at(mapping, mapping_cutoff)]
     for mapping in mappings:
+        mapping.pop("updated_at", None)
         mapping["evidence"] = json.loads(mapping.pop("evidence_json") or "{}")
     item["company_count"] = len(mappings)
     item["companies"] = mappings
@@ -460,19 +748,38 @@ def get_theme(theme_code: str, *, as_of_date: str = "") -> dict[str, Any] | None
 def best_theme_for_stock(ts_code: str, *, as_of_time: str | None = None) -> dict[str, Any] | None:
     code = str(ts_code or "").strip().upper()
     cutoff = str(as_of_time or "")[:10].replace("-", "")
+    visibility_cutoff = _theme_query_cutoff(as_of_time, default_now=not bool(as_of_time))
     with _conn() as c:
         clauses = ["m.ts_code=?", "s.promotable=1"]
         params: list[Any] = [code]
         if cutoff:
             clauses.append("m.as_of_date<=?"); params.append(cutoff)
-        row = c.execute(
-            f"""SELECT s.*,m.exposure_score,m.evidence_json FROM dc_theme_company_mapping m
+        candidates = c.execute(
+            f"""SELECT s.*,m.exposure_score,m.evidence_json,m.updated_at AS mapping_updated_at FROM dc_theme_company_mapping m
                 JOIN dc_theme_snapshot s ON s.as_of_date=m.as_of_date AND s.theme_code=m.theme_code
-                WHERE {' AND '.join(clauses)} ORDER BY m.as_of_date DESC,s.score DESC LIMIT 1""", tuple(params),
-        ).fetchone()
+                WHERE {' AND '.join(clauses)} ORDER BY m.as_of_date DESC,s.score DESC""", tuple(params),
+        ).fetchall()
+        row = None
+        for candidate in candidates:
+            candidate_dict = dict(candidate)
+            try:
+                payload = json.loads(candidate_dict.get("payload_json") or "{}")
+            except (TypeError, json.JSONDecodeError):
+                payload = {}
+            if (
+                _theme_snapshot_visible_at(payload, visibility_cutoff, row=candidate_dict)
+                and _theme_mapping_visible_at(
+                    {"updated_at": candidate_dict.get("mapping_updated_at")},
+                    visibility_cutoff if as_of_time else "",
+                )
+            ):
+                row = candidate_dict
+                row["_decoded_payload"] = payload
+                break
     if not row:
         return None
     item = dict(row)
-    item["payload"] = json.loads(item.pop("payload_json") or "{}")
+    item["payload"] = item.pop("_decoded_payload", None) or json.loads(item.pop("payload_json") or "{}")
     item["evidence"] = json.loads(item.pop("evidence_json") or "{}")
+    item.pop("mapping_updated_at", None)
     return item

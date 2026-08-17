@@ -7769,6 +7769,7 @@ def _model_live_health_snapshot() -> dict[str, dict[str, Any]]:
 
 
 def _latest_market_state_code() -> str:
+    """Return display-only market state without fabricating an S1 fallback."""
     try:
         from app.data_platform.db import _conn as data_conn
         with data_conn() as c:
@@ -7776,9 +7777,9 @@ def _latest_market_state_code() -> str:
                 """SELECT market_state FROM dc_market_context_snapshot
                    ORDER BY trade_date DESC LIMIT 1"""
             ).fetchone()
-        return str(dict(row).get("market_state") or "S1") if row else "S1"
+        return str(dict(row).get("market_state") or "") if row else ""
     except Exception:
-        return "S1"
+        return ""
 
 
 def _compact_plan_model_train_run(run: dict[str, Any] | None) -> dict[str, Any] | None:

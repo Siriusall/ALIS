@@ -347,6 +347,10 @@ def _health_payload() -> dict:
     revisions_ready = current_revisions == expected_revisions
     release_drift = discover_release_change()
     runtime_code_ready = not bool(release_drift.get("restart_required"))
+    # A process can be running the current source while the active immutable
+    # release still points at an older manifest.  That state is intentionally
+    # execution-blocking and must not be reported as a healthy runtime.
+    release_binding_ready = not bool(release_drift.get("changed"))
     redis = redis_health()
     evolution = evolution_runtime_status()
     runtime_heartbeats = runtime_heartbeat_status()
@@ -383,6 +387,9 @@ def _health_payload() -> dict:
             f"runtime_commit={release_drift.get('runtime_commit')}, "
             f"repository_commit={release_drift.get('repository_commit')}; restart required"
         ])
+        + ([] if release_binding_ready else [
+            "Active system release does not match observed runtime bindings; execution is blocked"
+        ])
         + component_issues
         + runtime_issues
     )
@@ -392,7 +399,14 @@ def _health_payload() -> dict:
         and (not background_owner or bool(runtime_heartbeats))
         and (not background_owner or not unhealthy_heartbeats)
     )
-    ready = databases_ready and revisions_ready and runtime_code_ready and bool(redis.get("available", False)) and runtime_ready
+    ready = (
+        databases_ready
+        and revisions_ready
+        and runtime_code_ready
+        and release_binding_ready
+        and bool(redis.get("available", False))
+        and runtime_ready
+    )
     return {
         "status": "ok" if ready else "error",
         "ready": ready,

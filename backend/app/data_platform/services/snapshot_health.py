@@ -40,14 +40,18 @@ def snapshot_stats_for_range(c: Any, start: str, end: str, *, expected_dates: li
     """
     def aggregate_normalized() -> dict[str, dict[str, Any]] | None:
         try:
+            clock = "observed_at" if _has_column(c, "dc_stock_daily_snapshot", "observed_at") else "available_time"
+            provenance = "" if clock == "available_time" else " AND LOWER(COALESCE(observation_provenance,'')) NOT LIKE 'legacy_%' AND content_hash<>''"
             rows = c.execute(
-                """SELECT trade_date,
+                f"""SELECT trade_date,
                           COUNT(*) AS rows_total,
                           COUNT(CASE WHEN close IS NOT NULL AND volume IS NOT NULL AND turnover IS NOT NULL THEN 1 END) AS market_rows,
-                          MIN(available_time) AS min_available_time,
-                          MAX(available_time) AS max_available_time
+                          MIN({clock}) AS min_available_time,
+                          MAX({clock}) AS max_available_time,
+                          MIN({clock}) AS min_observed_at,
+                          MAX({clock}) AS max_observed_at
                      FROM dc_stock_daily_snapshot
-                    WHERE trade_date BETWEEN ? AND ?
+                    WHERE trade_date BETWEEN ? AND ? {provenance}
                     GROUP BY trade_date""",
                 (start, end),
             ).fetchall()
@@ -55,6 +59,50 @@ def snapshot_stats_for_range(c: Any, start: str, end: str, *, expected_dates: li
             return result
         except Exception:
             return None
+
+    # When immutable snapshot versions exist, expose their actual observation
+    # watermarks to every consumer.  The legacy summary tables remain useful
+    # for operational counts but cannot prove point-in-time readiness.
+    try:
+        market_fields = (
+            "payload_json::jsonb->>'close' <> '' AND payload_json::jsonb->>'volume' <> '' AND payload_json::jsonb->>'turnover' <> ''"
+            if bool(getattr(c, "_is_postgres", False))
+            else "json_extract(payload_json,'$.close') IS NOT NULL AND json_extract(payload_json,'$.volume') IS NOT NULL AND json_extract(payload_json,'$.turnover') IS NOT NULL"
+        )
+        version_rows = c.execute(
+            """SELECT trade_date,
+                      COUNT(DISTINCT CASE WHEN observed_at<>'' AND content_hash<>''
+                        AND LOWER(COALESCE(observation_provenance,'')) NOT LIKE 'legacy_%'
+                        THEN ts_code END) AS observation_rows,
+                      COUNT(DISTINCT CASE WHEN observed_at<>'' AND content_hash<>''
+                        AND LOWER(COALESCE(observation_provenance,'')) NOT LIKE 'legacy_%'
+                        THEN ts_code END) AS rows_total,
+                      COUNT(DISTINCT CASE WHEN observed_at<>'' AND content_hash<>''
+                        AND LOWER(COALESCE(observation_provenance,'')) NOT LIKE 'legacy_%'
+                        AND """ + market_fields + """
+                        THEN ts_code END) AS market_rows,
+                      MIN(CASE WHEN observed_at<>'' AND content_hash<>''
+                        AND LOWER(COALESCE(observation_provenance,'')) NOT LIKE 'legacy_%'
+                        THEN observed_at END) AS min_observed_at,
+                      MAX(CASE WHEN observed_at<>'' AND content_hash<>''
+                        AND LOWER(COALESCE(observation_provenance,'')) NOT LIKE 'legacy_%'
+                        THEN observed_at END) AS max_observed_at,
+                      MIN(CASE WHEN observed_at<>'' AND content_hash<>''
+                        AND LOWER(COALESCE(observation_provenance,'')) NOT LIKE 'legacy_%'
+                        THEN observed_at END) AS min_available_time,
+                      MAX(CASE WHEN observed_at<>'' AND content_hash<>''
+                        AND LOWER(COALESCE(observation_provenance,'')) NOT LIKE 'legacy_%'
+                        THEN observed_at END) AS max_available_time
+                 FROM dc_stock_daily_snapshot_version
+                WHERE trade_date BETWEEN ? AND ?
+                GROUP BY trade_date""",
+            (start, end),
+        ).fetchall()
+        versioned = {str(_value(row, "trade_date", "")): dict(row) for row in version_rows if _value(row, "trade_date", "")}
+        if versioned and (expected_dates is None or set(str(value) for value in expected_dates).issubset(versioned)):
+            return versioned
+    except Exception:
+        pass
 
     summary_tables = _summary_tables(c)
     if not summary_tables:
@@ -81,6 +129,20 @@ def snapshot_stats_for_range(c: Any, start: str, end: str, *, expected_dates: li
         # authority. Fall back to normalized rows for the complete audit range.
         return aggregate_normalized()
     return result
+
+
+def _has_column(c: Any, table: str, column: str) -> bool:
+    try:
+        if bool(getattr(c, "_is_postgres", False)):
+            row = c.execute(
+                "SELECT 1 AS present FROM information_schema.columns WHERE table_schema='public' AND table_name=? AND column_name=?",
+                (table, column),
+            ).fetchone()
+            return bool(row)
+        rows = c.execute(f"PRAGMA table_info({table})").fetchall()
+        return column in {str(_value(row, "name", "")) for row in rows}
+    except Exception:
+        return False
 
 
 def candidate_snapshot_dates(c: Any, *, before: str = "", limit: int = 32) -> list[str]:

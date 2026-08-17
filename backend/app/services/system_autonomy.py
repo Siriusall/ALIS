@@ -289,13 +289,42 @@ def _owner_summary(steps: list[dict[str, Any]]) -> dict[str, Any]:
     llm_data_operations = (((by_name.get("data_operations") or by_name.get("llm_data_operations") or {}).get("result")) or {})
     incident_supervisor = ((by_name.get("llm_incident_supervisor") or {}).get("result") or {})
     healing = ((by_name.get("autonomous_self_healing") or {}).get("result") or {})
+    historical_gate_waits = []
+    for gate_name in ("hard_data_gate", "sealed_holdout_data_gate"):
+        gate_step = by_name.get(gate_name) or {}
+        gate_result = gate_step.get("result") if isinstance(gate_step.get("result"), dict) else {}
+        gate_status = str(gate_result.get("status") or "")
+        if gate_status and gate_status != "ready":
+            historical_gate_waits.append({
+                "module": gate_name,
+                "status": gate_status,
+                "scope": "formal_oos_or_sealed_holdout_only",
+                "eligible_sessions": gate_result.get("eligible_sessions"),
+                "required_sessions": gate_result.get("required_sessions"),
+                "repair_dates": list(gate_result.get("repair_dates") or []),
+                "non_repairable_dates": list(gate_result.get("non_repairable_dates") or []),
+                "non_repairable_sessions": gate_result.get("non_repairable_sessions"),
+                "non_repairable_dates_truncated": bool(gate_result.get("non_repairable_dates_truncated")),
+            })
     cost_active = cost.get("active") if isinstance(cost.get("active"), dict) else {}
     hard_data = ((by_name.get("hard_data_gate") or {}).get("result") or {})
     decision_data = ((by_name.get("decision_data_gate") or {}).get("result") or {})
     optimizer = portfolio.get("optimizer") if isinstance(portfolio.get("optimizer"), dict) else {}
     rebalance_items = list(portfolio.get("rebalance_proposal") or portfolio.get("proposal") or [])
     rebalance_actions = [action for action in rebalance_items if int(action.get("planned_quantity") or 0) > 0]
-    champion_gate = champion_execution_gate()
+    champion_gate_error = ""
+    try:
+        champion_gate = champion_execution_gate()
+    except Exception as exc:  # noqa: BLE001 - preserve the completed step evidence
+        # Summary construction is not allowed to turn a completed, auditable
+        # autonomy cycle into an opaque task failure.  The live execution gate
+        # remains fail-closed and the unavailable read is surfaced below.
+        champion_gate_error = type(exc).__name__
+        champion_gate = {
+            "status": "unavailable",
+            "mode": "fail_closed",
+            "reason": f"live_champion_gate_unavailable:{champion_gate_error}",
+        }
     anomalies = [
         {
             "module": str(step["name"]),
@@ -305,6 +334,28 @@ def _owner_summary(steps: list[dict[str, Any]]) -> dict[str, Any]:
         if str(step.get("name") or "") not in {"autonomous_self_healing", "llm_incident_supervisor"}
         if str((step.get("health") or {}).get("status") or ("healthy" if step.get("ok") else "failed")) in {"failed", "degraded"}
     ]
+    # The supervisor and self-healing layers are not allowed to erase their
+    # own timeout/failure.  Their *cases* are handled separately, but a
+    # failed wrapper remains a deterministic cycle anomaly.
+    for meta_name in ("autonomous_self_healing", "llm_incident_supervisor"):
+        if meta_name not in by_name:
+            # Older persisted cycles predate these wrappers.  Missing evidence
+            # must stay distinguishable from a wrapper that actually timed
+            # out; otherwise opening an old summary manufactures an outage.
+            continue
+        meta_step = by_name.get(meta_name) or {}
+        meta_health = meta_step.get("health") if isinstance(meta_step.get("health"), dict) else {}
+        meta_status = str(meta_health.get("status") or ("healthy" if meta_step.get("ok") else "failed"))
+        if meta_status in {"failed", "degraded"}:
+            anomalies.append({
+                "module": meta_name,
+                "message": str(meta_step.get("error") or meta_health.get("reason") or "模块返回未通过"),
+            })
+    if champion_gate_error:
+        anomalies.append({
+            "module": "champion_execution_gate",
+            "message": f"live_champion_gate_unavailable:{champion_gate_error}",
+        })
     return {
         "schema_version": "alis_owner_daily_summary_v3",
         "generated_at": datetime.now().astimezone().isoformat(),
@@ -397,6 +448,7 @@ def _owner_summary(steps: list[dict[str, Any]]) -> dict[str, Any]:
                 "self_healing_unresolved_count": len(healing.get("unresolved") or []),
             },
             "anomalies": anomalies,
+            "historical_research_waits": historical_gate_waits,
             "incident_supervision": incident_supervisor,
         },
         # The LLM incident supervisor is an additional escalation layer, not
@@ -405,6 +457,7 @@ def _owner_summary(steps: list[dict[str, Any]]) -> dict[str, Any]:
         # supervisor decides that no owner action is necessary.
         "healthy": (
             not anomalies
+            and not historical_gate_waits
             and (
                 int(incident_supervisor.get("owner_action_required_count") or 0) == 0
                 if incident_supervisor
@@ -437,7 +490,7 @@ def run_system_autonomy_cycle(*, trade_date: str = "") -> dict[str, Any]:
     from app.services.llm_research_governance import assess_llm_research_proposals
     from app.services.llm_proposal_router import route_llm_research_proposals
     from app.services.llm_data_operations import run_deterministic_data_operations_cycle
-    from app.services.profit_loop import _latest_trade_date, build_profit_loop
+    from app.services.profit_loop import build_profit_loop
     from app.services.simulation_ledger_audit import audit_simulation_ledger
     from app.services.strategy_controller import advance_waiting_strategy_policy_candidates, run_strategy_policy_auto_optimization
     from app.services.controller_candidate_observation import ensure_controller_candidate_observation_tasks
@@ -457,8 +510,36 @@ def run_system_autonomy_cycle(*, trade_date: str = "") -> dict[str, Any]:
         ),
     )
     decision_data = decision_data_step.get("result") if isinstance(decision_data_step.get("result"), dict) else {}
-    experiments_allowed = bool(decision_data.get("experiment_ready")) and str((hard_data_step.get("result") or {}).get("status") or "") == "ready"
-    decisions_allowed = bool(decision_data.get("decision_ready"))
+    current_market_date = frozen_trade_date or str(
+        ((decision_data.get("readiness") or {}).get("target_trade_date") or "")
+    ).replace("-", "")[:8]
+
+    def require_current_market_date() -> str:
+        if current_market_date:
+            return current_market_date
+        raise RuntimeError(
+            "current_market_data_target_missing: 决策数据门未提供权威目标交易日，"
+            "禁止从历史快照或工作日推断研究日期"
+        )
+    # Keep historical research-gate evidence explicit in the cycle payload.
+    # It is intentionally separate from the current decision-data gate below;
+    # a missing old PIT record must not disable today's isolated account.
+    for historical_step in (hard_data_step, sealed_holdout_step):
+        historical_result = historical_step.get("result")
+        if isinstance(historical_result, dict) and str(historical_result.get("status") or "") != "ready":
+            historical_result.setdefault("scope", "formal_oos_or_sealed_holdout_only")
+            historical_result.setdefault("current_decision_impact", False)
+    # Current experiments consume only the current decision-data contract and
+    # their own frozen evidence.  Formal OOS / sealed-holdout PIT history
+    # remains a strict production-eligibility gate in its dedicated consumer,
+    # but an irrecoverable historical evidence gap must not deadlock isolated
+    # future observation or today’s decision/execution path.
+    # A readiness flag is only authoritative when the step itself completed
+    # successfully.  Do not trust a stale/partial result object after a
+    # wrapper error or an optimistic producer projection.
+    decision_gate_ok = bool(decision_data_step.get("ok"))
+    experiments_allowed = decision_gate_ok and bool(decision_data.get("experiment_ready"))
+    decisions_allowed = decision_gate_ok and bool(decision_data.get("decision_ready"))
     def experimental_step(name: str, fn: Callable[[], dict[str, Any]]) -> dict[str, Any]:
         return _run_step(name, fn) if experiments_allowed else _skip_experimental_step(name, decision_data)
     def decision_step(name: str, fn: Callable[[], dict[str, Any]]) -> dict[str, Any]:
@@ -471,7 +552,7 @@ def run_system_autonomy_cycle(*, trade_date: str = "") -> dict[str, Any]:
         _run_step("execution_cost_calibration", calibrate_execution_cost_model),
         _run_step(
             "simulation_corporate_actions",
-            lambda: run_corporate_action_cycle(as_of_date=_latest_trade_date()),
+            lambda: run_corporate_action_cycle(as_of_date=require_current_market_date()),
         ),
         _run_step("simulation_ledger_audit", audit_simulation_ledger),
         decision_step(
@@ -495,7 +576,7 @@ def run_system_autonomy_cycle(*, trade_date: str = "") -> dict[str, Any]:
                     frozen_trade_date or str((decision_data.get("readiness") or {}).get("target_trade_date") or ""),
                 ),
             )
-            if bool(decision_data.get("experiment_ready"))
+            if experiments_allowed
             else _skip_experimental_step("strategy_shadow_recovery", decision_data)
         ),
         _run_step("periodic_performance_review", run_periodic_performance_review),
@@ -521,7 +602,10 @@ def run_system_autonomy_cycle(*, trade_date: str = "") -> dict[str, Any]:
         _run_step("professional_metric_candidate_audit", audit_professional_metric_candidates),
         _run_step(
             "futures_price_proxies",
-            lambda: materialize_futures_price_proxies(start_date=_latest_trade_date(), end_date=_latest_trade_date()),
+            lambda: materialize_futures_price_proxies(
+                start_date=require_current_market_date(),
+                end_date=require_current_market_date(),
+            ),
         ),
         _run_step("theme_revenue_exposure", materialize_theme_revenue_exposure),
         _run_step("research_data_assets", audit_research_data_assets),
@@ -680,6 +764,13 @@ def _build_latest_owner_summary() -> dict[str, Any]:
             questions = summary.setdefault("questions", {})
             anomalies = questions.setdefault("anomalies", [])
             anomalies[:] = [item for item in anomalies if str(item.get("module") or "") != "sealed_holdout_data_gate"]
+            historical_waits = questions.get("historical_research_waits")
+            if isinstance(historical_waits, list):
+                questions["historical_research_waits"] = [
+                    item for item in historical_waits
+                    if not isinstance(item, dict)
+                    or str(item.get("module") or "") != "sealed_holdout_data_gate"
+                ]
             supervision = questions.get("incident_supervision") if isinstance(questions.get("incident_supervision"), dict) else {}
             cases = supervision.get("cases") if isinstance(supervision.get("cases"), list) else []
             supervision["cases"] = [item for item in cases if str(item.get("module") or "") != "sealed_holdout_data_gate"]
@@ -688,6 +779,11 @@ def _build_latest_owner_summary() -> dict[str, Any]:
             supervision["waiting_condition_count"] = sum(1 for case in supervision["cases"] if case.get("resolution_class") == "waiting_condition")
             supervision["status"] = "owner_action_required" if supervision["owner_action_required_count"] else "self_managed" if supervision["cases"] else "healthy"
             questions["incident_supervision"] = supervision
+            summary["healthy"] = bool(
+                not questions.get("anomalies")
+                and not questions.get("historical_research_waits")
+                and int(supervision.get("owner_action_required_count") or 0) == 0
+            )
     except Exception as exc:
         append_read_error(exc, "owner_summary:sealed_holdout")
     # Rebalance, performance and ledger values are also frozen in the latest
@@ -766,9 +862,7 @@ def _autonomy_trade_date(task: dict[str, Any]) -> str:
     decision_result = decision.get("result") if isinstance(decision.get("result"), dict) else {}
     value = (
         decision_result.get("target_trade_date")
-        or decision_result.get("latest_decision_ready_trade_date")
         or (task.get("payload") or {}).get("trade_date")
-        or str(task.get("created_at") or "")[:10]
     )
     return str(value or "").replace("-", "")[:8]
 
@@ -847,9 +941,7 @@ def build_autonomy_slo(tasks: list[dict[str, Any]] | None = None, *, window_sess
         result = latest.get("result") if isinstance(latest.get("result"), dict) else {}
         steps = result.get("steps") if isinstance(result.get("steps"), list) else []
         by_name = {str(item.get("name") or ""): item for item in steps if isinstance(item, dict)}
-        hard_result = (by_name.get("hard_data_gate") or {}).get("result") or {}
         decision_result = (by_name.get("decision_data_gate") or {}).get("result") or {}
-        hard_data_ok = bool((by_name.get("hard_data_gate") or {}).get("ok")) and str(hard_result.get("status") or "") == "ready"
         decision_data_ok = (
             bool((by_name.get("decision_data_gate") or {}).get("ok"))
             and bool(decision_result.get("decision_ready", decision_result.get("ok", False)))
@@ -861,7 +953,10 @@ def build_autonomy_slo(tasks: list[dict[str, Any]] | None = None, *, window_sess
             "attempt_count": len(attempts),
             "completed_count": len(successful),
             "cycle_completed": bool(successful),
-            "critical_data_gates_passed": hard_data_ok and decision_data_ok,
+            # The rolling autonomy SLO measures today's decision/execution
+            # contract.  Permanent OOS PIT history is a separate research
+            # gate and must not make an otherwise valid isolated cycle fail.
+            "critical_data_gates_passed": decision_data_ok,
             "ledger_zero_drift": ledger_ok,
             "recovery_required": len(attempts) > 1 or any(str(item.get("status") or "") in {"failed", "retry_wait"} for item in attempts[:-1]),
             "recovered": bool(successful),

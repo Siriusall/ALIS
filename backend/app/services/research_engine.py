@@ -7,7 +7,12 @@ from datetime import datetime
 from typing import Any
 
 from app.data_platform.db import _conn
+from app.data_platform.services.observation_clock import (
+    load_raw_record_versions,
+    load_snapshot_versions,
+)
 from app.db.store import _conn as _business_conn
+from app.services.point_in_time import normalize_explicit_timestamp
 
 
 def _clip(value: Any, low: float = 0.0, high: float = 100.0) -> float:
@@ -301,33 +306,202 @@ def _linear(value: Any, bad: float, good: float) -> float | None:
     return _clip((number - bad) / (good - bad) * 100.0)
 
 
+def _decode_observation_payload(row: dict[str, Any]) -> dict[str, Any]:
+    """Decode one append-only observation while retaining all four PIT clocks."""
+    try:
+        payload = json.loads(row.get("payload_json") or "{}")
+    except (TypeError, json.JSONDecodeError):
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    item = dict(row)
+    item["payload"] = payload
+    item["available_time"] = str(item.get("observed_at") or "")
+    # Provider payload fields are useful to the research templates, but may not
+    # overwrite the immutable envelope (including its observation clocks).
+    for key, value in payload.items():
+        item.setdefault(key, value)
+    return item
+
+
+def _strict_raw_payloads(
+    c: Any,
+    ts_code: str,
+    api: str,
+    *,
+    limit: int,
+    as_of_time: str,
+) -> list[dict[str, Any]]:
+    """Read raw evidence only from append-only versions under all PIT clocks.
+
+    ``None`` from the loader means the migration/schema is unavailable.  It is
+    deliberately collapsed to an empty evidence set here so callers cannot
+    accidentally continue with the mutable projection as a fallback.
+    """
+    cutoff = normalize_explicit_timestamp(as_of_time)
+    if not cutoff:
+        return []
+    rows = load_raw_record_versions(
+        c,
+        api,
+        cutoff=cutoff,
+        ts_codes=[ts_code],
+    )
+    if rows is None:
+        return []
+    return [_decode_observation_payload(dict(row)) for row in rows]
+
+
+def _strict_master_row(
+    c: Any,
+    ts_code: str,
+    *,
+    as_of_time: str,
+) -> tuple[dict[str, Any] | None, str]:
+    """Read stock master facts only when their own visibility is PIT-safe.
+
+    ``dc_stock_master`` is an overwrite projection.  It has no append-only
+    history yet, so formal reads can only use it when the row carries the
+    source and availability clocks and all of them precede the cutoff.  A
+    missing clock is a contract gap, not a reason to use today's industry or
+    listing label for an old replay.
+    """
+    cutoff = normalize_explicit_timestamp(as_of_time)
+    if not cutoff:
+        return None, "invalid_observation_cutoff"
+    try:
+        columns = {
+            str(dict(row).get("column_name") or "")
+            for row in c.execute(
+                "SELECT column_name FROM information_schema.columns WHERE table_schema='public' AND table_name=?",
+                ("dc_stock_master",),
+            ).fetchall()
+        } if bool(getattr(c, "_is_postgres", False)) else {
+            str(dict(row).get("name") or "")
+            for row in c.execute("PRAGMA table_info(dc_stock_master)").fetchall()
+        }
+    except Exception:
+        return None, "stock_master_pit_unavailable"
+    required = {"available_time", "updated_at", "source_code"}
+    if not required.issubset(columns):
+        return None, "stock_master_pit_unavailable"
+    try:
+        row = c.execute(
+            "SELECT * FROM dc_stock_master WHERE ts_code=? AND NULLIF(TRIM(COALESCE(source_code,'')),'') IS NOT NULL AND available_time<>'' AND updated_at<>''",
+            (ts_code,),
+        ).fetchone()
+    except Exception:
+        return None, "stock_master_pit_unavailable"
+    if not row:
+        return None, "stock_master_not_found"
+    item = dict(row)
+    available = normalize_explicit_timestamp(item.get("available_time"))
+    updated = normalize_explicit_timestamp(item.get("updated_at"))
+    if not available or not updated or available > cutoff or updated > cutoff:
+        return None, "stock_master_not_visible_at_cutoff"
+    return item, "ready"
+
+
+def _decode_snapshot_observation(row: dict[str, Any]) -> dict[str, Any]:
+    """Decode one immutable normalized snapshot into the research row shape."""
+    item = _decode_observation_payload(row)
+    payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
+    # Snapshot payloads use canonical market names. Keep the projection aliases
+    # used by older research code without consulting the overwrite table.
+    aliases = {
+        "daily_open": "open",
+        "daily_high": "high",
+        "daily_low": "low",
+        "daily_pre_close": "pre_close",
+        "volume": "vol",
+        "change_pct": "pct_chg",
+    }
+    for alias, source in aliases.items():
+        if item.get(alias) is None and payload.get(source) is not None:
+            item[alias] = payload.get(source)
+    return item
+
+
+def _strict_snapshot_for_code(
+    c: Any,
+    ts_code: str,
+    *,
+    as_of_time: str,
+    as_of_date: str = "",
+) -> tuple[dict[str, Any] | None, str]:
+    """Return latest visible immutable snapshot and a machine-readable status."""
+    cutoff = normalize_explicit_timestamp(as_of_time)
+    if not cutoff:
+        return None, "invalid_observation_cutoff"
+    rows = load_snapshot_versions(
+        c,
+        cutoff=cutoff,
+        ts_codes=[ts_code],
+        trade_date_end=as_of_date,
+    )
+    if rows is None:
+        return None, "immutable_snapshot_schema_unavailable"
+    decoded = [_decode_snapshot_observation(dict(row)) for row in rows]
+    if not decoded:
+        return None, "immutable_snapshot_not_visible_at_cutoff"
+    decoded.sort(key=lambda item: str(item.get("trade_date") or ""), reverse=True)
+    return decoded[0], "ready"
+
+
 def _payloads(ts_code: str, api: str, limit: int = 12, *, as_of_time: str | None = None) -> list[dict[str, Any]]:
-    with _conn() as c:
-        query = """WITH ranked AS (
-            SELECT period,available_time,payload_json,
-                   ROW_NUMBER() OVER(
-                     PARTITION BY period
-                     ORDER BY available_time DESC,length(payload_json) DESC,id DESC
-                   ) rn
-            FROM dc_tushare_raw_records WHERE api_name=? AND ts_code=?"""
-        params: list[Any] = [api, ts_code]
-        if as_of_time:
-            query += " AND available_time<=?"; params.append(str(as_of_time))
-        query += ") SELECT period,available_time,payload_json FROM ranked WHERE rn=1 ORDER BY period DESC LIMIT ?"; params.append(limit)
-        rows = c.execute(query, tuple(params)).fetchall()
+    if as_of_time:
+        with _conn() as c:
+            rows = _strict_raw_payloads(
+                c, ts_code, api, limit=limit, as_of_time=as_of_time,
+            )
+        # The immutable loader ranks by record key. Research contracts rank by
+        # reporting period, so apply the same period de-duplication after
+        # decoding and never fall back to the mutable projection.
+        rows.sort(
+            key=lambda item: (
+                str(item.get("period") or item.get("end_date") or ""),
+                str(item.get("observed_at") or ""),
+            ),
+            reverse=True,
+        )
+    else:
+        with _conn() as c:
+            query = """WITH ranked AS (
+                SELECT period,available_time,payload_json,
+                       ROW_NUMBER() OVER(
+                         PARTITION BY period
+                         ORDER BY available_time DESC,length(payload_json) DESC,id DESC
+                       ) rn
+                FROM dc_tushare_raw_records WHERE api_name=? AND ts_code=?"""
+            params: list[Any] = [api, ts_code]
+            query += ") SELECT period,available_time,payload_json FROM ranked WHERE rn=1 ORDER BY period DESC LIMIT ?"
+            params.append(limit)
+            rows = [dict(row) for row in c.execute(query, tuple(params)).fetchall()]
     values: list[dict[str, Any]] = []
     seen: set[str] = set()
     for row in rows:
         item = dict(row)
-        period = str(item.get("period") or "")
+        payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
+        period = str(item.get("period") or payload.get("period") or payload.get("end_date") or "")
         if period in seen:
             continue
         seen.add(period)
-        try:
-            payload = json.loads(item.get("payload_json") or "{}")
-        except (TypeError, json.JSONDecodeError):
-            payload = {}
-        values.append({"period": period, "available_time": item.get("available_time"), "payload": payload})
+        if not payload:
+            try:
+                payload = json.loads(item.get("payload_json") or "{}")
+            except (TypeError, json.JSONDecodeError):
+                payload = {}
+        values.append({
+            "period": period,
+            "available_time": item.get("available_time") or item.get("observed_at"),
+            "observed_at": item.get("observed_at"),
+            "first_observed_at": item.get("first_observed_at"),
+            "economic_available_time": item.get("economic_available_time"),
+            "created_at": item.get("created_at"),
+            "payload": payload if isinstance(payload, dict) else {},
+        })
+        if len(values) >= max(1, int(limit)):
+            break
     return values
 
 
@@ -338,33 +512,55 @@ def _forecast_history(ts_code: str, limit: int = 16, *, as_of_time: str | None =
     consensus.  Keeping it separate prevents the UI and gates from presenting
     a management notice as a sell-side estimate.
     """
-    with _conn() as c:
-        query = """SELECT period,ann_date,available_time,payload_json FROM dc_tushare_raw_records
-               WHERE api_name='forecast' AND ts_code=?"""
-        params: list[Any] = [ts_code]
-        if as_of_time:
-            query += " AND available_time<=?"; params.append(str(as_of_time))
-        query += " ORDER BY ann_date DESC, available_time DESC LIMIT ?"; params.append(limit)
-        rows = c.execute(query, tuple(params)).fetchall()
+    if as_of_time:
+        with _conn() as c:
+            rows = _strict_raw_payloads(
+                c, ts_code, "forecast", limit=limit, as_of_time=as_of_time,
+            )
+        rows.sort(
+            key=lambda item: (
+                str(item.get("ann_date") or ""),
+                str(item.get("observed_at") or ""),
+            ),
+            reverse=True,
+        )
+    else:
+        with _conn() as c:
+            rows = [dict(row) for row in c.execute(
+                """SELECT period,ann_date,available_time,payload_json FROM dc_tushare_raw_records
+                   WHERE api_name='forecast' AND ts_code=?
+                   ORDER BY ann_date DESC, available_time DESC LIMIT ?""",
+                (ts_code, limit),
+            ).fetchall()]
     values: list[dict[str, Any]] = []
     seen: set[tuple[str, str]] = set()
     for row in rows:
         item = dict(row)
-        key = (str(item.get("period") or ""), str(item.get("ann_date") or ""))
+        payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
+        key = (
+            str(item.get("period") or payload.get("period") or ""),
+            str(item.get("ann_date") or payload.get("ann_date") or ""),
+        )
         if key in seen:
             continue
         seen.add(key)
-        try:
-            payload = json.loads(item.get("payload_json") or "{}")
-        except (TypeError, json.JSONDecodeError):
-            payload = {}
+        if not isinstance(payload, dict) or not payload:
+            try:
+                payload = json.loads(item.get("payload_json") or "{}")
+            except (TypeError, json.JSONDecodeError):
+                payload = {}
         lower, upper = payload.get("p_change_min"), payload.get("p_change_max")
         try:
             change_mid = (float(lower) + float(upper)) / 2 if lower is not None and upper is not None else None
         except (TypeError, ValueError):
             change_mid = None
         values.append({
-            "period": key[0], "ann_date": key[1], "available_time": item.get("available_time"),
+            "period": key[0], "ann_date": key[1],
+            "available_time": item.get("available_time") or item.get("observed_at"),
+            "observed_at": item.get("observed_at"),
+            "first_observed_at": item.get("first_observed_at"),
+            "economic_available_time": item.get("economic_available_time"),
+            "created_at": item.get("created_at"),
             "type": payload.get("type"), "p_change_min": lower, "p_change_max": upper,
             "net_profit_min": payload.get("net_profit_min"), "net_profit_max": payload.get("net_profit_max"),
             "change_mid": change_mid,
@@ -520,9 +716,31 @@ def _specialized_research_inputs(code: str, industry_name: str, *, as_of_time: s
 
     expectation = build_expectation_state(code, persist_baseline=False, as_of_time=as_of_time)
     valuation = build_valuation_state(code, persist=False, as_of_time=as_of_time)
-    industry_items = list_industries(as_of_time=as_of_time).get("items") or []
+    industry_result = list_industries(as_of_time=as_of_time)
+    events_result = list_events(ts_code=code, limit=100, as_of_time=as_of_time)
+    if as_of_time:
+        dependency_failures = []
+        for dependency, result in (("industry", industry_result), ("events", events_result)):
+            if not isinstance(result, dict) or not bool(result.get("ok")) or str(result.get("status") or "") == "blocked":
+                dependency_failures.append({
+                    "dependency": dependency,
+                    "reason": str((result or {}).get("reason") or "pit_dependency_unavailable"),
+                    "status": str((result or {}).get("status") or "blocked"),
+                })
+        if dependency_failures:
+            return {}, {
+                "status": "blocked",
+                "reason": "specialized_pit_dependency_unavailable",
+                "dependencies": dependency_failures,
+                "expectation": expectation,
+                "valuation": valuation,
+                "industry": None,
+                "events": [],
+                "negative_events": [],
+            }
+    industry_items = industry_result.get("items") or []
     industry = next((item for item in industry_items if str(item.get("industry_name") or "").strip() == industry_name.strip()), None)
-    events = list_events(ts_code=code, limit=100, as_of_time=as_of_time).get("items") or []
+    events = events_result.get("items") or []
 
     industry_state = (industry or {}).get("state") or {}
     industry_observations = {
@@ -546,6 +764,7 @@ def _specialized_research_inputs(code: str, industry_name: str, *, as_of_time: s
         "valuation": {key: item.get("value") for key, item in (valuation_dimension or {}).get("components", {}).items()},
         "governance": governance,
     }, {
+        "status": "ready",
         "expectation": expectation,
         "valuation": valuation,
         "industry": industry,
@@ -558,13 +777,47 @@ def build_stock_research(ts_code: str, *, persist: bool = True, as_of_time: str 
     code = str(ts_code).strip().upper()
     as_of_date = str(as_of_time or "")[:10].replace("-", "")
     with _conn() as c:
-        master_row = c.execute("SELECT * FROM dc_stock_master WHERE ts_code=?", (code,)).fetchone()
         if as_of_date:
-            snapshot_row = c.execute("SELECT * FROM dc_stock_daily_snapshot WHERE ts_code=? AND trade_date<=? AND available_time<=? ORDER BY trade_date DESC LIMIT 1", (code, as_of_date, str(as_of_time))).fetchone()
+            master_row, master_status = _strict_master_row(
+                c, code, as_of_time=str(as_of_time),
+            )
+            snapshot_row, snapshot_status = _strict_snapshot_for_code(
+                c,
+                code,
+                as_of_time=str(as_of_time),
+                as_of_date=as_of_date,
+            )
         else:
+            master_row = c.execute("SELECT * FROM dc_stock_master WHERE ts_code=?", (code,)).fetchone()
+            master_status = "ready" if master_row else "stock_not_found"
             snapshot_row = c.execute("SELECT * FROM dc_stock_daily_snapshot WHERE ts_code=? ORDER BY trade_date DESC LIMIT 1", (code,)).fetchone()
+            snapshot_status = "ready" if snapshot_row else "mutable_snapshot_missing"
+    if as_of_date and snapshot_status != "ready":
+        return {
+            "ok": False,
+            "status": "blocked",
+            "reason": snapshot_status,
+            "ts_code": code,
+            "as_of_time": str(as_of_time),
+            "point_in_time_method": "immutable_snapshot_versions_v1",
+        }
     if not master_row:
-        return {"ok": False, "reason": "stock_not_found", "ts_code": code}
+        return {
+            "ok": False,
+            "status": "blocked" if as_of_date else "insufficient_data",
+            "reason": master_status if as_of_date else "stock_not_found",
+            "ts_code": code,
+            "as_of_time": str(as_of_time or ""),
+        }
+    if as_of_date and master_status != "ready":
+        return {
+            "ok": False,
+            "status": "blocked",
+            "reason": master_status,
+            "ts_code": code,
+            "as_of_time": str(as_of_time),
+            "point_in_time_method": "immutable_snapshot_and_master_clock_v1",
+        }
     master, snapshot = dict(master_row), dict(snapshot_row) if snapshot_row else {}
     income = _payloads(code, "income", as_of_time=as_of_time)
     balance = _payloads(code, "balancesheet", as_of_time=as_of_time)
@@ -573,6 +826,27 @@ def build_stock_research(ts_code: str, *, persist: bool = True, as_of_time: str 
     audit = _payloads(code, "fina_audit", limit=4, as_of_time=as_of_time)
     pledge = _payloads(code, "pledge_stat", limit=8, as_of_time=as_of_time)
     name_changes = _payloads(code, "namechange", limit=20, as_of_time=as_of_time)
+    if as_of_date:
+        required_raw = ["income", "balancesheet", "fina_indicator"]
+        if _industry_template_kind(str(master.get("industry") or "")) != "financial_institution_v1":
+            required_raw.append("cashflow")
+        raw_by_api = {
+            "income": income,
+            "balancesheet": balance,
+            "fina_indicator": indicator,
+            "cashflow": cashflow,
+        }
+        missing_raw = [api for api in required_raw if not raw_by_api.get(api)]
+        if missing_raw:
+            return {
+                "ok": False,
+                "status": "blocked",
+                "reason": "immutable_raw_evidence_missing",
+                "missing_apis": missing_raw,
+                "ts_code": code,
+                "as_of_time": str(as_of_time),
+                "point_in_time_method": "immutable_snapshot_and_raw_versions_v1",
+            }
     latest_income = (income[0]["payload"] if income else {})
     latest_balance = (balance[0]["payload"] if balance else {})
     latest_cashflow = (cashflow[0]["payload"] if cashflow else {})
@@ -595,6 +869,16 @@ def build_stock_research(ts_code: str, *, persist: bool = True, as_of_time: str 
     template_kind = _industry_template_kind(str(master.get("industry") or ""))
     financial_template = template_kind == "financial_institution_v1"
     specialized, specialized_state = _specialized_research_inputs(code, str(master.get("industry") or ""), as_of_time=as_of_time)
+    if as_of_date and str(specialized_state.get("status") or "") == "blocked":
+        return {
+            "ok": False,
+            "status": "blocked",
+            "reason": str(specialized_state.get("reason") or "specialized_pit_dependency_unavailable"),
+            "dependencies": specialized_state.get("dependencies") or [],
+            "ts_code": code,
+            "as_of_time": str(as_of_time),
+            "point_in_time_method": "immutable_snapshot_raw_and_specialized_versions_v1",
+        }
     receivable_to_revenue = _safe_ratio(latest_balance.get("accounts_receiv"), latest_income.get("total_revenue"))
     cash_debt_coverage = _safe_ratio(cash_balance, interest_debt) if interest_debt > 0 else None
     dimensions_input = {
@@ -803,6 +1087,18 @@ def build_stock_research(ts_code: str, *, persist: bool = True, as_of_time: str 
             *template_limitations,
         ] if item]
     }
+    if as_of_date:
+        result["point_in_time_method"] = "immutable_snapshot_and_raw_versions_v1"
+        result["observation_evidence"] = {
+            "snapshot": {
+                "trade_date": snapshot.get("trade_date"),
+                "observed_at": snapshot.get("observed_at"),
+                "first_observed_at": snapshot.get("first_observed_at"),
+                "economic_available_time": snapshot.get("economic_available_time"),
+                "created_at": snapshot.get("created_at"),
+            },
+            "raw_versions_required": True,
+        }
     if persist:
         as_of = max((str(x.get("available_time") or "") for x in evidence), default=str(snapshot.get("available_time") or datetime.now().isoformat(timespec="seconds")))
         confidence = float(result["research_state"].get("confidence") or 0)
@@ -917,7 +1213,11 @@ def build_expectation_state(ts_code: str, *, persist_baseline: bool = True, as_o
         profit_forecast = float(latest_payload.get("n_income") or 0) * (1 + max(-.8, min(.8, profit_yoy / 100)) / 4)
         confidence = min(.55, .25 + .05 * min(6, len(income)))
         now = datetime.now().isoformat(timespec="seconds")
-        baseline = {"target_period": target_period, "revenue_forecast": revenue_forecast, "profit_forecast": profit_forecast, "confidence": confidence, "model_version": "seasonal_yoy_baseline_v1", "available_time": now}
+        # A derived baseline may be persisted now, but its feature/evidence
+        # clock is the frozen cutoff when called by formal replay.  Never stamp
+        # it with wall-clock ``now`` and make a historical result look newer.
+        baseline_available_time = normalize_explicit_timestamp(as_of_time) if as_of_time else now
+        baseline = {"target_period": target_period, "revenue_forecast": revenue_forecast, "profit_forecast": profit_forecast, "confidence": confidence, "model_version": "seasonal_yoy_baseline_v1", "available_time": baseline_available_time}
         if persist_baseline:
             with _business_conn() as c:
                 c.execute(
@@ -969,21 +1269,95 @@ def build_valuation_state(ts_code: str, *, persist: bool = True, as_of_time: str
     code = str(ts_code).strip().upper()
     as_of_date = str(as_of_time or "")[:10].replace("-", "")
     with _conn() as c:
-        master_row = c.execute("SELECT * FROM dc_stock_master WHERE ts_code=?", (code,)).fetchone()
         if as_of_date:
-            rows = [dict(row) for row in c.execute("SELECT trade_date,close,pe_ttm,pb,total_mv,available_time FROM dc_stock_daily_snapshot WHERE ts_code=? AND trade_date<=? AND available_time<=? ORDER BY trade_date DESC LIMIT 500", (code, as_of_date, str(as_of_time))).fetchall()]
+            cutoff = normalize_explicit_timestamp(str(as_of_time))
+            if not cutoff:
+                return {
+                    "ok": False,
+                    "status": "blocked",
+                    "reason": "invalid_observation_cutoff",
+                    "ts_code": code,
+                }
+            master_row, master_status = _strict_master_row(
+                c, code, as_of_time=cutoff,
+            )
+            version_rows = load_snapshot_versions(
+                c,
+                cutoff=cutoff,
+                ts_codes=[code],
+                trade_date_end=as_of_date,
+            )
+            if version_rows is None:
+                return {
+                    "ok": False,
+                    "status": "blocked",
+                    "reason": "immutable_snapshot_schema_unavailable",
+                    "ts_code": code,
+                    "as_of_time": cutoff,
+                }
+            rows = [_decode_snapshot_observation(dict(row)) for row in version_rows]
+            rows.sort(key=lambda item: str(item.get("trade_date") or ""), reverse=True)
         else:
+            master_row = c.execute("SELECT * FROM dc_stock_master WHERE ts_code=?", (code,)).fetchone()
+            master_status = "ready" if master_row else "stock_not_found"
             rows = [dict(row) for row in c.execute("SELECT trade_date,close,pe_ttm,pb,total_mv,available_time FROM dc_stock_daily_snapshot WHERE ts_code=? ORDER BY trade_date DESC LIMIT 500", (code,)).fetchall()]
+        if as_of_date and not rows:
+            return {
+                "ok": False,
+                "status": "blocked",
+                "reason": "immutable_snapshot_not_visible_at_cutoff",
+                "ts_code": code,
+                "as_of_time": str(as_of_time or ""),
+            }
         if not master_row or not rows:
-            return {"ok": False, "reason": "valuation_data_missing", "ts_code": code}
+            return {
+                "ok": False,
+                "status": "blocked" if as_of_date else "insufficient_data",
+                "reason": master_status if as_of_date and not master_row else "valuation_data_missing",
+                "ts_code": code,
+                "as_of_time": str(as_of_time or ""),
+            }
+        if as_of_date and master_status != "ready":
+            return {
+                "ok": False,
+                "status": "blocked",
+                "reason": master_status,
+                "ts_code": code,
+                "as_of_time": str(as_of_time),
+                "point_in_time_method": "immutable_snapshot_and_master_clock_v1",
+            }
         master = dict(master_row)
         latest = rows[0]
-        peer_query = """SELECT s.pe_ttm,s.pb FROM dc_stock_daily_snapshot s JOIN dc_stock_master m ON m.ts_code=s.ts_code
-               WHERE s.trade_date=? AND m.industry=? AND s.ts_code<>?"""
-        peer_params: tuple[Any, ...] = (latest["trade_date"], master.get("industry") or "", code)
         if as_of_time:
-            peer_query += " AND s.available_time<=?"; peer_params += (str(as_of_time),)
-        peer_rows = [dict(row) for row in c.execute(peer_query, peer_params).fetchall()]
+            peer_master_rows = c.execute(
+                """SELECT ts_code,available_time,updated_at,source_code FROM dc_stock_master
+                   WHERE industry=? AND ts_code<>?
+                     AND NULLIF(TRIM(COALESCE(source_code,'')),'') IS NOT NULL
+                     AND available_time<>'' AND updated_at<>''""",
+                (master.get("industry") or "", code),
+            ).fetchall()
+            peer_codes = []
+            for row in peer_master_rows:
+                peer = dict(row)
+                available = normalize_explicit_timestamp(peer.get("available_time"))
+                updated = normalize_explicit_timestamp(peer.get("updated_at"))
+                if available and updated and available <= cutoff and updated <= cutoff:
+                    peer_codes.append(str(peer.get("ts_code") or ""))
+            peer_versions = load_snapshot_versions(
+                c,
+                cutoff=normalize_explicit_timestamp(str(as_of_time)),
+                ts_codes=peer_codes,
+                trade_date=str(latest.get("trade_date") or ""),
+            ) if peer_codes else []
+            peer_rows = [
+                _decode_snapshot_observation(dict(row))
+                for row in (peer_versions or [])
+            ]
+        else:
+            peer_query = """SELECT s.pe_ttm,s.pb FROM dc_stock_daily_snapshot s JOIN dc_stock_master m ON m.ts_code=s.ts_code
+                   WHERE s.trade_date=? AND m.industry=? AND s.ts_code<>?"""
+            peer_params: tuple[Any, ...] = (latest["trade_date"], master.get("industry") or "", code)
+            peer_rows = [dict(row) for row in c.execute(peer_query, peer_params).fetchall()]
     financial = any(x in str(master.get("industry") or "") for x in ("银行", "保险", "证券"))
     cyclical = any(x in str(master.get("industry") or "") for x in ("煤炭", "石油", "有色", "钢铁", "化工"))
     asset_based = cyclical or any(x in str(master.get("industry") or "") for x in ("房地产", "公用事业", "交通运输"))

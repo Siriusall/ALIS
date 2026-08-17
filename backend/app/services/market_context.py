@@ -12,21 +12,103 @@ from datetime import datetime
 import json
 import math
 import os
+import re
 import threading
 import time
 from statistics import median
 
 from app.data_platform.db import _conn
+from app.data_platform.services.market_calendar import target_trade_date
+from app.data_platform.services.observation_clock import (
+    _explicit_timestamp_sql,
+    _table_columns,
+    _timestamp_value_sql,
+    _trade_date_cutoff_sql,
+    load_raw_record_versions,
+    load_snapshot_market_aggregates,
+    load_snapshot_versions,
+    now_observed_at,
+)
 from app.data_platform.redis_store import get_json, set_json
 from app.services.hsmm_shadow import (
     HSMM_MAX_DURATION_WEEKS,
     HSMM_MIN_DURATION_WEEKS,
+)
+from app.services.point_in_time import (
+    normalize_explicit_timestamp as _normalize_explicit_pit_timestamp,
+    normalize_timestamp as _normalize_pit_timestamp,
 )
 
 
 _market_enrichment_cache_lock = threading.Lock()
 _market_enrichment_cache: dict[tuple[str, str], tuple[float, dict[str, Any]]] = {}
 _MARKET_ENRICHMENT_CACHE_TTL_SECONDS = 300.0
+
+
+def _strict_raw_payload_rows(
+    conn: Any,
+    api_name: str,
+    *,
+    cutoff: str = "",
+    cutoff_by_trade_date: bool = False,
+    ts_codes: list[str] | tuple[str, ...] | None = None,
+    trade_date_start: str = "",
+    trade_date_end: str = "",
+) -> list[dict[str, Any]] | None:
+    rows = load_raw_record_versions(
+        conn, api_name, cutoff=cutoff, ts_codes=ts_codes,
+        cutoff_by_trade_date=cutoff_by_trade_date,
+        trade_date_start=trade_date_start, trade_date_end=trade_date_end,
+    )
+    if rows is None:
+        return None
+    result = []
+    for row in rows:
+        item = dict(row)
+        try:
+            payload = json.loads(item.get("payload_json") or "{}")
+        except (TypeError, json.JSONDecodeError):
+            payload = {}
+        item["available_time"] = str(item.get("observed_at") or "")
+        item.update({key: value for key, value in payload.items() if key not in item})
+        result.append(item)
+    return result
+
+
+def _strict_snapshot_payload_rows(
+    conn: Any,
+    *,
+    cutoff: str = "",
+    cutoff_by_trade_date: bool = False,
+    trade_date_start: str = "",
+    trade_date_end: str = "",
+    trade_date: str = "",
+) -> list[dict[str, Any]] | None:
+    """Expand immutable normalized rows without consulting the overwrite table."""
+
+    rows = load_snapshot_versions(
+        conn,
+        cutoff=cutoff,
+        cutoff_by_trade_date=cutoff_by_trade_date,
+        trade_date_start=trade_date_start,
+        trade_date_end=trade_date_end,
+        trade_date=trade_date,
+    )
+    if rows is None:
+        return None
+    result: list[dict[str, Any]] = []
+    for row in rows:
+        item = dict(row)
+        try:
+            payload = json.loads(item.get("payload_json") or "{}")
+        except (TypeError, json.JSONDecodeError):
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+        item["available_time"] = str(item.get("observed_at") or "")
+        item.update({key: value for key, value in payload.items() if key not in item})
+        result.append(item)
+    return result
 
 
 def _clip(value: float, low: float = -1.0, high: float = 1.0) -> float:
@@ -354,13 +436,18 @@ def materialize_market_training_history() -> dict[str, Any]:
     using the complete cross-section available in the data platform.
     """
     index_codes = ("000300.SH", "000905.SH", "000852.SH")
-    placeholders = ",".join("?" for _ in index_codes)
     with _conn() as c:
-        rows = [dict(row) for row in c.execute(
-            f"""SELECT ts_code,trade_date,payload_json,available_time FROM dc_tushare_raw_records
-                WHERE api_name='index_daily' AND ts_code IN ({placeholders})
-                ORDER BY ts_code,trade_date""", index_codes,
-        ).fetchall()]
+        versioned_index = _strict_raw_payload_rows(
+            c, "index_daily", ts_codes=list(index_codes), cutoff_by_trade_date=True,
+        )
+        if versioned_index is not None:
+            rows = versioned_index
+        else:
+            # Training features are historical evidence.  A mutable raw
+            # projection cannot tell whether a late correction replaced the
+            # version visible at that session's 15:00 cutoff, even on a local
+            # SQLite fixture.  Do not silently downgrade this path.
+            return {"ok": False, "status": "blocked", "reason": "observation_clock_unavailable", "written": 0}
         by_code: dict[str, dict[str, dict[str, Any]]] = {code: {} for code in index_codes}
         for row in rows:
             try:
@@ -376,27 +463,76 @@ def materialize_market_training_history() -> dict[str, Any]:
         # data database.  The normalized, point-in-time snapshot is the
         # production market-data contract and has the typed fields this model
         # actually needs.
-        market_rows = [dict(row) for row in c.execute(
-            """SELECT trade_date,
+        snapshot_columns = _table_columns(c, "dc_stock_daily_snapshot_version")
+        if {
+            "observed_at", "first_observed_at", "economic_available_time",
+            "created_at", "source_code", "content_hash", "observation_provenance",
+        }.issubset(snapshot_columns):
+            is_postgres = bool(getattr(c, "_is_postgres", False))
+            observed_at = _timestamp_value_sql("v.observed_at", is_postgres=is_postgres)
+            first_observed_at = _timestamp_value_sql("v.first_observed_at", is_postgres=is_postgres)
+            created_at = _timestamp_value_sql("v.created_at", is_postgres=is_postgres)
+            session_cutoff = _trade_date_cutoff_sql("v.trade_date", is_postgres=is_postgres)
+            snapshot_evidence = (
+                "v.content_hash<>'' "
+                "AND NULLIF(TRIM(COALESCE(v.source_code,'')),'') IS NOT NULL "
+                "AND LOWER(COALESCE(v.observation_provenance,'')) NOT LIKE 'legacy_%' "
+                f"AND {_explicit_timestamp_sql('v.observed_at', is_postgres=is_postgres)} "
+                f"AND {_explicit_timestamp_sql('v.first_observed_at', is_postgres=is_postgres)} "
+                f"AND {_explicit_timestamp_sql('v.economic_available_time', is_postgres=is_postgres)} "
+                f"AND {_explicit_timestamp_sql('v.created_at', is_postgres=is_postgres)} "
+                f"AND {session_cutoff} IS NOT NULL "
+                f"AND {observed_at}<={session_cutoff} "
+                f"AND {first_observed_at}<={session_cutoff} "
+                f"AND {created_at}<={session_cutoff}"
+            )
+            if is_postgres:
+                change_expr = "NULLIF(payload_json::jsonb->>'change_pct','')::double precision"
+                turnover_expr = "NULLIF(payload_json::jsonb->>'turnover','')::double precision"
+            else:
+                change_expr = "CAST(json_extract(payload_json,'$.change_pct') AS REAL)"
+                turnover_expr = "CAST(json_extract(payload_json,'$.turnover') AS REAL)"
+            market_sql = """WITH ranked AS (
+                    SELECT v.ts_code,v.trade_date,v.payload_json,v.observed_at,
+                           ROW_NUMBER() OVER (
+                              PARTITION BY v.ts_code,v.trade_date
+                              ORDER BY {observed_at} DESC,{created_at} DESC,v.id DESC
+                           ) AS row_rank
+                      FROM dc_stock_daily_snapshot_version v
+                     WHERE {snapshot_evidence}
+                ), latest AS (
+                    SELECT * FROM ranked WHERE row_rank=1
+                )
+                SELECT trade_date,
                       COUNT(*) AS instrument_count,
-                      AVG(CASE WHEN change_pct > 0 THEN 1.0 ELSE 0.0 END) AS breadth,
-                      AVG(change_pct / 100.0) AS average_return,
-                      STDDEV_POP(change_pct / 100.0) AS return_dispersion,
-                      AVG(CASE WHEN change_pct >= 9.7 THEN 1.0 ELSE 0.0 END) AS limit_up_ratio,
-                      AVG(CASE WHEN change_pct <= -9.7 THEN 1.0 ELSE 0.0 END) AS limit_down_ratio,
-                      SUM(COALESCE(turnover, 0.0)) AS total_amount,
-                      MAX(available_time) AS source_as_of_time
-               FROM dc_stock_daily_snapshot
-               WHERE available_time <= trade_date || 'T15:00:00'
-               GROUP BY trade_date
-               ORDER BY trade_date"""
-        ).fetchall()]
+                      AVG(CASE WHEN {change_expr} > 0 THEN 1.0 ELSE 0.0 END) AS breadth,
+                      AVG({change_expr} / 100.0) AS average_return,
+                      0.0 AS return_dispersion,
+                      AVG(CASE WHEN {change_expr} >= 9.7 THEN 1.0 ELSE 0.0 END) AS limit_up_ratio,
+                      AVG(CASE WHEN {change_expr} <= -9.7 THEN 1.0 ELSE 0.0 END) AS limit_down_ratio,
+                      SUM(COALESCE({turnover_expr},0.0)) AS total_amount,
+                      MAX(observed_at) AS source_as_of_time
+                 FROM latest
+                GROUP BY trade_date
+                ORDER BY trade_date""".format(
+                observed_at=observed_at,
+                created_at=created_at,
+                snapshot_evidence=snapshot_evidence,
+                change_expr=change_expr,
+                turnover_expr=turnover_expr,
+            )
+            market_rows = [dict(row) for row in c.execute(market_sql).fetchall()]
+        else:
+            # This is a historical feature materialization.  A mutable
+            # snapshot can no longer prove whether an earlier, complete
+            # version was replaced by a later partial refresh.
+            return {"ok": False, "status": "blocked", "reason": "snapshot_observation_clock_unavailable", "written": 0}
         market_by_date = {str(row.get("trade_date") or ""): row for row in market_rows}
         common_dates = sorted(
             set.intersection(*(set(by_code[code]) for code in index_codes), set(market_by_date))
         ) if all(by_code.values()) and market_by_date else []
         written = 0
-        now = datetime.now().isoformat(timespec="seconds")
+        now = now_observed_at()
         for index, feature_date in enumerate(common_dates):
             if index < 120:
                 continue
@@ -478,7 +614,7 @@ def _production_regime_reason(governance: dict[str, Any]) -> str:
 
 def _market_enrichment_observations(latest: str, *, as_of_time: str | None = None) -> dict[str, Any]:
     """Build the three previously-neutralized daily market observations."""
-    cutoff = str(as_of_time or "") or f"{latest[:4]}-{latest[4:6]}-{latest[6:8]}T23:59:59"
+    cutoff = _normalize_pit_timestamp(as_of_time or f"{latest[:4]}-{latest[4:6]}-{latest[6:8]}T23:59:59+08:00")
     cache_key = (str(latest), cutoff)
     now = time.monotonic()
     with _market_enrichment_cache_lock:
@@ -486,24 +622,42 @@ def _market_enrichment_observations(latest: str, *, as_of_time: str | None = Non
         if cached and now - cached[0] < _MARKET_ENRICHMENT_CACHE_TTL_SECONDS:
             return {**cached[1], "coverage": dict(cached[1].get("coverage") or {})}
     result: dict[str, Any] = {
+        "status": "ready" if cutoff else "blocked",
         "northbound_flow_z": None,
         "leader_persistence": None,
         "price_fundamental_divergence": None,
         "coverage": {"northbound": 0, "leader_sessions": 0, "fundamental_codes": 0},
+        "missing_sources": [],
     }
+    if not cutoff:
+        result["missing_sources"] = ["invalid_observation_cutoff"]
+        return result
+
+    def _float_value(value: Any) -> float | None:
+        try:
+            return float(value) if value is not None and str(value).strip() != "" else None
+        except (TypeError, ValueError):
+            return None
+
     with _conn() as c:
-        north_rows = [dict(row) for row in c.execute(
-            "SELECT trade_date,payload_json FROM dc_tushare_raw_records WHERE api_name='moneyflow_hsgt' AND trade_date<=? AND available_time<=? ORDER BY trade_date DESC LIMIT 61",
-            (latest, cutoff),
-        ).fetchall()]
+        north_rows = _strict_raw_payload_rows(
+            c, "moneyflow_hsgt", cutoff=cutoff, trade_date_end=latest,
+        )
+        if north_rows is None:
+            result["status"] = "partial"
+            result["missing_sources"].append("moneyflow_hsgt")
+            north_rows = []
+        north_by_date: dict[str, dict[str, Any]] = {}
+        for row in north_rows:
+            date = str(row.get("trade_date") or "")
+            if date and date <= latest:
+                north_by_date.setdefault(date, row)
+        north_rows = [north_by_date[date] for date in sorted(north_by_date, reverse=True)[:61]]
         north_values: list[float] = []
         for row in north_rows:
-            try:
-                value = json.loads(row.get("payload_json") or "{}").get("north_money")
-                if value is not None:
-                    north_values.append(float(value))
-            except (TypeError, ValueError, json.JSONDecodeError):
-                continue
+            value = _float_value(row.get("north_money"))
+            if value is not None:
+                north_values.append(value)
         if north_values:
             center = median(north_values[1:]) if len(north_values) > 1 else north_values[0]
             mad = median(abs(value - center) for value in north_values[1:]) if len(north_values) > 2 else 0.0
@@ -515,64 +669,54 @@ def _market_enrichment_observations(latest: str, *, as_of_time: str | None = Non
             "SELECT trade_date FROM dc_available_trade_dates WHERE trade_date<=? ORDER BY trade_date DESC LIMIT 21",
             (latest,),
         ).fetchall()]
+        snapshot_rows = _strict_snapshot_payload_rows(
+            c,
+            cutoff=cutoff,
+            trade_date_start=min(date_rows) if date_rows else "",
+            trade_date_end=latest,
+        )
+        if snapshot_rows is None:
+            result["status"] = "partial"
+            result["missing_sources"].append("daily_snapshot")
+            snapshot_rows = []
         if date_rows:
-            placeholders = ",".join("?" for _ in date_rows)
-            # Rank on the database host and return only the top 50 positive
-            # turnover names per session. The API only needs leader overlap;
-            # transferring every row of 21 full cross-sections is unnecessary.
-            daily_rows = [dict(row) for row in c.execute(
-                f"""WITH ranked AS (
-                         SELECT trade_date,ts_code,
-                                ROW_NUMBER() OVER (PARTITION BY trade_date ORDER BY turnover DESC,ts_code) AS rank
-                           FROM dc_stock_daily_snapshot
-                          WHERE trade_date IN ({placeholders})
-                            AND available_time<=?
-                            AND change_pct>0
-                            AND turnover>0
-                     )
-                     SELECT trade_date,ts_code FROM ranked WHERE rank<=50""",
-                (*date_rows, cutoff),
-            ).fetchall()]
-            leaders_by_date: dict[str, set[str]] = {}
-            for row in daily_rows:
-                try:
-                    code = str(row.get("ts_code") or "")
-                    if code:
-                        leaders_by_date.setdefault(str(row.get("trade_date") or ""), set()).add(code)
-                except (TypeError, ValueError, json.JSONDecodeError):
+            leaders_by_date: dict[str, list[tuple[float, str]]] = {}
+            for row in snapshot_rows:
+                date = str(row.get("trade_date") or "")
+                if date not in date_rows:
                     continue
-            current = leaders_by_date.get(latest, set())
-            prior_sets = [leaders_by_date.get(day, set()) for day in date_rows[1:] if leaders_by_date.get(day)]
+                change = _float_value(row.get("change_pct", row.get("pct_chg")))
+                turnover = _float_value(row.get("turnover", row.get("amount")))
+                code = str(row.get("ts_code") or "")
+                if change is not None and turnover is not None and change > 0 and turnover > 0 and code:
+                    leaders_by_date.setdefault(date, []).append((turnover, code))
+            leader_sets = {
+                date: {code for _turnover, code in sorted(values, key=lambda item: (-item[0], item[1]))[:50]}
+                for date, values in leaders_by_date.items()
+            }
+            current = leader_sets.get(latest, set())
+            prior_sets = [leader_sets.get(day, set()) for day in date_rows[1:] if leader_sets.get(day)]
             if current and prior_sets:
                 result["leader_persistence"] = round(sum(len(current & previous) / max(1, len(current | previous)) for previous in prior_sets) / len(prior_sets), 6)
                 result["coverage"]["leader_sessions"] = len(prior_sets) + 1
 
-        periods = [str(dict(row).get("period") or "") for row in c.execute(
-            "SELECT DISTINCT period FROM dc_tushare_raw_records WHERE api_name='fina_indicator' AND period<>'' AND available_time<=? ORDER BY period DESC LIMIT 2",
-            (cutoff,),
-        ).fetchall()]
+        financial_rows = _strict_raw_payload_rows(c, "fina_indicator", cutoff=cutoff)
+        if financial_rows is None:
+            result["status"] = "partial"
+            result["missing_sources"].append("fina_indicator")
+            financial_rows = []
+        periods = sorted({str(row.get("period") or "") for row in financial_rows if str(row.get("period") or "")}, reverse=True)[:2]
         fundamental_by_period: dict[str, dict[str, float]] = {}
         for period in periods:
-            rows = c.execute(
-                """SELECT ts_code,
-                          payload_json::jsonb->>'q_profit_yoy' AS q_profit_yoy,
-                          payload_json::jsonb->>'q_sales_yoy' AS q_sales_yoy,
-                          payload_json::jsonb->>'roe' AS roe
-                     FROM dc_tushare_raw_records
-                    WHERE api_name='fina_indicator' AND period=? AND available_time<=?""",
-                (period, cutoff),
-            ).fetchall()
             values: dict[str, float] = {}
-            for row in rows:
-                try:
-                    payload = dict(row)
-                    # TuShare 的 q_profit_yoy 在部分财报批次为空；使用同一口径的
-                    # q_sales_yoy，再退化到 ROE，避免整段基本面观测被误判为缺失。
-                    value = next((payload.get(key) for key in ("q_profit_yoy", "q_sales_yoy", "roe") if payload.get(key) is not None), None)
-                    if value is not None:
-                        values[str(payload.get("ts_code") or "")] = float(value)
-                except (TypeError, ValueError, json.JSONDecodeError):
-                    continue
+            for payload in (row for row in financial_rows if str(row.get("period") or "") == period):
+                # TuShare 的 q_profit_yoy 在部分财报批次为空；使用同一口径的
+                # q_sales_yoy，再退化到 ROE，避免整段基本面观测被误判为缺失。
+                value = next((payload.get(key) for key in ("q_profit_yoy", "q_sales_yoy", "roe") if payload.get(key) is not None), None)
+                parsed = _float_value(value)
+                code = str(payload.get("ts_code") or "")
+                if parsed is not None and code:
+                    values[code] = parsed
             fundamental_by_period[period] = values
         if fundamental_by_period:
             current_values = fundamental_by_period[periods[0]]
@@ -581,15 +725,14 @@ def _market_enrichment_observations(latest: str, *, as_of_time: str | None = Non
             fundamental_signal = median(current_values.values()) / 50.0 if current_values else 0.0
             if comparable:
                 fundamental_signal = (fundamental_signal + median(comparable) / 50.0) / 2.0
-            placeholders = ",".join("?" for _ in date_rows)
-            price_rows = c.execute(
-                f"""SELECT trade_date,AVG(change_pct) average_return
-                   FROM dc_stock_daily_snapshot
-                  WHERE trade_date IN ({placeholders}) AND available_time<=?
-                  GROUP BY trade_date ORDER BY trade_date DESC LIMIT 20""",
-                (*date_rows, cutoff),
-            ).fetchall()
-            price_signal = (sum(float(dict(row).get("average_return") or 0) for row in price_rows) / max(1, len(price_rows))) / 3.0
+            price_by_date: dict[str, list[float]] = {}
+            for row in snapshot_rows:
+                date = str(row.get("trade_date") or "")
+                change = _float_value(row.get("change_pct", row.get("pct_chg")))
+                if date in date_rows and change is not None:
+                    price_by_date.setdefault(date, []).append(change)
+            price_values = [sum(values) / len(values) for values in price_by_date.values() if values]
+            price_signal = (sum(price_values[-20:]) / max(1, len(price_values[-20:]))) / 3.0
             result["price_fundamental_divergence"] = round(max(-1.0, min(1.0, price_signal - fundamental_signal)), 6)
             result["coverage"]["fundamental_codes"] = len(current_values)
     with _market_enrichment_cache_lock:
@@ -601,19 +744,39 @@ def _market_enrichment_observations(latest: str, *, as_of_time: str | None = Non
 
 
 def live_market_context(*, persist: bool = False) -> dict[str, Any]:
-    cached = get_json("alis:market-context:live:v5")
-    if isinstance(cached, dict):
-        return cached
     with _conn() as c:
+        target_date = target_trade_date(c)
+        cached = get_json("alis:market-context:live:v5")
+        if (
+            isinstance(cached, dict)
+            and str(cached.get("trade_date") or "").replace("-", "")[:8] == target_date
+            and bool(cached.get("ok"))
+        ):
+            return cached
         # The normalized snapshot is the production market-data contract. The
         # raw JSON archive remains evidence storage and must not be scanned by
         # an interactive read.
         dates = [str(dict(row)["trade_date"]) for row in c.execute(
             """SELECT trade_date FROM dc_available_trade_dates
-               ORDER BY trade_date DESC LIMIT 6"""
+               WHERE trade_date<=?
+               ORDER BY trade_date DESC LIMIT 6""",
+            (target_date,),
         ).fetchall()]
+        if not dates or dates[0] != target_date:
+            return {
+                "ok": False,
+                "status": "blocked",
+                "reason": "target_market_context_snapshot_missing",
+                "trade_date": target_date,
+                "latest_available_trade_date": dates[0] if dates else None,
+            }
         if len(dates) < 2:
-            return {"ok": False, "status": "insufficient_data", "reason": "至少需要两个交易日行情"}
+            return {
+                "ok": False,
+                "status": "insufficient_data",
+                "reason": "至少需要两个交易日行情",
+                "trade_date": target_date,
+            }
         latest, previous = dates[0], dates[1]
         # Redis is a transport cache; the database snapshot is the durable
         # read model. Reuse it after a Redis miss only when it was refreshed
@@ -636,33 +799,120 @@ def live_market_context(*, persist: bool = False) -> dict[str, Any]:
                     snapshot_payload = json.loads(stored.get("result_json") or "{}")
                 except (TypeError, json.JSONDecodeError):
                     snapshot_payload = {}
-                if isinstance(snapshot_payload, dict) and snapshot_payload.get("trade_date") == latest and snapshot_payload.get("ok"):
+                snapshot_clocks_valid = isinstance(snapshot_payload, dict) and all(
+                    _normalize_explicit_pit_timestamp(value)
+                    for value in (
+                        snapshot_payload.get("available_time"),
+                        stored.get("created_at"),
+                        stored.get("updated_at"),
+                    )
+                )
+                if (
+                    snapshot_clocks_valid
+                    and snapshot_payload.get("trade_date") == latest
+                    and snapshot_payload.get("ok")
+                ):
                     set_json("alis:market-context:live:v5", snapshot_payload, ttl=300)
                     return snapshot_payload
-        breadth_row = dict(c.execute(
-            """SELECT COUNT(*) total,
-                      SUM(CASE WHEN change_pct>0 THEN 1 ELSE 0 END) rising,
-                      AVG(change_pct/100.0) average_return
-               FROM dc_stock_daily_snapshot WHERE trade_date=?""", (latest,)
-        ).fetchone())
-        limit_row = dict(c.execute(
-            """SELECT COUNT(*) total,
-                      SUM(CASE WHEN change_pct>=9.7 THEN 1 ELSE 0 END) limit_up,
-                      SUM(CASE WHEN change_pct<=-9.7 THEN 1 ELSE 0 END) limit_down
-               FROM dc_stock_daily_snapshot WHERE trade_date=?""", (latest,)
-        ).fetchone())
-        amount_rows = [dict(row) for row in c.execute(
-            """SELECT trade_date,SUM(COALESCE(turnover,0.0)) total_amount
-               FROM dc_stock_daily_snapshot WHERE trade_date IN (?,?,?,?,?,?)
-               GROUP BY trade_date""", tuple(dates)
-        ).fetchall()]
-        concentration_row = dict(c.execute(
-            """WITH values AS (
-                 SELECT turnover AS amount
-                 FROM dc_stock_daily_snapshot WHERE trade_date=?),
-               ranked AS (SELECT amount,NTILE(20) OVER(ORDER BY amount DESC) bucket FROM values WHERE amount IS NOT NULL)
-               SELECT SUM(CASE WHEN bucket=1 THEN amount ELSE 0 END)/NULLIF(SUM(amount),0) concentration FROM ranked""", (latest,)
-        ).fetchone())
+        # A live context is still a production decision dependency after the
+        # Redis/read-model cache expires.  Never rebuild it from the mutable
+        # normalized projection: a late repair there can silently rewrite the
+        # market state used by today's controller.  The immutable aggregate
+        # reader binds every row to the accepted provider hash and its own
+        # T15 observation boundary.
+        # Close data is economically stamped at T15 but is commonly observed
+        # after the close.  The live decision path may consume it only up to
+        # the actual captured observation clock; historical PIT readers keep
+        # the strict T15 default in ``load_snapshot_market_aggregates``.
+        live_observation_cutoff = now_observed_at()
+        aggregates = load_snapshot_market_aggregates(
+            c,
+            trade_dates=dates,
+            observation_cutoff=live_observation_cutoff,
+        )
+        if aggregates is None:
+            return {
+                "ok": False,
+                "status": "blocked",
+                "reason": "snapshot_observation_clock_unavailable",
+                "trade_date": latest,
+                "missing_dates": dates,
+            }
+        missing_dates = [date for date in dates if date not in aggregates]
+        if latest not in aggregates:
+            return {
+                "ok": False,
+                "status": "blocked",
+                "reason": "immutable_snapshot_market_aggregates_missing",
+                "trade_date": latest,
+                "missing_dates": missing_dates,
+            }
+        stock_count_row = c.execute("SELECT COUNT(*) AS cnt FROM dc_stock_master").fetchone()
+        stock_count = int(dict(stock_count_row).get("cnt") or 0) if stock_count_row else 0
+        minimum_rows = max(1, int(math.ceil(stock_count * 0.80))) if stock_count else 1
+        incomplete_dates = {
+            date: {
+                "rows_total": int(dict(aggregates[date]).get("rows_total") or 0),
+                "market_rows": int(dict(aggregates[date]).get("market_rows") or 0),
+            }
+            for date in dates
+            if date in aggregates
+            and int(dict(aggregates[date]).get("market_rows") or 0) < minimum_rows
+        }
+        if latest in incomplete_dates:
+            return {
+                "ok": False,
+                "status": "blocked",
+                "reason": "immutable_snapshot_market_aggregates_incomplete",
+                "trade_date": latest,
+                "minimum_rows": minimum_rows,
+                "incomplete_dates": incomplete_dates,
+            }
+
+        latest_rows = load_snapshot_versions(
+            c,
+            cutoff=live_observation_cutoff,
+            trade_date=latest,
+        )
+        if latest_rows is None or not latest_rows:
+            return {
+                "ok": False,
+                "status": "blocked",
+                "reason": "immutable_snapshot_concentration_rows_missing",
+                "trade_date": latest,
+            }
+        amounts: list[float] = []
+        for item in latest_rows:
+            try:
+                payload = json.loads(item.get("payload_json") or "{}")
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if not isinstance(payload, dict):
+                continue
+            try:
+                value = float(payload.get("turnover"))
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(value) and value >= 0:
+                amounts.append(value)
+        if not amounts:
+            return {
+                "ok": False,
+                "status": "blocked",
+                "reason": "immutable_snapshot_turnover_missing",
+                "trade_date": latest,
+            }
+        amounts.sort(reverse=True)
+        top_count = max(1, int(math.ceil(len(amounts) / 20)))
+        total_amount = sum(amounts)
+        concentration = sum(amounts[:top_count]) / total_amount if total_amount > 0 else 0.0
+        breadth_row = dict(aggregates[latest])
+        limit_row = dict(aggregates[latest])
+        amount_rows = [
+            {"trade_date": date, "total_amount": float(dict(aggregates[date]).get("amount") or 0.0)}
+            for date in dates
+            if date in aggregates
+        ]
         previous_context = c.execute(
             "SELECT market_state FROM dc_market_context_snapshot WHERE trade_date<? ORDER BY trade_date DESC LIMIT 1",
             (latest,),
@@ -671,19 +921,19 @@ def live_market_context(*, persist: bool = False) -> dict[str, Any]:
             "SELECT observations_json,result_json FROM dc_market_context_snapshot WHERE trade_date<? ORDER BY trade_date DESC LIMIT 60",
             (latest,),
         ).fetchall()]
-    total = int(breadth_row.get("total") or 0)
-    limit_total = int(limit_row.get("total") or total or 1)
+    total = int(breadth_row.get("market_rows") or 0)
+    limit_total = total or 1
     amount_by_date = {str(x["trade_date"]): float(x.get("total_amount") or 0) for x in amount_rows}
     prior_amounts = [amount_by_date[x] for x in dates[1:] if amount_by_date.get(x)]
     volume_ratio = amount_by_date.get(latest, 0) / (sum(prior_amounts) / len(prior_amounts)) if prior_amounts else 1.0
-    concentration = float(concentration_row.get("concentration") or 0)
+    concentration = float(concentration)
     crowding = max(0.0, min(1.0, (concentration - .30) / .30))
     observations = {
-        "breadth": int(breadth_row.get("rising") or 0) / total if total else .5,
+        "breadth": float(breadth_row.get("breadth") or 0.5),
         "average_return": float(breadth_row.get("average_return") or 0),
         "volume_ratio": volume_ratio,
-        "limit_up_ratio": int(limit_row.get("limit_up") or 0) / limit_total,
-        "limit_down_ratio": int(limit_row.get("limit_down") or 0) / limit_total,
+        "limit_up_ratio": float(limit_row.get("limit_up_ratio") or 0),
+        "limit_down_ratio": float(limit_row.get("limit_down_ratio") or 0),
         "northbound_flow_z": 0.0,
         "leader_persistence": 0.0,
         "price_fundamental_divergence": 0.0,
@@ -714,10 +964,11 @@ def live_market_context(*, persist: bool = False) -> dict[str, Any]:
     market_state = _transparent_regime(score, average_return, previous_state)
     market_profile = classify_market_profile(market_state, observations)
     confidence = min(.85, .45 + abs(score - 50) / 100)
-    now = datetime.now().isoformat(timespec="seconds")
+    now = now_observed_at()
     model_governance = market_state_model_governance()
+    history_degraded = bool(missing_dates or incomplete_dates)
     payload = {
-        "ok": True, "status": "ready", "trade_date": latest,
+        "ok": True, "status": "degraded" if history_degraded else "ready", "trade_date": latest,
         "market_state": {"state": market_state, "label": REGIME_LABELS[market_state], "confidence": round(confidence, 4), "model": "transparent_four_state_v1", "reason": _production_regime_reason(model_governance)},
         "market_profile": market_profile,
         "sentiment": sentiment, "observations": observations, "change_alarm": change_alarm,
@@ -725,6 +976,8 @@ def live_market_context(*, persist: bool = False) -> dict[str, Any]:
         "evidence": {"latest_date": latest, "previous_date": previous, "symbols": total, "amount_dates": len(amount_rows)},
         "observation_evidence": enrichment.get("coverage") or {},
         "limitations": [
+            *([f"历史市场聚合缺少 {len(missing_dates)} 个比较交易日，成交量比率按可见样本计算" ] if missing_dates else []),
+            *(["部分历史市场聚合行数不足，当前状态仅使用最新完整交易日"] if incomplete_dates else []),
             *([] if enrichment.get("coverage", {}).get("northbound") else ["北向资金原始观测暂不可用，当前按中性值处理"]),
             *([] if enrichment.get("coverage", {}).get("leader_sessions") else ["龙头持续性日度样本不足，当前按中性值处理"]),
             *([] if enrichment.get("coverage", {}).get("fundamental_codes") else ["价格与基本面背离日度样本不足，当前按中性值处理"]),
@@ -737,7 +990,7 @@ def live_market_context(*, persist: bool = False) -> dict[str, Any]:
                 """INSERT INTO dc_market_context_snapshot(trade_date,market_state,state_confidence,sentiment_score,observations_json,result_json,model_version,available_time,created_at,updated_at)
                    VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(trade_date) DO UPDATE SET market_state=excluded.market_state,state_confidence=excluded.state_confidence,
                    sentiment_score=excluded.sentiment_score,observations_json=excluded.observations_json,result_json=excluded.result_json,model_version=excluded.model_version,
-                   available_time=excluded.available_time,updated_at=excluded.updated_at""",
+                   available_time=excluded.available_time,created_at=excluded.created_at,updated_at=excluded.updated_at""",
                 (latest, market_state, confidence, score, json.dumps(observations, ensure_ascii=False), json.dumps(payload, ensure_ascii=False), "transparent_four_state_v1", now, now, now),
             )
         set_json("alis:market-context:live:v5", payload, ttl=300)
@@ -765,38 +1018,153 @@ def market_context_history(limit: int = 120) -> dict[str, Any]:
     return {"ok": True, "items": rows, "transitions": transitions, "count": len(rows)}
 
 
-def market_context_as_of(as_of_time: str) -> dict[str, Any]:
-    """Return the latest market context whose observation date is visible at the cutoff."""
-    cutoff = str(as_of_time or "")
-    trade_date = cutoff[:10].replace("-", "")
+def market_context_as_of(as_of_time: str, *, trade_date: str | None = None) -> dict[str, Any]:
+    """Return a derived market state only when its own evidence was visible.
+
+    ``dc_market_context_snapshot`` is a mutable read model.  Selecting by
+    ``trade_date`` alone therefore allowed a snapshot rebuilt today to be
+    replayed as if it had existed on the historical decision date.  The
+    derived row now has to carry real observation/materialization timestamps
+    that are all at or before the requested cutoff, and it must correspond to
+    the exact requested session.  A prior-session state is not a valid formal
+    decision input; callers receive a blocked result instead of a stale green
+    fallback.
+    """
+    raw_cutoff = str(as_of_time or "").strip()
+    cutoff = _normalize_pit_timestamp(raw_cutoff)
+    if not cutoff or not re.search(r"(?:Z|[+-][0-9]{2}:[0-9]{2})$", raw_cutoff):
+        return {
+            "ok": False,
+            "status": "blocked",
+            "as_of_time": str(as_of_time or ""),
+            "reason": "invalid_market_context_observation_cutoff",
+        }
+    requested_trade_date = str(trade_date or cutoff[:10]).replace("-", "")[:8]
+    if len(requested_trade_date) != 8 or not requested_trade_date.isdigit():
+        return {
+            "ok": False,
+            "status": "blocked",
+            "as_of_time": cutoff,
+            "snapshot_trade_date": None,
+            "reason": "invalid_market_context_trade_date",
+            "point_in_time_method": "derived_snapshot_visibility_v2",
+        }
+
+    def visible(value: Any) -> bool:
+        raw_value = str(value or "").strip()
+        if not re.search(r"(?:Z|[+-][0-9]{2}:[0-9]{2})$", raw_value):
+            return False
+        normalized = _normalize_pit_timestamp(raw_value)
+        return bool(normalized) and normalized <= cutoff
+
     with _conn() as c:
-        row = c.execute(
-            """SELECT trade_date,result_json,model_version,available_time
-               FROM dc_market_context_snapshot WHERE trade_date<=?
-               ORDER BY trade_date DESC LIMIT 1""",
-            (trade_date,),
-        ).fetchone()
-    if not row:
-        return {"ok": False, "status": "insufficient_data", "as_of_time": cutoff, "reason": "no_market_context_at_cutoff"}
-    item = dict(row)
+        rows = [dict(row) for row in c.execute(
+            """SELECT trade_date,result_json,model_version,available_time,created_at,updated_at
+                 FROM dc_market_context_snapshot
+                WHERE trade_date<=?
+                ORDER BY trade_date DESC""",
+            (requested_trade_date,),
+        ).fetchall()]
+
+    visible_rows = [
+        row for row in rows
+        if visible(row.get("available_time"))
+        and visible(row.get("created_at"))
+        and visible(row.get("updated_at"))
+    ]
+    if not visible_rows:
+        return {
+            "ok": False,
+            "status": "blocked",
+            "as_of_time": cutoff,
+            "snapshot_trade_date": None,
+            "reason": "no_market_context_visible_at_cutoff",
+            "point_in_time_method": "derived_snapshot_visibility_v2",
+        }
+    item = visible_rows[0]
+    snapshot_date = str(item.get("trade_date") or "").replace("-", "")[:8]
+    if snapshot_date != requested_trade_date:
+        return {
+            "ok": False,
+            "status": "blocked",
+            "as_of_time": cutoff,
+            "snapshot_trade_date": snapshot_date or None,
+            "reason": "market_context_exact_trade_date_missing",
+            "point_in_time_method": "derived_snapshot_visibility_v2",
+        }
     try:
         payload = json.loads(item.get("result_json") or "{}")
     except (TypeError, json.JSONDecodeError):
         payload = {}
+    if not isinstance(payload, dict) or not payload.get("market_state"):
+        return {
+            "ok": False,
+            "status": "blocked",
+            "as_of_time": cutoff,
+            "snapshot_trade_date": snapshot_date,
+            "reason": "market_context_snapshot_payload_invalid",
+            "point_in_time_method": "derived_snapshot_visibility_v2",
+        }
     payload["as_of_time"] = cutoff
-    payload["snapshot_trade_date"] = item.get("trade_date")
-    payload["point_in_time_method"] = "observation_date_cutoff_v1"
+    payload["snapshot_trade_date"] = snapshot_date
+    payload["snapshot_available_time"] = _normalize_pit_timestamp(item.get("available_time"))
+    payload["snapshot_created_at"] = _normalize_pit_timestamp(item.get("created_at"))
+    payload["snapshot_updated_at"] = _normalize_pit_timestamp(item.get("updated_at"))
+    payload["point_in_time_method"] = "derived_snapshot_visibility_v2"
     return payload
 
 
 def rebuild_market_context_history(limit: int = 120) -> dict[str, Any]:
-    """Materialize historical transparent-state snapshots from raw daily bars."""
+    """Materialize historical transparent-state snapshots from PIT daily bars.
+
+    The overwrite raw table is intentionally not a fallback here.  Rebuilding
+    a historical state from its latest projection would let a late correction
+    silently rewrite the evidence that was visible at that session's close.
+    """
     with _conn() as c:
-        date_rows = c.execute(
-            """SELECT DISTINCT trade_date FROM dc_tushare_raw_records
-               WHERE api_name='daily' ORDER BY trade_date DESC LIMIT ?""", (max(2, min(500, limit)),)
-        ).fetchall()
-        dates = list(reversed([str(dict(row).get("trade_date") or "") for row in date_rows]))
+        requested = max(2, min(500, limit))
+        try:
+            calendar_rows = c.execute(
+                """SELECT trade_date FROM dc_available_trade_dates
+                   ORDER BY trade_date DESC LIMIT ?""",
+                (requested,),
+            ).fetchall()
+        except Exception:
+            calendar_rows = []
+        requested_dates = sorted({
+            str(dict(row).get("trade_date") or "")
+            for row in calendar_rows
+            if len(str(dict(row).get("trade_date") or "")) == 8
+        })
+        if not requested_dates:
+            return {
+                "ok": False,
+                "status": "blocked",
+                "reason": "trade_calendar_unavailable",
+                "dates_considered": 0,
+                "snapshots_written": 0,
+            }
+        daily_rows = _strict_raw_payload_rows(
+            c,
+            "daily",
+            cutoff_by_trade_date=True,
+            trade_date_start=requested_dates[0],
+            trade_date_end=requested_dates[-1],
+        )
+        if daily_rows is None:
+            return {
+                "ok": False,
+                "status": "blocked",
+                "reason": "observation_clock_unavailable",
+                "dates_considered": 0,
+                "snapshots_written": 0,
+            }
+        rows_by_date: dict[str, list[dict[str, Any]]] = {}
+        for row in daily_rows:
+            date = str(row.get("trade_date") or "")
+            if len(date) == 8 and date.isdigit():
+                rows_by_date.setdefault(date, []).append(row)
+        dates = [date for date in requested_dates if date in rows_by_date]
         written = 0
         observation_history: list[dict[str, Any]] = []
         change_signals: list[float] = []
@@ -804,33 +1172,44 @@ def rebuild_market_context_history(limit: int = 120) -> dict[str, Any]:
             prior_dates = dates[max(0, index - 5):index]
             if not prior_dates:
                 continue
-            row = dict(c.execute(
-                """SELECT COUNT(*) total,
-                          SUM(CASE WHEN NULLIF(payload_json::jsonb->>'pct_chg','')::double precision>0 THEN 1 ELSE 0 END) rising,
-                          AVG(NULLIF(payload_json::jsonb->>'pct_chg','')::double precision/100.0) average_return,
-                          SUM(NULLIF(payload_json::jsonb->>'amount','')::double precision) amount,
-                          SUM(CASE WHEN NULLIF(payload_json::jsonb->>'pct_chg','')::double precision>=9.7 THEN 1 ELSE 0 END) limit_up,
-                          SUM(CASE WHEN NULLIF(payload_json::jsonb->>'pct_chg','')::double precision<=-9.7 THEN 1 ELSE 0 END) limit_down
-                   FROM dc_tushare_raw_records WHERE api_name='daily' AND trade_date=?""", (trade_date,)
-            ).fetchone())
-            placeholders = ",".join("?" for _ in prior_dates)
-            prior = [dict(x) for x in c.execute(
-                f"""SELECT trade_date,SUM(NULLIF(payload_json::jsonb->>'amount','')::double precision) amount
-                    FROM dc_tushare_raw_records WHERE api_name='daily' AND trade_date IN ({placeholders}) GROUP BY trade_date""", tuple(prior_dates)
-            ).fetchall()]
-            prior_amounts = [float(x.get("amount") or 0) for x in prior if float(x.get("amount") or 0) > 0]
-            total = int(row.get("total") or 0)
+            current_rows = rows_by_date.get(trade_date, [])
+            parsed_current: list[tuple[float | None, float | None]] = []
+            for item in current_rows:
+                try:
+                    change = float(item.get("pct_chg")) if item.get("pct_chg") is not None else None
+                except (TypeError, ValueError):
+                    change = None
+                try:
+                    amount = float(item.get("amount")) if item.get("amount") is not None else None
+                except (TypeError, ValueError):
+                    amount = None
+                parsed_current.append((change, amount))
+            valid_current = [(change, amount) for change, amount in parsed_current if change is not None]
+            total = len(valid_current)
             if total <= 0:
                 continue
+            current_amount = sum(amount or 0.0 for _change, amount in valid_current)
+            prior_amounts: list[float] = []
+            for prior_date in prior_dates:
+                amount = sum(
+                    float(item.get("amount") or 0.0)
+                    for item in rows_by_date.get(prior_date, [])
+                    if item.get("amount") is not None
+                )
+                if amount > 0:
+                    prior_amounts.append(amount)
             observations = {
-                "breadth": int(row.get("rising") or 0) / total,
-                "average_return": float(row.get("average_return") or 0),
-                "volume_ratio": float(row.get("amount") or 0) / (sum(prior_amounts) / len(prior_amounts)) if prior_amounts else 1.0,
-                "limit_up_ratio": int(row.get("limit_up") or 0) / total,
-                "limit_down_ratio": int(row.get("limit_down") or 0) / total,
+                "breadth": sum(1 for change, _amount in valid_current if change > 0) / total,
+                "average_return": sum(change for change, _amount in valid_current) / total / 100.0,
+                "volume_ratio": current_amount / (sum(prior_amounts) / len(prior_amounts)) if prior_amounts else 1.0,
+                "limit_up_ratio": sum(1 for change, _amount in valid_current if change >= 9.7) / total,
+                "limit_down_ratio": sum(1 for change, _amount in valid_current if change <= -9.7) / total,
                 "northbound_flow_z": 0.0, "leader_persistence": 0.0, "price_fundamental_divergence": 0.0, "crowding": 0.0,
             }
-            enrichment = _market_enrichment_observations(trade_date)
+            enrichment = _market_enrichment_observations(
+                trade_date,
+                as_of_time=f"{trade_date[:4]}-{trade_date[4:6]}-{trade_date[6:]}T15:00:00+08:00",
+            )
             observations.update({
                 key: float(enrichment[key]) if enrichment.get(key) is not None else 0.0
                 for key in ("northbound_flow_z", "leader_persistence", "price_fundamental_divergence")
@@ -846,7 +1225,7 @@ def rebuild_market_context_history(limit: int = 120) -> dict[str, Any]:
             state = _transparent_regime(score, average_return, previous_state)
             market_profile = classify_market_profile(state, observations)
             confidence = min(.85, .45 + abs(score - 50) / 100)
-            now = datetime.now().isoformat(timespec="seconds")
+            now = now_observed_at()
             payload = {"ok": True, "status": "ready", "trade_date": trade_date, "market_state": {"state": state, "label": REGIME_LABELS[state], "confidence": round(confidence, 4), "model": "transparent_four_state_v1", "reason": "历史回放固定使用当时可解释的透明四状态机，不代表当前HSMM训练历史不足"}, "market_profile": market_profile, "sentiment": sentiment, "observations": observations, "observation_evidence": enrichment.get("coverage") or {}, "change_alarm": change_alarm, "model_governance": {"production_model": "transparent_four_state_v1", "hsmm": {"status": "historical_transparent_rule", "minimum_years": 6, "state_count": 4, "profile_state_count": 12}, "bocpd": {"status": "active", "model": "bocpd_gaussian_v1"}}, "evidence": {"symbols": total, "prior_amount_dates": len(prior_amounts)}, "limitations": [], "available_time": now}
             c.execute(
                 """INSERT INTO dc_market_context_snapshot(trade_date,market_state,state_confidence,sentiment_score,observations_json,result_json,model_version,available_time,created_at,updated_at)

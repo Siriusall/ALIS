@@ -22,15 +22,12 @@ from app.db.store import (
     update_position,
 )
 from app.api.state import ensure_manual_trade_allowed
-from app.integrations.market_data_client import fetch_symbol_names, fetch_symbol_prices_with_time
+from app.integrations.market_data_client import fetch_symbol_names
 from app.schemas.execution_list import ExecutionListItem, ExecutionOrderItem
 from app.schemas.position import OperationResponse, PositionsListResponse, PositionResponse
-from app.core.trade_calendar import get_last_trade_date
-from app.services.cache_consolidation import read_consolidated_cache
-from app.services.tushare_snapshot import get_daily_snapshot
 from app.services.strategy_config import parse_strategy_content
-from app.core.a_share_fees import is_exchange_etf
-from app.services.defensive_assets import defensive_asset_bars
+from app.data_platform.db import _conn as data_conn
+from app.data_platform.services.market_calendar import TradeCalendarNotReady, target_trade_date
 
 router = APIRouter()
 _BUSINESS_TZ = ZoneInfo("Asia/Shanghai")
@@ -120,108 +117,34 @@ def get_positions() -> PositionsListResponse:
     prices_by_symbol: dict[str, float] = {}
     trade_date = ""
 
-    # 1) 优先使用 all_in_one（统一缓存入口）
+    # Current valuation must use the exact target session from the canonical
+    # exchange calendar and the PostgreSQL data-platform projection only.
     try:
-        trade_date = get_last_trade_date(for_data_availability=True).strftime("%Y%m%d")
-        payload = read_consolidated_cache(date=trade_date, symbols=symbols)
-        data = payload.get("data") if isinstance(payload, dict) else None
-        if isinstance(data, dict) and data:
-            day = data.get(trade_date, {})
-            if isinstance(day, dict):
-                for s in symbols:
-                    row = day.get(_normalize_symbol_key(s))
-                    if isinstance(row, dict):
-                        p = float(row.get("price", row.get("close", 0)) or 0)
-                        if p > 0:
-                            prices_by_symbol[s] = p
-                data_source_time = (
-                    f"{trade_date[:4]}-{trade_date[4:6]}-{trade_date[6:8]}T15:00:00"
-                )
-    except Exception:
-        pass
+        with data_conn() as c:
+            trade_date = target_trade_date(c)
+        from app.services.position_console import resolve_position_prices
 
-    # 2) 回退使用 TuShare snapshot（与折线图/日线口径一致）
-    try:
-        snap = get_daily_snapshot(cache_only=True) if len(prices_by_symbol) < len(symbols) else {}
-        if snap:
-            snap_prices_by_norm: dict[str, float] = {}
-            snap_trade_date: Optional[str] = None
-            for row in snap.values():
-                norm = _normalize_symbol_key(getattr(row, "symbol", ""))
-                close = float(getattr(row, "close", 0) or 0)
-                if norm:
-                    snap_prices_by_norm[norm] = close
-                td = str(getattr(row, "trade_date", "") or "")
-                if not snap_trade_date and len(td) == 8 and td.isdigit():
-                    snap_trade_date = td
-            for r in rows:
-                norm = _normalize_symbol_key(r["symbol"])
-                if norm in snap_prices_by_norm:
-                    prices_by_symbol[r["symbol"]] = snap_prices_by_norm[norm]
-            if snap_trade_date:
-                data_source_time = (
-                    f"{snap_trade_date[:4]}-{snap_trade_date[4:6]}-{snap_trade_date[6:8]}T15:00:00"
-                )
-    except Exception:
-        pass
+        prices_by_symbol, source_time = resolve_position_prices(symbols, trade_date)
+        data_source_time = source_time or f"{trade_date[:4]}-{trade_date[4:6]}-{trade_date[6:8]}T15:00:00+08:00"
+    except TradeCalendarNotReady as exc:
+        raise HTTPException(status_code=503, detail={"code": exc.code, "message": str(exc)}) from exc
+    except Exception as exc:  # noqa: BLE001 - data readiness must be visible to the caller
+        raise HTTPException(
+            status_code=503,
+            detail={"code": "position_market_data_not_ready", "trade_date": trade_date, "message": str(exc)[:300]},
+        ) from exc
 
-    # 3) snapshot 不全时，缺失标的再回退到 spot
     missing_symbols = [s for s in symbols if s not in prices_by_symbol]
     if missing_symbols:
-        try:
-            from app.services.position_console import resolve_position_prices
-
-            local_prices, local_time = resolve_position_prices(missing_symbols, trade_date)
-            prices_by_symbol.update(local_prices)
-            missing_symbols = [s for s in missing_symbols if s not in prices_by_symbol]
-            if local_time:
-                data_source_time = min(filter(None, [data_source_time, local_time]), default=local_time)
-        except Exception:
-            pass
-    fallback_etf_symbols = [s for s in missing_symbols if is_exchange_etf(s)]
-    still_missing: list[str] = [s for s in missing_symbols if s not in fallback_etf_symbols]
-    if fallback_etf_symbols:
-        trade_date = (
-            (data_source_time or "")[:10].replace("-", "")
-            or get_last_trade_date(for_data_availability=True).strftime("%Y%m%d")
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "position_market_data_not_ready",
+                "trade_date": trade_date,
+                "missing_symbols": missing_symbols,
+                "message": "持仓标的缺少目标交易日精确收盘数据，未使用前日、成本价或实时行情冒充",
+            },
         )
-        fallback_codes = [_etf_ts_code(str(symbol)) for symbol in fallback_etf_symbols]
-        try:
-            fallback_bars = defensive_asset_bars(fallback_codes, trade_date)
-        except Exception:
-            # A stale/overloaded data connection must not turn the read-only
-            # positions page into HTTP 500; the spot fallback below remains.
-            fallback_bars = {}
-        for symbol, ts_code in zip(fallback_etf_symbols, fallback_codes):
-            bar = fallback_bars.get(ts_code.upper())
-            p = float((bar or {}).get("close") or 0)
-            if p > 0:
-                prices_by_symbol[symbol] = p
-            else:
-                still_missing.append(symbol)
-    missing_symbols = still_missing
-    if missing_symbols:
-        try:
-            from app.services.position_console import resolve_stock_position_prices
-
-            local_prices, local_time = resolve_stock_position_prices(missing_symbols, trade_date)
-            prices_by_symbol.update(local_prices)
-            missing_symbols = [s for s in missing_symbols if s not in prices_by_symbol]
-            if local_time:
-                data_source_time = min(filter(None, [data_source_time, local_time]), default=local_time)
-        except Exception:
-            pass
-    if missing_symbols:
-        try:
-            spot_prices, spot_time = fetch_symbol_prices_with_time(missing_symbols)
-            for s in missing_symbols:
-                p = float(spot_prices.get(s) or 0)
-                if p > 0:
-                    prices_by_symbol[s] = p
-            if data_source_time is None:
-                data_source_time = spot_time
-        except Exception:
-            pass
 
     for r in rows:
         sym = r["symbol"]

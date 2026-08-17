@@ -11,6 +11,7 @@ from app.db.store import _conn
 from app.services.backtest_data_source import BacktestDataSource, HistBar, SnapshotRow
 from app.services.factor_dsl import DSL_SCHEMA_VERSION, evaluate_expression
 from app.services.point_in_time import signal_available_time
+from app.data_platform.services.observation_clock import _table_columns
 
 
 FACTOR_SCHEMA_VERSION = "alis_factor_registry_v1"
@@ -440,6 +441,12 @@ def _industry_candidate_inputs(symbols: list[str], *, trade_date: str, cutoff: s
             ).fetchall()] if requested_codes else []
             industries = sorted({str(row.get("industry") or "").strip() for row in master if str(row.get("industry") or "").strip()})
             industry_placeholders = ",".join("?" for _ in industries)
+            columns = _table_columns(conn, "dc_industry_metric_value")
+            # Industry metric values do not yet have an immutable version log.
+            # In production, a PIT request therefore returns no candidate
+            # input instead of treating the mutable ``available_time`` as proof.
+            if bool(getattr(conn, "_is_postgres", False)) and "observed_at" not in columns:
+                return {}, {}
             rows = [dict(row) for row in conn.execute(
                 f"""SELECT d.metric_code,d.industry_name,d.metric_name,d.source_code,
                           v.data_date,v.value,v.available_time

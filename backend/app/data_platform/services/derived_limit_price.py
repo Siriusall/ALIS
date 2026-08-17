@@ -9,6 +9,8 @@ from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Any
 
 from app.data_platform.db import _conn
+from app.data_platform.services.observation_clock import upsert_raw_record
+from app.data_platform.tushare_client import tushare_compatible_source_codes
 
 
 SOURCE_EXCHANGE_RULE = "exchange_rule_derived"
@@ -22,7 +24,7 @@ def _now() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
 
-def _available_time(trade_date: str) -> str:
+def _economic_available_time(trade_date: str) -> str:
     value = str(trade_date or "").replace("-", "")[:8]
     return (
         f"{value[:4]}-{value[4:6]}-{value[6:8]}T08:40:00+08:00"
@@ -167,16 +169,41 @@ def _listing_session_number(open_dates: list[str], list_date: str, trade_date: s
 
 
 def _load_st_codes(trade_date: str) -> tuple[set[str], dict[str, Any]]:
-    from app.data_platform.tushare_client import get_tushare_client
-
+    target = _normalise_date(trade_date)
     try:
-        frame = get_tushare_client().pro.query("stock_st", trade_date=_normalise_date(trade_date))
+        with _conn() as conn:
+            rows = conn.execute(
+                """SELECT ts_code,source_code FROM dc_tushare_raw_records
+                   WHERE api_name='stock_st' AND trade_date=?""",
+                (target,),
+            ).fetchall()
     except Exception as exc:  # noqa: BLE001
-        return set(), {"ok": False, "reason": "stock_st_request_failed", "error": str(exc)[:300]}
-    if frame is None or frame.empty or "ts_code" not in frame.columns:
+        return set(), {"ok": False, "reason": "stock_st_read_failed", "error": str(exc)[:300]}
+    if not rows:
+        from app.data_platform.services.data_center import sync_tushare_api_raw
+
+        result = sync_tushare_api_raw("stock_st", {"trade_date": target})
+        if not result.get("ok"):
+            return set(), {
+                "ok": False,
+                "reason": "stock_st_sync_failed",
+                "error": str(result.get("error") or result.get("status") or "")[:300],
+                "result": result,
+            }
+        try:
+            with _conn() as conn:
+                rows = conn.execute(
+                    """SELECT ts_code,source_code FROM dc_tushare_raw_records
+                       WHERE api_name='stock_st' AND trade_date=?""",
+                    (target,),
+                ).fetchall()
+        except Exception as exc:  # noqa: BLE001
+            return set(), {"ok": False, "reason": "stock_st_read_failed", "error": str(exc)[:300]}
+    codes = {str(dict(row).get("ts_code") or "") for row in rows if str(dict(row).get("ts_code") or "")}
+    if not codes:
         return set(), {"ok": False, "reason": "stock_st_empty"}
-    codes = {str(value) for value in frame["ts_code"].tolist() if str(value)}
-    return codes, {"ok": True, "rows": len(frame), "source": "configured_tushare_compatible_proxy"}
+    sources = sorted({str(dict(row).get("source_code") or "") for row in rows if str(dict(row).get("source_code") or "")})
+    return codes, {"ok": True, "rows": len(codes), "sources": sources}
 
 
 def _candidate_rows(c: Any, trade_date: str, *, require_reference: bool) -> list[dict[str, Any]]:
@@ -204,12 +231,15 @@ def calibrate_rule_engine(trade_date: str) -> dict[str, Any]:
     """Compare the rule engine with the latest earlier proxy reference slice."""
 
     target = _normalise_date(trade_date)
+    source_codes = tushare_compatible_source_codes()
+    source_placeholders = ",".join("?" for _ in source_codes)
     with _conn() as c:
         reference = c.execute(
-            """SELECT MAX(trade_date) AS value FROM dc_tushare_raw_records
-               WHERE api_name='stk_limit' AND source_code='tushare' AND trade_date<?
+            f"""SELECT MAX(trade_date) AS value FROM dc_tushare_raw_records
+               WHERE api_name='stk_limit' AND source_code IN ({source_placeholders})
+                 AND trade_date<?
                GROUP BY trade_date HAVING COUNT(*)>=? ORDER BY trade_date DESC LIMIT 1""",
-            (target, MIN_CALIBRATION_OBSERVATIONS),
+            (*source_codes, target, MIN_CALIBRATION_OBSERVATIONS),
         ).fetchone()
         reference_date = str(dict(reference).get("value") or "") if reference else ""
         if not reference_date:
@@ -338,7 +368,7 @@ def repair_stk_limit_from_exchange_rules(trade_date: str) -> dict[str, Any]:
 
     _ensure_source()
     now = _now()
-    available_time = _available_time(target)
+    economic_time = _economic_available_time(target)
     with _conn() as c:
         for ts_code, result in accepted.items():
             quote = tencent_quotes.get(ts_code)
@@ -355,25 +385,13 @@ def repair_stk_limit_from_exchange_rules(trade_date: str) -> dict[str, Any]:
                 "calibration_match_rate": calibration["match_rate"],
                 "tencent_quote_time": str((quote or {}).get("quote_time") or ""),
             }
-            c.execute(
-                """INSERT INTO dc_tushare_raw_records
-                   (api_name,record_key,ts_code,trade_date,period,ann_date,payload_json,
-                    source_code,available_time,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)
-                   ON CONFLICT(api_name,record_key) DO UPDATE SET
-                    payload_json=excluded.payload_json,source_code=excluded.source_code,
-                    available_time=excluded.available_time,updated_at=excluded.updated_at""",
-                (
-                    "stk_limit",
-                    f"stk_limit:{target}:{ts_code}",
-                    ts_code,
-                    target,
-                    "",
-                    "",
-                    json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
-                    SOURCE_EXCHANGE_RULE,
-                    available_time,
-                    now,
-                ),
+            upsert_raw_record(
+                c, api_name="stk_limit", record_key=f"stk_limit:{target}:{ts_code}",
+                ts_code=ts_code, trade_date=target, payload=payload, source_code=SOURCE_EXCHANGE_RULE,
+                observed_at=now, economic_time=economic_time,
+                # This is a gap repair.  Do not overwrite a provider that won
+                # the same publication race after the missing set was read.
+                provenance="exchange_rule_derived:calibrated",
             )
     return {
         "ok": bool(accepted),

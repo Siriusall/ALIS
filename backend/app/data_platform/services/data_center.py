@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import math
 import os
 import time
 import threading
@@ -16,9 +17,25 @@ import pandas as pd
 import requests
 
 from app.data_platform.db import _conn, _is_mysql
-from app.data_platform.tushare_client import get_tushare_client, reset_tushare_client
+from app.data_platform.tushare_client import (
+    configured_tushare_probe_endpoints,
+    get_tushare_client,
+    get_tushare_client_for_provider,
+    is_tushare_compatible_source,
+    reset_tushare_client,
+    tushare_compatible_source_codes,
+)
 from app.data_platform.services.runtime_logs import write_runtime_log
 from app.data_platform.redis_store import set_add as redis_set_add, set_remove as redis_set_remove
+from app.data_platform.services.observation_clock import (
+    append_raw_record_version,
+    append_snapshot_version,
+    economic_available_time,
+    load_raw_record_versions,
+    observation_metadata,
+    payload_content_hash,
+)
+from app.core.sql_compat import qmark_to_pyformat
 
 SOURCE_TUSHARE = "tushare"
 SOURCE_CNINFO = "cninfo"
@@ -35,6 +52,10 @@ _tushare_global_cooldown_until = 0.0
 _tushare_reduced_concurrency_until = 0.0
 _tushare_reduced_concurrency = 0
 TUSHARE_RATE_LIMIT_COOLDOWN_SECONDS = int(os.getenv("TUSHARE_RATE_LIMIT_COOLDOWN_SECONDS", "180") or 180)
+TUSHARE_HARD_FAILURE_COOLDOWN_SECONDS = max(
+    600,
+    min(int(os.getenv("TUSHARE_HARD_FAILURE_COOLDOWN_SECONDS", "86400") or 86400), 7 * 86400),
+)
 STK_LIMIT_PAGE_SIZE = max(500, min(int(os.getenv("TUSHARE_STK_LIMIT_PAGE_SIZE", "5800") or 5800), 5800))
 STK_LIMIT_MAX_PAGES = max(2, min(int(os.getenv("TUSHARE_STK_LIMIT_MAX_PAGES", "4") or 4), 10))
 STK_LIMIT_GAP_BATCH_SIZE = max(3, min(int(os.getenv("TUSHARE_STK_LIMIT_GAP_BATCH_SIZE", "25") or 25), 100))
@@ -219,10 +240,12 @@ TUSHARE_CATALOG: list[TushareCatalogItem] = [
 
 
 def _now() -> str:
-    # The rest of the data platform stores naive timestamps in the host
-    # timezone (Asia/Shanghai). UTC here made live activity appear eight hours
-    # behind and corrupted elapsed/ETA presentation in the frontend.
-    return datetime.now().isoformat(timespec="seconds")
+    # All persisted clocks are explicit business instants.  A naive 15:00
+    # cutoff compares incorrectly with later ``+08:00`` observations when a
+    # consumer uses string ordering, and loses the evidence needed for PIT.
+    from zoneinfo import ZoneInfo
+
+    return datetime.now(ZoneInfo("Asia/Shanghai")).isoformat(timespec="seconds")
 
 
 class EmptyTushareResult(RuntimeError):
@@ -326,7 +349,7 @@ def resolve_covered_failed_tushare_requests(*, limit: int = 500) -> dict[str, An
             resolved_rows = [(_now(), request_id) for request_id in ids]
             cursor = c.raw.cursor() if bool(getattr(c, "_is_postgres", False)) else c.raw
             cursor.executemany(
-                resolved_sql.replace("?", "%s") if bool(getattr(c, "_is_postgres", False)) else resolved_sql,
+                qmark_to_pyformat(resolved_sql) if bool(getattr(c, "_is_postgres", False)) else resolved_sql,
                 resolved_rows,
             )
     for row in rows:
@@ -490,13 +513,29 @@ def ensure_data_center_seeded() -> dict[str, Any]:
 def _seed_data_center_catalog() -> dict[str, Any]:
     now = _now()
     with _conn() as c:
-        for values in (
+        source_rows = [
             (SOURCE_TUSHARE, "TuShare Pro", "api", 10, "active", "A股行情、财务、股东、分红、指数等结构化数据主通道", now, now),
             (SOURCE_CNINFO, "巨潮资讯", "crawler", 20, "active", "A股公告元数据、公告正文和附件主通道", now, now),
             (SOURCE_EXCHANGE_PCF, "沪深交易所 ETF PCF", "exchange_api", 15, "active", "上交所与深交所每日申购赎回篮子官方数据", now, now),
             ("official_policy", "主管部门公开政策与供给文件", "official_web", 25, "active", "发改委、工信部、能源局、海关和统计局公开目录；保留原文链接与可用时间", now, now),
             (SOURCE_MANUAL, "手工/公开行业指标", "manual", 30, "active", "行业景气指标定义和值的人工维护或脚本导入通道", now, now),
-        ):
+        ]
+        for provider, endpoint in configured_tushare_probe_endpoints():
+            if provider == SOURCE_TUSHARE:
+                continue
+            source_rows.append(
+                (
+                    provider,
+                    f"TuShare兼容源：{provider}",
+                    "api_proxy",
+                    12,
+                    "active",
+                    f"TuShare兼容数据端点（仅在探针胜出且全量合同通过后使用）：{endpoint}",
+                    now,
+                    now,
+                )
+            )
+        for values in source_rows:
             if c._is_mysql:
                 c.execute(
                     """
@@ -579,15 +618,21 @@ def _seed_data_center_catalog() -> dict[str, Any]:
     return {"ok": True, "source": SOURCE_TUSHARE, "catalog_count": len(TUSHARE_CATALOG)}
 
 
-def start_ingestion_run(job_name: str, meta: dict[str, Any] | None = None) -> int:
+def start_ingestion_run(
+    job_name: str,
+    meta: dict[str, Any] | None = None,
+    *,
+    source_code: str = SOURCE_TUSHARE,
+) -> int:
     now = _now()
+    source = str(source_code or SOURCE_TUSHARE).strip() or SOURCE_TUSHARE
     with _conn() as c:
         c.execute(
             """
             INSERT INTO data_ingestion_runs (job_name, source_code, status, started_at, rows_read, rows_written, meta_json)
             VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
-            (job_name, SOURCE_TUSHARE, "running", now, 0, 0, json.dumps(meta or {}, ensure_ascii=False)),
+            (job_name, source, "running", now, 0, 0, json.dumps(meta or {}, ensure_ascii=False)),
         )
         return c.last_insert_id()
 
@@ -953,9 +998,15 @@ def _catalog_item(api_name: str) -> TushareCatalogItem:
     raise ValueError(f"Unsupported TuShare API: {api_name}")
 
 
-def _call_tushare_api(api_name: str, params: dict[str, Any] | None = None, fields: str | None = None) -> pd.DataFrame:
+def _call_tushare_api(
+    api_name: str,
+    params: dict[str, Any] | None = None,
+    fields: str | None = None,
+    *,
+    provider: str = SOURCE_TUSHARE,
+) -> pd.DataFrame:
     item = _catalog_item(api_name)
-    client = get_tushare_client()
+    client = get_tushare_client_for_provider(provider)
     kwargs = {k: v for k, v in {**item.params, **(params or {})}.items() if v not in (None, "")}
     use_fields = fields or item.fields
     fn = getattr(client.pro, api_name, None)
@@ -966,7 +1017,13 @@ def _call_tushare_api(api_name: str, params: dict[str, Any] | None = None, field
     return value if isinstance(value, pd.DataFrame) else pd.DataFrame()
 
 
-def sync_tushare_api_raw(api_name: str, params: dict[str, Any] | None = None, *, limit_rows: int | None = None) -> dict[str, Any]:
+def sync_tushare_api_raw(
+    api_name: str,
+    params: dict[str, Any] | None = None,
+    *,
+    limit_rows: int | None = None,
+    provider: str = SOURCE_TUSHARE,
+) -> dict[str, Any]:
     """Sync any catalogued TuShare API into dc_tushare_raw_records."""
 
     ensure_data_center_seeded()
@@ -975,7 +1032,18 @@ def sync_tushare_api_raw(api_name: str, params: dict[str, Any] | None = None, *,
     if cooldown > 0:
         _emit_tushare_activity("cooldown", api_name, params or {}, seconds=cooldown)
         raise TushareCoolingDown(api_name, cooldown)
-    run_id = start_ingestion_run(f"tushare.{api_name}", {"api": api_name, "params": params or {}, "limit_rows": limit_rows})
+    provider = str(provider or SOURCE_TUSHARE).strip() or SOURCE_TUSHARE
+    run_meta = {
+        "api": api_name,
+        "params": params or {},
+        "limit_rows": limit_rows,
+        "provider": provider,
+    }
+    run_id = start_ingestion_run(
+        f"{provider}.{api_name}",
+        run_meta,
+        source_code=provider,
+    )
     request_params = params or {}
     try:
         retry_delays = (1.0, 3.0, 8.0)
@@ -984,7 +1052,9 @@ def sync_tushare_api_raw(api_name: str, params: dict[str, Any] | None = None, *,
         for attempt in range(len(retry_delays) + 1):
             try:
                 _emit_tushare_activity("request", api_name, request_params, attempt=attempt + 1)
-                df = _call_tushare_api(api_name, params=request_params, fields=item.fields)
+                df = _call_tushare_api(
+                    api_name, params=request_params, fields=item.fields, provider=provider,
+                )
                 _emit_tushare_activity("response", api_name, request_params, attempt=attempt + 1, rows=len(df))
                 last_exc = None
                 break
@@ -1000,7 +1070,8 @@ def sync_tushare_api_raw(api_name: str, params: dict[str, Any] | None = None, *,
                     error=str(exc)[:300],
                 )
                 if category == "authentication" and attempt == 0:
-                    reset_tushare_client()
+                    if provider == SOURCE_TUSHARE:
+                        reset_tushare_client()
                     continue
                 if category == "rate_limit":
                     _activate_rate_limit_cooldown(api_name)
@@ -1027,7 +1098,9 @@ def sync_tushare_api_raw(api_name: str, params: dict[str, Any] | None = None, *,
             if ts_code and period:
                 broad_params = {k: v for k, v in request_params.items() if k not in {"period", "start_date", "end_date"}}
                 _emit_tushare_activity("request", api_name, broad_params, attempt="period_fallback")
-                broad = _call_tushare_api(api_name, params=broad_params, fields=item.fields)
+                broad = _call_tushare_api(
+                    api_name, params=broad_params, fields=item.fields, provider=provider,
+                )
                 if isinstance(broad, pd.DataFrame) and not broad.empty:
                     period_col = "end_date" if "end_date" in broad.columns else ("period" if "period" in broad.columns else "")
                     if period_col:
@@ -1049,7 +1122,10 @@ def sync_tushare_api_raw(api_name: str, params: dict[str, Any] | None = None, *,
             ts_code = str(request_params.get("ts_code") or "")
             period = str(request_params.get("period") or "")
             if _period_not_applicable(ts_code, period):
-                finish_ingestion_run(run_id, status="not_applicable", rows_read=0, rows_written=0, meta={"api": api_name, "params": request_params, "reason": "listed_after_period"})
+                finish_ingestion_run(
+                    run_id, status="not_applicable", rows_read=0, rows_written=0,
+                    meta={**run_meta, "reason": "listed_after_period"},
+                )
                 _record_request_coverage(api_name, request_params, limit_rows, 0, result_status="not_applicable", result_reason="listed_after_period")
                 _emit_tushare_activity("skipped", api_name, request_params, rows=0, written=0, category="not_applicable", error="股票上市日晚于报告期")
                 return {"ok": True, "api": api_name, "run_id": run_id, "rows_read": 0, "rows_written": 0, "not_applicable": True}
@@ -1058,7 +1134,10 @@ def sync_tushare_api_raw(api_name: str, params: dict[str, Any] | None = None, *,
                 or (api_name == "fund_nav" and _mature_fund_nav_empty(request_params))
                 or _mature_optional_daily_empty(api_name, request_params)
             ):
-                finish_ingestion_run(run_id, status="valid_empty", rows_read=0, rows_written=0, meta={"api": api_name, "params": request_params, "reason": "no_optional_event"})
+                finish_ingestion_run(
+                    run_id, status="valid_empty", rows_read=0, rows_written=0,
+                    meta={**run_meta, "reason": "no_optional_event"},
+                )
                 _record_request_coverage(api_name, request_params, limit_rows, 0, result_status="valid_empty", result_reason="no_optional_event")
                 _resolve_failed_tushare_request(api_name, request_params, limit_rows)
                 _emit_tushare_activity("skipped", api_name, request_params, rows=0, written=0, category="valid_empty", error="该范围内无可选事件")
@@ -1066,8 +1145,11 @@ def sync_tushare_api_raw(api_name: str, params: dict[str, Any] | None = None, *,
             raise EmptyTushareResult(
                 f"Tushare {api_name} 返回为空，待下一轮复核（empty_pending）"
             )
-        written = _upsert_raw_records(api_name, df)
-        finish_ingestion_run(run_id, status="completed", rows_read=len(df), rows_written=written, meta={"api": api_name, "params": params or {}})
+        written = _upsert_raw_records(api_name, df, source_code=provider)
+        finish_ingestion_run(
+            run_id, status="completed", rows_read=len(df), rows_written=written,
+            meta=run_meta,
+        )
         _record_probe(api_name, "ok" if written else "empty", len(df))
         _record_request_coverage(api_name, request_params, limit_rows, len(df))
         _resolve_failed_tushare_request(api_name, request_params, limit_rows)
@@ -1077,7 +1159,10 @@ def sync_tushare_api_raw(api_name: str, params: dict[str, Any] | None = None, *,
         return {"ok": True, "api": api_name, "run_id": run_id, "rows_read": len(df), "rows_written": written}
     except Exception as exc:  # noqa: BLE001
         category = classify_tushare_error(exc)
-        finish_ingestion_run(run_id, status="failed", rows_read=0, rows_written=0, error=str(exc), meta={"api": api_name, "params": params or {}})
+        finish_ingestion_run(
+            run_id, status="failed", rows_read=0, rows_written=0,
+            error=str(exc), meta=run_meta,
+        )
         _record_probe(api_name, "failed", 0, str(exc))
         _record_failed_tushare_request(api_name, request_params, limit_rows, category, str(exc))
         raise
@@ -1126,7 +1211,12 @@ def refresh_cn_ppi_from_first_source(*, today: date | None = None) -> dict[str, 
             headline_frame = fetch_eastmoney_ppi_headline(
                 target_month, timeout_seconds=float(os.getenv("RESEARCH_PROBE_TIMEOUT_SECONDS", "12")),
             )
-            headline_written = _upsert_raw_records("cn_ppi_headline", headline_frame) if not headline_frame.empty else 0
+            headline_written = (
+                _upsert_raw_records(
+                    "cn_ppi_headline", headline_frame, source_code="eastmoney_ppi_headline",
+                )
+                if not headline_frame.empty else 0
+            )
             headline = {
                 "status": "available" if not headline_frame.empty else "not_published",
                 "provider": "eastmoney_ppi_headline", "rows": len(headline_frame),
@@ -1165,17 +1255,19 @@ def refresh_cn_ppi_from_first_source(*, today: date | None = None) -> dict[str, 
     frame = discovery.get("frame")
     if not isinstance(frame, pd.DataFrame) or frame.empty:
         return {"ok": True, "status": "observing", "reason": "winner_returned_empty", "target_month": target_month}
+    provider = str(discovery.get("winner") or SOURCE_TUSHARE).strip() or SOURCE_TUSHARE
+    run_meta = {
+        "api": "cn_ppi", "target_month": target_month, "provider": provider,
+        "endpoint": discovery.get("endpoint"),
+    }
     run_id = start_ingestion_run(
-        "tushare.cn_ppi.first_source", {
-            "api": "cn_ppi", "target_month": target_month, "provider": discovery.get("winner"),
-            "endpoint": discovery.get("endpoint"),
-        },
+        f"{provider}.cn_ppi.first_source", run_meta, source_code=provider,
     )
     try:
-        written = _upsert_raw_records("cn_ppi", frame)
+        written = _upsert_raw_records("cn_ppi", frame, source_code=provider)
         finish_ingestion_run(
             run_id, status="completed", rows_read=len(frame), rows_written=written,
-            meta={"target_month": target_month, "provider": discovery.get("winner"), "probe_contract": discovery.get("probe_contract")},
+            meta={**run_meta, "probe_contract": discovery.get("probe_contract")},
         )
         _record_probe("cn_ppi", "ok", len(frame))
         _record_request_coverage("cn_ppi", {}, None, len(frame))
@@ -1190,7 +1282,10 @@ def refresh_cn_ppi_from_first_source(*, today: date | None = None) -> dict[str, 
             "discovery": {key: value for key, value in discovery.items() if key != "frame"},
         }
     except Exception as exc:  # noqa: BLE001
-        finish_ingestion_run(run_id, status="failed", rows_read=0, rows_written=0, error=str(exc))
+        finish_ingestion_run(
+            run_id, status="failed", rows_read=0, rows_written=0,
+            error=str(exc), meta=run_meta,
+        )
         raise
 
 
@@ -1482,21 +1577,174 @@ def resolve_superseded_failed_requests_by_id(request_ids: list[int], *, limit: i
     }
 
 
-def _upsert_raw_records(api_name: str, df: pd.DataFrame) -> int:
+_MARKET_RECONCILIATION_FIELDS: dict[str, tuple[str, ...]] = {
+    "daily": (
+        "open", "high", "low", "close", "pre_close", "change", "pct_chg", "vol", "amount",
+    ),
+    "daily_basic": (
+        "turnover_rate", "volume_ratio", "pe_ttm", "pb", "total_mv", "circ_mv",
+    ),
+    "stk_limit": ("up_limit", "down_limit"),
+}
+
+
+def _market_field_present(value: Any) -> bool:
+    """Treat null, blank and non-finite provider values as unavailable."""
+
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return False
+    try:
+        return math.isfinite(float(value))
+    except (TypeError, ValueError):
+        # Non-numeric market metadata (for example a source label) is still a
+        # valid non-empty field; numeric validation belongs to the slice gate.
+        return True
+
+
+def _merge_verified_market_fallback_fields(
+    api_name: str,
+    primary_payload: dict[str, Any],
+    fallback_payload: dict[str, Any],
+    fallback_source: str,
+    *,
+    primary_source: str = SOURCE_TUSHARE,
+) -> tuple[dict[str, Any], dict[str, str]]:
+    """Preserve verified fallback fields absent from a later primary response.
+
+    The returned payload is the canonical late-source evidence version.
+    Restricting the merge to documented market fields prevents stale
+    observation metadata from the fallback record becoming provenance for a
+    new TuShare version.  The current projection may remain pinned to the
+    first verified provider and is restored after this evidence write.
+    """
+
+    merged = dict(primary_payload)
+    prior_sources = fallback_payload.get("_field_sources")
+    field_sources = dict(prior_sources) if isinstance(prior_sources, dict) else {}
+    for field, value in primary_payload.items():
+        if not field.startswith("_") and _market_field_present(value):
+            field_sources[field] = str(primary_source or SOURCE_TUSHARE)
+    for field in _MARKET_RECONCILIATION_FIELDS[api_name]:
+        if _market_field_present(primary_payload.get(field)):
+            continue
+        fallback_value = fallback_payload.get(field)
+        if _market_field_present(fallback_value):
+            merged[field] = fallback_value
+            field_sources[field] = str(field_sources.get(field) or fallback_source)
+    return merged, field_sources
+
+
+# These providers can win the publication probe for a market slice.  Once a
+# migrated current projection has an observation hash from one of them, a
+# later TuShare response is evidence-only and must not silently replace the
+# accepted source.  The immutable version table still retains that response
+# for reconciliation/audit.
+_FIRST_SOURCE_PRESERVE_PROVIDERS = frozenset({
+    "tencent_market_snapshot",
+    "tencent_etf_quote_fallback",
+    "eastmoney_index_daily_fallback",
+    "sina_index_daily_fallback",
+    "tencent_quote_fallback",
+})
+
+
+def _restore_first_source_projection(
+    c: Any,
+    *,
+    api_name: str,
+    record_key: str,
+    previous: dict[str, Any],
+    observation_columns_ready: bool,
+) -> bool:
+    """Restore a verified first-source projection after evidence-only writes."""
+
+    source = str(previous.get("source_code") or "").strip()
+    if source not in _FIRST_SOURCE_PRESERVE_PROVIDERS:
+        return False
+    # A legacy row has no trustworthy accepted clock/hash and must not acquire
+    # first-source semantics merely because its source label looks familiar.
+    if not str(previous.get("content_hash") or "").strip():
+        return False
+    if observation_columns_ready:
+        c.execute(
+            """UPDATE dc_tushare_raw_records
+                  SET payload_json=?,source_code=?,available_time=?,
+                      economic_available_time=?,observed_at=?,first_observed_at=?,
+                      observation_provenance=?,content_hash=?,updated_at=?
+                WHERE api_name=? AND record_key=?""",
+            (
+                previous.get("payload_json") or "{}",
+                previous.get("source_code") or source,
+                previous.get("available_time") or previous.get("observed_at") or "",
+                previous.get("economic_available_time") or "",
+                previous.get("observed_at") or "",
+                previous.get("first_observed_at") or previous.get("observed_at") or "",
+                previous.get("observation_provenance") or "",
+                previous.get("content_hash") or "",
+                previous.get("updated_at") or "",
+                api_name,
+                record_key,
+            ),
+        )
+    else:
+        c.execute(
+            """UPDATE dc_tushare_raw_records
+                  SET payload_json=?,source_code=?,available_time=?,updated_at=?
+                WHERE api_name=? AND record_key=?""",
+            (
+                previous.get("payload_json") or "{}",
+                previous.get("source_code") or source,
+                previous.get("available_time") or "",
+                previous.get("updated_at") or "",
+                api_name,
+                record_key,
+            ),
+        )
+    return True
+
+
+def _upsert_raw_records(
+    api_name: str,
+    df: pd.DataFrame,
+    *,
+    source_code: str = SOURCE_TUSHARE,
+) -> int:
     if not isinstance(df, pd.DataFrame) or df.empty:
         return 0
+    record_source = str(source_code or SOURCE_TUSHARE).strip() or SOURCE_TUSHARE
     now = _now()
     returned_fields = sorted(str(column) for column in df.columns)
     written = 0
     field_audit: dict[tuple[str, str, str], dict[str, float]] = {}
     with _conn() as c:
+        try:
+            if bool(getattr(c, "_is_postgres", False)):
+                columns = {
+                    str(row["column_name"])
+                    for row in c.execute(
+                        "SELECT column_name FROM information_schema.columns WHERE table_schema='public' AND table_name='dc_tushare_raw_records'"
+                    ).fetchall()
+                }
+            else:
+                columns = {
+                    str(row["name"])
+                    for row in c.execute("PRAGMA table_info(dc_tushare_raw_records)").fetchall()
+                }
+        except Exception:
+            if bool(getattr(c, "_is_postgres", False)):
+                raise RuntimeError("observation_clock_schema_inspection_failed")
+            columns = set()
+        observation_columns_ready = {
+            "economic_available_time", "observed_at", "first_observed_at",
+            "observation_provenance", "content_hash",
+        }.issubset(columns)
         if api_name in {"cn_ppi", "cn_ppi_headline", "cn_cpi"}:
             _normalize_monthly_raw_record_keys(c, api_name)
         for idx, row in df.iterrows():
             payload = _clean_payload(row.to_dict())
             if api_name in {"daily", "daily_basic", "stk_limit"}:
                 payload["_field_sources"] = {
-                    field: SOURCE_TUSHARE for field, value in payload.items()
+                    field: record_source for field, value in payload.items()
                     if not field.startswith("_") and value is not None
                 }
                 payload["_field_source_contract"] = "alis_market_field_lineage_v1"
@@ -1507,16 +1755,32 @@ def _upsert_raw_records(api_name: str, df: pd.DataFrame) -> int:
             trade_date = str(payload.get("trade_date") or payload.get("report_date") or payload.get("nav_date") or payload.get("date") or payload.get("month") or payload.get("MONTH") or payload.get("quarter") or "").strip()
             period = str(payload.get("period") or payload.get("end_date") or "").strip()
             ann_date = str(payload.get("ann_date") or "").strip()
-            available_time = _point_in_time_available_time(api_name, payload, fallback=now)
+            # The immutable version must contain the final canonical payload,
+            # including any verified non-null fields retained from a faster
+            # fallback source.  Build observation metadata only after source
+            # reconciliation so its content hash describes that payload.
             record_key = _record_key(api_name, payload, idx)
+            previous_item: dict[str, Any] = {}
+            preserve_first_source = False
             if api_name == "index_daily" and ts_code == "000300.SH":
+                previous_columns = (
+                    "source_code,payload_json,available_time,economic_available_time,observed_at,"
+                    "first_observed_at,observation_provenance,content_hash,updated_at"
+                    if observation_columns_ready
+                    else "source_code,payload_json,available_time,updated_at"
+                )
                 previous = c.execute(
-                    """SELECT source_code,payload_json FROM dc_tushare_raw_records
+                    f"""SELECT {previous_columns} FROM dc_tushare_raw_records
                        WHERE api_name=? AND record_key=? LIMIT 1""",
                     (api_name, record_key),
                 ).fetchone()
                 previous_item = dict(previous) if previous else {}
                 previous_source = str(previous_item.get("source_code") or "")
+                preserve_first_source = (
+                    observation_columns_ready
+                    and previous_source in _FIRST_SOURCE_PRESERVE_PROVIDERS
+                    and bool(str(previous_item.get("content_hash") or "").strip())
+                )
                 if previous_source in {"eastmoney_index_daily_fallback", "sina_index_daily_fallback"}:
                     try:
                         previous_payload = json.loads(previous_item.get("payload_json") or "{}")
@@ -1553,13 +1817,24 @@ def _upsert_raw_records(api_name: str, df: pd.DataFrame) -> int:
                         "reconciled_at": now,
                     })
             elif api_name in {"daily", "daily_basic", "stk_limit"}:
+                previous_columns = (
+                    "source_code,payload_json,available_time,economic_available_time,observed_at,"
+                    "first_observed_at,observation_provenance,content_hash,updated_at"
+                    if observation_columns_ready
+                    else "source_code,payload_json,available_time,updated_at"
+                )
                 previous = c.execute(
-                    """SELECT source_code,payload_json FROM dc_tushare_raw_records
+                    f"""SELECT {previous_columns} FROM dc_tushare_raw_records
                        WHERE api_name=? AND record_key=? LIMIT 1""",
                     (api_name, record_key),
                 ).fetchone()
                 previous_item = dict(previous) if previous else {}
                 previous_source = str(previous_item.get("source_code") or "")
+                preserve_first_source = (
+                    observation_columns_ready
+                    and previous_source in _FIRST_SOURCE_PRESERVE_PROVIDERS
+                    and bool(str(previous_item.get("content_hash") or "").strip())
+                )
                 if previous_source == "tencent_market_snapshot":
                     try:
                         previous_payload = json.loads(previous_item.get("payload_json") or "{}")
@@ -1574,8 +1849,9 @@ def _upsert_raw_records(api_name: str, df: pd.DataFrame) -> int:
                         "stk_limit": {"up_limit": 0.011, "down_limit": 0.011},
                     }[api_name]
                     mismatches = []
+                    primary_payload = dict(payload)
                     for field, tolerance in tolerances.items():
-                        left, right = payload.get(field), previous_payload.get(field)
+                        left, right = primary_payload.get(field), previous_payload.get(field)
                         if left is None or right is None:
                             continue
                         try:
@@ -1598,11 +1874,18 @@ def _upsert_raw_records(api_name: str, df: pd.DataFrame) -> int:
                         except (TypeError, ValueError):
                             mismatches.append(field)
                     status = "conflict_primary_selected" if mismatches else "matched_primary"
-                    previous_sources = previous_payload.get("_field_sources")
-                    field_sources = dict(previous_sources) if isinstance(previous_sources, dict) else {}
-                    for field in returned_fields:
-                        if not field.startswith("_") and payload.get(field) is not None:
-                            field_sources[field] = SOURCE_TUSHARE
+                    # Keep the late-source evidence complete for audit, but
+                    # never copy fallback observation metadata into the new
+                    # TuShare version.  If this fallback row was already the
+                    # accepted publication winner, the projection is restored
+                    # after the append below.
+                    payload, field_sources = _merge_verified_market_fallback_fields(
+                        api_name,
+                        primary_payload,
+                        previous_payload,
+                        previous_source,
+                        primary_source=record_source,
+                    )
                     payload.update({
                         "pending_primary_reconciliation": False,
                         "fallback_reconciliation_status": status,
@@ -1622,12 +1905,29 @@ def _upsert_raw_records(api_name: str, df: pd.DataFrame) -> int:
                                 f"{api_name}:{ts_code}:{trade_date}",
                                 "warning",
                                 "medium",
-                                "腾讯先到切片与后到 TuShare 主源存在字段差异，已保留冲突证据并采用主源修订",
+                                "腾讯先到切片与后到结构化源存在字段差异，已保留冲突证据并采用后到修订",
                                 1,
                                 now,
                                 _strict_json({"fallback_source": previous_source, "mismatched_fields": mismatches}),
                             ),
                         )
+            # ``available_time`` is retained as a compatibility alias, but it
+            # now carries the real observation clock.  The economic market
+            # date is stored separately and never used as proof of historical
+            # availability.  This must happen after reconciliation so the
+            # immutable version and current projection receive the same
+            # canonical field set and hash.
+            metadata = observation_metadata(
+                api_name,
+                payload,
+                source_code=record_source,
+                observed_at=now,
+                economic_time=economic_available_time(api_name, payload, fallback=""),
+                provenance=f"{record_source}:direct_fetch",
+            )
+            payload.update({key: value for key, value in metadata.items() if key != "content_hash"})
+            payload["content_hash"] = metadata["content_hash"]
+            available_time = metadata["observed_at"]
             if api_name == "stk_holdernumber":
                 end_date = str(payload.get("end_date") or "")
                 holder_num = payload.get("holder_num")
@@ -1649,16 +1949,61 @@ def _upsert_raw_records(api_name: str, df: pd.DataFrame) -> int:
                 period,
                 ann_date,
                 _strict_json(payload),
-                SOURCE_TUSHARE,
+                record_source,
                 available_time,
+                metadata["economic_available_time"],
+                metadata["observed_at"],
+                metadata["first_observed_at"],
+                metadata["observation_provenance"],
+                metadata["content_hash"],
                 now,
             )
-            if c._is_mysql:
+            legacy_values = values[:9] + (now,)
+            # Append the immutable source version before touching the current
+            # projection.  A repeated identical response is idempotent; a
+            # revised payload or provider becomes a new evidence version.
+            try:
+                append_raw_record_version(
+                    c,
+                    api_name=api_name,
+                    record_key=record_key,
+                    ts_code=ts_code,
+                    trade_date=trade_date,
+                    period=period,
+                    ann_date=ann_date,
+                    payload_json=_strict_json(payload),
+                    source_code=record_source,
+                    metadata=metadata,
+                    created_at=now,
+                )
+            except Exception:
+                # A PostgreSQL projection is never authoritative without its
+                # append-only evidence.  Raise inside the surrounding write
+                # transaction so the current row cannot be committed alone.
+                if bool(getattr(c, "_is_postgres", False)):
+                    raise
+            if not observation_columns_ready:
+                # Small isolated test fixtures and pre-migration replicas use
+                # the legacy projection.  They are intentionally not strict
+                # PIT-ready, but ingestion remains backward compatible.
+                c.execute(
+                    """INSERT INTO dc_tushare_raw_records
+                       (api_name,record_key,ts_code,trade_date,period,ann_date,payload_json,source_code,available_time,updated_at)
+                       VALUES(?,?,?,?,?,?,?,?,?,?)
+                       ON CONFLICT(api_name,record_key) DO UPDATE SET
+                         ts_code=excluded.ts_code,trade_date=excluded.trade_date,
+                         period=excluded.period,ann_date=excluded.ann_date,
+                         payload_json=excluded.payload_json,source_code=excluded.source_code,
+                         available_time=excluded.available_time,updated_at=excluded.updated_at""",
+                    legacy_values,
+                )
+            elif c._is_mysql:
                 c.execute(
                     """
                     INSERT INTO dc_tushare_raw_records
-                        (api_name, record_key, ts_code, trade_date, period, ann_date, payload_json, source_code, available_time, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        (api_name, record_key, ts_code, trade_date, period, ann_date, payload_json, source_code, available_time,
+                         economic_available_time, observed_at, first_observed_at, observation_provenance, content_hash, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON DUPLICATE KEY UPDATE
                         ts_code = VALUES(ts_code),
                         trade_date = VALUES(trade_date),
@@ -1667,6 +2012,11 @@ def _upsert_raw_records(api_name: str, df: pd.DataFrame) -> int:
                         payload_json = VALUES(payload_json),
                         source_code = VALUES(source_code),
                         available_time = VALUES(available_time),
+                        economic_available_time = VALUES(economic_available_time),
+                        observed_at = VALUES(observed_at),
+                        first_observed_at = COALESCE(first_observed_at, VALUES(first_observed_at)),
+                        observation_provenance = VALUES(observation_provenance),
+                        content_hash = VALUES(content_hash),
                         updated_at = VALUES(updated_at)
                     """,
                     values,
@@ -1675,8 +2025,9 @@ def _upsert_raw_records(api_name: str, df: pd.DataFrame) -> int:
                 c.execute(
                     """
                     INSERT INTO dc_tushare_raw_records
-                        (api_name, record_key, ts_code, trade_date, period, ann_date, payload_json, source_code, available_time, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        (api_name, record_key, ts_code, trade_date, period, ann_date, payload_json, source_code, available_time,
+                         economic_available_time, observed_at, first_observed_at, observation_provenance, content_hash, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(api_name, record_key) DO UPDATE SET
                         ts_code = excluded.ts_code,
                         trade_date = excluded.trade_date,
@@ -1699,11 +2050,24 @@ def _upsert_raw_records(api_name: str, df: pd.DataFrame) -> int:
                         )::text,
                         source_code = excluded.source_code,
                         available_time = excluded.available_time,
+                        economic_available_time = excluded.economic_available_time,
+                        observed_at = excluded.observed_at,
+                        first_observed_at = CASE WHEN dc_tushare_raw_records.first_observed_at='' THEN excluded.first_observed_at ELSE dc_tushare_raw_records.first_observed_at END,
+                        observation_provenance = excluded.observation_provenance,
+                        content_hash = excluded.content_hash,
                         updated_at = excluded.updated_at
                     """,
                     values,
                 )
             written += 1
+            if preserve_first_source:
+                _restore_first_source_projection(
+                    c,
+                    api_name=api_name,
+                    record_key=record_key,
+                    previous=previous_item,
+                    observation_columns_ready=observation_columns_ready,
+                )
         for (audit_date, dataset, field), audit in field_audit.items():
             count = int(audit["count"])
             mismatch_count = int(audit["mismatches"])
@@ -1719,7 +2083,7 @@ def _upsert_raw_records(api_name: str, df: pd.DataFrame) -> int:
                     mean_relative_diff=excluded.mean_relative_diff,max_relative_diff=excluded.max_relative_diff,
                     status=excluded.status,checked_at=excluded.checked_at,evidence_json=excluded.evidence_json""",
                 (
-                    dataset, audit_date, SOURCE_TUSHARE, "tencent_market_snapshot", field, count,
+                    dataset, audit_date, record_source, "tencent_market_snapshot", field, count,
                     mismatch_count, audit["abs_sum"] / count, audit["abs_max"],
                     audit["relative_sum"] / count, audit["relative_max"], status, now,
                     _strict_json({
@@ -1735,7 +2099,13 @@ def _upsert_raw_records(api_name: str, df: pd.DataFrame) -> int:
                 for value in df.get("trade_date", pd.Series(dtype=str)).tolist()
                 if len(str(value or "").replace("-", "")[:8]) == 8
             })
-            _refresh_oos_hard_api_stats(c, api_name, trade_dates, now)
+            try:
+                _refresh_oos_hard_api_stats(c, api_name, trade_dates, now)
+            except Exception:
+                # The OOS summary is a strict consumer-side read model.  A
+                # migration gap must block that consumer, not make ordinary
+                # daily ingestion fail or fabricate its old summary.
+                pass
     return written
 
 
@@ -2017,7 +2387,12 @@ def _missing_stk_limit_stock_codes(trade_date: str, *, limit: int) -> list[str]:
     return [str(dict(row).get("ts_code") or "") for row in rows if str(dict(row).get("ts_code") or "")]
 
 
-def sync_stk_limit_gap_batch(trade_date: str, *, limit: int = STK_LIMIT_GAP_BATCH_SIZE) -> dict[str, Any]:
+def sync_stk_limit_gap_batch(
+    trade_date: str,
+    *,
+    limit: int = STK_LIMIT_GAP_BATCH_SIZE,
+    provider: str = SOURCE_TUSHARE,
+) -> dict[str, Any]:
     """Bounded exact-code fallback after the full-market slice is truncated.
 
     This path only touches codes proven missing from the retained full-market
@@ -2035,7 +2410,12 @@ def sync_stk_limit_gap_batch(trade_date: str, *, limit: int = STK_LIMIT_GAP_BATC
     successes = 0
     probe_count = min(3, len(codes))
     for index, ts_code in enumerate(codes):
-        result = _safe_sync_raw("stk_limit", {"trade_date": trade_date, "ts_code": ts_code})
+        params = {"trade_date": trade_date, "ts_code": ts_code}
+        result = (
+            _safe_sync_raw("stk_limit", params)
+            if provider == SOURCE_TUSHARE
+            else _safe_sync_raw("stk_limit", params, provider=provider)
+        )
         rows_read = int(result.get("rows_read") or 0)
         results.append({"ts_code": ts_code, "ok": bool(result.get("ok")) and rows_read > 0, "rows_read": rows_read, "result": result})
         if bool(result.get("ok")) and rows_read > 0:
@@ -2091,7 +2471,11 @@ def sync_stk_limit_gap_batch(trade_date: str, *, limit: int = STK_LIMIT_GAP_BATC
     }
 
 
-def sync_complete_stk_limit_slice(trade_date: str) -> dict[str, Any]:
+def sync_complete_stk_limit_slice(
+    trade_date: str,
+    *,
+    provider: str = SOURCE_TUSHARE,
+) -> dict[str, Any]:
     """Fetch a full trade-date ``stk_limit`` slice with bounded pagination.
 
     The endpoint can return an exact maximum-size page containing funds before all
@@ -2109,7 +2493,11 @@ def sync_complete_stk_limit_slice(trade_date: str) -> dict[str, Any]:
             "limit": STK_LIMIT_PAGE_SIZE,
             "offset": page_index * STK_LIMIT_PAGE_SIZE,
         }
-        result = _safe_sync_raw("stk_limit", params)
+        result = (
+            _safe_sync_raw("stk_limit", params)
+            if provider == SOURCE_TUSHARE
+            else _safe_sync_raw("stk_limit", params, provider=provider)
+        )
         coverage = _stk_limit_stock_coverage(trade_date)
         retained = int(coverage["retained_rows"])
         rows_read = int(result.get("rows_read") or 0)
@@ -2168,7 +2556,11 @@ def sync_complete_stk_limit_slice(trade_date: str) -> dict[str, Any]:
         if rows_read >= STK_LIMIT_PAGE_SIZE:
             saw_full_page = True
         if page_index > 0 and rows_read >= STK_LIMIT_PAGE_SIZE and retained <= int(previous_retained):
-            gap_repair = sync_stk_limit_gap_batch(trade_date)
+            gap_repair = (
+                sync_stk_limit_gap_batch(trade_date)
+                if provider == SOURCE_TUSHARE
+                else sync_stk_limit_gap_batch(trade_date, provider=provider)
+            )
             if gap_repair.get("coverage", {}).get("ready"):
                 return {
                     "ok": True,
@@ -2222,7 +2614,13 @@ def sync_complete_stk_limit_slice(trade_date: str) -> dict[str, Any]:
     }
 
 
-def _sync_tushare_market_bundle(trade_date: str, *, include_suspend: bool = False, apis: list[str] | None = None) -> dict[str, Any]:
+def _sync_tushare_market_bundle(
+    trade_date: str,
+    *,
+    include_suspend: bool = False,
+    apis: list[str] | None = None,
+    provider: str = SOURCE_TUSHARE,
+) -> dict[str, Any]:
     """Run the TuShare provider without controlling provider selection."""
 
     # Cross-border aggregate flow is a delayed optional research enrichment.
@@ -2235,9 +2633,16 @@ def _sync_tushare_market_bundle(trade_date: str, *, include_suspend: bool = Fals
     results = []
     for api in requested_apis:
         if api == "stk_limit":
-            result = sync_complete_stk_limit_slice(trade_date)
+            result = (
+                sync_complete_stk_limit_slice(trade_date)
+                if provider == SOURCE_TUSHARE
+                else sync_complete_stk_limit_slice(trade_date, provider=provider)
+            )
         else:
-            result = _safe_sync_raw(api, {"trade_date": trade_date})
+            if provider == SOURCE_TUSHARE:
+                result = _safe_sync_raw(api, {"trade_date": trade_date})
+            else:
+                result = _safe_sync_raw(api, {"trade_date": trade_date}, provider=provider)
         results.append(result)
         if api == "stk_limit" and not result.get("ok"):
             # The limit-price hard gate already blocks the snapshot.  Do not
@@ -2248,7 +2653,7 @@ def _sync_tushare_market_bundle(trade_date: str, *, include_suspend: bool = Fals
     failure_categories = [str(item.get("category") or "") for item in results if not item.get("ok")]
     return {
         "ok": all(bool(x.get("ok")) for x in results),
-        "provider": SOURCE_TUSHARE,
+        "provider": provider,
         "trade_date": trade_date,
         "apis": requested_apis,
         "results": results,
@@ -2261,6 +2666,167 @@ def _sync_tushare_market_bundle(trade_date: str, *, include_suspend: bool = Fals
     }
 
 
+def _sync_discovered_market_bundle(
+    trade_date: str,
+    *,
+    include_suspend: bool = False,
+    apis: list[str] | None = None,
+) -> dict[str, Any]:
+    """Repair an exact market slice without silently reverting to one endpoint.
+
+    The normal close-of-day path already uses the hedged bulk executor.  OOS
+    repair and targeted backfill call ``sync_market_bundle(..., apis=...)``
+    instead, so they need the same publication decision before fetching an
+    exact missing slice.  A failed winner may fall through to another
+    configured TuShare-compatible endpoint, but a provider with no positive
+    publication probe is never treated as successful merely because it was
+    reachable.
+    """
+    from app.data_platform.services.market_data_discovery import (
+        DATASET_PROVIDERS,
+        available_bulk_candidates,
+        discover_first_published,
+        mark_provider_bulk_result,
+    )
+    from app.data_platform.services.tencent_market_snapshot import sync_tencent_market_bundle
+
+    requested_apis = list(apis or ["daily", "daily_basic", "stk_limit", "adj_factor", "suspend_d", "moneyflow"])
+    if include_suspend and "suspend_d" not in requested_apis:
+        requested_apis.append("suspend_d")
+    allowed = {"daily", "daily_basic", "stk_limit", "adj_factor", "suspend_d", "moneyflow", "moneyflow_hsgt"}
+    requested_apis = [api for api in requested_apis if api in allowed]
+    results: list[dict[str, Any]] = []
+    discoveries: dict[str, dict[str, Any]] = {}
+
+    def _run_provider(api_name: str, provider: str) -> dict[str, Any]:
+        if provider == "tencent_market_snapshot":
+            return sync_tencent_market_bundle(trade_date, [api_name])
+        if not is_tushare_compatible_source(provider):
+            return {
+                "ok": False,
+                "api": api_name,
+                "status": "unsupported_provider_for_market_slice",
+                "provider": provider,
+            }
+        if api_name == "stk_limit":
+            return (
+                sync_complete_stk_limit_slice(trade_date)
+                if provider == SOURCE_TUSHARE
+                else sync_complete_stk_limit_slice(trade_date, provider=provider)
+            )
+        return (
+            _safe_sync_raw(api_name, {"trade_date": trade_date})
+            if provider == SOURCE_TUSHARE
+            else _safe_sync_raw(api_name, {"trade_date": trade_date}, provider=provider)
+        )
+
+    for api_name in requested_apis:
+        # No registered alternate source exists for these optional enrichments.
+        # Keep their source explicit rather than falsely labelling them raced.
+        if api_name not in DATASET_PROVIDERS:
+            result = dict(_safe_sync_raw(api_name, {"trade_date": trade_date}))
+            result.setdefault("api", api_name)
+            result["provider"] = SOURCE_TUSHARE
+            result["provider_policy"] = "single_registered_source"
+            results.append(result)
+            continue
+
+        discovery = discover_first_published(api_name, trade_date)
+        discoveries[api_name] = discovery
+        winner = str(discovery.get("winner") or "")
+        if not winner:
+            results.append({
+                "ok": False,
+                "api": api_name,
+                "status": str(discovery.get("status") or "no_provider_published"),
+                "failure_category": str(discovery.get("failure_category") or ""),
+                "provider_policy": "publication_probe_required",
+            })
+            if api_name == "stk_limit":
+                break
+            continue
+
+        # Retained positive probes are preferred after the race winner.  For
+        # a failed bulk we then try the remaining compatible endpoints once;
+        # each attempt remains separately attributable in the raw ledger.
+        providers = [winner]
+        providers.extend(
+            str(item.get("provider") or "")
+            for item in available_bulk_candidates(api_name, trade_date)
+        )
+        providers.extend(tushare_compatible_source_codes())
+        providers = list(dict.fromkeys(provider for provider in providers if provider))
+        attempts: list[dict[str, Any]] = []
+        result: dict[str, Any] | None = None
+        for provider in providers:
+            # Tencent is a real candidate only for the three stock-slice
+            # datasets.  It must not be invoked for a different data contract.
+            if provider == "tencent_market_snapshot" and api_name not in {"daily", "daily_basic", "stk_limit"}:
+                continue
+            started = time.monotonic()
+            try:
+                candidate = dict(_run_provider(api_name, provider))
+            except Exception as exc:  # noqa: BLE001 - try the next announced endpoint once
+                candidate = {
+                    "ok": False,
+                    "api": api_name,
+                    "status": "bulk_fetch_failed",
+                    "error": str(exc)[:300],
+                }
+            latency_ms = max(0, int((time.monotonic() - started) * 1000))
+            candidate.setdefault("api", api_name)
+            candidate["provider"] = provider
+            attempts.append(candidate)
+            received = int(candidate.get("received") or candidate.get("rows_read") or candidate.get("rows_written") or 0)
+            expected = int(candidate.get("expected") or received or 0)
+            mark_provider_bulk_result(
+                api_name,
+                trade_date,
+                provider,
+                ok=bool(candidate.get("ok")),
+                latency_ms=latency_ms,
+                coverage=received / expected if expected else (1.0 if candidate.get("ok") else 0.0),
+                evidence={"status": candidate.get("status"), "rows": received, "targeted_repair": True},
+            )
+            if candidate.get("ok"):
+                result = candidate
+                break
+        if result is None:
+            result = attempts[-1] if attempts else {
+                "ok": False,
+                "api": api_name,
+                "status": "no_compatible_provider_attempted",
+            }
+        result["provider_attempts"] = [
+            {"provider": item.get("provider"), "ok": bool(item.get("ok")), "status": item.get("status")}
+            for item in attempts
+        ]
+        result["provider_policy"] = "probe_winner_then_bounded_compatible_fallback"
+        results.append(result)
+        if api_name == "stk_limit" and not result.get("ok"):
+            break
+
+    snapshot = build_stock_daily_snapshot(trade_date)
+    failures = [item for item in results if not item.get("ok")]
+    failure_categories = [
+        str(item.get("failure_category") or item.get("category") or item.get("status") or "")
+        for item in failures
+    ]
+    used_providers = list(dict.fromkeys(str(item.get("provider") or "") for item in results if item.get("provider")))
+    return {
+        "ok": bool(results) and all(bool(item.get("ok")) for item in results),
+        "provider": used_providers[0] if len(used_providers) == 1 else "mixed",
+        "trade_date": trade_date,
+        "apis": requested_apis,
+        "results": results,
+        "snapshot": snapshot,
+        "discovery": discoveries,
+        "provider_discovery_contract": "alis_market_publication_probe_v1",
+        "provider_policy": "probe_winner_then_bounded_compatible_fallback",
+        "failure_category": failure_categories[0] if failure_categories else "",
+    }
+
+
 def _decision_core_ready(trade_date: str) -> tuple[bool, dict[str, Any]]:
     from app.data_platform.services.decision_data_contract import decision_data_contract
 
@@ -2270,10 +2836,27 @@ def _decision_core_ready(trade_date: str) -> tuple[bool, dict[str, Any]]:
     return bool(contract.get("ok")), {"snapshot": snapshot, "decision_contract": contract}
 
 
-def sync_market_bundle(trade_date: str, *, include_suspend: bool = False, apis: list[str] | None = None) -> dict[str, Any]:
+def sync_market_bundle(
+    trade_date: str,
+    *,
+    include_suspend: bool = False,
+    apis: list[str] | None = None,
+    provider: str | None = None,
+) -> dict[str, Any]:
     """Probe first, start immediately, then hedge a slow bulk with another published source."""
     if apis is not None:
-        return _sync_tushare_market_bundle(trade_date, include_suspend=include_suspend, apis=apis)
+        if provider is None:
+            return _sync_discovered_market_bundle(
+                trade_date,
+                include_suspend=include_suspend,
+                apis=apis,
+            )
+        return _sync_tushare_market_bundle(
+            trade_date,
+            include_suspend=include_suspend,
+            apis=apis,
+            provider=str(provider or SOURCE_TUSHARE),
+        )
 
     from app.data_platform.services.market_data_discovery import (
         available_bulk_candidates,
@@ -2290,21 +2873,37 @@ def sync_market_bundle(trade_date: str, *, include_suspend: bool = False, apis: 
     )
     from app.data_platform.services.tencent_market_snapshot import sync_tencent_market_bundle
 
-    def _tracked_tushare_job(dataset: str, job: Callable[[], dict[str, Any]]) -> dict[str, Any]:
+    def _is_tushare_provider(name: str) -> bool:
+        return is_tushare_compatible_source(name)
+
+    def _job_provider(name: str) -> str:
+        raw = str(name or "")
+        if raw == "tencent_market_snapshot" or "tencent_market_snapshot" in raw:
+            return "tencent_market_snapshot"
+        if raw.startswith("hedge:"):
+            return raw.split(":", 2)[1]
+        return raw.split(":", 1)[0] if ":" in raw else SOURCE_TUSHARE
+
+    def _tracked_tushare_job(
+        dataset: str,
+        job: Callable[[], dict[str, Any]],
+        *,
+        provider_name: str = SOURCE_TUSHARE,
+    ) -> dict[str, Any]:
         started = time.monotonic()
-        begin_execution(trade_date, SOURCE_TUSHARE, dataset, 1, evidence={"single_call_provider": True})
-        if bulk_cancel_requested(trade_date, SOURCE_TUSHARE, dataset):
+        begin_execution(trade_date, provider_name, dataset, 1, evidence={"single_call_provider": True})
+        if bulk_cancel_requested(trade_date, provider_name, dataset):
             return {"ok": False, "status": "cancelled_before_request"}
         try:
             result = dict(job())
         except Exception as exc:  # noqa: BLE001
             finish_execution(
-                trade_date, SOURCE_TUSHARE, dataset, status="failed",
+                trade_date, provider_name, dataset, status="failed",
                 elapsed_ms=int((time.monotonic() - started) * 1000), evidence={"error": str(exc)[:300]},
             )
             raise
         finish_execution(
-            trade_date, SOURCE_TUSHARE, dataset,
+            trade_date, provider_name, dataset,
             status="validated" if result.get("ok") else "failed",
             elapsed_ms=int((time.monotonic() - started) * 1000), evidence={
                 "status": result.get("status"),
@@ -2352,18 +2951,32 @@ def sync_market_bundle(trade_date: str, *, include_suspend: bool = False, apis: 
             lambda: sync_tencent_market_bundle(trade_date, tencent_apis),
         ))
     for api, provider in winners.items():
-        if provider != SOURCE_TUSHARE:
+        if not _is_tushare_provider(provider):
             continue
         if api == "stk_limit":
-            jobs.append((f"tushare:{api}", [api], lambda api_name=api: _tracked_tushare_job(
-                api_name, lambda: sync_complete_stk_limit_slice(trade_date)
+            jobs.append((f"{provider}:{api}", [api], lambda api_name=api, provider_name=provider: _tracked_tushare_job(
+                api_name,
+                lambda: (
+                    sync_complete_stk_limit_slice(trade_date)
+                    if provider_name == SOURCE_TUSHARE
+                    else sync_complete_stk_limit_slice(trade_date, provider=provider_name)
+                ),
+                provider_name=provider_name,
             )))
         else:
             jobs.append((
-                f"tushare:{api}",
+                f"{provider}:{api}",
                 [api],
-                lambda api_name=api: _tracked_tushare_job(
-                    api_name, lambda: _safe_sync_raw(api_name, {"trade_date": trade_date})
+                lambda api_name=api, provider_name=provider: _tracked_tushare_job(
+                    api_name,
+                    lambda: (
+                        _safe_sync_raw(api_name, {"trade_date": trade_date})
+                        if provider_name == SOURCE_TUSHARE
+                        else _safe_sync_raw(
+                            api_name, {"trade_date": trade_date}, provider=provider_name,
+                        )
+                    ),
+                    provider_name=provider_name,
                 ),
             ))
 
@@ -2377,7 +2990,7 @@ def sync_market_bundle(trade_date: str, *, include_suspend: bool = False, apis: 
         pending: dict[Any, tuple[str, list[str], float]] = {
             executor.submit(job): (name, datasets, time.monotonic()) for name, datasets, job in jobs
         }
-        launched = {(dataset, "tencent_market_snapshot" if name == "tencent_market_snapshot" else SOURCE_TUSHARE)
+        launched = {(dataset, _job_provider(name))
                     for name, datasets, _job in jobs for dataset in datasets}
         bulk_started_at = time.monotonic()
         hard_deadline = bulk_started_at + max(30.0, float(os.getenv("MARKET_BULK_HARD_TIMEOUT_SECONDS", "120")))
@@ -2400,13 +3013,23 @@ def sync_market_bundle(trade_date: str, *, include_suspend: bool = False, apis: 
                         continue
                     if provider == "tencent_market_snapshot":
                         job = lambda dataset_name=dataset: sync_tencent_market_bundle(trade_date, [dataset_name])
-                    elif provider == SOURCE_TUSHARE and dataset == "stk_limit":
-                        job = lambda dataset_name=dataset: _tracked_tushare_job(
-                            dataset_name, lambda: sync_complete_stk_limit_slice(trade_date)
+                    elif _is_tushare_provider(provider) and dataset == "stk_limit":
+                        job = lambda dataset_name=dataset, provider_name=provider: _tracked_tushare_job(
+                            dataset_name,
+                            lambda: (
+                                sync_complete_stk_limit_slice(trade_date)
+                                if provider_name == SOURCE_TUSHARE
+                                else sync_complete_stk_limit_slice(trade_date, provider=provider_name)
+                            ),
+                            provider_name=provider_name,
                         )
-                    elif provider == SOURCE_TUSHARE:
-                        job = lambda dataset_name=dataset: _tracked_tushare_job(
-                            dataset_name, lambda: _safe_sync_raw(dataset_name, {"trade_date": trade_date})
+                    elif _is_tushare_provider(provider):
+                        job = lambda dataset_name=dataset, provider_name=provider: _tracked_tushare_job(
+                            dataset_name,
+                            lambda: _safe_sync_raw(
+                                dataset_name, {"trade_date": trade_date}, provider=provider_name,
+                            ),
+                            provider_name=provider_name,
                         )
                     else:
                         continue
@@ -2424,7 +3047,7 @@ def sync_market_bundle(trade_date: str, *, include_suspend: bool = False, apis: 
             if time.monotonic() >= hard_deadline:
                 for future in pending:
                     pending_name, pending_datasets, _pending_started = pending[future]
-                    pending_provider = "tencent_market_snapshot" if "tencent_market_snapshot" in pending_name else SOURCE_TUSHARE
+                    pending_provider = _job_provider(pending_name)
                     pending_scope = "a_share_close" if pending_provider == "tencent_market_snapshot" else pending_datasets[0]
                     request_bulk_cancel(
                         trade_date, pending_provider, pending_scope, reason="bulk_hard_timeout",
@@ -2450,7 +3073,7 @@ def sync_market_bundle(trade_date: str, *, include_suspend: bool = False, apis: 
                 result.setdefault("provider_job", name)
                 result["bulk_latency_ms"] = latency_ms
                 provider_results.append(result)
-                provider = "tencent_market_snapshot" if "tencent_market_snapshot" in name else SOURCE_TUSHARE
+                provider = _job_provider(name)
                 received = int(result.get("received") or result.get("rows_read") or 0)
                 expected = int(result.get("expected") or received or 0)
                 coverage = received / expected if expected else (1.0 if result.get("ok") else 0.0)
@@ -2465,7 +3088,7 @@ def sync_market_bundle(trade_date: str, *, include_suspend: bool = False, apis: 
                 completed_evidence = _ready_evidence
                 for future in pending:
                     pending_name, pending_datasets, _pending_started = pending[future]
-                    pending_provider = "tencent_market_snapshot" if "tencent_market_snapshot" in pending_name else SOURCE_TUSHARE
+                    pending_provider = _job_provider(pending_name)
                     pending_scope = "a_share_close" if pending_provider == "tencent_market_snapshot" else pending_datasets[0]
                     request_bulk_cancel(
                         trade_date, pending_provider, pending_scope,
@@ -2501,9 +3124,9 @@ def sync_market_bundle(trade_date: str, *, include_suspend: bool = False, apis: 
         "decision_contract": evidence["decision_contract"],
         "failure_category": "" if core_ready else "bulk_slice_contract_failed",
         "field_source_policy": {
-            "daily": "first_full_contract_source; tushare_late_reconciliation",
-            "stk_limit": "first_full_contract_source; exact_limit_cross_check",
-            "daily_basic": "fast_source_provisional; tushare_field_definitions_authoritative_on_reconciliation",
+            "daily": "first_full_contract_source; late_sources_evidence_only",
+            "stk_limit": "first_full_contract_source; exact_limit_cross_check; late_sources_evidence_only",
+            "daily_basic": "first_full_contract_source; late_sources_evidence_only; field_lineage_retained",
             "adj_factor": "tushare_only_until_pit_equivalent_source_exists",
         },
         "policy": "bounded_batches_with_checkpoint_resume; hedge_only_on_eta_advantage_or_stall; cancel_unstarted_loser_batches",
@@ -2606,8 +3229,8 @@ def _bulk_mark_requests_valid_empty(
                                SET status='resolved',resolved_at=?
                              WHERE id=? AND status='pending'"""
         cursor = c.raw.cursor() if bool(getattr(c, "_is_postgres", False)) else c.raw
-        cursor.executemany(coverage_sql.replace("?", "%s") if bool(getattr(c, "_is_postgres", False)) else coverage_sql, coverage_rows)
-        cursor.executemany(resolved_sql.replace("?", "%s") if bool(getattr(c, "_is_postgres", False)) else resolved_sql, resolved_rows)
+        cursor.executemany(qmark_to_pyformat(coverage_sql) if bool(getattr(c, "_is_postgres", False)) else coverage_sql, coverage_rows)
+        cursor.executemany(qmark_to_pyformat(resolved_sql) if bool(getattr(c, "_is_postgres", False)) else resolved_sql, resolved_rows)
         updated_count = getattr(cursor, "rowcount", -1)
     for key in request_keys:
         redis_set_remove("alis:data-platform:tushare:failed", key)
@@ -2843,7 +3466,16 @@ def backfill_etf_price_history(
 
     def fetch_one(item: tuple[str, dict[str, Any]]) -> dict[str, Any]:
         api_name, params = item
-        return {"api_name": api_name, "request": params, **_safe_sync_raw(api_name, params)}
+        if api_name == "fund_daily":
+            result = _sync_tushare_compatible_range(
+                api_name,
+                params,
+                discovery_dataset="defensive_fund_daily",
+                discovery_date=str(params.get("trade_date") or end_date),
+            )
+        else:
+            result = _safe_sync_raw(api_name, params)
+        return {"api_name": api_name, "request": params, **result}
 
     results: list[dict[str, Any]] = []
     workers = 0
@@ -2955,7 +3587,16 @@ def backfill_etf_daily_incremental(
 
     def fetch_one(item: tuple[str, dict[str, Any]]) -> dict[str, Any]:
         api_name, params = item
-        return {"api_name": api_name, "request": params, **_safe_sync_raw(api_name, params)}
+        if api_name == "fund_daily":
+            result = _sync_tushare_compatible_range(
+                api_name,
+                params,
+                discovery_dataset="defensive_fund_daily",
+                discovery_date=str(params.get("trade_date") or end_date),
+            )
+        else:
+            result = _safe_sync_raw(api_name, params)
+        return {"api_name": api_name, "request": params, **result}
 
     results: list[dict[str, Any]] = []
     workers = 0
@@ -4085,7 +4726,7 @@ def _reconcile_verified_date_coverage(
             cursor = c.raw.cursor() if bool(getattr(c, "_is_postgres", False)) else c.raw
             sql = "UPDATE dc_tushare_failed_requests SET status='resolved',resolved_at=? WHERE id=? AND status='pending'"
             cursor.executemany(
-                sql.replace("?", "%s") if bool(getattr(c, "_is_postgres", False)) else sql,
+                qmark_to_pyformat(sql) if bool(getattr(c, "_is_postgres", False)) else sql,
                 [(_now(), request_id) for request_id in resolved_ids],
             )
     return len(missing)
@@ -4143,8 +4784,37 @@ def sync_tushare_date_batch(
             "failed_items": [],
             "results": [],
         }
+    # Date-granular hard-data repairs must not regress to the primary endpoint
+    # merely because they run outside the close-of-day bundle.  Registered
+    # market datasets re-enter the same publication-discovery contract; other
+    # APIs have no approved alternate source and remain explicitly single
+    # source until one is registered.
+    from app.data_platform.services.market_data_discovery import DATASET_PROVIDERS
+
+    def _sync_one_date(value: str) -> dict[str, Any]:
+        if api_name not in DATASET_PROVIDERS:
+            return {"trade_date": value, **_safe_sync_raw(api_name, {"trade_date": value})}
+        bundle = sync_market_bundle(value, apis=[api_name])
+        matching = next(
+            (
+                dict(item) for item in bundle.get("results") or []
+                if str(item.get("api") or "") == api_name
+            ),
+            {},
+        )
+        return {
+            "trade_date": value,
+            "api": api_name,
+            "ok": bool(bundle.get("ok")) and bool(matching.get("ok")),
+            "provider": matching.get("provider"),
+            "status": matching.get("status") or bundle.get("failure_category"),
+            "error": matching.get("error") or "",
+            "bundle": bundle,
+            **matching,
+        }
+
     results, workers = _parallel_tushare_map(
-        pending, lambda d: _safe_sync_raw(api_name, {"trade_date": d}), prefix=f"tushare-{api_name}"
+        pending, _sync_one_date, prefix=f"market-date-{api_name}"
     )
     cooldown = any(bool(x.get("cooldown")) for x in results)
     cooldown_seconds = max([int(x.get("cooldown_seconds") or 0) for x in results if x.get("cooldown")] or [0])
@@ -4239,6 +4909,95 @@ def sync_expectation_bundle(ts_code: str, period: str | None = None) -> dict[str
     return {"ok": True, "ts_code": ts_code, "period": period, "results": results}
 
 
+def _sync_tushare_compatible_range(
+    api_name: str,
+    params: dict[str, Any],
+    *,
+    discovery_dataset: str,
+    discovery_date: str,
+) -> dict[str, Any]:
+    """Fetch a range from the first usable TuShare-compatible endpoint.
+
+    Some datasets expose an exact-session web fallback but no safe range API.
+    The fallback may repair that single date, while historical range consumers
+    still need a structured provider capable of returning every requested
+    session.  Select the published compatible race winner when available and
+    only move to another configured endpoint after its complete range request
+    fails.
+    """
+    from app.data_platform.services.market_data_discovery import (
+        discover_first_published,
+        mark_provider_bulk_result,
+    )
+
+    discovery = discover_first_published(discovery_dataset, discovery_date)
+    winner = str(discovery.get("winner") or "")
+    if not winner:
+        return {
+            "ok": False,
+            "api": api_name,
+            "status": str(discovery.get("status") or "no_provider_published"),
+            "failure_category": str(discovery.get("failure_category") or ""),
+            "discovery": discovery,
+            "provider_attempts": [],
+            "provider_policy": "publication_probe_required_before_range_fetch",
+        }
+    providers = [winner] if is_tushare_compatible_source(winner) else []
+    providers.extend(provider for provider in tushare_compatible_source_codes() if provider not in providers)
+    attempts: list[dict[str, Any]] = []
+    for provider in providers:
+        started = time.monotonic()
+        try:
+            result = (
+                _safe_sync_raw(api_name, params)
+                if provider == SOURCE_TUSHARE
+                else _safe_sync_raw(api_name, params, provider=provider)
+            )
+            result = dict(result)
+        except Exception as exc:  # noqa: BLE001 - bounded endpoint fallback
+            result = {
+                "ok": False,
+                "api": api_name,
+                "status": "range_fetch_failed",
+                "error": str(exc)[:300],
+            }
+        latency_ms = max(0, int((time.monotonic() - started) * 1000))
+        result["provider"] = provider
+        attempts.append(result)
+        rows = int(result.get("rows_read") or result.get("rows_written") or 0)
+        mark_provider_bulk_result(
+            discovery_dataset,
+            discovery_date,
+            provider,
+            ok=bool(result.get("ok")),
+            latency_ms=latency_ms,
+            coverage=1.0 if result.get("ok") else 0.0,
+            evidence={"status": result.get("status"), "rows": rows, "range_request": True},
+        )
+        if result.get("ok"):
+            return {
+                **result,
+                "provider": provider,
+                "discovery": discovery,
+                "provider_attempts": [
+                    {"provider": item.get("provider"), "ok": bool(item.get("ok")), "status": item.get("status")}
+                    for item in attempts
+                ],
+                "provider_policy": "published_compatible_winner_then_bounded_range_fallback",
+            }
+    return {
+        "ok": False,
+        "api": api_name,
+        "status": "no_compatible_range_provider_succeeded",
+        "discovery": discovery,
+        "provider_attempts": [
+            {"provider": item.get("provider"), "ok": bool(item.get("ok")), "status": item.get("status")}
+            for item in attempts
+        ],
+        "provider_policy": "published_compatible_winner_then_bounded_range_fallback",
+    }
+
+
 def sync_index_bundle(index_code: str = "000300.SH", start_date: str | None = None, end_date: str | None = None) -> dict[str, Any]:
     """Probe equivalent index sources, then fetch from the first publisher."""
 
@@ -4246,14 +5005,10 @@ def sync_index_bundle(index_code: str = "000300.SH", start_date: str | None = No
         start_date, end_date = _recent_calendar_window(days_back=30, days_forward=0)
     if index_code == "000300.SH" and start_date == end_date:
         with _conn() as conn:
-            existing = conn.execute(
-                """SELECT source_code FROM dc_tushare_raw_records
-                   WHERE api_name='index_daily' AND ts_code=? AND trade_date=? LIMIT 1""",
-                (index_code, start_date),
-            ).fetchone()
+            existing = _strict_benchmark_bar(conn, start_date)
         if existing:
-            existing_source = str(dict(existing).get("source_code") or "")
-            if existing_source != SOURCE_TUSHARE:
+            existing_source = str(existing.get("source_code") or "")
+            if not is_tushare_compatible_source(existing_source):
                 threading.Thread(
                     target=lambda: _safe_sync_raw(
                         "index_daily",
@@ -4270,7 +5025,7 @@ def sync_index_bundle(index_code: str = "000300.SH", start_date: str | None = No
                 "index_code": index_code,
                 "start_date": start_date,
                 "end_date": end_date,
-                "reconciliation_pending": existing_source != SOURCE_TUSHARE,
+                "reconciliation_pending": not is_tushare_compatible_source(existing_source),
                 "policy": "consume_ready_bar_immediately_reconcile_primary_in_background",
             }
         from app.data_platform.services.eastmoney_index_daily_fallback import (
@@ -4283,21 +5038,19 @@ def sync_index_bundle(index_code: str = "000300.SH", start_date: str | None = No
 
         discovery = discover_first_published("index_daily", start_date)
         winner = str(discovery.get("winner") or "")
-        if winner == SOURCE_TUSHARE:
-            bulk = _safe_sync_raw(
-                "index_daily",
-                {"ts_code": index_code, "start_date": start_date, "end_date": end_date},
+        if is_tushare_compatible_source(winner):
+            params = {"ts_code": index_code, "start_date": start_date, "end_date": end_date}
+            bulk = (
+                _safe_sync_raw("index_daily", params)
+                if winner == SOURCE_TUSHARE
+                else _safe_sync_raw("index_daily", params, provider=winner)
             )
         elif winner:
             bulk = repair_hs300_index_daily_from_eastmoney(start_date, provider=winner)
         else:
             bulk = {"ok": False, "status": "no_provider_published"}
         with _conn() as conn:
-            ready = bool(conn.execute(
-                """SELECT 1 FROM dc_tushare_raw_records
-                   WHERE api_name='index_daily' AND ts_code=? AND trade_date=? LIMIT 1""",
-                (index_code, start_date),
-            ).fetchone())
+            ready = bool(_strict_benchmark_bar(conn, start_date))
         if winner:
             mark_provider_bulk_result(
                 "index_daily",
@@ -4327,17 +5080,19 @@ def sync_index_bundle(index_code: str = "000300.SH", start_date: str | None = No
             "metadata_pending": ["index_basic", "index_weight"] if ready else [],
             "policy": "probe_all_due_sources_then_bulk_fetch_first_publisher_only",
         }
+    index_range = _sync_tushare_compatible_range(
+        "index_daily",
+        {"ts_code": index_code, "start_date": start_date, "end_date": end_date},
+        discovery_dataset="index_daily",
+        discovery_date=end_date,
+    )
     results = [
         _safe_sync_raw("index_basic", {"market": "SSE"}),
-        _safe_sync_raw("index_daily", {"ts_code": index_code, "start_date": start_date, "end_date": end_date}),
+        index_range,
         _sync_monthly_index_weight_if_due(index_code, end_date),
     ]
     with _conn() as c:
-        benchmark_ready = bool(c.execute(
-            """SELECT 1 FROM dc_tushare_raw_records
-               WHERE api_name='index_daily' AND ts_code=? AND trade_date=? LIMIT 1""",
-            (index_code, end_date),
-        ).fetchone())
+        benchmark_ready = bool(_strict_index_bar(c, index_code, end_date))
     return {
         "ok": all(bool(x.get("ok")) for x in results),
         "index_code": index_code,
@@ -4387,13 +5142,36 @@ def sync_training_market_date_vip(trade_date: str) -> dict[str, Any]:
     retry_delays = (5, 15, 30, 60, 120, 180, 240, 300, 300)
     results: list[dict[str, Any]] = []
     for api_name in ("daily", "daily_basic", "stk_limit"):
+        # Training needs the same source resilience as the daily market path.
+        # The discovery probe races providers; the selected source is then
+        # used for the batch request and recorded on every raw version.  A
+        # late historical fetch remains late PIT evidence regardless of which
+        # compatible provider supplied it.
+        from app.data_platform.services.market_data_discovery import discover_first_published
+
+        discovery = discover_first_published(api_name, value)
+        discovered_provider = str(discovery.get("winner") or "")
+        compatible_providers = list(tushare_compatible_source_codes())
+        provider_order = (
+            [discovered_provider]
+            if is_tushare_compatible_source(discovered_provider)
+            else []
+        )
+        provider_order.extend(provider for provider in compatible_providers if provider not in provider_order)
+        if not provider_order:
+            provider_order = [SOURCE_TUSHARE]
         last_error: Exception | None = None
         outcome: dict[str, Any] | None = None
         for attempt in range(1, max_attempts + 1):
+            provider = provider_order[(attempt - 1) % len(provider_order)]
             try:
-                candidate = sync_tushare_api_raw(api_name, {"trade_date": value})
+                candidate = (
+                    sync_tushare_api_raw(api_name, {"trade_date": value})
+                    if provider == SOURCE_TUSHARE
+                    else sync_tushare_api_raw(api_name, {"trade_date": value}, provider=provider)
+                )
                 if bool(candidate.get("ok")) and int(candidate.get("rows_written") or candidate.get("rows_read") or 0) > 0:
-                    outcome = candidate
+                    outcome = {**candidate, "provider": provider, "discovery": discovery}
                     break
                 last_error = RuntimeError(str(candidate.get("error") or f"{api_name} returned no rows"))
             except Exception as exc:  # noqa: BLE001 - historical download is resumable
@@ -4403,9 +5181,14 @@ def sync_training_market_date_vip(trade_date: str) -> dict[str, Any]:
                 write_runtime_log(
                     "WARNING", "model-training",
                     f"{value} {api_name} 返回异常，{delay}秒后重试",
-                    {"trade_date": value, "api": api_name, "attempt": attempt, "max_attempts": max_attempts, "error": str(last_error)[:300]},
+                    {
+                        "trade_date": value, "api": api_name, "provider": provider,
+                        "attempt": attempt, "max_attempts": max_attempts,
+                        "error": str(last_error)[:300],
+                    },
                 )
-                reset_tushare_client()
+                if provider == SOURCE_TUSHARE:
+                    reset_tushare_client()
                 time.sleep(delay)
         if outcome is None:
             raise RuntimeError(f"训练历史 {value} {api_name} 连续{max_attempts}次下载失败：{str(last_error)[:300]}")
@@ -4413,7 +5196,7 @@ def sync_training_market_date_vip(trade_date: str) -> dict[str, Any]:
     return {
         "ok": all(bool(item.get("ok")) for item in results),
         "trade_date": value,
-        "mode": "tushare_vip_trade_date_batch",
+        "mode": "tushare_compatible_trade_date_batch_v2",
         "results": results,
         "rows_written": sum(int(item.get("rows_written") or 0) for item in results),
     }
@@ -4429,9 +5212,16 @@ def training_market_date_ready(trade_date: str) -> bool:
     return bool(decision_data_contract(value).get("ok"))
 
 
-def _safe_sync_raw(api_name: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+def _safe_sync_raw(
+    api_name: str,
+    params: dict[str, Any] | None = None,
+    *,
+    provider: str = SOURCE_TUSHARE,
+) -> dict[str, Any]:
     try:
-        return sync_tushare_api_raw(api_name, params)
+        if str(provider or SOURCE_TUSHARE) == SOURCE_TUSHARE:
+            return sync_tushare_api_raw(api_name, params)
+        return sync_tushare_api_raw(api_name, params, provider=provider)
     except TushareCoolingDown as exc:
         return {
             "ok": False,
@@ -4482,6 +5272,23 @@ def _safe_sync_raw(api_name: str, params: dict[str, Any] | None = None) -> dict[
                 "error": str(exc)[:500],
                 "category": category,
             }
+        if category in {"authentication", "permission", "invalid_request", "unknown"}:
+            # These failures cannot be repaired by immediately asking the same
+            # provider again. Keep the exact category and a long cooldown so
+            # the scheduler records an external dependency instead of
+            # hammering an invalid credential or request every cycle.
+            return {
+                "ok": False,
+                "api": api_name,
+                "params": params or {},
+                "rows_read": 0,
+                "rows_written": 0,
+                "cooldown": True,
+                "cooldown_seconds": TUSHARE_HARD_FAILURE_COOLDOWN_SECONDS,
+                "soft_failed": True,
+                "error": str(exc)[:500],
+                "category": category,
+            }
         return {
             "ok": False,
             "api": api_name,
@@ -4494,28 +5301,31 @@ def _safe_sync_raw(api_name: str, params: dict[str, Any] | None = None) -> dict[
 
 
 def purge_temporary_training_market_data(*, fetched_dates: list[str], online_window_start: str) -> dict[str, Any]:
-    """Delete only old, training-created market slices after feature extraction.
+    """Audit historical training dates without mutating shared market data.
 
-    The caller supplies all dates fetched for one training slice.  Dates in or
-    after the normal online window are deliberately excluded, so a failed or
-    repeated training run cannot erase current business data.
+    ``dc_stock_daily_snapshot``, ``dc_tushare_raw_records`` and
+    ``dc_available_trade_dates`` are authoritative shared data, not disposable
+    training scratch space.  Older versions deleted rows after feature
+    extraction, which could remove evidence needed by point-in-time replay and
+    by another concurrent consumer.  Training-specific temporary data must be
+    stored in an isolated table/storage area; this compatibility entry point
+    therefore only returns an explicit retention audit and never opens a DB
+    write transaction.
     """
     from app.services.streaming_training import temporary_dates_for_cleanup
 
     dates = temporary_dates_for_cleanup(fetched_dates=fetched_dates, online_window_start=online_window_start)
-    if not dates:
-        return {"ok": True, "deleted_dates": [], "raw_records_deleted": 0, "snapshots_deleted": 0}
-    placeholders = ",".join("?" for _ in dates)
-    with _conn() as c:
-        snapshot = c.execute(f"DELETE FROM dc_stock_daily_snapshot WHERE trade_date IN ({placeholders})", tuple(dates))
-        raw = c.execute(
-            f"DELETE FROM dc_tushare_raw_records WHERE trade_date IN ({placeholders}) AND api_name IN ('daily','daily_basic','stk_limit','suspend_d')",
-            tuple(dates),
-        )
-        c.execute(f"DELETE FROM dc_available_trade_dates WHERE trade_date IN ({placeholders})", tuple(dates))
     return {
-        "ok": True, "deleted_dates": dates, "raw_records_deleted": int(raw.rowcount or 0),
-        "snapshots_deleted": int(snapshot.rowcount or 0),
+        "ok": True,
+        "status": "shared_market_data_retained",
+        "reason": "authoritative_shared_market_data_is_immutable",
+        "retained_dates": dates,
+        "retained_count": len(dates),
+        "deleted": 0,
+        "deleted_dates": [],
+        "raw_records_deleted": 0,
+        "snapshots_deleted": 0,
+        "available_trade_dates_deleted": 0,
     }
 
 
@@ -4534,12 +5344,13 @@ def build_stock_daily_snapshot(trade_date: str) -> dict[str, Any]:
             adj_factors = _raw_payload_map(c, "adj_factor", trade_date, "ts_code")
             limits = _raw_payload_map(c, "stk_limit", trade_date, "ts_code")
             suspended = set(_raw_payload_map(c, "suspend_d", trade_date, "ts_code").keys())
+            source_metadata = _raw_source_metadata_map(c, trade_date)
         now = _now()
         written = 0
         stock_codes = set(stocks.keys())
         all_codes = sorted((set(daily_basic) | set(daily) | set(adj_factors) | set(limits) | suspended) & stock_codes)
         with _conn() as c:
-            c.execute("DELETE FROM dc_stock_daily_snapshot WHERE trade_date = ?", (trade_date,))
+            day_observed_times: list[str] = []
             for ts_code in all_codes:
                 info = stocks.get(ts_code, {})
                 basic = daily_basic.get(ts_code, {})
@@ -4556,7 +5367,81 @@ def build_stock_daily_snapshot(trade_date: str) -> dict[str, Any]:
                 if ts_code in suspended:
                     flags.append("suspended")
                 score = max(0, 100 - len([f for f in flags if f != "suspended"]) * 25)
-                snapshot_available_time = _iso_available_on_date(trade_date, hour=15, minute=0, second=0) or now
+                # A normalized row inherits the latest actual observation
+                # time of the raw slices it depends on.  Rebuilds update the
+                # current projection but append an immutable version first.
+                source_items = source_metadata.get(ts_code, [])
+                source_codes = sorted({
+                    str(item.get("source_code") or "").strip()
+                    for item in source_items
+                    if str(item.get("source_code") or "").strip()
+                })
+                snapshot_source_code = (
+                    source_codes[0]
+                    if len(source_codes) == 1
+                    else f"mixed:{'+'.join(source_codes)}"
+                    if source_codes
+                    else "snapshot:unknown"
+                )
+                source_observed = _sorted_observation_times(source_items, "observed_at", fallback="available_time")
+                source_economic = _sorted_observation_times(source_items, "economic_available_time")
+                source_first = _sorted_observation_times(source_items, "first_observed_at")
+                strict_sources = _decision_source_observation_ready(source_items)
+                snapshot_observed_at = source_observed[-1] if source_observed else now
+                snapshot_economic_time = source_economic[-1] if source_economic else ""
+                snapshot_first_observed = source_first[-1] if source_first else snapshot_observed_at
+                snapshot_provenance = (
+                    "snapshot:raw_dependency_observation_v1"
+                    if strict_sources else "legacy_snapshot_rebuild_unverifiable"
+                )
+                snapshot_available_time = snapshot_observed_at
+                if snapshot_observed_at:
+                    day_observed_times.append(snapshot_observed_at)
+                snapshot_payload = {
+                    "ts_code": ts_code, "trade_date": trade_date, "symbol": str(info.get("symbol") or ts_code[:6]),
+                    "name": str(info.get("name") or ""), "industry": str(info.get("industry") or ""),
+                    "close": close, "open": _float_or_none(price.get("open")), "high": _float_or_none(price.get("high")),
+                    "low": _float_or_none(price.get("low")), "pre_close": _float_or_none(price.get("pre_close")),
+                    "adj_factor": _float_or_none(adj_factors.get(ts_code, {}).get("adj_factor")),
+                    "change_pct": _float_or_none(price.get("pct_chg")), "volume": _float_or_none(price.get("vol")),
+                    "turnover": _float_or_none(price.get("amount")), "total_mv": _float_or_none(basic.get("total_mv")),
+                    "circ_mv": _float_or_none(basic.get("circ_mv")), "pe_ttm": _float_or_none(basic.get("pe_ttm")),
+                    "pb": _float_or_none(basic.get("pb")), "turnover_rate": _float_or_none(basic.get("turnover_rate")),
+                    "up_limit": _float_or_none(limit.get("up_limit")), "down_limit": _float_or_none(limit.get("down_limit")),
+                    "is_suspended": ts_code in suspended, "data_quality_score": float(score), "quality_flags": flags,
+                    "raw_content_hashes": sorted(str(item.get("content_hash") or "") for item in source_items),
+                }
+                # A factor may legitimately be published after the executable
+                # core slice. Preserve the earlier core-only version first;
+                # the full version below remains the current/experiment view.
+                _append_decision_core_snapshot_version(
+                    c,
+                    ts_code=ts_code,
+                    trade_date=trade_date,
+                    payload=snapshot_payload,
+                    source_items=source_items,
+                    created_at=now,
+                )
+                snapshot_hash = payload_content_hash(
+                    snapshot_payload, source_code=snapshot_source_code,
+                    economic_time=snapshot_economic_time,
+                )
+                snapshot_metadata = {
+                    "economic_available_time": snapshot_economic_time,
+                    "observed_at": snapshot_observed_at,
+                    "first_observed_at": snapshot_first_observed,
+                    "observation_provenance": snapshot_provenance,
+                    "content_hash": snapshot_hash,
+                }
+                try:
+                    append_snapshot_version(
+                        c, ts_code=ts_code, trade_date=trade_date,
+                        payload_json=_strict_json(snapshot_payload), source_code=snapshot_source_code,
+                        metadata=snapshot_metadata, created_at=now,
+                    )
+                except Exception:
+                    if bool(getattr(c, "_is_postgres", False)):
+                        raise
                 values = (
                     ts_code,
                     trade_date,
@@ -4582,14 +5467,26 @@ def build_stock_daily_snapshot(trade_date: str) -> dict[str, Any]:
                     1 if ts_code in suspended else 0,
                     float(score),
                     json.dumps(flags, ensure_ascii=False),
-                    str(limit.get("source_code") or SOURCE_TUSHARE),
+                    snapshot_source_code,
                     snapshot_available_time,
+                    snapshot_economic_time,
+                    snapshot_observed_at,
+                    snapshot_first_observed,
+                    snapshot_provenance,
+                    snapshot_hash,
                     now,
                 )
                 _upsert_snapshot_row(c, values)
                 written += 1
             if written > 0:
-                available_time = _iso_available_on_date(trade_date, hour=15, minute=0, second=0) or now
+                # The date marker is only a freshness watermark.  It must
+                # carry the actual latest observation, not the market close.
+                watermark_values = [
+                    (parsed, parsed.isoformat(timespec="seconds"))
+                    for value in day_observed_times
+                    if (parsed := _explicit_observation_datetime(value)) is not None
+                ]
+                available_time = max(watermark_values, default=(None, now), key=lambda item: item[0] or datetime.min.replace(tzinfo=_BUSINESS_TZ))[1]
                 c.execute(
                     """INSERT INTO dc_available_trade_dates(trade_date,source_code,available_time,updated_at)
                        VALUES(?,?,?,?)
@@ -4608,11 +5505,111 @@ def build_stock_daily_snapshot(trade_date: str) -> dict[str, Any]:
         raise
 
 
+def _append_decision_core_snapshot_version(
+    c: Any,
+    *,
+    ts_code: str,
+    trade_date: str,
+    payload: dict[str, Any],
+    source_items: list[dict[str, Any]],
+    created_at: str,
+) -> bool:
+    """Append the decision-core view before a late factor can change its clock.
+
+    The projection may contain ``adj_factor`` when the snapshot is rebuilt.
+    This helper preserves a version that contains only the three mandatory
+    decision inputs when a later factor observation would otherwise push the
+    whole normalized row past the frozen decision cutoff.
+    """
+
+    core_apis = {"daily", "daily_basic", "stk_limit"}
+    # A positive suspension record is itself a trading-safety dependency.  If
+    # it arrived late, keep that asset out of the earlier core version instead
+    # of writing a false tradable state with an old observation clock.
+    if bool(payload.get("is_suspended")):
+        core_apis.add("suspend_d")
+    core_items = [item for item in source_items if str(item.get("api_name") or "") in core_apis]
+    if not _decision_source_observation_ready(core_items):
+        return False
+    core_observed = _sorted_observation_times(core_items, "observed_at", fallback="available_time")
+    if not core_observed:
+        return False
+    factor_items = [item for item in source_items if str(item.get("api_name") or "") == "adj_factor"]
+    factor_observed = _sorted_observation_times(factor_items, "observed_at", fallback="available_time")
+    # No separate core version is needed when the factor was already visible
+    # by the time every formal-decision dependency arrived.
+    if not factor_observed or factor_observed[-1] <= core_observed[-1]:
+        return False
+    core_payload = dict(payload)
+    core_payload["adj_factor"] = None
+    core_payload["raw_content_hashes"] = sorted(
+        str(item.get("content_hash") or "")
+        for item in core_items
+        if str(item.get("content_hash") or "").strip()
+    )
+    flags = list(core_payload.get("quality_flags") or [])
+    if "adj_factor_late" not in flags:
+        flags.append("adj_factor_late")
+    core_payload["quality_flags"] = flags
+    source_code = next(
+        (
+            str(item.get("source_code") or "").strip()
+            for item in reversed(core_items)
+            if str(item.get("source_code") or "").strip()
+        ),
+        SOURCE_TUSHARE,
+    )
+    economic_times = _sorted_observation_times(core_items, "economic_available_time")
+    first_observed = _sorted_observation_times(core_items, "first_observed_at")
+    economic_time = economic_times[-1] if economic_times else ""
+    observed_at = core_observed[-1]
+    content_hash = payload_content_hash(core_payload, source_code=source_code, economic_time=economic_time)
+    try:
+        append_snapshot_version(
+            c,
+            ts_code=ts_code,
+            trade_date=trade_date,
+            payload_json=_strict_json(core_payload),
+            source_code=source_code,
+            metadata={
+                "economic_available_time": economic_time,
+                "observed_at": observed_at,
+                "first_observed_at": first_observed[-1] if first_observed else observed_at,
+                "observation_provenance": "snapshot:decision_core_observation_v2",
+                "content_hash": content_hash,
+            },
+            created_at=created_at,
+        )
+    except Exception:
+        if bool(getattr(c, "_is_postgres", False)):
+            raise
+        return False
+    return True
+
+
 def _raw_payload_map(c: Any, api_name: str, trade_date: str, key: str) -> dict[str, dict[str, Any]]:
-    rows = c.execute(
-        "SELECT payload_json FROM dc_tushare_raw_records WHERE api_name = ? AND trade_date = ?",
-        (api_name, trade_date),
-    ).fetchall()
+    versioned = load_raw_record_versions(
+        c, api_name,
+        trade_date_start=str(trade_date or "").replace("-", "")[:8],
+        trade_date_end=str(trade_date or "").replace("-", "")[:8],
+    )
+    if versioned:
+        rows = versioned
+    elif versioned is None and not bool(getattr(c, "_is_postgres", False)):
+        rows = c.execute(
+            "SELECT payload_json FROM dc_tushare_raw_records WHERE api_name = ? AND trade_date = ?",
+            (api_name, trade_date),
+        ).fetchall()
+    elif not bool(getattr(c, "_is_postgres", False)):
+        # The immutable schema exists but has no evidence for this slice. Do
+        # not let a later mutable projection silently become PIT evidence in
+        # production. Small SQLite fixtures retain the compatibility path.
+        rows = c.execute(
+            "SELECT payload_json FROM dc_tushare_raw_records WHERE api_name = ? AND trade_date = ?",
+            (api_name, trade_date),
+        ).fetchall()
+    else:
+        rows = []
     out: dict[str, dict[str, Any]] = {}
     for row in rows:
         payload = json.loads(_row_to_dict(row).get("payload_json") or "{}")
@@ -4622,6 +5619,82 @@ def _raw_payload_map(c: Any, api_name: str, trade_date: str, key: str) -> dict[s
     return out
 
 
+def _raw_source_metadata_map(c: Any, trade_date: str) -> dict[str, list[dict[str, Any]]]:
+    """Build per-stock dependency metadata from immutable versions first."""
+    target = str(trade_date or "").replace("-", "")[:8]
+    result: dict[str, list[dict[str, Any]]] = {}
+    for api_name in ("daily", "daily_basic", "adj_factor", "stk_limit", "suspend_d"):
+        versioned = load_raw_record_versions(
+            c, api_name, trade_date_start=target, trade_date_end=target,
+        )
+        if (versioned is None or not versioned) and not bool(getattr(c, "_is_postgres", False)):
+            try:
+                rows = c.execute(
+                    """SELECT api_name,source_code,economic_available_time,observed_at,first_observed_at,
+                              observation_provenance,content_hash,created_at,available_time,ts_code
+                         FROM dc_tushare_raw_records
+                        WHERE trade_date=? AND api_name=?""",
+                    (target, api_name),
+                ).fetchall()
+            except Exception:
+                rows = []
+            versioned = [dict(row) for row in rows]
+        for row in versioned:
+            item = dict(row)
+            # ``load_raw_record_versions`` intentionally returns the logical
+            # record fields and omits the API discriminator from its SELECT.
+            # Reattach the loop's API name before dependency contracts group
+            # the immutable evidence by required slice.
+            item["api_name"] = api_name
+            code = str(item.get("ts_code") or "").strip()
+            if code:
+                result.setdefault(code, []).append(item)
+    return result
+
+
+def _raw_source_items(c: Any, trade_date: str, ts_code: str) -> list[dict[str, Any]]:
+    """Load dependency metadata from immutable accepted observations only."""
+
+    target = str(trade_date or "").replace("-", "")[:8]
+    code = str(ts_code or "").strip()
+    if len(target) != 8 or not code:
+        return []
+    result: list[dict[str, Any]] = []
+    for api_name in ("daily", "daily_basic", "adj_factor", "stk_limit", "suspend_d"):
+        rows = load_raw_record_versions(
+            c,
+            api_name,
+            ts_codes=[code],
+            trade_date_start=target,
+            trade_date_end=target,
+        )
+        if rows is None:
+            if bool(getattr(c, "_is_postgres", False)):
+                raise RuntimeError("observation_clock_schema_inspection_failed")
+            continue
+        for row in rows:
+            item = dict(row)
+            item["api_name"] = api_name
+            result.append(item)
+    return result
+
+
+def _sorted_observation_times(
+    source_items: list[dict[str, Any]], field: str, *, fallback: str = "",
+) -> list[str]:
+    """Sort mixed-offset timestamps by instant, retaining canonical text."""
+    values: list[tuple[datetime, str]] = []
+    for item in source_items:
+        raw = item.get(field)
+        if not raw and fallback:
+            raw = item.get(fallback)
+        parsed = _explicit_observation_datetime(raw)
+        if parsed is not None:
+            values.append((parsed, parsed.isoformat(timespec="seconds")))
+    values.sort(key=lambda pair: pair[0])
+    return [value for _parsed, value in values]
+
+
 def _float_or_none(value: Any) -> float | None:
     if value in (None, ""):
         return None
@@ -4629,6 +5702,158 @@ def _float_or_none(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _explicit_observation_datetime(value: Any) -> datetime | None:
+    """Parse a real observation timestamp; naive text is not PIT evidence."""
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed.astimezone(_BUSINESS_TZ)
+
+
+def _immutable_observation_metadata_ready(item: dict[str, Any]) -> bool:
+    """Validate the metadata that makes one append-only row usable evidence."""
+
+    observed = _explicit_observation_datetime(item.get("observed_at"))
+    first_observed = _explicit_observation_datetime(item.get("first_observed_at"))
+    economic = _explicit_observation_datetime(item.get("economic_available_time"))
+    created = _explicit_observation_datetime(item.get("created_at"))
+    provenance = str(item.get("observation_provenance") or "").strip().lower()
+    return bool(
+        str(item.get("source_code") or "").strip()
+        and observed
+        and first_observed
+        and economic
+        and created
+        and first_observed <= observed
+        and provenance
+        and not provenance.startswith("legacy_")
+        and str(item.get("content_hash") or "").strip()
+    )
+
+
+def _strict_index_bar(c: Any, index_code: str, trade_date: str) -> dict[str, Any] | None:
+    """Return an immutable, exact-date index bar or ``None``.
+
+    Coverage/request ledgers and the mutable raw projection are diagnostic
+    only.  A bar can feed experiment readiness only after its append-only
+    observation version, metadata, exact date and numeric execution fields
+    have all been validated.
+    """
+    target = str(trade_date or "").replace("-", "")[:8]
+    code = str(index_code or "").strip()
+    if len(target) != 8 or not code:
+        return None
+    try:
+        rows = load_raw_record_versions(
+            c, "index_daily", ts_codes=[code],
+            trade_date_start=target, trade_date_end=target,
+        )
+    except Exception:
+        return None
+    if not rows:
+        return None
+    for row in rows:
+        item = dict(row)
+        if str(item.get("trade_date") or "").replace("-", "")[:8] != target:
+            continue
+        if not _immutable_observation_metadata_ready(item):
+            continue
+        try:
+            payload = json.loads(item.get("payload_json") or "{}")
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        values: dict[str, float] = {}
+        valid = True
+        for field in ("open", "high", "low", "close", "pre_close", "vol"):
+            # The audited Sina fallback stores the previous TuShare close
+            # under its evidence-specific name after cross-checking it. Treat
+            # that value as the canonical pre-close input; it is not a guess
+            # or a read from the mutable projection.
+            value = payload.get(field)
+            if field == "pre_close" and value in (None, ""):
+                value = payload.get("previous_tushare_close")
+            if isinstance(value, bool):
+                valid = False
+                break
+            try:
+                number = float(value)
+            except (TypeError, ValueError):
+                valid = False
+                break
+            if not math.isfinite(number) or number <= 0:
+                valid = False
+                break
+            values[field] = number
+        if valid:
+            return {"trade_date": target, "source_code": item.get("source_code"), **values}
+    return None
+
+
+def _strict_benchmark_bar(c: Any, trade_date: str) -> dict[str, Any] | None:
+    """Return an immutable, exact-date HS300 benchmark bar."""
+    return _strict_index_bar(c, "000300.SH", trade_date)
+
+
+def _strict_adj_factor_codes(c: Any, trade_date: str) -> set[str]:
+    target = str(trade_date or "").replace("-", "")[:8]
+    if len(target) != 8:
+        return set()
+    try:
+        rows = load_raw_record_versions(
+            c, "adj_factor", trade_date_start=target, trade_date_end=target,
+        )
+    except Exception:
+        return set()
+    valid: set[str] = set()
+    for row in rows or []:
+        item = dict(row)
+        if str(item.get("trade_date") or "").replace("-", "")[:8] != target:
+            continue
+        if not _immutable_observation_metadata_ready(item):
+            continue
+        try:
+            payload = json.loads(item.get("payload_json") or "{}")
+            code = str(payload.get("ts_code") or item.get("ts_code") or "").strip()
+            factor = float(payload.get("adj_factor"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if code and math.isfinite(factor) and factor > 0:
+            valid.add(code)
+    return valid
+
+
+def _decision_source_observation_ready(source_items: list[dict[str, Any]]) -> bool:
+    """Whether the three formal-decision inputs have immutable provenance.
+
+    ``adj_factor`` deliberately stays outside this predicate: it is required
+    by experiment/PIT-replay contracts, but not by the current formal decision
+    data contract.  This keeps a legitimate late factor publication visible to
+    research without stranding a complete, auditable T-day decision slice.
+    """
+
+    required = {"daily", "daily_basic", "stk_limit"}
+    by_api: dict[str, list[dict[str, Any]]] = {api: [] for api in required}
+    for item in source_items:
+        api_name = str(item.get("api_name") or "")
+        if api_name in by_api:
+            by_api[api_name].append(item)
+    if any(not by_api[api] for api in required):
+        return False
+    return all(
+        _immutable_observation_metadata_ready(item)
+        for items in by_api.values()
+        for item in items
+    )
 
 
 def _refresh_snapshot_stats(c: Any, trade_date: str, updated_at: str) -> None:
@@ -4680,18 +5905,36 @@ def _refresh_snapshot_stats(c: Any, trade_date: str, updated_at: str) -> None:
 
 
 def _refresh_oos_hard_api_stats(c: Any, api_name: str, trade_dates: list[str], updated_at: str) -> None:
-    """Persist bounded point-in-time raw coverage for the permanent OOS gate."""
+    """Persist bounded observation evidence for the permanent OOS gate.
+
+    The retained counts deliberately use the real observation clock.  A row
+    first seen after the historical decision cutoff remains a late arrival,
+    even if its economic date was the same trading day.
+    """
     targets = _oos_hard_stats_target_dates(c, trade_dates)
     for trade_date in sorted(targets):
-        row = c.execute(
-            """SELECT COUNT(DISTINCT ts_code) FILTER (WHERE available_time<=
-                        (SUBSTRING(trade_date,1,4)||'-'||SUBSTRING(trade_date,5,2)||'-'||SUBSTRING(trade_date,7,2)||'T15:00:00')) AS point_in_time_rows,
-                      COUNT(DISTINCT ts_code) AS raw_rows,
-                      COALESCE(MIN(available_time), '') AS first_available_time
-                 FROM dc_tushare_raw_records
-                WHERE api_name=? AND trade_date=? AND ts_code<>''""",
-            (api_name, trade_date),
-        ).fetchone()
+        cutoff = f"{trade_date[:4]}-{trade_date[4:6]}-{trade_date[6:]}T15:00:00+08:00"
+        versions = load_raw_record_versions(
+            c, api_name, cutoff=cutoff,
+            trade_date_start=trade_date, trade_date_end=trade_date,
+        )
+        # The live OOS summary must never derive historical readiness from an
+        # overwrite projection. A missing version table/evidence becomes zero
+        # coverage and the strict OOS auditor supplies the explicit reason.
+        rows = [
+            dict(row) for row in (versions or [])
+            if str(dict(row).get("ts_code") or "")
+            and _immutable_observation_metadata_ready(dict(row))
+        ]
+        # ``load_raw_record_versions(..., cutoff=cutoff)`` filters before its
+        # logical-version rank, so every retained row is the latest version
+        # actually visible at this date's fixed T15 boundary.
+        observed_rows = rows
+        first_times = [
+            _explicit_observation_datetime(item.get("first_observed_at"))
+            for item in rows
+        ]
+        first_times = [item for item in first_times if item is not None]
         c.execute(
             """INSERT INTO dc_oos_hard_api_stats_live
                    (api_name,trade_date,point_in_time_rows,raw_rows,first_available_time,updated_at)
@@ -4702,9 +5945,11 @@ def _refresh_oos_hard_api_stats(c: Any, api_name: str, trade_dates: list[str], u
                    first_available_time=excluded.first_available_time,
                    updated_at=excluded.updated_at""",
             (
-                api_name, trade_date, int(_row_value(row, "point_in_time_rows", 0) or 0),
-                int(_row_value(row, "raw_rows", 0) or 0),
-                str(_row_value(row, "first_available_time", "") or ""), updated_at,
+                api_name, trade_date,
+                len({str(item.get("ts_code") or "") for item in observed_rows}),
+                len({str(item.get("ts_code") or "") for item in rows}),
+                min(first_times).isoformat(timespec="seconds") if first_times else "",
+                updated_at,
             ),
         )
 
@@ -4747,14 +5992,49 @@ def _oos_hard_stats_target_dates(c: Any, trade_dates: list[str]) -> set[str]:
 
 
 def _upsert_snapshot_row(c: Any, values: tuple[Any, ...]) -> None:
+    # 27 legacy fields + five observation-clock fields + updated_at.
+    has_clock = False
+    try:
+        if bool(getattr(c, "_is_postgres", False)):
+            columns = {
+                str(row["column_name"])
+                for row in c.execute(
+                    "SELECT column_name FROM information_schema.columns WHERE table_schema='public' AND table_name='dc_stock_daily_snapshot'"
+                ).fetchall()
+            }
+        else:
+            columns = {str(row["name"]) for row in c.execute("PRAGMA table_info(dc_stock_daily_snapshot)").fetchall()}
+        has_clock = {"economic_available_time", "observed_at", "first_observed_at", "observation_provenance", "content_hash"}.issubset(columns)
+    except Exception:
+        if bool(getattr(c, "_is_postgres", False)):
+            raise RuntimeError("observation_clock_schema_inspection_failed")
+    if not has_clock:
+        values = values[:26] + (values[-1],)
+        c.execute(
+            """INSERT INTO dc_stock_daily_snapshot
+               (ts_code,trade_date,symbol,name,industry,close,open,high,low,pre_close,adj_factor,change_pct,volume,turnover,
+                total_mv,circ_mv,pe_ttm,pb,turnover_rate,up_limit,down_limit,is_suspended,data_quality_score,quality_flags_json,
+                source_code,available_time,updated_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+               ON CONFLICT(ts_code,trade_date) DO UPDATE SET
+                symbol=excluded.symbol,name=excluded.name,industry=excluded.industry,close=excluded.close,open=excluded.open,
+                high=excluded.high,low=excluded.low,pre_close=excluded.pre_close,adj_factor=excluded.adj_factor,
+                change_pct=excluded.change_pct,volume=excluded.volume,turnover=excluded.turnover,total_mv=excluded.total_mv,
+                circ_mv=excluded.circ_mv,pe_ttm=excluded.pe_ttm,pb=excluded.pb,turnover_rate=excluded.turnover_rate,
+                up_limit=excluded.up_limit,down_limit=excluded.down_limit,is_suspended=excluded.is_suspended,
+                data_quality_score=excluded.data_quality_score,quality_flags_json=excluded.quality_flags_json,
+                source_code=excluded.source_code,available_time=excluded.available_time,updated_at=excluded.updated_at""",
+            values,
+        )
+        return
     if c._is_mysql:
         c.execute(
             """
             INSERT INTO dc_stock_daily_snapshot
                 (ts_code, trade_date, symbol, name, industry, close, open, high, low, pre_close, adj_factor, change_pct, volume, turnover, total_mv, circ_mv, pe_ttm, pb,
                  turnover_rate, up_limit, down_limit, is_suspended, data_quality_score, quality_flags_json,
-                 source_code, available_time, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 source_code, available_time, economic_available_time, observed_at, first_observed_at, observation_provenance, content_hash, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON DUPLICATE KEY UPDATE
                 symbol = VALUES(symbol), name = VALUES(name), industry = VALUES(industry),
                 close = VALUES(close), open = VALUES(open), high = VALUES(high), low = VALUES(low), pre_close = VALUES(pre_close), adj_factor = VALUES(adj_factor),
@@ -4762,7 +6042,9 @@ def _upsert_snapshot_row(c: Any, values: tuple[Any, ...]) -> None:
                 pe_ttm = VALUES(pe_ttm), pb = VALUES(pb), turnover_rate = VALUES(turnover_rate),
                 up_limit = VALUES(up_limit), down_limit = VALUES(down_limit), is_suspended = VALUES(is_suspended),
                 data_quality_score = VALUES(data_quality_score), quality_flags_json = VALUES(quality_flags_json),
-                source_code = VALUES(source_code), available_time = VALUES(available_time), updated_at = VALUES(updated_at)
+                source_code = VALUES(source_code), available_time = VALUES(available_time), economic_available_time = VALUES(economic_available_time), observed_at = VALUES(observed_at),
+                first_observed_at = CASE WHEN first_observed_at='' THEN VALUES(first_observed_at) ELSE first_observed_at END,
+                observation_provenance = VALUES(observation_provenance), content_hash = VALUES(content_hash), updated_at = VALUES(updated_at)
             """,
             values,
         )
@@ -4772,8 +6054,8 @@ def _upsert_snapshot_row(c: Any, values: tuple[Any, ...]) -> None:
             INSERT INTO dc_stock_daily_snapshot
                 (ts_code, trade_date, symbol, name, industry, close, open, high, low, pre_close, adj_factor, change_pct, volume, turnover, total_mv, circ_mv, pe_ttm, pb,
                  turnover_rate, up_limit, down_limit, is_suspended, data_quality_score, quality_flags_json,
-                 source_code, available_time, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 source_code, available_time, economic_available_time, observed_at, first_observed_at, observation_provenance, content_hash, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(ts_code, trade_date) DO UPDATE SET
                 symbol = excluded.symbol,
                 name = excluded.name,
@@ -4799,6 +6081,11 @@ def _upsert_snapshot_row(c: Any, values: tuple[Any, ...]) -> None:
                 quality_flags_json = excluded.quality_flags_json,
                 source_code = excluded.source_code,
                 available_time = excluded.available_time,
+                economic_available_time = excluded.economic_available_time,
+                observed_at = excluded.observed_at,
+                first_observed_at = CASE WHEN dc_stock_daily_snapshot.first_observed_at='' THEN excluded.first_observed_at ELSE dc_stock_daily_snapshot.first_observed_at END,
+                observation_provenance = excluded.observation_provenance,
+                content_hash = excluded.content_hash,
                 updated_at = excluded.updated_at
             """,
             values,

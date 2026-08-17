@@ -9,7 +9,6 @@ from time import perf_counter
 from typing import Any, Callable, Tuple
 
 from app.integrations.tushare_client import reset_tushare_client
-from app.core.trade_calendar import is_trade_day
 from app.data_platform.db import _conn as data_conn
 from app.db.store import (
     _conn as business_conn,
@@ -17,7 +16,8 @@ from app.db.store import (
     get_quant_replay_waterline,
     get_quant_run_task_health,
     get_quant_run_task_runtime_config,
-    create_quant_run_task,
+    create_or_reuse_autonomous_quant_run_task,
+    claim_quant_run_task_start,
     create_quant_run_task_record,
     get_quant_run_task,
     list_active_quant_run_tasks,
@@ -28,6 +28,7 @@ from app.db.store import (
 )
 from app.services.cache_consolidation import trigger_backfill_merge_meta_async
 from app.services.backtest_data_source import BacktestDataSource
+from app.data_platform.tushare_client import is_tushare_compatible_source
 from app.services.quant_run_engine import (
     HistoricalDataMissingError,
     ReplayRiskGateError,
@@ -43,9 +44,21 @@ _BUSINESS_TZ = ZoneInfo("Asia/Shanghai")
 
 _task_lock = threading.Lock()
 _running_task_ids: set[int] = set()
+_autonomous_task_lock = threading.Lock()
 _account_execution_lock = threading.Lock()
 _REPLAY_BATCH_STEPS = max(1, min(int(os.getenv("QUANT_REPLAY_BATCH_STEPS", "3")), 5))
 _PRAGMATIC_MAX_GAP_DAYS = max(1, min(int(os.getenv("QUANT_PRAGMATIC_MAX_GAP_DAYS", "5")), 30))
+
+# These failures mean that the exact-date market slice is not available yet.
+# They must leave a frozen plan retryable; turning one into a contract terminal
+# state would prevent the publication probe/backfill loop from ever recovering.
+_RETRYABLE_EXECUTION_DATA_CODES = {
+    "paused_frozen_execution_data_not_ready",
+    "paused_frozen_execution_order_data_not_ready",
+    "paused_data_not_ready",
+    "future_guard_execute_snapshot",
+    "historical_data_missing_508",
+}
 _ENFORCE_TRADING_SESSION_GATE = str(os.getenv("QUANT_ENFORCE_TRADING_SESSION_GATE", "0")).strip().lower() in {"1", "true", "yes", "on"}
 _DEFAULT_SCORING_TIMEOUT_SEC = max(10, min(int(os.getenv("QUANT_SCORING_TIMEOUT_SEC", "90")), 1800))
 _DEFAULT_MIN_ACCOUNT_BALANCE = max(0.0, float(os.getenv("QUANT_MIN_ACCOUNT_BALANCE", "0") or 0))
@@ -241,32 +254,170 @@ def _execution_slice_ready(stock_count: int, counts: dict[str, int]) -> bool:
     )
 
 
+def _strict_execution_observation_record(record: dict[str, Any], *, cutoff: datetime) -> bool:
+    """Check that one immutable row can safely support a live execution gate."""
+
+    def _parse(value: Any) -> datetime | None:
+        raw = str(value or "").strip().replace("Z", "+00:00")
+        if not raw:
+            return None
+        try:
+            parsed = datetime.fromisoformat(raw)
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            return None
+        return parsed.astimezone(_BUSINESS_TZ)
+
+    observed = _parse(record.get("observed_at"))
+    first_observed = _parse(record.get("first_observed_at"))
+    economic = _parse(record.get("economic_available_time"))
+    created = _parse(record.get("created_at"))
+    provenance = str(record.get("observation_provenance") or "").strip().lower()
+    return bool(
+        str(record.get("source_code") or "").strip()
+        and str(record.get("content_hash") or "").strip()
+        and provenance
+        and not provenance.startswith("legacy_")
+        and observed is not None
+        and first_observed is not None
+        and economic is not None
+        and created is not None
+        and first_observed <= observed <= cutoff
+        and economic <= observed
+        and created <= cutoff
+    )
+
+
 def _snapshot_data_status(trade_date: str = "") -> tuple[str, dict[str, int]]:
-    """Return exact-date market coverage without applying a decision policy."""
+    """Return immutable exact-date market coverage without applying policy.
+
+    This is a scheduler hint only; per-order immutable evidence remains the
+    final execution gate. It must nevertheless not treat a mutable projection
+    as publication proof, otherwise an incomplete late rewrite can advertise a
+    close slice as ready before the exact frozen-order audit runs.
+    """
     requested = _trade_date_key(trade_date)
     from app.data_platform.db import _conn
-    from app.data_platform.services.market_calendar import target_trade_date
+    from app.data_platform.services.market_calendar import TradeCalendarNotReady, target_trade_date
+    from app.data_platform.services.observation_clock import load_raw_record_versions, load_snapshot_versions
 
+    observation_cutoff = _business_now()
+    cutoff_text = observation_cutoff.isoformat(timespec="seconds")
     with _conn() as c:
-        target = requested or target_trade_date(c)
-        stock_count = int(dict(c.execute("SELECT COUNT(*) n FROM dc_stock_master").fetchone()).get("n") or 0)
-        row = c.execute(
-            """SELECT
-                 SUM(CASE WHEN s.close IS NOT NULL THEN 1 ELSE 0 END) AS daily_n,
-                 SUM(CASE WHEN EXISTS (
-                     SELECT 1 FROM dc_tushare_raw_records r
-                     WHERE r.api_name='daily' AND r.trade_date=s.trade_date AND r.ts_code=s.ts_code
-                       AND NULLIF(r.payload_json::jsonb->>'open','') IS NOT NULL
-                       AND NULLIF(r.payload_json::jsonb->>'pre_close','') IS NOT NULL
-                 ) THEN 1 ELSE 0 END) AS execution_price_n,
-                 SUM(CASE WHEN s.total_mv IS NOT NULL THEN 1 ELSE 0 END) AS valuation_n,
-                 SUM(CASE WHEN s.up_limit IS NOT NULL AND s.down_limit IS NOT NULL THEN 1 ELSE 0 END) AS limit_n
-               FROM dc_stock_daily_snapshot s WHERE s.trade_date=?""",
-            (target,),
-        ).fetchone()
+        try:
+            target = requested or target_trade_date(c)
+        except TradeCalendarNotReady as exc:
+            logger.error("交易日历未就绪，收盘数据检查阻断: %s", exc)
+            return "", {
+                "stock_count": 0,
+                "daily_n": 0,
+                "execution_price_n": 0,
+                "valuation_n": 0,
+                "limit_n": 0,
+                "immutable_schema_ready": 0,
+                "calendar_ready": 0,
+                "calendar_error": exc.code,
+            }
+        stock_rows = c.execute("SELECT ts_code FROM dc_stock_master").fetchall()
+        stock_codes = {str(dict(row).get("ts_code") or "") for row in stock_rows}
+        stock_codes.discard("")
+        stock_count = len(stock_codes)
+        snapshot_versions = load_snapshot_versions(c, cutoff=cutoff_text, trade_date=target)
+        daily_versions = load_raw_record_versions(
+            c, "daily", cutoff=cutoff_text, trade_date_start=target, trade_date_end=target,
+        )
+        basic_versions = load_raw_record_versions(
+            c, "daily_basic", cutoff=cutoff_text, trade_date_start=target, trade_date_end=target,
+        )
+        limit_versions = load_raw_record_versions(
+            c, "stk_limit", cutoff=cutoff_text, trade_date_start=target, trade_date_end=target,
+        )
+    # A missing version schema is fail-closed in production. SQLite's fixture
+    # compatibility is intentionally not used by the autonomous scheduler.
+    if any(value is None for value in (snapshot_versions, daily_versions, basic_versions, limit_versions)):
+        return target, {
+            "stock_count": stock_count,
+            "daily_n": 0,
+            "execution_price_n": 0,
+            "valuation_n": 0,
+            "limit_n": 0,
+            "immutable_schema_ready": 0,
+        }
+
+    def _payload(item: dict) -> dict:
+        import json
+        try:
+            value = json.loads(item.get("payload_json") or "{}")
+        except (TypeError, ValueError):
+            value = {}
+        return value if isinstance(value, dict) else {}
+
+    def _finite(value: Any, *, positive: bool = False) -> bool:
+        if isinstance(value, bool):
+            return False
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            return False
+        return parsed == parsed and abs(parsed) != float("inf") and (parsed > 0 if positive else True)
+
+    def _eligible_rows(versions: list[dict] | None) -> dict[str, dict]:
+        result: dict[str, dict] = {}
+        for raw in versions or []:
+            item = dict(raw)
+            if not _strict_execution_observation_record(item, cutoff=observation_cutoff):
+                continue
+            payload = _payload(item)
+            code = str(item.get("ts_code") or "").strip().upper()
+            payload_code = str(payload.get("ts_code") or code).strip().upper()
+            row_date = str(item.get("trade_date") or "").replace("-", "")[:8]
+            payload_date = str(payload.get("trade_date") or row_date).replace("-", "")[:8]
+            if not code or code not in stock_codes or payload_code != code or row_date != target or payload_date != target:
+                continue
+            result[code] = payload
+        return result
+
+    daily_by_code = _eligible_rows(daily_versions)
+    basic_by_code = _eligible_rows(basic_versions)
+    limit_by_code = _eligible_rows(limit_versions)
+    snapshot_by_code: dict[str, dict] = {}
+    for item in snapshot_versions or []:
+        item = dict(item)
+        if not _strict_execution_observation_record(item, cutoff=observation_cutoff):
+            continue
+        payload = _payload(item)
+        code = str(item.get("ts_code") or "").strip().upper()
+        payload_code = str(payload.get("ts_code") or code).strip().upper()
+        row_date = str(item.get("trade_date") or "").replace("-", "")[:8]
+        payload_date = str(payload.get("trade_date") or row_date).replace("-", "")[:8]
+        if code and code in stock_codes and payload_code == code and row_date == target and payload_date == target:
+            snapshot_by_code[code] = payload
+    daily_n = sum(_finite(row.get("close"), positive=True) for row in daily_by_code.values())
+    execution_price_n = sum(
+        _finite(row.get("open"), positive=True) and _finite(row.get("pre_close"), positive=True)
+        and _finite(snapshot_by_code.get(code, {}).get("open"), positive=True)
+        and _finite(snapshot_by_code.get(code, {}).get("pre_close"), positive=True)
+        for code, row in daily_by_code.items()
+    )
+    valuation_n = sum(
+        _finite(row.get("total_mv"), positive=True)
+        and _finite(snapshot_by_code.get(code, {}).get("total_mv"), positive=True)
+        for code, row in basic_by_code.items()
+    )
+    limit_n = sum(
+        _finite(limit_by_code.get(code, {}).get("up_limit"))
+        and _finite(limit_by_code.get(code, {}).get("down_limit"))
+        and _finite(snapshot_by_code.get(code, {}).get("up_limit"))
+        and _finite(snapshot_by_code.get(code, {}).get("down_limit"))
+        for code in daily_by_code
+    )
     counts = {
-        key: int((dict(row).get(key) if row else 0) or 0)
-        for key in ("daily_n", "execution_price_n", "valuation_n", "limit_n")
+        "daily_n": int(daily_n),
+        "execution_price_n": int(execution_price_n),
+        "valuation_n": int(valuation_n),
+        "limit_n": int(limit_n),
+        "immutable_schema_ready": 1,
     }
     return target, {"stock_count": stock_count, **counts}
 
@@ -276,10 +427,27 @@ def _close_data_status() -> tuple[str, bool, dict[str, int]]:
 
     The simulator must never silently fall back to yesterday merely because
     today's market bundle has not been ingested yet.  Keep this check close to
-    the scheduler instead of relying on the short-lived readiness cache.
+    the scheduler instead of relying on the short-lived readiness cache. The
+    aggregate counts remain useful execution evidence, but the decision-ready
+    result must come from the same strict field/PIT contract used by plan
+    generation. Otherwise a partial valuation or turnover slice can suppress
+    the refresh that would repair it.
     """
     target, counts = _snapshot_data_status()
-    ready = _market_slice_ready(int(counts.get("stock_count") or 0), counts)
+    if not target:
+        return target, False, counts
+    try:
+        from app.data_platform.services.decision_data_contract import decision_data_contract
+
+        contract = decision_data_contract(target)
+        ready = bool(contract.get("ok")) if isinstance(contract, dict) else False
+    except Exception as exc:  # noqa: BLE001 - a scheduler data gate is fail-closed
+        logger.warning(
+            "收盘严格决策数据合同检查失败 target=%s error=%s",
+            target,
+            str(exc)[:200],
+        )
+        ready = False
     return target, ready, counts
 
 
@@ -314,7 +482,7 @@ def _evaluate_frozen_execution_data_gate(
         exit_condition="当日仍无法取得安全切片时记录漏跑，不得跨日补成交。",
         severity="error",
         evidence={
-            "schema_version": "alis_frozen_t1_execution_data_gate_v2",
+            "schema_version": "alis_frozen_t1_execution_data_gate_v3",
             "execute_date": _trade_date_key(execute_date),
             "target_trade_date": target,
             "counts": counts,
@@ -322,8 +490,12 @@ def _evaluate_frozen_execution_data_gate(
             "defensive_asset_required_fields": [
                 "fund_daily.trade_date=execute_date",
                 "fund_daily.open",
+                "fund_daily.high",
+                "fund_daily.low",
+                "fund_daily.close",
                 "fund_daily.pre_close",
                 "fund_daily.vol",
+                "fund_daily.amount",
             ],
             "defensive_assets": defensive_status,
             "daily_basic_required": False,
@@ -361,11 +533,12 @@ def _refresh_missing_frozen_defensive_assets(
 
     discovery = discover_first_published("defensive_fund_daily", execute_date)
     winner = str(discovery.get("winner") or "")
-    if winner == "tushare":
+    if is_tushare_compatible_source(winner):
         provider_result = materialize_defensive_asset_history(
             start_date=execute_date,
             end_date=execute_date,
             ts_codes=missing,
+            provider=winner,
         )
     elif winner == "tencent_etf_quote":
         provider_result = repair_fund_daily_from_tencent(execute_date, required)
@@ -387,9 +560,72 @@ def _refresh_missing_frozen_defensive_assets(
         "winner": winner,
         "discovery": discovery,
         "provider_result": provider_result,
-        "refresh_result": provider_result if winner == "tushare" else None,
+        "refresh_result": provider_result if is_tushare_compatible_source(winner) else None,
         "fallback_result": provider_result if winner == "tencent_etf_quote" else None,
     }
+
+
+def _refresh_missing_frozen_stock_orders(
+    execute_date: str,
+    contract: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Repair only stock symbols in the frozen order set that fail the gate.
+
+    The market bundle's coverage threshold is intentionally broad.  A frozen
+    order is narrower and must be repaired exactly, so a 99.5% universe cannot
+    hide one missing order behind the aggregate ratio.
+    """
+    from app.data_platform.services.data_center import sync_market_bundle
+    from app.services.profit_loop import audit_frozen_execution_orders
+    from app.data_platform.services.tencent_limit_fallback import repair_stk_limit_from_tencent
+
+    audit = audit_frozen_execution_orders(contract or {}, execute_date)
+    missing_items = [
+        item for item in audit.get("orders") or []
+        if not bool(item.get("ready")) and not bool(item.get("is_etf"))
+    ]
+    if not missing_items:
+        return {"refresh": "not_needed", "audit": audit}
+    target = _trade_date_key(execute_date)
+    requested_apis: set[str] = set()
+    for item in missing_items:
+        fields = set(str(value) for value in item.get("missing_fields") or [])
+        if any(value.startswith("daily.") or value.startswith("snapshot.") for value in fields):
+            requested_apis.add("daily")
+        if any(value.startswith("stk_limit.") for value in fields):
+            requested_apis.add("stk_limit")
+
+    # A frozen order gap is exact, but its data contract is still a market
+    # slice.  Reuse the publication race and full-slice validators so the
+    # repair cannot quietly pin itself to the primary endpoint or retain a
+    # per-symbol partial response as executable evidence.
+    results: list[dict[str, Any]] = []
+    if requested_apis:
+        try:
+            result = sync_market_bundle(target, apis=sorted(requested_apis))
+            results.append({
+                "ts_codes": [str(item.get("ts_code") or "").strip().upper() for item in missing_items],
+                "apis": sorted(requested_apis),
+                "result": result,
+            })
+        except Exception as exc:
+            results.append({
+                "apis": sorted(requested_apis),
+                "error": str(exc)[:240],
+            })
+    refreshed = audit_frozen_execution_orders(contract or {}, execute_date)
+    if not refreshed.get("ok") and any(
+        any(str(value).startswith("stk_limit.") for value in item.get("missing_fields") or [])
+        for item in refreshed.get("orders") or []
+        if not item.get("is_etf")
+    ):
+        try:
+            fallback = repair_stk_limit_from_tencent(target)
+        except Exception as exc:
+            fallback = {"ok": False, "status": "fallback_request_failed", "error": str(exc)[:240]}
+        results.append({"api": "stk_limit", "fallback": fallback})
+        refreshed = audit_frozen_execution_orders(contract or {}, execute_date)
+    return {"refresh": "attempted", "audit": refreshed, "results": results}
 
 
 def _ensure_close_data_ready() -> tuple[str, bool]:
@@ -450,9 +686,9 @@ def _is_exchange_trade_day(value: datetime) -> bool:
             return bool(int(dict(row).get("is_open") or 0))
         logger.warning("交易所日历缺少执行日期，拒绝启动执行探测 date=%s", trade_date)
         return False
-    except Exception as exc:  # noqa: BLE001 - static calendar is an outage fallback only
-        logger.warning("交易所日历不可读，使用内置日历回退 date=%s error=%s", trade_date, str(exc)[:160])
-        return is_trade_day(value.date())
+    except Exception as exc:  # noqa: BLE001 - execution must fail closed without exchange evidence
+        logger.error("交易所日历不可读，拒绝启动执行探测 date=%s error=%s", trade_date, str(exc)[:160])
+        return False
 
 
 def _auto_simulation_check_due(now: datetime, close_time: dtime) -> bool:
@@ -521,6 +757,16 @@ def start_auto_simulation_scheduler() -> bool:
                                 due_context.get("required_defensive_ts_codes") or [],
                             )
                             if execution_gate.should_pause:
+                                try:
+                                    _refresh_missing_frozen_stock_orders(
+                                        str(due_context.get("current_execute_date") or ""),
+                                        due_context.get("execution_contract") or {},
+                                    )
+                                except Exception as exc:
+                                    logger.warning(
+                                        "冻结计划股票精确补数失败 execute_date=%s: %s",
+                                        due_context.get("current_execute_date"), str(exc)[:200],
+                                    )
                                 refresh = _refresh_missing_frozen_defensive_assets(
                                     str(due_context.get("current_execute_date") or ""),
                                     due_context.get("required_defensive_ts_codes") or [],
@@ -804,6 +1050,7 @@ def _execute_step_with_retry(
     execute_date: str,
     progress_callback,
     scoring_timeout_sec: int,
+    claim_observer: Optional[Callable[[str, str], None]] = None,
 ):
     authoritative_plan = None
     if str(task_live.get("replay_mode") or "") == "autonomous_daily":
@@ -819,9 +1066,11 @@ def _execute_step_with_retry(
                 claim_token=claim_token,
                 expected_strategy_id=int(task_live.get("strategy_id") or 0),
             )
+            if authoritative_plan and claim_observer is not None:
+                claim_observer(signal_date, claim_token)
         except ReplayRiskGateError as exc:
             error_code = str(getattr(exc, "code", "") or "invalid_authoritative_plan")
-            if error_code != "formal_plan_not_due":
+            if error_code not in {"formal_plan_not_due", *_RETRYABLE_EXECUTION_DATA_CODES}:
                 block_daily_rebalance_plan_contract(
                     signal_date,
                     execute_date,
@@ -836,8 +1085,38 @@ def _execute_step_with_retry(
         )
     def _run_atomically():
         from app.db.store import atomic_business_transaction
+        from app.services.profit_loop import (
+            _persist_frozen_order_audit,
+            audit_frozen_execution_orders,
+            frozen_order_data_gate_error,
+        )
 
-        with atomic_business_transaction():
+        with atomic_business_transaction() as business_tx:
+            if str(task_live.get("replay_mode") or "") == "autonomous_daily":
+                contract = (authoritative_plan or {}).get("decision_contract") or {}
+                order_audit = audit_frozen_execution_orders(
+                    contract,
+                    execute_date,
+                    observed_at=str((authoritative_plan or {}).get("execution_observation_cutoff") or ""),
+                )
+                if not order_audit.get("ok"):
+                    # Raising rolls back all ledger mutations. The outer
+                    # retryable error path then releases the claim and stores
+                    # this exact evidence without quarantining the plan.
+                    raise frozen_order_data_gate_error(order_audit)
+                # Keep the claim and transaction checks on one immutable
+                # observation clock. The execution engine receives this same
+                # cutoff after the transaction scope has been opened.
+                if authoritative_plan is not None:
+                    authoritative_plan["execution_observation_cutoff"] = str(order_audit.get("checked_at") or "")
+                    authoritative_plan["execution_data_evidence"] = order_audit
+                plan_id = int((authoritative_plan or {}).get("plan_id") or 0)
+                if plan_id:
+                    _persist_frozen_order_audit(
+                        plan_id=plan_id,
+                        audit=order_audit,
+                        conn=business_tx,
+                    )
             result = run_for_trade_date(
                 strategy_id=int(task_live.get("strategy_id") or 0),
                 signal_date=signal_date,
@@ -938,6 +1217,7 @@ def _build_autonomous_plan_context(dates: list[str]) -> dict:
                 "current_execute_date": execute_date,
                 "target_execute_date": execute_date,
                 "required_defensive_ts_codes": list(item.get("required_defensive_ts_codes") or []),
+                "execution_contract": item.get("execution_contract") or {},
             }
     return {"ok": False, "reason": "no_due_formal_plan"}
 
@@ -1043,16 +1323,38 @@ def _persist_step_result(
 
 def run_quant_task_async(task_id: int) -> bool:
     task_id = int(task_id)
-    if _is_running(task_id):
-        return False
-    task = get_quant_run_task(task_id)
-    if not task:
-        return False
-    if str(task.get("status") or "").lower() in {"failed"}:
-        return False
+    # Reserve synchronously, before the thread is created.  Checking and only
+    # marking from inside ``_worker`` leaves a small but real scheduler race in
+    # which two ticks can start duplicate workers for the same task.
+    with _task_lock:
+        if task_id in _running_task_ids:
+            return False
+        _running_task_ids.add(task_id)
+    try:
+        task = get_quant_run_task(task_id)
+        if not task:
+            _mark_running(task_id, False)
+            return False
+        if str(task.get("status") or "").lower() in {"failed", "stopped", "stopping", "running"}:
+            _mark_running(task_id, False)
+            return False
+        if not claim_quant_run_task_start(
+            task_id,
+            replay_mode=_normalized_replay_mode(task.get("replay_mode")),
+            replay_status="planning",
+            started_at=task.get("started_at") or _utc_now_iso(),
+            error=None,
+            last_message="正在生成补跑计划",
+            stop_requested=0,
+        ):
+            # Another process owns the row, or a stop request won the race.
+            _mark_running(task_id, False)
+            return False
+    except Exception:
+        _mark_running(task_id, False)
+        raise
 
     def _worker() -> None:
-        _mark_running(task_id, True)
         active_claim: tuple[str, str] | None = None
 
         def _quarantine_active_claim(reason: str) -> None:
@@ -1103,18 +1405,6 @@ def run_quant_task_async(task_id: int) -> bool:
                 "last_risk_code": str(task0.get("last_risk_code") or ""),
             }
             upsert_quant_run_task_health(task_id, **health0)
-            _transition_task_status(
-                task_id,
-                "running",
-                "start_planning",
-                stop_requested=0,
-                started_at=task0.get("started_at") or now,
-                replay_mode=mode,
-                replay_status="planning",
-                error=None,
-                last_message="正在生成补跑计划",
-            )
-
             if enable_data_health_gate and replay_opinion_gates:
                 data_decision = evaluate_data_health_gate(limit_days=5)
                 if data_decision.should_pause:
@@ -1272,12 +1562,26 @@ def run_quant_task_async(task_id: int) -> bool:
                 )
                 return
 
-            if enable_data_health_gate and mode == "autonomous_daily":
+            # A frozen T+1 plan may only execute against its exact-date market
+            # slice. This is a production execution contract, not an optional
+            # runtime data-health opinion, so autonomous execution cannot turn
+            # it off through task metadata or an environment override.
+            if mode == "autonomous_daily":
                 execution_data_decision = _evaluate_frozen_execution_data_gate(
                     str(plan.get("current_execute_date") or ""),
                     plan.get("required_defensive_ts_codes") or [],
                 )
                 if execution_data_decision.should_pause:
+                    try:
+                        _refresh_missing_frozen_stock_orders(
+                            str(plan.get("current_execute_date") or ""),
+                            plan.get("execution_contract") or {},
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "冻结计划股票精确补数失败 execute_date=%s: %s",
+                            plan.get("current_execute_date"), str(exc)[:200],
+                        )
                     try:
                         _ensure_close_data_ready()
                     except Exception as exc:  # noqa: BLE001
@@ -1472,12 +1776,11 @@ def run_quant_task_async(task_id: int) -> bool:
                 # The simulator has one shared cash account and one position
                 # book.  Different task ids must not execute or checkpoint a
                 # trade concurrently inside the same service process.
+                def _record_claim(claim_signal: str, claim_token: str) -> None:
+                    nonlocal active_claim
+                    active_claim = (claim_signal, claim_token)
+
                 with _account_execution_lock:
-                    if mode == "autonomous_daily":
-                        active_claim = (
-                            signal_date,
-                            f"quant-task:{int(task_id)}:{signal_date}:{execute_date}",
-                        )
                     result = _execute_step_with_retry(
                         task_id=task_id,
                         task_live=task_live,
@@ -1485,6 +1788,7 @@ def run_quant_task_async(task_id: int) -> bool:
                         execute_date=execute_date,
                         progress_callback=_step_phase,
                         scoring_timeout_sec=scoring_timeout_sec,
+                        claim_observer=_record_claim,
                     )
                     step_ms = max(1, int((perf_counter() - step_t0) * 1000))
                     prev_cnt = int(health0["step_count"])
@@ -1594,7 +1898,21 @@ def run_quant_task_async(task_id: int) -> bool:
                     last_run_status="completed",
                 )
         except HistoricalDataMissingError as e:
-            _quarantine_active_claim(str(e))
+            # A missing exact-date slice is recoverable.  Release any claim so
+            # the next publication probe can retry; only an unknown/ledger
+            # failure is allowed to quarantine an execution.
+            if active_claim:
+                signal_claim, token_claim = active_claim
+                try:
+                    from app.services.profit_loop import release_daily_rebalance_execution_claim
+
+                    release_daily_rebalance_execution_claim(
+                        signal_claim,
+                        claim_token=token_claim,
+                        reason=e,
+                    )
+                finally:
+                    active_claim = None
             trigger_backfill_merge_meta_async(reason=f"quant_task_{task_id}_508")
             logger.warning("quant task paused by 508 historical data missing task_id=%s | %s", task_id, str(e)[:160])
             decision = pause_decision(
@@ -1623,8 +1941,22 @@ def run_quant_task_async(task_id: int) -> bool:
                 last_risk_code="historical_data_missing_508",
             )
         except ReplayRiskGateError as e:
-            _quarantine_active_claim(str(e))
             error_code = str(getattr(e, "code", "") or "replay_risk_gate")
+            retryable_execution_data_codes = _RETRYABLE_EXECUTION_DATA_CODES
+            if error_code in retryable_execution_data_codes and active_claim:
+                signal_claim, token_claim = active_claim
+                try:
+                    from app.services.profit_loop import release_daily_rebalance_execution_claim
+
+                    release_daily_rebalance_execution_claim(
+                        signal_claim,
+                        claim_token=token_claim,
+                        reason=e,
+                    )
+                finally:
+                    active_claim = None
+            elif error_code not in retryable_execution_data_codes:
+                _quarantine_active_claim(str(e))
             contract_rejections = {
                 "legacy_authoritative_plan",
                 "invalid_authoritative_plan",
@@ -1646,6 +1978,18 @@ def run_quant_task_async(task_id: int) -> bool:
                     **_waiting_schedule_projection(),
                 )
                 logger.info("autonomous plan is not claimable yet task_id=%s code=%s", task_id, error_code)
+                return
+            if mode == "autonomous_daily" and error_code in retryable_execution_data_codes:
+                _transition_task_status(
+                    task_id,
+                    "pending",
+                    "schedule_wait",
+                    replay_status="waiting_execution_data",
+                    error=None,
+                    finished_at=None,
+                    **_waiting_schedule_projection(),
+                )
+                logger.info("autonomous plan is waiting for exact execution data task_id=%s code=%s", task_id, error_code)
                 return
             if mode == "autonomous_daily" and error_code in contract_rejections:
                 committed_records = list_quant_run_task_records(task_id, limit=5000)
@@ -1731,8 +2075,12 @@ def run_quant_task_async(task_id: int) -> bool:
         finally:
             _mark_running(task_id, False)
 
-    t = threading.Thread(target=_worker, daemon=True, name=f"quant-task-{task_id}")
-    t.start()
+    try:
+        t = threading.Thread(target=_worker, daemon=True, name=f"quant-task-{task_id}")
+        t.start()
+    except Exception:
+        _mark_running(task_id, False)
+        raise
     return True
 
 
@@ -1762,10 +2110,25 @@ def _is_autonomous_schedule_wait(task: dict) -> bool:
 def reconcile_quant_tasks_on_startup() -> dict[str, int]:
     """Classify restart recovery without conflating idle, queued and blocked work."""
     tasks = list_active_quant_run_tasks()
-    summary = {"interrupted": 0, "waiting_schedule": 0, "pending_preserved": 0}
+    summary = {"interrupted": 0, "stopping_finalized": 0, "waiting_schedule": 0, "pending_preserved": 0}
     for t in tasks:
         status = normalize_status(t.get("status"))
         task_id = int(t.get("id") or 0)
+        if status == "stopping":
+            # A stop request has no worker left to acknowledge after a
+            # process restart.  Finalize it explicitly so it cannot occupy
+            # the autonomous singleton forever.
+            if _transition_task_status(
+                task_id,
+                "stopped",
+                "manual_stop_finalize",
+                stop_requested=1,
+                finished_at=_utc_now_iso(),
+                replay_status="stopped_after_restart",
+                last_message="进程重启后收敛遗留停止请求，任务已停止",
+            ):
+                summary["stopping_finalized"] += 1
+            continue
         if status == "running" and can_transition(status, "paused", event="startup_pause"):
             if _transition_task_status(
                 task_id,
@@ -1798,67 +2161,70 @@ def reconcile_quant_tasks_on_startup() -> dict[str, int]:
 
 def ensure_autonomous_simulation_task() -> dict:
     """Ensure exactly one scheduler-owned simulation task for the Champion."""
-    from app.services.production_strategy import resolve_production_strategy_champion
+    # Startup and scheduler recovery can call this concurrently.  The process
+    # lock reduces local contention; the database-backed helper is the actual
+    # cross-process singleton boundary.
+    with _autonomous_task_lock:
+        from app.services.production_strategy import resolve_production_strategy_champion
 
-    champion = resolve_production_strategy_champion()
-    strategy = champion.get("strategy") if isinstance(champion.get("strategy"), dict) else {}
-    content = strategy.get("content") if isinstance(strategy.get("content"), dict) else {}
-    rebalance = content.get("rebalance") if isinstance(content.get("rebalance"), dict) else {}
-    desired_top_n = int(
-        rebalance.get("top_n")
-        or ((champion.get("strategy_policy") or {}).get("top_n"))
-        or 10
-    )
-    tasks = list_active_quant_run_tasks()
-    autonomous_tasks = [
-        task for task in tasks if str(task.get("replay_mode") or "") == "autonomous_daily"
-    ]
-    matching = [
-        task for task in autonomous_tasks
-        if int(task.get("strategy_id") or 0) == int(champion["strategy_id"])
-    ]
-    existing = matching[-1] if matching else None
-    for stale in autonomous_tasks:
-        if existing and int(stale.get("id") or 0) == int(existing.get("id") or 0):
-            continue
-        update_quant_run_task(
-            int(stale["id"]),
-            status="stopped",
-            finished_at=_utc_now_iso(),
-            last_message="自动任务已由新 Champion 调度任务替代",
+        champion = resolve_production_strategy_champion()
+        strategy = champion.get("strategy") if isinstance(champion.get("strategy"), dict) else {}
+        content = strategy.get("content") if isinstance(strategy.get("content"), dict) else {}
+        rebalance = content.get("rebalance") if isinstance(content.get("rebalance"), dict) else {}
+        desired_top_n = int(
+            rebalance.get("top_n")
+            or ((champion.get("strategy_policy") or {}).get("top_n"))
+            or 10
         )
-    if existing:
-        if int(existing.get("top_n") or 0) != desired_top_n:
+        tasks = list_active_quant_run_tasks()
+        autonomous_tasks = [
+            task for task in tasks if str(task.get("replay_mode") or "") == "autonomous_daily"
+        ]
+        matching = [
+            task for task in autonomous_tasks
+            if int(task.get("strategy_id") or 0) == int(champion["strategy_id"])
+        ]
+        existing = matching[-1] if matching else None
+        for stale in autonomous_tasks:
+            if existing and int(stale.get("id") or 0) == int(existing.get("id") or 0):
+                continue
             update_quant_run_task(
-                int(existing["id"]),
-                top_n=desired_top_n,
-                last_message="自动任务参数已与当前 Champion 同步",
+                int(stale["id"]),
+                status="stopped",
+                finished_at=_utc_now_iso(),
+                last_message="自动任务已由新 Champion 调度任务替代",
             )
-            existing = get_quant_run_task(int(existing["id"])) or existing
+        if existing:
+            if int(existing.get("top_n") or 0) != desired_top_n:
+                update_quant_run_task(
+                    int(existing["id"]),
+                    top_n=desired_top_n,
+                    last_message="自动任务参数已与当前 Champion 同步",
+                )
+                existing = get_quant_run_task(int(existing["id"])) or existing
+            return {
+                "ok": True,
+                "created": False,
+                "task": existing,
+                "champion_version": champion.get("champion_version"),
+                "policy": "scheduler_owned_simulation_only",
+            }
+
+        dates = list_consolidated_trade_dates()
+        start_date = str(dates[-1]) if dates else None
+        task_id, created = create_or_reuse_autonomous_quant_run_task(
+            strategy_id=int(champion["strategy_id"]),
+            top_n=desired_top_n,
+            budget_ratio=1.0,
+            exchange_group="HS",
+            start_date=start_date,
+            max_steps=1,
+        )
+        task = get_quant_run_task(task_id)
         return {
             "ok": True,
-            "created": False,
-            "task": existing,
+            "created": bool(created),
+            "task": task,
             "champion_version": champion.get("champion_version"),
             "policy": "scheduler_owned_simulation_only",
         }
-
-    dates = list_consolidated_trade_dates()
-    start_date = str(dates[-1]) if dates else None
-    task_id = create_quant_run_task(
-        strategy_id=int(champion["strategy_id"]),
-        top_n=desired_top_n,
-        budget_ratio=1.0,
-        exchange_group="HS",
-        start_date=start_date,
-        max_steps=1,
-        replay_mode="autonomous_daily",
-    )
-    task = get_quant_run_task(task_id)
-    return {
-        "ok": True,
-        "created": True,
-        "task": task,
-        "champion_version": champion.get("champion_version"),
-        "policy": "scheduler_owned_simulation_only",
-    }

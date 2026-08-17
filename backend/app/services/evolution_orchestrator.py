@@ -15,6 +15,7 @@ from typing import Any, Callable
 from app.data_platform.services.oos_hard_data import audit_oos_hard_data
 from app.data_platform.db import _conn as data_conn
 from app.core.trade_calendar import is_trade_day
+from app.data_platform.services.market_calendar import TradeCalendarNotReady
 from app.db.store import (
     _conn,
     get_model_version,
@@ -55,6 +56,10 @@ TASK_TIMEOUT_MINUTES = max(30, min(int(os.getenv("EVOLUTION_TASK_TIMEOUT_MINUTES
 DECISION_DATA_RETRY_SECONDS = max(
     60, min(int(os.getenv("EVOLUTION_DECISION_DATA_RETRY_SECONDS", "300")), 3600)
 )
+HISTORICAL_PIT_EVIDENCE_RECHECK_SECONDS = max(
+    24 * 60 * 60,
+    min(int(os.getenv("EVOLUTION_HISTORICAL_PIT_EVIDENCE_RECHECK_SECONDS", str(24 * 60 * 60))), 7 * 24 * 60 * 60),
+)
 RESOURCE_BUDGET_RETRY_SECONDS = max(
     2, min(int(os.getenv("EVOLUTION_RESOURCE_BUDGET_RETRY_SECONDS", "5")), 300)
 )
@@ -84,6 +89,20 @@ LONG_RESEARCH_TASK_TYPES = frozenset({
     "strategy_failure_model_training", "model_candidate_research",
     "model_strategy_impact_validation", "hsmm_shadow_training",
     "controller_candidate_observation",
+})
+# Tasks that consume the current trading-day slice must prove the current
+# decision-data contract first.  Formal historical evaluations use their own
+# frozen window and must not be coupled to whether today's close has arrived.
+CURRENT_EXPERIMENT_TASK_TYPES = frozenset({
+    "strategy_shadow_cycle",
+    "model_shadow_observation",
+    "controller_candidate_observation",
+    "factor_daily_cycle",
+})
+FORMAL_OOS_TASK_TYPES = frozenset({
+    "strategy_evolution_cycle",
+    "strategy_controller_oos",
+    "model_strategy_impact_validation",
 })
 _worker_started = False
 _scheduler_started = False
@@ -172,8 +191,10 @@ def _is_scheduled_trade_day(value: datetime) -> bool:
         if row is not None:
             return bool(int(row["is_open"] or 0))
     except Exception:
-        pass
-    return is_trade_day(value.date())
+        return False
+    # A missing calendar row is unknown, not a weekday.  Do not delegate to a
+    # static holiday table; callers will surface the bounded schedule block.
+    return False
 
 
 def _defer_long_research_claims(value: datetime) -> bool:
@@ -722,22 +743,35 @@ def _next_weekday_at(now: datetime, weekday: int, hour: int) -> datetime:
     candidate += timedelta(days=days)
     if candidate <= now:
         candidate += timedelta(days=7)
-    while not _is_scheduled_trade_day(candidate):
+    for _ in range(370):
+        if _is_scheduled_trade_day(candidate):
+            return candidate
         candidate += timedelta(days=7)
-    return candidate
+    raise TradeCalendarNotReady(today=candidate.strftime("%Y%m%d"), include_today=True)
 
 
 def _next_business_day_at(now: datetime, hour: int) -> datetime:
     candidate = now.replace(hour=hour, minute=0, second=0, microsecond=0)
     if candidate <= now:
         candidate += timedelta(days=1)
-    while not _is_scheduled_trade_day(candidate):
+    for _ in range(370):
+        if _is_scheduled_trade_day(candidate):
+            return candidate
         candidate += timedelta(days=1)
-    return candidate
+    raise TradeCalendarNotReady(today=candidate.strftime("%Y%m%d"), include_today=True)
 
 
 def evolution_schedule_status() -> dict[str, Any]:
     now = _now()
+    next_factor_cycle = next_system_cycle = next_formal_cycle = None
+    calendar_error = ""
+    if AUTO_ENABLED:
+        try:
+            next_factor_cycle = _next_business_day_at(now, 16).isoformat()
+            next_system_cycle = _next_business_day_at(now, 17).isoformat()
+            next_formal_cycle = _next_weekday_at(now, AUTO_WEEKDAY, AUTO_HOUR).isoformat()
+        except TradeCalendarNotReady as exc:
+            calendar_error = str(exc)
     return {
         "factor_strategy_operating_model": "continuous_research",
         "factor_strategy_operating_model_version": "alis_factor_strategy_continuous_research_v1",
@@ -767,7 +801,9 @@ def evolution_schedule_status() -> dict[str, Any]:
                 "requires_market_close": False,
             },
         },
-        "next_factor_cycle_at": _next_business_day_at(now, 16).isoformat() if AUTO_ENABLED else None,
+        "next_factor_cycle_at": next_factor_cycle,
+        "calendar_status": "blocked" if calendar_error else "ready",
+        "calendar_error": calendar_error,
         "continuous_factor_research": {
             "enabled": AUTO_ENABLED,
             "cadence": "persistent_low_priority_continuation",
@@ -776,8 +812,8 @@ def evolution_schedule_status() -> dict[str, Any]:
         },
         "next_shadow_cycle_at": None,
         "shadow_cycle_trigger": "decision_data_ready",
-        "next_system_cycle_at": _next_business_day_at(now, 17).isoformat() if AUTO_ENABLED else None,
-        "next_formal_cycle_at": _next_weekday_at(now, AUTO_WEEKDAY, AUTO_HOUR).isoformat() if AUTO_ENABLED else None,
+        "next_system_cycle_at": next_system_cycle,
+        "next_formal_cycle_at": next_formal_cycle,
     }
 
 
@@ -843,19 +879,10 @@ def ensure_latest_ready_system_cycle() -> dict[str, Any]:
     health = assess_latest_decision_data_health()
     readiness = health.get("readiness") if isinstance(health.get("readiness"), dict) else {}
     trade_date = str(readiness.get("target_trade_date") or "")
-    if not bool(health.get("decision_ready")):
-        from app.data_platform.db import _conn as data_conn
-        from app.data_platform.services.decision_data_contract import latest_decision_ready_trade_date
-
-        with data_conn() as conn:
-            recovered_trade_date = latest_decision_ready_trade_date(conn)
-        if recovered_trade_date:
-            health = assess_latest_decision_data_health(recovered_trade_date)
-            readiness = health.get("readiness") if isinstance(health.get("readiness"), dict) else {}
-            trade_date = str(readiness.get("target_trade_date") or recovered_trade_date)
-    if not trade_date or not bool(health.get("decision_ready")):
+    decision_gate_ready = bool(health.get("ok", health.get("decision_ready"))) and bool(health.get("decision_ready"))
+    if not trade_date or not decision_gate_ready:
         return {"ok": False, "reason": "decision_data_not_ready", "trade_date": trade_date}
-    experiments_required = bool(health.get("experiment_ready"))
+    experiments_required = decision_gate_ready and bool(health.get("experiment_ready"))
     required_recovery_scope = (
         "decision_and_experiments" if experiments_required else "production_decision"
     )
@@ -890,7 +917,6 @@ def ensure_latest_ready_system_cycle() -> dict[str, Any]:
         result = task.get("result") if isinstance(task.get("result"), dict) else {}
         decision_ready_for_date = False
         experiment_ready_for_date = False
-        hard_data_ready = False
         model_autonomy_completed = False
         strategy_shadow_completed = False
         plan_status = ""
@@ -899,8 +925,10 @@ def ensure_latest_ready_system_cycle() -> dict[str, Any]:
             step_name = str(step.get("name") or "") if isinstance(step, dict) else ""
             if step_name != "decision_data_gate":
                 if step_name == "hard_data_gate":
-                    hard_result = step.get("result") if isinstance(step.get("result"), dict) else {}
-                    hard_data_ready = bool(step.get("ok")) and str(hard_result.get("status") or "") == "ready"
+                    # Historical OOS readiness is tracked for formal OOS
+                    # tasks only; it must not decide whether today's
+                    # isolated experiment recovery is complete.
+                    continue
                 elif step_name == "plan_model_autonomy":
                     model_autonomy_completed = bool(step.get("ok"))
                 elif step_name == "strategy_shadow_recovery":
@@ -929,7 +957,6 @@ def ensure_latest_ready_system_cycle() -> dict[str, Any]:
         )
         experiments_completed = (
             experiment_ready_for_date
-            and hard_data_ready
             and model_autonomy_completed
             and strategy_shadow_completed
         )
@@ -1212,6 +1239,21 @@ def _experiment_data_gate() -> dict[str, Any]:
     return assess_latest_decision_data_health()
 
 
+def _current_experiment_gate_required(task_type: str) -> bool:
+    """Return whether a task consumes today's point-in-time slice.
+
+    Keep this decision explicit instead of treating every research task as a
+    live experiment.  A formal OOS task replays a separately frozen historical
+    window; coupling it to the latest close would make an unrelated late
+    source publication deadlock historical validation.
+    """
+    return str(task_type or "") in CURRENT_EXPERIMENT_TASK_TYPES
+
+
+def _formal_oos_gate_required(task_type: str) -> bool:
+    return str(task_type or "") in FORMAL_OOS_TASK_TYPES
+
+
 def _blocked_by_decision_data(task: dict[str, Any], gate: dict[str, Any]) -> dict[str, Any]:
     return {
         "ok": True,
@@ -1220,7 +1262,8 @@ def _blocked_by_decision_data(task: dict[str, Any], gate: dict[str, Any]) -> dic
         "task_type": str(task.get("task_type") or ""),
         "reason": "latest_decision_data_not_safe_for_research",
         "data_gate": gate,
-        "policy": "no_factor_evaluation_shadow_or_formal_oos_until_experiment_ready",
+        "scope": "current_experiment_slice",
+        "policy": "no_current_factor_or_future_shadow_observation_until_experiment_ready; formal_oos_uses_historical_gate",
     }
 
 
@@ -1767,6 +1810,21 @@ def _persist_candidate_result(target: dict[str, Any], result: dict[str, Any]) ->
         ensure_production_strategy_champion(force_rebind=True)
 
 
+def _oos_hard_data_block(task: dict[str, Any], audit: dict[str, Any]) -> dict[str, Any]:
+    """Return the common fail-closed result for a frozen-history consumer."""
+    return {
+        "status": "blocked_by_oos_hard_data",
+        "reason": "permanent_oos_hard_data_not_ready",
+        "hard_data_audit": audit,
+        "scope": (
+            "formal_oos"
+            if _formal_oos_gate_required(str(task.get("task_type") or ""))
+            else "historical_replay"
+        ),
+        "production_change_forbidden": True,
+    }
+
+
 def _execute_strategy_cycle(
     task: dict[str, Any],
     *,
@@ -1774,12 +1832,7 @@ def _execute_strategy_cycle(
 ) -> dict[str, Any]:
     audit = audit_oos_hard_data(include_dates=False)
     if audit.get("status") != "ready":
-        return {
-            "status": "blocked_by_oos_hard_data",
-            "reason": "permanent_oos_hard_data_not_ready",
-            "hard_data_audit": audit,
-            "production_change_forbidden": True,
-        }
+        return _oos_hard_data_block(task, audit)
     payload = task.get("payload") if isinstance(task.get("payload"), dict) else {}
     checkpoint = task.get("checkpoint") if isinstance(task.get("checkpoint"), dict) else {}
     checkpoint_targets = (
@@ -2091,7 +2144,7 @@ def execute_evolution_task(
     if task_type == "research_data_publication_probe":
         from app.data_platform.services.data_center import refresh_cn_ppi_from_first_source
         from app.services.free_research_data import materialize_futures_price_proxies
-        from app.services.profit_loop import _latest_trade_date
+        from app.core.trade_calendar import get_last_trade_date_str
 
         payload = task.get("payload") if isinstance(task.get("payload"), dict) else {}
         _heartbeat(
@@ -2102,7 +2155,7 @@ def execute_evolution_task(
         ppi = refresh_cn_ppi_from_first_source()
         futures = {"ok": True, "status": "not_due", "reason": "before_futures_probe_window"}
         if bool(payload.get("include_futures")):
-            trade_date = _latest_trade_date()
+            trade_date = get_last_trade_date_str(for_data_availability=True)
             futures = materialize_futures_price_proxies(start_date=trade_date, end_date=trade_date)
         degraded = any(str(item.get("status") or "") == "degraded" for item in (ppi, futures))
         return {
@@ -2112,16 +2165,10 @@ def execute_evolution_task(
             "ppi": ppi, "futures": futures,
             "policy": "bounded_parallel_probe; first_valid_source; exact_date_cache; no_stale_data_claim",
         }
-    if task_type in {
-        "strategy_evolution_cycle",
-        "strategy_controller_oos",
-        "strategy_shadow_cycle",
-        "factor_daily_cycle",
-        "model_shadow_observation",
-        "controller_candidate_observation",
-    }:
+    if _current_experiment_gate_required(task_type):
         gate = _experiment_data_gate()
-        if not bool(gate.get("experiment_ready")):
+        gate_ok = bool(gate.get("ok", gate.get("experiment_ready")))
+        if not gate_ok or not bool(gate.get("experiment_ready")):
             return _blocked_by_decision_data(task, gate)
     if task_type == "strategy_evolution_cycle":
         return _run_with_heartbeat_pulse(
@@ -2335,6 +2382,13 @@ def execute_evolution_task(
         )
         return result
     if task_type == "model_strategy_impact_validation":
+        # This is a formal five-window A/B replay, not a live observation.
+        # It consumes the same frozen historical market inputs as formal OOS;
+        # without this explicit gate a PIT gap would be flattened into a
+        # generic replay error and retried as if a fresh fetch could repair it.
+        audit = audit_oos_hard_data(include_dates=False)
+        if audit.get("status") != "ready":
+            return _oos_hard_data_block(task, audit)
         from app.services.model_strategy_impact import run_controlled_model_strategy_ab
 
         model_version_id = int((task.get("payload") or {}).get("model_version_id") or 0)
@@ -2676,13 +2730,17 @@ def _defer_for_oos_hard_data(task: dict[str, Any], result: dict[str, Any]) -> bo
     now = _now()
     audit = result.get("hard_data_audit") if isinstance(result.get("hard_data_audit"), dict) else {}
     non_repairable = list(audit.get("non_repairable_dates") or [])
+    historical_evidence_wait = bool(non_repairable) and not bool(audit.get("repair_dates"))
     return _update_active_task(
         int(task["id"]),
         statuses=("running",),
         require_not_stopped=True,
         expected_lease_owner=WORKER_ID,
         status="retry_wait",
-        phase="waiting_for_oos_hard_data",
+        phase=(
+            "waiting_for_historical_pit_evidence"
+            if historical_evidence_wait else "waiting_for_oos_hard_data"
+        ),
         message=(
             "正式 OOS 永久硬数据未就绪，保留检查点等待数据合同变化"
             if not non_repairable
@@ -2691,7 +2749,12 @@ def _defer_for_oos_hard_data(task: dict[str, Any], result: dict[str, Any]) -> bo
         result=result,
         error=None,
         attempt=max(0, int(task.get("attempt") or 1) - 1),
-        next_run_at=(now + timedelta(seconds=DECISION_DATA_RETRY_SECONDS)).isoformat(),
+        next_run_at=(now + timedelta(
+            seconds=(
+                HISTORICAL_PIT_EVIDENCE_RECHECK_SECONDS
+                if historical_evidence_wait else DECISION_DATA_RETRY_SECONDS
+            )
+        )).isoformat(),
         lease_owner=None,
         lease_expires_at=None,
         deadline_at=None,

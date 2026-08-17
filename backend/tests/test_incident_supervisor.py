@@ -119,6 +119,52 @@ def test_sealed_holdout_no_progress_becomes_internal_fault(monkeypatch):
     assert case["action"] == "diagnose_backfill_contract"
 
 
+def test_sealed_holdout_historical_pit_absence_does_not_become_a_fake_repair_fault(monkeypatch):
+    monkeypatch.setattr(incident_supervisor, "get_env_value", lambda *_args: "")
+    result = incident_supervisor.run_incident_supervisor([
+        {
+            "name": "sealed_holdout_data_gate",
+            "ok": True,
+            "health": {"status": "waiting_condition", "reason": "historical_point_in_time_unavailable"},
+            "result": {
+                "status": "blocked",
+                "eligible_sessions": 0,
+                "required_sessions": 126,
+                "non_repairable_dates": ["20190910"],
+                "repair_dates": [],
+            },
+        },
+    ])
+
+    case = result["cases"][0]
+    assert case["resolution_class"] == "waiting_condition"
+    assert case["failure_signature"] == "historical_observation_evidence_missing"
+
+
+def test_historical_oos_pit_absence_is_a_formal_gate_wait(monkeypatch):
+    monkeypatch.setattr(incident_supervisor, "get_env_value", lambda *_args: "")
+    result = incident_supervisor.run_incident_supervisor([
+        {
+            "name": "hard_data_gate",
+            "ok": False,
+            "health": {"status": "waiting_condition", "reason": "historical_point_in_time_unavailable"},
+            "result": {
+                "status": "blocked",
+                "eligible_sessions": 0,
+                "required_sessions": 1537,
+                "non_repairable_dates": ["20260701"],
+                "repair_dates": [],
+            },
+        },
+    ])
+
+    case = result["cases"][0]
+    assert case["resolution_class"] == "waiting_condition"
+    assert case["formal_scope"] == "formal_oos_or_sealed_holdout_only"
+    assert case["owner_action_required"] is False
+    assert case["action"] == "historical_pit_wait"
+
+
 def test_sealed_holdout_with_progress_waits_for_next_bounded_cycle(monkeypatch):
     monkeypatch.setattr(incident_supervisor, "get_env_value", lambda *_args: "")
     result = incident_supervisor.run_incident_supervisor([

@@ -1,17 +1,20 @@
 from __future__ import annotations
 
-import csv
 import json
 import logging
 from dataclasses import dataclass
 from datetime import datetime
-from pathlib import Path
 from typing import Dict, List, Optional
 
-from app.integrations.tushare_client import get_tushare_client
 from app.core.a_share_fees import is_exchange_etf
 from app.data_platform.db import _conn, _is_postgres
-from app.core.runtime_paths import backend_cache_root
+from app.data_platform.services.observation_clock import (
+    _explicit_timestamp_sql,
+    _table_columns,
+    _timestamp_parameter_sql,
+    _timestamp_value_sql,
+)
+from app.services.point_in_time import is_available_at, normalize_explicit_timestamp, normalize_timestamp
 
 logger = logging.getLogger("quant.backtest_data_source")
 
@@ -45,20 +48,6 @@ class HistBar:
 
 class BacktestDataSource:
     def __init__(self) -> None:
-        # backend/app/services -> backend/app -> backend -> repo
-        self._repo_root = Path(__file__).resolve().parents[3]
-        cache_root = backend_cache_root()
-        self._data_root = cache_root / "data"
-        self._daily_snapshot_dir = self._data_root / "daily_basic" / "2026"
-        self._full_k_dir = self._data_root / "全部日k" / "全部日k"
-        # 用户可长期沉淀的本地日截面目录（优先级高于 .cache）
-        self._daily_basic_data_dir = self._data_root / "daily_basic"
-        self._daily_basic_data_dir.mkdir(parents=True, exist_ok=True)
-        self._cache_dir = cache_root / "backtest"
-        self._cache_dir.mkdir(parents=True, exist_ok=True)
-        self._all_in_one_dir = cache_root / "all_in_one"
-
-        self._symbol_file_index: Dict[str, Path] = {}
         self._hist_cache: Dict[str, List[HistBar]] = {}
         self._hist_cache_through: Dict[str, str] = {}
         self._history_load_failed: set[str] = set()
@@ -74,14 +63,14 @@ class BacktestDataSource:
         self._replay_adjustment_bases: Dict[str, float] = {}
 
     def set_as_of_time(self, cutoff: str) -> None:
-        cutoff = str(cutoff or "").strip()
+        cutoff = normalize_explicit_timestamp(cutoff) if cutoff else ""
         if cutoff == self._as_of_time:
             return
         # A forward replay only gains one newly visible session at each cutoff.
         # Keep earlier bars: they were read under an earlier (therefore stricter)
         # cutoff. A backward or unrestricted switch must discard them to avoid
         # carrying data observed later into an earlier point-in-time replay.
-        if not cutoff or not self._as_of_time or cutoff < self._as_of_time:
+        if not cutoff or not self._as_of_time or not is_available_at(self._as_of_time, cutoff):
             self._hist_cache.clear()
             self._hist_cache_through.clear()
             self._history_load_failed.clear()
@@ -91,14 +80,43 @@ class BacktestDataSource:
         self._pit_sources.clear()
 
     def _record_pit_read(self, source: str, rows: List[dict]) -> None:
-        available = [str(row.get("available_time") or "") for row in rows if row.get("available_time")]
+        available: list[str] = []
+        invalid_observation = 0
+        missing_clock = 0
+        future_clock = 0
+        clock_fields = ("observed_at", "first_observed_at", "economic_available_time", "created_at")
+        for row in rows:
+            raw_values = [row.get(field) for field in clock_fields]
+            if not any(raw_values) and row.get("available_time"):
+                # Compatibility rows are used only by isolated local fixtures
+                # and non-formal CSV paths.  Formal PostgreSQL readers always
+                # return all four clocks from the immutable version table.
+                raw_values = [row.get("available_time")] * len(clock_fields)
+            if any(not str(value or "").strip() for value in raw_values):
+                missing_clock += 1
+                continue
+            normalized_values = [normalize_explicit_timestamp(value) for value in raw_values]
+            if any(not value for value in normalized_values):
+                invalid_observation += 1
+                continue
+            available.extend(normalized_values)
+            if self._as_of_time and any(
+                not is_available_at(value, str(self._as_of_time), require_explicit_offset=True)
+                for value in normalized_values
+            ):
+                future_clock += 1
+        available = [value for value in available if value]
         current = self._pit_sources.get(source, {})
         current_max = str(current.get("max_available_time") or "")
         observed_max = max(available) if available else ""
         passed = (
-            bool(self._as_of_time)
-            and all(row.get("available_time") for row in rows)
-            and all(value <= str(self._as_of_time) for value in available)
+            bool(rows)
+            and bool(self._as_of_time)
+            and all(row.get("observed_at") or row.get("available_time") for row in rows)
+            and all(
+                is_available_at(value, str(self._as_of_time), require_explicit_offset=True)
+                for value in available
+            )
         )
         # All-market history is read in batches. Preserve the full audit
         # instead of letting a later, possibly empty, batch erase prior reads.
@@ -107,18 +125,356 @@ class BacktestDataSource:
             "cutoff": self._as_of_time,
             "read_count": int(current.get("read_count") or 0) + len(rows),
             "batch_count": int(current.get("batch_count") or 0) + 1,
-            "future_excluded_count": int(current.get("future_excluded_count") or 0),
+            "future_excluded_count": int(current.get("future_excluded_count") or 0) + future_clock,
             "missing_available_time_count": (
                 int(current.get("missing_available_time_count") or 0)
-                + sum(1 for row in rows if not row.get("available_time"))
+                + missing_clock
             ),
-            "max_available_time": max(current_max, observed_max) or None,
-            "sql_predicate": "available_time <= decision_cutoff" if self._as_of_time else "disabled",
-            "passed": bool(current.get("passed", True)) and passed,
+            "invalid_available_time_count": (
+                int(current.get("invalid_available_time_count") or 0)
+                + invalid_observation
+            ),
+            "max_available_time": max(
+                (value for value in (current_max, observed_max) if value),
+                key=lambda value: normalize_explicit_timestamp(value) or value,
+                default="",
+            ) or None,
+            "sql_predicate": "all_observation_clocks <= decision_cutoff" if self._as_of_time else "disabled",
+            "passed": (
+                bool(current.get("passed", True))
+                and passed
+                and invalid_observation == 0
+                and missing_clock == 0
+                and future_clock == 0
+            ),
         }
 
     def point_in_time_sources(self) -> List[Dict[str, object]]:
         return list(self._pit_sources.values())
+
+    def _record_pit_failure(self, source: str, reason: str) -> None:
+        """Record an unavailable PIT source as a hard replay failure."""
+        current = self._pit_sources.get(source, {})
+        self._pit_sources[source] = {
+            **current,
+            "source": source,
+            "cutoff": self._as_of_time,
+            "read_count": int(current.get("read_count") or 0),
+            "batch_count": int(current.get("batch_count") or 0) + 1,
+            "sql_predicate": "immutable_observation_version_required",
+            "passed": False,
+            "error": str(reason),
+        }
+
+    @staticmethod
+    def _decode_versioned_snapshot_row(raw: dict) -> dict:
+        """Expand one immutable snapshot payload into the legacy read shape.
+
+        Version rows store the normalized snapshot as a payload. Some readers
+        use market names such as open and vol, while older readers use
+        projection aliases such as daily_open and volume. Return both without
+        consulting the mutable projection table.
+        """
+        try:
+            payload = json.loads(raw.get("payload_json") or "{}")
+        except (TypeError, json.JSONDecodeError):
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+        result = {
+            **payload,
+            "ts_code": raw.get("ts_code"),
+            "trade_date": raw.get("trade_date"),
+            "economic_available_time": raw.get("economic_available_time") or "",
+            "observed_at": raw.get("observed_at") or "",
+            "first_observed_at": raw.get("first_observed_at") or "",
+            "observation_provenance": raw.get("observation_provenance") or "",
+            "content_hash": raw.get("content_hash") or "",
+            "created_at": raw.get("created_at") or "",
+            "available_time": raw.get("observed_at") or "",
+            "source_code": raw.get("source_code") or "",
+        }
+        aliases = {
+            "daily_open": "open",
+            "daily_high": "high",
+            "daily_low": "low",
+            "daily_pre_close": "pre_close",
+            "volume": "vol",
+            "turnover": "amount",
+            "change_pct": "pct_chg",
+        }
+        for alias, field in aliases.items():
+            if result.get(alias) is None and payload.get(field) is not None:
+                result[alias] = payload.get(field)
+        return result
+
+    @staticmethod
+    def _normalise_date_clause(date_clause: str) -> str:
+        clause = str(date_clause or "").strip()
+        if clause.lower().startswith("and "):
+            clause = clause[4:].strip()
+        return clause.replace("trade_date", "v.trade_date")
+
+    @staticmethod
+    def _observed_before_predicate(*, postgres: bool) -> str:
+        return f"{_timestamp_value_sql('v.observed_at', is_postgres=postgres)}<={_timestamp_parameter_sql(is_postgres=postgres)}"
+
+    @staticmethod
+    def _materialized_before_predicate(*, postgres: bool) -> str:
+        return f"{_timestamp_value_sql('v.created_at', is_postgres=postgres)}<={_timestamp_parameter_sql(is_postgres=postgres)}"
+
+    @staticmethod
+    def _first_observed_before_predicate(*, postgres: bool) -> str:
+        return f"{_timestamp_value_sql('v.first_observed_at', is_postgres=postgres)}<={_timestamp_parameter_sql(is_postgres=postgres)}"
+
+    @staticmethod
+    def _economic_before_predicate(*, postgres: bool) -> str:
+        return f"{_timestamp_value_sql('v.economic_available_time', is_postgres=postgres)}<={_timestamp_parameter_sql(is_postgres=postgres)}"
+
+    def _versioned_raw_rows(
+        self,
+        api_name: str,
+        ymd: str = "",
+        *,
+        ts_codes: list[str] | None = None,
+        date_clause: str = "",
+        date_params: tuple = (),
+    ) -> list[dict] | None:
+        """Read the latest immutable provider version visible at the cutoff.
+
+        ``None`` means the observation-version migration is unavailable; an
+        empty list means it is installed but no version was visible.  Keeping
+        those states distinct prevents a later current-table row from leaking
+        into a historical replay.
+        """
+        try:
+            postgres = _is_postgres()
+            # The mutable projection records the provider selected by the
+            # publication probe. Bind the immutable read to that hash so a
+            # slower source cannot replace the first accepted source merely
+            # because its observed_at is later. If the projection table is
+            # absent (small legacy fixtures), retain the old version ranking.
+            with _conn() as schema_conn:
+                projection_columns = _table_columns(schema_conn, "dc_tushare_raw_records")
+            projection_rank_sql = "0"
+            projection_filter_sql = ""
+            if {"api_name", "record_key", "content_hash"}.issubset(projection_columns):
+                projection_rank_sql = (
+                    "CASE WHEN EXISTS (SELECT 1 FROM dc_tushare_raw_records p "
+                    "WHERE p.api_name=v.api_name AND p.record_key=v.record_key "
+                    "AND p.content_hash=v.content_hash) THEN 1 ELSE 0 END"
+                )
+                projection_filter_sql = (
+                    "EXISTS (SELECT 1 FROM dc_tushare_raw_records p "
+                    "WHERE p.api_name=v.api_name AND p.record_key=v.record_key "
+                    "AND p.content_hash=v.content_hash)"
+                )
+            predicates = [
+                "v.api_name=?",
+                "v.observed_at<>''",
+                "v.content_hash<>''",
+                "LOWER(COALESCE(v.observation_provenance,'')) NOT LIKE 'legacy_%'",
+                _explicit_timestamp_sql("v.observed_at", is_postgres=postgres),
+                _explicit_timestamp_sql("v.first_observed_at", is_postgres=postgres),
+                _explicit_timestamp_sql("v.economic_available_time", is_postgres=postgres),
+                _explicit_timestamp_sql("v.created_at", is_postgres=postgres),
+            ]
+            if projection_filter_sql:
+                predicates.append(projection_filter_sql)
+            params: list = [api_name]
+            if ymd:
+                predicates.append("v.trade_date=?")
+                params.append(ymd)
+            if ts_codes:
+                placeholders = ",".join("?" for _ in ts_codes)
+                predicates.append(f"v.ts_code IN ({placeholders})")
+                params.extend(ts_codes)
+            if date_clause:
+                predicates.append(self._normalise_date_clause(date_clause))
+                params.extend(date_params)
+            if self._as_of_time:
+                predicates.append(self._observed_before_predicate(postgres=postgres))
+                predicates.append(self._first_observed_before_predicate(postgres=postgres))
+                predicates.append(self._economic_before_predicate(postgres=postgres))
+                predicates.append(self._materialized_before_predicate(postgres=postgres))
+                params.append(self._as_of_time)
+                params.append(self._as_of_time)
+                params.append(self._as_of_time)
+                params.append(self._as_of_time)
+            where = " AND ".join(predicates)
+            sql = f"""WITH ranked AS (
+                         SELECT v.api_name,v.record_key,v.ts_code,v.trade_date,v.payload_json,
+                                v.economic_available_time,v.observed_at,v.first_observed_at,
+                                v.observation_provenance,v.content_hash,v.created_at,v.source_code,
+                                ROW_NUMBER() OVER (
+                                  PARTITION BY v.api_name,v.record_key
+                                  ORDER BY {projection_rank_sql} DESC,
+                                           v.observed_at DESC,v.created_at DESC,v.id DESC
+                                ) AS row_rank
+                           FROM dc_tushare_raw_record_version v
+                          WHERE {where}
+                       )
+                       SELECT api_name,record_key,ts_code,trade_date,payload_json,
+                              economic_available_time,observed_at,first_observed_at,
+                              observation_provenance,content_hash,created_at,source_code
+                         FROM ranked WHERE row_rank=1"""
+            with _conn() as conn:
+                rows = [dict(row) for row in conn.execute(sql, tuple(params)).fetchall()]
+            return rows
+        except Exception as exc:  # migration not installed or incompatible adapter
+            logger.debug("immutable raw PIT version read unavailable: %s", str(exc)[:160])
+            return None
+
+    def _versioned_snapshot_rows(self, ymd: str, *, ts_codes: list[str] | None = None,
+                                 date_clause: str = "", date_params: tuple = ()) -> list[dict] | None:
+        try:
+            postgres = _is_postgres()
+            with _conn() as schema_conn:
+                projection_columns = _table_columns(schema_conn, "dc_stock_daily_snapshot")
+            projection_rank_sql = "0"
+            projection_filter_sql = ""
+            if {"ts_code", "trade_date", "content_hash"}.issubset(projection_columns):
+                projection_rank_sql = (
+                    "CASE WHEN EXISTS (SELECT 1 FROM dc_stock_daily_snapshot p "
+                    "WHERE p.ts_code=v.ts_code AND p.trade_date=v.trade_date "
+                    "AND p.content_hash=v.content_hash) THEN 1 ELSE 0 END"
+                )
+                projection_filter_sql = (
+                    "EXISTS (SELECT 1 FROM dc_stock_daily_snapshot p "
+                    "WHERE p.ts_code=v.ts_code AND p.trade_date=v.trade_date "
+                    "AND p.content_hash=v.content_hash)"
+                )
+            predicates: list[str] = [
+                "v.observed_at<>''",
+                "v.content_hash<>''",
+                "LOWER(COALESCE(v.observation_provenance,'')) NOT LIKE 'legacy_%'",
+                _explicit_timestamp_sql("v.observed_at", is_postgres=postgres),
+                _explicit_timestamp_sql("v.first_observed_at", is_postgres=postgres),
+                _explicit_timestamp_sql("v.economic_available_time", is_postgres=postgres),
+                _explicit_timestamp_sql("v.created_at", is_postgres=postgres),
+            ]
+            if projection_filter_sql:
+                predicates.append(projection_filter_sql)
+            params: list = []
+            if ymd:
+                predicates.append("v.trade_date=?")
+                params.append(ymd)
+            if ts_codes:
+                placeholders = ",".join("?" for _ in ts_codes)
+                predicates.append(f"v.ts_code IN ({placeholders})")
+                params.extend(ts_codes)
+            if date_clause:
+                predicates.append(self._normalise_date_clause(date_clause))
+                params.extend(date_params)
+            if self._as_of_time:
+                predicates.append(self._observed_before_predicate(postgres=postgres))
+                predicates.append(self._first_observed_before_predicate(postgres=postgres))
+                predicates.append(self._economic_before_predicate(postgres=postgres))
+                predicates.append(self._materialized_before_predicate(postgres=postgres))
+                params.append(self._as_of_time)
+                params.append(self._as_of_time)
+                params.append(self._as_of_time)
+                params.append(self._as_of_time)
+            where = " AND ".join(predicates)
+            sql = f"""WITH ranked AS (
+                         SELECT v.ts_code,v.trade_date,v.payload_json,v.source_code,
+                                v.economic_available_time,v.observed_at,v.first_observed_at,
+                                v.observation_provenance,v.content_hash,v.created_at,
+                                ROW_NUMBER() OVER (
+                                  PARTITION BY v.ts_code,v.trade_date
+                                  ORDER BY {projection_rank_sql} DESC,
+                                           v.observed_at DESC,v.created_at DESC,v.id DESC
+                                ) AS row_rank
+                           FROM dc_stock_daily_snapshot_version v
+                          WHERE {where}
+                       )
+                       SELECT ts_code,trade_date,payload_json,source_code,
+                              economic_available_time,observed_at,first_observed_at,
+                              observation_provenance,content_hash,created_at
+                         FROM ranked WHERE row_rank=1"""
+            with _conn() as conn:
+                raw_rows = [dict(row) for row in conn.execute(sql, tuple(params)).fetchall()]
+            return [self._decode_versioned_snapshot_row(raw) for raw in raw_rows]
+        except Exception as exc:
+            logger.debug("immutable snapshot PIT version read unavailable: %s", str(exc)[:160])
+            return None
+
+    def _versioned_snapshot_history_rows(
+        self,
+        ts_codes: list[str],
+        *,
+        date_clause: str = "",
+        date_params: tuple = (),
+    ) -> list[dict] | None:
+        """Read a bounded multi-date snapshot history from immutable versions.
+
+        The current snapshot is an overwrite projection.  It is suitable for
+        today's screen, but cannot prove what was visible on an earlier replay
+        date after a late refresh.  Historical consumers must use this method
+        whenever the observation-clock migration is installed.
+        """
+        if not ts_codes:
+            return []
+        try:
+            placeholders = ",".join("?" for _ in ts_codes)
+            postgres = _is_postgres()
+            with _conn() as schema_conn:
+                projection_columns = _table_columns(schema_conn, "dc_stock_daily_snapshot")
+            projection_filter_sql = ""
+            if {"ts_code", "trade_date", "content_hash"}.issubset(projection_columns):
+                projection_filter_sql = (
+                    "EXISTS (SELECT 1 FROM dc_stock_daily_snapshot p "
+                    "WHERE p.ts_code=v.ts_code AND p.trade_date=v.trade_date "
+                    "AND p.content_hash=v.content_hash)"
+                )
+            predicates = [
+                f"v.ts_code IN ({placeholders})",
+                "v.observed_at<>''",
+                "v.content_hash<>''",
+                "LOWER(COALESCE(v.observation_provenance,'')) NOT LIKE 'legacy_%'",
+                _explicit_timestamp_sql("v.observed_at", is_postgres=postgres),
+                _explicit_timestamp_sql("v.first_observed_at", is_postgres=postgres),
+                _explicit_timestamp_sql("v.economic_available_time", is_postgres=postgres),
+                _explicit_timestamp_sql("v.created_at", is_postgres=postgres),
+            ]
+            if projection_filter_sql:
+                predicates.append(projection_filter_sql)
+            params: list = list(ts_codes)
+            if date_clause:
+                predicates.append(self._normalise_date_clause(date_clause))
+                params.extend(date_params)
+            if self._as_of_time:
+                predicates.append(self._observed_before_predicate(postgres=postgres))
+                predicates.append(self._first_observed_before_predicate(postgres=postgres))
+                predicates.append(self._economic_before_predicate(postgres=postgres))
+                predicates.append(self._materialized_before_predicate(postgres=postgres))
+                params.append(self._as_of_time)
+                params.append(self._as_of_time)
+                params.append(self._as_of_time)
+                params.append(self._as_of_time)
+            where = " AND ".join(predicates)
+            sql = f"""WITH ranked AS (
+                         SELECT v.ts_code,v.trade_date,v.payload_json,v.source_code,
+                                v.economic_available_time,v.observed_at,v.first_observed_at,
+                                v.observation_provenance,v.content_hash,v.created_at,
+                                ROW_NUMBER() OVER (
+                                  PARTITION BY v.ts_code,v.trade_date
+                                  ORDER BY v.observed_at DESC,v.id DESC
+                                ) AS row_rank
+                           FROM dc_stock_daily_snapshot_version v
+                          WHERE {where}
+                       )
+                       SELECT ts_code,trade_date,payload_json,source_code,
+                              economic_available_time,observed_at,first_observed_at,
+                              observation_provenance,content_hash,created_at
+                         FROM ranked WHERE row_rank=1
+                        ORDER BY ts_code,trade_date"""
+            with _conn() as conn:
+                raw_rows = [dict(row) for row in conn.execute(sql, tuple(params)).fetchall()]
+            return [self._decode_versioned_snapshot_row(raw) for raw in raw_rows]
+        except Exception as exc:
+            logger.debug("immutable snapshot PIT history read unavailable: %s", str(exc)[:160])
+            return None
 
     def _postgres_trade_dates(self, start: str, end: str) -> List[str]:
         try:
@@ -135,10 +491,22 @@ class BacktestDataSource:
 
     def _postgres_daily_rows(self, ymd: str, symbol: str = "") -> List[dict]:
         try:
-            sql = "SELECT ts_code,trade_date,payload_json,available_time FROM dc_tushare_raw_records WHERE api_name='daily' AND trade_date=?"
+            wanted = []
+            if symbol:
+                code = str(symbol).strip().split(".", 1)[0].zfill(6)
+                suffix = ".SH" if code.startswith(("6", "9")) else ".SZ" if code.startswith(("0", "3")) else ".BJ"
+                wanted = [f"{code}{suffix}"]
+            versioned = self._versioned_raw_rows("daily", ymd, ts_codes=wanted)
+            if versioned is not None:
+                self._record_pit_read("tushare.daily", versioned)
+                return versioned
+            if _is_postgres() or self._as_of_time:
+                self._record_pit_failure("tushare.daily", "observation_version_table_unavailable")
+                return []
+            sql = "SELECT ts_code,trade_date,payload_json,observed_at AS available_time,observed_at FROM dc_tushare_raw_records WHERE api_name='daily' AND trade_date=?"
             params: tuple = (ymd,)
             if self._as_of_time:
-                sql += " AND available_time<=?"
+                sql += " AND observed_at<=?"
                 params += (self._as_of_time,)
             if symbol:
                 code = str(symbol).strip().split(".", 1)[0].zfill(6)
@@ -156,15 +524,22 @@ class BacktestDataSource:
 
     def _postgres_snapshot_rows(self, ymd: str) -> List[dict]:
         try:
+            versioned = self._versioned_snapshot_rows(ymd)
+            if versioned is not None:
+                self._record_pit_read("snapshot.daily_structured", versioned)
+                return versioned
+            if _is_postgres() or self._as_of_time:
+                self._record_pit_failure("snapshot.daily_structured", "observation_version_table_unavailable")
+                return []
             sql = """SELECT ts_code,trade_date,name,close,change_pct,volume,turnover,
-                            total_mv,circ_mv,pe_ttm,pb,turnover_rate,available_time,
+                            total_mv,circ_mv,pe_ttm,pb,turnover_rate,observed_at AS available_time,observed_at,
                             open AS daily_open,high AS daily_high,low AS daily_low,
                             pre_close AS daily_pre_close,adj_factor
                      FROM dc_stock_daily_snapshot
                      WHERE trade_date=?"""
             params: tuple = (ymd,)
             if self._as_of_time:
-                sql += " AND available_time<=?"
+                sql += " AND observed_at<=?"
                 params += (self._as_of_time,)
             with _conn() as conn:
                 rows = [dict(row) for row in conn.execute(sql, params).fetchall()]
@@ -172,6 +547,7 @@ class BacktestDataSource:
             return rows
         except Exception as exc:  # noqa: BLE001
             logger.warning("PostgreSQL point-in-time snapshot read failed: %s", str(exc)[:160])
+            self._record_pit_failure("snapshot.daily_structured", "immutable_snapshot_read_failed")
             return []
 
     def load_fund_snapshot(self, date_ymd: str, ts_codes: List[str]) -> List[SnapshotRow]:
@@ -180,16 +556,23 @@ class BacktestDataSource:
         if not codes:
             return []
         ymd = str(date_ymd).replace("-", "")[:8]
-        placeholders = ",".join("?" for _ in codes)
-        sql = f"""SELECT ts_code,trade_date,payload_json,available_time
-                  FROM dc_tushare_raw_records
-                  WHERE api_name='fund_daily' AND trade_date=? AND ts_code IN ({placeholders})"""
-        params: tuple = (ymd, *codes)
-        if self._as_of_time:
-            sql += " AND available_time<=?"
-            params += (self._as_of_time,)
-        with _conn() as conn:
-            raw_rows = [dict(row) for row in conn.execute(sql, params).fetchall()]
+        versioned = self._versioned_raw_rows("fund_daily", ymd, ts_codes=codes)
+        if versioned is not None:
+            raw_rows = versioned
+        else:
+            if _is_postgres() or self._as_of_time:
+                self._record_pit_failure("tushare.fund_daily", "observation_version_table_unavailable")
+                return []
+            placeholders = ",".join("?" for _ in codes)
+            sql = f"""SELECT ts_code,trade_date,payload_json,observed_at AS available_time,observed_at
+                      FROM dc_tushare_raw_records
+                      WHERE api_name='fund_daily' AND trade_date=? AND ts_code IN ({placeholders})"""
+            params: tuple = (ymd, *codes)
+            if self._as_of_time:
+                sql += " AND observed_at<=?"
+                params += (self._as_of_time,)
+            with _conn() as conn:
+                raw_rows = [dict(row) for row in conn.execute(sql, params).fetchall()]
         self._record_pit_read("tushare.fund_daily", raw_rows)
         result: List[SnapshotRow] = []
         for raw in raw_rows:
@@ -249,39 +632,73 @@ class BacktestDataSource:
 
         result: Dict[str, float] = {}
         if stock_codes:
-            placeholders = ",".join("?" for _ in stock_codes)
-            sql = f"""SELECT ts_code,close,available_time
-                        FROM dc_stock_daily_snapshot
-                       WHERE trade_date=? AND ts_code IN ({placeholders})
-                         AND close IS NOT NULL"""
-            params: tuple = (ymd, *stock_codes)
-            if self._as_of_time:
-                sql += " AND available_time<=?"
-                params += (self._as_of_time,)
-            with _conn() as conn:
-                rows = [dict(row) for row in conn.execute(sql, params).fetchall()]
-            self._record_pit_read("snapshot.execution_close", rows)
-            for row in rows:
-                code = str(row.get("ts_code") or "").split(".", 1)[0].zfill(6)
-                close = float(row.get("close") or 0)
-                if code and close > 0:
-                    result[code] = close
+            versioned = self._versioned_snapshot_rows(ymd, ts_codes=stock_codes)
+            if versioned is not None:
+                rows = [dict(row) for row in versioned if float(row.get("close") or 0) > 0]
+                self._record_pit_read("snapshot.execution_close", rows)
+                for row in rows:
+                    code = str(row.get("ts_code") or "").split(".", 1)[0].zfill(6)
+                    close = float(row.get("close") or 0)
+                    if code and close > 0:
+                        result[code] = close
+                stock_codes = []
+        if stock_codes:
+            if _is_postgres() or self._as_of_time:
+                self._record_pit_failure("snapshot.execution_close", "observation_version_table_unavailable")
+                stock_codes = []
+            else:
+                placeholders = ",".join("?" for _ in stock_codes)
+                sql = f"""SELECT ts_code,close,observed_at AS available_time,observed_at
+                            FROM dc_stock_daily_snapshot
+                           WHERE trade_date=? AND ts_code IN ({placeholders})
+                             AND close IS NOT NULL"""
+                params: tuple = (ymd, *stock_codes)
+                if self._as_of_time:
+                    sql += " AND observed_at<=?"
+                    params += (self._as_of_time,)
+                with _conn() as conn:
+                    rows = [dict(row) for row in conn.execute(sql, params).fetchall()]
+                self._record_pit_read("snapshot.execution_close", rows)
+                for row in rows:
+                    code = str(row.get("ts_code") or "").split(".", 1)[0].zfill(6)
+                    close = float(row.get("close") or 0)
+                    if code and close > 0:
+                        result[code] = close
 
+        if fund_codes:
+            versioned = self._versioned_raw_rows("fund_daily", ymd, ts_codes=fund_codes)
+            if versioned is not None:
+                rows = versioned
+                self._record_pit_read("tushare.fund_daily_execution_close", rows)
+                for row in rows:
+                    try:
+                        payload = json.loads(row.get("payload_json") or "{}")
+                    except (TypeError, json.JSONDecodeError):
+                        payload = {}
+                    code = str(row.get("ts_code") or "").split(".", 1)[0].zfill(6)
+                    close = float(payload.get("close") or 0)
+                    if code and close > 0:
+                        result[code] = close
+                fund_codes = []
+        if fund_codes:
+            if _is_postgres() or self._as_of_time:
+                self._record_pit_failure("tushare.fund_daily_execution_close", "observation_version_table_unavailable")
+                fund_codes = []
         if fund_codes:
             placeholders = ",".join("?" for _ in fund_codes)
             sql = f"""WITH ranked AS (
-                           SELECT ts_code,payload_json,available_time,
+                           SELECT ts_code,payload_json,observed_at AS available_time,observed_at,
                                   ROW_NUMBER() OVER (
-                                      PARTITION BY ts_code ORDER BY available_time DESC,id DESC
+                                      PARTITION BY ts_code ORDER BY observed_at DESC,id DESC
                                   ) AS row_rank
                              FROM dc_tushare_raw_records
                             WHERE api_name='fund_daily' AND trade_date=?
                               AND ts_code IN ({placeholders})"""
             params = (ymd, *fund_codes)
             if self._as_of_time:
-                sql += " AND available_time<=?"
+                sql += " AND observed_at<=?"
                 params += (self._as_of_time,)
-            sql += ") SELECT ts_code,payload_json,available_time FROM ranked WHERE row_rank=1"
+            sql += ") SELECT ts_code,payload_json,available_time,observed_at FROM ranked WHERE row_rank=1"
             with _conn() as conn:
                 rows = [dict(row) for row in conn.execute(sql, params).fetchall()]
             self._record_pit_read("tushare.fund_daily_execution_close", rows)
@@ -360,16 +777,26 @@ class BacktestDataSource:
                 for offset in range(0, len(group), batch_size):
                     batch = group[offset : offset + batch_size]
                     placeholders = ",".join("?" for _ in batch)
-                    with _conn() as conn:
-                        rows = conn.execute(
-                            f"""SELECT ts_code,trade_date,close,volume,turnover,available_time,adj_factor
-                                FROM dc_stock_daily_snapshot
-                                WHERE ts_code IN ({placeholders}){date_clause}
-                                  AND adj_factor IS NOT NULL
-                                  {' AND available_time<=?' if self._as_of_time else ''}
-                                ORDER BY ts_code,trade_date""",
-                            tuple(ts_code for _, ts_code in batch) + date_params + ((self._as_of_time,) if self._as_of_time else ()),
-                        ).fetchall()
+                    batch_codes = [ts_code for _, ts_code in batch]
+                    versioned_history = self._versioned_snapshot_history_rows(
+                        batch_codes, date_clause=date_clause, date_params=date_params,
+                    )
+                    if versioned_history is not None:
+                        rows = versioned_history
+                    elif _is_postgres() or self._as_of_time:
+                        self._record_pit_failure("snapshot.history", "observation_version_table_unavailable")
+                        rows = []
+                    else:
+                        with _conn() as conn:
+                            rows = conn.execute(
+                                f"""SELECT ts_code,trade_date,close,volume,turnover,observed_at AS available_time,observed_at,adj_factor
+                                    FROM dc_stock_daily_snapshot
+                                    WHERE ts_code IN ({placeholders}){date_clause}
+                                      AND adj_factor IS NOT NULL
+                                      {' AND observed_at<=?' if self._as_of_time else ''}
+                                    ORDER BY ts_code,trade_date""",
+                                tuple(batch_codes) + date_params + ((self._as_of_time,) if self._as_of_time else ()),
+                            ).fetchall()
                     self._record_pit_read("snapshot.history", [dict(row) for row in rows])
                     for raw_row in rows:
                         item = dict(raw_row)
@@ -403,123 +830,6 @@ class BacktestDataSource:
                 self._hist_cache_through[code] = bars[-1].date.replace("-", "")
         self._hist_cache.update(grouped)
 
-    def _daily_basic_data_path_json(self, ymd: str) -> Path:
-        return self._daily_basic_data_dir / f"{ymd}.json"
-
-    def _daily_basic_data_path_csv(self, ymd: str) -> Path:
-        return self._daily_basic_data_dir / f"{ymd}.csv"
-
-    def _load_daily_basic_from_data_dir(self, ymd: str) -> Dict[str, Dict[str, float]]:
-        """
-        从 .cache/data/daily_basic 读取用户沉淀的本地截面数据。
-        兼容 json/csv 两种格式。
-        """
-        json_path = self._daily_basic_data_path_json(ymd)
-        if json_path.exists():
-            try:
-                payload = json.loads(json_path.read_text(encoding="utf-8"))
-                if isinstance(payload, dict):
-                    return payload
-            except Exception:
-                pass
-
-        csv_path = self._daily_basic_data_path_csv(ymd)
-        if not csv_path.exists():
-            return {}
-        out: Dict[str, Dict[str, float]] = {}
-        try:
-            with csv_path.open("r", encoding="utf-8-sig", newline="") as f:
-                reader = csv.DictReader(f)
-                for r in reader:
-                    ts_code = str(r.get("ts_code", "")).strip()
-                    symbol = ts_code.split(".")[0].zfill(6) if ts_code else str(r.get("symbol", "")).strip().zfill(6)
-                    if not symbol:
-                        continue
-                    out[symbol] = {
-                        "total_mv": float(r.get("total_mv", 0) or 0),
-                        "float_mv": float(r.get("circ_mv", r.get("float_mv", 0)) or 0),
-                        "pe_ttm": float(r.get("pe_ttm", 0) or 0),
-                        "pb": float(r.get("pb", 0) or 0),
-                        "turnover_rate": float(r.get("turnover_rate", 0) or 0),
-                    }
-        except Exception:
-            return {}
-        return out
-
-    def _save_daily_basic_to_data_dir(
-        self, ymd: str, out: Dict[str, Dict[str, float]], ts_code_by_symbol: Dict[str, str]
-    ) -> None:
-        """
-        将从 TuShare 拉取的 daily_basic 同步落地到 .cache/data/daily_basic，后续优先本地复用。
-        """
-        if not out:
-            return
-        try:
-            self._daily_basic_data_path_json(ymd).write_text(
-                json.dumps(out, ensure_ascii=False),
-                encoding="utf-8",
-            )
-        except Exception:
-            pass
-
-        try:
-            with self._daily_basic_data_path_csv(ymd).open("w", encoding="utf-8", newline="") as f:
-                writer = csv.writer(f)
-                writer.writerow(["ts_code", "trade_date", "total_mv", "circ_mv", "pe_ttm", "pb", "turnover_rate"])
-                for symbol, vals in out.items():
-                    writer.writerow(
-                        [
-                            ts_code_by_symbol.get(symbol, f"{symbol}.SZ"),
-                            ymd,
-                            vals.get("total_mv", 0),
-                            vals.get("float_mv", 0),
-                            vals.get("pe_ttm", 0),
-                            vals.get("pb", 0),
-                            vals.get("turnover_rate", 0),
-                        ]
-                    )
-        except Exception:
-            pass
-
-    def _load_latest_daily_basic_cache(self, target_ymd: str) -> Dict[str, Dict[str, float]]:
-        """
-        当某日 daily_basic 拉取失败时，回退到最近一个可用缓存（<= target_ymd）。
-        """
-        candidates = sorted(self._cache_dir.glob("daily_basic_*.json"), reverse=True)
-        for p in candidates:
-            stem = p.stem.replace("daily_basic_", "")
-            if len(stem) != 8 or not stem.isdigit():
-                continue
-            if stem > target_ymd:
-                continue
-            try:
-                payload = json.loads(p.read_text(encoding="utf-8"))
-                if isinstance(payload, dict) and payload:
-                    logger.warning(
-                        "backtest daily_basic 使用历史缓存回退: target=%s fallback=%s rows=%d",
-                        target_ymd,
-                        stem,
-                        len(payload),
-                    )
-                    self.fallback_events.append(
-                        {
-                            "type": "daily_basic_fallback",
-                            "target_date": target_ymd,
-                            "fallback_date": stem,
-                            "rows": str(len(payload)),
-                        }
-                    )
-                    self.data_warnings.append(
-                        f"{target_ymd} daily_basic 使用 {stem} 的历史缓存回退；市值/估值过滤和打分可能存在偏差。"
-                    )
-                    return payload
-            except Exception:
-                continue
-        self.data_warnings.append(
-            f"{target_ymd} daily_basic 不可用且没有可回退缓存；市值/估值因子不完整。"
-        )
-        return {}
-
     @staticmethod
     def _fmt_date(ymd: str) -> str:
         s = str(ymd).replace("-", "")[:8]
@@ -527,55 +837,14 @@ class BacktestDataSource:
             return f"{s[:4]}-{s[4:6]}-{s[6:8]}"
         return ymd
 
-    def _build_symbol_index(self) -> None:
-        if self._symbol_file_index:
-            return
-        if not self._full_k_dir.exists():
-            return
-        for p in self._full_k_dir.glob("*.csv"):
-            stem = p.stem.lower()
-            code = stem[-6:] if len(stem) >= 6 else stem
-            if code.isdigit():
-                self._symbol_file_index[code] = p
-
     def get_available_trade_dates(self, start_date: str, end_date: str) -> List[str]:
-        """
-        优先使用 .cache/data/daily_basic/2026 按日快照作为回测交易日；若为空则退化为 000001 的历史日期。
-        """
+        """Read exchange sessions from normalized PostgreSQL coverage only."""
         start = self._fmt_date(start_date)
         end = self._fmt_date(end_date)
         postgres_dates = self._postgres_trade_dates(start, end)
         if not postgres_dates:
             self.data_warnings.append("PostgreSQL 中没有覆盖该区间的日线数据。")
         return postgres_dates
-        out: List[str] = []
-        if self._daily_snapshot_dir.exists():
-            for p in self._daily_snapshot_dir.glob("*.csv"):
-                ymd = p.stem
-                if len(ymd) != 8 or not ymd.isdigit():
-                    continue
-                d = self._fmt_date(ymd)
-                if start <= d <= end:
-                    out.append(d)
-        out = sorted(set(out))
-        if out:
-            return out
-
-        if self._all_in_one_dir.exists():
-            for p in self._all_in_one_dir.glob("*.json"):
-                ymd = p.stem
-                if len(ymd) != 8 or not ymd.isdigit():
-                    continue
-                d = self._fmt_date(ymd)
-                if start <= d <= end:
-                    out.append(d)
-        out = sorted(set(out))
-        if out:
-            return out
-
-        # 兜底：用 000001 的历史 K 线日期做交易日历
-        bars = self.get_symbol_history("000001")
-        return [b.date for b in bars if start <= b.date <= end]
 
     def load_snapshot(self, date_ymd: str) -> List[SnapshotRow]:
         date_iso = self._fmt_date(date_ymd)
@@ -616,164 +885,14 @@ class BacktestDataSource:
                 ))
             self._snapshot_cache[date_iso] = rows
             return rows
-        postgres_rows = self._postgres_daily_rows(ymd)
-        if postgres_rows:
-            rows: List[SnapshotRow] = []
-            for raw in postgres_rows:
-                payload = json.loads(str(raw.get("payload_json") or "{}"))
-                ts_code = str(raw.get("ts_code") or payload.get("ts_code") or "")
-                symbol = ts_code.split(".", 1)[0].zfill(6)
-                if not symbol:
-                    continue
-                rows.append(SnapshotRow(
-                    symbol=symbol, date=self._fmt_date(str(payload.get("trade_date") or ymd)),
-                    open=float(payload.get("open") or 0), high=float(payload.get("high") or 0),
-                    low=float(payload.get("low") or 0), close=float(payload.get("close") or 0),
-                    prev_close=float(payload.get("pre_close") or 0), change_pct=float(payload.get("pct_chg") or 0),
-                    volume=float(payload.get("vol") or 0), turnover=float(payload.get("amount") or 0),
-                ))
-            self._snapshot_cache[date_iso] = rows
-            return rows
+        # A normalized snapshot is the contract consumed by formal replay.
+        # Reconstructing it from raw daily bars omits the independently frozen
+        # daily_basic/limit/factor dependencies and lets an incomplete snapshot
+        # appear usable.  Leave the date empty and make the PIT audit fail.
+        self._record_pit_failure("snapshot.daily_structured", "normalized_snapshot_version_missing")
         self.data_warnings.append(f"{ymd} PostgreSQL 快照不可用。")
         self._snapshot_cache[date_iso] = []
         return []
-        local_path = self._daily_snapshot_dir / f"{ymd}.csv"
-        if local_path.exists():
-            rows = self._load_snapshot_csv(local_path)
-            self._snapshot_cache[date_iso] = rows
-            return rows
-
-        # 本地无按日快照时，尝试 TuShare daily 补齐
-        cache_path = self._cache_dir / f"snapshot_{ymd}.json"
-        if cache_path.exists():
-            try:
-                payload = json.loads(cache_path.read_text(encoding="utf-8"))
-                rows = [SnapshotRow(**x) for x in payload]
-                self._snapshot_cache[date_iso] = rows
-                return rows
-            except Exception:
-                pass
-
-        all_in_one_path = self._all_in_one_dir / f"{ymd}.json"
-        if all_in_one_path.exists():
-            try:
-                payload = json.loads(all_in_one_path.read_text(encoding="utf-8"))
-                day_data = ((payload.get("data") or {}).get(ymd) or {}) if isinstance(payload, dict) else {}
-                rows = []
-                for symbol, vals in day_data.items():
-                    if not isinstance(vals, dict):
-                        continue
-                    rows.append(
-                        SnapshotRow(
-                            symbol=str(vals.get("symbol") or symbol).zfill(6),
-                            date=self._fmt_date(str(vals.get("trade_date") or ymd)),
-                            open=float(vals.get("open", vals.get("price", 0)) or 0),
-                            high=float(vals.get("high", vals.get("close", 0)) or 0),
-                            low=float(vals.get("low", vals.get("close", 0)) or 0),
-                            close=float(vals.get("close", vals.get("price", 0)) or 0),
-                            prev_close=float(vals.get("prev_close", 0) or 0),
-                            change_pct=float(vals.get("change_pct", 0) or 0),
-                            volume=float(vals.get("volume", 0) or 0),
-                            turnover=float(vals.get("turnover", 0) or 0),
-                            name=str(vals.get("name") or ""),
-                        )
-                    )
-                self._snapshot_cache[date_iso] = rows
-                return rows
-            except Exception:
-                pass
-
-        rows = self._fetch_snapshot_from_tushare(ymd)
-        try:
-            cache_path.write_text(
-                json.dumps([r.__dict__ for r in rows], ensure_ascii=False),
-                encoding="utf-8",
-            )
-        except Exception:
-            pass
-        self._snapshot_cache[date_iso] = rows
-        return rows
-
-    def _load_snapshot_csv(self, path: Path) -> List[SnapshotRow]:
-        out: List[SnapshotRow] = []
-        def _pick(row: dict, keys: list[str], default: str = "") -> str:
-            for k in keys:
-                v = row.get(k)
-                if v is not None and str(v).strip() != "":
-                    return str(v).strip()
-            return default
-
-        def _to_float(val: str) -> float:
-            try:
-                return float(val or 0)
-            except Exception:
-                return 0.0
-
-        with path.open("r", encoding="utf-8-sig", newline="") as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                # 兼容两种列名：
-                # 1) 中文: 股票代码/日期/开盘价...
-                # 2) 英文: code/date/open...
-                symbol = _pick(row, ["股票代码", "code"]).zfill(6)
-                if not symbol:
-                    continue
-                raw_date = _pick(row, ["日期", "date"])
-                date_val = self._fmt_date(raw_date)[:10]
-                open_val = _to_float(_pick(row, ["开盘价", "open"], "0"))
-                high_val = _to_float(_pick(row, ["最高价", "high"], "0"))
-                low_val = _to_float(_pick(row, ["最低价", "low"], "0"))
-                close_val = _to_float(_pick(row, ["收盘价", "close"], "0"))
-                prev_close_val = _to_float(_pick(row, ["昨收价", "pre_close"], "0"))
-                change_pct_val = _to_float(_pick(row, ["涨跌幅", "pct_chg"], "0"))
-                volume_val = _to_float(_pick(row, ["成交量", "vol"], "0"))
-                turnover_val = _to_float(_pick(row, ["成交额", "amount"], "0"))
-                out.append(
-                    SnapshotRow(
-                        symbol=symbol,
-                        date=date_val,
-                        open=open_val,
-                        high=high_val,
-                        low=low_val,
-                        close=close_val,
-                        prev_close=prev_close_val,
-                        change_pct=change_pct_val,
-                        volume=volume_val,
-                        turnover=turnover_val,
-                        name="",
-                    )
-                )
-        return out
-
-    def _fetch_snapshot_from_tushare(self, ymd: str) -> List[SnapshotRow]:
-        client = get_tushare_client()
-        df = client.daily(
-            trade_date=ymd,
-            fields="ts_code,trade_date,open,high,low,close,pre_close,pct_chg,vol,amount",
-        )
-        if df is None or df.empty:
-            return []
-        out: List[SnapshotRow] = []
-        for _, r in df.iterrows():
-            ts_code = str(r.get("ts_code", ""))
-            symbol = ts_code.split(".")[0].zfill(6)
-            trade_date = str(r.get("trade_date", "")).strip()
-            out.append(
-                SnapshotRow(
-                    symbol=symbol,
-                    date=self._fmt_date(trade_date),
-                    open=float(r.get("open", 0) or 0),
-                    high=float(r.get("high", 0) or 0),
-                    low=float(r.get("low", 0) or 0),
-                    close=float(r.get("close", 0) or 0),
-                    prev_close=float(r.get("pre_close", 0) or 0),
-                    change_pct=float(r.get("pct_chg", 0) or 0),
-                    volume=float(r.get("vol", 0) or 0),
-                    turnover=float(r.get("amount", 0) or 0),
-                    name="",
-                )
-            )
-        return out
 
     def get_symbol_history(self, symbol: str) -> List[HistBar]:
         code = str(symbol).strip().zfill(6)
@@ -784,15 +903,23 @@ class BacktestDataSource:
 
         try:
             suffix = ".SH" if code.startswith(("6", "9")) else ".SZ" if code.startswith(("0", "3")) else ".BJ"
-            with _conn() as conn:
-                rows = conn.execute(
-                    f"""SELECT trade_date,close,volume,turnover,available_time,adj_factor
-                       FROM dc_stock_daily_snapshot
-                       WHERE ts_code=? AND adj_factor IS NOT NULL
-                       {' AND available_time<=?' if self._as_of_time else ''}
-                       ORDER BY trade_date""",
-                    (f"{code}{suffix}",) + ((self._as_of_time,) if self._as_of_time else ()),
-                ).fetchall()
+            versioned = self._versioned_snapshot_history_rows([f"{code}{suffix}"])
+            if versioned is None:
+                if _is_postgres() or self._as_of_time:
+                    self._record_pit_failure("snapshot.symbol_history", "observation_version_table_unavailable")
+                    self._hist_cache[code] = []
+                    return []
+                with _conn() as conn:
+                    rows = conn.execute(
+                        f"""SELECT trade_date,close,volume,turnover,observed_at AS available_time,observed_at,adj_factor
+                           FROM dc_stock_daily_snapshot
+                           WHERE ts_code=? AND adj_factor IS NOT NULL
+                           {' AND observed_at<=?' if self._as_of_time else ''}
+                           ORDER BY trade_date""",
+                        (f"{code}{suffix}",) + ((self._as_of_time,) if self._as_of_time else ()),
+                    ).fetchall()
+            else:
+                rows = [row for row in versioned if row.get("adj_factor") is not None]
             self._record_pit_read("snapshot.symbol_history", [dict(row) for row in rows])
             postgres_bars = []
             for raw in rows:
@@ -810,33 +937,10 @@ class BacktestDataSource:
                 return postgres_bars
         except Exception as exc:  # noqa: BLE001
             logger.warning("PostgreSQL backtest history read failed: %s", str(exc)[:160])
+            self._record_pit_failure("snapshot.symbol_history", "immutable_snapshot_history_read_failed")
 
         self._hist_cache[code] = []
         return []
-        self._build_symbol_index()
-        path = self._symbol_file_index.get(code)
-        if path is None or not path.exists():
-            self._hist_cache[code] = []
-            return []
-
-        rows: List[HistBar] = []
-        with path.open("r", encoding="utf-8-sig", newline="") as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                rows.append(
-                    HistBar(
-                        date=str(row.get("日期", ""))[:10],
-                        open=float(row.get("开盘价", 0) or 0),
-                        high=float(row.get("最高价", 0) or 0),
-                        low=float(row.get("最低价", 0) or 0),
-                        close=float(row.get("收盘价", 0) or 0),
-                        volume=float(row.get("成交量", 0) or 0),
-                        turnover=float(row.get("成交额", 0) or 0),
-                    )
-                )
-        rows.sort(key=lambda x: x.date)
-        self._hist_cache[code] = rows
-        return rows
 
     def get_hist_window(self, symbol: str, end_date_iso: str, lookback: int) -> List[HistBar]:
         bars = self.get_symbol_history(symbol)
@@ -853,22 +957,29 @@ class BacktestDataSource:
         if "." in ts_code:
             ymd = str(date_iso or "").replace("-", "")[:8]
             try:
-                sql = """SELECT payload_json,available_time FROM dc_tushare_raw_records
-                         WHERE api_name='index_daily' AND ts_code=? AND trade_date=?"""
-                params: tuple = (ts_code, ymd)
-                if self._as_of_time:
-                    sql += " AND available_time<=?"
-                    params += (self._as_of_time,)
-                with _conn() as conn:
-                    raw = conn.execute(sql, params).fetchone()
-                if raw:
-                    item = dict(raw)
+                versioned = self._versioned_raw_rows("index_daily", ymd, ts_codes=[ts_code])
+                if versioned is None:
+                    if _is_postgres() or self._as_of_time:
+                        self._record_pit_failure("canonical_market.index_daily", "observation_version_table_unavailable")
+                        return None
+                    sql = """SELECT payload_json,observed_at AS available_time,observed_at FROM dc_tushare_raw_records
+                             WHERE api_name='index_daily' AND ts_code=? AND trade_date=?"""
+                    params: tuple = (ts_code, ymd)
+                    if self._as_of_time:
+                        sql += " AND observed_at<=?"
+                        params += (self._as_of_time,)
+                    with _conn() as conn:
+                        raw = conn.execute(sql, params).fetchone()
+                    versioned = [dict(raw)] if raw else []
+                if versioned:
+                    item = dict(versioned[-1])
                     self._record_pit_read("canonical_market.index_daily", [item])
                     payload = json.loads(str(item.get("payload_json") or "{}"))
                     value = float(payload.get(field) or 0)
                     return value if value > 0 else None
             except Exception as exc:  # noqa: BLE001
                 logger.warning("PostgreSQL benchmark read failed: %s", str(exc)[:160])
+                self._record_pit_failure("canonical_market.index_daily", "immutable_index_read_failed")
         bars = self.get_symbol_history(symbol)
         if not bars:
             return None
@@ -892,17 +1003,26 @@ class BacktestDataSource:
         """Return point-in-time daily benchmark returns in chronological order."""
         ts_code = str(symbol or "").strip().upper()
         ymd = str(as_of_date or "").replace("-", "")[:8]
-        sql = """SELECT trade_date,payload_json,available_time FROM dc_tushare_raw_records
-                 WHERE api_name='index_daily' AND ts_code=? AND trade_date<=?"""
-        params: tuple = (ts_code, ymd)
-        if self._as_of_time:
-            sql += " AND available_time<=?"
-            params += (self._as_of_time,)
-        sql += " ORDER BY trade_date DESC LIMIT ?"
-        params += (max(2, min(int(lookback) + 1, 251)),)
         try:
-            with _conn() as conn:
-                raw_rows = [dict(row) for row in conn.execute(sql, params).fetchall()]
+            versioned = self._versioned_raw_rows(
+                "index_daily", ts_codes=[ts_code], date_clause="trade_date<=?", date_params=(ymd,),
+            )
+            if versioned is None:
+                if _is_postgres() or self._as_of_time:
+                    self._record_pit_failure("canonical_market.index_daily_trend", "observation_version_table_unavailable")
+                    return []
+                sql = """SELECT trade_date,payload_json,observed_at AS available_time,observed_at FROM dc_tushare_raw_records
+                         WHERE api_name='index_daily' AND ts_code=? AND trade_date<=?"""
+                params: tuple = (ts_code, ymd)
+                if self._as_of_time:
+                    sql += " AND observed_at<=?"
+                    params += (self._as_of_time,)
+                sql += " ORDER BY trade_date DESC LIMIT ?"
+                params += (max(2, min(int(lookback) + 1, 251)),)
+                with _conn() as conn:
+                    raw_rows = [dict(row) for row in conn.execute(sql, params).fetchall()]
+            else:
+                raw_rows = sorted(versioned, key=lambda row: str(row.get("trade_date") or ""), reverse=True)[:max(2, min(int(lookback) + 1, 251))]
             self._record_pit_read("canonical_market.index_daily_trend", raw_rows)
             closes = [
                 float(json.loads(str(row.get("payload_json") or "{}")).get("close") or 0)
@@ -916,6 +1036,7 @@ class BacktestDataSource:
             ]
         except Exception as exc:  # noqa: BLE001
             logger.warning("PostgreSQL benchmark trend read failed: %s", str(exc)[:160])
+            self._record_pit_failure("canonical_market.index_daily_trend", "immutable_index_history_read_failed")
             return []
 
     def get_daily_basic_map(self, date_ymd: str) -> Dict[str, Dict[str, float]]:
@@ -928,12 +1049,20 @@ class BacktestDataSource:
             return self._daily_basic_cache[ymd]
 
         try:
-            with _conn() as conn:
-                rows = conn.execute(
-                    f"""SELECT ts_code,total_mv,circ_mv,pe_ttm,pb,turnover_rate,available_time
-                         FROM dc_stock_daily_snapshot WHERE trade_date=?{' AND available_time<=?' if self._as_of_time else ''}""",
-                    (ymd,) + ((self._as_of_time,) if self._as_of_time else ()),
-                ).fetchall()
+            versioned = self._versioned_snapshot_rows(ymd)
+            if versioned is None:
+                if _is_postgres() or self._as_of_time:
+                    self._record_pit_failure("snapshot.daily_basic", "observation_version_table_unavailable")
+                    self._daily_basic_cache[ymd] = {}
+                    return {}
+                with _conn() as conn:
+                    rows = conn.execute(
+                        f"""SELECT ts_code,total_mv,circ_mv,pe_ttm,pb,turnover_rate,observed_at AS available_time,observed_at
+                             FROM dc_stock_daily_snapshot WHERE trade_date=?{' AND observed_at<=?' if self._as_of_time else ''}""",
+                        (ymd,) + ((self._as_of_time,) if self._as_of_time else ()),
+                    ).fetchall()
+            else:
+                rows = versioned
             self._record_pit_read("snapshot.daily_basic", [dict(row) for row in rows])
             postgres_payload: Dict[str, Dict[str, float]] = {}
             for raw in rows:
@@ -952,89 +1081,10 @@ class BacktestDataSource:
                 return postgres_payload
         except Exception as exc:  # noqa: BLE001
             logger.warning("PostgreSQL backtest daily_basic read failed: %s", str(exc)[:160])
+            self._record_pit_failure("snapshot.daily_basic", "immutable_snapshot_daily_basic_read_failed")
         self.data_warnings.append(f"{ymd} PostgreSQL daily_basic 不可用。")
         self._daily_basic_cache[ymd] = {}
         return {}
-
-        # 1) 用户长期本地目录优先（.cache/data/daily_basic）
-        data_dir_payload = self._load_daily_basic_from_data_dir(ymd)
-        if data_dir_payload:
-            logger.info("backtest daily_basic trade_date=%s 使用 .cache/data/daily_basic 本地文件 rows=%d", ymd, len(data_dir_payload))
-            self._daily_basic_cache[ymd] = data_dir_payload
-            return data_dir_payload
-
-        # 2) 进程缓存目录（backend/.cache/backtest）
-        cache_path = self._cache_dir / f"daily_basic_{ymd}.json"
-        if cache_path.exists():
-            try:
-                payload = json.loads(cache_path.read_text(encoding="utf-8"))
-                self._daily_basic_cache[ymd] = payload
-                logger.info("backtest daily_basic trade_date=%s 使用 .cache 文件 rows=%d", ymd, len(payload))
-                return payload
-            except Exception:
-                pass
-
-        all_in_one_path = self._all_in_one_dir / f"{ymd}.json"
-        if all_in_one_path.exists():
-            try:
-                payload = json.loads(all_in_one_path.read_text(encoding="utf-8"))
-                day_data = ((payload.get("data") or {}).get(ymd) or {}) if isinstance(payload, dict) else {}
-                out = {}
-                for symbol, vals in day_data.items():
-                    if not isinstance(vals, dict):
-                        continue
-                    out[str(vals.get("symbol") or symbol).zfill(6)] = {
-                        "total_mv": float(vals.get("total_mv", 0) or 0),
-                        "float_mv": float(vals.get("float_mv", 0) or 0),
-                        "pe_ttm": float(vals.get("pe_ttm", 0) or 0),
-                        "pb": float(vals.get("pb", 0) or 0),
-                        "turnover_rate": float(vals.get("turnover_rate", 0) or 0),
-                    }
-                if out:
-                    self._daily_basic_cache[ymd] = out
-                    return out
-            except Exception:
-                pass
-
-        # 3) TuShare 拉取（仅在本地无数据时触发）
-        client = get_tushare_client()
-        try:
-            df = client.daily_basic_resilient(
-                trade_date=ymd,
-                ts_code="",
-                fields="ts_code,total_mv,circ_mv,pe_ttm,pb,turnover_rate",
-            )
-        except Exception as e:  # noqa: BLE001
-            logger.warning(
-                "backtest daily_basic 拉取失败 trade_date=%s，尝试历史缓存回退 | %s",
-                ymd,
-                str(e)[:200],
-            )
-            fallback = self._load_latest_daily_basic_cache(ymd)
-            self._daily_basic_cache[ymd] = fallback
-            return fallback
-        out: Dict[str, Dict[str, float]] = {}
-        ts_code_by_symbol: Dict[str, str] = {}
-        if df is not None and not df.empty:
-            for _, r in df.iterrows():
-                ts_code = str(r.get("ts_code", ""))
-                symbol = ts_code.split(".")[0].zfill(6)
-                ts_code_by_symbol[symbol] = ts_code
-                out[symbol] = {
-                    "total_mv": float(r.get("total_mv", 0) or 0),
-                    "float_mv": float(r.get("circ_mv", 0) or 0),
-                    "pe_ttm": float(r.get("pe_ttm", 0) or 0),
-                    "pb": float(r.get("pb", 0) or 0),
-                    "turnover_rate": float(r.get("turnover_rate", 0) or 0),
-                }
-        try:
-            cache_path.write_text(json.dumps(out, ensure_ascii=False), encoding="utf-8")
-        except Exception:
-            pass
-        self._save_daily_basic_to_data_dir(ymd, out, ts_code_by_symbol)
-        logger.info("backtest daily_basic trade_date=%s rows=%d", ymd, len(out))
-        self._daily_basic_cache[ymd] = out
-        return out
 
     @staticmethod
     def should_rebalance(freq: str, trade_date_iso: str, prev_rebalance_date: Optional[str]) -> bool:
