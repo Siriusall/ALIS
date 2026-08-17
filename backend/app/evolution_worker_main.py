@@ -9,6 +9,7 @@ import threading
 from app.data_platform.db import _conn as data_platform_conn
 from app.db.store import _conn as business_conn
 from app.services.evolution_orchestrator import (
+    WORKER_POOL,
     recover_evolution_tasks,
     start_evolution_worker,
 )
@@ -34,8 +35,8 @@ def run_forever(stop_event: threading.Event | None = None) -> None:
     recovered = recover_evolution_tasks()
     started = start_evolution_worker()
     logger.info(
-        "Standalone evolution worker ready: started=%s recovered=%s",
-        started,
+        "Standalone evolution worker ready: pool=%s started=%s recovered=%s",
+        WORKER_POOL, started,
         recovered,
     )
     while not stopper.wait(5):

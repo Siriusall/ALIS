@@ -857,6 +857,7 @@ CREATE TABLE IF NOT EXISTS model_train_runs (
 CREATE TABLE IF NOT EXISTS evolution_tasks (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     task_type TEXT NOT NULL,
+    worker_pool TEXT NOT NULL DEFAULT 'control',
     dedupe_key TEXT NOT NULL,
     status TEXT NOT NULL,
     phase TEXT NOT NULL DEFAULT '',
@@ -1220,6 +1221,7 @@ CREATE TABLE IF NOT EXISTS model_train_runs (
 CREATE TABLE IF NOT EXISTS evolution_tasks (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,
     task_type VARCHAR(64) NOT NULL,
+    worker_pool VARCHAR(32) NOT NULL DEFAULT 'control',
     dedupe_key VARCHAR(255) NOT NULL,
     status VARCHAR(32) NOT NULL,
     phase VARCHAR(64) NOT NULL DEFAULT '',
@@ -1244,6 +1246,7 @@ CREATE TABLE IF NOT EXISTS evolution_tasks (
     updated_at VARCHAR(64) NOT NULL,
     INDEX idx_evolution_tasks_status_next (status, next_run_at, priority, created_at),
     INDEX idx_evolution_tasks_type_id (task_type, id)
+    ,INDEX idx_evolution_tasks_pool_status_next (worker_pool, status, next_run_at, priority, created_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 CREATE TABLE IF NOT EXISTS strategy_shadow_observations (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,
@@ -1385,6 +1388,9 @@ def init_db() -> None:
                 ALTER TABLE operations ALTER COLUMN execution_id DROP NOT NULL;
                 ALTER TABLE evolution_tasks ADD COLUMN IF NOT EXISTS stop_requested INTEGER NOT NULL DEFAULT 0;
                 ALTER TABLE evolution_tasks ADD COLUMN IF NOT EXISTS deadline_at VARCHAR(64);
+                ALTER TABLE evolution_tasks ADD COLUMN IF NOT EXISTS worker_pool VARCHAR(32) NOT NULL DEFAULT 'control';
+                CREATE INDEX IF NOT EXISTS idx_evolution_tasks_pool_status_next
+                    ON evolution_tasks(worker_pool, status, next_run_at, priority, created_at);
                 ALTER TABLE quant_run_task_runs ADD COLUMN IF NOT EXISTS detail_json TEXT NULL;
                 CREATE TABLE IF NOT EXISTS quant_run_task_meta (
                     task_id BIGINT PRIMARY KEY REFERENCES quant_run_tasks(id),

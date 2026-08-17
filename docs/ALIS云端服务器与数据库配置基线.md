@@ -25,11 +25,15 @@
        | WireGuard `/29` 私网隧道（`10.44.0.3 -> 10.44.0.1`）；公网 TLS `/32` 保留为回滚
        |
      阿里云 Evolution Worker / 47.119.146.111
-       - 独立因子研究与策略迭代 Worker
+       - control 池：轻量控制任务与兼容旧任务
        - 通过 evolution_tasks 的 PostgreSQL 租约领取任务
+       |
+     腾讯云 Research Worker / 124.223.225.117
+       - research 池：因子、策略、OOS 等重型研究任务
+       - 通过独立 systemd Worker 和 PostgreSQL 租约领取任务
 ```
 
-腾讯云轻量实例的原生 `10.0.0.4`/`10.0.0.12` 私网 TCP 5432 不作为生产路径。当前通过直连 SSH 配置的 WireGuard `/29` 隧道提供受控跨云路径：数据库机为 `10.44.0.1`，应用机为 `10.44.0.2`，阿里 Worker 为 `10.44.0.3`。应用机和 Worker 的生产数据库 URL 均使用 `10.44.0.1`、PostgreSQL TLS 和 `pg_hba` 的 `/32` 隧道白名单；公网 TLS `/32` 规则仍保留作回滚和故障诊断，不开放 `0.0.0.0/0`。
+腾讯云轻量实例的原生 `10.0.0.4`/`10.0.0.12` 私网 TCP 5432 不作为生产路径。当前通过直连 SSH 配置的 WireGuard `/29` 隧道提供受控跨云路径：数据库机为 `10.44.0.1`，应用机为 `10.44.0.2`，阿里 Worker 为 `10.44.0.3`，Research Worker 为 `10.44.0.4`。应用机和两个 Worker 的生产数据库 URL 均使用 `10.44.0.1`、PostgreSQL TLS 和 `pg_hba` 的 `/32` 隧道白名单；公网 TLS `/32` 规则仍保留作回滚和故障诊断，不开放 `0.0.0.0/0`。
 
 ## 2. 服务器清单
 
@@ -38,6 +42,7 @@
 | `kevin2` / `VM-0-4-ubuntu` | 腾讯云轻量 | 4 核 4GB，40GB | `124.221.86.123` | `10.0.0.4` | Nginx、前端、API、Redis、调度器、模拟交易主流程 |
 | `Kevin` / `VM-0-12-ubuntu` | 腾讯云轻量 | 4 核 4GB，40GB + 100GB | `122.51.159.195` | `10.0.0.12` | PostgreSQL 16 双库和数据存储 |
 | Evolution Worker | 阿里云 ECS | 2 核 2GB，40GB | `47.119.146.111` | `172.18.239.180` | 因子研究、策略迭代、OOS 与候选验证任务 |
+| Research Worker | 腾讯云轻量 | 4 核 4GB，40GB | `124.223.225.117` | `10.0.0.15` | research 池重型因子、策略、OOS 与候选验证任务 |
 
 生产域名：
 
@@ -173,6 +178,7 @@ sudo -u postgres psql -Atqc "SELECT datname,pg_size_pretty(pg_database_size(datn
 47.119.146.111/32  # 阿里 Evolution Worker
 10.44.0.2/32        # WireGuard 应用机
 10.44.0.3/32        # WireGuard 阿里 Worker
+10.44.0.4/32        # WireGuard Research Worker
 ```
 
 禁止：
@@ -192,6 +198,8 @@ hostssl alis_sim  alis_app 10.44.0.2/32 scram-sha-256
 hostssl alis_data alis_app 10.44.0.2/32 scram-sha-256
 hostssl alis_sim  alis_app 10.44.0.3/32 scram-sha-256
 hostssl alis_data alis_app 10.44.0.3/32 scram-sha-256
+hostssl alis_sim  alis_app 10.44.0.4/32 scram-sha-256
+hostssl alis_data alis_app 10.44.0.4/32 scram-sha-256
 ```
 
 检查命令：

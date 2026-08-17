@@ -481,6 +481,7 @@ def _normalise_evolution(task: dict[str, Any], schedule: dict[str, Any]) -> dict
     return {
         "id": f"evolution:{task.get('id')}", "source": "evolution", "source_id": int(task.get("id") or 0),
         "module": module, "task_type": task_type, "name": TASK_TYPE_LABEL.get(task_type, task_type or "自治任务"),
+        "worker_pool": str(task.get("worker_pool") or "control"),
         "status": display_status, "raw_status": raw_status,
         "phase": str(task.get("phase") or ""), "progress": float(task.get("progress") or 0),
         "message": str(task.get("message") or ""), "error": _iso(task.get("error")),

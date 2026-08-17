@@ -1,0 +1,32 @@
+[Unit]
+Description=ALIS Research Compute Worker
+After=network-online.target wg-quick@wg0.service
+Wants=network-online.target wg-quick@wg0.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/alis-research-worker/backend
+EnvironmentFile=/etc/alis/research-worker.env
+Environment=PYTHONPATH=/opt/alis-research-worker/backend
+Environment=ALIS_WORKER_POOL=research
+Environment=ALIS_WORKER_PROFILE=4gb
+Environment=ALIS_V10_ENV_PARALLELISM=1
+Environment=ALIS_RESEARCH_MAX_REPLAY_SECONDS=300
+Environment=OMP_NUM_THREADS=1
+Environment=OPENBLAS_NUM_THREADS=1
+Environment=MKL_NUM_THREADS=1
+Environment=NUMEXPR_NUM_THREADS=1
+Environment=VECLIB_MAXIMUM_THREADS=1
+ExecStart=/opt/alis-research-worker/shared/app-venv/bin/python -m app.evolution_worker_main
+Restart=always
+RestartSec=10
+User=alis-research
+NoNewPrivileges=true
+PrivateTmp=true
+MemoryHigh=2600M
+MemoryMax=3200M
+MemorySwapMax=1G
+TasksMax=256
+
+[Install]
+WantedBy=multi-user.target

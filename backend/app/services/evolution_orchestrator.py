@@ -42,6 +42,9 @@ POLL_SECONDS = max(2, min(int(os.getenv("EVOLUTION_POLL_SECONDS", "5")), 60))
 AUTO_ENABLED = str(os.getenv("EVOLUTION_AUTO_ENABLED", "1")).lower() in {"1", "true", "yes", "on"}
 V10_RESEARCH_ENABLED = str(os.getenv("ALIS_V10_RESEARCH_ENABLED", "1")).lower() in {"1", "true", "yes", "on"}
 LOW_MEMORY_WORKER = str(os.getenv("ALIS_WORKER_PROFILE", "")).lower() in {"2gb", "low_memory", "low-memory"}
+WORKER_POOL = str(os.getenv("ALIS_WORKER_POOL", "control")).strip().lower() or "control"
+if WORKER_POOL not in {"control", "research"}:
+    raise RuntimeError("ALIS_WORKER_POOL must be control or research")
 WORKER_RESEARCH_BATCH_SIZE = 1 if LOW_MEMORY_WORKER else 4
 AUTO_WEEKDAY = max(0, min(int(os.getenv("EVOLUTION_AUTO_WEEKDAY", "4")), 6))
 AUTO_HOUR = max(0, min(int(os.getenv("EVOLUTION_AUTO_HOUR", "18")), 23))
@@ -90,6 +93,18 @@ LONG_RESEARCH_TASK_TYPES = frozenset({
     "model_strategy_impact_validation", "hsmm_shadow_training",
     "controller_candidate_observation",
 })
+
+
+def _default_worker_pool(task_type: str) -> str:
+    """Keep long, CPU-heavy research away from the control-plane worker."""
+    return "research" if str(task_type or "") in LONG_RESEARCH_TASK_TYPES else "control"
+
+
+def _normalise_worker_pool(value: Any, *, task_type: str = "") -> str:
+    pool = str(value or _default_worker_pool(task_type)).strip().lower()
+    if pool not in {"control", "research"}:
+        raise ValueError("worker_pool must be control or research")
+    return pool
 # Tasks that consume the current trading-day slice must prove the current
 # decision-data contract first.  Formal historical evaluations use their own
 # frozen window and must not be coupled to whether today's close has arrived.
@@ -287,7 +302,7 @@ def _row(row: Any) -> dict[str, Any]:
 
 
 _TASK_LIST_COLUMNS = (
-    "id,task_type,dedupe_key,status,phase,progress,message,error,attempt,max_attempts,priority,"
+    "id,task_type,worker_pool,dedupe_key,status,phase,progress,message,error,attempt,max_attempts,priority,"
     "stop_requested,deadline_at,lease_owner,lease_expires_at,heartbeat_at,next_run_at,"
     "started_at,finished_at,created_at,updated_at"
 )
@@ -551,9 +566,11 @@ def create_evolution_task(
     priority: int = 100,
     force: bool = False,
     coalesce_active_type: bool = False,
+    worker_pool: str | None = None,
 ) -> dict[str, Any]:
     now = _now().isoformat()
     payload = dict(payload or {})
+    resolved_worker_pool = _normalise_worker_pool(worker_pool, task_type=task_type)
     key = str(dedupe_key or f"{task_type}:{now[:10]}")
     if force:
         key = f"{key}:{uuid.uuid4().hex[:8]}"
@@ -585,13 +602,13 @@ def create_evolution_task(
             return _get_evolution_task_summary(int(existing["id"])) or {"id": int(existing["id"])}
         conn.execute(
             """INSERT INTO evolution_tasks(
-                   task_type,dedupe_key,status,phase,progress,message,payload_json,
+                   task_type,worker_pool,dedupe_key,status,phase,progress,message,payload_json,
                    checkpoint_json,result_json,error,attempt,max_attempts,priority,
                    lease_owner,lease_expires_at,heartbeat_at,next_run_at,
                    started_at,finished_at,created_at,updated_at
-               ) VALUES(?,?,'queued','queued',0,?,?,'{}','{}',NULL,0,?,?,NULL,NULL,NULL,?,NULL,NULL,?,?)""",
+               ) VALUES(?,?,?,'queued','queued',0,?,?,'{}','{}',NULL,0,?,?,NULL,NULL,NULL,?,NULL,NULL,?,?)""",
             (
-                str(task_type), key, "任务已创建，等待后台执行", _json(payload),
+                str(task_type), resolved_worker_pool, key, "任务已创建，等待后台执行", _json(payload),
                 max(1, int(max_attempts)), int(priority), now, now, now,
             ),
         )
@@ -661,6 +678,7 @@ def get_evolution_task(task_id: int, *, compact: bool = False) -> dict[str, Any]
                               ) WITH ORDINALITY AS step_data(step, step_order)
                           ), '[]'::jsonb)::text AS result_json,
                           error,attempt,max_attempts,priority,stop_requested,deadline_at,lease_owner,
+                          worker_pool,
                           lease_expires_at,heartbeat_at,next_run_at,started_at,finished_at,created_at,updated_at
                    FROM evolution_tasks WHERE id=?""",
                 (int(task_id),),
@@ -777,9 +795,11 @@ def evolution_schedule_status() -> dict[str, Any]:
         "factor_strategy_operating_model_version": "alis_factor_strategy_continuous_research_v1",
         "auto_enabled": AUTO_ENABLED,
         "worker_id": WORKER_ID,
+        "worker_pool": WORKER_POOL,
         "scheduler_tick_seconds": 300,
         "budgets": {
             "single_worker": True,
+            "worker_pools": ["control", "research"],
             "max_candidates_per_cycle": MAX_CANDIDATES_PER_CYCLE,
             "max_windows_per_candidate": MAX_WINDOWS_PER_CANDIDATE,
             "task_timeout_minutes": TASK_TIMEOUT_MINUTES,
@@ -997,7 +1017,8 @@ def _claim_next_task() -> dict[str, Any] | None:
     now = _now()
     lease_until = (now + timedelta(minutes=LEASE_MINUTES)).isoformat()
     research_clause = ""
-    claim_params: list[Any] = [now.isoformat()]
+    claim_params: list[Any] = [now.isoformat(), WORKER_POOL]
+    worker_pool_clause = "AND worker_pool=?"
     if _defer_long_research_claims(now):
         placeholders = ",".join("?" for _ in LONG_RESEARCH_TASK_TYPES)
         research_clause = f"AND task_type NOT IN ({placeholders})"
@@ -1008,6 +1029,7 @@ def _claim_next_task() -> dict[str, Any] | None:
             f"""SELECT * FROM evolution_tasks
                 WHERE status IN ('queued','retry_wait')
                   AND (next_run_at IS NULL OR next_run_at<=?)
+                  {worker_pool_clause}
                   {research_clause}
                 ORDER BY priority ASC,created_at ASC LIMIT 1{suffix}""",
             tuple(claim_params),
