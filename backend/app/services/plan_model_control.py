@@ -6942,6 +6942,17 @@ def classify_plan_model_training_failure(error: Any) -> dict[str, Any]:
         category = "data_coverage_gap"
         retryable = False
         action = "delegate_data_backfill"
+    elif "影子重放" in raw and any(value in raw for value in (
+        "缺少相邻两个权益点",
+        "缺少当日权益点",
+        "权益点无效",
+    )):
+        # A future Shadow observation needs two persisted equity points.  This
+        # is evidence not yet formed, not a training/runtime defect and must
+        # never be "repaired" by synthesising a historical return.
+        category = "shadow_equity_evidence_gap"
+        retryable = False
+        action = "wait_for_next_natural_shadow_observation"
     elif any(value in message for value in (
         "nameerror",
         "not defined",

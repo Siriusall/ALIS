@@ -461,12 +461,17 @@ def test_training_failure_classifier_separates_retry_backfill_and_code_errors():
     code = plan_model_control.classify_plan_model_training_failure(
         "NameError: _model_score is not defined"
     )
+    shadow = plan_model_control.classify_plan_model_training_failure(
+        "影子重放 2026-08-18 缺少相邻两个权益点"
+    )
 
     assert timeout["category"] == "transient_query_timeout"
     assert timeout["retryable"] is True
     assert coverage["recommended_action"] == "delegate_data_backfill"
     assert code["category"] == "code_contract_error"
     assert code["retryable"] is False
+    assert shadow["category"] == "shadow_equity_evidence_gap"
+    assert shadow["recommended_action"] == "wait_for_next_natural_shadow_observation"
 
 
 def test_training_failure_is_closed_when_existing_candidate_is_observing(monkeypatch):

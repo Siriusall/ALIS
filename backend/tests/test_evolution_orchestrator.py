@@ -962,6 +962,28 @@ def test_historical_contract_incompatibility_is_terminal_but_not_owner_incident(
     assert transition["result"]["classification"]["category"] == "historical_contract_incompatible"
 
 
+def test_shadow_equity_evidence_gap_is_not_reported_as_unknown_failure(monkeypatch):
+    task = {
+        "id": 29, "task_type": "strategy_shadow_cycle", "status": "running",
+        "stop_requested": 0, "lease_owner": evolution.WORKER_ID,
+        "attempt": 1, "max_attempts": 3,
+    }
+    transition = {}
+    monkeypatch.setattr(evolution, "get_evolution_task", lambda _task_id: task)
+    monkeypatch.setattr(
+        evolution,
+        "_update_active_task",
+        lambda task_id, **fields: transition.update({"task_id": task_id, **fields}) or True,
+    )
+
+    evolution._finish_failure(task, RuntimeError("影子重放 2026-08-18 缺少相邻两个权益点"))
+
+    assert transition["status"] == "failed"
+    assert transition["phase"] == "shadow_equity_evidence_gap"
+    assert transition["result"]["classification"]["category"] == "shadow_equity_evidence_gap"
+    assert "未知故障" not in transition["message"]
+
+
 def test_historical_contract_reconciliation_reason_is_limited_to_retired_bindings():
     assert evolution._historical_contract_incompatibility_reason({
         "task_type": "controller_candidate_observation",

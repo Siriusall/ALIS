@@ -557,6 +557,63 @@ def reconcile_historical_data_gate_waiting_tasks(*, limit: int = 200) -> dict[st
     }
 
 
+def reconcile_shadow_equity_evidence_gap_tasks(*, limit: int = 200) -> dict[str, Any]:
+    """Relabel stale Shadow point gaps without replaying historical outcomes."""
+    from app.services.plan_model_control import classify_plan_model_training_failure
+
+    now = _now().isoformat()
+    with _conn() as conn:
+        rows = conn.execute(
+            """SELECT id,task_type,phase,message,error,result_json
+                 FROM evolution_tasks
+                WHERE status='failed'
+                  AND task_type='strategy_shadow_cycle'
+                  AND COALESCE(lease_owner,'')=''
+                  AND COALESCE(phase,'')<>'shadow_equity_evidence_gap'
+                ORDER BY id ASC LIMIT ?""",
+            (max(1, min(int(limit), 500)),),
+        ).fetchall()
+        reconciled: list[int] = []
+        for row in rows:
+            task = dict(row)
+            classification = classify_plan_model_training_failure(
+                task.get("error") or task.get("message")
+            )
+            if str(classification.get("category") or "") != "shadow_equity_evidence_gap":
+                continue
+            result = _loads(task.get("result_json"), {})
+            result = result if isinstance(result, dict) else {}
+            result["classification"] = classification
+            result["shadow_evidence_reconciliation"] = {
+                "schema_version": "alis_shadow_equity_evidence_gap_v1",
+                "reason": "相邻权益点未形成；不伪造收益、不重放同日结果",
+                "reconciled_at": now,
+            }
+            cursor = conn.execute(
+                """UPDATE evolution_tasks
+                       SET phase='shadow_equity_evidence_gap',
+                           message=?,error=?,result_json=?,updated_at=?
+                     WHERE id=? AND status='failed'
+                       AND COALESCE(lease_owner,'')=''
+                       AND COALESCE(phase,'')<>'shadow_equity_evidence_gap'""",
+                (
+                    "影子权益证据未形成，保留原始缺口且等待下一自然观察周期",
+                    str(task.get("error") or "")[:2000],
+                    json.dumps(result, ensure_ascii=False, sort_keys=True),
+                    now,
+                    int(task["id"]),
+                ),
+            )
+            if int(cursor.rowcount or 0) > 0:
+                reconciled.append(int(task["id"]))
+    return {
+        "ok": True,
+        "schema_version": "alis_shadow_equity_evidence_reconciliation_v1",
+        "reconciled": reconciled,
+        "count": len(reconciled),
+    }
+
+
 def create_evolution_task(
     *,
     task_type: str = "strategy_evolution_cycle",
@@ -3114,6 +3171,10 @@ def _finish_failure(task: dict[str, Any], exc: Exception) -> None:
         str(classification.get("category") or "")
         == "historical_contract_incompatible"
     )
+    shadow_equity_evidence_gap = (
+        str(classification.get("category") or "")
+        == "shadow_equity_evidence_gap"
+    )
     if retryable and attempt < maximum:
         delay = min(900, 30 * (2 ** max(0, attempt - 1)))
         _update_active_task(
@@ -3130,12 +3191,18 @@ def _finish_failure(task: dict[str, Any], exc: Exception) -> None:
             task_id, statuses=("running",), require_not_stopped=True,
             expected_lease_owner=WORKER_ID,
             status="failed",
-            phase="historical_contract_incompatible" if historical_contract_incompatible else "failed",
+            phase=(
+                "historical_contract_incompatible" if historical_contract_incompatible
+                else "shadow_equity_evidence_gap" if shadow_equity_evidence_gap
+                else "failed"
+            ),
             progress=1.0,
             message=(
                 "历史冻结合同与当前注册表不兼容，保留证据且不再重试"
                 if historical_contract_incompatible else "超过自动重试次数"
                 if retryable else "确定性或未知故障已停止重试，等待所有者异常复核"
+                if not shadow_equity_evidence_gap else
+                "影子权益证据未形成，保留原始缺口且等待下一自然观察周期"
             ),
             error=str(exc)[:2000], result=failure_result,
             lease_owner=None, lease_expires_at=None, finished_at=_now().isoformat(),
@@ -3234,6 +3301,13 @@ def run_worker_once() -> dict[str, Any] | None:
             "quarantined %s historical data-gate waiting task(s): %s",
             historical_data_gate_reconciliation["count"],
             [item.get("id") for item in historical_data_gate_reconciliation.get("reconciled") or []],
+        )
+    shadow_evidence_reconciliation = reconcile_shadow_equity_evidence_gap_tasks()
+    if shadow_evidence_reconciliation.get("count"):
+        logger.info(
+            "relabelled %s Shadow equity-evidence gap task(s): %s",
+            shadow_evidence_reconciliation["count"],
+            shadow_evidence_reconciliation.get("reconciled") or [],
         )
     task = _claim_next_task()
     if not task:
