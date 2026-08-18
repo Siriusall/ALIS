@@ -208,7 +208,19 @@ def _conn():
         # Reuse the plan-level transaction for nested ledger/store calls.  The
         # outer owner alone commits, rolls back through connection close, and
         # releases the connection-gate slot.
-        yield active
+        try:
+            yield active
+        except BaseException:
+            # A PostgreSQL statement timeout aborts the whole transaction.
+            # Roll it back before the exception can be caught by a scheduler
+            # layer; otherwise nested store calls reuse a poisoned connection
+            # and only report the misleading ``current transaction is
+            # aborted`` error on the next query.
+            try:
+                active._conn.rollback()
+            except Exception:
+                logger.debug("nested business transaction rollback failed", exc_info=True)
+            raise
         return
     if _is_postgres():
         import psycopg
@@ -238,6 +250,16 @@ def _conn():
                 w = _ConnWrapper(raw, is_mysql=False, is_postgres=True)
                 yield w
                 w.commit()
+            except BaseException:
+                # Explicit rollback makes the failure boundary deterministic
+                # even when a caller catches a database exception outside this
+                # context.  Closing a psycopg connection also rolls back, but
+                # relying on close hid the poisoned-transaction root cause.
+                try:
+                    raw.rollback()
+                except Exception:
+                    logger.debug("business transaction rollback failed", exc_info=True)
+                raise
             finally:
                 unregister_postgres_connection(cancellation_registration)
                 if w is not None:

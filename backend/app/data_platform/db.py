@@ -729,6 +729,15 @@ def _conn():
                 conn = Connection(raw, is_postgres=True)
                 yield conn
                 raw.commit()
+            except BaseException:
+                # ``statement_timeout`` aborts the current PostgreSQL
+                # transaction.  Always rollback before the connection can be
+                # observed by a retrying scheduler or diagnostic hook.
+                try:
+                    raw.rollback()
+                except Exception:
+                    pass
+                raise
             finally:
                 unregister_postgres_connection(cancellation_registration)
                 raw.close()
