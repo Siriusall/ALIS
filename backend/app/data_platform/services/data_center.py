@@ -68,6 +68,10 @@ STK_LIMIT_MIN_STOCK_COVERAGE = max(
     0.5,
     min(float(os.getenv("TUSHARE_STK_LIMIT_MIN_STOCK_COVERAGE", "0.8") or 0.8), 1.0),
 )
+SNAPSHOT_MATERIALIZATION_TIMEOUT_MS = max(
+    60_000,
+    min(int(os.getenv("ALIS_SNAPSHOT_MATERIALIZATION_TIMEOUT_MS", "300000") or 300000), 900_000),
+)
 
 
 def set_tushare_activity_hook(hook: Callable[[dict[str, Any]], None] | None) -> None:
@@ -5482,21 +5486,36 @@ def build_stock_daily_snapshot(trade_date: str) -> dict[str, Any]:
     run_id = start_ingestion_run("data_center.stock_daily_snapshot", {"trade_date": trade_date})
     try:
         with _conn() as c:
+            # Current-session materialization transfers and validates the full
+            # market slice.  It is a bounded background batch, not an
+            # interactive request, so the global 30-second query budget can
+            # otherwise cancel an otherwise healthy cross-region transfer.
+            if bool(getattr(c, "_is_postgres", False)):
+                c.execute(
+                    "SELECT set_config('statement_timeout', ?, false)",
+                    (str(SNAPSHOT_MATERIALIZATION_TIMEOUT_MS),),
+                )
             stocks = {
                 row["ts_code"] if not isinstance(row, dict) else row["ts_code"]: _row_to_dict(row)
                 for row in c.execute("SELECT ts_code, symbol, name, industry FROM dc_stock_master").fetchall()
             }
-            daily_basic = _raw_payload_map(c, "daily_basic", trade_date, "ts_code")
-            daily = _raw_payload_map(c, "daily", trade_date, "ts_code")
-            adj_factors = _raw_payload_map(c, "adj_factor", trade_date, "ts_code")
-            limits = _raw_payload_map(c, "stk_limit", trade_date, "ts_code")
-            suspended = set(_raw_payload_map(c, "suspend_d", trade_date, "ts_code").keys())
-            source_metadata = _raw_source_metadata_map(c, trade_date)
+            raw_dependencies = _snapshot_raw_dependencies(c, trade_date)
+            daily_basic = raw_dependencies["payloads"]["daily_basic"]
+            daily = raw_dependencies["payloads"]["daily"]
+            adj_factors = raw_dependencies["payloads"]["adj_factor"]
+            limits = raw_dependencies["payloads"]["stk_limit"]
+            suspended = set(raw_dependencies["payloads"]["suspend_d"].keys())
+            source_metadata = raw_dependencies["source_metadata"]
         now = _now()
         written = 0
         stock_codes = set(stocks.keys())
         all_codes = sorted((set(daily_basic) | set(daily) | set(adj_factors) | set(limits) | suspended) & stock_codes)
         with _conn() as c:
+            if bool(getattr(c, "_is_postgres", False)):
+                c.execute(
+                    "SELECT set_config('statement_timeout', ?, false)",
+                    (str(SNAPSHOT_MATERIALIZATION_TIMEOUT_MS),),
+                )
             day_observed_times: list[str] = []
             for ts_code in all_codes:
                 info = stocks.get(ts_code, {})
@@ -5765,6 +5784,42 @@ def _raw_payload_map(c: Any, api_name: str, trade_date: str, key: str) -> dict[s
         if k:
             out[k] = payload
     return out
+
+
+def _snapshot_raw_dependencies(c: Any, trade_date: str) -> dict[str, Any]:
+    """Load each raw dependency once for current-session snapshot materialization.
+
+    The snapshot needs both payloads and observation metadata.  Loading those
+    independently doubled the cross-region transfer for every full market
+    slice, making a healthy close-data run exceed the interactive query budget.
+    """
+    target = str(trade_date or "").replace("-", "")[:8]
+    api_names = ("daily", "daily_basic", "adj_factor", "stk_limit", "suspend_d")
+    payloads: dict[str, dict[str, dict[str, Any]]] = {api_name: {} for api_name in api_names}
+    source_metadata: dict[str, list[dict[str, Any]]] = {}
+    for api_name in api_names:
+        versioned = load_current_raw_record_versions(c, api_name, target)
+        if versioned is None:
+            versioned = load_raw_record_versions(
+                c, api_name, trade_date_start=target, trade_date_end=target,
+            )
+        if not versioned:
+            continue
+        for row in versioned:
+            item = dict(row)
+            code = str(item.get("ts_code") or "").strip()
+            if not code:
+                continue
+            try:
+                payload = json.loads(item.get("payload_json") or "{}")
+            except (TypeError, json.JSONDecodeError):
+                payload = {}
+            payload_code = str(payload.get("ts_code") or code).strip()
+            if payload_code:
+                payloads[api_name][payload_code] = payload
+            item["api_name"] = api_name
+            source_metadata.setdefault(code, []).append(item)
+    return {"payloads": payloads, "source_metadata": source_metadata}
 
 
 def _raw_source_metadata_map(c: Any, trade_date: str) -> dict[str, list[dict[str, Any]]]:
