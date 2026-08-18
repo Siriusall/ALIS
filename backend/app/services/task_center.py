@@ -429,6 +429,8 @@ def _evolution_next_step(task: dict[str, Any]) -> str:
             "plan_model_autonomy": "按资源预算启动下一模型训练或等待数据",
         }.get(phase, "继续当前步骤并写入检查点")
     if status == "retry_wait":
+        if phase == "accumulating_new_strict_pit_baseline":
+            return "旧 OOS 已归档为历史参考；正在按交易日积累新的严格 PIT 基线，不重试历史补数"
         if phase == "waiting_for_historical_pit_evidence":
             return "正式历史 OOS 等待可追溯点时证据；不重试刷历史，不影响当前隔离观察"
         return "到达重试时间后从检查点恢复"

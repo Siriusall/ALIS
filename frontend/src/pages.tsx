@@ -248,7 +248,7 @@ function HomeRuntimeSummary({ data }: { data: ConsoleData }) {
     { label: "日更链路", status: dailyStatus, detail: dailyRunning ? pick(data.dailyUpdateStatus, ["message"], "正在更新") : pick(data.dailyUpdateStatus, ["latest_decision_ready_trade_date"], "等待下一个完整数据日") },
     { label: "模拟账本", status: ledgerStatus, detail: pick(data.ledgerAudit, ["reason", "summary", "checked_at"], "账本一致性审计") },
     { label: "数据资产", status: staleAssets.length ? "degraded" : watermarks.length ? "ready" : "unknown", detail: `${watermarks.length - staleAssets.length}/${watermarks.length} 项无异常标记` },
-    { label: "OOS / 密封集", status: /failed|blocked/.test(String(pick(data.oos, ["status"], ""))) ? pick(data.oos, ["status"], "unknown") : pick(data.sealed, ["status"], pick(data.oos, ["status"], "unknown")), detail: `${pick(data.oos, ["eligible_sessions"], "未记录")}/1537 · ${pick(data.sealed, ["eligible_sessions"], "未记录")}/126` },
+    { label: "OOS / 密封集", status: pick(data.oos,["legacy_reference","status"],"")==="legacy_economic_time_reference" ? "observing" : /failed|blocked/.test(String(pick(data.oos, ["status"], ""))) ? pick(data.oos, ["status"], "unknown") : pick(data.sealed, ["status"], pick(data.oos, ["status"], "unknown")), detail: pick(data.oos,["legacy_reference","status"],"")==="legacy_economic_time_reference" ? `旧证据归档 · 新 PIT ${pick(data.oos,["new_strict_baseline","eligible_sessions"],0)}/${pick(data.oos,["new_strict_baseline","required_sessions"],126)}` : `${pick(data.oos, ["eligible_sessions"], "未记录")}/1537 · ${pick(data.sealed, ["eligible_sessions"], "未记录")}/126` },
   ];
   return <>
     <Section title="运行与数据状态"><div className="health-chain overview-health-grid">{rows.map((row) => <article key={row.label}><Status>{row.status}</Status><strong>{row.label}</strong><p>{String(row.detail)}</p></article>)}</div></Section>
@@ -947,7 +947,7 @@ export function AdminOverview({ data }: { data: ConsoleData }) {
     { name: "决策硬数据", status: staleAssets.length ? "degraded" : watermarks.length ? "ready" : "unknown", detail: (watermarks.length - staleAssets.length) + "/" + watermarks.length + " 项无异常标记" },
     { name: "自治任务", status: failed.length ? "failed" : running.length ? "running" : tasks.length ? "ready" : "unknown", detail: running.length + " 运行 · " + failed.length + " 异常" },
     { name: "模拟账本", status: ledgerStatus, detail: String(pick(data.ledgerAudit, ["reason", "summary", "checked_at"], "只读一致性审计")) },
-    { name: "OOS 硬数据", status: pick(data.oos, ["status"], "unknown"), detail: pick(data.oos, ["eligible_sessions"], "未记录") + "/" + pick(data.oos, ["required_sessions"], 1537) + " 个交易日" },
+    { name: "OOS 硬数据", status: pick(data.oos,["legacy_reference","status"],"")==="legacy_economic_time_reference" ? "observing" : pick(data.oos, ["status"], "unknown"), detail: pick(data.oos,["legacy_reference","status"],"")==="legacy_economic_time_reference" ? `旧证据归档；新严格 PIT ${pick(data.oos,["new_strict_baseline","eligible_sessions"],0)}/${pick(data.oos,["new_strict_baseline","required_sessions"],126)} 个交易日` : pick(data.oos, ["eligible_sessions"], "未记录") + "/" + pick(data.oos, ["required_sessions"], 1537) + " 个交易日" },
     { name: "密封保留集", status: pick(data.sealed, ["status"], "unknown"), detail: pick(data.sealed, ["eligible_sessions"], "未记录") + "/" + pick(data.sealed, ["required_sessions"], 126) + " 个交易日" },
   ];
   return <><PageHeader eyebrow="ADMIN CONSOLE" title="系统管理后台" summary="先看系统是否活着、基础服务是否就绪，再看当前是否允许自动运行；页面保持只读。"/>

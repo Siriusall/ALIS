@@ -34,6 +34,11 @@ def classify_step_health(step: dict[str, Any]) -> dict[str, str]:
         and not bool(result.get("repair_dates"))
     ):
         return {"status": "waiting_condition", "reason": "historical_point_in_time_unavailable"}
+    if (
+        str(step.get("name") or "") == "hard_data_gate"
+        and str((result.get("legacy_reference") or {}).get("status") or "") == "legacy_economic_time_reference"
+    ):
+        return {"status": "waiting_condition", "reason": "legacy_oos_reference_accumulating_new_pit"}
     if step.get("error") or not bool(step.get("ok", True)):
         return {"status": "failed", "reason": str(step.get("error") or "module_returned_not_ok")}
     failure_category = str(

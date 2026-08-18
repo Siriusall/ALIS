@@ -1834,9 +1834,10 @@ def _persist_candidate_result(target: dict[str, Any], result: dict[str, Any]) ->
 
 def _oos_hard_data_block(task: dict[str, Any], audit: dict[str, Any]) -> dict[str, Any]:
     """Return the common fail-closed result for a frozen-history consumer."""
+    legacy = str((audit.get("legacy_reference") or {}).get("status") or "") == "legacy_economic_time_reference"
     return {
-        "status": "blocked_by_oos_hard_data",
-        "reason": "permanent_oos_hard_data_not_ready",
+        "status": "blocked_by_legacy_oos_reference" if legacy else "blocked_by_oos_hard_data",
+        "reason": "legacy_pit_evidence_retired_accumulating_new_baseline" if legacy else "permanent_oos_hard_data_not_ready",
         "hard_data_audit": audit,
         "scope": (
             "formal_oos"
@@ -2751,6 +2752,7 @@ def _defer_for_oos_hard_data(task: dict[str, Any], result: dict[str, Any]) -> bo
     """Keep formal OOS evidence pending while an external hard-data gate blocks it."""
     now = _now()
     audit = result.get("hard_data_audit") if isinstance(result.get("hard_data_audit"), dict) else {}
+    legacy_reference = str((audit.get("legacy_reference") or {}).get("status") or "") == "legacy_economic_time_reference"
     non_repairable = list(audit.get("non_repairable_dates") or [])
     historical_evidence_wait = bool(non_repairable) and not bool(audit.get("repair_dates"))
     return _update_active_task(
@@ -2760,10 +2762,12 @@ def _defer_for_oos_hard_data(task: dict[str, Any], result: dict[str, Any]) -> bo
         expected_lease_owner=WORKER_ID,
         status="retry_wait",
         phase=(
-            "waiting_for_historical_pit_evidence"
+            "accumulating_new_strict_pit_baseline" if legacy_reference else "waiting_for_historical_pit_evidence"
             if historical_evidence_wait else "waiting_for_oos_hard_data"
         ),
         message=(
+            "旧 OOS 已归档为经济时间参考；不重试历史补数，按交易日积累新的严格 PIT 基线"
+            if legacy_reference else
             "正式 OOS 永久硬数据未就绪，保留检查点等待数据合同变化"
             if not non_repairable
             else "正式 OOS 被历史点时不可用数据阻断，保留检查点等待外部可验证修复"
@@ -2774,7 +2778,7 @@ def _defer_for_oos_hard_data(task: dict[str, Any], result: dict[str, Any]) -> bo
         next_run_at=(now + timedelta(
             seconds=(
                 HISTORICAL_PIT_EVIDENCE_RECHECK_SECONDS
-                if historical_evidence_wait else DECISION_DATA_RETRY_SECONDS
+                if (historical_evidence_wait or legacy_reference) else DECISION_DATA_RETRY_SECONDS
             )
         )).isoformat(),
         lease_owner=None,
@@ -3145,7 +3149,7 @@ def _run_claimed_task(task: dict[str, Any]) -> dict[str, Any]:
         if str(result.get("status") or "") == "blocked_by_decision_data":
             _defer_for_decision_data(task, result)
             return get_evolution_task(task_id) or task
-        if str(result.get("status") or "") == "blocked_by_oos_hard_data":
+        if str(result.get("status") or "") in {"blocked_by_oos_hard_data", "blocked_by_legacy_oos_reference"}:
             _defer_for_oos_hard_data(task, result)
             return get_evolution_task(task_id) or task
         if str(result.get("status") or "") == "blocked_incomplete_factor_bindings":

@@ -24,6 +24,9 @@ MINIMUM_HARD_API_ROWS = 500
 MINIMUM_MARKET_FIELD_RATIO = 0.80
 PENDING_TRADE_DAY_BUFFER = 30
 MAX_COMPACT_NON_REPAIRABLE_DATE_SAMPLES = 20
+# A visible progress target for the post-observation-clock evidence run.  It
+# is not an alternative to the full formal OOS requirement below.
+NEW_STRICT_BASELINE_SESSIONS = 126
 HARD_APIS = ("daily", "daily_basic", "stk_limit", "adj_factor")
 BENCHMARK_INDEX_CODE = "000300.SH"
 BENCHMARK_API_KEY = f"index_daily:{BENCHMARK_INDEX_CODE}"
@@ -764,6 +767,11 @@ def _calendar_not_ready_audit(exc: TradeCalendarNotReady) -> dict[str, Any]:
         "repair_dates": [],
         "non_repairable_dates": [],
         "non_repairable_sessions": 0,
+        "legacy_reference": {"status": "not_assessed"},
+        "new_strict_baseline": {
+            "status": "unavailable", "eligible_sessions": 0,
+            "required_sessions": NEW_STRICT_BASELINE_SESSIONS,
+        },
         "trailing_pending_dates": [],
         "observation_evidence": {
             "required": True,
@@ -772,6 +780,28 @@ def _calendar_not_ready_audit(exc: TradeCalendarNotReady) -> dict[str, Any]:
             "missing_reason": exc.code,
         },
         "generated_at": datetime.now().isoformat(timespec="seconds"),
+    }
+
+
+def _new_strict_baseline(details: list[dict[str, Any]]) -> dict[str, Any]:
+    """Describe consecutive current PIT evidence without relaxing formal OOS."""
+    contiguous: list[str] = []
+    for item in reversed(details):
+        if not bool(item.get("eligible")):
+            break
+        contiguous.append(str(item.get("trade_date") or ""))
+    contiguous.reverse()
+    observed = len(contiguous)
+    return {
+        "status": "ready_for_initial_frozen_research" if observed >= NEW_STRICT_BASELINE_SESSIONS else "accumulating",
+        "eligible_sessions": observed,
+        "required_sessions": NEW_STRICT_BASELINE_SESSIONS,
+        "coverage": round(min(1.0, observed / NEW_STRICT_BASELINE_SESSIONS), 6),
+        "window_start": contiguous[0] if contiguous else "",
+        "window_end": contiguous[-1] if contiguous else "",
+        "promotion_authorized": False,
+        "formal_oos_required_sessions": REQUIRED_SESSIONS,
+        "note": "仅用于新严格 PIT 证据积累；不替代正式五窗口 OOS 或 Champion 晋升门",
     }
 
 
@@ -941,6 +971,16 @@ def audit_oos_hard_data(*, end_date: str | None = None, include_dates: bool = Tr
     )
     calendar_missing = max(0, REQUIRED_SESSIONS - len(required_dates))
     coverage = len(eligible_dates) / REQUIRED_SESSIONS
+    baseline = _new_strict_baseline(details)
+    legacy_reasons = {
+        "historical_observation_evidence_missing",
+        "historical_point_in_time_unavailable",
+        "historical_snapshot_materialized_after_cutoff",
+    }
+    legacy_reference_mode = bool(all_non_repairable_dates) and not repair_dates and all(
+        bool(set(item.get("reasons") or []) & legacy_reasons)
+        for item in details if not item["eligible"]
+    )
     result = {
         "ok": len(eligible_dates) >= REQUIRED_SESSIONS,
         "audit_completed": True,
@@ -965,6 +1005,16 @@ def audit_oos_hard_data(*, end_date: str | None = None, include_dates: bool = Tr
         "non_repairable_sessions": len(all_non_repairable_dates),
         "non_repairable_dates_truncated": len(non_repairable_dates) < len(all_non_repairable_dates),
         "trailing_pending_dates": list(reversed(trailing_pending_dates)),
+        "legacy_reference": {
+            "status": "legacy_economic_time_reference" if legacy_reference_mode else "not_activated",
+            "strict_pit_recovery": "external_immutable_evidence_only" if legacy_reference_mode else "not_applicable",
+            "repair_loop_disabled": legacy_reference_mode,
+            "note": (
+                "旧窗口缺少可验证的不可变观测证据，仅保留经济时间诊断价值；不得重抓后追认为历史 PIT。"
+                if legacy_reference_mode else ""
+            ),
+        },
+        "new_strict_baseline": baseline,
         "generated_at": datetime.now().isoformat(timespec="seconds"),
     }
     if include_dates:

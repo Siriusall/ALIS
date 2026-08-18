@@ -605,6 +605,19 @@ def test_default_audit_keeps_elapsed_historical_evidence_gaps_visible(monkeypatc
     assert result["non_repairable_dates"] == dates
 
 
+def test_new_strict_baseline_is_progress_only_and_never_promotion_authorized():
+    details = [
+        {"trade_date": "20260814", "eligible": True},
+        {"trade_date": "20260817", "eligible": True},
+        {"trade_date": "20260818", "eligible": False},
+    ]
+    result = oos_hard_data._new_strict_baseline(details)
+    assert result["eligible_sessions"] == 0
+    assert result["required_sessions"] == 126
+    assert result["promotion_authorized"] is False
+    assert result["formal_oos_required_sessions"] == oos_hard_data.REQUIRED_SESSIONS
+
+
 def test_compact_audit_returns_nonrepairable_count_with_bounded_date_samples(monkeypatch):
     dates = ["20200102", "20200103", "20200106"]
 
