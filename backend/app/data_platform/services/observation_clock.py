@@ -404,6 +404,61 @@ def load_raw_record_versions(
     return [dict(row) for row in c.execute(sql, tuple(params)).fetchall()]
 
 
+def load_current_raw_record_versions(
+    c: Any,
+    api_name: str,
+    trade_date: str,
+) -> list[dict[str, Any]] | None:
+    """Load an accepted current projection joined to its immutable version.
+
+    Daily snapshot materialization already has an exact accepted projection for
+    the requested session.  Re-running the general PIT reader there performs a
+    window rank and correlated projection checks for every market API.  This
+    direct join retains the immutable-evidence requirement while letting the
+    database use the projection and version keys directly.
+
+    There is deliberately no cutoff argument: historical replay and OOS keep
+    using ``load_raw_record_versions`` and their per-date PIT clocks.
+    """
+    projection_columns = _table_columns(c, "dc_tushare_raw_records")
+    version_columns = _table_columns(c, "dc_tushare_raw_record_version")
+    required_projection = {"api_name", "record_key", "trade_date", "content_hash"}
+    required_version = {
+        "api_name", "record_key", "ts_code", "trade_date", "period",
+        "ann_date", "payload_json", "source_code", "economic_available_time",
+        "observed_at", "first_observed_at", "observation_provenance",
+        "content_hash", "created_at", "id",
+    }
+    if not required_projection.issubset(projection_columns) or not required_version.issubset(version_columns):
+        return None
+    is_postgres = bool(getattr(c, "_is_postgres", False))
+    predicates = [
+        "p.api_name=?",
+        "p.trade_date=?",
+        "NULLIF(TRIM(COALESCE(p.content_hash,'')),'') IS NOT NULL",
+        "NULLIF(TRIM(COALESCE(v.source_code,'')),'') IS NOT NULL",
+        _valid_provenance_sql("v.observation_provenance"),
+        _explicit_timestamp_sql("v.observed_at", is_postgres=is_postgres),
+        _explicit_timestamp_sql("v.first_observed_at", is_postgres=is_postgres),
+        _explicit_timestamp_sql("v.economic_available_time", is_postgres=is_postgres),
+        _explicit_timestamp_sql("v.created_at", is_postgres=is_postgres),
+    ]
+    sql = f"""
+        SELECT v.id,v.api_name,v.record_key,v.ts_code,v.trade_date,
+               v.period,v.ann_date,v.payload_json,v.source_code,
+               v.economic_available_time,v.observed_at,v.first_observed_at,
+               v.observation_provenance,v.content_hash,v.created_at
+          FROM dc_tushare_raw_records p
+          JOIN dc_tushare_raw_record_version v
+            ON v.api_name=p.api_name
+           AND v.record_key=p.record_key
+           AND v.content_hash=p.content_hash
+         WHERE {' AND '.join(predicates)}
+         ORDER BY v.observed_at,v.id
+    """
+    return [dict(row) for row in c.execute(sql, (str(api_name), str(trade_date))).fetchall()]
+
+
 def load_snapshot_versions(
     c: Any,
     *,

@@ -31,6 +31,7 @@ from app.data_platform.services.observation_clock import (
     append_raw_record_version,
     append_snapshot_version,
     economic_available_time,
+    load_current_raw_record_versions,
     load_raw_record_versions,
     observation_metadata,
     payload_content_hash,
@@ -5734,11 +5735,12 @@ def _append_decision_core_snapshot_version(
 
 
 def _raw_payload_map(c: Any, api_name: str, trade_date: str, key: str) -> dict[str, dict[str, Any]]:
-    versioned = load_raw_record_versions(
-        c, api_name,
-        trade_date_start=str(trade_date or "").replace("-", "")[:8],
-        trade_date_end=str(trade_date or "").replace("-", "")[:8],
-    )
+    target = str(trade_date or "").replace("-", "")[:8]
+    versioned = load_current_raw_record_versions(c, api_name, target)
+    if versioned is None:
+        versioned = load_raw_record_versions(
+            c, api_name, trade_date_start=target, trade_date_end=target,
+        )
     if versioned:
         rows = versioned
     elif versioned is None and not bool(getattr(c, "_is_postgres", False)):
@@ -5770,9 +5772,11 @@ def _raw_source_metadata_map(c: Any, trade_date: str) -> dict[str, list[dict[str
     target = str(trade_date or "").replace("-", "")[:8]
     result: dict[str, list[dict[str, Any]]] = {}
     for api_name in ("daily", "daily_basic", "adj_factor", "stk_limit", "suspend_d"):
-        versioned = load_raw_record_versions(
-            c, api_name, trade_date_start=target, trade_date_end=target,
-        )
+        versioned = load_current_raw_record_versions(c, api_name, target)
+        if versioned is None:
+            versioned = load_raw_record_versions(
+                c, api_name, trade_date_start=target, trade_date_end=target,
+            )
         if (versioned is None or not versioned) and not bool(getattr(c, "_is_postgres", False)):
             try:
                 rows = c.execute(

@@ -4,6 +4,7 @@ import json
 import sqlite3
 
 from app.data_platform.services.observation_clock import (
+    load_current_raw_record_versions,
     load_raw_record_versions,
     load_snapshot_market_aggregates,
     load_snapshot_versions,
@@ -288,6 +289,30 @@ def test_raw_loader_blocks_when_accepted_version_is_after_cutoff():
     assert load_raw_record_versions(
         connection, "daily", cutoff="2026-08-14T15:01:00+08:00",
     ) == []
+
+
+def test_current_projection_loader_requires_its_immutable_version():
+    connection = _connection_with_accepted_projections()
+    connection.execute("ALTER TABLE dc_tushare_raw_records ADD COLUMN trade_date TEXT NOT NULL DEFAULT ''")
+    observed = "2026-08-14T15:02:00+08:00"
+    connection.execute(
+        """INSERT INTO dc_tushare_raw_record_version
+           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (1, "daily", "daily:000001.SZ:20260814", "000001.SZ", "20260814", "", "",
+         json.dumps({"ts_code": "000001.SZ", "close": 10}), "tencent_market_snapshot",
+         observed, observed, observed, "tencent_market_snapshot:validated", "accepted", observed),
+    )
+    connection.execute(
+        """INSERT INTO dc_tushare_raw_records(api_name,record_key,content_hash,trade_date)
+           VALUES(?,?,?,?)""",
+        ("daily", "daily:000001.SZ:20260814", "accepted", "20260814"),
+    )
+
+    rows = load_current_raw_record_versions(connection, "daily", "20260814")
+
+    assert [(row["ts_code"], row["content_hash"]) for row in rows or []] == [
+        ("000001.SZ", "accepted"),
+    ]
 
 
 def test_snapshot_loader_keeps_accepted_projection_and_blocks_late_acceptance():

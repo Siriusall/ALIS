@@ -200,3 +200,36 @@ def test_daily_update_calendar_auth_failure_is_bounded(monkeypatch):
     assert state["phase"] == "failed"
     assert state["failure_category"] == "authentication"
     assert state["retry_after_seconds"] == 86400
+
+
+def test_daily_update_statement_timeout_is_bounded(monkeypatch):
+    class _Result:
+        def fetchone(self):
+            return {"cnt": 100}
+
+    class _Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, _sql, _params=()):
+            return _Result()
+
+    state = {}
+    monkeypatch.setattr(daily_update, "_conn", lambda: _Connection())
+    monkeypatch.setattr(daily_update, "_state", state)
+    monkeypatch.setattr(daily_update, "ensure_data_center_seeded", lambda: None)
+    monkeypatch.setattr(daily_update, "sync_trade_calendar", lambda *_args, **_kwargs: {"ok": True})
+    monkeypatch.setattr(
+        daily_update,
+        "_latest_trade_date",
+        lambda: (_ for _ in ()).throw(RuntimeError("canceling statement due to statement timeout")),
+    )
+
+    daily_update._worker(124)
+
+    assert state["phase"] == "failed"
+    assert state["failure_category"] == "transient"
+    assert state["retry_after_seconds"] == 600

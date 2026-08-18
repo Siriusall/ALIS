@@ -652,6 +652,14 @@ def _worker(parent_run_id: int) -> None:
         final_status, error = "failed", str(exc)[:1000]
         failure_category = str(getattr(exc, "category", "internal_fault"))
         retry_after_seconds = int(getattr(exc, "retry_after_seconds", 0) or 0)
+        if failure_category == "internal_fault" and retry_after_seconds <= 0:
+            classified = classify_tushare_error(exc)
+            if classified != "unknown":
+                failure_category = classified
+            retry_after_seconds = (
+                600 if classified in {"transient", "rate_limit", "upstream_not_ready", "empty_pending"}
+                else _DAILY_UPDATE_INTERNAL_FAULT_COOLDOWN_SEC
+            )
         _set_state(running=False, phase="failed", message=f"更新失败：{error}", error=error,
                    failure_category=failure_category, retry_after_seconds=retry_after_seconds,
                    finished_at=_now(), steps=steps)
