@@ -45,8 +45,8 @@ set -euo pipefail
 sha256sum '$remote_archive' | awk '{print \$1}' | grep -Fx '$sha'
 id -u alis-research >/dev/null 2>&1 || sudo useradd --system --home-dir /opt/alis-research-worker --shell /usr/sbin/nologin alis-research
 sudo install -d -o alis-research -g alis-research -m 750 '$release_root' /opt/alis-research-worker/shared /opt/alis-research-worker/shared/runtime-cache /etc/alis
-if [ ! -x /opt/alis-research-worker/shared/app-venv/bin/python ]; then
-  sudo python3 -m venv /opt/alis-research-worker/shared/app-venv
+if [ ! -x /opt/alis-research-worker/shared/app-venv/bin/python ] || [ ! -x /opt/alis-research-worker/shared/app-venv/bin/pip ]; then
+  sudo python3 -m venv --clear /opt/alis-research-worker/shared/app-venv
 fi
 sudo mkdir -p '$release_root'
 sudo test ! -e '$release'
