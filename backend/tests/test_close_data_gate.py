@@ -1,5 +1,14 @@
 from app.services import quant_task_runner
 from app.services.quant_task_runner import _execution_slice_ready, _market_slice_ready
+
+
+def test_scheduler_poll_timeout_is_retryable_wait_not_component_failure():
+    assert quant_task_runner._is_expected_scheduler_wait(
+        RuntimeError("canceling statement due to statement timeout")
+    ) is True
+    assert quant_task_runner._is_expected_scheduler_wait(
+        RuntimeError("unexpected contract corruption")
+    ) is False
 from datetime import datetime, timezone
 
 

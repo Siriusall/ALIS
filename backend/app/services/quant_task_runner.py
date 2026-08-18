@@ -94,6 +94,16 @@ def _wait_for_auto_simulation_retry(
     (wait_fn or threading.Event().wait)(_AUTO_SIMULATION_INTERVAL_SEC)
 
 
+def _is_expected_scheduler_wait(exc: BaseException) -> bool:
+    """Classify bounded close-data polling failures as a retryable wait."""
+    message = str(exc or "").lower()
+    return any(marker in message for marker in (
+        "statement timeout", "querycanceled", "query canceled",
+        "current transaction is aborted", "connection timeout",
+        "connection timeout expired",
+    ))
+
+
 def _trade_date_key(value: object) -> str:
     """Normalize supported trade-date representations for identity checks."""
     normalized = str(value or "").strip().replace("-", "")[:8]
@@ -800,8 +810,12 @@ def start_auto_simulation_scheduler() -> bool:
                                 run_quant_task_async(int(task["id"]))
                 beat("auto_simulation_scheduler")
             except Exception as exc:  # noqa: BLE001
-                logger.warning("自动模拟调度检查失败: %s", str(exc)[:200])
-                beat("auto_simulation_scheduler", error=str(exc))
+                if _is_expected_scheduler_wait(exc):
+                    logger.warning("自动模拟调度暂缓本轮数据探测，将在下一周期重试: %s", str(exc)[:200])
+                    beat("auto_simulation_scheduler")
+                else:
+                    logger.warning("自动模拟调度检查失败: %s", str(exc)[:200])
+                    beat("auto_simulation_scheduler", error=str(exc))
             threading.Event().wait(_AUTO_SIMULATION_INTERVAL_SEC)
 
     scheduler_thread = threading.Thread(target=_loop, name="quant-auto-simulation", daemon=True)

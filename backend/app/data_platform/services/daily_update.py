@@ -33,6 +33,16 @@ from app.core.error_evidence import error_evidence
 _lock = threading.Lock()
 _state: dict[str, Any] = {"running": False, "phase": "idle", "message": "等待更新"}
 _scheduler_lock = threading.Lock()
+
+
+def _is_expected_scheduler_wait(exc: BaseException) -> bool:
+    """Treat bounded polling timeout/aborted-transaction as a retry wait."""
+    message = str(exc or "").lower()
+    return any(marker in message for marker in (
+        "statement timeout", "querycanceled", "query canceled",
+        "current transaction is aborted", "connection timeout",
+        "connection timeout expired",
+    ))
 _scheduler_started = False
 _DAILY_UPDATE_ENABLED = str(os.getenv("ALIS_DAILY_UPDATE_ENABLED", "1")).strip().lower() in {"1", "true", "yes", "on"}
 _DAILY_UPDATE_INTERVAL_SEC = max(60, min(int(os.getenv("ALIS_DAILY_UPDATE_INTERVAL_SEC", "60")), 3600))
@@ -827,8 +837,19 @@ def start_daily_update_scheduler() -> bool:
                 logger.warning("自动收盘日更因交易日历未就绪而阻断: %s", exc)
                 beat("daily_update_scheduler", error=str(exc))
             except Exception as exc:  # noqa: BLE001
-                logger.warning("自动收盘日更检查失败: %s", str(exc)[:300])
-                beat("daily_update_scheduler", error=str(exc))
+                if _is_expected_scheduler_wait(exc):
+                    _set_state(
+                        running=False,
+                        phase="waiting_data_probe",
+                        message="收盘数据探测超时，已丢弃本次连接并等待下一周期重试",
+                        error=str(exc)[:300],
+                        failure_category="transient_database_poll_timeout",
+                    )
+                    logger.warning("自动收盘日更暂缓本轮探测，将在下一周期重试: %s", str(exc)[:300])
+                    beat("daily_update_scheduler")
+                else:
+                    logger.warning("自动收盘日更检查失败: %s", str(exc)[:300])
+                    beat("daily_update_scheduler", error=str(exc))
             _set_state(next_scheduler_check_at=(_business_now() + timedelta(seconds=_DAILY_UPDATE_INTERVAL_SEC)).isoformat(timespec="seconds"))
             threading.Event().wait(_DAILY_UPDATE_INTERVAL_SEC)
 
