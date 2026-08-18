@@ -5,6 +5,10 @@
 > 范围：投资研究、策略、组合、模拟交易和复盘；不包含实盘接入、自动备份与服务器运维。  
 > 本文正文给出当前真实状态；附录保留 2026-07-19 详细设计，所有变更均标注而不直接抹除。
 
+> 最新审计记录（2026-08-18）：严格 PIT OOS 审计仍为 `0/1537 blocked_by_oos_hard_data`，原因不是数据底表被删除，也不是 research Worker 故障，而是 `data_0011_pit_observation_clock` 启用后要求不可变历史观测证据。生产两张版本表均为 0 行；本机版本表仅覆盖 `20260814` 一天（原始 22,121 行、快照 16,572 行），另有一条 `20990102` 异常日期，均不足以恢复历史窗口。旧原始/快照数据的观测字段仍为空或 `legacy_unknown`，不能把当前重抓时间回写为历史 T15 证据。数据库机只读检查确认无 ALIS 导出、快照或 WAL 归档（`archive_mode=off`）。因此不执行伪造回填、不放宽正式 PIT 门；保留 OOS 明确阻断，下一步先将旧结果标识为 legacy economic-time 参考，再从观察时钟切换后的新数据自然积累正式证据，或在发现外部可信快照后做只追加导入和重新审计。
+
+> 最近完成记录（2026-08-18）：修复 TuShare 凭证失效时交易日历每分钟重复失败、导致日更无法进入行情阶段的问题。`backend/app/data_platform/services/data_center.py` 为日更增加严格的 `daily` 精确日期多源探针 fallback：只有当天已有确切收盘行情且日历没有冲突时，才追加当天开市记录，并保留 `market_observation:<provider>` 来源；已有节假日记录、探针未发布、缺少上一交易日或探针异常均继续失败。`backend/app/data_platform/services/daily_update.py` 将认证/权限/非法参数/未知错误设置为 24 小时有界冷却，其他上游异常设置为 10 分钟冷却，避免无限重试。历史补数和 OOS 调用默认关闭该 fallback，不能把一条今日行情证据误报为历史日历区间完成。新增 fallback、冲突、探针失败、历史调用隔离和日更认证失败回归；全量后端测试 `1336 passed、1 skipped、2 warnings、6 subtests passed`。本修复不修改 OOS PIT 证据、账户、持仓、成交、账本、冻结计划、Champion 或模型权限。
+
 > 最近完成记录（2026-08-18）：完成四机研究计算分流并发布控制面。`evolution_tasks` 新增 `worker_pool` 及 `sim_0008_worker_pools`，重型因子、策略、OOS 和候选验证任务默认进入 `research` 池，旧阿里 Worker 保持 `control` 池，新腾讯 `124.223.225.117` 只运行独立 `alis-research-worker.service`，初始并发固定为1，不承载 API、调度器、Redis、模拟交易、账本或数据库备份。定向 Worker 路由测试 `3 passed`、四组相关回归 `82 passed`；应用机已发布 `a26aeb8`，数据库迁移和系统发布治理完成，应用/旧 Worker 均 active，`/api/ready=true`。新机已切换数据库公网 WireGuard 端点 `122.51.159.195:51820`，双库 TLS `SELECT 1`、`alis-research-worker.service active`、`NRestarts=0` 和 `pool=research` 均验收通过。
 
 > 最近完成记录（2026-08-17）：修复线上 PostgreSQL qmark 适配器把 SQL 百分号字面量误识别为占位符的问题。根因为业务 SQL 使用 `LIKE '%transmission_direction=%'`，旧 `sql.replace("?", "%s")` 交给 psycopg 后触发 `only '%s', '%b', '%t' are allowed as placeholders`，正式调仓生成器因此失败并重复重试。新增 `backend/app/core/sql_compat.py` 做词法安全转换，两个数据库连接包装器统一使用；行业事件查询改为参数化 `LIKE ?`。基于线上 `30ff763` 构建最小制品 `98471ab`，仅发布该修复到腾讯 API 与阿里 Worker，未带入其他本地改动。发布后双机服务 active，`/api/health`、`/api/live`、`/api/ready` 均通过，双库只读百分号 SQL 实测通过，发布治理任务完成；发布后日志未再出现该占位符错误。未修改账户、持仓、账本、成交、冻结计划、Champion 或模型权限。

@@ -763,7 +763,13 @@ def _upsert_stock_master(df: pd.DataFrame) -> int:
     return written
 
 
-def sync_trade_calendar(start_date: str | None = None, end_date: str | None = None, exchange: str = "SSE") -> dict[str, Any]:
+def sync_trade_calendar(
+    start_date: str | None = None,
+    end_date: str | None = None,
+    exchange: str = "SSE",
+    *,
+    allow_market_observation_fallback: bool = False,
+) -> dict[str, Any]:
     ensure_data_center_seeded()
     if not start_date or not end_date:
         start_date, end_date = _recent_calendar_window()
@@ -793,10 +799,150 @@ def sync_trade_calendar(start_date: str | None = None, end_date: str | None = No
     except Exception as exc:  # noqa: BLE001
         finish_ingestion_run(run_id, status="failed", rows_read=0, rows_written=0, error=str(exc))
         _record_probe("trade_cal", "failed", 0, str(exc))
+        # The calendar is normally sourced from TuShare, but a credential or
+        # endpoint outage must not block today's close-data path when a
+        # verified market provider has already published the exact session.
+        # The fallback only adds the current date after an exact daily probe;
+        # it never guesses weekdays, rewrites prior sessions, or relaxes the
+        # historical PIT contract.
+        fallback = (
+            _fallback_trade_calendar_from_market_observation(
+                start_date=start_date,
+                end_date=end_date,
+                exchange=exchange,
+                upstream_error=exc,
+            )
+            if allow_market_observation_fallback
+            else {"ok": False, "status": "fallback_disabled_for_historical_sync"}
+        )
+        if fallback.get("ok"):
+            return {
+                "ok": True,
+                "run_id": run_id,
+                "exchange": exchange,
+                "start_date": start_date,
+                "end_date": end_date,
+                "rows_read": int(fallback.get("rows_read") or 0),
+                "rows_written": int(fallback.get("rows_written") or 0),
+                "status": str(fallback.get("status") or "fallback_market_observation"),
+                "warning": str(exc)[:500],
+                "failure_category": classify_tushare_error(exc),
+                "fallback": fallback,
+            }
         raise
 
 
-def _upsert_trade_calendar(df: pd.DataFrame) -> int:
+def _fallback_trade_calendar_from_market_observation(
+    *,
+    start_date: str,
+    end_date: str,
+    exchange: str,
+    upstream_error: Exception,
+) -> dict[str, Any]:
+    """Recover only an exact current session from an already published close.
+
+    A market close for the exact date is stronger evidence than a weekday
+    guess, while still being deliberately narrower than a calendar import.
+    Existing rows are never overwritten and a missing previous open session
+    keeps the fallback fail-closed.
+    """
+    today = _now()[:10].replace("-", "")
+    if today < str(start_date or "") or today > str(end_date or ""):
+        return {"ok": False, "status": "fallback_out_of_requested_range", "trade_date": today}
+    try:
+        from app.data_platform.services.market_data_discovery import discover_first_published
+
+        discovery = discover_first_published("daily", today)
+    except Exception as exc:  # noqa: BLE001 - preserve the original auth failure
+        return {
+            "ok": False,
+            "status": "fallback_probe_failed",
+            "trade_date": today,
+            "error": str(exc)[:500],
+            "upstream_error": str(upstream_error)[:500],
+        }
+    if not bool(discovery.get("ok")):
+        return {
+            "ok": False,
+            "status": "fallback_market_not_published",
+            "trade_date": today,
+            "discovery": discovery,
+            "upstream_error": str(upstream_error)[:500],
+        }
+    winner = str(discovery.get("winner") or "").strip()
+    if not winner:
+        return {
+            "ok": False,
+            "status": "fallback_missing_provider",
+            "trade_date": today,
+            "discovery": discovery,
+            "upstream_error": str(upstream_error)[:500],
+        }
+    with _conn() as c:
+        existing = c.execute(
+            "SELECT is_open,source_code FROM dc_trade_calendar WHERE exchange=? AND cal_date=? LIMIT 1",
+            (exchange, today),
+        ).fetchone()
+        previous = c.execute(
+            "SELECT MAX(cal_date) value FROM dc_trade_calendar WHERE exchange=? AND is_open=1 AND cal_date<?",
+            (exchange, today),
+        ).fetchone()
+    if existing is not None:
+        current = dict(existing)
+        if int(current.get("is_open") or 0) == 1:
+            return {
+                "ok": True,
+                "status": "existing_calendar_row_after_tushare_failure",
+                "trade_date": today,
+                "rows_read": 1,
+                "rows_written": 0,
+                "provider": winner,
+                "discovery": discovery,
+                "source_code": str(current.get("source_code") or ""),
+            }
+        # A published exact close conflicts with a pre-existing holiday row;
+        # never overwrite the calendar automatically.
+        return {
+            "ok": False,
+            "status": "calendar_provider_conflict",
+            "trade_date": today,
+            "provider": winner,
+            "existing_is_open": int(current.get("is_open") or 0),
+            "discovery": discovery,
+            "upstream_error": str(upstream_error)[:500],
+        }
+    previous_date = str(dict(previous or {}).get("value") or "")
+    if not previous_date:
+        return {
+            "ok": False,
+            "status": "fallback_missing_previous_session",
+            "trade_date": today,
+            "provider": winner,
+            "discovery": discovery,
+            "upstream_error": str(upstream_error)[:500],
+        }
+    frame = pd.DataFrame([{
+        "exchange": exchange,
+        "cal_date": today,
+        "is_open": 1,
+        "pretrade_date": previous_date,
+    }])
+    source_code = f"market_observation:{winner}"
+    written = _upsert_trade_calendar(frame, source_code=source_code)
+    return {
+        "ok": written > 0,
+        "status": "fallback_market_observation" if written > 0 else "fallback_write_empty",
+        "trade_date": today,
+        "provider": winner,
+        "discovery": discovery,
+        "rows_read": 1,
+        "rows_written": written,
+        "source_code": source_code,
+        "upstream_error": str(upstream_error)[:500],
+    }
+
+
+def _upsert_trade_calendar(df: pd.DataFrame, *, source_code: str = SOURCE_TUSHARE) -> int:
     if not isinstance(df, pd.DataFrame) or df.empty:
         return 0
     now = _now()
@@ -808,7 +954,7 @@ def _upsert_trade_calendar(df: pd.DataFrame) -> int:
                 str(row.get("cal_date") or "").strip(),
                 int(row.get("is_open") or 0),
                 str(row.get("pretrade_date") or "").strip(),
-                SOURCE_TUSHARE,
+                str(source_code or SOURCE_TUSHARE),
                 now,
                 now,
             )

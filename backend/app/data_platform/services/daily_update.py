@@ -10,6 +10,7 @@ from zoneinfo import ZoneInfo
 
 from app.data_platform.db import _conn
 from app.data_platform.services.data_center import (
+    classify_tushare_error,
     enrich_financial_research_fields,
     ensure_data_center_seeded,
     financial_research_completeness,
@@ -402,7 +403,21 @@ def _worker(parent_run_id: int) -> None:
         today = _business_now().date()
         start = (today - timedelta(days=35)).strftime("%Y%m%d")
         end = (today + timedelta(days=7)).strftime("%Y%m%d")
-        steps.append({"step": "trade_calendar", "result": sync_trade_calendar(start, end)})
+        try:
+            calendar_result = sync_trade_calendar(
+                start,
+                end,
+                allow_market_observation_fallback=True,
+            )
+        except Exception as exc:  # noqa: BLE001 - calendar failures need bounded retry semantics
+            category = classify_tushare_error(exc)
+            retry_after = 86400 if category in {"authentication", "permission", "invalid_request", "unknown"} else 600
+            raise DailyUpdateDataBlocked(
+                f"交易日历同步失败（{category}）：{str(exc)[:300]}",
+                category=category or "calendar_sync_failed",
+                retry_after_seconds=retry_after,
+            ) from exc
+        steps.append({"step": "trade_calendar", "result": calendar_result})
         trade_date = _latest_trade_date()
 
         _set_state(phase="market", message=f"正在更新 {trade_date} 行情和估值", progress=50, trade_date=trade_date)
