@@ -213,6 +213,53 @@ def test_due_prior_plan_has_priority_over_today_materialization(monkeypatch):
     assert called["materialize"] == 0
 
 
+def test_due_plan_is_not_blocked_by_today_decision_data(monkeypatch):
+    monkeypatch.setattr(
+        runner,
+        "_build_autonomous_plan_context",
+        lambda _dates: {
+            "ok": True,
+            "signal_date": "20260817",
+            "current_execute_date": "20260818",
+        },
+    )
+    monkeypatch.setattr(
+        runner,
+        "_materialize_current_plan_and_find_due_context",
+        lambda _dates: (_ for _ in ()).throw(AssertionError("must not materialize today first")),
+    )
+
+    context = runner._resolve_autonomous_plan_context(
+        ["2026-08-17", "2026-08-18"],
+        decision_data_ready=False,
+    )
+
+    assert context["ok"] is True
+    assert context["current_execute_date"] == "20260818"
+    assert context["today_materialization"]["status"] == "deferred_until_due_plan_processed"
+
+
+def test_no_due_plan_does_not_materialize_before_decision_data_is_ready(monkeypatch):
+    monkeypatch.setattr(
+        runner,
+        "_build_autonomous_plan_context",
+        lambda _dates: {"ok": False, "reason": "no_due_formal_plan"},
+    )
+    monkeypatch.setattr(
+        runner,
+        "_materialize_current_plan_and_find_due_context",
+        lambda _dates: (_ for _ in ()).throw(AssertionError("must defer materialization")),
+    )
+
+    context = runner._resolve_autonomous_plan_context(
+        ["2026-08-18"],
+        decision_data_ready=False,
+    )
+
+    assert context["ok"] is False
+    assert context["today_materialization"]["status"] == "deferred_until_decision_data_ready"
+
+
 def test_today_materializes_when_no_plan_is_due(monkeypatch):
     materialization = {"status": "planned", "persisted": True}
     monkeypatch.setattr(

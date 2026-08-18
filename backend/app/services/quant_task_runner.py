@@ -742,24 +742,24 @@ def start_auto_simulation_scheduler() -> bool:
                 from app.services.profit_loop import effective_rebalance_clock
                 close_time = effective_rebalance_clock()
                 if _auto_simulation_check_due(now, close_time):
-                    target, data_ready = _ensure_close_data_ready()
-                    if not data_ready:
-                        # Do not execute against the latest *old* slice while
-                        # the target-day market bundle is still being fetched.
-                        _wait_for_auto_simulation_retry(beat)
-                        continue
+                    target, decision_data_ready = _ensure_close_data_ready()
                     dates = list_consolidated_trade_dates()
                     latest = str(dates[-1]) if dates else ""
                     target_key = _trade_date_key(target)
                     if not target_key or _trade_date_key(latest) != target_key:
+                        # Do not execute against the latest old slice while
+                        # the exact execution-date bundle is still ingesting.
                         logger.warning("收盘日更已通过但合并行情尚未就绪 target=%s latest=%s", target, latest)
                         _wait_for_auto_simulation_retry(beat)
                         continue
                     if latest:
                         # Execution eligibility belongs to the immutable plan
                         # whose execute-date slice is now available. It must not
-                        # depend on whether today's new T-day plan was generated.
-                        due_context = _materialize_current_plan_and_find_due_context(dates)
+                        # depend on whether today's new T-day plan can be generated.
+                        due_context = _resolve_autonomous_plan_context(
+                            dates,
+                            decision_data_ready=decision_data_ready,
+                        )
                         formal_plan_claimable = bool(due_context.get("ok"))
                         if formal_plan_claimable:
                             execution_gate = _evaluate_frozen_execution_data_gate(
@@ -808,6 +808,13 @@ def start_auto_simulation_scheduler() -> bool:
                                 # still-planned row forever. The atomic plan
                                 # status/claim token remains the duplicate guard.
                                 run_quant_task_async(int(task["id"]))
+                        elif not decision_data_ready:
+                            logger.info(
+                                "冻结计划已无到期项；等待当天新决策数据完整 target=%s",
+                                target,
+                            )
+                            _wait_for_auto_simulation_retry(beat)
+                            continue
                 beat("auto_simulation_scheduler")
             except Exception as exc:  # noqa: BLE001
                 if _is_expected_scheduler_wait(exc):
@@ -1260,6 +1267,37 @@ def _materialize_current_plan_and_find_due_context(dates: list[str]) -> dict:
             logger.warning("每日正式调仓方案生成失败 trade_date=%s: %s", latest, str(exc)[:200])
             materialization = {"ok": False, "status": "error", "error": str(exc)[:300]}
     return {**_build_autonomous_plan_context(dates), "today_materialization": materialization}
+
+
+def _resolve_autonomous_plan_context(
+    dates: list[str], *, decision_data_ready: bool,
+) -> dict:
+    """Give a due frozen plan priority over today's decision-data contract.
+
+    A T+1 plan is allowed to consume only its exact execution slice.  Its
+    safety must therefore not depend on whether today's new plan can be
+    generated, which also requires valuation and other close-data fields.
+    """
+    due_context = _build_autonomous_plan_context(dates)
+    if due_context.get("ok"):
+        return {
+            **due_context,
+            "today_materialization": {
+                "ok": True,
+                "status": "deferred_until_due_plan_processed",
+                "reason": "due_frozen_plan_has_execution_priority",
+            },
+        }
+    if not decision_data_ready:
+        return {
+            **due_context,
+            "today_materialization": {
+                "ok": False,
+                "status": "deferred_until_decision_data_ready",
+                "reason": "today_decision_data_not_ready",
+            },
+        }
+    return _materialize_current_plan_and_find_due_context(dates)
 
 
 def _persist_step_result(
