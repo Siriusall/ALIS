@@ -49,3 +49,18 @@ def test_snapshot_refresh_defaults_match_page_freshness_contract():
     assert snapshots._ttl("operations") == 15
     assert snapshots._ttl("data") == 60
     assert snapshots._ttl("models") == 300
+
+
+def test_busy_data_platform_defers_optional_snapshot_work(monkeypatch):
+    class Context:
+        def __enter__(self):
+            return self
+        def __exit__(self, *_args):
+            return False
+        def execute(self, *_args):
+            return self
+        def fetchone(self):
+            return {"count": 2}
+
+    monkeypatch.setattr(snapshots, "data_platform_conn", lambda: Context())
+    assert snapshots._data_platform_is_busy() is True
