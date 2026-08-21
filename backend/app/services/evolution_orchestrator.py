@@ -43,8 +43,8 @@ AUTO_ENABLED = str(os.getenv("EVOLUTION_AUTO_ENABLED", "1")).lower() in {"1", "t
 V10_RESEARCH_ENABLED = str(os.getenv("ALIS_V10_RESEARCH_ENABLED", "1")).lower() in {"1", "true", "yes", "on"}
 LOW_MEMORY_WORKER = str(os.getenv("ALIS_WORKER_PROFILE", "")).lower() in {"2gb", "low_memory", "low-memory"}
 WORKER_POOL = str(os.getenv("ALIS_WORKER_POOL", "control")).strip().lower() or "control"
-if WORKER_POOL not in {"control", "research"}:
-    raise RuntimeError("ALIS_WORKER_POOL must be control or research")
+if WORKER_POOL not in {"api_local", "control", "research"}:
+    raise RuntimeError("ALIS_WORKER_POOL must be api_local, control or research")
 WORKER_RESEARCH_BATCH_SIZE = 1 if LOW_MEMORY_WORKER else 4
 AUTO_WEEKDAY = max(0, min(int(os.getenv("EVOLUTION_AUTO_WEEKDAY", "4")), 6))
 AUTO_HOUR = max(0, min(int(os.getenv("EVOLUTION_AUTO_HOUR", "18")), 23))
@@ -97,13 +97,20 @@ LONG_RESEARCH_TASK_TYPES = frozenset({
 
 def _default_worker_pool(task_type: str) -> str:
     """Keep long, CPU-heavy research away from the control-plane worker."""
+    # System-release activation changes the production execution authority.
+    # It must run beside the API/runtime whose manifest it validates.  An
+    # external worker can be intentionally version-skewed while rolling out;
+    # allowing it to claim this task previously let an old process reactivate
+    # its own stale release and block otherwise healthy trading.
+    if str(task_type or "") == "system_release_governance":
+        return "api_local"
     return "research" if str(task_type or "") in LONG_RESEARCH_TASK_TYPES else "control"
 
 
 def _normalise_worker_pool(value: Any, *, task_type: str = "") -> str:
     pool = str(value or _default_worker_pool(task_type)).strip().lower()
-    if pool not in {"control", "research"}:
-        raise ValueError("worker_pool must be control or research")
+    if pool not in {"api_local", "control", "research"}:
+        raise ValueError("worker_pool must be api_local, control or research")
     return pool
 # Tasks that consume the current trading-day slice must prove the current
 # decision-data contract first.  Formal historical evaluations use their own
@@ -856,7 +863,7 @@ def evolution_schedule_status() -> dict[str, Any]:
         "scheduler_tick_seconds": 300,
         "budgets": {
             "single_worker": True,
-            "worker_pools": ["control", "research"],
+            "worker_pools": ["api_local", "control", "research"],
             "max_candidates_per_cycle": MAX_CANDIDATES_PER_CYCLE,
             "max_windows_per_candidate": MAX_WINDOWS_PER_CANDIDATE,
             "task_timeout_minutes": TASK_TIMEOUT_MINUTES,

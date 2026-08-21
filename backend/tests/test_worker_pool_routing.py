@@ -8,6 +8,7 @@ def test_default_worker_pool_routes_only_long_research_to_research_pool():
     assert evolution._default_worker_pool("strategy_controller_oos") == "research"
     assert evolution._default_worker_pool("strategy_shadow_cycle") == "control"
     assert evolution._default_worker_pool("system_autonomy_cycle") == "control"
+    assert evolution._default_worker_pool("system_release_governance") == "api_local"
 
 
 def test_claim_query_is_scoped_to_current_worker_pool(monkeypatch):
@@ -42,4 +43,4 @@ def test_schedule_status_exposes_worker_pool(monkeypatch):
     monkeypatch.setattr(evolution, "WORKER_POOL", "research")
     status = evolution.evolution_schedule_status()
     assert status["worker_pool"] == "research"
-    assert status["budgets"]["worker_pools"] == ["control", "research"]
+    assert status["budgets"]["worker_pools"] == ["api_local", "control", "research"]
