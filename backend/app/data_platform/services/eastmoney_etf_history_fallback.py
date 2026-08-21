@@ -38,6 +38,11 @@ def fetch_eastmoney_etf_history(ts_code: str, start_date: str, end_date: str) ->
         body = response.json()
     finally:
         session.close()
+    return parse_eastmoney_etf_history(ts_code, body)
+
+
+def parse_eastmoney_etf_history(ts_code: str, body: Any) -> list[dict[str, Any]]:
+    """Validate a retained raw HTTP response with the same live-source contract."""
     data = body.get("data") if isinstance(body, dict) else None
     rows: list[dict[str, Any]] = []
     for value in (data or {}).get("klines") or []:
