@@ -219,8 +219,17 @@ def has_consolidated_for_date(date_ymd: str) -> bool:
 def list_available_trade_dates() -> List[str]:
     """Return only dates with a durable normalized exact-session snapshot.
 
-    Raw API rows are deliberately not a fallback: they can be incomplete and
-    cannot establish that the normalized cross-section is usable.
+    ``dc_available_trade_dates`` is only the calendar index.  A date becomes
+    usable when its accepted normalized projection still has a matching,
+    auditable immutable version.  The exact content-hash join prevents a late
+    projection rewrite from making a date look durable before its evidence is
+    available.
+
+    This is polled by read paths, so it deliberately uses an autocommit,
+    server-read-only connection.  The matching partial index is installed by
+    ``data_0013_strict_snapshot_idx``; it lets PostgreSQL reject legacy
+    dates from a small index instead of probing the multi-gigabyte snapshot
+    table for every calendar row.
     """
     global _available_trade_dates_cache
     now = time.monotonic()
@@ -229,17 +238,26 @@ def list_available_trade_dates() -> List[str]:
         if cached_dates and now - cached_at <= _AVAILABLE_TRADE_DATES_TTL_SECONDS:
             return list(cached_dates)
     try:
-        from app.data_platform.db import _conn
+        from app.data_platform.db import _read_conn
 
-        with _conn() as conn:
+        with _read_conn() as conn:
             rows = conn.execute(
                 """SELECT available.trade_date
                    FROM dc_available_trade_dates AS available
                    WHERE EXISTS (
-                       SELECT 1 FROM dc_stock_daily_snapshot AS snapshot
-                       WHERE snapshot.trade_date=available.trade_date
-                         AND COALESCE(snapshot.observed_at,'')<>''
-                         AND LOWER(COALESCE(snapshot.observation_provenance,'')) NOT LIKE 'legacy_%'
+                       SELECT 1
+                         FROM dc_stock_daily_snapshot AS snapshot
+                         JOIN dc_stock_daily_snapshot_version AS versioned
+                           ON versioned.ts_code=snapshot.ts_code
+                          AND versioned.trade_date=snapshot.trade_date
+                          AND versioned.content_hash=snapshot.content_hash
+                        WHERE snapshot.trade_date=available.trade_date
+                          AND snapshot.observed_at<>''
+                          AND snapshot.content_hash<>''
+                          AND LOWER(COALESCE(snapshot.observation_provenance,'')) NOT LIKE 'legacy_%'
+                          AND versioned.observed_at<>''
+                          AND versioned.content_hash<>''
+                          AND LOWER(COALESCE(versioned.observation_provenance,'')) NOT LIKE 'legacy_%'
                    )
                    ORDER BY available.trade_date"""
             ).fetchall()
@@ -248,19 +266,6 @@ def list_available_trade_dates() -> List[str]:
                 for value in (str(dict(row).get("trade_date") or "") for row in rows)
                 if _normalize_ymd(value)
             ]
-            if not dates:
-                rows = conn.execute(
-                    """SELECT DISTINCT trade_date
-                       FROM dc_stock_daily_snapshot
-                       WHERE COALESCE(observed_at,'')<>''
-                         AND LOWER(COALESCE(observation_provenance,'')) NOT LIKE 'legacy_%'
-                       ORDER BY trade_date"""
-                ).fetchall()
-                dates = [
-                    value
-                    for value in (str(dict(row).get("trade_date") or "") for row in rows)
-                    if _normalize_ymd(value)
-                ]
     except Exception as exc:  # noqa: BLE001
         logger.warning("PostgreSQL available-session read failed: %s", str(exc)[:120])
         return []

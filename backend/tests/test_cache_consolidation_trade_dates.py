@@ -6,7 +6,7 @@ import app.data_platform.db as db
 import app.services.cache_consolidation as cache_consolidation
 
 
-def test_available_trade_dates_use_materialized_table_before_raw_records(monkeypatch):
+def test_available_trade_dates_use_immutable_projection_join_on_read_only_connection(monkeypatch):
     executed: list[str] = []
 
     class FakeConn:
@@ -29,9 +29,12 @@ def test_available_trade_dates_use_materialized_table_before_raw_records(monkeyp
     def fake_conn():
         yield FakeConn()
 
-    monkeypatch.setattr(db, "_conn", fake_conn)
+    monkeypatch.setattr(db, "_read_conn", fake_conn)
     monkeypatch.setattr(cache_consolidation, "_available_trade_dates_cache", (0.0, []))
 
     assert cache_consolidation.list_available_trade_dates() == ["20260714", "20260715"]
-    assert any("dc_available_trade_dates" in sql for sql in executed)
+    strict_sql = next(sql for sql in executed if "dc_available_trade_dates" in sql)
+    assert "dc_stock_daily_snapshot_version" in strict_sql
+    assert "versioned.content_hash=snapshot.content_hash" in strict_sql
+    assert "snapshot.trade_date=available.trade_date" in strict_sql
     assert not any("dc_tushare_raw_records" in sql for sql in executed)
