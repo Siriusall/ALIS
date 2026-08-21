@@ -50,9 +50,10 @@ from app.services.evolution_orchestrator import (
     evolution_schedule_status,
     get_evolution_task,
     list_evolution_tasks,
+    enqueue_plan_model_autonomy_task,
 )
 from app.services.plan_model_control import model_family_status, plan_model_operations_status, request_plan_model_training, review_plan_model_version, train_all_trainable_plan_models, review_all_candidate_plan_models, score_plan_model_features
-from app.services.plan_model_auto_optimizer import build_auto_optimization_status, run_auto_optimization_once
+from app.services.plan_model_auto_optimizer import build_auto_optimization_status
 from app.services.strategy_controller import (
     create_strategy_policy_candidate,
     evaluate_strategy_policy_version,
@@ -339,7 +340,13 @@ def model_strategy_auto_optimization() -> dict:
 
 @router.post("/model-strategy/auto-optimization/run")
 def model_strategy_run_auto_optimization(req: PlanModelAutoOptimizationRequest) -> dict:
-    return run_auto_optimization_once(force=req.force)
+    # Keep the API runtime read/dispatch-only.  Auto optimization builds a
+    # large point-in-time training dataset and must execute on the research
+    # worker through the persistent evolution task contract.
+    return enqueue_plan_model_autonomy_task(
+        trigger="api_auto_optimization",
+        force=bool(req.force),
+    )
 
 
 @router.get("/model-strategy/strategy-controller")
@@ -914,7 +921,7 @@ def model_strategy_compare(champion_id: int, challenger_id: int) -> dict:
 
 @router.post("/model-strategy/auto-tune")
 def model_strategy_auto_tune() -> dict:
-    return run_auto_optimization_once(force=False)
+    return enqueue_plan_model_autonomy_task(trigger="api_auto_tune")
 
 
 @router.get("/model-strategy/train-runs/{run_id}")

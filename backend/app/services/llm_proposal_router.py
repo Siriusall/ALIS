@@ -37,12 +37,20 @@ def _ensure_tables() -> None:
 
 def _routes() -> dict[str, tuple[str, Callable[[], dict[str, Any]]]]:
     # Imports stay lazy so the router remains cheap and testable in isolation.
-    from app.services.plan_model_auto_optimizer import run_auto_optimization_once
+    from app.services.evolution_orchestrator import enqueue_plan_model_autonomy_task
     from app.services.review_data_quality_governance import run_review_data_quality_governance
     from app.services.strategy_controller import run_strategy_policy_auto_optimization
     return {
         "factor": ("factor_daily_evaluation", _enqueue_factor_daily_evaluation),
-        "model": ("model_challenger_cycle", lambda: run_auto_optimization_once(force=False)),
+        # Model training scans point-in-time history and must run through the
+        # persistent research-pool task.  The proposal router is called from
+        # the control-plane daily bus, so invoking the optimizer inline here
+        # would reintroduce the same database/I/O contention this task routing
+        # contract is intended to prevent.
+        "model": (
+            "model_challenger_cycle",
+            lambda: enqueue_plan_model_autonomy_task(trigger="llm_proposal_router"),
+        ),
         "strategy": ("strategy_policy_whitelist", lambda: run_strategy_policy_auto_optimization(force=False)),
         "data": ("oos_data_quality_governance", lambda: run_review_data_quality_governance()),
     }

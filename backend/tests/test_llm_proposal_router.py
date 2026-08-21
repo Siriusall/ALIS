@@ -142,3 +142,20 @@ def test_factor_route_uses_persistent_evolution_task(monkeypatch):
         "persistent": True,
         "production_change_forbidden": True,
     }
+
+
+def test_model_route_delegates_to_research_pool_task(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(
+        "app.services.evolution_orchestrator.enqueue_plan_model_autonomy_task",
+        lambda **kwargs: captured.update(kwargs)
+        or {"ok": True, "status": "delegated", "worker_pool": "research"},
+    )
+
+    route_key, action = router._routes()["model"]
+    result = action()
+
+    assert route_key == "model_challenger_cycle"
+    assert result["status"] == "delegated"
+    assert result["worker_pool"] == "research"
+    assert captured == {"trigger": "llm_proposal_router"}

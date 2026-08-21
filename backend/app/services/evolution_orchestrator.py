@@ -1743,6 +1743,7 @@ def enqueue_plan_model_autonomy_task(
     trade_date: str = "",
     *,
     trigger: str = "daily_system_autonomy",
+    force: bool = False,
 ) -> dict[str, Any]:
     """Delegate model auto-optimization to the dedicated research worker.
 
@@ -1775,10 +1776,12 @@ def enqueue_plan_model_autonomy_task(
             "delegated_from": "system_autonomy_cycle",
             "production_change_forbidden": True,
             "execution_contract": "alis_plan_model_autonomy_research_task_v1",
+            "force": bool(force),
         },
         dedupe_key=f"plan_model_autonomy:daily:v1:{date_key}",
         max_attempts=3,
         priority=73,
+        force=bool(force),
         worker_pool="research",
     )
     task_status = str(task.get("status") or "queued")
@@ -1800,6 +1803,7 @@ def enqueue_plan_model_autonomy_task(
             for key in ("id", "status", "phase", "progress", "message", "worker_pool")
         },
         "production_change_forbidden": True,
+        "force": bool(force),
     }
 
 
@@ -2714,6 +2718,7 @@ def execute_evolution_task(
         from app.services.plan_model_control import request_plan_model_training
 
         payload = task.get("payload") if isinstance(task.get("payload"), dict) else {}
+        force = bool(payload.get("force", False))
         target_model_key = str(payload.get("target_model_key") or "")
         model_candidate_spec = (
             dict(payload.get("model_candidate_spec") or {})
@@ -2766,7 +2771,7 @@ def execute_evolution_task(
                 }
         else:
             def model_runner() -> dict[str, Any]:
-                return run_auto_optimization_once(force=False)
+                return run_auto_optimization_once(force=force)
         result = _run_with_heartbeat_pulse(
             int(task["id"]),
             phase="plan_model_autonomy",

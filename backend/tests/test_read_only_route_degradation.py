@@ -124,6 +124,28 @@ def test_model_status_get_routes_disable_governance_and_snapshot_writes(monkeypa
         "optimizer": {"apply_auto_reject": False},
         "market": {"persist": False},
     }
+
+
+def test_model_auto_optimization_api_routes_to_persistent_research_task(monkeypatch):
+    calls = []
+
+    def enqueue(**kwargs):
+        calls.append(kwargs)
+        return {"ok": True, "status": "delegated", "worker_pool": "research"}
+
+    monkeypatch.setattr(model_strategy, "enqueue_plan_model_autonomy_task", enqueue)
+
+    result = model_strategy.model_strategy_run_auto_optimization(
+        model_strategy.PlanModelAutoOptimizationRequest(force=True)
+    )
+    legacy = model_strategy.model_strategy_auto_tune()
+
+    assert result["status"] == "delegated"
+    assert legacy["worker_pool"] == "research"
+    assert calls == [
+        {"trigger": "api_auto_optimization", "force": True},
+        {"trigger": "api_auto_tune"},
+    ]
 def test_plan_model_console_projection_keeps_governance_summary_without_fold_payload(monkeypatch):
     payload = {
         "items": [{
