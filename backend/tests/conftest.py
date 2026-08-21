@@ -51,7 +51,9 @@ os.environ["ALIS_REDIS_NAMESPACE"] = "alis:test:pytest:"
 os.environ["ALIS_TASK_STREAM"] = "alis:test:data-platform:tasks"
 os.environ["ALIS_TASK_GROUP"] = "alis:test:data-platform-workers"
 os.environ["ALIS_TASK_DEAD_LETTER"] = "alis:test:data-platform:tasks:dead-letter"
-os.environ["ALIS_CACHE_ROOT"] = tempfile.mkdtemp(prefix="alis-pytest-", dir="/tmp")
+# Do not assume a Linux /tmp exists: contributors and CI also run the suite
+# on Windows, where tempfile already selects a safe writable directory.
+os.environ["ALIS_CACHE_ROOT"] = tempfile.mkdtemp(prefix="alis-pytest-")
 os.environ["ALIS_COLD_ARCHIVE_ROOT"] = str(Path(os.environ["ALIS_CACHE_ROOT"]) / "cold-archive")
 
 

@@ -31,6 +31,18 @@ const routeKeys: Record<string, Array<keyof typeof endpoints>> = {
   "/research": ["researchContracts", "researchGovernance", "researchPositionState", "researchDataAssets", "analystConsensus", "theses", "industries", "industryAllocation", "themes", "events", "pools", "modelMarketLive"],
 };
 
+// Shared-account pages are materialized on the server.  A browser therefore
+// reads one coherent page document instead of fanning out into the same large
+// PostgreSQL reads as every other open tab.
+const snapshotPages: Record<string, string> = {
+  "/overview": "overview",
+  "/decision": "decision",
+  "/portfolio": "portfolio",
+  "/operations": "operations",
+  "/data": "data",
+  "/models": "models",
+};
+
 const cache = new Map<string, { value: Json; readAt: number }>();
 type PendingRequest = {
   key: string;
@@ -319,6 +331,10 @@ async function loadDynamicRequest(request: InitialDynamicRequest, force: boolean
 }
 
 export async function preloadConsoleRoutes(paths: string[], concurrency = 3) {
+  const snapshotPaths = [...new Set(paths.map((path) => snapshotPages[path]).filter(Boolean))];
+  if (snapshotPaths.length) {
+    return Promise.allSettled(snapshotPaths.map((page) => loadPath(`snapshot:${page}`, `/api/console/snapshots/${page}`)));
+  }
   const keys = [...new Set(paths.flatMap((path) => routeKeys[path] || []))];
   const results: PromiseSettledResult<Json>[] = [];
   let cursor = 0;
@@ -367,12 +383,48 @@ export function useConsoleData(pathname: string) {
     if (force) retryAttempt.current = 0;
     controller.current?.abort();
     controller.current = new AbortController();
+    const snapshotPage = snapshotPages[pathname];
+    const activeController = controller.current;
+    if (snapshotPage) {
+      setLoading(!cache.has(`snapshot:${snapshotPage}`));
+      setLoadingMessage("正在读取服务端页面快照");
+      setRefreshing(force);
+      setProgress({ completed: 0, total: 1 });
+      setErrors({});
+      try {
+        const payload = await loadPath(
+          `snapshot:${snapshotPage}`,
+          `/api/console/snapshots/${snapshotPage}${force ? "?refresh=true" : ""}`,
+          force,
+          activeController.signal,
+        );
+        if (controller.current !== activeController) return;
+        const snapshotData = payload?.data && typeof payload.data === "object" ? payload.data as ConsoleData : {};
+        setData(snapshotData);
+        const sectionErrors = Object.entries(payload?.sections || {}).reduce<Record<string, string>>((result, [key, section]: [string, any]) => {
+          if (section?.status === "error" || section?.status === "degraded") result[key] = String(section.error || section.status);
+          return result;
+        }, {});
+        if (payload?.stale) sectionErrors.snapshot = "正在展示最近一次成功快照；服务端正在重建";
+        setErrors(sectionErrors);
+      } catch (error: any) {
+        if (activeController.signal.aborted || controller.current !== activeController) return;
+        setErrors({ snapshot: error?.name === "AbortError" ? "页面快照读取超时" : String(error?.message || "页面快照读取失败") });
+      } finally {
+        if (controller.current === activeController) {
+          setProgress({ completed: 1, total: 1 });
+          setLoading(false);
+          setRefreshing(false);
+          setLoadingMessage("正在汇总决策、账户和运行证据");
+        }
+      }
+      return;
+    }
     const hasRouteCache = incompleteRouteData(pathname, cachedData).length === 0 && keys.every((key) => cache.has(String(key))) && initialDynamicRequests(pathname, cachedData).every((request) => cache.has(request.cacheKey));
     setLoading(!hasRouteCache);
     setLoadingMessage("正在汇总决策、账户和运行证据");
     setRefreshing(force);
     const entries = keys;
-    const activeController = controller.current;
     setProgress({ completed: 0, total: entries.length });
     setErrors({});
     const releaseRefreshTimer = window.setTimeout(() => {

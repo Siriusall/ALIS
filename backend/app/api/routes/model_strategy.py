@@ -847,7 +847,7 @@ def model_strategy_evolution_task(task_id: int) -> dict:
 
 @router.post("/model-strategy/evolution/tasks")
 def model_strategy_create_evolution_task(req: EvolutionTaskRequest) -> dict:
-    return create_evolution_task(
+    result = create_evolution_task(
         task_type="strategy_evolution_cycle",
         payload={
             "max_windows": req.max_windows,
@@ -857,6 +857,9 @@ def model_strategy_create_evolution_task(req: EvolutionTaskRequest) -> dict:
         dedupe_key=f"strategy_evolution_cycle:{datetime.now(_BUSINESS_TZ).date().isoformat()}",
         force=req.force,
     )
+    from app.services.console_snapshots import invalidate
+    invalidate(("overview", "operations", "models"), reason="evolution_task_created")
+    return result
 
 
 @router.post("/model-strategy/evolution/strategy-controller-candidates/{version_id}/oos")
@@ -872,6 +875,8 @@ def model_strategy_cancel_evolution_task(task_id: int) -> dict:
     task = cancel_evolution_task(task_id)
     if not task:
         raise HTTPException(status_code=404, detail="evolution task not found")
+    from app.services.console_snapshots import invalidate
+    invalidate(("overview", "operations", "models"), reason="evolution_task_cancelled")
     return {"ok": True, "task": task}
 
 

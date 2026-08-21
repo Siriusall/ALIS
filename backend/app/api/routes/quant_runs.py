@@ -880,6 +880,10 @@ def quant_run_task_create(req: QuantTaskCreateRequest) -> dict:
     upsert_quant_run_task_meta(task_id, strategy_snapshot=strategy_snapshot, risk_config=risk_cfg)
     started = run_quant_task_async(task_id)
     task = get_quant_run_task(task_id)
+    # Task creation changes the shared operations console.  The next read
+    # serves its last durable snapshot and refreshes it outside the request.
+    from app.services.console_snapshots import invalidate
+    invalidate(("overview", "operations", "portfolio"), reason="quant_task_created")
     return {"ok": True, "task_id": task_id, "started": started, "task": _attach_risk_decision(task or {})}
 
 

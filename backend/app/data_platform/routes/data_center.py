@@ -250,6 +250,8 @@ def data_center_start_daily_update() -> dict[str, Any]:
     result = start_daily_update()
     if not result.get("ok"):
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=result)
+    from app.services.console_snapshots import invalidate
+    invalidate(("overview", "decision", "portfolio", "data"), reason="daily_update_started")
     return result
 
 
@@ -306,6 +308,8 @@ def data_center_backfill_start(
     )
     if not result.get("ok"):
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=result)
+    from app.services.console_snapshots import invalidate
+    invalidate(("overview", "decision", "portfolio", "data", "models"), reason="backfill_started")
     return result
 
 
