@@ -73,3 +73,22 @@ def test_blocked_industry_snapshot_is_not_reported_as_empty_healthy_allocation(m
     assert result["status"] == "blocked"
     assert result["reason"] == "industry_snapshot_not_visible_at_cutoff"
     assert result["allocated_equity_budget"] == 0.0
+
+
+def test_missing_theme_snapshot_degrades_without_blocking_industry_allocation(monkeypatch):
+    monkeypatch.setattr(industry_allocator, "list_industries", lambda **_: {"ok": True, **_research()})
+    monkeypatch.setattr(industry_allocator, "_industry_members", _members)
+    monkeypatch.setattr(
+        industry_allocator,
+        "list_themes",
+        lambda **_: {"ok": False, "status": "blocked", "reason": "no_theme_snapshot_visible_at_cutoff"},
+    )
+
+    result = industry_allocator.build_industry_allocation(
+        symbols=["000001", "000002", "000003"], equity_budget=.4, market_state="S0",
+        as_of_time="2026-08-20T16:20:00+08:00",
+    )
+
+    assert result["ok"] is True
+    assert result["theme_enhancement_status"] == "degraded"
+    assert result["warnings"] == ["degraded_no_theme_snapshot_visible_at_cutoff"]

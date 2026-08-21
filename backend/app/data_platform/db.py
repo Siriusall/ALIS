@@ -918,6 +918,11 @@ def init_db() -> None:
                 evidence_json TEXT NOT NULL, updated_at VARCHAR(64) NOT NULL,
                 PRIMARY KEY(as_of_date,theme_code,ts_code))""")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_dc_theme_score_date ON dc_theme_snapshot(promotable,score,as_of_date)")
+            # ``list_themes`` resolves the newest point-in-time-visible row
+            # per theme for formal portfolio construction.  Keep that lookup
+            # index-backed so it never transports the complete historical
+            # JSON snapshot archive into the planning request.
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_dc_theme_code_date ON dc_theme_snapshot(theme_code,as_of_date DESC)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_dc_theme_company_symbol ON dc_theme_company_mapping(ts_code,as_of_date)")
             conn.execute("""CREATE TABLE IF NOT EXISTS dc_event_followup (
                 event_key VARCHAR(128) PRIMARY KEY, ts_code VARCHAR(16) NOT NULL DEFAULT '',

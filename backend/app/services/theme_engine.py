@@ -625,11 +625,34 @@ def list_themes(
             clauses.append("as_of_date<=?"); params.append(cutoff)
         if promotable_only:
             clauses.append("promotable=1")
+        # The portfolio allocator only needs the newest visible snapshot per
+        # theme.  Reading every historic JSON payload (tens of thousands of
+        # rows in production) made an otherwise small plan calculation exceed
+        # the statement timeout.  Filter the row clocks in SQL and choose one
+        # current candidate per theme; Python still validates the embedded PIT
+        # source marker below, so this is a bounded transport optimisation and
+        # not a relaxation of the theme point-in-time contract.
+        if visibility_cutoff:
+            clauses.extend([
+                "available_time<>''", "created_at<>''", "updated_at<>''",
+                "available_time<=?", "created_at<=?", "updated_at<=?",
+            ])
+            params.extend([visibility_cutoff, visibility_cutoff, visibility_cutoff])
         where = "WHERE " + " AND ".join(clauses) if clauses else ""
-        candidates = [dict(row) for row in c.execute(
-            f"""SELECT * FROM dc_theme_snapshot s {where}
-                ORDER BY as_of_date DESC,promotable DESC,score DESC""", tuple(params),
-        ).fetchall()]
+        if bool(getattr(c, "_is_postgres", False)):
+            candidate_sql = f"""SELECT DISTINCT ON (theme_code) *
+                                  FROM dc_theme_snapshot s {where}
+                                 ORDER BY theme_code,as_of_date DESC,
+                                          promotable DESC,score DESC"""
+        else:
+            candidate_sql = f"""WITH ranked AS (
+                                  SELECT s.*,ROW_NUMBER() OVER (
+                                      PARTITION BY theme_code
+                                      ORDER BY as_of_date DESC,promotable DESC,score DESC
+                                  ) AS row_rank
+                                    FROM dc_theme_snapshot s {where}
+                                ) SELECT * FROM ranked WHERE row_rank=1"""
+        candidates = [dict(row) for row in c.execute(candidate_sql, tuple(params)).fetchall()]
         visible_by_theme: dict[str, dict[str, Any]] = {}
         for row in candidates:
             try:

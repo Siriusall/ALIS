@@ -140,23 +140,23 @@ def build_industry_allocation(
         compact=True,
         include_company_counts=False,
     )
+    # Themes are an optional narrative enhancement, never a substitute for
+    # market, factor, execution or industry hard evidence.  A missing strict
+    # PIT theme snapshot must remain visible in the frozen diagnostics, but
+    # must not turn otherwise complete daily trading data into a zero-trade
+    # deadlock.  Historical replay continues to report the same degradation;
+    # it simply receives no narrative bonus or eligibility veto.
+    theme_warning = ""
     if not isinstance(theme_result, dict):
-        return _blocked_allocation(
-            reason="theme_snapshot_contract_invalid",
-            symbols=symbols,
-            equity_budget=equity_budget,
-            market_state=market_state,
-            as_of_time=as_of_time,
+        themes = []
+        theme_warning = "degraded_theme_snapshot_contract_invalid"
+    elif theme_result.get("ok") is False or str(theme_result.get("status") or "") == "blocked":
+        themes = []
+        theme_warning = "degraded_" + str(
+            theme_result.get("reason") or theme_result.get("status") or "theme_snapshot_unavailable"
         )
-    if theme_result.get("ok") is False or str(theme_result.get("status") or "") == "blocked":
-        return _blocked_allocation(
-            reason=str(theme_result.get("reason") or theme_result.get("status") or "theme_snapshot_unavailable"),
-            symbols=symbols,
-            equity_budget=equity_budget,
-            market_state=market_state,
-            as_of_time=as_of_time,
-        )
-    themes = theme_result.get("items") or []
+    else:
+        themes = theme_result.get("items") or []
     # A page-level allocation over all industries does not need the stock
     # membership map. Only production calls with an explicit symbol universe
     # need that table, so the read-only console path avoids scanning it. Do it
@@ -234,6 +234,8 @@ def build_industry_allocation(
         "symbol_industries": by_symbol,
         "items": rows,
         "method": "market_then_industry_then_stock_v1",
+        "warnings": [theme_warning] if theme_warning else [],
+        "theme_enhancement_status": "degraded" if theme_warning else "ready",
     }
 
 
