@@ -1067,10 +1067,19 @@ def build_task_center(
             latest_cycle = detailed_cycle
     if latest_cycle:
         tasks.extend(_normalise_cycle_steps(latest_cycle, schedule))
-    daily = safe_read("daily_update_status", daily_update_status, {})
+    # The compact task-center projection is polled every few seconds by the
+    # owner/model consoles.  Do not run the full data-platform diagnostic on
+    # every poll: it includes provider calibration and an up-to-12-session
+    # point-in-time readiness search.  The compact status still reads the
+    # current target slice and preserves explicit degraded evidence.
+    daily = safe_read(
+        "daily_update_status",
+        lambda: daily_update_status(compact=True) if compact_cycle else daily_update_status(),
+        {},
+    )
     tasks.append(_daily_task(daily, generated))
     try:
-        health = simple_health()
+        health = simple_health(compact=True) if compact_cycle else simple_health()
     except Exception as exc:  # noqa: BLE001 - task center must expose degraded state
         health = degraded_read("decision_data_health", exc)
     tasks.append(_decision_data_task(health, daily, generated))

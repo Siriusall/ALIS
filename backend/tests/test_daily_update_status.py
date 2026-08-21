@@ -49,6 +49,46 @@ def test_compact_daily_update_status_omits_large_completed_steps(monkeypatch):
     assert "steps" not in daily_update.daily_update_status(compact=True)
 
 
+def test_compact_daily_update_status_skips_deep_provider_diagnostics(monkeypatch):
+    monkeypatch.setattr(daily_update, "_state", {"running": False, "phase": "completed"})
+
+    class _Result:
+        def __init__(self, rows=None):
+            self.rows = rows or []
+
+        def fetchone(self):
+            return None
+
+        def fetchall(self):
+            return self.rows
+
+    class _Conn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def execute(self, sql, _params=()):
+            # The compact projection still exposes current provider
+            # publication/performance evidence, but must not fan out into
+            # calibration, field-audit, or bulk-execution diagnostics.
+            assert "dc_market_provider_field_audit" not in sql
+            return _Result()
+
+    monkeypatch.setattr(daily_update, "_conn", lambda: _Conn())
+    monkeypatch.setattr(daily_update, "_latest_usable_snapshot_date", lambda c: "20260717")
+    monkeypatch.setattr(daily_update, "target_trade_date", lambda c: "20260717")
+    monkeypatch.setattr(daily_update, "decision_data_contract", lambda target, conn: {"ok": True})
+
+    result = daily_update.daily_update_status(compact=True)
+
+    assert result["latest_decision_ready_trade_date"] == "20260717"
+    assert "provider_calibration" not in result
+    assert "provider_field_audit" not in result
+    assert "provider_bulk_executions" not in result
+
+
 def test_daily_update_status_never_reports_a_failed_run_as_ok(monkeypatch):
     monkeypatch.setattr(daily_update, "_state", {
         "running": False,
@@ -74,6 +114,44 @@ def test_daily_update_status_never_reports_a_failed_run_as_ok(monkeypatch):
     assert result["failure_category"] == "execution_slice_blocked"
     assert result["retry_after_seconds"] == 60
     assert result["next_retry_at"]
+
+
+def test_compact_simple_health_does_not_search_historical_ready_dates(monkeypatch):
+    class _Result:
+        def __init__(self, row=None):
+            self.row = row or {"cnt": 1}
+
+        def fetchone(self):
+            return self.row
+
+    class _Conn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def execute(self, sql, _params=()):
+            if "MAX(publish_time)" in sql:
+                return _Result({"value": ""})
+            return _Result({"cnt": 1})
+
+    monkeypatch.setattr(daily_update, "_conn", lambda: _Conn())
+    monkeypatch.setattr(daily_update, "target_trade_date", lambda c: "20260820")
+    monkeypatch.setattr(daily_update, "decision_data_contract", lambda target, conn: {"ok": False})
+    monkeypatch.setattr(daily_update, "estimated_table_count", lambda c, table: (1, False))
+    monkeypatch.setattr(daily_update, "_latest_usable_snapshot_date", lambda c: "20260819")
+    monkeypatch.setattr(
+        daily_update,
+        "_latest_decision_ready_trade_date",
+        lambda c: (_ for _ in ()).throw(AssertionError("historical search is not compact")),
+    )
+
+    result = daily_update.simple_health(compact=True)
+
+    assert result["target_trade_date"] == "20260820"
+    assert result["latest_decision_ready_trade_date"] == ""
+    assert result["ok"] is False
 
 
 def test_benchmark_gate_rejects_a_present_but_partial_bar() -> None:
@@ -167,6 +245,64 @@ def test_scheduler_uses_utc8_when_given_utc_clock() -> None:
         datetime(2026, 7, 29, 7, 1, 0, tzinfo=timezone.utc),
         "20260729",
     )
+
+
+def test_scheduler_reads_etf_execution_evidence_after_metadata_transaction_closes(monkeypatch):
+    """ETF checks must not share a transaction that a prior diagnostic can poison."""
+    events = []
+
+    class _Conn:
+        def __enter__(self):
+            events.append("metadata_enter")
+            return self
+
+        def __exit__(self, *_args):
+            events.append("metadata_exit")
+            return False
+
+    class _StopLoop(Exception):
+        pass
+
+    monkeypatch.setattr(daily_update, "_DAILY_UPDATE_INTERVAL_SEC", 0)
+    monkeypatch.setattr("app.services.runtime_heartbeat.mark_started", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr("app.services.runtime_heartbeat.beat", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(daily_update, "_conn", lambda: _Conn())
+    monkeypatch.setattr(daily_update, "_scheduler_should_check", lambda *_args: True)
+    monkeypatch.setattr(daily_update, "target_trade_date", lambda *_args, **_kwargs: "20260729")
+    monkeypatch.setattr(daily_update, "_latest_decision_ready_trade_date", lambda *_args: "20260729")
+    monkeypatch.setattr(daily_update, "_benchmark_ready_for_date", lambda *_args: True)
+    monkeypatch.setattr(daily_update, "_adj_factor_ready_for_date", lambda *_args: True)
+    monkeypatch.setattr(daily_update, "_daily_update_retry_policy", lambda *_args, **_kwargs: {"allowed": False})
+    monkeypatch.setattr(daily_update, "_set_state", lambda **_kwargs: None)
+    monkeypatch.setattr(daily_update, "_business_now", lambda: datetime(2026, 7, 29, 16, 0, 0))
+    monkeypatch.setattr(daily_update, "_lock", type("_Lock", (), {"__enter__": lambda self: self, "__exit__": lambda self, *_: False})())
+    monkeypatch.setattr(
+        "app.services.defensive_assets.defensive_asset_execution_status",
+        lambda *_args: events.append("etf_read") or {"ok": True, "missing": []},
+    )
+
+    class _Thread:
+        def __init__(self, *, target, **_kwargs):
+            self.target = target
+
+        def start(self):
+            try:
+                self.target()
+            except _StopLoop:
+                pass
+
+    monkeypatch.setattr(daily_update.threading, "Thread", _Thread)
+    monkeypatch.setattr(
+        daily_update.threading,
+        "Event",
+        lambda: type("_Event", (), {"wait": lambda _self, _seconds: (_ for _ in ()).throw(_StopLoop())})(),
+    )
+
+    original_started = daily_update._scheduler_started
+    daily_update._scheduler_started = False
+    assert daily_update.start_daily_update_scheduler() is True
+    daily_update._scheduler_started = original_started
+    assert events[:3] == ["metadata_enter", "metadata_exit", "etf_read"]
 
 
 def test_retry_cooldown_accepts_aware_now_with_legacy_naive_timestamp() -> None:

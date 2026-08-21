@@ -462,6 +462,16 @@ def decision_data_contract(
         field_provider_counts: dict[str, dict[str, int]] = {}
         base_query_error = ""
         if value:
+            # The aggregate/source counts are diagnostic inputs.  They share a
+            # caller-owned data-platform connection with the scheduler, so a
+            # PostgreSQL statement timeout here must not leave that outer
+            # transaction poisoned.  A later readiness check on the same
+            # connection otherwise reports only ``current transaction is
+            # aborted`` and hides the original bounded timeout.
+            #
+            # Do not suppress a failed savepoint cleanup: the owning _conn()
+            # context must see it and rollback/discard the whole connection.
+            active.execute("SAVEPOINT decision_base_counts")
             try:
                 api_rows = active.execute(_base_counts_query(), (value, cutoff, cutoff)).fetchall()
                 api_counts = {
@@ -501,7 +511,11 @@ def decision_data_contract(
                         str(item.get("source_code") or "unknown")
                     ] = _count(item.get("rows"))
             except Exception as exc:  # noqa: BLE001 - production gates fail closed
+                active.execute("ROLLBACK TO SAVEPOINT decision_base_counts")
+                active.execute("RELEASE SAVEPOINT decision_base_counts")
                 base_query_error = type(exc).__name__
+            else:
+                active.execute("RELEASE SAVEPOINT decision_base_counts")
 
         evidence = _empty_evidence()
         strict_schema_ready = False

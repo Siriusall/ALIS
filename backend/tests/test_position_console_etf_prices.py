@@ -8,9 +8,10 @@ from fastapi import HTTPException
 def test_bare_szse_etf_uses_sz_suffix(monkeypatch):
     requested = []
 
-    def fake_batch(codes, _trade_date, *, limit, exact_date=False):
+    def fake_batch(codes, _trade_date, *, limit, exact_date=False, available_as_of_time=None):
         requested.extend(codes)
         assert exact_date is True
+        assert available_as_of_time
         return {"159001.SZ": ({"close": 1.23, "available_time": "2026-08-11T15:00:00"}, [])}
 
     monkeypatch.setattr(position_console, "defensive_asset_series_batch", fake_batch)

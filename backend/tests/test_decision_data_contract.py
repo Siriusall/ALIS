@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from copy import deepcopy
 
+import pytest
+
 from app.data_platform.services.decision_data_contract import (
     DECISION_DATA_CONTRACT_SCHEMA_VERSION,
     REQUIRED_DECISION_APIS,
@@ -55,6 +57,15 @@ class _ContractConn:
 
     def execute(self, sql, params=()):
         self.queries.append((sql, params))
+        if sql in {
+            "SAVEPOINT decision_base_counts",
+            "ROLLBACK TO SAVEPOINT decision_base_counts",
+            "RELEASE SAVEPOINT decision_base_counts",
+            "SAVEPOINT decision_field_lineage",
+            "ROLLBACK TO SAVEPOINT decision_field_lineage",
+            "RELEASE SAVEPOINT decision_field_lineage",
+        }:
+            return _Result()
         if "FROM dc_stock_master" in sql and "COUNT(*) AS count" in sql:
             return _Result(one={"count": self.stock_count})
         if "GROUP BY raw.api_name,raw.source_code" in sql:
@@ -239,3 +250,64 @@ def test_contract_query_guards_bad_persisted_timestamp_before_casting():
         "20260724", "2026-07-24T18:00:00+08:00", "2026-07-24T18:00:00+08:00",
         "2026-07-24T18:00:00+08:00", "2026-07-24T18:00:00+08:00",
     )
+
+
+def test_contract_rolls_back_base_diagnostic_timeout_before_reusing_caller_connection():
+    """A bounded diagnostic timeout must not poison the scheduler's connection."""
+
+    class TimeoutThenRecoveringConn(_ContractConn):
+        def __init__(self):
+            super().__init__()
+            self.poisoned = False
+            self.timed_out = False
+
+        def execute(self, sql, params=()):
+            self.queries.append((sql, params))
+            if sql == "SAVEPOINT decision_base_counts":
+                return _Result()
+            if sql == "ROLLBACK TO SAVEPOINT decision_base_counts":
+                self.poisoned = False
+                return _Result()
+            if sql == "RELEASE SAVEPOINT decision_base_counts":
+                return _Result()
+            if self.poisoned:
+                raise RuntimeError("current transaction is aborted")
+            if "GROUP BY raw.api_name" in sql and "raw.source_code" not in sql and not self.timed_out:
+                self.timed_out = True
+                self.poisoned = True
+                raise RuntimeError("canceling statement due to statement timeout")
+            if sql == "SELECT 1":
+                return _Result(one={"?column?": 1})
+            return super().execute(sql, params)
+
+    conn = TimeoutThenRecoveringConn()
+
+    result = _contract(conn)
+
+    assert result["ok"] is False
+    assert conn.poisoned is False
+    assert [sql for sql, _params in conn.queries if "decision_base_counts" in sql] == [
+        "SAVEPOINT decision_base_counts",
+        "ROLLBACK TO SAVEPOINT decision_base_counts",
+        "RELEASE SAVEPOINT decision_base_counts",
+    ]
+    assert not any("WITH raw_ranked AS" in sql for sql, _params in conn.queries)
+    assert conn.execute("SELECT 1").fetchone() == {"?column?": 1}
+
+
+def test_contract_does_not_hide_a_failed_base_diagnostic_savepoint_recovery():
+    """If the recovery itself fails, the enclosing data connection must rollback."""
+
+    class BrokenRecoveryConn(_ContractConn):
+        def execute(self, sql, params=()):
+            self.queries.append((sql, params))
+            if sql == "SAVEPOINT decision_base_counts":
+                return _Result()
+            if "GROUP BY raw.api_name" in sql and "raw.source_code" not in sql:
+                raise RuntimeError("canceling statement due to statement timeout")
+            if sql == "ROLLBACK TO SAVEPOINT decision_base_counts":
+                raise RuntimeError("savepoint recovery failed")
+            return super().execute(sql, params)
+
+    with pytest.raises(RuntimeError, match="savepoint recovery failed"):
+        _contract(BrokenRecoveryConn())

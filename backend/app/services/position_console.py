@@ -2,13 +2,22 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from app.core.a_share_fees import is_exchange_etf
 from app.data_platform.db import _conn as data_conn
 from app.data_platform.services.observation_clock import _table_columns
 from app.services.defensive_assets import defensive_asset_series_batch
-from app.services.point_in_time import signal_available_time
+
+
+_BUSINESS_TZ = ZoneInfo("Asia/Shanghai")
+
+
+def _live_observation_cutoff() -> str:
+    """Use the actual read time for current valuation, not the signal clock."""
+    return datetime.now(_BUSINESS_TZ).isoformat(timespec="seconds")
 
 
 def _etf_ts_code(symbol: str) -> str:
@@ -22,7 +31,7 @@ def _etf_ts_code(symbol: str) -> str:
 
 
 def resolve_stock_position_prices(
-    symbols: list[str], trade_date: str,
+    symbols: list[str], trade_date: str, *, available_as_of_time: str = "",
 ) -> tuple[dict[str, float], str]:
     """Read the exact requested-session stock closes in one bounded query.
 
@@ -48,7 +57,10 @@ def resolve_stock_position_prices(
         return {}, ""
     codes = tuple(sorted(symbol_by_code))
     placeholders = ",".join("?" for _ in codes)
-    cutoff = signal_available_time(compact_date)
+    # This endpoint is a live, read-only console.  Its source rows are
+    # observed after the 15:00 decision cutoff, so use the actual read clock;
+    # formal plans and execution continue to call their own signal cutoff.
+    cutoff = available_as_of_time or _live_observation_cutoff()
     with data_conn() as c:
         columns = _table_columns(c, "dc_stock_daily_snapshot")
         if "observed_at" in columns:
@@ -94,15 +106,21 @@ def resolve_stock_position_prices(
 def resolve_position_prices(symbols: list[str], trade_date: str) -> tuple[dict[str, float], str]:
     """Resolve stock and ETF closes with bounded local batch reads."""
     normalized = [str(symbol or "").strip().upper() for symbol in symbols if str(symbol or "").strip()]
+    live_cutoff = _live_observation_cutoff()
     stock_symbols = [symbol for symbol in normalized if not is_exchange_etf(symbol)]
-    prices, source_time = resolve_stock_position_prices(stock_symbols, trade_date)
+    prices, source_time = resolve_stock_position_prices(
+        stock_symbols, trade_date, available_as_of_time=live_cutoff,
+    )
     etf_by_code = {
         _etf_ts_code(symbol): symbol
         for symbol in normalized if is_exchange_etf(symbol)
     }
     if not etf_by_code:
         return prices, source_time
-    series_by_code = defensive_asset_series_batch(etf_by_code, trade_date, limit=20, exact_date=True)
+    series_by_code = defensive_asset_series_batch(
+        etf_by_code, trade_date, limit=20, exact_date=True,
+        available_as_of_time=live_cutoff,
+    )
     source_times = [source_time] if source_time else []
     for code, symbol in etf_by_code.items():
         bar, _returns = series_by_code.get(code, (None, []))

@@ -24,12 +24,12 @@ def test_task_center_unifies_modules_tasks_next_time_and_logs(monkeypatch):
         "updated_at": "2026-07-24T23:02:00+08:00", "created_at": "2026-07-24T22:59:00+08:00",
         "checkpoint": {"window": 2}, "result": {},
     }])
-    monkeypatch.setattr(task_center, "daily_update_status", lambda: {
+    monkeypatch.setattr(task_center, "daily_update_status", lambda **_kwargs: {
         "running": False, "run_id": 88, "phase": "cooldown", "progress": 50,
         "message": "等待上游", "retry_after_seconds": 120,
         "started_at": "2026-07-24T23:01:00+08:00", "finished_at": "2026-07-24T23:01:30+08:00",
     })
-    monkeypatch.setattr(task_center, "simple_health", lambda: {
+    monkeypatch.setattr(task_center, "simple_health", lambda **_kwargs: {
         "ok": False, "level": "blocked", "summary": "目标交易日未完成",
         "target_trade_date": "20260724", "latest_decision_ready_trade_date": "20260723",
     })
@@ -73,6 +73,37 @@ def test_task_center_unifies_modules_tasks_next_time_and_logs(monkeypatch):
     assert result["logs"][0]["logger"] == "strategy"
     assert result["autonomy_slo"]["status"] == "observing"
     assert result["execution_slo"]["status"] == "observing"
+
+
+def test_compact_task_center_uses_bounded_data_status_and_health_reads(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(task_center, "evolution_schedule_status", lambda: {})
+    monkeypatch.setattr(task_center, "list_evolution_tasks", lambda limit=20: [])
+    monkeypatch.setattr(
+        task_center,
+        "daily_update_status",
+        lambda **kwargs: calls.append(("daily", kwargs)) or {"running": False, "phase": "idle"},
+    )
+    monkeypatch.setattr(
+        task_center,
+        "simple_health",
+        lambda **kwargs: calls.append(("health", kwargs)) or {"ok": False, "level": "blocked"},
+    )
+    monkeypatch.setattr(task_center, "get_plan_model_data_backfill_status", lambda: {"status": "not_started"})
+    monkeypatch.setattr(task_center, "_data_runs", lambda limit: [])
+    monkeypatch.setattr(task_center, "_quant_tasks", lambda limit: [])
+    monkeypatch.setattr(task_center, "list_runtime_logs", lambda limit=200: [])
+
+    task_center.build_task_center(
+        limit=20,
+        log_limit=20,
+        include_slo=False,
+        include_cycle_details=False,
+        compact_cycle=True,
+    )
+
+    assert calls == [("daily", {"compact": True}), ("health", {"compact": True})]
 
 
 def test_cycle_step_uses_recorded_precise_times():

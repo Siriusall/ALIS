@@ -805,17 +805,23 @@ def start_daily_update_scheduler() -> bool:
                         ready = _latest_decision_ready_trade_date(c)
                         benchmark_ready = _benchmark_ready_for_date(c, target)
                         adj_factor_ready = _adj_factor_ready_for_date(c, target)
-                        from app.services.defensive_assets import DEFENSIVE_ASSETS, defensive_asset_execution_status
-                        defensive_codes = [str(item["ts_code"]) for item in DEFENSIVE_ASSETS]
-                        defensive_execution_slice = defensive_asset_execution_status(target, defensive_codes)
                         retry_policy = _daily_update_retry_policy(c, target, now=now)
                     else:
                         ready = ""
                         benchmark_ready = False
                         adj_factor_ready = False
-                        defensive_execution_slice = {"ok": False, "missing": []}
                         retry_policy = {"allowed": False, "reason": "before_close_data_window"}
                 if should_check:
+                    # Keep the scheduler's short metadata transaction separate
+                    # from the per-ETF immutable-evidence reads. A statement
+                    # timeout aborts a PostgreSQL transaction; doing the latter
+                    # inside this context used to turn an optional ETF check
+                    # into a misleading "current transaction is aborted" on
+                    # the next scheduler query.
+                    from app.services.defensive_assets import DEFENSIVE_ASSETS, defensive_asset_execution_status
+
+                    defensive_codes = [str(item["ts_code"]) for item in DEFENSIVE_ASSETS]
+                    defensive_execution_slice = defensive_asset_execution_status(target, defensive_codes)
                     if target and (
                         ready != target
                         or not benchmark_ready
@@ -926,8 +932,19 @@ def daily_update_status(*, compact: bool = False) -> dict[str, Any]:
     try:
         with _conn() as c:
             state["latest_usable_snapshot_date"] = _latest_usable_snapshot_date(c)
-            state["latest_decision_ready_trade_date"] = _latest_decision_ready_trade_date(c)
-            target = target_trade_date(c)
+            # A compact status is a live polling projection, not a historical
+            # readiness report.  Searching backwards through up to twelve
+            # PIT contracts on every poll can monopolize the data connection
+            # gate when today's slice is incomplete.  Report only the exact
+            # target state; full diagnostics retain the historical lookup.
+            if compact:
+                target = target_trade_date(c)
+                state["latest_decision_ready_trade_date"] = (
+                    target if decision_data_contract(target, conn=c).get("ok") else ""
+                )
+            else:
+                state["latest_decision_ready_trade_date"] = _latest_decision_ready_trade_date(c)
+                target = target_trade_date(c)
             probe_rows = c.execute(
                 """SELECT dataset,provider,status,probed_at,next_probe_at,latency_ms
                    FROM dc_market_provider_probe WHERE trade_date=?
@@ -946,27 +963,32 @@ def daily_update_status(*, compact: bool = False) -> dict[str, Any]:
                    ORDER BY dataset,provider"""
             ).fetchall()
             state["provider_performance"] = [dict(row) for row in performance_rows]
-            from app.data_platform.services.market_data_discovery import provider_calibration_status
-            state["provider_calibration"] = provider_calibration_status()
-            audit_rows = c.execute(
-                """SELECT dataset,trade_date,primary_provider,fallback_provider,field_name,
-                          compared_count,mismatch_count,mean_abs_diff,max_abs_diff,
-                          mean_relative_diff,max_relative_diff,status,checked_at
-                   FROM dc_market_provider_field_audit WHERE trade_date=?
-                   ORDER BY dataset,field_name""",
-                (target,),
-            ).fetchall()
-            state["provider_field_audit"] = {
-                "trade_date": target,
-                "items": [dict(row) for row in audit_rows],
-                "contract": "alis_market_provider_field_audit_v1",
-            }
-            from app.data_platform.services.market_bulk_execution import recent_execution_status
-            state["provider_bulk_executions"] = {
-                "trade_date": target,
-                "items": recent_execution_status(target),
-                "contract": "alis_market_bulk_checkpoint_v1",
-            }
+            if not compact:
+                # These are useful for the full data-center diagnostics but
+                # are too expensive for the task-center poll: calibration
+                # opens one connection per dataset/provider and the two
+                # detailed projections are only explanatory evidence.
+                from app.data_platform.services.market_data_discovery import provider_calibration_status
+                state["provider_calibration"] = provider_calibration_status()
+                audit_rows = c.execute(
+                    """SELECT dataset,trade_date,primary_provider,fallback_provider,field_name,
+                              compared_count,mismatch_count,mean_abs_diff,max_abs_diff,
+                              mean_relative_diff,max_relative_diff,status,checked_at
+                       FROM dc_market_provider_field_audit WHERE trade_date=?
+                       ORDER BY dataset,field_name""",
+                    (target,),
+                ).fetchall()
+                state["provider_field_audit"] = {
+                    "trade_date": target,
+                    "items": [dict(row) for row in audit_rows],
+                    "contract": "alis_market_provider_field_audit_v1",
+                }
+                from app.data_platform.services.market_bulk_execution import recent_execution_status
+                state["provider_bulk_executions"] = {
+                    "trade_date": target,
+                    "items": recent_execution_status(target),
+                    "contract": "alis_market_bulk_checkpoint_v1",
+                }
     except TradeCalendarNotReady as exc:
         state.update({
             "ok": False,
@@ -986,7 +1008,7 @@ def daily_update_status(*, compact: bool = False) -> dict[str, Any]:
     return state
 
 
-def simple_health() -> dict[str, Any]:
+def simple_health(*, compact: bool = False) -> dict[str, Any]:
     try:
         with _conn() as c:
             target = target_trade_date(c)
@@ -996,7 +1018,17 @@ def simple_health() -> dict[str, Any]:
                 "stock_count": c.execute("SELECT COUNT(*) cnt FROM dc_stock_master").fetchone(),
                 "snapshot_count": {"cnt": snapshot_count},
                 "latest_trade_date": {"value": _latest_usable_snapshot_date(c)},
-                "latest_decision_ready_trade_date": {"value": _latest_decision_ready_trade_date(c)},
+                # The full health route searches prior sessions when today's
+                # target is incomplete.  That is valuable for diagnostics but
+                # can take several seconds against a large PIT history.  A
+                # compact task-center read only needs to know whether the
+                # current target is executable; never substitute an older
+                # session as if it were today's readiness.
+                "latest_decision_ready_trade_date": {
+                    "value": (
+                        target if contract.get("ok") else ""
+                    ) if compact else _latest_decision_ready_trade_date(c)
+                },
                 "latest_announcement": c.execute("SELECT MAX(publish_time) value FROM dc_announcement_raw").fetchone(),
                 "failed_runs": c.execute("SELECT COUNT(*) cnt FROM data_ingestion_runs WHERE status='failed'").fetchone(),
                 "recent_failed_runs": c.execute(
