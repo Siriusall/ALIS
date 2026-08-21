@@ -258,16 +258,13 @@ class BacktestDataSource:
                 projection_columns = _table_columns(schema_conn, "dc_tushare_raw_records")
             projection_rank_sql = "0"
             projection_filter_sql = ""
+            version_source_sql = "dc_tushare_raw_record_version v"
             if {"api_name", "record_key", "content_hash"}.issubset(projection_columns):
-                projection_rank_sql = (
-                    "CASE WHEN EXISTS (SELECT 1 FROM dc_tushare_raw_records p "
-                    "WHERE p.api_name=v.api_name AND p.record_key=v.record_key "
-                    "AND p.content_hash=v.content_hash) THEN 1 ELSE 0 END"
-                )
-                projection_filter_sql = (
-                    "EXISTS (SELECT 1 FROM dc_tushare_raw_records p "
-                    "WHERE p.api_name=v.api_name AND p.record_key=v.record_key "
-                    "AND p.content_hash=v.content_hash)"
+                version_source_sql = (
+                    "dc_tushare_raw_record_version v "
+                    "JOIN dc_tushare_raw_records p "
+                    "ON p.api_name=v.api_name AND p.record_key=v.record_key "
+                    "AND p.content_hash=v.content_hash"
                 )
             predicates = [
                 "v.api_name=?",
@@ -311,7 +308,7 @@ class BacktestDataSource:
                                   ORDER BY {projection_rank_sql} DESC,
                                            v.observed_at DESC,v.created_at DESC,v.id DESC
                                 ) AS row_rank
-                           FROM dc_tushare_raw_record_version v
+                           FROM {version_source_sql}
                           WHERE {where}
                        )
                        SELECT api_name,record_key,ts_code,trade_date,payload_json,
