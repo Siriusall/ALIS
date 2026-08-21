@@ -11,7 +11,7 @@ router = APIRouter(tags=["console-snapshots"])
 @router.get("/console/snapshots/{page_key}")
 def console_page_snapshot(
     page_key: str,
-    refresh: bool = Query(default=False, description="Rebuild this page snapshot before returning it."),
+    refresh: bool = Query(default=False, description="Queue a background rebuild; never blocks this read."),
 ) -> dict:
     try:
         return read(page_key, force=refresh)

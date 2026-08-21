@@ -35,6 +35,10 @@ _DEFAULT_TTLS = {
 _locks = {key: threading.Lock() for key in PAGE_KEYS}
 _schema_ready = False
 _schema_lock = threading.Lock()
+_refresh_pending: set[str] = set()
+_refresh_lock = threading.Lock()
+_refresh_event = threading.Event()
+_scheduler_started = False
 
 
 def _now() -> str:
@@ -232,21 +236,58 @@ def invalidate(page_keys: list[str] | tuple[str, ...] = PAGE_KEYS, *, reason: st
             if page_key in PAGE_KEYS:
                 conn.execute("UPDATE console_page_snapshots SET invalidated_at=? WHERE page_key=?", (now, page_key))
                 redis_delete(_redis_key(page_key))
+                request_refresh(page_key)
 
 
-def _refresh_in_background(page_key: str) -> bool:
-    """Start one rebuild without making a browser wait on expensive readers."""
-    lock = _locks[page_key]
-    if not lock.acquire(blocking=False):
+def request_refresh(page_key: str) -> bool:
+    """Queue a rebuild for the single low-priority snapshot worker.
+
+    This deliberately does *not* start a thread in a request handler.  The
+    app host only has one Uvicorn worker; an HTTP miss must never become a
+    competing large-query workload.
+    """
+    if page_key not in PAGE_KEYS:
         return False
+    with _refresh_lock:
+        already_queued = page_key in _refresh_pending
+        _refresh_pending.add(page_key)
+        _refresh_event.set()
+    return not already_queued
 
-    def runner() -> None:
-        try:
-            build(page_key)
-        finally:
-            lock.release()
 
-    threading.Thread(target=runner, name=f"console-snapshot-{page_key}", daemon=True).start()
+def start_snapshot_scheduler() -> bool:
+    """Pre-warm and refresh pages outside browser request lifetimes."""
+    global _scheduler_started
+    with _refresh_lock:
+        if _scheduler_started:
+            return True
+        _scheduler_started = True
+
+    def loop() -> None:
+        # On restart every page gets a controlled warm-up.  Existing durable
+        # snapshots remain readable until their replacement commits.
+        for page_key in PAGE_KEYS:
+            request_refresh(page_key)
+        while True:
+            _refresh_event.wait(timeout=30.0)
+            _refresh_event.clear()
+            while True:
+                with _refresh_lock:
+                    page_key = next(iter(_refresh_pending), None)
+                    if page_key:
+                        _refresh_pending.discard(page_key)
+                if not page_key:
+                    break
+                try:
+                    build(page_key)
+                except Exception:
+                    # Keep the prior durable snapshot.  A later invalidation
+                    # or restart can retry; never poison browser reads.
+                    pass
+                # Avoid a burst against the same small PostgreSQL budget.
+                time.sleep(1.0)
+
+    threading.Thread(target=loop, name="console-snapshot-scheduler", daemon=True).start()
     return True
 
 
@@ -286,17 +327,26 @@ def read(page_key: str, *, force: bool = False) -> dict[str, Any]:
             return cached
     durable = _load_durable(page_key)
     if durable:
-        # A manual browser refresh is still non-blocking: it asks the server
-        # to discard the Redis mirror and rebuild in the background, while the
-        # last PostgreSQL-authoritative document remains visible.
+        # A browser never performs the rebuild. It gets the last committed
+        # authority while the singleton scheduler handles the refresh.
         redis_payload = copy.deepcopy(durable)
         redis_payload["stale"] = True
-        redis_payload["refreshing"] = _refresh_in_background(page_key)
+        redis_payload["refreshing"] = request_refresh(page_key)
         set_json(_redis_key(page_key), redis_payload, ttl=min(15, _ttl(page_key)))
         return redis_payload
-    lock = _locks[page_key]
-    with lock:
-        return build(page_key)
+    request_refresh(page_key)
+    return {
+        "page": page_key,
+        "version": "",
+        "generated_at": "",
+        "as_of": "",
+        "status": "warming_up",
+        "stale": False,
+        "refreshing": True,
+        "sections": {},
+        "data": {},
+        "error": "No committed page snapshot exists yet; background warm-up is queued.",
+    }
 
 
 def status() -> dict[str, Any]:
@@ -306,4 +356,6 @@ def status() -> dict[str, Any]:
             "SELECT page_key, version, generated_at, as_of, status, invalidated_at, updated_at "
             "FROM console_page_snapshots ORDER BY page_key"
         ).fetchall()
-    return {"ok": True, "items": [dict(row) for row in rows], "pages": list(PAGE_KEYS)}
+    with _refresh_lock:
+        pending = sorted(_refresh_pending)
+    return {"ok": True, "items": [dict(row) for row in rows], "pages": list(PAGE_KEYS), "pending": pending}
