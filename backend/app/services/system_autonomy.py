@@ -401,6 +401,15 @@ def _owner_summary(steps: list[dict[str, Any]]) -> dict[str, Any]:
                 "model_auto_promoted": int(model.get("auto_promoted_count") or 0),
                 "model_auto_rejected": int(model.get("auto_rejected_count") or 0),
                 "model_training_started": int(model.get("started_count") or 0),
+                "model_training_delegated": bool(
+                    str(model.get("status") or "") == "delegated"
+                    or str(model.get("execution_mode") or "") == "persistent_research_task"
+                ),
+                "model_autonomy_task_id": int(model.get("task_id") or 0) or None,
+                "model_autonomy_task_status": str(
+                    model.get("task_status") or model.get("status") or ""
+                ),
+                "model_autonomy_worker_pool": str(model.get("worker_pool") or ""),
                 "model_degraded_count": len(degraded_models),
                 "degraded_models": degraded_models,
                 "strategy_candidates_created": int(strategy.get("created_count") or 0),
@@ -474,10 +483,12 @@ def run_system_autonomy_cycle(*, trade_date: str = "") -> dict[str, Any]:
     from app.services.corporate_actions import run_corporate_action_cycle
     from app.services.execution_cost_calibration import calibrate_execution_cost_model
     from app.services.factor_platform import run_factor_daily_cycle
-    from app.services.plan_model_auto_optimizer import run_auto_optimization_once
     from app.services.performance_reports import run_periodic_performance_review
     from app.services.review_data_quality_governance import run_review_data_quality_governance
-    from app.services.evolution_orchestrator import enqueue_strategy_shadow_daily_task
+    from app.services.evolution_orchestrator import (
+        enqueue_plan_model_autonomy_task,
+        enqueue_strategy_shadow_daily_task,
+    )
     from app.services.research_data_assets import audit_research_data_assets
     from app.services.theme_revenue_exposure import materialize_theme_revenue_exposure
     from app.services.free_research_data import materialize_cn_ppi_price_proxies, materialize_financial_industry_series, materialize_futures_price_proxies
@@ -564,7 +575,17 @@ def run_system_autonomy_cycle(*, trade_date: str = "") -> dict[str, Any]:
             ),
         ),
         experimental_step("factor_daily_cycle", run_factor_daily_cycle),
-        experimental_step("plan_model_autonomy", lambda: run_auto_optimization_once(force=False)),
+        # Model training is a large historical read and belongs to the
+        # research worker.  The control-plane daily bus only persists an
+        # idempotent task and continues immediately, preserving the production
+        # decision/ledger path even when the research database is busy.
+        experimental_step(
+            "plan_model_autonomy",
+            lambda: enqueue_plan_model_autonomy_task(
+                frozen_trade_date or current_market_date,
+                trigger="daily_system_autonomy",
+            ),
+        ),
         # Future shadow consumes the current experiment gate and the
         # candidate's already-frozen formal evidence. It must not inherit the
         # rolling historical OOS audit, whose historical PIT failures cannot

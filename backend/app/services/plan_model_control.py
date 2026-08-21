@@ -2352,8 +2352,13 @@ def _build_plan_training_dataset(
         )
         values_sql = ",".join(["(?, ?)"] * len(mapped_dates))
         values_params = [value for pair in mapped_dates for value in pair]
-        if getattr(c, "_is_postgres", False):
-            c.execute("SELECT set_config('statement_timeout', ?, false)", ("120000",))
+        # ``data_conn`` applies the shared 30s PostgreSQL statement budget on
+        # every session.  Do not override it here: this dataset is intentionally
+        # executed by the persistent research task in bounded retries, and a
+        # two-minute session override lets one full-history scan monopolise
+        # ``alis_data`` and starve the API/control-plane workload.  The task
+        # checkpoint/retry contract is the recovery mechanism for a timeout;
+        # callers must not turn this into an unbounded synchronous query.
         sampled_symbols: list[str] = []
         symbol_sampling = {
             "contract": "not_applicable_for_theme_level_training",

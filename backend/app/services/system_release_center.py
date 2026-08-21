@@ -21,7 +21,7 @@ from app.services.strategy_controller import active_strategy_policy_context
 
 RELEASE_SCHEMA_VERSION = "alis_system_release_manifest_v1"
 DECISION_MANIFEST_SCHEMA_VERSION = "alis_decision_version_manifest_v3"
-SIM_SCHEMA_HEAD = "sim_0010_snapshot_generation"
+SIM_SCHEMA_HEAD = "sim_0011_model_research_route"
 DATA_SCHEMA_HEAD = "data_0012_large_table_autovacuum"
 REPO_ROOT = Path(__file__).resolve().parents[3]
 

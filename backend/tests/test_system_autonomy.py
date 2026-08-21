@@ -409,6 +409,72 @@ def test_autonomy_freezes_production_plan_before_long_experiments(monkeypatch):
     assert "llm_data_operations" not in invoked
 
 
+def test_autonomy_delegates_model_training_without_running_optimizer_inline(monkeypatch):
+    delegated = []
+
+    def fake_enqueue(trade_date="", *, trigger=""):
+        delegated.append((trade_date, trigger))
+        return {
+            "ok": True,
+            "status": "delegated",
+            "task_status": "queued",
+            "task_id": 321,
+            "trade_date": trade_date,
+            "worker_pool": "research",
+            "execution_mode": "persistent_research_task",
+        }
+
+    monkeypatch.setattr(
+        "app.services.evolution_orchestrator.enqueue_plan_model_autonomy_task",
+        fake_enqueue,
+    )
+    monkeypatch.setattr(
+        "app.services.production_strategy.champion_execution_gate",
+        lambda: {"status": "allowed", "mode": "normal"},
+    )
+
+    def controlled_run_step(name, fn):
+        if name == "hard_data_gate":
+            result = {"ok": True, "status": "ready"}
+        elif name == "decision_data_gate":
+            result = {
+                "ok": True,
+                "status": "ready",
+                "decision_ready": True,
+                "experiment_ready": True,
+                "readiness": {"target_trade_date": "20260810"},
+            }
+        elif name == "plan_model_autonomy":
+            # Execute exactly the delegation callback.  If the old inline
+            # optimizer were still wired here this test would hit the real
+            # training path (or the monkeypatched guard below).
+            result = fn()
+        elif name == "autonomous_self_healing":
+            result = {"ok": True, "status": "completed", "components": {}}
+        elif name == "llm_incident_supervisor":
+            result = {"ok": True, "status": "self_managed", "owner_action_required_count": 0}
+        else:
+            result = {"ok": True, "status": "completed"}
+        return {"name": name, "ok": bool(result.get("ok", True)), "result": result}
+
+    monkeypatch.setattr(system_autonomy, "_run_step", controlled_run_step)
+
+    # The production optimizer must not be imported/called by the daily bus.
+    # A raising replacement makes an accidental synchronous call explicit.
+    monkeypatch.setattr(
+        "app.services.plan_model_auto_optimizer.run_auto_optimization_once",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("optimizer ran inline")),
+    )
+
+    result = system_autonomy.run_system_autonomy_cycle(trade_date="20260810")
+    model_step = next(item for item in result["steps"] if item["name"] == "plan_model_autonomy")
+
+    assert delegated == [("20260810", "daily_system_autonomy")]
+    assert model_step["result"]["status"] == "delegated"
+    assert model_step["result"]["worker_pool"] == "research"
+    assert model_step["result"]["task_id"] == 321
+
+
 def test_recovery_cycle_retries_strategy_shadow_after_data_becomes_ready(monkeypatch):
     calls = []
 

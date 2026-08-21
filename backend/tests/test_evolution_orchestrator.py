@@ -25,6 +25,78 @@ def test_long_research_claims_continue_on_non_trade_days(monkeypatch):
     assert evolution._defer_long_research_claims(datetime(2026, 8, 15, 18, 0)) is False
 
 
+def test_superseded_task_reconciliation_reads_autocommit_then_writes(monkeypatch):
+    """Broad reconciliation scans must not hold a writable transaction open."""
+
+    events = []
+
+    class Result:
+        rowcount = 1
+
+        def __init__(self, rows=()):
+            self.rows = list(rows)
+
+        def fetchall(self):
+            return self.rows
+
+    queued = {
+        "id": 11,
+        "task_type": "strategy_evolution_cycle",
+        "status": "queued",
+        "payload_json": '{"trigger":"weekly_scheduler"}',
+    }
+
+    class ReadConnection:
+        def execute(self, sql, params=()):  # noqa: ANN001
+            events.append(("read", "execute", str(sql)))
+            if "LIMIT ?" in str(sql):
+                return Result([queued])
+            return Result([queued])
+
+    class WriteConnection:
+        def execute(self, sql, params=()):  # noqa: ANN001
+            events.append(("write", "execute", str(sql)))
+            assert str(sql).lstrip().upper().startswith("UPDATE")
+            return Result()
+
+    @contextmanager
+    def read_connection():
+        events.append(("read", "enter"))
+        yield ReadConnection()
+        events.append(("read", "exit"))
+
+    @contextmanager
+    def write_connection():
+        events.append(("write", "enter"))
+        yield WriteConnection()
+        events.append(("write", "exit"))
+
+    monkeypatch.setattr(evolution, "_read_conn", read_connection)
+    monkeypatch.setattr(evolution, "_conn", write_connection)
+    monkeypatch.setattr(evolution, "V10_RESEARCH_ENABLED", True)
+
+    result = evolution.reconcile_superseded_evolution_tasks(limit=10)
+
+    assert result["count"] == 1
+    assert result["quarantined"] == [
+        {
+            "id": 11,
+            "reason": "旧 weekly_scheduler 合同已由 V10 事件驱动研究替代，保留证据但禁止执行",
+        }
+    ]
+    # Both SELECTs finish and the read-only connection closes before the
+    # writable transaction is opened for the conditional UPDATE.
+    assert [item[:2] for item in events] == [
+        ("read", "enter"),
+        ("read", "execute"),
+        ("read", "execute"),
+        ("read", "exit"),
+        ("write", "enter"),
+        ("write", "execute"),
+        ("write", "exit"),
+    ]
+
+
 def test_checkpoint_recovery_claim_does_not_consume_failure_attempt(monkeypatch):
     statements = []
 
@@ -111,6 +183,34 @@ def test_shadow_daily_dispatch_is_idempotent_by_date_and_current_data_contract(m
     assert calls[0]["payload"]["data_contract"] == "current_experiment_gate_and_candidate_frozen_formal_evidence_v1"
     assert calls[0]["payload"]["observation_contract"] == "alis_strategy_shadow_incremental_task_v5"
     assert calls[0]["dedupe_key"] == "strategy_shadow_daily:v5:20260810"
+
+
+def test_plan_model_autonomy_dispatches_to_research_worker(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        evolution,
+        "create_evolution_task",
+        lambda **kwargs: calls.append(kwargs) or {
+            "id": 92,
+            "status": "queued",
+            "phase": "queued",
+            "progress": 0,
+            "message": "等待研究 Worker",
+            "worker_pool": kwargs.get("worker_pool"),
+        },
+    )
+
+    result = evolution.enqueue_plan_model_autonomy_task("2026-08-10")
+
+    assert result["ok"] is True
+    assert result["status"] == "delegated"
+    assert result["execution_mode"] == "persistent_research_task"
+    assert result["worker_pool"] == "research"
+    assert result["task_id"] == 92
+    assert calls[0]["task_type"] == "plan_model_autonomy"
+    assert calls[0]["worker_pool"] == "research"
+    assert calls[0]["dedupe_key"] == "plan_model_autonomy:daily:v1:20260810"
+    assert calls[0]["payload"]["production_change_forbidden"] is True
 
 
 def test_plan_model_autonomy_holds_worker_until_training_is_terminal(monkeypatch):

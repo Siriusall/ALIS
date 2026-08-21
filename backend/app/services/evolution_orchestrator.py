@@ -18,6 +18,7 @@ from app.core.trade_calendar import is_trade_day
 from app.data_platform.services.market_calendar import TradeCalendarNotReady
 from app.db.store import (
     _conn,
+    _read_conn,
     get_model_version,
     get_strategy,
     list_model_versions,
@@ -91,7 +92,7 @@ LONG_RESEARCH_TASK_TYPES = frozenset({
     "strategy_cluster_distillation", "strategy_portfolio_research",
     "strategy_failure_model_training", "model_candidate_research",
     "model_strategy_impact_validation", "hsmm_shadow_training",
-    "controller_candidate_observation",
+    "controller_candidate_observation", "plan_model_autonomy",
 })
 
 
@@ -360,7 +361,13 @@ def reconcile_superseded_evolution_tasks(*, limit: int = 200) -> dict[str, Any]:
     OOS with a live lease, are never touched.
     """
     now = _now().isoformat()
-    with _conn() as conn:
+    # Keep the potentially broad task scans out of a writable transaction.
+    # The old implementation opened ``_conn`` before both SELECTs and then
+    # performed Python-side graph construction, leaving the session idle in
+    # transaction while it worked.  A read-only autocommit connection closes
+    # each SELECT immediately; the conditional UPDATE below is the only part
+    # that needs a writable transaction.
+    with _read_conn() as conn:
         rows = conn.execute(
             """SELECT id,task_type,status,payload_json
                FROM evolution_tasks
@@ -387,24 +394,29 @@ def reconcile_superseded_evolution_tasks(*, limit: int = 200) -> dict[str, Any]:
             if predecessor and str(item.get("task_type") or "") in successor_types:
                 successor_edges.add((predecessor, str(item.get("task_type") or "")))
 
-        quarantined: list[dict[str, Any]] = []
-        for row in rows:
-            task = dict(row)
-            task["payload"] = _loads(task.pop("payload_json", None), {})
-            reason = _superseded_task_reason(task, successor_edges)
-            if not reason:
-                continue
-            cursor = conn.execute(
-                """UPDATE evolution_tasks
-                   SET status='cancelled',phase='superseded',progress=1,
-                       message=?,error=NULL,stop_requested=1,
-                       finished_at=?,lease_owner=NULL,lease_expires_at=NULL,
-                       heartbeat_at=?,updated_at=?
-                   WHERE id=? AND status IN ('queued','retry_wait')""",
-                (reason, now, now, now, int(task["id"])),
-            )
-            if int(cursor.rowcount or 0) > 0:
-                quarantined.append({"id": int(task["id"]), "reason": reason})
+    superseded: list[tuple[dict[str, Any], str]] = []
+    for row in rows:
+        task = dict(row)
+        task["payload"] = _loads(task.pop("payload_json", None), {})
+        reason = _superseded_task_reason(task, successor_edges)
+        if reason:
+            superseded.append((task, reason))
+
+    quarantined: list[dict[str, Any]] = []
+    if superseded:
+        with _conn() as conn:
+            for task, reason in superseded:
+                cursor = conn.execute(
+                    """UPDATE evolution_tasks
+                       SET status='cancelled',phase='superseded',progress=1,
+                           message=?,error=NULL,stop_requested=1,
+                           finished_at=?,lease_owner=NULL,lease_expires_at=NULL,
+                           heartbeat_at=?,updated_at=?
+                       WHERE id=? AND status IN ('queued','retry_wait')""",
+                    (reason, now, now, now, int(task["id"])),
+                )
+                if int(cursor.rowcount or 0) > 0:
+                    quarantined.append({"id": int(task["id"]), "reason": reason})
     return {
         "ok": True,
         "schema_version": LEGACY_TASK_RECONCILIATION_VERSION,
@@ -1724,6 +1736,70 @@ def enqueue_strategy_shadow_daily_task(
         "task": {key: task.get(key) for key in ("id", "status", "phase", "progress", "message")},
         "execution_mode": "persistent_incremental_task",
         "production_change_forbidden_until_shadow_gate": True,
+    }
+
+
+def enqueue_plan_model_autonomy_task(
+    trade_date: str = "",
+    *,
+    trigger: str = "daily_system_autonomy",
+) -> dict[str, Any]:
+    """Delegate model auto-optimization to the dedicated research worker.
+
+    The daily autonomy bus runs on the control worker because it owns the
+    production decision/ledger sequence.  Model training can scan a large
+    point-in-time history, however, and must never execute inline on that
+    worker.  This helper only persists a bounded evolution task; the research
+    worker later claims it and executes the existing task-native runner.
+
+    The date-scoped dedupe key makes repeated recovery cycles idempotent while
+    still allowing the next trading day to enqueue an independent research
+    run.  ``worker_pool`` is explicit here (rather than relying solely on the
+    task-type default) so a deployment cannot accidentally route this heavy
+    task back to the control plane during a rolling upgrade.
+    """
+    normalized_date = str(trade_date or "").replace("-", "")[:8]
+    if normalized_date and (len(normalized_date) != 8 or not normalized_date.isdigit()):
+        return {
+            "ok": False,
+            "status": "invalid_trade_date",
+            "trade_date": normalized_date,
+            "execution_mode": "persistent_research_task",
+        }
+    date_key = normalized_date or "undated"
+    task = create_evolution_task(
+        task_type="plan_model_autonomy",
+        payload={
+            "trigger": str(trigger or "daily_system_autonomy"),
+            "trade_date": normalized_date or None,
+            "delegated_from": "system_autonomy_cycle",
+            "production_change_forbidden": True,
+            "execution_contract": "alis_plan_model_autonomy_research_task_v1",
+        },
+        dedupe_key=f"plan_model_autonomy:daily:v1:{date_key}",
+        max_attempts=3,
+        priority=73,
+        worker_pool="research",
+    )
+    task_status = str(task.get("status") or "queued")
+    # Keep the bus-level status distinct from the persisted task status.  A
+    # task may already be running because a recovery cycle raced this enqueue;
+    # either case is a successful delegation, while the raw status remains
+    # available to the owner/UI for observability.
+    delegated = task_status in {"queued", "running", "retry_wait"}
+    return {
+        "ok": True,
+        "status": "delegated" if delegated else task_status,
+        "task_status": task_status,
+        "task_id": int(task.get("id") or 0) or None,
+        "trade_date": normalized_date,
+        "worker_pool": "research",
+        "execution_mode": "persistent_research_task",
+        "task": {
+            key: task.get(key)
+            for key in ("id", "status", "phase", "progress", "message", "worker_pool")
+        },
+        "production_change_forbidden": True,
     }
 
 

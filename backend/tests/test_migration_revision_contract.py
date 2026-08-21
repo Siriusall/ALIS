@@ -52,3 +52,19 @@ def test_runtime_schema_heads_match_alembic_heads() -> None:
     data_revisions, data_referenced = _revision_graph(root / "data")
     assert set(sim_revisions) - sim_referenced == {SIM_SCHEMA_HEAD}
     assert set(data_revisions) - data_referenced == {DATA_SCHEMA_HEAD}
+
+
+def test_model_autonomy_route_migration_only_moves_pending_tasks(monkeypatch) -> None:
+    from migrations.sim.versions import sim_0011_route_model_autonomy_research as migration
+
+    statements: list[str] = []
+    monkeypatch.setattr(migration.op, "execute", lambda sql: statements.append(str(sql)))
+
+    migration.upgrade()
+
+    assert len(statements) == 1
+    statement = statements[0].lower()
+    assert "task_type='plan_model_autonomy'" in statement
+    assert "status in ('queued','retry_wait')" in statement
+    assert "worker_pool='research'" in statement
+    assert "running" not in statement
