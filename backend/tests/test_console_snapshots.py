@@ -43,3 +43,12 @@ def test_missing_snapshot_never_builds_in_browser_read(monkeypatch):
 
     assert payload["status"] == "warming_up"
     assert payload["refreshing"] is True
+
+
+def test_snapshot_refresh_defaults_match_page_freshness_contract():
+    assert snapshots._ttl("overview") == 30
+    assert snapshots._ttl("decision") == 30
+    assert snapshots._ttl("portfolio") == 30
+    assert snapshots._ttl("operations") == 15
+    assert snapshots._ttl("data") == 60
+    assert snapshots._ttl("models") == 300

@@ -39,6 +39,7 @@ _refresh_pending: set[str] = set()
 _refresh_lock = threading.Lock()
 _refresh_event = threading.Event()
 _scheduler_started = False
+_next_periodic_refresh_at: dict[str, float] = {}
 
 
 def _now() -> str:
@@ -256,7 +257,7 @@ def request_refresh(page_key: str) -> bool:
 
 
 def start_snapshot_scheduler() -> bool:
-    """Pre-warm and refresh pages outside browser request lifetimes."""
+    """Pre-warm, event-refresh and periodically refresh pages off-request."""
     global _scheduler_started
     with _refresh_lock:
         if _scheduler_started:
@@ -268,9 +269,17 @@ def start_snapshot_scheduler() -> bool:
         # snapshots remain readable until their replacement commits.
         for page_key in PAGE_KEYS:
             request_refresh(page_key)
+            _next_periodic_refresh_at[page_key] = time.monotonic() + _ttl(page_key)
         while True:
-            _refresh_event.wait(timeout=30.0)
+            # A short wake-up is only scheduling bookkeeping.  Expensive SQL
+            # remains single-threaded below, and browser requests never join it.
+            _refresh_event.wait(timeout=1.0)
             _refresh_event.clear()
+            now = time.monotonic()
+            for page_key in PAGE_KEYS:
+                if now >= _next_periodic_refresh_at.get(page_key, 0.0):
+                    request_refresh(page_key)
+                    _next_periodic_refresh_at[page_key] = now + _ttl(page_key)
             while True:
                 with _refresh_lock:
                     page_key = next(iter(_refresh_pending), None)
@@ -280,10 +289,11 @@ def start_snapshot_scheduler() -> bool:
                     break
                 try:
                     build(page_key)
+                    _next_periodic_refresh_at[page_key] = time.monotonic() + _ttl(page_key)
                 except Exception:
                     # Keep the prior durable snapshot.  A later invalidation
-                    # or restart can retry; never poison browser reads.
-                    pass
+                    # or bounded periodic retry can retry; never poison reads.
+                    _next_periodic_refresh_at[page_key] = time.monotonic() + min(30, _ttl(page_key))
                 # Avoid a burst against the same small PostgreSQL budget.
                 time.sleep(1.0)
 
