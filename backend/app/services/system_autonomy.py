@@ -12,7 +12,7 @@ from typing import Any, Callable
 import uuid
 
 from app.core.error_evidence import error_evidence
-from app.db.store import _conn
+from app.db.store import _conn, _read_conn
 
 
 _STEP_TIMEOUT_SECONDS = max(15, min(int(os.getenv("ALIS_AUTONOMY_STEP_TIMEOUT_SECONDS", "120")), 900))
@@ -697,7 +697,10 @@ def _owner_rebalance_action(action: dict[str, Any]) -> dict[str, Any]:
 
 
 def _build_latest_owner_summary() -> dict[str, Any]:
-    with _conn() as conn:
+    # This projection is read-only and is followed by JSON decoding outside
+    # the database call.  Use an autocommit connection so that decoding a
+    # large completed cycle cannot leave ``idle in transaction`` on PostgreSQL.
+    with _read_conn() as conn:
         row = conn.execute(
             """SELECT id,status,result_json,finished_at FROM evolution_tasks
                WHERE task_type='system_autonomy_cycle' AND status='completed'
@@ -891,7 +894,10 @@ def _autonomy_trade_date(task: dict[str, Any]) -> str:
 def build_autonomy_slo(tasks: list[dict[str, Any]] | None = None, *, window_sessions: int = AUTONOMY_SLO_WINDOW_SESSIONS) -> dict[str, Any]:
     """Measure rolling autonomy reliability from persisted cycle evidence."""
     if tasks is None:
-        with _conn() as conn:
+        # SLO computation is pure Python after this bounded SELECT.  Keep the
+        # read outside a writable transaction while the task evidence is
+        # normalized and grouped below.
+        with _read_conn() as conn:
             if getattr(conn, "_is_postgres", False):
                 # SLO checks only need three gate results. Avoid transferring
                 # every historical step and its nested evidence to the API.

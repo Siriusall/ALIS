@@ -406,7 +406,10 @@ def build_position_market_series_cache(
                         ),
                         ts_codes=stock_codes,
                         trade_date_end=compact_date,
-                        limit=max(history_limit * len(stock_codes), history_limit),
+                        # A global LIMIT lets a dense symbol consume the
+                        # result set and starve other holdings.  Bound the
+                        # history independently for each requested security.
+                        per_ts_code_limit=history_limit,
                     )
                     if versioned_rows is not None:
                         rows = []

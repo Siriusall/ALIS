@@ -267,6 +267,7 @@ def load_raw_record_versions(
     ts_codes: list[str] | tuple[str, ...] | None = None,
     trade_date_start: str = "",
     trade_date_end: str = "",
+    period_limit: int = 0,
     limit: int = 0,
 ) -> list[dict[str, Any]] | None:
     """Read the latest immutable raw observations visible at ``cutoff``.
@@ -281,6 +282,14 @@ def load_raw_record_versions(
     observation was available.  Callers may only fall back to the mutable
     projection for isolated, non-PostgreSQL legacy fixtures; production must
     treat ``None`` as missing evidence.
+
+    ``period_limit`` optionally keeps only the newest N distinct ``period``
+    values per ``ts_code``.  The bound is applied *after* the accepted
+    projection hash and all point-in-time clocks have been checked, and one
+    latest immutable version is retained for each code/period.  This is used
+    by wide financial readers that need recent reporting periods rather than
+    the complete append-only archive; the default ``0`` preserves the full
+    logical result.
     """
     columns = _table_columns(c, "dc_tushare_raw_record_version")
     required = {
@@ -375,6 +384,7 @@ def load_raw_record_versions(
     if trade_date_end:
         predicates.append("v.trade_date<=?")
         params.append(str(trade_date_end))
+    bounded_periods = max(1, int(period_limit)) if period_limit else 0
     source_sql = "dc_tushare_raw_record_version v"
     if {"api_name", "record_key", "content_hash"}.issubset(projection_columns):
         source_sql = (
@@ -382,7 +392,65 @@ def load_raw_record_versions(
             "ON p.api_name=v.api_name AND p.record_key=v.record_key AND p.content_hash=v.content_hash"
             f"{accepted_trade_date_join}"
         )
-    if {"api_name", "record_key", "content_hash"}.issubset(projection_columns):
+    selected_columns = (
+        "id,api_name,record_key,ts_code,trade_date,period,ann_date,payload_json,"
+        "source_code,economic_available_time,observed_at,first_observed_at,"
+        "observation_provenance,content_hash,created_at"
+    )
+    qualified_columns = (
+        "v.id,v.api_name,v.record_key,v.ts_code,v.trade_date,v.period,v.ann_date,"
+        "v.payload_json,v.source_code,v.economic_available_time,v.observed_at,"
+        "v.first_observed_at,v.observation_provenance,v.content_hash,v.created_at"
+    )
+    if bounded_periods:
+        # The accepted-hash join above is already unique per logical record
+        # in production.  The compatibility branch first applies the same
+        # latest-version rule as the unbounded reader, then both branches
+        # select one latest version for each code/period and the newest N
+        # periods for each code.  Ranking occurs only after all PIT predicates
+        # have filtered the source, so a late accepted revision cannot leak
+        # into a historical cutoff or force a fallback to an older hash.
+        observed_rank = _timestamp_value_sql("visible.observed_at", is_postgres=is_postgres)
+        created_rank = _timestamp_value_sql("visible.created_at", is_postgres=is_postgres)
+        period_rank = "NULLIF(TRIM(COALESCE(visible.period,'')),'')"
+        if {"api_name", "record_key", "content_hash"}.issubset(projection_columns):
+            visible_cte = f"""visible AS (
+                SELECT {qualified_columns}
+                  FROM {source_sql}
+                 WHERE {' AND '.join(predicates)}
+            )"""
+        else:
+            visible_cte = f"""visible_versions AS (
+                SELECT {qualified_columns},
+                       ROW_NUMBER() OVER (
+                           PARTITION BY v.api_name,v.record_key
+                           ORDER BY {timestamp_cast} DESC,{created_cast} DESC,v.id DESC
+                       ) AS logical_rank
+                  FROM {source_sql}
+                 WHERE {' AND '.join(predicates)}
+            ), visible AS (
+                SELECT {selected_columns}
+                  FROM visible_versions
+                 WHERE logical_rank=1
+            )"""
+        sql = f"""WITH {visible_cte}, period_ranked AS (
+                SELECT visible.*,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY visible.ts_code,{period_rank}
+                           ORDER BY {observed_rank} DESC,{created_rank} DESC,visible.id DESC
+                       ) AS version_rank,
+                       DENSE_RANK() OVER (
+                           PARTITION BY visible.ts_code
+                           ORDER BY {period_rank} DESC
+                       ) AS period_rank
+                  FROM visible
+             )
+             SELECT {selected_columns}
+               FROM period_ranked
+              WHERE version_rank=1 AND period_rank<=?
+              ORDER BY ts_code,period DESC,observed_at,id"""
+        params.append(bounded_periods)
+    elif {"api_name", "record_key", "content_hash"}.issubset(projection_columns):
         # The accepted projection has one row per (api_name, record_key), and
         # the immutable table is unique on (api_name, record_key,
         # content_hash).  Their exact-hash join therefore returns at most one
@@ -490,9 +558,17 @@ def load_snapshot_versions(
     trade_date_start: str = "",
     trade_date_end: str = "",
     trade_date: str = "",
+    per_ts_code_limit: int = 0,
     limit: int = 0,
 ) -> list[dict[str, Any]] | None:
-    """Read latest immutable normalized snapshot rows under the PIT clock."""
+    """Read latest immutable normalized snapshot rows under the PIT clock.
+
+    ``per_ts_code_limit`` bounds a historical series independently for each
+    security.  A global ``LIMIT`` is not sufficient for a batch valuation: one
+    dense symbol can consume the result set and starve the remaining holdings.
+    The per-code window is applied after the accepted projection hash and all
+    point-in-time predicates, so it cannot select an unaccepted revision.
+    """
     columns = _table_columns(c, "dc_stock_daily_snapshot_version")
     required = {
         "id", "ts_code", "trade_date", "payload_json", "source_code",
@@ -554,6 +630,16 @@ def load_snapshot_versions(
     if trade_date_end:
         predicates.append("v.trade_date<=?")
         params.append(str(trade_date_end))
+    per_code_limit = max(1, int(per_ts_code_limit)) if per_ts_code_limit else 0
+    selected_columns = (
+        "id,ts_code,trade_date,payload_json,source_code,economic_available_time,"
+        "observed_at,first_observed_at,observation_provenance,content_hash,created_at"
+    )
+    qualified_columns = (
+        "v.id,v.ts_code,v.trade_date,v.payload_json,v.source_code,"
+        "v.economic_available_time,v.observed_at,v.first_observed_at,"
+        "v.observation_provenance,v.content_hash,v.created_at"
+    )
     if has_accepted_projection:
         # The accepted projection has one row per (ts_code, trade_date), and
         # append-only snapshots are unique on that key plus content_hash.
@@ -561,33 +647,67 @@ def load_snapshot_versions(
         # Do not rank or correlate against the 7 GB projection: if its chosen
         # hash arrived after the caller's PIT cutoff, returning no row is the
         # required fail-closed result.
-        sql = f"""SELECT v.id,v.ts_code,v.trade_date,v.payload_json,v.source_code,
-                         v.economic_available_time,v.observed_at,v.first_observed_at,
-                         v.observation_provenance,v.content_hash,v.created_at
-                    FROM dc_stock_daily_snapshot accepted
-                    JOIN dc_stock_daily_snapshot_version v
-                      ON v.ts_code=accepted.ts_code
-                     AND v.trade_date=accepted.trade_date
-                     AND v.content_hash=accepted.content_hash
-                   WHERE {' AND '.join(predicates)}
-                   ORDER BY v.trade_date,v.ts_code,v.observed_at,v.id"""
+        source_sql = f"""SELECT {qualified_columns}
+                              FROM dc_stock_daily_snapshot accepted
+                              JOIN dc_stock_daily_snapshot_version v
+                                ON v.ts_code=accepted.ts_code
+                               AND v.trade_date=accepted.trade_date
+                               AND v.content_hash=accepted.content_hash
+                             WHERE {' AND '.join(predicates)}"""
+        if per_code_limit:
+            sql = f"""WITH visible AS ({source_sql}), ranked AS (
+                           SELECT visible.*,
+                                  ROW_NUMBER() OVER (
+                                      PARTITION BY visible.ts_code
+                                      ORDER BY visible.trade_date DESC,
+                                               {_timestamp_value_sql('visible.observed_at', is_postgres=is_postgres)} DESC,
+                                               visible.id DESC
+                                  ) AS code_rank
+                             FROM visible
+                        )
+                        SELECT {selected_columns}
+                          FROM ranked
+                         WHERE code_rank<=?
+                         ORDER BY trade_date,ts_code,observed_at,id"""
+            params.append(per_code_limit)
+        else:
+            sql = f"""SELECT {selected_columns}
+                              FROM ({source_sql}) visible
+                             ORDER BY trade_date,ts_code,observed_at,id"""
     else:
-        sql = f"""WITH ranked AS (
-                     SELECT v.id,v.ts_code,v.trade_date,v.payload_json,v.source_code,
-                            v.economic_available_time,v.observed_at,v.first_observed_at,
-                            v.observation_provenance,v.content_hash,v.created_at,
+        sql = f"""WITH logical AS (
+                     SELECT {qualified_columns},
                             ROW_NUMBER() OVER (
                                 PARTITION BY v.ts_code,v.trade_date
                                 ORDER BY {timestamp_cast} DESC,{created_cast} DESC,v.id DESC
                             ) AS row_rank
                        FROM dc_stock_daily_snapshot_version v
                       WHERE {' AND '.join(predicates)}
+                 ), visible AS (
+                     SELECT {selected_columns}
+                       FROM logical
+                      WHERE row_rank=1
+                 )"""
+        if per_code_limit:
+            sql += f""", ranked AS (
+                     SELECT visible.*,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY visible.ts_code
+                                ORDER BY visible.trade_date DESC,
+                                         {_timestamp_value_sql('visible.observed_at', is_postgres=is_postgres)} DESC,
+                                         visible.id DESC
+                            ) AS code_rank
+                       FROM visible
                  )
-                 SELECT id,ts_code,trade_date,payload_json,source_code,
-                        economic_available_time,observed_at,first_observed_at,
-                        observation_provenance,content_hash,created_at
+                 SELECT {selected_columns}
                    FROM ranked
-                  WHERE row_rank=1
+                  WHERE code_rank<=?
+                  ORDER BY trade_date,ts_code,observed_at,id"""
+            params.append(per_code_limit)
+        else:
+            sql += f"""
+                 SELECT {selected_columns}
+                   FROM visible
                   ORDER BY trade_date,ts_code,observed_at,id"""
     if limit:
         sql += " LIMIT ?"

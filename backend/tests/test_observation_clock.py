@@ -111,6 +111,50 @@ def test_immutable_loaders_reject_blank_legacy_and_naive_observation_evidence():
     assert [(row["ts_code"], row["content_hash"]) for row in snapshots or []] == [("000001.SZ", "valid")]
 
 
+def test_snapshot_loader_per_code_limit_keeps_each_security_window():
+    connection = _connection_with_accepted_projections()
+    rows = []
+    accepted = []
+    record_id = 1
+    for code in ("000001.SZ", "000002.SZ"):
+        for offset in range(4):
+            trade_date = f"202608{14 - offset:02d}"
+            observed = f"2026-08-{14 - offset:02d}T15:01:00+08:00"
+            content_hash = f"{code}-{trade_date}"
+            rows.append((
+                record_id, code, trade_date, json.dumps({"close": record_id}),
+                "tushare", observed, observed, observed,
+                "snapshot:test", content_hash, observed,
+            ))
+            accepted.append((code, trade_date, content_hash))
+            record_id += 1
+    connection.executemany(
+        """INSERT INTO dc_stock_daily_snapshot_version
+           VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+        rows,
+    )
+    connection.executemany(
+        """INSERT INTO dc_stock_daily_snapshot(ts_code,trade_date,content_hash)
+           VALUES(?,?,?)""",
+        accepted,
+    )
+
+    visible = load_snapshot_versions(
+        connection,
+        cutoff="2026-08-14T16:00:00+08:00",
+        ts_codes=["000001.SZ", "000002.SZ"],
+        per_ts_code_limit=2,
+    )
+
+    assert [
+        (row["ts_code"], row["trade_date"])
+        for row in visible or []
+    ] == [
+        ("000001.SZ", "20260813"), ("000002.SZ", "20260813"),
+        ("000001.SZ", "20260814"), ("000002.SZ", "20260814"),
+    ]
+
+
 def test_observation_metadata_does_not_reinterpret_naive_source_clock_as_actual_fetch_time(monkeypatch):
     monkeypatch.setattr(
         "app.data_platform.services.observation_clock.now_observed_at",
@@ -268,6 +312,69 @@ def test_raw_loader_keeps_first_accepted_provider_when_later_version_arrives():
 
     assert [(row["source_code"], row["content_hash"]) for row in visible or []] == [
         ("tencent_market_snapshot", "fallback"),
+    ]
+
+
+def test_raw_loader_period_limit_is_per_code_and_keeps_accepted_pit_versions():
+    """Bound wide financial reads without weakening the immutable contract."""
+
+    connection = _connection_with_accepted_projections()
+    cutoff = "2026-08-14T15:10:00+08:00"
+
+    def version(
+        record_id: int,
+        code: str,
+        period: str,
+        content_hash: str,
+        observed: str,
+        *,
+        record_key: str | None = None,
+    ) -> tuple:
+        key = record_key or f"income:{code}:{period}"
+        payload = json.dumps({"ts_code": code, "period": period, "n_income": record_id})
+        return (
+            record_id, "income", key, code, "", period, "", payload,
+            "tushare", observed, observed, observed,
+            "tushare:direct_fetch", content_hash, observed,
+        )
+
+    rows = [
+        version(1, "000001.SZ", "20230101", "a-2023", "2026-08-14T15:01:00+08:00"),
+        version(2, "000001.SZ", "20240101", "a-2024", "2026-08-14T15:02:00+08:00"),
+        version(3, "000001.SZ", "20250101", "a-2025-old", "2026-08-14T15:03:00+08:00", record_key="income:000001.SZ:20250101"),
+        version(4, "000001.SZ", "20250101", "a-2025", "2026-08-14T15:04:00+08:00", record_key="income:000001.SZ:20250101"),
+        version(5, "000001.SZ", "20260101", "a-2026", "2026-08-14T16:00:00+08:00"),
+        version(6, "000002.SZ", "20240101", "b-2024", "2026-08-14T15:01:00+08:00"),
+        version(7, "000002.SZ", "20250101", "b-2025", "2026-08-14T15:02:00+08:00"),
+        version(8, "000002.SZ", "20230101", "b-2023", "2026-08-14T15:03:00+08:00"),
+    ]
+    connection.executemany(
+        """INSERT INTO dc_tushare_raw_record_version
+           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        rows,
+    )
+    connection.executemany(
+        """INSERT INTO dc_tushare_raw_records(api_name,record_key,content_hash)
+           VALUES(?,?,?)""",
+        [
+            ("income", row[2], row[13])
+            for row in rows
+            if row[13] != "a-2025-old"
+        ],
+    )
+
+    visible = load_raw_record_versions(
+        connection, "income", cutoff=cutoff, period_limit=2,
+    )
+
+    assert [
+        (row["ts_code"], row["period"], row["content_hash"])
+        for row in visible or []
+    ] == [
+        ("000001.SZ", "20250101", "a-2025"),
+        ("000001.SZ", "20240101", "a-2024"),
+        ("000002.SZ", "20250101", "b-2025"),
+        ("000002.SZ", "20240101", "b-2024"),
     ]
 
 

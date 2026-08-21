@@ -10,7 +10,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from app.db.store import _conn
+from app.db.store import _conn, _read_conn
 from app.services.model_evaluation_contracts import SCHEMA_VERSION
 from app.services.model_registry import models_root
 
@@ -366,7 +366,10 @@ def _archive_marker(
 
 def _raw_audit() -> dict[str, Any]:
     placeholders = ",".join("?" for _ in MODEL_KEYS)
-    with _conn() as c:
+    # This audit only reads and then decodes JSON outside the database call.
+    # Keep the session autocommit/read-only so a large historical scan cannot
+    # leave the business database idle in transaction.
+    with _read_conn() as c:
         versions = [
             dict(row)
             for row in c.execute(

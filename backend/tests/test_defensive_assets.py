@@ -121,6 +121,38 @@ def test_defensive_series_exact_date_keeps_prior_history(monkeypatch):
     assert len(returns) == 1
 
 
+def test_defensive_series_batch_bounds_each_code_history_window(monkeypatch):
+    calls = []
+
+    def fake_load(_connection, _api_name, **kwargs):
+        calls.append(dict(kwargs))
+        code = kwargs["ts_codes"][0]
+        return [
+            {
+                "ts_code": code,
+                "trade_date": f"202607{24 - index:02d}",
+                "payload_json": '{"close": 100}',
+                "observed_at": "2026-07-24T15:00:00+08:00",
+            }
+            for index in range(8)
+        ]
+
+    monkeypatch.setattr(defensive_assets, "load_raw_record_versions", fake_load)
+
+    result = defensive_assets.defensive_asset_series_batch(
+        ["510880.SH", "511010.SH"],
+        "20260724",
+        limit=3,
+        connection=object(),
+        available_as_of_time="2026-07-24T15:00:00+08:00",
+    )
+
+    assert [call["ts_codes"] for call in calls] == [["510880.SH"], ["511010.SH"]]
+    assert all(call["trade_date_start"] == "20260624" for call in calls)
+    assert all(call["trade_date_end"] == "20260724" for call in calls)
+    assert all(len(result[code][1]) == 3 for code in ("510880.SH", "511010.SH"))
+
+
 def test_defensive_asset_reader_rejects_naive_observation_cutoff(monkeypatch):
     connection = sqlite3.connect(":memory:")
     connection.row_factory = sqlite3.Row

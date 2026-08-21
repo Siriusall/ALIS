@@ -59,9 +59,9 @@ def _summarize_date_row(row: Any) -> dict[str, Any]:
 
 def _summarize_postgresql_market_snapshots(limit_days: int) -> dict[str, Any]:
     """Summarize the authoritative PostgreSQL market snapshots only."""
-    from app.data_platform.db import _conn
+    from app.data_platform.db import _read_conn
 
-    with _conn() as conn:
+    with _read_conn() as conn:
         rows = conn.execute(
             "SELECT DISTINCT trade_date FROM dc_stock_daily_snapshot ORDER BY trade_date DESC LIMIT ?",
             (limit_days,),
@@ -103,8 +103,8 @@ def build_data_health_report(limit_days: int = 30) -> dict[str, Any]:
             return cached[1]
 
     market_snapshots = _summarize_postgresql_market_snapshots(limit_days)
-    from app.data_platform.db import _conn
-    with _conn() as conn:
+    from app.data_platform.db import _read_conn
+    with _read_conn() as conn:
         # This compact table is maintained while materializing a daily
         # snapshot.  It is the authoritative dashboard index and avoids a
         # full DISTINCT scan across daily_basic raw records on every poll.

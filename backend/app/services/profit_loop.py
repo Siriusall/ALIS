@@ -797,7 +797,10 @@ def _position_returns(
             cutoff=cutoff,
             ts_codes=list(symbol_by_code),
             trade_date_end=end_date,
-            limit=max(history_limit * len(symbol_by_code), history_limit),
+            # A global result cap lets the first dense symbol consume the
+            # entire window and leaves the remaining requested series empty.
+            # Keep the historical bound independently for every security.
+            per_ts_code_limit=history_limit,
         )
         if versioned is None and as_of_time:
             # A formal cutoff cannot fall back to the mutable snapshot
@@ -845,14 +848,23 @@ def _position_returns(
         missing_codes = [code for symbol in missing for code in code_by_symbol[symbol] if code in symbol_by_code]
         if missing_codes:
             raw_placeholders = ",".join("?" for _ in missing_codes)
-            raw_versions = load_raw_record_versions(
-                c,
-                "fund_daily",
-                cutoff=cutoff,
-                ts_codes=missing_codes,
-                trade_date_end=end_date,
-                limit=max(history_limit * len(missing_codes), history_limit),
-            )
+            # The immutable raw loader's legacy ``limit`` is global. Split
+            # this small fallback by security so one ETF cannot starve the
+            # other requested series while preserving the PIT contract.
+            raw_versions: list[dict[str, Any]] | None = []
+            for missing_code in missing_codes:
+                rows_for_code = load_raw_record_versions(
+                    c,
+                    "fund_daily",
+                    cutoff=cutoff,
+                    ts_codes=[missing_code],
+                    trade_date_end=end_date,
+                    limit=history_limit,
+                )
+                if rows_for_code is None:
+                    raw_versions = None
+                    break
+                raw_versions.extend(rows_for_code)
             if raw_versions is None and as_of_time:
                 raw_rows = []
             elif raw_versions is not None:

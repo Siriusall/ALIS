@@ -6,6 +6,30 @@ import json
 from app.services import market_context
 
 
+def test_financial_enrichment_forwards_bounded_period_read(monkeypatch) -> None:
+    calls: list[dict] = []
+
+    def bounded_loader(_conn, _api_name, **kwargs):
+        calls.append(kwargs)
+        return []
+
+    monkeypatch.setattr(market_context, "load_raw_record_versions", bounded_loader)
+
+    result = market_context._strict_raw_payload_rows(
+        object(), "fina_indicator", cutoff="2026-08-14T15:00:00+08:00", period_limit=2,
+    )
+
+    assert result == []
+    assert calls == [{
+        "cutoff": "2026-08-14T15:00:00+08:00",
+        "ts_codes": None,
+        "cutoff_by_trade_date": False,
+        "trade_date_start": "",
+        "trade_date_end": "",
+        "period_limit": 2,
+    }]
+
+
 def test_market_training_requires_trade_date_pit_cutoff(monkeypatch) -> None:
     calls: list[dict] = []
 

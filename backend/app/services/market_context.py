@@ -54,11 +54,13 @@ def _strict_raw_payload_rows(
     ts_codes: list[str] | tuple[str, ...] | None = None,
     trade_date_start: str = "",
     trade_date_end: str = "",
+    period_limit: int = 0,
 ) -> list[dict[str, Any]] | None:
     rows = load_raw_record_versions(
         conn, api_name, cutoff=cutoff, ts_codes=ts_codes,
         cutoff_by_trade_date=cutoff_by_trade_date,
         trade_date_start=trade_date_start, trade_date_end=trade_date_end,
+        period_limit=period_limit,
     )
     if rows is None:
         return None
@@ -752,7 +754,12 @@ def _market_enrichment_observations(
                 result["leader_persistence"] = round(sum(len(current & previous) / max(1, len(current | previous)) for previous in prior_sets) / len(prior_sets), 6)
                 result["coverage"]["leader_sessions"] = len(prior_sets) + 1
 
-        financial_rows = _strict_raw_payload_rows(c, "fina_indicator", cutoff=cutoff)
+        # The divergence signal compares the latest two reporting periods;
+        # avoid reading the complete immutable financial archive on every
+        # historical enrichment request.
+        financial_rows = _strict_raw_payload_rows(
+            c, "fina_indicator", cutoff=cutoff, period_limit=2,
+        )
         if financial_rows is None:
             result["status"] = "partial"
             result["missing_sources"].append("fina_indicator")

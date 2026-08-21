@@ -232,7 +232,13 @@ def test_industry_valuation_uses_accepted_snapshot_hash_without_version_ranking(
             ),
         )
 
-    monkeypatch.setattr(event_engine, "load_raw_record_versions", lambda *_args, **_kwargs: [])
+    financial_calls: list[dict] = []
+
+    def fake_load_raw_record_versions(*_args, **kwargs):
+        financial_calls.append(kwargs)
+        return []
+
+    monkeypatch.setattr(event_engine, "load_raw_record_versions", fake_load_raw_record_versions)
 
     result = event_engine._derived_industry_proxies(
         connection,
@@ -240,5 +246,6 @@ def test_industry_valuation_uses_accepted_snapshot_hash_without_version_ranking(
     )
 
     valuation = result["测试行业"]
+    assert [call.get("period_limit") for call in financial_calls] == [8, 8]
     assert valuation["evidence"]["company_valuation_points"] == 3
     assert valuation["observations"]["industry_valuation"] == 96.92307692307692

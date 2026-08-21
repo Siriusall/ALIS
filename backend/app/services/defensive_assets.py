@@ -74,6 +74,30 @@ def _fund_daily_observation_sql(connection: Any) -> tuple[str, str, str] | None:
     return None
 
 
+def _fund_daily_history_start(trade_date: str, limit: int) -> str:
+    """Return a bounded calendar start for a per-ETF history request.
+
+    ``fund_daily`` is a daily series, but exchange holidays and suspensions mean
+    a calendar window must include some slack to yield ``limit`` observations.
+    Keeping the slack bounded still prevents a history request from scanning the
+    append-only archive when the caller only needs a short return window.
+    """
+    compact = str(trade_date or "").replace("-", "")[:8]
+    try:
+        requested = max(1, int(limit))
+        end = datetime.strptime(compact, "%Y%m%d").date()
+    except (TypeError, ValueError):
+        # ``list_defensive_assets()`` uses an open-ended sentinel date.  Use
+        # the current business date for that read so the sentinel cannot turn
+        # a bounded momentum request back into a full archive scan.
+        if compact in {"", "99999999"}:
+            end = datetime.now(_BUSINESS_TZ).date()
+        else:
+            return ""
+    calendar_days = max(30, min(3650, requested * 4))
+    return (end - timedelta(days=calendar_days)).strftime("%Y%m%d")
+
+
 def _fund_daily_rows(
     connection: Any,
     ts_codes: Iterable[str],
@@ -106,15 +130,40 @@ def _fund_daily_rows(
         cutoff = normalize_explicit_timestamp(cutoff)
         if not cutoff:
             return []
-    versioned = load_raw_record_versions(
-        connection,
-        "fund_daily",
-        cutoff=cutoff,
-        ts_codes=codes,
-        trade_date_start=target if exact_date and target else "",
-        trade_date_end=target if target else "",
-        limit=0,
+    # The immutable loader's legacy ``limit`` is a global result cap.  Split a
+    # bounded request by code so one ETF cannot consume another ETF's window,
+    # and use a calendar slack window to keep the SQL result itself small.
+    history_start = (
+        _fund_daily_history_start(target, limit)
+        if limit and target and not exact_date else ""
     )
+    if limit and target and not exact_date:
+        versioned_parts: list[dict[str, Any]] = []
+        versioned: list[dict[str, Any]] | None = versioned_parts
+        for code in codes:
+            rows_for_code = load_raw_record_versions(
+                connection,
+                "fund_daily",
+                cutoff=cutoff,
+                ts_codes=[code],
+                trade_date_start=history_start,
+                trade_date_end=target,
+                limit=0,
+            )
+            if rows_for_code is None:
+                versioned = None
+                break
+            versioned_parts.extend(rows_for_code)
+    else:
+        versioned = load_raw_record_versions(
+            connection,
+            "fund_daily",
+            cutoff=cutoff,
+            ts_codes=codes,
+            trade_date_start=target if exact_date and target else "",
+            trade_date_end=target if target else "",
+            limit=0,
+        )
     if versioned is not None:
         by_key: dict[tuple[str, str], dict[str, Any]] = {}
         for row in versioned:
@@ -164,13 +213,16 @@ def _fund_daily_rows(
     _selected_clock, clock_filter, order_clock = observation_sql
     placeholders = ",".join("?" for _ in codes)
     date_operator = "=" if exact_date else "<="
+    date_start_clause = " AND trade_date>=?" if history_start else ""
     sql = f"""SELECT ts_code,trade_date,payload_json,{_selected_clock}
                 FROM dc_tushare_raw_records
                WHERE api_name='fund_daily' AND ts_code IN ({placeholders})
+                 {date_start_clause}
                  AND trade_date{date_operator}?
                  AND {clock_filter}
                ORDER BY ts_code,trade_date DESC,{order_clock} DESC"""
-    rows = connection.execute(sql, (*codes, target, cutoff)).fetchall()
+    params: tuple[Any, ...] = (*codes, *((history_start,) if history_start else ()), target, cutoff)
+    rows = connection.execute(sql, params).fetchall()
     result = []
     seen: set[tuple[str, str]] = set()
     for row in rows:
@@ -343,6 +395,9 @@ def list_defensive_assets(*, as_of_date: str | None = None) -> dict[str, Any]:
                 [asset["ts_code"] for asset in DEFENSIVE_ASSETS],
                 trade_date=cutoff,
                 cutoff=available_cutoff,
+                # Only the latest close plus the 20-session momentum window
+                # is consumed below; do not scan the full fund_daily archive.
+                limit=21,
             )
             result_rows: dict[str, list[dict[str, Any]]] = {
                 asset["ts_code"]: [] for asset in DEFENSIVE_ASSETS
@@ -498,6 +553,7 @@ def defensive_asset_bars(
             trade_date=cutoff,
             exact_date=exact_date,
             cutoff=available_cutoff,
+            limit=1,
         )
     result: dict[str, dict[str, Any]] = {}
     for row in rows:
@@ -579,7 +635,9 @@ def defensive_asset_series_batch(
             trade_date=cutoff,
             exact_date=False,
             cutoff=available_cutoff,
-            limit=0,
+            # Keep one independent history window per ETF.  A global result
+            # limit would let the first code starve the remaining holdings.
+            limit=max(2, min(int(limit) + 1, 251)),
         ) or []
     if connection is None:
         with _conn() as c:

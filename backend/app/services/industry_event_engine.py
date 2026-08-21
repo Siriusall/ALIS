@@ -224,7 +224,10 @@ def _derived_industry_proxies(c, *, as_of_time: str | None = None) -> dict[str, 
             raise RuntimeError("industry_financial_pit_cutoff_invalid")
         by_api: dict[str, list[dict[str, Any]]] = {"income": [], "balancesheet": []}
         for api_name in by_api:
-            rows = load_raw_record_versions(c, api_name, cutoff=cutoff)
+            # Industry proxies only compare the latest annual/comparable
+            # periods. Keep the immutable PIT read bounded before decoding
+            # the complete financial archive.
+            rows = load_raw_record_versions(c, api_name, cutoff=cutoff, period_limit=8)
             if rows is None:
                 raise RuntimeError(
                     "industry_financial_pit_unavailable: immutable raw version required"
