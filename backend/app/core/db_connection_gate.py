@@ -13,6 +13,18 @@ from contextlib import contextmanager
 from typing import Iterator
 
 
+# Conservative per-process defaults for the small production PostgreSQL node.
+# The database server currently allows 30 connections and reserves 3 for
+# superusers. ALIS may have an API process plus control/research workers
+# connected at the same time, so the defaults must be safe when multiplied
+# across processes rather than sized for a single process in isolation.
+# Operators can still override these values per service with the corresponding
+# environment variables, but the checked-in fallback must remain conservative.
+
+DEFAULT_BUSINESS_DB_CONNECTIONS = 4
+DEFAULT_DATA_PLATFORM_DB_CONNECTIONS = 3
+
+
 class DatabaseConnectionCapacity(RuntimeError):
     """Raised when this process cannot safely open another DB connection."""
 

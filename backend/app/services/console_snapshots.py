@@ -9,17 +9,19 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 import os
 import time
 import uuid
 from datetime import datetime, timezone
+from threading import Lock
 from typing import Any, Callable
 
+from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
 
 from app.data_platform.redis_store import delete as redis_delete
 from app.data_platform.redis_store import get_json, set_json
-from app.data_platform.db import _conn as data_platform_conn
 from app.db.store import _conn
 
 
@@ -32,10 +34,10 @@ _DEFAULT_TTLS = {
     "data": 60,
     "models": 300,
 }
+_FAILURE_RETRY_SECONDS = 15
 _schema_ready = False
-from threading import Lock
-
 _schema_lock = Lock()
+logger = logging.getLogger(__name__)
 
 
 def _now() -> str:
@@ -52,6 +54,14 @@ def _ttl(page_key: str) -> int:
         return max(5, int(raw)) if raw else _DEFAULT_TTLS[page_key]
     except ValueError:
         return _DEFAULT_TTLS[page_key]
+
+
+def _failure_retry_seconds() -> int:
+    raw = os.getenv("ALIS_CONSOLE_SNAPSHOT_FAILURE_RETRY_SECONDS", "")
+    try:
+        return max(5, min(120, int(raw))) if raw else _FAILURE_RETRY_SECONDS
+    except ValueError:
+        return _FAILURE_RETRY_SECONDS
 
 
 def _ensure_table() -> None:
@@ -71,7 +81,11 @@ def _ensure_table() -> None:
                     status VARCHAR(32) NOT NULL,
                     invalidated_at VARCHAR(64),
                     payload_json TEXT NOT NULL,
-                    updated_at VARCHAR(64) NOT NULL
+                    updated_at VARCHAR(64) NOT NULL,
+                    refresh_generation BIGINT NOT NULL DEFAULT 0,
+                    last_attempt_generation BIGINT NOT NULL DEFAULT -1,
+                    last_attempt_at VARCHAR(64),
+                    last_error_code VARCHAR(64) NOT NULL DEFAULT ''
                 )
             """)
             conn.execute(
@@ -83,20 +97,31 @@ def _ensure_table() -> None:
 
 def _as_json(value: Any) -> Any:
     if isinstance(value, JSONResponse):
-        return json.loads(value.body.decode("utf-8"))
-    return value
+        value = json.loads(value.body.decode("utf-8"))
+    return jsonable_encoder(value)
 
 
-def _section(name: str, reader: Callable[[], Any]) -> tuple[Any, dict[str, Any]]:
+def _section(page_key: str, name: str, reader: Callable[[], Any]) -> tuple[Any, dict[str, Any]]:
     try:
         value = _as_json(reader())
         unhealthy = isinstance(value, dict) and (
-            value.get("ok") is False or value.get("status") in {"blocked", "error", "failed", "degraded"}
+            value.get("ok") is False
+            or value.get("status") in {"blocked", "error", "failed", "degraded", "unavailable", "warming_up"}
         )
         return value, {"status": "degraded" if unhealthy else "ready", "error": ""}
     except Exception as exc:  # a page can surface partial evidence safely
-        return {"ok": False, "status": "unavailable", "error": str(exc)[:300]}, {
-            "status": "error", "error": f"{type(exc).__name__}: {str(exc)[:240]}",
+        logger.warning(
+            "Console snapshot section unavailable page=%s section=%s error_type=%s",
+            page_key,
+            name,
+            type(exc).__name__,
+        )
+        error = {
+            "code": "snapshot_section_unavailable",
+            "message": "该页面分区暂时不可用，系统将自动重试。",
+        }
+        return {"ok": False, "status": "unavailable", "error": error}, {
+            "status": "error", "error": error,
         }
 
 
@@ -124,13 +149,13 @@ def _readers(page_key: str) -> dict[str, Callable[[], Any]]:
             "dailyUpdateStatus": lambda: data_center.data_center_daily_update_status(compact=True),
             "watermarks": data_center.data_center_asset_watermarks,
             "ledgerAudit": model_strategy.model_strategy_ledger_audit,
-            "oos": data_center.data_center_oos_hard_data,
-            "sealed": data_center.data_center_sealed_strategy_holdout,
+            "oos": lambda: data_center.data_center_oos_hard_data(include_dates=False),
+            "sealed": lambda: data_center.data_center_sealed_strategy_holdout(include_dates=False),
         },
         "decision": {
             **common,
             "owner": model_strategy.model_strategy_owner_summary,
-            "decision": decision_summary,
+            "decision": lambda: decision_summary(limit_days=30),
             "latestPlan": lambda: decision_latest_plan(compact=True),
         },
         "portfolio": {
@@ -151,25 +176,29 @@ def _readers(page_key: str) -> dict[str, Callable[[], Any]]:
             "quantTasks": lambda: quant_runs.quant_run_tasks(limit=20),
             "quantStatus": quant_runs.quant_run_status,
             "quantRecent": lambda: quant_runs.quant_run_recent(limit=10),
-            "operationsPage": lambda: __import__("app.api.routes.positions", fromlist=["get_operations_page"]).get_operations_page(limit=20, offset=0),
+            "operationsPage": lambda: __import__("app.api.routes.positions", fromlist=["get_operations_page"]).get_operations_page(execution_id=None, limit=20, offset=0),
             "executionsPage": lambda: __import__("app.api.routes.positions", fromlist=["get_executions_page"]).get_executions_page(limit=20, offset=0),
             "ledgerAudit": model_strategy.model_strategy_ledger_audit,
-            "oos": data_center.data_center_oos_hard_data,
-            "sealed": data_center.data_center_sealed_strategy_holdout,
+            "oos": lambda: data_center.data_center_oos_hard_data(include_dates=False),
+            "sealed": lambda: data_center.data_center_sealed_strategy_holdout(include_dates=False),
         },
         "data": {
             "watermarks": data_center.data_center_asset_watermarks,
-            "failedRequests": data_center.data_center_failed_tushare_requests,
-            "dataOperations": data_center.data_center_llm_data_operations,
-            "runtimeLogs": lambda: data_center.data_center_runtime_logs(limit=100),
-            "dataObservability": lambda: data_center.data_center_observability(compact=True),
-            "dataStreams": data_center.data_center_streams,
+            "failedRequests": lambda: data_center.data_center_failed_tushare_requests(request_status="pending", limit=100),
+            "dataOperations": lambda: data_center.data_center_llm_data_operations(limit=20),
+            "runtimeLogs": lambda: data_center.data_center_runtime_logs(after_id=0, limit=100, wait_seconds=0.0),
+            "dataObservability": lambda: data_center.data_center_observability(limit_logs=50, compact=True),
+            "dataStreams": lambda: data_center.data_center_streams(limit=50, pending_limit=50),
             "dailyUpdateStatus": lambda: data_center.data_center_daily_update_status(compact=True),
             "backfillStatus": data_center.data_center_backfill_status,
-            "backfillPlan": data_center.data_center_backfill_plan,
+            "backfillPlan": lambda: data_center.data_center_backfill_plan(
+                market_batch_days=30,
+                financial_batch_size=100,
+                rebuild=False,
+            ),
             "tasks": lambda: model_strategy.model_strategy_task_center(limit=16, log_limit=40, compact=True),
-            "oos": data_center.data_center_oos_hard_data,
-            "sealed": data_center.data_center_sealed_strategy_holdout,
+            "oos": lambda: data_center.data_center_oos_hard_data(include_dates=False),
+            "sealed": lambda: data_center.data_center_sealed_strategy_holdout(include_dates=False),
         },
         "models": {
             "planModels": lambda: model_strategy.model_strategy_plan_models(console=True),
@@ -184,7 +213,7 @@ def _readers(page_key: str) -> dict[str, Callable[[], Any]]:
             "modelEvidenceBindings": model_strategy.model_strategy_evidence_bindings,
             "modelValidation": model_strategy.model_strategy_multi_period_validation,
             "modelMarketHistory": lambda: model_strategy.model_strategy_market_context_history(limit=120),
-            "factorResearchCompact": lambda: __import__("app.api.routes.factors", fromlist=["factor_research_status"]).factor_research_status(compact=True),
+            "factorResearchCompact": lambda: __import__("app.api.routes.factors", fromlist=["factor_research_status"]).factor_research_status(compact=True, console=False),
             "evolutionTasks": lambda: model_strategy.model_strategy_evolution_tasks(limit=30),
             "modelTasksLive": lambda: model_strategy.model_strategy_task_center(limit=24, log_limit=40, compact=True),
         },
@@ -192,138 +221,316 @@ def _readers(page_key: str) -> dict[str, Callable[[], Any]]:
     return pages[page_key]
 
 
+def _serialize(payload: dict[str, Any]) -> str:
+    return json.dumps(jsonable_encoder(payload), ensure_ascii=False, separators=(",", ":"))
+
+
+def _generation(record: dict[str, Any] | None) -> int:
+    try:
+        return int((record or {}).get("refresh_generation") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _has_committed_snapshot(record: dict[str, Any] | None) -> bool:
+    if not record:
+        return False
+    return bool(record.get("version")) and str(record.get("status") or "") in {"ready", "degraded"}
+
+
+def _warming_payload(page_key: str, generation: int = 0) -> dict[str, Any]:
+    return {
+        "page": page_key,
+        "version": "",
+        "generated_at": "",
+        "as_of": "",
+        "status": "warming_up",
+        "stale": False,
+        "refreshing": True,
+        "refresh_generation": generation,
+        "sections": {},
+        "data": {},
+        "error": {
+            "code": "snapshot_warming_up",
+            "message": "页面快照正在由控制节点生成，请稍后自动重试。",
+        },
+    }
+
+
+def _unavailable_payload(page_key: str, generation: int, sections: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "page": page_key,
+        "version": "",
+        "generated_at": "",
+        "as_of": "",
+        "status": "unavailable",
+        "stale": False,
+        "refreshing": True,
+        "refresh_generation": generation,
+        "sections": sections,
+        "data": {},
+        "error": {
+            "code": "snapshot_build_unavailable",
+            "message": "页面快照暂时未能生成，控制节点将自动重试。",
+        },
+    }
+
+
+def _snapshot_metadata(page_key: str) -> dict[str, Any] | None:
+    _ensure_table()
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT page_key,version,generated_at,as_of,status,invalidated_at,updated_at,"
+            "refresh_generation,last_attempt_generation,last_attempt_at,last_error_code "
+            "FROM console_page_snapshots WHERE page_key=?",
+            (page_key,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
 def _load_durable(page_key: str) -> dict[str, Any] | None:
     _ensure_table()
     with _conn() as conn:
         row = conn.execute(
-            "SELECT payload_json, invalidated_at FROM console_page_snapshots WHERE page_key=?", (page_key,)
+            "SELECT page_key,version,generated_at,as_of,status,invalidated_at,updated_at,"
+            "refresh_generation,last_attempt_generation,last_attempt_at,last_error_code,payload_json "
+            "FROM console_page_snapshots WHERE page_key=?",
+            (page_key,),
         ).fetchone()
     if not row:
         return None
-    value = dict(row).get("payload_json")
+    record = dict(row)
     try:
-        payload = json.loads(value) if value else None
-        if isinstance(payload, dict):
-            payload["_invalidated"] = bool(dict(row).get("invalidated_at"))
-        return payload
+        payload = json.loads(record.get("payload_json") or "")
     except (TypeError, ValueError):
         return None
+    if not isinstance(payload, dict):
+        return None
+    payload["refresh_generation"] = _generation(record)
+    return payload
 
 
-def _save_durable(page_key: str, payload: dict[str, Any]) -> None:
+def _ensure_snapshot_record(page_key: str) -> dict[str, Any]:
+    """Create a durable cold-start sentinel before observing a generation."""
     _ensure_table()
-    serialized = json.dumps(payload, ensure_ascii=False, default=str, separators=(",", ":"))
+    now = _now()
+    payload = _serialize(_warming_payload(page_key))
     with _conn() as conn:
-        conn.execute("""
-            INSERT INTO console_page_snapshots
-                (page_key, version, generated_at, as_of, status, invalidated_at, payload_json, updated_at)
-            VALUES (?, ?, ?, ?, ?, NULL, ?, ?)
-            ON CONFLICT (page_key) DO UPDATE SET
-                version=EXCLUDED.version, generated_at=EXCLUDED.generated_at, as_of=EXCLUDED.as_of,
-                status=EXCLUDED.status, invalidated_at=NULL, payload_json=EXCLUDED.payload_json,
-                updated_at=EXCLUDED.updated_at
-        """, (
-            page_key, payload["version"], payload["generated_at"], payload["as_of"],
-            payload["status"], serialized, payload["generated_at"],
-        ))
+        conn.execute(
+            """INSERT INTO console_page_snapshots
+                (page_key,version,generated_at,as_of,status,invalidated_at,payload_json,updated_at,
+                 refresh_generation,last_attempt_generation,last_attempt_at,last_error_code)
+               VALUES (?, '', '', '', 'warming_up', ?, ?, ?, 0, -1, NULL, '')
+               ON CONFLICT (page_key) DO NOTHING""",
+            (page_key, now, payload, now),
+        )
+        row = conn.execute(
+            "SELECT page_key,version,status,invalidated_at,refresh_generation "
+            "FROM console_page_snapshots WHERE page_key=?",
+            (page_key,),
+        ).fetchone()
+    if not row:
+        raise RuntimeError("console_snapshot_record_unavailable")
+    return dict(row)
 
 
-def invalidate(page_keys: list[str] | tuple[str, ...] = PAGE_KEYS, *, reason: str = "source_changed") -> None:
+def _save_durable(page_key: str, payload: dict[str, Any], expected_generation: int) -> bool:
+    """Commit only if no invalidation happened while the readers were running."""
+    _ensure_table()
+    serialized = _serialize(payload)
+    with _conn() as conn:
+        row = conn.execute(
+            """UPDATE console_page_snapshots SET
+                    version=?, generated_at=?, as_of=?, status=?, invalidated_at=NULL,
+                    payload_json=?, updated_at=?, last_attempt_generation=-1,
+                    last_attempt_at=NULL, last_error_code=''
+                WHERE page_key=? AND refresh_generation=?
+                RETURNING refresh_generation""",
+            (
+                payload["version"],
+                payload["generated_at"],
+                payload["as_of"],
+                payload["status"],
+                serialized,
+                payload["generated_at"],
+                page_key,
+                expected_generation,
+            ),
+        ).fetchone()
+    return row is not None
+
+
+def _record_failed_build(
+    page_key: str,
+    expected_generation: int,
+    candidate: dict[str, Any],
+) -> bool:
+    """Record bounded retry state without replacing a last-known-good page."""
     _ensure_table()
     now = _now()
     with _conn() as conn:
+        row = conn.execute(
+            """UPDATE console_page_snapshots SET
+                    last_attempt_generation=?, last_attempt_at=?,
+                    last_error_code='snapshot_section_unavailable', updated_at=?
+                WHERE page_key=? AND refresh_generation=?
+                RETURNING version,status""",
+            (expected_generation, now, now, page_key, expected_generation),
+        ).fetchone()
+        if not row:
+            return False
+        current = dict(row)
+        if _has_committed_snapshot(current):
+            return True
+        unavailable = _unavailable_payload(page_key, expected_generation, candidate["sections"])
+        persisted = conn.execute(
+            """UPDATE console_page_snapshots SET
+                    status='error', payload_json=?, updated_at=?
+                WHERE page_key=? AND refresh_generation=? AND version=''
+                  AND status IN ('warming_up','error')
+                RETURNING refresh_generation""",
+            (_serialize(unavailable), now, page_key, expected_generation),
+        ).fetchone()
+    return persisted is not None
+
+
+def invalidate(page_keys: list[str] | tuple[str, ...] = PAGE_KEYS, *, reason: str = "source_changed") -> None:
+    """Durably advance a page generation before invalidating the app cache."""
+    del reason  # The durable generation is the cross-node invalidation evidence.
+    _ensure_table()
+    now = _now()
+    invalidated: list[str] = []
+    with _conn() as conn:
         for page_key in page_keys:
-            if page_key in PAGE_KEYS:
-                conn.execute("UPDATE console_page_snapshots SET invalidated_at=? WHERE page_key=?", (now, page_key))
-                redis_delete(_redis_key(page_key))
+            if page_key not in PAGE_KEYS:
+                continue
+            sentinel = _serialize(_warming_payload(page_key, 1))
+            conn.execute(
+                """INSERT INTO console_page_snapshots
+                    (page_key,version,generated_at,as_of,status,invalidated_at,payload_json,updated_at,
+                     refresh_generation,last_attempt_generation,last_attempt_at,last_error_code)
+                   VALUES (?, '', '', '', 'warming_up', ?, ?, ?, 1, -1, NULL, '')
+                   ON CONFLICT (page_key) DO UPDATE SET
+                     invalidated_at=EXCLUDED.invalidated_at,
+                     refresh_generation=console_page_snapshots.refresh_generation + 1,
+                     updated_at=EXCLUDED.updated_at""",
+                (page_key, now, sentinel, now),
+            )
+            invalidated.append(page_key)
+    # Redis belongs to the application host; only remove it after PostgreSQL
+    # commits the newer generation. A delayed cache deletion cannot override
+    # the metadata check in read().
+    for page_key in invalidated:
+        redis_delete(_redis_key(page_key))
+
+
+def _parse_timestamp(value: Any) -> datetime | None:
+    try:
+        parsed = datetime.fromisoformat(str(value or "").replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed.astimezone(timezone.utc)
+
+
+def _retry_is_deferred(record: dict[str, Any], now: datetime) -> bool:
+    try:
+        attempted_generation = int(record.get("last_attempt_generation"))
+    except (TypeError, ValueError):
+        return False
+    if attempted_generation != _generation(record):
+        return False
+    attempted_at = _parse_timestamp(record.get("last_attempt_at"))
+    if attempted_at is None:
+        return False
+    return (now - attempted_at).total_seconds() < _failure_retry_seconds()
 
 
 def _pages_due_for_refresh() -> list[str]:
-    """Use PostgreSQL state as the cross-node refresh protocol.
-
-    Redis is private to the application host, so it must not coordinate a
-    worker on another machine.  Invalidated timestamps and committed snapshot
-    times are durable and safely visible from the control worker.
-    """
+    """Use PostgreSQL state as the cross-node refresh protocol."""
     _ensure_table()
     with _conn() as conn:
         rows = conn.execute(
-            "SELECT page_key, generated_at, invalidated_at FROM console_page_snapshots"
+            "SELECT page_key,version,generated_at,status,invalidated_at,refresh_generation,"
+            "last_attempt_generation,last_attempt_at FROM console_page_snapshots"
         ).fetchall()
     by_page = {str(dict(row).get("page_key")): dict(row) for row in rows}
     now = datetime.now(timezone.utc)
     due: list[str] = []
     for page_key in PAGE_KEYS:
-        row = by_page.get(page_key)
-        if not row or row.get("invalidated_at"):
+        record = by_page.get(page_key)
+        if not record:
             due.append(page_key)
             continue
-        try:
-            generated_at = datetime.fromisoformat(str(row.get("generated_at") or "").replace("Z", "+00:00"))
-            if generated_at.tzinfo is None:
-                generated_at = generated_at.replace(tzinfo=timezone.utc)
-            if (now - generated_at.astimezone(timezone.utc)).total_seconds() >= _ttl(page_key):
-                due.append(page_key)
-        except ValueError:
+        if _retry_is_deferred(record, now):
+            continue
+        if record.get("invalidated_at") or not _has_committed_snapshot(record):
+            due.append(page_key)
+            continue
+        generated_at = _parse_timestamp(record.get("generated_at"))
+        if generated_at is None or (now - generated_at).total_seconds() >= _ttl(page_key):
             due.append(page_key)
     return due
 
 
-def _data_platform_is_busy() -> bool:
-    """Defer snapshots while ingestion/large raw-data work owns the database.
-
-    Snapshot freshness is strictly lower priority than daily ingestion and
-    decision data.  This also prevents a control-worker prewarm from adding
-    another wide query during the known ``raw_ranked`` pressure window.
-    """
-    try:
-        with data_platform_conn() as conn:
-            row = conn.execute("""
-                SELECT COUNT(*) AS count
-                FROM pg_stat_activity
-                WHERE datname = current_database()
-                  AND pid <> pg_backend_pid()
-                  AND usename = current_user
-                  AND state IN ('active', 'idle in transaction')
-            """).fetchone()
-        return int(dict(row).get("count") or 0) > 0
-    except Exception:
-        # Connection uncertainty is a reason to protect the authoritative
-        # data pipeline, not to start optional page aggregation.
-        return True
+def _wait_or_stop(stopper: Any | None, seconds: float) -> bool:
+    if stopper is None:
+        time.sleep(seconds)
+        return False
+    return bool(stopper.wait(seconds))
 
 
 def run_snapshot_worker_forever(stop_event: Any | None = None) -> None:
-    """Run only on the control worker; serializes all page aggregation."""
+    """Run only on the control worker; serialize expensive page aggregation."""
     stopper = stop_event
     while stopper is None or not stopper.is_set():
         try:
-            if _data_platform_is_busy():
-                time.sleep(10.0)
-                continue
             due = _pages_due_for_refresh()
-            for page_key in due:
-                if stopper is not None and stopper.is_set():
-                    return
+        except Exception as exc:  # database failures must not involve the API host
+            logger.warning("Console snapshot due scan unavailable error_type=%s", type(exc).__name__)
+            if _wait_or_stop(stopper, 5.0):
+                return
+            continue
+        for page_key in due:
+            if stopper is not None and stopper.is_set():
+                return
+            try:
                 build(page_key)
-                # Never fan out expensive aggregations across the small DB.
-                time.sleep(1.0)
-            if not due:
-                time.sleep(1.0)
-        except Exception:
-            # Database unavailability leaves the last committed snapshot in
-            # place. Retry slowly without involving the HTTP process.
-            time.sleep(5.0)
+            except Exception as exc:  # retain any LKG; the next scan retries safely
+                logger.warning(
+                    "Console snapshot build unavailable page=%s error_type=%s",
+                    page_key,
+                    type(exc).__name__,
+                )
+            # Never fan out expensive aggregations across the small DB.
+            if _wait_or_stop(stopper, 1.0):
+                return
+        if not due and _wait_or_stop(stopper, 1.0):
+            return
 
 
 def build(page_key: str) -> dict[str, Any]:
     if page_key not in PAGE_KEYS:
         raise ValueError(f"unsupported console page: {page_key}")
-    readers = _readers(page_key)
+    record = _ensure_snapshot_record(page_key)
+    expected_generation = _generation(record)
     data: dict[str, Any] = {}
     sections: dict[str, dict[str, Any]] = {}
-    for key, reader in readers.items():
-        data[key], sections[key] = _section(key, reader)
+    try:
+        readers = _readers(page_key)
+        for key, reader in readers.items():
+            data[key], sections[key] = _section(page_key, key, reader)
+    except Exception as exc:  # import/setup failures are a controlled cold-start error
+        logger.warning(
+            "Console snapshot reader setup unavailable page=%s error_type=%s",
+            page_key,
+            type(exc).__name__,
+        )
+        error = {
+            "code": "snapshot_reader_setup_unavailable",
+            "message": "页面读取组件暂时不可用，系统将自动重试。",
+        }
+        sections = {"snapshot": {"status": "error", "error": error}}
+        data = {"snapshot": {"ok": False, "status": "unavailable", "error": error}}
     generated_at = _now()
     errors = [name for name, detail in sections.items() if detail["status"] == "error"]
     degraded = [name for name, detail in sections.items() if detail["status"] == "degraded"]
@@ -335,51 +542,59 @@ def build(page_key: str) -> dict[str, Any]:
         "status": "error" if errors else "degraded" if degraded else "ready",
         "stale": False,
         "refreshing": False,
+        "refresh_generation": expected_generation,
         "sections": sections,
         "data": data,
     }
-    _save_durable(page_key, payload)
-    # The application host owns Redis.  Do not write a worker-local cache from
-    # this cross-node process; the next browser read mirrors the PostgreSQL
-    # authority into the application Redis instance.
+    if errors:
+        _record_failed_build(page_key, expected_generation, payload)
+        return payload
+    # The application host owns Redis. It mirrors this committed PostgreSQL
+    # version only after its next read, so a worker never writes remote cache.
+    _save_durable(page_key, payload, expected_generation)
     return payload
+
+
+def _cache_matches_metadata(cached: dict[str, Any], metadata: dict[str, Any]) -> bool:
+    return (
+        _has_committed_snapshot(metadata)
+        and not metadata.get("invalidated_at")
+        and str(cached.get("version") or "") == str(metadata.get("version") or "")
+        and _generation(cached) == _generation(metadata)
+    )
 
 
 def read(page_key: str, *, force: bool = False) -> dict[str, Any]:
     if page_key not in PAGE_KEYS:
         raise ValueError(f"unsupported console page: {page_key}")
-    if not force:
-        cached = get_json(_redis_key(page_key))
-        if isinstance(cached, dict):
-            return cached
-    durable = _load_durable(page_key)
-    if durable:
-        # A browser never performs the rebuild. It gets the last committed
-        # authority while the singleton scheduler handles the refresh.
-        redis_payload = copy.deepcopy(durable)
-        redis_payload["stale"] = bool(durable.pop("_invalidated", False))
-        redis_payload["refreshing"] = redis_payload["stale"]
-        set_json(_redis_key(page_key), redis_payload, ttl=min(15, _ttl(page_key)))
-        return redis_payload
-    return {
-        "page": page_key,
-        "version": "",
-        "generated_at": "",
-        "as_of": "",
-        "status": "warming_up",
-        "stale": False,
-        "refreshing": True,
-        "sections": {},
-        "data": {},
-        "error": "No committed page snapshot exists yet; background warm-up is queued.",
-    }
+    metadata = _snapshot_metadata(page_key)
+    cached = None if force else get_json(_redis_key(page_key))
+    if isinstance(cached, dict) and metadata and _cache_matches_metadata(cached, metadata):
+        return cached
+    if isinstance(cached, dict):
+        redis_delete(_redis_key(page_key))
+    generation = _generation(metadata)
+    durable = _load_durable(page_key) if metadata else None
+    if metadata and _has_committed_snapshot(metadata) and durable:
+        response = copy.deepcopy(durable)
+        response["stale"] = bool(metadata.get("invalidated_at"))
+        response["refreshing"] = response["stale"]
+        if not response["stale"]:
+            set_json(_redis_key(page_key), response, ttl=min(15, _ttl(page_key)))
+        return response
+    if durable and str(durable.get("status") or "") == "unavailable":
+        durable["stale"] = False
+        durable["refreshing"] = True
+        return durable
+    return _warming_payload(page_key, generation)
 
 
 def status() -> dict[str, Any]:
     _ensure_table()
     with _conn() as conn:
         rows = conn.execute(
-            "SELECT page_key, version, generated_at, as_of, status, invalidated_at, updated_at "
+            "SELECT page_key,version,generated_at,as_of,status,invalidated_at,updated_at,"
+            "refresh_generation,last_attempt_generation,last_attempt_at,last_error_code "
             "FROM console_page_snapshots ORDER BY page_key"
         ).fetchall()
     return {"ok": True, "items": [dict(row) for row in rows], "pages": list(PAGE_KEYS)}

@@ -9,7 +9,7 @@ from time import perf_counter
 from typing import Any, Callable, Tuple
 
 from app.integrations.tushare_client import reset_tushare_client
-from app.data_platform.db import _conn as data_conn
+from app.data_platform.db import _conn as data_conn, _read_conn as data_read_conn
 from app.db.store import (
     _conn as business_conn,
     get_account_balance,
@@ -271,7 +271,12 @@ def _execution_slice_ready(stock_count: int, counts: dict[str, int]) -> bool:
 
 
 def _strict_execution_observation_record(record: dict[str, Any], *, cutoff: datetime) -> bool:
-    """Check that one immutable row can safely support a live execution gate."""
+    """Check that one immutable row can safely support a live execution gate.
+
+    Kept only for the explicit non-PostgreSQL compatibility path. Production
+    PostgreSQL status checks use the direct-hash SQL contract below and never
+    materialize a full version payload set in Python.
+    """
 
     def _parse(value: Any) -> datetime | None:
         raw = str(value or "").strip().replace("Z", "+00:00")
@@ -314,13 +319,16 @@ def _snapshot_data_status(trade_date: str = "") -> tuple[str, dict[str, int]]:
     close slice as ready before the exact frozen-order audit runs.
     """
     requested = _trade_date_key(trade_date)
-    from app.data_platform.db import _conn
     from app.data_platform.services.market_calendar import TradeCalendarNotReady, target_trade_date
+    from app.data_platform.services.decision_data_contract import decision_data_contract
     from app.data_platform.services.observation_clock import load_raw_record_versions, load_snapshot_versions
 
     observation_cutoff = _business_now()
     cutoff_text = observation_cutoff.isoformat(timespec="seconds")
-    with _conn() as c:
+    # Scheduler status reads never need to share a mutation transaction.  An
+    # autocommit read avoids retaining an ``idle in transaction`` backend while
+    # a later daily-update or task step is being scheduled.
+    with data_read_conn() as c:
         try:
             target = requested or target_trade_date(c)
         except TradeCalendarNotReady as exc:
@@ -334,6 +342,29 @@ def _snapshot_data_status(trade_date: str = "") -> tuple[str, dict[str, int]]:
                 "immutable_schema_ready": 0,
                 "calendar_ready": 0,
                 "calendar_error": exc.code,
+            }
+        if bool(getattr(c, "_is_postgres", False)):
+            # Reuse the exact direct-hash/PIT contract used by plan
+            # generation. It performs one bounded target-date query and also
+            # returns the execution-only open/pre-close intersection; avoid a
+            # second scheduler-specific aggregate over the 41 GB projection.
+            contract = decision_data_contract(
+                target,
+                conn=c,
+                as_of_time=cutoff_text,
+                include_diagnostics=False,
+            )
+            contract_counts = dict(contract.get("counts") or {})
+            return target, {
+                "stock_count": max(0, int(contract.get("stock_count") or 0)),
+                "daily_n": max(0, int(contract_counts.get("daily") or 0)),
+                "execution_price_n": max(0, int(contract.get("execution_price_rows") or 0)),
+                "valuation_n": max(0, int(contract_counts.get("daily_basic") or 0)),
+                "limit_n": max(0, int(contract_counts.get("stk_limit") or 0)),
+                "immutable_schema_ready": int(bool(
+                    (contract.get("observation_contract") or {}).get("strict_schema_ready")
+                )),
+                "decision_ready": int(bool(contract.get("ok"))),
             }
         stock_rows = c.execute("SELECT ts_code FROM dc_stock_master").fetchall()
         stock_codes = {str(dict(row).get("ts_code") or "") for row in stock_rows}
@@ -452,6 +483,8 @@ def _close_data_status() -> tuple[str, bool, dict[str, int]]:
     target, counts = _snapshot_data_status()
     if not target:
         return target, False, counts
+    if "decision_ready" in counts:
+        return target, bool(counts.get("decision_ready")), counts
     try:
         from app.data_platform.services.decision_data_contract import decision_data_contract
 

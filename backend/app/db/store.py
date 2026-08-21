@@ -32,7 +32,10 @@ from app.core.a_share_fees import (
 from app.core.config import settings
 from app.core.trade_calendar import get_last_trade_date
 from app.core.runtime_guard import assert_database_boundary
-from app.core.db_connection_gate import DatabaseConnectionGate
+from app.core.db_connection_gate import (
+    DEFAULT_BUSINESS_DB_CONNECTIONS,
+    DatabaseConnectionGate,
+)
 from app.core.db_connect import connect_postgres
 from app.core.sql_compat import qmark_to_pyformat
 
@@ -67,11 +70,12 @@ _DEFAULT_STRATEGY_CONTENT = {
 }
 
 _BUSINESS_DB_CONNECTION_GATE = DatabaseConnectionGate(
-    "ALIS_BUSINESS_DB_MAX_CONNECTIONS", default=10
+    "ALIS_BUSINESS_DB_MAX_CONNECTIONS", default=DEFAULT_BUSINESS_DB_CONNECTIONS
 )
 _ACTIVE_BUSINESS_TRANSACTION: ContextVar[Optional["_ConnWrapper"]] = ContextVar(
     "alis_active_business_transaction", default=None,
 )
+_DEFAULT_IDLE_IN_TRANSACTION_TIMEOUT_MS = "60000"
 
 
 def _json_load(s: Any, default: Any) -> Any:
@@ -126,14 +130,34 @@ def _mysql_connect_kwargs() -> dict:
 class _ConnWrapper:
     """统一连接封装：SQLite 与 MySQL 使用相同的 execute / last_insert_id 接口。"""
 
-    def __init__(self, raw_conn, is_mysql: bool, is_postgres: bool = False):
+    def __init__(
+        self,
+        raw_conn,
+        is_mysql: bool,
+        is_postgres: bool = False,
+        autocommit_read_only: bool = False,
+    ):
         self._conn = raw_conn
         # Domain code historically uses _is_mysql to select the server-SQL
         # branch. PostgreSQL shares that branch, while the wrapper handles the
         # actual driver differences below.
         self._is_mysql = is_mysql or is_postgres
         self._is_postgres = is_postgres
+        self._autocommit_read_only = autocommit_read_only
         self._last_cursor = None
+
+    @property
+    def raw(self):
+        """Expose the driver connection consistently with the data DB wrapper.
+
+        A small number of bounded batch writers need ``cursor()``/
+        ``executemany()``.  Keeping this public alias aligned with
+        ``data_platform.db.Connection.raw`` also lets connection-contract
+        checks inspect the actual autocommit setting without bypassing the
+        wrapper through its private attribute.
+        """
+
+        return self._conn
 
     def execute(self, sql: str, params: Optional[tuple] = None):
         if self._is_postgres:
@@ -178,6 +202,9 @@ class _ConnWrapper:
     def commit(self) -> None:
         self._conn.commit()
 
+    def rollback(self) -> None:
+        self._conn.rollback()
+
     def close(self) -> None:
         self._conn.close()
 
@@ -199,6 +226,79 @@ def _split_sql_statements(sql: str) -> List[str]:
     """按分号拆分 SQL，忽略空段和仅注释。"""
     parts = re.split(r";\s*", sql)
     return [p.strip() for p in parts if p.strip() and not p.strip().startswith("--")]
+
+
+def _idle_in_transaction_timeout_ms() -> str:
+    return os.getenv(
+        "DATABASE_IDLE_IN_TRANSACTION_TIMEOUT_MS",
+        _DEFAULT_IDLE_IN_TRANSACTION_TIMEOUT_MS,
+    )
+
+
+def _configure_postgres_session(raw: Any, *, read_only: bool = False) -> None:
+    """Apply the bounded session contract to a newly opened connection."""
+
+    raw.execute(
+        "SELECT set_config('statement_timeout', %s, false)",
+        (str(settings.database_statement_timeout_ms),),
+    )
+    raw.execute(
+        "SELECT set_config('idle_in_transaction_session_timeout', %s, false)",
+        (_idle_in_transaction_timeout_ms(),),
+    )
+    if read_only:
+        raw.execute(
+            "SELECT set_config('default_transaction_read_only', 'on', false)"
+        )
+
+
+@contextmanager
+def _postgres_conn(*, read_only: bool):
+    """Open one business PostgreSQL connection with explicit semantics."""
+
+    import psycopg
+    from psycopg.rows import dict_row
+
+    url = (settings.database_url or "").strip()
+    assert_database_boundary(url, role="business")
+    if url.startswith("postgresql+psycopg://"):
+        url = url.replace("postgresql+psycopg://", "postgresql://", 1)
+    logger.debug("PostgreSQL 连接: %s", url.split("@")[-1])
+    with _BUSINESS_DB_CONNECTION_GATE.slot(settings.database_connect_timeout_seconds):
+        raw = connect_postgres(
+            psycopg.connect,
+            url,
+            row_factory=dict_row,
+            timeout=settings.database_connect_timeout_seconds,
+            role="business",
+            autocommit=read_only,
+        )
+        from app.core.autonomy_step_control import register_postgres_connection, unregister_postgres_connection
+
+        cancellation_registration = register_postgres_connection(raw)
+        wrapper = _ConnWrapper(
+            raw,
+            is_mysql=False,
+            is_postgres=True,
+            autocommit_read_only=read_only,
+        )
+        try:
+            _configure_postgres_session(raw, read_only=read_only)
+            yield wrapper
+            if not read_only:
+                wrapper.commit()
+        except BaseException:
+            # A statement timeout aborts a write transaction.  Autocommit
+            # reads have no enclosing transaction to poison and are closed.
+            if not read_only:
+                try:
+                    wrapper.rollback()
+                except Exception:
+                    logger.debug("business transaction rollback failed", exc_info=True)
+            raise
+        finally:
+            unregister_postgres_connection(cancellation_registration)
+            wrapper.close()
 
 
 @contextmanager
@@ -223,49 +323,8 @@ def _conn():
             raise
         return
     if _is_postgres():
-        import psycopg
-        from psycopg.rows import dict_row
-        url = (settings.database_url or "").strip()
-        assert_database_boundary(url, role="business")
-        if url.startswith("postgresql+psycopg://"):
-            url = url.replace("postgresql+psycopg://", "postgresql://", 1)
-        logger.debug("PostgreSQL 连接: %s", url.split("@")[-1])
-        with _BUSINESS_DB_CONNECTION_GATE.slot(settings.database_connect_timeout_seconds):
-            raw = connect_postgres(
-                psycopg.connect,
-                url,
-                row_factory=dict_row,
-                timeout=settings.database_connect_timeout_seconds,
-                role="business",
-            )
-            from app.core.autonomy_step_control import register_postgres_connection, unregister_postgres_connection
-            cancellation_registration = register_postgres_connection(raw)
-            w = None
-            try:
-                raw.execute("SELECT set_config('statement_timeout', %s, false)", (str(settings.database_statement_timeout_ms),))
-                raw.execute(
-                    "SELECT set_config('idle_in_transaction_session_timeout', %s, false)",
-                    (os.getenv("DATABASE_IDLE_IN_TRANSACTION_TIMEOUT_MS", "120000"),),
-                )
-                w = _ConnWrapper(raw, is_mysql=False, is_postgres=True)
-                yield w
-                w.commit()
-            except BaseException:
-                # Explicit rollback makes the failure boundary deterministic
-                # even when a caller catches a database exception outside this
-                # context.  Closing a psycopg connection also rolls back, but
-                # relying on close hid the poisoned-transaction root cause.
-                try:
-                    raw.rollback()
-                except Exception:
-                    logger.debug("business transaction rollback failed", exc_info=True)
-                raise
-            finally:
-                unregister_postgres_connection(cancellation_registration)
-                if w is not None:
-                    w.close()
-                else:
-                    raw.close()
+        with _postgres_conn(read_only=False) as connection:
+            yield connection
     elif _is_mysql():
         import pymysql
         kw = _mysql_connect_kwargs()
@@ -281,6 +340,38 @@ def _conn():
         raise RuntimeError(
             "DATABASE_URL 未配置为 PostgreSQL；SQLite 已禁用，请设置 DATABASE_URL。"
         )
+
+
+@contextmanager
+def _read_conn():
+    """Open a short-lived, server-enforced read-only autocommit connection.
+
+    Status and contract reads use this path so application-side aggregation
+    cannot leave an idle PostgreSQL transaction open.  It intentionally does
+    not join an active business write transaction: callers that need that
+    snapshot must use the supplied write connection explicitly.
+    """
+
+    if _ACTIVE_BUSINESS_TRANSACTION.get() is not None:
+        raise RuntimeError("只读自动提交连接不能加入活动的模拟账本事务")
+    if _is_postgres():
+        with _postgres_conn(read_only=True) as connection:
+            yield connection
+        return
+    if _is_mysql():
+        import pymysql
+
+        raw = pymysql.connect(**_mysql_connect_kwargs(), autocommit=True)
+        try:
+            with raw.cursor() as cursor:
+                cursor.execute("SET SESSION TRANSACTION READ ONLY")
+            yield _ConnWrapper(raw, is_mysql=True, autocommit_read_only=True)
+        finally:
+            raw.close()
+        return
+    raise RuntimeError(
+        "DATABASE_URL 未配置为 PostgreSQL；SQLite 已禁用，请设置 DATABASE_URL。"
+    )
 
 
 @contextmanager
@@ -1662,7 +1753,7 @@ def init_db() -> None:
 def database_health() -> dict[str, Any]:
     """Run a cheap readiness probe against the configured primary database."""
     try:
-        with _conn() as conn:
+        with _read_conn() as conn:
             conn.execute("SELECT 1").fetchone()
         return {
             "status": "ok",

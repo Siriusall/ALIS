@@ -162,6 +162,67 @@ def test_live_market_context_rebuild_uses_immutable_aggregates_after_cache_miss(
     assert not any("FROM dc_stock_daily_snapshot " in sql for sql in executed)
 
 
+def test_live_market_context_reuses_valid_durable_snapshot_after_redis_miss(monkeypatch) -> None:
+    dates = ["20260814", "20260813"]
+    snapshot_time = "2026-08-14T16:01:00+08:00"
+    payload = {
+        "ok": True,
+        "status": "ready",
+        "trade_date": dates[0],
+        "available_time": snapshot_time,
+        "market_state": {"state": "S1"},
+    }
+    redis_writes: list[tuple[str, dict, int]] = []
+
+    class Result:
+        def __init__(self, *, rows=None, row=None):
+            self._rows = rows or []
+            self._row = row
+
+        def fetchall(self):
+            return self._rows
+
+        def fetchone(self):
+            return self._row
+
+    class Connection:
+        def execute(self, sql, _params=()):
+            if "FROM dc_available_trade_dates" in sql and "LIMIT 6" in sql:
+                return Result(rows=[{"trade_date": value} for value in dates])
+            if "FROM dc_market_context_snapshot" in sql and "result_json,created_at,updated_at" in sql:
+                return Result(row={
+                    "result_json": json.dumps(payload),
+                    "created_at": snapshot_time,
+                    "updated_at": snapshot_time,
+                })
+            if "SELECT updated_at FROM dc_available_trade_dates" in sql:
+                return Result(row={"updated_at": "2026-08-14T16:00:00+08:00"})
+            raise AssertionError(f"durable market-context cache should avoid rebuild query: {sql}")
+
+    @contextmanager
+    def fake_conn():
+        yield Connection()
+
+    monkeypatch.setattr(market_context, "_conn", fake_conn)
+    monkeypatch.setattr(market_context, "target_trade_date", lambda _conn: dates[0])
+    monkeypatch.setattr(market_context, "get_json", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        market_context,
+        "set_json",
+        lambda key, value, ttl: redis_writes.append((key, value, ttl)),
+    )
+    monkeypatch.setattr(
+        market_context,
+        "load_snapshot_market_aggregates",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must use durable snapshot")),
+    )
+
+    result = market_context.live_market_context()
+
+    assert result == payload
+    assert redis_writes == [("alis:market-context:live:v5", payload, 300)]
+
+
 def test_live_market_context_rejects_stale_cache_when_target_session_is_missing(monkeypatch) -> None:
     class Result:
         def fetchall(self):

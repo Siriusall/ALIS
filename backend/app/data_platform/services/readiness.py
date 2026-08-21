@@ -6,7 +6,7 @@ import time
 from typing import Any
 
 from app.data_platform.contracts import CONTRACTS
-from app.data_platform.db import _conn
+from app.data_platform.db import _read_conn
 from app.data_platform.redis_store import delete as redis_delete, get_json, set_json
 from app.data_platform.services.market_calendar import TradeCalendarNotReady, target_trade_date
 from app.data_platform.services.assets import _report_periods
@@ -45,7 +45,7 @@ def _recent_report_periods(today: date) -> list[str]:
 def _metrics() -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
     today_d = date.today()
     today = today_d.strftime("%Y%m%d")
-    with _conn() as c:
+    with _read_conn() as c:
         target = target_trade_date(c)
     target_d = date(int(target[:4]), int(target[4:6]), int(target[6:8]))
     window_start = (target_d - timedelta(days=730)).strftime("%Y%m%d")
@@ -54,7 +54,7 @@ def _metrics() -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
     # must not inflate the denominator and create a false gap.
     calendar_end = today
     calendar_expected = (date.today() - (date.today() - timedelta(days=730))).days + 1
-    with _conn() as c:
+    with _read_conn() as c:
         stock_count = int(_value(c.execute("SELECT COUNT(*) n FROM dc_stock_master").fetchone(), "n"))
         latest = target
         usable_latest = _latest_usable_snapshot_date(c, stock_count)
@@ -244,7 +244,7 @@ def readiness_overview() -> dict[str, Any]:
     # Redis or process-cache snapshot.  A cached green readiness result must
     # never survive a calendar outage/bootstrap gap.
     try:
-        with _conn() as c:
+        with _read_conn() as c:
             target_trade_date(c)
     except TradeCalendarNotReady as exc:
         blocked = {

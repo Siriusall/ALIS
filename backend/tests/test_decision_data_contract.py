@@ -28,7 +28,11 @@ class _Result:
 
 def _complete_evidence(stock_count: int = 5518) -> dict[str, int]:
     evidence = _empty_evidence()
-    evidence.update({"snapshot_rows": stock_count, "snapshot_observation_rows": stock_count})
+    evidence.update({
+        "snapshot_rows": stock_count,
+        "snapshot_observation_rows": stock_count,
+        "daily_execution_price_rows": stock_count,
+    })
     for api in REQUIRED_DECISION_APIS:
         evidence[f"{api}_raw_rows"] = stock_count
         evidence[f"{api}_raw_observation_rows"] = stock_count
@@ -64,6 +68,9 @@ class _ContractConn:
             "SAVEPOINT decision_field_lineage",
             "ROLLBACK TO SAVEPOINT decision_field_lineage",
             "RELEASE SAVEPOINT decision_field_lineage",
+            "SAVEPOINT decision_strict_evidence",
+            "ROLLBACK TO SAVEPOINT decision_strict_evidence",
+            "RELEASE SAVEPOINT decision_strict_evidence",
         }:
             return _Result()
         if "FROM dc_stock_master" in sql and "COUNT(*) AS count" in sql:
@@ -80,7 +87,7 @@ class _ContractConn:
             ])
         if "jsonb_each_text" in sql:
             return _Result(many=[])
-        if "WITH raw_ranked AS" in sql:
+        if "qualified_evidence AS (" in sql:
             if self.strict_error:
                 raise self.strict_error
             return _Result(one=self.evidence)
@@ -231,7 +238,9 @@ def test_contract_query_guards_bad_persisted_timestamp_before_casting():
 
     assert result["ok"] is True
     strict_sql, strict_params = next(
-        (sql, params) for sql, params in conn.queries if "WITH raw_ranked AS" in sql
+        (sql, params)
+        for sql, params in conn.queries
+        if "qualified_evidence AS (" in sql
     )
     assert "~ '(Z|[+-][0-9]{2}:[0-9]{2})$'" in strict_sql
     assert "CASE WHEN" in strict_sql
@@ -244,12 +253,43 @@ def test_contract_query_guards_bad_persisted_timestamp_before_casting():
     assert "raw.economic_available_time" in strict_sql
     assert "snapshot.first_observed_at" in strict_sql
     assert "snapshot.economic_available_time" in strict_sql
+    assert "FROM dc_tushare_raw_records accepted" in strict_sql
+    assert "FROM dc_stock_daily_snapshot accepted" in strict_sql
+    assert "ROW_NUMBER() OVER" not in strict_sql
+    assert "COUNT(DISTINCT" not in strict_sql
+    assert "raw_flags AS MATERIALIZED" in strict_sql
+    assert "snapshot_flags AS MATERIALIZED" in strict_sql
+    assert "COUNT(*) FILTER" in strict_sql
+    assert "bool_or" in strict_sql
+    assert "FILTER (WHERE api_name='daily')" in strict_sql
+    # The source sets are reduced before their only cross-source join.  A
+    # full join forces PostgreSQL to use hash/merge semantics even when the
+    # strict timestamp predicates cause a very low CTE cardinality estimate;
+    # null-extended rows cannot pass the qualified r/s conjunctions.
+    assert "FULL OUTER JOIN snapshot_flags s ON s.ts_code=r.ts_code" in strict_sql
+    assert "FROM raw_flags r\n              FULL OUTER JOIN snapshot_flags s" in strict_sql
+    assert "qualified AS (" not in strict_sql
+    assert "daily_execution_price_rows" in strict_sql
+    assert "'double precision'" in strict_sql
+    assert "< 'Infinity'::double precision" in strict_sql
+    # The mutable accepted projection selects the content hash, but the
+    # immutable evidence must still belong to that same market session.  A
+    # provider correction must not let a retained old version be counted for
+    # a rewritten projection date.
+    all_contract_sql = "\n".join(sql for sql, _params in conn.queries)
+    assert all_contract_sql.count("raw.trade_date=accepted.trade_date") == 4
     assert strict_params == (
         "20260724", "2026-07-24T18:00:00+08:00", "2026-07-24T18:00:00+08:00",
         "2026-07-24T18:00:00+08:00", "2026-07-24T18:00:00+08:00",
         "20260724", "2026-07-24T18:00:00+08:00", "2026-07-24T18:00:00+08:00",
         "2026-07-24T18:00:00+08:00", "2026-07-24T18:00:00+08:00",
     )
+
+
+def test_contract_exposes_execution_only_price_coverage_from_same_strict_query():
+    result = _contract(_ContractConn())
+
+    assert result["execution_price_rows"] == 5518
 
 
 def test_contract_rolls_back_base_diagnostic_timeout_before_reusing_caller_connection():
@@ -291,7 +331,10 @@ def test_contract_rolls_back_base_diagnostic_timeout_before_reusing_caller_conne
         "ROLLBACK TO SAVEPOINT decision_base_counts",
         "RELEASE SAVEPOINT decision_base_counts",
     ]
-    assert not any("WITH raw_ranked AS" in sql for sql, _params in conn.queries)
+    assert not any(
+        "qualified_evidence AS (" in sql
+        for sql, _params in conn.queries
+    )
     assert conn.execute("SELECT 1").fetchone() == {"?column?": 1}
 
 

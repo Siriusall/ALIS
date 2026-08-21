@@ -801,7 +801,7 @@ def live_market_context(*, persist: bool = False) -> dict[str, Any]:
         # read model. Reuse it after a Redis miss only when it was refreshed
         # after the latest trade-date index, otherwise rebuild from source.
         stored_snapshot = c.execute(
-            """SELECT result_json,updated_at
+            """SELECT result_json,created_at,updated_at
                  FROM dc_market_context_snapshot
                 WHERE trade_date=?""",
             (latest,),

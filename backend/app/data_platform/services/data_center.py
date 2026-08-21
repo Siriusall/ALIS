@@ -16,7 +16,7 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 import requests
 
-from app.data_platform.db import _conn, _is_mysql
+from app.data_platform.db import _conn, _is_mysql, _read_conn
 from app.data_platform.tushare_client import (
     configured_tushare_probe_endpoints,
     get_tushare_client,
@@ -72,6 +72,19 @@ SNAPSHOT_MATERIALIZATION_TIMEOUT_MS = max(
     60_000,
     min(int(os.getenv("ALIS_SNAPSHOT_MATERIALIZATION_TIMEOUT_MS", "300000") or 300000), 900_000),
 )
+# Keep each current-session snapshot write batch short.  The full market has
+# roughly 5,500 rows and writes both an immutable version and a projection per
+# symbol; one transaction held for the whole loop created old snapshots and
+# made unrelated readers wait behind a long-lived transaction.
+SNAPSHOT_MATERIALIZATION_BATCH_SIZE = max(
+    100,
+    min(int(os.getenv("ALIS_SNAPSHOT_MATERIALIZATION_BATCH_SIZE", "250") or 250), 1_000),
+)
+# Industry metric imports can contain thousands of monthly observations. Keep
+# each transaction bounded so a slow/failed batch does not hold a database
+# transaction open for the entire import. The boundary is deliberately fixed
+# at 250 rows across all supported database adapters.
+INDUSTRY_METRIC_UPSERT_BATCH_SIZE = 250
 
 
 def set_tushare_activity_hook(hook: Callable[[dict[str, Any]], None] | None) -> None:
@@ -5485,7 +5498,10 @@ def build_stock_daily_snapshot(trade_date: str) -> dict[str, Any]:
 
     run_id = start_ingestion_run("data_center.stock_daily_snapshot", {"trade_date": trade_date})
     try:
-        with _conn() as c:
+        # All dependency reads are independent of the subsequent writes.
+        # Autocommit/read-only prevents Python decoding of the full market
+        # slice from leaving PostgreSQL ``idle in transaction``.
+        with _read_conn() as c:
             # Current-session materialization transfers and validates the full
             # market slice.  It is a bounded background batch, not an
             # interactive request, so the global 30-second query budget can
@@ -5644,6 +5660,12 @@ def build_stock_daily_snapshot(trade_date: str) -> dict[str, Any]:
                 )
                 _upsert_snapshot_row(c, values)
                 written += 1
+                if written % SNAPSHOT_MATERIALIZATION_BATCH_SIZE == 0:
+                    # Each row's immutable append and overwrite projection
+                    # remain atomic; a later failed batch leaves the formal
+                    # data contract incomplete rather than exposing a false
+                    # full-day success.
+                    c.commit()
             if written > 0:
                 # The date marker is only a freshness watermark.  It must
                 # carry the actual latest observation, not the market close.
@@ -6878,31 +6900,129 @@ def _load_industry_metric_file(path: Path) -> tuple[list[dict[str, Any]], list[d
     return definitions, values
 
 
+def _batch_raw_connection(conn: Any) -> Any:
+    """Return the driver connection behind either supported wrapper shape."""
+
+    raw = getattr(conn, "raw", None)
+    if raw is not None:
+        return raw
+    raw = getattr(conn, "_conn", None)
+    if raw is not None:
+        return raw
+    return conn
+
+
+def _batch_sql_is_postgres(conn: Any) -> bool:
+    return bool(getattr(conn, "_is_postgres", False))
+
+
+def _batch_sql_is_mysql(conn: Any) -> bool:
+    # The business wrapper historically sets both flags for PostgreSQL. Give
+    # the explicit PostgreSQL dialect precedence so an adapted wrapper cannot
+    # accidentally receive MySQL's ON DUPLICATE KEY syntax.
+    return bool(getattr(conn, "_is_mysql", False)) and not _batch_sql_is_postgres(conn)
+
+
+def _batch_executemany(conn: Any, sql: str, rows: list[tuple[Any, ...]]) -> None:
+    """Execute one bounded batch on PostgreSQL, MySQL, or SQLite.
+
+    psycopg and PyMySQL expose ``executemany`` on a cursor, while sqlite3
+    exposes it directly on the connection. A few migration/test wrappers only
+    expose the method on the wrapper itself, so retain that final fallback.
+    """
+
+    if not rows:
+        return
+    raw = _batch_raw_connection(conn)
+    needs_pyformat = _batch_sql_is_postgres(conn) or _batch_sql_is_mysql(conn)
+    statement = qmark_to_pyformat(sql) if needs_pyformat else sql
+    if _batch_sql_is_postgres(conn) or _batch_sql_is_mysql(conn):
+        cursor = raw.cursor()
+        try:
+            cursor.executemany(statement, rows)
+        finally:
+            close = getattr(cursor, "close", None)
+            if callable(close):
+                close()
+        return
+    executemany = getattr(raw, "executemany", None)
+    if callable(executemany):
+        executemany(statement, rows)
+        return
+    executemany = getattr(conn, "executemany", None)
+    if callable(executemany):
+        executemany(statement, rows)
+        return
+    raise AttributeError("database wrapper does not expose executemany")
+
+
+def _batch_commit(conn: Any) -> None:
+    commit = getattr(conn, "commit", None)
+    if callable(commit):
+        commit()
+        return
+    raw = _batch_raw_connection(conn)
+    commit = getattr(raw, "commit", None)
+    if callable(commit):
+        commit()
+        return
+    raise AttributeError("database wrapper does not expose commit")
+
+
+def _batch_rollback(conn: Any) -> None:
+    rollback = getattr(conn, "rollback", None)
+    if callable(rollback):
+        rollback()
+        return
+    raw = _batch_raw_connection(conn)
+    rollback = getattr(raw, "rollback", None)
+    if callable(rollback):
+        rollback()
+
+
+def _commit_industry_metric_batch(conn: Any, sql: str, rows: list[tuple[Any, ...]]) -> None:
+    """Write and commit one batch, rolling back only that batch on failure."""
+
+    try:
+        _batch_executemany(conn, sql, rows)
+        _batch_commit(conn)
+    except BaseException:
+        # Preserve the original database error. The surrounding _conn()
+        # context will also clean up its transaction, but an explicit rollback
+        # here is required before a caller can inspect/retry the same session.
+        try:
+            _batch_rollback(conn)
+        except Exception:
+            pass
+        raise
+
+
 def _upsert_industry_metric_definitions(rows: list[dict[str, Any]]) -> int:
     if not rows:
         return 0
     now = _now()
-    written = 0
+    pending: list[tuple[Any, ...]] = []
+    for row in rows:
+        metric_code = str(row.get("metric_code") or "").strip()
+        if not metric_code:
+            continue
+        pending.append((
+            metric_code,
+            str(row.get("industry_code") or "").strip(),
+            str(row.get("industry_name") or "").strip(),
+            str(row.get("metric_name") or "").strip(),
+            str(row.get("unit") or "").strip(),
+            str(row.get("frequency") or "").strip(),
+            str(row.get("source_code") or SOURCE_MANUAL).strip(),
+            str(row.get("description") or "").strip(),
+            now,
+            now,
+        ))
+    if not pending:
+        return 0
     with _conn() as c:
-        for row in rows:
-            metric_code = str(row.get("metric_code") or "").strip()
-            if not metric_code:
-                continue
-            values = (
-                metric_code,
-                str(row.get("industry_code") or "").strip(),
-                str(row.get("industry_name") or "").strip(),
-                str(row.get("metric_name") or "").strip(),
-                str(row.get("unit") or "").strip(),
-                str(row.get("frequency") or "").strip(),
-                str(row.get("source_code") or SOURCE_MANUAL).strip(),
-                str(row.get("description") or "").strip(),
-                now,
-                now,
-            )
-            if c._is_mysql:
-                c.execute(
-                    """
+        sql = (
+            """
                     INSERT INTO dc_industry_metric_definition
                         (metric_code, industry_code, industry_name, metric_name, unit, frequency, source_code, description, created_at, updated_at)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -6910,12 +7030,10 @@ def _upsert_industry_metric_definitions(rows: list[dict[str, Any]]) -> int:
                         industry_code = VALUES(industry_code), industry_name = VALUES(industry_name),
                         metric_name = VALUES(metric_name), unit = VALUES(unit), frequency = VALUES(frequency),
                         source_code = VALUES(source_code), description = VALUES(description), updated_at = VALUES(updated_at)
-                    """,
-                    values,
-                )
-            else:
-                c.execute(
                     """
+            if _batch_sql_is_mysql(c)
+            else
+            """
                     INSERT INTO dc_industry_metric_definition
                         (metric_code, industry_code, industry_name, metric_name, unit, frequency, source_code, description, created_at, updated_at)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -6928,11 +7046,15 @@ def _upsert_industry_metric_definitions(rows: list[dict[str, Any]]) -> int:
                         source_code = excluded.source_code,
                         description = excluded.description,
                         updated_at = excluded.updated_at
-                    """,
-                    values,
-                )
-            written += 1
-    return written
+                    """
+        )
+        for offset in range(0, len(pending), INDUSTRY_METRIC_UPSERT_BATCH_SIZE):
+            _commit_industry_metric_batch(
+                c,
+                sql,
+                pending[offset:offset + INDUSTRY_METRIC_UPSERT_BATCH_SIZE],
+            )
+    return len(pending)
 
 
 def estimate_data_center_runtime(years: int = 10, *, trading_days_per_year: int = 250) -> dict[str, Any]:
@@ -7008,39 +7130,38 @@ def _upsert_industry_metric_values(rows: list[dict[str, Any]]) -> int:
     if not rows:
         return 0
     now = _now()
-    written = 0
+    pending: list[tuple[Any, ...]] = []
+    for row in rows:
+        metric_code = str(row.get("metric_code") or "").strip()
+        data_date = str(row.get("data_date") or "").strip()
+        if not metric_code or not data_date:
+            continue
+        raw_value = str(row.get("raw_value") if row.get("raw_value") is not None else row.get("value") or "")
+        available_time = str(row.get("available_time") or now)
+        pending.append((
+            metric_code,
+            data_date,
+            _float_or_none(row.get("value")),
+            raw_value,
+            str(row.get("source_code") or SOURCE_MANUAL).strip(),
+            available_time,
+            now,
+        ))
+    if not pending:
+        return 0
     with _conn() as c:
-        for row in rows:
-            metric_code = str(row.get("metric_code") or "").strip()
-            data_date = str(row.get("data_date") or "").strip()
-            if not metric_code or not data_date:
-                continue
-            raw_value = str(row.get("raw_value") if row.get("raw_value") is not None else row.get("value") or "")
-            available_time = str(row.get("available_time") or now)
-            values = (
-                metric_code,
-                data_date,
-                _float_or_none(row.get("value")),
-                raw_value,
-                str(row.get("source_code") or SOURCE_MANUAL).strip(),
-                available_time,
-                now,
-            )
-            if c._is_mysql:
-                c.execute(
-                    """
+        sql = (
+            """
                     INSERT INTO dc_industry_metric_value
                         (metric_code, data_date, value, raw_value, source_code, available_time, updated_at)
                     VALUES (?, ?, ?, ?, ?, ?, ?)
                     ON DUPLICATE KEY UPDATE
                         value = VALUES(value), raw_value = VALUES(raw_value), source_code = VALUES(source_code),
                         available_time = VALUES(available_time), updated_at = VALUES(updated_at)
-                    """,
-                    values,
-                )
-            else:
-                c.execute(
                     """
+            if _batch_sql_is_mysql(c)
+            else
+            """
                     INSERT INTO dc_industry_metric_value
                         (metric_code, data_date, value, raw_value, source_code, available_time, updated_at)
                     VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -7050,8 +7171,12 @@ def _upsert_industry_metric_values(rows: list[dict[str, Any]]) -> int:
                         source_code = excluded.source_code,
                         available_time = excluded.available_time,
                         updated_at = excluded.updated_at
-                    """,
-                    values,
-                )
-            written += 1
-    return written
+                    """
+        )
+        for offset in range(0, len(pending), INDUSTRY_METRIC_UPSERT_BATCH_SIZE):
+            _commit_industry_metric_batch(
+                c,
+                sql,
+                pending[offset:offset + INDUSTRY_METRIC_UPSERT_BATCH_SIZE],
+            )
+    return len(pending)

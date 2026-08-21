@@ -1,3 +1,6 @@
+from contextlib import contextmanager
+from datetime import datetime, timezone
+
 from app.services import quant_task_runner
 from app.services.quant_task_runner import _execution_slice_ready, _market_slice_ready
 
@@ -9,7 +12,6 @@ def test_scheduler_poll_timeout_is_retryable_wait_not_component_failure():
     assert quant_task_runner._is_expected_scheduler_wait(
         RuntimeError("unexpected contract corruption")
     ) is False
-from datetime import datetime, timezone
 
 
 def test_close_data_gate_requires_all_target_day_market_fields() -> None:
@@ -21,6 +23,63 @@ def test_close_data_gate_requires_all_target_day_market_fields() -> None:
 
 def test_close_data_gate_does_not_treat_an_empty_slice_as_ready() -> None:
     assert not _market_slice_ready(5_534, {"daily_n": 0, "valuation_n": 0, "limit_n": 0})
+
+
+def test_postgres_scheduler_reuses_one_strict_direct_hash_contract(monkeypatch) -> None:
+    """Minute scheduling must not add a second raw-table aggregation path."""
+
+    class ReadConnection:
+        _is_postgres = True
+        _autocommit_read_only = True
+
+    connection = ReadConnection()
+    captured = {}
+
+    @contextmanager
+    def open_read_connection():
+        yield connection
+
+    def contract(trade_date, *, conn, as_of_time, include_diagnostics):
+        captured.update({
+            "trade_date": trade_date,
+            "conn": conn,
+            "as_of_time": as_of_time,
+            "include_diagnostics": include_diagnostics,
+        })
+        return {
+            "ok": True,
+            "stock_count": 1_000,
+            "counts": {"daily": 996, "daily_basic": 950, "stk_limit": 990},
+            "execution_price_rows": 996,
+            "observation_contract": {"strict_schema_ready": True},
+        }
+
+    monkeypatch.setattr(quant_task_runner, "data_read_conn", open_read_connection)
+    monkeypatch.setattr(
+        "app.data_platform.services.market_calendar.target_trade_date",
+        lambda _conn: "20260731",
+    )
+    monkeypatch.setattr(
+        "app.data_platform.services.decision_data_contract.decision_data_contract",
+        contract,
+    )
+
+    target, counts = quant_task_runner._snapshot_data_status()
+
+    assert target == "20260731"
+    assert counts == {
+        "stock_count": 1_000,
+        "daily_n": 996,
+        "execution_price_n": 996,
+        "valuation_n": 950,
+        "limit_n": 990,
+        "immutable_schema_ready": 1,
+        "decision_ready": 1,
+    }
+    assert captured["trade_date"] == "20260731"
+    assert captured["conn"] is connection
+    assert captured["include_diagnostics"] is False
+    assert captured["as_of_time"].endswith("+08:00")
 
 
 def test_t1_execution_slice_does_not_require_new_decision_valuation_data() -> None:

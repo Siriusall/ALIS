@@ -8,7 +8,7 @@ from datetime import date, datetime, time as dtime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from app.data_platform.db import _conn
+from app.data_platform.db import _conn, _read_conn
 from app.data_platform.services.data_center import (
     classify_tushare_error,
     enrich_financial_research_fields,
@@ -930,7 +930,7 @@ def daily_update_status(*, compact: bool = False) -> dict[str, Any]:
             parsed_origin + timedelta(seconds=retry_after_seconds)
         ).isoformat(timespec="seconds")
     try:
-        with _conn() as c:
+        with _read_conn() as c:
             state["latest_usable_snapshot_date"] = _latest_usable_snapshot_date(c)
             # A compact status is a live polling projection, not a historical
             # readiness report.  Searching backwards through up to twelve
@@ -1010,7 +1010,7 @@ def daily_update_status(*, compact: bool = False) -> dict[str, Any]:
 
 def simple_health(*, compact: bool = False) -> dict[str, Any]:
     try:
-        with _conn() as c:
+        with _read_conn() as c:
             target = target_trade_date(c)
             contract = decision_data_contract(target, conn=c)
             snapshot_count, snapshot_count_estimated = estimated_table_count(c, "dc_stock_daily_snapshot")

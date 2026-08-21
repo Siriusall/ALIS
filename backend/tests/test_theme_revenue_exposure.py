@@ -1,3 +1,4 @@
+import app.services.theme_revenue_exposure as theme_revenue_exposure
 from app.services.theme_revenue_exposure import (
     _company_exposures,
     _execute_many,
@@ -52,8 +53,13 @@ def test_company_exposure_is_deterministic_and_uses_latest_period_segments():
     assert exposures == same_exposures
 
 
-def test_initial_company_discovery_uses_bounded_distinct_index_query():
+def test_initial_company_discovery_uses_bounded_distinct_index_query(monkeypatch):
     captured = {}
+
+    def fail_if_history_loader_is_used(*_args, **_kwargs):
+        raise AssertionError("initial current discovery must not scan immutable raw history")
+
+    monkeypatch.setattr(theme_revenue_exposure, "load_raw_record_versions", fail_if_history_loader_is_used)
 
     class Cursor:
         def fetchall(self):

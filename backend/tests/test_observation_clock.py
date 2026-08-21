@@ -315,6 +315,34 @@ def test_current_projection_loader_requires_its_immutable_version():
     ]
 
 
+def test_raw_loader_does_not_move_an_accepted_hash_between_trade_dates():
+    """The accepted projection's session is part of immutable PIT identity."""
+
+    connection = _connection_with_accepted_projections()
+    connection.execute(
+        "ALTER TABLE dc_tushare_raw_records ADD COLUMN trade_date TEXT NOT NULL DEFAULT ''"
+    )
+    observed = "2026-08-14T15:02:00+08:00"
+    connection.execute(
+        """INSERT INTO dc_tushare_raw_record_version
+           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (
+            1, "daily", "daily:000001.SZ:20260813", "000001.SZ", "20260813", "", "",
+            json.dumps({"ts_code": "000001.SZ", "close": 10}), "tencent_market_snapshot",
+            observed, observed, observed, "tencent_market_snapshot:validated", "accepted", observed,
+        ),
+    )
+    connection.execute(
+        """INSERT INTO dc_tushare_raw_records(api_name,record_key,content_hash,trade_date)
+           VALUES(?,?,?,?)""",
+        ("daily", "daily:000001.SZ:20260813", "accepted", "20260814"),
+    )
+
+    assert load_raw_record_versions(
+        connection, "daily", cutoff="2026-08-14T15:05:00+08:00",
+    ) == []
+
+
 def test_snapshot_loader_keeps_accepted_projection_and_blocks_late_acceptance():
     connection = _connection_with_accepted_projections()
     early = "2026-08-14T15:01:00+08:00"

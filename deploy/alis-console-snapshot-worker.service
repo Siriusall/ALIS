@@ -9,6 +9,15 @@ WorkingDirectory=/opt/alis-worker/backend
 EnvironmentFile=/etc/alis/worker.env
 Environment=PYTHONPATH=/opt/alis-worker/backend
 Environment=ALIS_WORKER_POOL=control
+# This is a fourth process against the same 30-session PostgreSQL cluster as
+# the API, control and research workers.  Keep its own short-lived connection
+# allowance below the shared worker.env defaults so enabling snapshot prewarm
+# cannot exhaust the cluster during a data-platform recovery.
+Environment=ALIS_BUSINESS_DB_MAX_CONNECTIONS=2
+Environment=ALIS_DATA_DB_MAX_CONNECTIONS=2
+Environment=DATABASE_CONNECT_TIMEOUT_SECONDS=5
+Environment=DATABASE_STATEMENT_TIMEOUT_MS=30000
+Environment=DATABASE_IDLE_IN_TRANSACTION_TIMEOUT_MS=60000
 ExecStart=/opt/alis-worker/backend/.venv/bin/python -m app.console_snapshot_worker_main
 Restart=always
 RestartSec=10

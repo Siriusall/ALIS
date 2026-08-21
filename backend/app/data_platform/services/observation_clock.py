@@ -303,6 +303,7 @@ def load_raw_record_versions(
     projection_columns = _table_columns(c, "dc_tushare_raw_records")
     projection_winner_sql = "0"
     projection_filter_sql = ""
+    accepted_trade_date_join = ""
     if {"api_name", "record_key", "content_hash"}.issubset(projection_columns):
         projection_winner_sql = "1"
         # Do not fall back to another immutable version when the accepted
@@ -310,6 +311,12 @@ def load_raw_record_versions(
         # contract gap and must remain empty/blocked instead of being hidden
         # by an older or slower source.
         projection_filter_sql = ""
+        if "trade_date" in projection_columns and "trade_date" in columns:
+            # A repaired projection must remain tied to the immutable
+            # version's economic session.  Without this equality, a changed
+            # projection date could select an old version with the same
+            # logical key/hash and silently move evidence across sessions.
+            accepted_trade_date_join = " AND p.trade_date=v.trade_date"
         # Join the accepted projection once below. The old correlated EXISTS
         # was evaluated for every immutable version and made daily planning
         # scan the full raw-history table.
@@ -373,6 +380,7 @@ def load_raw_record_versions(
         source_sql = (
             "dc_tushare_raw_record_version v JOIN dc_tushare_raw_records p "
             "ON p.api_name=v.api_name AND p.record_key=v.record_key AND p.content_hash=v.content_hash"
+            f"{accepted_trade_date_join}"
         )
     if {"api_name", "record_key", "content_hash"}.issubset(projection_columns):
         # The accepted projection has one row per (api_name, record_key), and
@@ -461,11 +469,12 @@ def load_current_raw_record_versions(
                v.period,v.ann_date,v.payload_json,v.source_code,
                v.economic_available_time,v.observed_at,v.first_observed_at,
                v.observation_provenance,v.content_hash,v.created_at
-          FROM dc_tushare_raw_records p
-          JOIN dc_tushare_raw_record_version v
-            ON v.api_name=p.api_name
-           AND v.record_key=p.record_key
-           AND v.content_hash=p.content_hash
+        FROM dc_tushare_raw_records p
+        JOIN dc_tushare_raw_record_version v
+          ON v.api_name=p.api_name
+         AND v.record_key=p.record_key
+         AND v.content_hash=p.content_hash
+         AND v.trade_date=p.trade_date
          WHERE {' AND '.join(predicates)}
          ORDER BY v.observed_at,v.id
     """
@@ -502,25 +511,9 @@ def load_snapshot_versions(
     economic_available_cast = _timestamp_value_sql("v.economic_available_time", is_postgres=is_postgres)
     created_cast = _timestamp_value_sql("v.created_at", is_postgres=is_postgres)
     projection_columns = _table_columns(c, "dc_stock_daily_snapshot")
-    projection_winner_sql = "0"
-    projection_filter_sql = ""
-    if {"ts_code", "trade_date", "content_hash"}.issubset(projection_columns):
-        projection_winner_sql = (
-            "CASE WHEN EXISTS ("
-            "SELECT 1 FROM dc_stock_daily_snapshot current_projection "
-            "WHERE current_projection.ts_code=v.ts_code "
-            "AND current_projection.trade_date=v.trade_date "
-            "AND current_projection.content_hash=v.content_hash"
-            ") THEN 1 ELSE 0 END"
-        )
-        projection_filter_sql = (
-            "EXISTS ("
-            "SELECT 1 FROM dc_stock_daily_snapshot current_projection "
-            "WHERE current_projection.ts_code=v.ts_code "
-            "AND current_projection.trade_date=v.trade_date "
-            "AND current_projection.content_hash=v.content_hash"
-            ")"
-        )
+    has_accepted_projection = {
+        "ts_code", "trade_date", "content_hash",
+    }.issubset(projection_columns)
     predicates = [
         "v.content_hash<>''",
         "NULLIF(TRIM(COALESCE(v.source_code,'')),'') IS NOT NULL",
@@ -530,8 +523,6 @@ def load_snapshot_versions(
         _explicit_timestamp_sql("v.economic_available_time", is_postgres=is_postgres),
         _explicit_timestamp_sql("v.created_at", is_postgres=is_postgres),
     ]
-    if projection_filter_sql:
-        predicates.append(projection_filter_sql)
     params: list[Any] = []
     if normalized_cutoff:
         predicates.append(f"{timestamp_cast}<={timestamp_parameter}")
@@ -563,24 +554,41 @@ def load_snapshot_versions(
     if trade_date_end:
         predicates.append("v.trade_date<=?")
         params.append(str(trade_date_end))
-    sql = f"""WITH ranked AS (
-                 SELECT v.id,v.ts_code,v.trade_date,v.payload_json,v.source_code,
-                        v.economic_available_time,v.observed_at,v.first_observed_at,
-                        v.observation_provenance,v.content_hash,v.created_at,
-                        ROW_NUMBER() OVER (
-                            PARTITION BY v.ts_code,v.trade_date
-                            ORDER BY {projection_winner_sql} DESC,
-                                     {timestamp_cast} DESC,{created_cast} DESC,v.id DESC
-                        ) AS row_rank
-                   FROM dc_stock_daily_snapshot_version v
-                  WHERE {' AND '.join(predicates)}
-             )
-             SELECT id,ts_code,trade_date,payload_json,source_code,
-                    economic_available_time,observed_at,first_observed_at,
-                    observation_provenance,content_hash,created_at
-               FROM ranked
-              WHERE row_rank=1
-              ORDER BY trade_date,ts_code,observed_at,id"""
+    if has_accepted_projection:
+        # The accepted projection has one row per (ts_code, trade_date), and
+        # append-only snapshots are unique on that key plus content_hash.
+        # An exact hash join is therefore already one row per logical bar.
+        # Do not rank or correlate against the 7 GB projection: if its chosen
+        # hash arrived after the caller's PIT cutoff, returning no row is the
+        # required fail-closed result.
+        sql = f"""SELECT v.id,v.ts_code,v.trade_date,v.payload_json,v.source_code,
+                         v.economic_available_time,v.observed_at,v.first_observed_at,
+                         v.observation_provenance,v.content_hash,v.created_at
+                    FROM dc_stock_daily_snapshot accepted
+                    JOIN dc_stock_daily_snapshot_version v
+                      ON v.ts_code=accepted.ts_code
+                     AND v.trade_date=accepted.trade_date
+                     AND v.content_hash=accepted.content_hash
+                   WHERE {' AND '.join(predicates)}
+                   ORDER BY v.trade_date,v.ts_code,v.observed_at,v.id"""
+    else:
+        sql = f"""WITH ranked AS (
+                     SELECT v.id,v.ts_code,v.trade_date,v.payload_json,v.source_code,
+                            v.economic_available_time,v.observed_at,v.first_observed_at,
+                            v.observation_provenance,v.content_hash,v.created_at,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY v.ts_code,v.trade_date
+                                ORDER BY {timestamp_cast} DESC,{created_cast} DESC,v.id DESC
+                            ) AS row_rank
+                       FROM dc_stock_daily_snapshot_version v
+                      WHERE {' AND '.join(predicates)}
+                 )
+                 SELECT id,ts_code,trade_date,payload_json,source_code,
+                        economic_available_time,observed_at,first_observed_at,
+                        observation_provenance,content_hash,created_at
+                   FROM ranked
+                  WHERE row_rank=1
+                  ORDER BY trade_date,ts_code,observed_at,id"""
     if limit:
         sql += " LIMIT ?"
         params.append(max(1, int(limit)))
@@ -638,14 +646,9 @@ def load_snapshot_market_aggregates(
     # revision is not visible at the historical close, the row stays absent
     # and the formal PIT contract blocks rather than using an older provider.
     projection_columns = _table_columns(c, "dc_stock_daily_snapshot")
-    projection_filter_sql = ""
-    if {"ts_code", "trade_date", "content_hash"}.issubset(projection_columns):
-        projection_filter_sql = (
-            "EXISTS (SELECT 1 FROM dc_stock_daily_snapshot current_projection "
-            "WHERE current_projection.ts_code=v.ts_code "
-            "AND current_projection.trade_date=v.trade_date "
-            "AND current_projection.content_hash=v.content_hash)"
-        )
+    has_accepted_projection = {
+        "ts_code", "trade_date", "content_hash",
+    }.issubset(projection_columns)
     predicates = [
         "v.content_hash<>''",
         "NULLIF(TRIM(COALESCE(v.source_code,'')),'') IS NOT NULL",
@@ -659,8 +662,6 @@ def load_snapshot_market_aggregates(
         f"{_timestamp_value_sql('v.economic_available_time', is_postgres=is_postgres)}<={cutoff}",
         f"{created_cast}<={observed_limit_sql}",
     ]
-    if projection_filter_sql:
-        predicates.append(projection_filter_sql)
     placeholders = ",".join("?" for _ in compact_dates)
     predicates.append(f"v.trade_date IN ({placeholders})")
 
@@ -688,18 +689,35 @@ def load_snapshot_market_aggregates(
             "THEN CAST(json_extract(payload,'$.turnover') AS REAL) END"
         )
 
-    sql = f"""WITH ranked AS (
-                     SELECT v.ts_code,v.trade_date,v.payload_json,v.observed_at,v.created_at,v.id,
-                            ROW_NUMBER() OVER (
-                                PARTITION BY v.ts_code,v.trade_date
-                                ORDER BY {observed_cast} DESC,{created_cast} DESC,v.id DESC
-                            ) AS row_rank
-                       FROM dc_stock_daily_snapshot_version v
-                      WHERE {' AND '.join(predicates)}
-                 ), visible AS (
-                     SELECT ts_code,trade_date,payload_json
-                       FROM ranked WHERE row_rank=1
-                 ), decoded AS (
+    if has_accepted_projection:
+        # The accepted hash is authoritative for each date/code.  Joining it
+        # directly avoids sorting every immutable version and keeps late
+        # repairs invisible when they are not the accepted projection.
+        visible_sql = f"""visible AS (
+                         SELECT v.ts_code,v.trade_date,v.payload_json
+                           FROM dc_stock_daily_snapshot accepted
+                           JOIN dc_stock_daily_snapshot_version v
+                             ON v.ts_code=accepted.ts_code
+                            AND v.trade_date=accepted.trade_date
+                            AND v.content_hash=accepted.content_hash
+                          WHERE {' AND '.join(predicates)}
+                     ), decoded AS (
+        """
+    else:
+        visible_sql = f"""ranked AS (
+                         SELECT v.ts_code,v.trade_date,v.payload_json,v.observed_at,v.created_at,v.id,
+                                ROW_NUMBER() OVER (
+                                    PARTITION BY v.ts_code,v.trade_date
+                                    ORDER BY {observed_cast} DESC,{created_cast} DESC,v.id DESC
+                                ) AS row_rank
+                           FROM dc_stock_daily_snapshot_version v
+                          WHERE {' AND '.join(predicates)}
+                     ), visible AS (
+                         SELECT ts_code,trade_date,payload_json
+                           FROM ranked WHERE row_rank=1
+                     ), decoded AS (
+        """
+    sql = f"""WITH {visible_sql}
                      SELECT ts_code,trade_date,{payload} AS payload
                        FROM visible v
                  ), numeric_values AS (

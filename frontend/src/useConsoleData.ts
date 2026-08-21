@@ -54,6 +54,7 @@ type PendingRequest = {
 };
 
 const inFlight = new Map<string, PendingRequest>();
+const snapshotRequestGeneration = new Map<string, number>();
 const CACHE_TTL_MS = 60_000;
 
 const initialRequestLabels: Record<string, string> = {
@@ -66,6 +67,91 @@ const initialRequestLabels: Record<string, string> = {
 
 function initialRequestLabel(key: string) {
   return initialRequestLabels[key] || key;
+}
+
+function snapshotData(payload: unknown): ConsoleData | null {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return null;
+  const data = (payload as Json).data;
+  return data && typeof data === "object" && !Array.isArray(data) ? data as ConsoleData : null;
+}
+
+function snapshotHasData(payload: unknown) {
+  const data = snapshotData(payload);
+  return Boolean(data && Object.keys(data).length > 0);
+}
+
+function snapshotStatus(payload: unknown) {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return "unavailable";
+  return String((payload as Json).status || "unavailable").trim().toLowerCase();
+}
+
+function snapshotIsHealthy(payload: unknown): payload is Json {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return false;
+  const snapshot = payload as Json;
+  const status = snapshotStatus(snapshot);
+  // A completed document may be degraded because one named section is
+  // unavailable. Its other sections are still authoritative and must render;
+  // only transient/no-document states keep the page behind loading.
+  return status !== "warming_up"
+    && !Boolean(snapshot.stale)
+    && !Boolean(snapshot.refreshing)
+    && snapshotHasData(snapshot);
+}
+
+function cachedHealthySnapshot(page: string): Json | null {
+  const cacheKey = `snapshot:${page}`;
+  const cached = cache.get(cacheKey);
+  if (!cached) return null;
+  if (!snapshotIsHealthy(cached.value)) {
+    cache.delete(cacheKey);
+    return null;
+  }
+  return cached.value;
+}
+
+function snapshotErrorCode(section: Json) {
+  const error = section.error;
+  const value = error && typeof error === "object" && !Array.isArray(error)
+    ? error.code || error.kind || error.status
+    : section.error_code || section.code;
+  return String(value || "").trim().toLowerCase();
+}
+
+function snapshotSectionMessage(key: string, section: Json) {
+  const label = initialRequestLabel(key);
+  const status = String(section.status || "error").trim().toLowerCase();
+  const code = snapshotErrorCode(section);
+  if (/timeout|deadline/.test(code)) return `${label} 查询超时，不能据此判断为无数据`;
+  if (/connection|database|unavailable/.test(code)) return `${label} 暂不可读，正在等待下一个完整快照`;
+  if (status === "degraded") return `${label} 仅返回部分已验证证据`;
+  return `${label} 暂不可读，正在等待下一个完整快照`;
+}
+
+function snapshotSectionErrors(payload: Json) {
+  const sections = payload.sections;
+  if (!sections || typeof sections !== "object" || Array.isArray(sections)) return {};
+  return Object.entries(sections).reduce<Record<string, string>>((result, [key, value]) => {
+    const section = value && typeof value === "object" && !Array.isArray(value) ? value as Json : {};
+    const status = String(section.status || "").trim().toLowerCase();
+    if (status === "error" || status === "degraded") result[key] = snapshotSectionMessage(key, section);
+    return result;
+  }, {});
+}
+
+function snapshotRetryMessage(payload: Json, hasVisibleData: boolean) {
+  if (snapshotStatus(payload) === "warming_up") {
+    return hasVisibleData
+      ? "服务端页面快照正在生成，继续展示最近一次可验证数据"
+      : "服务端页面快照正在生成，尚无可验证的页面数据";
+  }
+  if (payload.stale) {
+    return hasVisibleData
+      ? "服务端页面快照已失效，继续展示最近一次可验证数据"
+      : "服务端页面快照已失效，正在等待首个可验证版本";
+  }
+  if (payload.refreshing) return "服务端正在生成新的页面快照";
+  if (snapshotStatus(payload) === "degraded") return "新页面快照包含部分可用证据，正在等待完整版本";
+  return "页面快照尚未达到完整状态，正在等待新版本";
 }
 
 function terminalReadFailure(component: string, error: any): Json | null {
@@ -200,18 +286,29 @@ function subscribePending(pending: PendingRequest, signal?: AbortSignal): Promis
 
 async function loadPath(cacheKey: string, path: string, force = false, signal?: AbortSignal): Promise<Json> {
   let cached = cache.get(cacheKey);
-  if (cached && !responseIsTerminal(cached.value)) {
+  const isSnapshot = cacheKey.startsWith("snapshot:");
+  if (cached && (!responseIsTerminal(cached.value) || (isSnapshot && !snapshotIsHealthy(cached.value)))) {
     cache.delete(cacheKey);
     cached = undefined;
   }
-  if (!force && cached && Date.now() - cached.readAt < CACHE_TTL_MS) return cached.value;
+  // The server-side snapshot layer already provides the cheap Redis/PostgreSQL
+  // read path. Re-read it on each navigation so a browser cache cannot hide a
+  // durable invalidation or a completed worker rebuild.
+  if (!force && !isSnapshot && cached && Date.now() - cached.readAt < CACHE_TTL_MS) return cached.value;
   const pending = inFlight.get(cacheKey);
-  if (pending) return subscribePending(pending, signal);
+  // A user-initiated snapshot refresh must still issue its durable
+  // invalidation when a hover prefetch is in flight.
+  if (pending && !(isSnapshot && force)) return subscribePending(pending, signal);
   if (signal?.aborted) return Promise.reject(abortError());
   const controller = new AbortController();
+  const generation = isSnapshot ? (snapshotRequestGeneration.get(cacheKey) || 0) + 1 : 0;
+  if (isSnapshot) snapshotRequestGeneration.set(cacheKey, generation);
   let requestEntry: PendingRequest;
   const request = readApi(path, controller.signal).then((value) => {
-    if (responseIsTerminal(value)) cache.set(cacheKey, { value, readAt: Date.now() });
+    if (responseIsTerminal(value) && (!isSnapshot || snapshotIsHealthy(value))
+      && (!isSnapshot || snapshotRequestGeneration.get(cacheKey) === generation)) {
+      cache.set(cacheKey, { value, readAt: Date.now() });
+    }
     return value;
   });
   requestEntry = {
@@ -333,7 +430,13 @@ async function loadDynamicRequest(request: InitialDynamicRequest, force: boolean
 export async function preloadConsoleRoutes(paths: string[], concurrency = 3) {
   const snapshotPaths = [...new Set(paths.map((path) => snapshotPages[path]).filter(Boolean))];
   if (snapshotPaths.length) {
-    return Promise.allSettled(snapshotPaths.map((page) => loadPath(`snapshot:${page}`, `/api/console/snapshots/${page}`)));
+    return Promise.allSettled(snapshotPaths.map(async (page) => {
+      const payload = await loadPath(`snapshot:${page}`, `/api/console/snapshots/${page}`);
+      // Hover prefetch must not make a warming or stale response look like a
+      // usable document to the next route transition.
+      if (!snapshotIsHealthy(payload)) throw new Error("snapshot_not_ready");
+      return payload;
+    }));
   }
   const keys = [...new Set(paths.flatMap((path) => routeKeys[path] || []))];
   const results: PromiseSettledResult<Json>[] = [];
@@ -354,10 +457,12 @@ export async function preloadConsoleRoutes(paths: string[], concurrency = 3) {
 
 export function useConsoleData(pathname: string) {
   const keys = useMemo(() => routeKeys[pathname] || routeKeys["/overview"], [pathname]);
-  const cachedData = Object.fromEntries(keys.flatMap((key) => {
+  const snapshotPage = snapshotPages[pathname];
+  const initialSnapshot = snapshotPage ? cachedHealthySnapshot(snapshotPage) : null;
+  const cachedData = (snapshotData(initialSnapshot) || Object.fromEntries(keys.flatMap((key) => {
     const item = cache.get(key);
     return item ? [[key, item.value]] : [];
-  })) as ConsoleData;
+  }))) as ConsoleData;
   for (const request of initialDynamicRequests(pathname, cachedData)) {
     const item = cache.get(request.cacheKey);
     if (item) cachedData[request.dataKey] = item.value;
@@ -366,13 +471,32 @@ export function useConsoleData(pathname: string) {
   const initialIncomplete = incompleteRouteData(pathname, cachedData);
   const [data, setData] = useState<ConsoleData>(cachedData);
   const [errors, setErrors] = useState<Record<string, string>>({});
-  const [loading, setLoading] = useState(initialIncomplete.length > 0 || keys.some((key) => !cache.has(String(key))) || initialDynamic.some((request) => !cache.has(request.cacheKey)));
+  const [loading, setLoading] = useState(
+    snapshotPage
+      ? !initialSnapshot
+      : initialIncomplete.length > 0 || keys.some((key) => !cache.has(String(key))) || initialDynamic.some((request) => !cache.has(request.cacheKey)),
+  );
   const [loadingMessage, setLoadingMessage] = useState("正在汇总决策、账户和运行证据");
   const [refreshing, setRefreshing] = useState(false);
   const [progress, setProgress] = useState({ completed: 0, total: 0 });
+  const routeGeneration = useRef({ pathname, value: 0 });
+  if (routeGeneration.current.pathname !== pathname) {
+    routeGeneration.current = { pathname, value: routeGeneration.current.value + 1 };
+  }
+  const activeRouteGeneration = routeGeneration.current.value;
+  const [loadedRoute, setLoadedRoute] = useState({
+    pathname: initialSnapshot ? pathname : "",
+    generation: 0,
+  });
   const controller = useRef<AbortController | null>(null);
   const retryTimer = useRef<number | null>(null);
   const retryAttempt = useRef(0);
+  const lastGoodSnapshot = useRef<{ page: string; payload: Json } | null>(
+    snapshotPage && initialSnapshot ? { page: snapshotPage, payload: initialSnapshot } : null,
+  );
+  const lastVisibleSnapshot = useRef<{ page: string; data: ConsoleData } | null>(
+    snapshotPage && snapshotData(initialSnapshot) ? { page: snapshotPage, data: snapshotData(initialSnapshot)! } : null,
+  );
 
   const refresh = useCallback(async (force = true) => {
     const startedAt = Date.now();
@@ -386,9 +510,41 @@ export function useConsoleData(pathname: string) {
     const snapshotPage = snapshotPages[pathname];
     const activeController = controller.current;
     if (snapshotPage) {
-      setLoading(!cache.has(`snapshot:${snapshotPage}`));
+      const snapshotCacheKey = `snapshot:${snapshotPage}`;
+      const cachedSnapshot = cachedHealthySnapshot(snapshotPage);
+      if (cachedSnapshot) lastGoodSnapshot.current = { page: snapshotPage, payload: cachedSnapshot };
+      const priorGood = lastGoodSnapshot.current?.page === snapshotPage
+        ? snapshotData(lastGoodSnapshot.current.payload)
+        : null;
+      const priorVisible = lastVisibleSnapshot.current?.page === snapshotPage
+        ? lastVisibleSnapshot.current.data
+        : null;
+      const visibleBeforeRead = priorGood || priorVisible;
+      if (force) cache.delete(snapshotCacheKey);
+
+      const showSnapshotData = (snapshot: ConsoleData) => {
+        lastVisibleSnapshot.current = { page: snapshotPage, data: snapshot };
+        setData(snapshot);
+        setLoadedRoute({ pathname, generation: activeRouteGeneration });
+      };
+      const scheduleSnapshotRetry = (message: string, hasVisibleData: boolean) => {
+        retryAttempt.current += 1;
+        const retryInMs = Math.min(15_000, 1_000 * 2 ** Math.min(retryAttempt.current - 1, 4));
+        if (controller.current !== activeController) return;
+        setProgress({ completed: 0, total: 1 });
+        setLoading(!hasVisibleData);
+        setRefreshing(true);
+        setLoadingMessage(`${message}；${Math.ceil(retryInMs / 1000)} 秒后自动重试`);
+        retryTimer.current = window.setTimeout(() => {
+          retryTimer.current = null;
+          if (controller.current === activeController) void refresh(false);
+        }, retryInMs);
+      };
+
+      if (visibleBeforeRead) showSnapshotData(visibleBeforeRead);
+      setLoading(!visibleBeforeRead);
       setLoadingMessage("正在读取服务端页面快照");
-      setRefreshing(force);
+      setRefreshing(Boolean(visibleBeforeRead) || force);
       setProgress({ completed: 0, total: 1 });
       setErrors({});
       try {
@@ -399,24 +555,36 @@ export function useConsoleData(pathname: string) {
           activeController.signal,
         );
         if (controller.current !== activeController) return;
-        const snapshotData = payload?.data && typeof payload.data === "object" ? payload.data as ConsoleData : {};
-        setData(snapshotData);
-        const sectionErrors = Object.entries(payload?.sections || {}).reduce<Record<string, string>>((result, [key, section]: [string, any]) => {
-          if (section?.status === "error" || section?.status === "degraded") result[key] = String(section.error || section.status);
-          return result;
-        }, {});
-        if (payload?.stale) sectionErrors.snapshot = "正在展示最近一次成功快照；服务端正在重建";
-        setErrors(sectionErrors);
-      } catch (error: any) {
-        if (activeController.signal.aborted || controller.current !== activeController) return;
-        setErrors({ snapshot: error?.name === "AbortError" ? "页面快照读取超时" : String(error?.message || "页面快照读取失败") });
-      } finally {
-        if (controller.current === activeController) {
+        const nextSnapshot = snapshotData(payload);
+        if (snapshotIsHealthy(payload) && nextSnapshot) {
+          lastGoodSnapshot.current = { page: snapshotPage, payload };
+          showSnapshotData(nextSnapshot);
+          retryAttempt.current = 0;
           setProgress({ completed: 1, total: 1 });
           setLoading(false);
           setRefreshing(false);
           setLoadingMessage("正在汇总决策、账户和运行证据");
+          setErrors(snapshotSectionErrors(payload));
+          return;
         }
+
+        // A stale durable document is useful only when this tab has no newer
+        // visible data. It remains in component state, never in browser cache.
+        const fallbackData = priorGood || priorVisible
+          || (snapshotStatus(payload) === "warming_up" ? null : nextSnapshot);
+        if (fallbackData) showSnapshotData(fallbackData);
+        const sectionErrors = snapshotSectionErrors(payload);
+        sectionErrors.snapshot = snapshotRetryMessage(payload, Boolean(fallbackData));
+        setErrors(sectionErrors);
+        scheduleSnapshotRetry(sectionErrors.snapshot, Boolean(fallbackData));
+      } catch (error: any) {
+        if (activeController.signal.aborted || controller.current !== activeController) return;
+        const message = error?.name === "AbortError"
+          ? "页面快照读取超时，不能据此判断为无数据"
+          : "页面快照暂不可读，正在等待下一个完整版本";
+        if (visibleBeforeRead) showSnapshotData(visibleBeforeRead);
+        setErrors({ snapshot: message });
+        scheduleSnapshotRetry(message, Boolean(visibleBeforeRead));
       }
       return;
     }
@@ -538,7 +706,7 @@ export function useConsoleData(pathname: string) {
     retryAttempt.current = 0;
     window.clearTimeout(releaseRefreshTimer);
     if (controller.current === activeController) { setLoading(false); setRefreshing(false); setLoadingMessage("正在汇总决策、账户和运行证据"); }
-  }, [keys]);
+  }, [keys, pathname, activeRouteGeneration]);
 
   useEffect(() => {
     refresh(false);
@@ -548,5 +716,28 @@ export function useConsoleData(pathname: string) {
     };
   }, [refresh]);
 
-  return { data, errors, loading, loadingMessage, refreshing, progress, refresh: () => refresh(true) };
+  const cachedSnapshot = snapshotPage ? cachedHealthySnapshot(snapshotPage) : null;
+  const cachedSnapshotData = snapshotData(cachedSnapshot);
+  const snapshotRouteReady = Boolean(cachedSnapshotData)
+    || (loadedRoute.pathname === pathname && loadedRoute.generation === activeRouteGeneration);
+  const stateMatchesSnapshotRoute = loadedRoute.pathname === pathname
+    && loadedRoute.generation === activeRouteGeneration;
+  const visibleData = cachedSnapshotData || data;
+  const visibleLoading = snapshotPage ? loading || !snapshotRouteReady : loading;
+  const cachedSnapshotErrors = cachedSnapshot ? snapshotSectionErrors(cachedSnapshot) : {};
+  const visibleErrors = snapshotPage
+    ? stateMatchesSnapshotRoute
+      ? { ...cachedSnapshotErrors, ...errors }
+      : cachedSnapshotErrors
+    : errors;
+
+  return {
+    data: visibleData,
+    errors: visibleErrors,
+    loading: visibleLoading,
+    loadingMessage,
+    refreshing,
+    progress,
+    refresh: () => refresh(true),
+  };
 }

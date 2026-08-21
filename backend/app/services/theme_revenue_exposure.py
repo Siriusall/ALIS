@@ -111,23 +111,40 @@ def _company_exposures(segments: list[dict[str, Any]]) -> tuple[dict[str, dict[s
 
 
 def _initial_company_rows(conn: Any, *, limit: int) -> list[dict[str, Any]]:
-    """Discover initial companies from the PIT index without grouping all segments."""
-    versioned = load_raw_record_versions(conn, "fina_mainbz", limit=int(limit) + 1)
-    if versioned is not None:
-        return [
-            {"ts_code": str(row.get("ts_code") or "")}
-            for row in versioned
-            if str(row.get("ts_code") or "")
-        ][: int(limit) + 1]
-    if bool(getattr(conn, "_is_postgres", False)):
+    """Discover current companies from the bounded overwrite projection.
+
+    This is the initial *current* materialization pass, not a historical PIT
+    replay.  Calling ``load_raw_record_versions`` here forces PostgreSQL to
+    join/rank the append-only ``fina_mainbz`` history before applying the
+    caller's limit; that table is large enough for the otherwise harmless
+    discovery step to become a long ``raw_ranked`` query.  The current
+    projection already contains the accepted winner and is the correct source
+    for this non-historical discovery.  Historical materialization below keeps
+    the immutable loader and its explicit cutoff unchanged.
+    """
+    cap = max(1, int(limit)) + 1
+    try:
+        rows = conn.execute(
+            """SELECT DISTINCT ts_code
+                 FROM dc_tushare_raw_records
+                WHERE api_name='fina_mainbz'
+                  AND available_time<>''
+                  AND COALESCE(ts_code,'')<>''
+                ORDER BY ts_code LIMIT ?""",
+            (cap,),
+        ).fetchall()
+    except Exception:
+        # A missing current projection is a real production data gap.  Keep
+        # PostgreSQL fail-closed instead of widening back to the raw history;
+        # tiny legacy SQLite fixtures may still expose only the old table.
+        if bool(getattr(conn, "_is_postgres", False)):
+            return []
         return []
-    return [dict(row) for row in conn.execute(
-        """SELECT DISTINCT ts_code
-             FROM dc_tushare_raw_records
-            WHERE api_name='fina_mainbz' AND available_time<>'' AND COALESCE(ts_code,'')<>''
-            ORDER BY ts_code LIMIT ?""",
-        (int(limit) + 1,),
-    ).fetchall()]
+    return [
+        {"ts_code": str(dict(row).get("ts_code") or "")}
+        for row in rows
+        if str(dict(row).get("ts_code") or "")
+    ][:cap]
 
 
 def _latest_segment_rows(

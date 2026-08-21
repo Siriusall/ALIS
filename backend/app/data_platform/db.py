@@ -4,17 +4,21 @@ import os
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
+from typing import Any
 
 from app.core.project_env import load_project_env
 from app.core.runtime_guard import assert_data_platform_path_boundary, assert_database_boundary
-from app.core.db_connection_gate import DatabaseConnectionGate
+from app.core.db_connection_gate import (
+    DEFAULT_DATA_PLATFORM_DB_CONNECTIONS,
+    DatabaseConnectionGate,
+)
 from app.core.db_connect import connect_postgres
 from app.core.sql_compat import qmark_to_pyformat
 
 load_project_env()
 
 _DATA_PLATFORM_DB_CONNECTION_GATE = DatabaseConnectionGate(
-    "ALIS_DATA_DB_MAX_CONNECTIONS", default=8
+    "ALIS_DATA_DB_MAX_CONNECTIONS", default=DEFAULT_DATA_PLATFORM_DB_CONNECTIONS
 )
 
 DB_PATH = Path(os.getenv("DATA_PLATFORM_DB_PATH", str(Path(__file__).resolve().parents[1] / "data" / "data-platform.db")))
@@ -645,10 +649,20 @@ CREATE INDEX idx_dc_announcement_review_lookup ON dc_announcement_label_review_q
 """
 
 class Connection:
-    def __init__(self, raw, *, is_postgres: bool = False):
+    def __init__(
+        self,
+        raw,
+        *,
+        is_postgres: bool = False,
+        autocommit_read_only: bool = False,
+    ):
         self.raw = raw
         self._last = None
         self._is_postgres = is_postgres
+        # Consumers with legacy savepoint recovery can branch safely: an
+        # autocommit statement is already isolated and PostgreSQL rejects
+        # SAVEPOINT outside an explicit transaction block.
+        self._autocommit_read_only = autocommit_read_only
         # Keep dialect flags truthful. PostgreSQL must take the ON CONFLICT
         # branches; aliasing PostgreSQL as MySQL caused every status request
         # that seeds catalog rows to execute invalid ON DUPLICATE KEY SQL.
@@ -676,6 +690,53 @@ class Connection:
             return int(row["lastval"] if isinstance(row, dict) else row[0])
         return int(self.raw.execute("SELECT last_insert_rowid()").fetchone()[0])
 
+    def commit(self) -> None:
+        """Expose the public transaction boundary for bounded batch writers."""
+
+        self.raw.commit()
+
+    def rollback(self) -> None:
+        """Discard a failed batch before the caller continues with a new one."""
+
+        self.raw.rollback()
+
+    def close(self) -> None:
+        self.raw.close()
+
+
+# The old two-minute default left a finished query holding a PostgreSQL
+# transaction while application-side decoding or aggregation continued.  Keep
+# the guard short by default; an operator can still set a deliberate bounded
+# override for a maintenance operation.
+_DEFAULT_IDLE_IN_TRANSACTION_TIMEOUT_MS = "60000"
+
+
+def _idle_in_transaction_timeout_ms() -> str:
+    return os.getenv(
+        "DATABASE_IDLE_IN_TRANSACTION_TIMEOUT_MS",
+        _DEFAULT_IDLE_IN_TRANSACTION_TIMEOUT_MS,
+    )
+
+
+def _configure_postgres_session(raw: Any, *, read_only: bool = False) -> None:
+    """Apply the bounded session contract to a newly opened connection."""
+
+    raw.execute(
+        "SELECT set_config('statement_timeout', %s, false)",
+        (os.getenv("DATABASE_STATEMENT_TIMEOUT_MS", "30000"),),
+    )
+    raw.execute(
+        "SELECT set_config('idle_in_transaction_session_timeout', %s, false)",
+        (_idle_in_transaction_timeout_ms(),),
+    )
+    if read_only:
+        # This is a server-enforced safety boundary, not merely a convention
+        # for dashboard/contract callers.  With autocommit, every statement
+        # gets its own short transaction and cannot remain idle afterwards.
+        raw.execute(
+            "SELECT set_config('default_transaction_read_only', 'on', false)"
+        )
+
 
 def _is_mysql() -> bool:
     return False
@@ -695,52 +756,64 @@ def _is_postgres() -> bool:
 
 
 @contextmanager
-def _conn():
-    if _is_postgres():
-        import psycopg
-        from psycopg.rows import dict_row
-        url = os.getenv(
-            "DATA_PLATFORM_DATABASE_URL",
-            "postgresql://alis_app@127.0.0.1:5432/alis_data",
+def _postgres_conn(*, read_only: bool):
+    """Open one data-platform PostgreSQL connection with explicit semantics."""
+
+    import psycopg
+    from psycopg.rows import dict_row
+
+    url = os.getenv(
+        "DATA_PLATFORM_DATABASE_URL",
+        "postgresql://alis_app@127.0.0.1:5432/alis_data",
+    )
+    assert_database_boundary(url, role="data-platform")
+    if url.startswith("postgresql+psycopg://"):
+        url = url.replace("postgresql+psycopg://", "postgresql://", 1)
+    connect_timeout = int(os.getenv("DATABASE_CONNECT_TIMEOUT_SECONDS", "5"))
+    with _DATA_PLATFORM_DB_CONNECTION_GATE.slot(connect_timeout):
+        raw = connect_postgres(
+            psycopg.connect,
+            url,
+            row_factory=dict_row,
+            timeout=connect_timeout,
+            role="data-platform",
+            autocommit=read_only,
         )
-        assert_database_boundary(url, role="data-platform")
-        if url.startswith("postgresql+psycopg://"):
-            url = url.replace("postgresql+psycopg://", "postgresql://", 1)
-        connect_timeout = int(os.getenv("DATABASE_CONNECT_TIMEOUT_SECONDS", "5"))
-        with _DATA_PLATFORM_DB_CONNECTION_GATE.slot(connect_timeout):
-            raw = connect_postgres(
-                psycopg.connect,
-                url,
-                row_factory=dict_row,
-                timeout=connect_timeout,
-                role="data-platform",
+        from app.core.autonomy_step_control import register_postgres_connection, unregister_postgres_connection
+
+        cancellation_registration = register_postgres_connection(raw)
+        try:
+            _configure_postgres_session(raw, read_only=read_only)
+            conn = Connection(
+                raw,
+                is_postgres=True,
+                autocommit_read_only=read_only,
             )
-            from app.core.autonomy_step_control import register_postgres_connection, unregister_postgres_connection
-            cancellation_registration = register_postgres_connection(raw)
-            try:
-                raw.execute(
-                    "SELECT set_config('statement_timeout', %s, false)",
-                    (os.getenv("DATABASE_STATEMENT_TIMEOUT_MS", "30000"),),
-                )
-                raw.execute(
-                    "SELECT set_config('idle_in_transaction_session_timeout', %s, false)",
-                    (os.getenv("DATABASE_IDLE_IN_TRANSACTION_TIMEOUT_MS", "120000"),),
-                )
-                conn = Connection(raw, is_postgres=True)
-                yield conn
+            yield conn
+            if not read_only:
                 raw.commit()
-            except BaseException:
-                # ``statement_timeout`` aborts the current PostgreSQL
-                # transaction.  Always rollback before the connection can be
-                # observed by a retrying scheduler or diagnostic hook.
+        except BaseException:
+            # ``statement_timeout`` aborts a write transaction.  Roll back
+            # before callers can retry; autocommit reads have no multi-query
+            # transaction to recover and are simply closed below.
+            if not read_only:
                 try:
                     raw.rollback()
                 except Exception:
                     pass
-                raise
-            finally:
-                unregister_postgres_connection(cancellation_registration)
-                raw.close()
+            raise
+        finally:
+            unregister_postgres_connection(cancellation_registration)
+            raw.close()
+
+
+@contextmanager
+def _conn():
+    """Default mutable connection path; preserves write transaction semantics."""
+
+    if _is_postgres():
+        with _postgres_conn(read_only=False) as conn:
+            yield conn
         return
     default_path = Path(__file__).resolve().parents[1] / "data" / "data-platform.db"
     assert_data_platform_path_boundary(DB_PATH, default_path=default_path)
@@ -757,6 +830,37 @@ def _conn():
         raw.commit()
     finally:
         raw.close()
+
+
+@contextmanager
+def _read_conn():
+    """Open a short-lived, server-enforced read-only autocommit connection.
+
+    Use this for status pages, readiness checks and independent data
+    contracts.  Do not use it for a read that must share an enclosing write
+    transaction's snapshot.
+    """
+
+    if _is_postgres():
+        with _postgres_conn(read_only=True) as conn:
+            yield conn
+        return
+    default_path = Path(__file__).resolve().parents[1] / "data" / "data-platform.db"
+    assert_data_platform_path_boundary(DB_PATH, default_path=default_path)
+    if DB_PATH == default_path:
+        raise RuntimeError(
+            "DATA_PLATFORM_DATABASE_URL 未配置为 PostgreSQL；SQLite 已禁用。"
+        )
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    raw = sqlite3.connect(str(DB_PATH), timeout=30, isolation_level=None)
+    raw.row_factory = sqlite3.Row
+    try:
+        raw.execute("PRAGMA query_only=ON")
+        yield Connection(raw, autocommit_read_only=True)
+    finally:
+        raw.close()
+
+
 def init_db() -> None:
     with _conn() as conn:
         if _is_postgres():
@@ -991,7 +1095,7 @@ def init_db() -> None:
 def database_health() -> dict[str, Any]:
     """Run a cheap readiness probe against the data-platform database."""
     try:
-        with _conn() as conn:
+        with _read_conn() as conn:
             conn.execute("SELECT 1").fetchone()
         return {"status": "ok", "engine": "postgresql"}
     except Exception as exc:  # noqa: BLE001

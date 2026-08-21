@@ -17,7 +17,7 @@ def test_daily_update_status_exposes_latest_decision_ready_trade_date(monkeypatc
         def __exit__(self, exc_type, exc, tb):
             return False
 
-    monkeypatch.setattr(daily_update, "_conn", lambda: _Conn())
+    monkeypatch.setattr(daily_update, "_read_conn", lambda: _Conn())
     monkeypatch.setattr(daily_update, "_latest_usable_snapshot_date", lambda c: "20260717")
     monkeypatch.setattr(daily_update, "_latest_decision_ready_trade_date", lambda c: "20260717")
 
@@ -41,7 +41,7 @@ def test_compact_daily_update_status_omits_large_completed_steps(monkeypatch):
         def __exit__(self, exc_type, exc, tb):
             return False
 
-    monkeypatch.setattr(daily_update, "_conn", lambda: _Conn())
+    monkeypatch.setattr(daily_update, "_read_conn", lambda: _Conn())
     monkeypatch.setattr(daily_update, "_latest_usable_snapshot_date", lambda c: "20260717")
     monkeypatch.setattr(daily_update, "_latest_decision_ready_trade_date", lambda c: "20260717")
 
@@ -76,7 +76,7 @@ def test_compact_daily_update_status_skips_deep_provider_diagnostics(monkeypatch
             assert "dc_market_provider_field_audit" not in sql
             return _Result()
 
-    monkeypatch.setattr(daily_update, "_conn", lambda: _Conn())
+    monkeypatch.setattr(daily_update, "_read_conn", lambda: _Conn())
     monkeypatch.setattr(daily_update, "_latest_usable_snapshot_date", lambda c: "20260717")
     monkeypatch.setattr(daily_update, "target_trade_date", lambda c: "20260717")
     monkeypatch.setattr(daily_update, "decision_data_contract", lambda target, conn: {"ok": True})
@@ -104,7 +104,7 @@ def test_daily_update_status_never_reports_a_failed_run_as_ok(monkeypatch):
         def __exit__(self, exc_type, exc, tb):
             return False
 
-    monkeypatch.setattr(daily_update, "_conn", lambda: _Conn())
+    monkeypatch.setattr(daily_update, "_read_conn", lambda: _Conn())
     monkeypatch.setattr(daily_update, "_latest_usable_snapshot_date", lambda c: "20260717")
     monkeypatch.setattr(daily_update, "_latest_decision_ready_trade_date", lambda c: "20260717")
 
@@ -136,7 +136,7 @@ def test_compact_simple_health_does_not_search_historical_ready_dates(monkeypatc
                 return _Result({"value": ""})
             return _Result({"cnt": 1})
 
-    monkeypatch.setattr(daily_update, "_conn", lambda: _Conn())
+    monkeypatch.setattr(daily_update, "_read_conn", lambda: _Conn())
     monkeypatch.setattr(daily_update, "target_trade_date", lambda c: "20260820")
     monkeypatch.setattr(daily_update, "decision_data_contract", lambda target, conn: {"ok": False})
     monkeypatch.setattr(daily_update, "estimated_table_count", lambda c, table: (1, False))
