@@ -3519,22 +3519,17 @@ def start_evolution_scheduler() -> bool:
 
 
 def ensure_system_release_governance_task(*, trigger: str = "startup") -> dict[str, Any]:
-    """Queue release governance before research workers can consume changed bindings."""
-    from app.services.system_release_center import discover_release_change
+    """Run release governance in the API runtime that owns the manifest.
+
+    This function is invoked by the API startup/scheduler, not by standalone
+    workers.  It intentionally does not enqueue a shared-worker task: a
+    version-skewed external worker must never validate and activate a release
+    for the API process it does not run.
+    """
+    from app.services.system_release_center import discover_release_change, run_release_governance_cycle
 
     release_change = discover_release_change()
     if not (release_change.get("changed") or release_change.get("restart_required")):
         return {"ok": True, "status": "unchanged", "discovery": release_change}
-    identity = hashlib.sha256(json.dumps({
-        "runtime": release_change.get("runtime_commit"),
-        "repository": release_change.get("repository_commit"),
-        "observed": release_change.get("observed_manifest_hash"),
-    }, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()[:20]
-    task = create_evolution_task(
-        task_type="system_release_governance",
-        dedupe_key=f"system_release_governance:v1:{identity}",
-        payload={"trigger": str(trigger), "discovery": release_change},
-        max_attempts=1,
-        priority=5,
-    )
-    return {"ok": True, "status": str(task.get("status") or "queued"), "task": task, "discovery": release_change}
+    result = run_release_governance_cycle(actor=f"api_runtime_release_governance:{trigger}")
+    return {**result, "discovery": release_change, "execution_owner": "api_runtime"}
