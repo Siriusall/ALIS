@@ -779,7 +779,10 @@ def model_strategy_task_center(limit: int = 50, log_limit: int = 200, compact: b
             limit=limit,
             log_limit=log_limit,
             include_slo=not compact,
-            include_cycle_details=True,
+            # The live/admin projection only needs task status, lease and
+            # checkpoint fields. Loading the full autonomy-cycle result here
+            # performs a large JSON read and competes with research requests.
+            include_cycle_details=not compact,
             compact_cycle=compact,
         )
     except Exception as exc:  # noqa: BLE001 - admin diagnostics must degrade safely

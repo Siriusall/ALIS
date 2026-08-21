@@ -1,6 +1,25 @@
 from app.api.routes import model_strategy, research
 
 
+def test_task_center_compact_does_not_load_full_cycle_details(monkeypatch):
+    captured = {}
+
+    def fake_build_task_center(**kwargs):
+        captured.update(kwargs)
+        return {"ok": True}
+
+    monkeypatch.setattr(model_strategy, "build_task_center", fake_build_task_center)
+
+    result = model_strategy.model_strategy_task_center(
+        limit=30, log_limit=20, compact=True
+    )
+
+    assert result == {"ok": True}
+    assert captured["include_cycle_details"] is False
+    assert captured["include_slo"] is False
+
+
+
 def test_evidence_verification_degrades_on_database_failure(monkeypatch):
     def fail(_snapshot_id):
         raise TimeoutError("database connection timeout")
