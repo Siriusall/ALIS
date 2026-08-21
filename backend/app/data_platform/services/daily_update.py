@@ -189,6 +189,9 @@ def _repair_defensive_etf_continuity(trade_date: str, ts_codes: list[str]) -> di
         mark_provider_bulk_result,
     )
     from app.data_platform.services.tencent_etf_daily_fallback import repair_fund_daily_from_tencent
+    from app.data_platform.services.eastmoney_etf_history_fallback import (
+        repair_fund_daily_history_from_eastmoney,
+    )
 
     with _conn() as conn:
         # The current session is not history. It may safely use the narrowly
@@ -211,11 +214,18 @@ def _repair_defensive_etf_continuity(trade_date: str, ts_codes: list[str]) -> di
             elif winner == "tencent_etf_quote":
                 result = repair_fund_daily_from_tencent(session, ts_codes)
             else:
-                result = {
-                    "ok": False,
-                    "status": str(discovery.get("status") or "no_provider_published"),
-                    "failure_category": str(discovery.get("failure_category") or ""),
-                }
+                result = repair_fund_daily_history_from_eastmoney(
+                    session, session, ts_codes, required_dates=[session],
+                )
+                if result.get("ok"):
+                    winner = "eastmoney_etf_history_fallback"
+            if not result.get("ok") and session < str(trade_date or "").replace("-", "")[:8]:
+                fallback = repair_fund_daily_history_from_eastmoney(
+                    session, session, ts_codes, required_dates=[session],
+                )
+                if fallback.get("ok"):
+                    result = fallback
+                    winner = "eastmoney_etf_history_fallback"
             if winner:
                 mark_provider_bulk_result(
                     "defensive_fund_daily",
