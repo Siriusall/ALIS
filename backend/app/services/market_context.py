@@ -612,7 +612,12 @@ def _production_regime_reason(governance: dict[str, Any]) -> str:
     )
 
 
-def _market_enrichment_observations(latest: str, *, as_of_time: str | None = None) -> dict[str, Any]:
+def _market_enrichment_observations(
+    latest: str,
+    *,
+    as_of_time: str | None = None,
+    include_expensive: bool = True,
+) -> dict[str, Any]:
     """Build the three previously-neutralized daily market observations."""
     cutoff = _normalize_pit_timestamp(as_of_time or f"{latest[:4]}-{latest[4:6]}-{latest[6:8]}T23:59:59+08:00")
     cache_key = (str(latest), cutoff)
@@ -638,6 +643,20 @@ def _market_enrichment_observations(latest: str, *, as_of_time: str | None = Non
             return float(value) if value is not None and str(value).strip() != "" else None
         except (TypeError, ValueError):
             return None
+
+    # The transparent production regime is already determined by bounded
+    # daily breadth, returns, limit ratios, turnover and concentration.  The
+    # three research enrichments below are useful explanations but can require
+    # wide immutable-history scans (especially financial PIT).  Do not make a
+    # complete close-data slice wait for them before it can freeze today's
+    # market-state evidence.  They remain available to the research/history
+    # path and are explicitly labelled neutral when skipped here.
+    if not include_expensive:
+        result["status"] = "partial"
+        result["missing_sources"] = [
+            "northbound_deferred", "leader_persistence_deferred", "fundamental_divergence_deferred",
+        ]
+        return result
 
     with _conn() as c:
         north_rows = _strict_raw_payload_rows(
@@ -939,7 +958,14 @@ def live_market_context(*, persist: bool = False) -> dict[str, Any]:
         "price_fundamental_divergence": 0.0,
         "crowding": crowding,
     }
-    enrichment = _market_enrichment_observations(latest)
+    try:
+        enrichment = _market_enrichment_observations(latest, include_expensive=False)
+    except TypeError:
+        # Retain the one-argument seam used by isolated legacy fixtures and
+        # third-party read-only extensions.  Production implementation above
+        # accepts ``include_expensive`` and therefore stays on the bounded
+        # close-time path.
+        enrichment = _market_enrichment_observations(latest)
     observations.update({
         key: float(enrichment[key]) if enrichment.get(key) is not None else 0.0
         for key in ("northbound_flow_z", "leader_persistence", "price_fundamental_divergence")
