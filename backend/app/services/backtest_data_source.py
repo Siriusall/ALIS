@@ -53,6 +53,7 @@ class BacktestDataSource:
         self._history_load_failed: set[str] = set()
         self._snapshot_cache: Dict[str, List[SnapshotRow]] = {}
         self._daily_basic_cache: Dict[str, Dict[str, Dict[str, float]]] = {}
+        self._versioned_snapshot_cache: Dict[tuple, List[dict]] = {}
         self.data_warnings: List[str] = []
         self.fallback_events: List[Dict[str, str]] = []
         self._as_of_time: str | None = None
@@ -77,6 +78,7 @@ class BacktestDataSource:
         self._as_of_time = cutoff or None
         self._snapshot_cache.clear()
         self._daily_basic_cache.clear()
+        self._versioned_snapshot_cache.clear()
         self._pit_sources.clear()
 
     def _record_pit_read(self, source: str, rows: List[dict]) -> None:
@@ -324,6 +326,13 @@ class BacktestDataSource:
 
     def _versioned_snapshot_rows(self, ymd: str, *, ts_codes: list[str] | None = None,
                                  date_clause: str = "", date_params: tuple = ()) -> list[dict] | None:
+        cache_key = (
+            str(self._as_of_time or ""), str(ymd or ""),
+            tuple(sorted(ts_codes or [])), str(date_clause or ""), tuple(date_params),
+        )
+        cached = self._versioned_snapshot_cache.get(cache_key)
+        if cached is not None:
+            return [dict(row) for row in cached]
         try:
             postgres = _is_postgres()
             with _conn() as schema_conn:
@@ -394,7 +403,9 @@ class BacktestDataSource:
                          FROM ranked WHERE row_rank=1"""
             with _conn() as conn:
                 raw_rows = [dict(row) for row in conn.execute(sql, tuple(params)).fetchall()]
-            return [self._decode_versioned_snapshot_row(raw) for raw in raw_rows]
+            decoded = [self._decode_versioned_snapshot_row(raw) for raw in raw_rows]
+            self._versioned_snapshot_cache[cache_key] = [dict(row) for row in decoded]
+            return decoded
         except Exception as exc:
             logger.debug("immutable snapshot PIT version read unavailable: %s", str(exc)[:160])
             return None
