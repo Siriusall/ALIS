@@ -477,8 +477,23 @@ def decision_data_contract(
                 # Field lineage is explanatory only.  An older role which
                 # cannot read JSONB lineage must not weaken the hard contract.
                 try:
-                    field_provider_rows = active.execute(_field_provider_counts_query(), (value, cutoff, cutoff)).fetchall()
+                    # This query is explanatory only.  Isolate it from the
+                    # hard decision gate because PostgreSQL leaves the whole
+                    # transaction aborted after any statement error.  The old
+                    # bare catch turned a harmless lineage diagnostic failure
+                    # into zero rows for the following strict evidence query,
+                    # permanently blocking otherwise complete trading data.
+                    active.execute("SAVEPOINT decision_field_lineage")
+                    field_provider_rows = active.execute(
+                        _field_provider_counts_query(), (value, cutoff, cutoff),
+                    ).fetchall()
+                    active.execute("RELEASE SAVEPOINT decision_field_lineage")
                 except Exception:  # noqa: BLE001 - optional diagnostic only
+                    try:
+                        active.execute("ROLLBACK TO SAVEPOINT decision_field_lineage")
+                        active.execute("RELEASE SAVEPOINT decision_field_lineage")
+                    except Exception:  # noqa: BLE001 - outer hard query will fail closed
+                        pass
                     field_provider_rows = []
                 for row in field_provider_rows:
                     item = _row_dict(row)

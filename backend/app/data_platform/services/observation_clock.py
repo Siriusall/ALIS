@@ -374,7 +374,25 @@ def load_raw_record_versions(
             "dc_tushare_raw_record_version v JOIN dc_tushare_raw_records p "
             "ON p.api_name=v.api_name AND p.record_key=v.record_key AND p.content_hash=v.content_hash"
         )
-    sql = f"""WITH ranked AS (
+    if {"api_name", "record_key", "content_hash"}.issubset(projection_columns):
+        # The accepted projection has one row per (api_name, record_key), and
+        # the immutable table is unique on (api_name, record_key,
+        # content_hash).  Their exact-hash join therefore returns at most one
+        # immutable winner per logical key.  Ranking that already-unique set
+        # used to sort years of full-market financial observations during
+        # daily planning and could exceed PostgreSQL's statement timeout.
+        # Keep all four PIT clock predicates above: an accepted winner first
+        # observed after the cutoff must remain invisible rather than falling
+        # back to an older immutable version.
+        sql = f"""SELECT v.id,v.api_name,v.record_key,v.ts_code,v.trade_date,
+                        v.period,v.ann_date,v.payload_json,v.source_code,
+                        v.economic_available_time,v.observed_at,
+                        v.first_observed_at,v.observation_provenance,v.content_hash,v.created_at
+                   FROM {source_sql}
+                  WHERE {' AND '.join(predicates)}
+                  ORDER BY v.observed_at,v.id"""
+    else:
+        sql = f"""WITH ranked AS (
                  SELECT v.id,v.api_name,v.record_key,v.ts_code,v.trade_date,
                         v.period,v.ann_date,v.payload_json,v.source_code,
                         v.economic_available_time,v.observed_at,
@@ -390,7 +408,7 @@ def load_raw_record_versions(
              SELECT id,api_name,record_key,ts_code,trade_date,period,ann_date,
                     payload_json,source_code,economic_available_time,observed_at,
                     first_observed_at,observation_provenance,content_hash,created_at
-               FROM ranked
+              FROM ranked
               WHERE row_rank=1
               ORDER BY observed_at,id"""
     if limit:
