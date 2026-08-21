@@ -541,6 +541,34 @@ def _worker(parent_run_id: int) -> None:
         if not bool(benchmark_result.get("benchmark_ready")):
             logger.warning("daily benchmark update deferred trade_date=%s result=%s", trade_date, benchmark_result)
 
+        # Market state is a formal decision dependency, not a dashboard-only
+        # derivative.  Previously the close slice could pass while this
+        # materialization was left to a later plan read, creating a needless
+        # `blocked_by_market_context` window (or a slow on-demand rebuild).
+        # Persist it immediately after the core stock slice; optional research
+        # enrichments are explicitly neutral/degraded inside the context
+        # builder and cannot hold up this hard dependency.
+        _set_state(phase="market_context", message=f"正在冻结 {trade_date} 市场状态", progress=64, trade_date=trade_date)
+        try:
+            from app.services.market_context import live_market_context
+
+            market_context = live_market_context(persist=True)
+        except Exception as exc:  # noqa: BLE001
+            raise DailyUpdateDataBlocked(
+                f"{trade_date} 市场状态物化失败：{type(exc).__name__}",
+                category="market_context_materialization_failed",
+                retry_after_seconds=60,
+            ) from exc
+        context_trade_date = str(market_context.get("trade_date") or "").replace("-", "")[:8]
+        context_state = str((market_context.get("market_state") or {}).get("state") or "")
+        steps.append({"step": "market_context", "result": market_context})
+        if not bool(market_context.get("ok")) or context_trade_date != trade_date or context_state not in {"S0", "S1", "S2", "S3"}:
+            raise DailyUpdateDataBlocked(
+                f"{trade_date} 市场状态点时证据未就绪：{market_context.get('reason') or context_state or 'unknown'}",
+                category="market_context_not_ready",
+                retry_after_seconds=60,
+            )
+
         _set_state(phase="etf_daily", message=f"正在按交易日更新 {trade_date} ETF 日线", progress=68)
         try:
             from app.data_platform.services.tencent_etf_daily_fallback import repair_fund_daily_from_tencent
