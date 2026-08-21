@@ -49,6 +49,36 @@ def _today_ymd() -> str:
     return datetime.now(_BUSINESS_TZ).date().strftime("%Y%m%d")
 
 
+def _frozen_plan_execution_is_due(plan: dict[str, Any], now: datetime | None = None) -> bool:
+    """Return whether a frozen plan has reached its precise execution clock.
+
+    ``planned_execute_date`` identifies the trading session, not the instant at
+    which the executor is allowed to claim the order.  Treating the whole date
+    as due made the readiness panel report a false execution-data outage from
+    midnight until the frozen 15:01 execution time.
+    """
+    current = now or datetime.now(_BUSINESS_TZ)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=_BUSINESS_TZ)
+    else:
+        current = current.astimezone(_BUSINESS_TZ)
+    execute_date = str(plan.get("planned_execute_date") or "").replace("-", "")[:8]
+    if len(execute_date) != 8 or not execute_date.isdigit():
+        return False
+    planned_at = str(plan.get("planned_execute_at") or "").strip()
+    if planned_at:
+        try:
+            execution_at = datetime.fromisoformat(planned_at.replace("Z", "+00:00"))
+            if execution_at.tzinfo is None:
+                execution_at = execution_at.replace(tzinfo=_BUSINESS_TZ)
+            return current >= execution_at.astimezone(_BUSINESS_TZ)
+        except ValueError:
+            # The date is still safe as a conservative compatibility fallback
+            # for old persisted plans which predate the exact timestamp.
+            pass
+    return execute_date < current.strftime("%Y%m%d")
+
+
 @router.get("/trading-ready")
 def trading_readiness(detail: str = Query("full", pattern="^(full|compact)$")) -> JSONResponse:
     """Aggregate the read-only gates that decide whether automation may act."""
@@ -111,11 +141,10 @@ def trading_readiness(detail: str = Query("full", pattern="^(full|compact)$")) -
         if pending["status"] == "ready" and cache_key == "compact"
         else len(pending_items)
     )
-    today = _today_ymd()
     plan_status = str(plan.get("status") or "not_generated")
     execute_date = str(plan.get("planned_execute_date") or "").replace("-", "")[:8]
-    plan_is_due = bool(plan_status == "planned" and execute_date and execute_date <= today)
-    plan_is_future = bool(plan_status == "planned" and execute_date and execute_date > today)
+    plan_is_due = bool(plan_status == "planned" and _frozen_plan_execution_is_due(plan))
+    plan_is_future = bool(plan_status == "planned" and not plan_is_due)
     plan_is_executable = bool(plan_status == "planned" and plan.get("execution_authorized"))
 
     if latest_plan["status"] != "ready":
@@ -200,7 +229,7 @@ def trading_readiness(detail: str = Query("full", pattern="^(full|compact)$")) -
         "trading_ready": status == "ready",
         "summary": summary,
         "hard_blockers": hard_blockers,
-        "today": today,
+        "today": _today_ymd(),
         "layers": {
             "process": {"status": "alive", "detail": "进程响应正常"},
             "infrastructure": {
