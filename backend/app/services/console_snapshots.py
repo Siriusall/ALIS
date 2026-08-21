@@ -10,7 +10,6 @@ from __future__ import annotations
 import copy
 import json
 import os
-import threading
 import time
 import uuid
 from datetime import datetime, timezone
@@ -32,14 +31,10 @@ _DEFAULT_TTLS = {
     "data": 60,
     "models": 300,
 }
-_locks = {key: threading.Lock() for key in PAGE_KEYS}
 _schema_ready = False
-_schema_lock = threading.Lock()
-_refresh_pending: set[str] = set()
-_refresh_lock = threading.Lock()
-_refresh_event = threading.Event()
-_scheduler_started = False
-_next_periodic_refresh_at: dict[str, float] = {}
+from threading import Lock
+
+_schema_lock = Lock()
 
 
 def _now() -> str:
@@ -200,13 +195,16 @@ def _load_durable(page_key: str) -> dict[str, Any] | None:
     _ensure_table()
     with _conn() as conn:
         row = conn.execute(
-            "SELECT payload_json FROM console_page_snapshots WHERE page_key=?", (page_key,)
+            "SELECT payload_json, invalidated_at FROM console_page_snapshots WHERE page_key=?", (page_key,)
         ).fetchone()
     if not row:
         return None
     value = dict(row).get("payload_json")
     try:
-        return json.loads(value) if value else None
+        payload = json.loads(value) if value else None
+        if isinstance(payload, dict):
+            payload["_invalidated"] = bool(dict(row).get("invalidated_at"))
+        return payload
     except (TypeError, ValueError):
         return None
 
@@ -237,68 +235,57 @@ def invalidate(page_keys: list[str] | tuple[str, ...] = PAGE_KEYS, *, reason: st
             if page_key in PAGE_KEYS:
                 conn.execute("UPDATE console_page_snapshots SET invalidated_at=? WHERE page_key=?", (now, page_key))
                 redis_delete(_redis_key(page_key))
-                request_refresh(page_key)
 
 
-def request_refresh(page_key: str) -> bool:
-    """Queue a rebuild for the single low-priority snapshot worker.
+def _pages_due_for_refresh() -> list[str]:
+    """Use PostgreSQL state as the cross-node refresh protocol.
 
-    This deliberately does *not* start a thread in a request handler.  The
-    app host only has one Uvicorn worker; an HTTP miss must never become a
-    competing large-query workload.
+    Redis is private to the application host, so it must not coordinate a
+    worker on another machine.  Invalidated timestamps and committed snapshot
+    times are durable and safely visible from the control worker.
     """
-    if page_key not in PAGE_KEYS:
-        return False
-    with _refresh_lock:
-        already_queued = page_key in _refresh_pending
-        _refresh_pending.add(page_key)
-        _refresh_event.set()
-    return not already_queued
+    _ensure_table()
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT page_key, generated_at, invalidated_at FROM console_page_snapshots"
+        ).fetchall()
+    by_page = {str(dict(row).get("page_key")): dict(row) for row in rows}
+    now = datetime.now(timezone.utc)
+    due: list[str] = []
+    for page_key in PAGE_KEYS:
+        row = by_page.get(page_key)
+        if not row or row.get("invalidated_at"):
+            due.append(page_key)
+            continue
+        try:
+            generated_at = datetime.fromisoformat(str(row.get("generated_at") or "").replace("Z", "+00:00"))
+            if generated_at.tzinfo is None:
+                generated_at = generated_at.replace(tzinfo=timezone.utc)
+            if (now - generated_at.astimezone(timezone.utc)).total_seconds() >= _ttl(page_key):
+                due.append(page_key)
+        except ValueError:
+            due.append(page_key)
+    return due
 
 
-def start_snapshot_scheduler() -> bool:
-    """Pre-warm, event-refresh and periodically refresh pages off-request."""
-    global _scheduler_started
-    with _refresh_lock:
-        if _scheduler_started:
-            return True
-        _scheduler_started = True
-
-    def loop() -> None:
-        # On restart every page gets a controlled warm-up.  Existing durable
-        # snapshots remain readable until their replacement commits.
-        for page_key in PAGE_KEYS:
-            request_refresh(page_key)
-            _next_periodic_refresh_at[page_key] = time.monotonic() + _ttl(page_key)
-        while True:
-            # A short wake-up is only scheduling bookkeeping.  Expensive SQL
-            # remains single-threaded below, and browser requests never join it.
-            _refresh_event.wait(timeout=1.0)
-            _refresh_event.clear()
-            now = time.monotonic()
-            for page_key in PAGE_KEYS:
-                if now >= _next_periodic_refresh_at.get(page_key, 0.0):
-                    request_refresh(page_key)
-                    _next_periodic_refresh_at[page_key] = now + _ttl(page_key)
-            while True:
-                with _refresh_lock:
-                    page_key = next(iter(_refresh_pending), None)
-                    if page_key:
-                        _refresh_pending.discard(page_key)
-                if not page_key:
-                    break
-                try:
-                    build(page_key)
-                    _next_periodic_refresh_at[page_key] = time.monotonic() + _ttl(page_key)
-                except Exception:
-                    # Keep the prior durable snapshot.  A later invalidation
-                    # or bounded periodic retry can retry; never poison reads.
-                    _next_periodic_refresh_at[page_key] = time.monotonic() + min(30, _ttl(page_key))
-                # Avoid a burst against the same small PostgreSQL budget.
+def run_snapshot_worker_forever(stop_event: Any | None = None) -> None:
+    """Run only on the control worker; serializes all page aggregation."""
+    stopper = stop_event
+    while stopper is None or not stopper.is_set():
+        try:
+            due = _pages_due_for_refresh()
+            for page_key in due:
+                if stopper is not None and stopper.is_set():
+                    return
+                build(page_key)
+                # Never fan out expensive aggregations across the small DB.
                 time.sleep(1.0)
-
-    threading.Thread(target=loop, name="console-snapshot-scheduler", daemon=True).start()
-    return True
+            if not due:
+                time.sleep(1.0)
+        except Exception:
+            # Database unavailability leaves the last committed snapshot in
+            # place. Retry slowly without involving the HTTP process.
+            time.sleep(5.0)
 
 
 def build(page_key: str) -> dict[str, Any]:
@@ -324,7 +311,9 @@ def build(page_key: str) -> dict[str, Any]:
         "data": data,
     }
     _save_durable(page_key, payload)
-    set_json(_redis_key(page_key), payload, ttl=_ttl(page_key))
+    # The application host owns Redis.  Do not write a worker-local cache from
+    # this cross-node process; the next browser read mirrors the PostgreSQL
+    # authority into the application Redis instance.
     return payload
 
 
@@ -340,11 +329,10 @@ def read(page_key: str, *, force: bool = False) -> dict[str, Any]:
         # A browser never performs the rebuild. It gets the last committed
         # authority while the singleton scheduler handles the refresh.
         redis_payload = copy.deepcopy(durable)
-        redis_payload["stale"] = True
-        redis_payload["refreshing"] = request_refresh(page_key)
+        redis_payload["stale"] = bool(durable.pop("_invalidated", False))
+        redis_payload["refreshing"] = redis_payload["stale"]
         set_json(_redis_key(page_key), redis_payload, ttl=min(15, _ttl(page_key)))
         return redis_payload
-    request_refresh(page_key)
     return {
         "page": page_key,
         "version": "",
@@ -366,6 +354,4 @@ def status() -> dict[str, Any]:
             "SELECT page_key, version, generated_at, as_of, status, invalidated_at, updated_at "
             "FROM console_page_snapshots ORDER BY page_key"
         ).fetchall()
-    with _refresh_lock:
-        pending = sorted(_refresh_pending)
-    return {"ok": True, "items": [dict(row) for row in rows], "pages": list(PAGE_KEYS), "pending": pending}
+    return {"ok": True, "items": [dict(row) for row in rows], "pages": list(PAGE_KEYS)}

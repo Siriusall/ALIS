@@ -24,19 +24,16 @@ def test_durable_snapshot_is_returned_stale_while_queued(monkeypatch):
     monkeypatch.setattr(snapshots, "get_json", lambda _key: None)
     monkeypatch.setattr(snapshots, "_load_durable", lambda _page: durable)
     monkeypatch.setattr(snapshots, "set_json", lambda *_args, **_kwargs: True)
-    monkeypatch.setattr(snapshots, "request_refresh", lambda _page: True)
-
     payload = snapshots.read("overview")
 
     assert payload["version"] == "old"
-    assert payload["stale"] is True
-    assert payload["refreshing"] is True
+    assert payload["stale"] is False
+    assert payload["refreshing"] is False
 
 
 def test_missing_snapshot_never_builds_in_browser_read(monkeypatch):
     monkeypatch.setattr(snapshots, "get_json", lambda _key: None)
     monkeypatch.setattr(snapshots, "_load_durable", lambda _page: None)
-    monkeypatch.setattr(snapshots, "request_refresh", lambda _page: True)
     monkeypatch.setattr(snapshots, "build", lambda _page: (_ for _ in ()).throw(AssertionError("must not build")))
 
     payload = snapshots.read("overview")

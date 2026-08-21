@@ -62,7 +62,6 @@ from app.data_platform.services.stream_admin import auto_heal_stream
 from app.data_platform.services.data_center import recover_orphaned_ingestion_runs
 from app.data_platform.services.runtime_logs import write_runtime_log
 from app.services.runtime_heartbeat import status as runtime_heartbeat_status
-from app.services.console_snapshots import start_snapshot_scheduler
 from app.services.system_release_center import (
     DATA_SCHEMA_HEAD,
     SIM_SCHEMA_HEAD,
@@ -237,7 +236,6 @@ def startup() -> None:
             "result": {"reason": "external_worker"},
         }
     _start_component("evolution_scheduler", start_evolution_scheduler, required=False)
-    _start_component("console_snapshot_scheduler", start_snapshot_scheduler, required=False)
     if isinstance(recovered_evolution, int) and recovered_evolution:
         logger.info("Recovered interrupted evolution tasks: %d", recovered_evolution)
     try:
