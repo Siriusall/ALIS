@@ -78,6 +78,12 @@ _auto_scheduler_started = False
 _auto_scheduler_watchdog_started = False
 _defensive_execution_refresh_lock = threading.Lock()
 _defensive_execution_refresh_attempts: dict[str, float] = {}
+_plan_materialization_retry_lock = threading.Lock()
+_plan_materialization_retry_after: dict[str, float] = {}
+_PLAN_MATERIALIZATION_TIMEOUT_COOLDOWN_SEC = max(
+    300,
+    min(int(os.getenv("QUANT_PLAN_TIMEOUT_COOLDOWN_SEC", "900")), 3600),
+)
 
 
 def _business_now() -> datetime:
@@ -1258,6 +1264,20 @@ def _materialize_current_plan_and_find_due_context(dates: list[str]) -> dict:
     latest = str(dates[-1]) if dates else ""
     materialization: dict = {}
     if latest:
+        retry_key = _trade_date_key(latest)
+        now = perf_counter()
+        with _plan_materialization_retry_lock:
+            retry_after = float(_plan_materialization_retry_after.get(retry_key) or 0.0)
+        if retry_after > now:
+            return {
+                **_build_autonomous_plan_context(dates),
+                "today_materialization": {
+                    "ok": False,
+                    "status": "database_timeout_cooldown",
+                    "retry_after_seconds": max(1, int(retry_after - now)),
+                    "error": "previous_plan_materialization_query_timed_out",
+                },
+            }
         try:
             from app.services.profit_loop import materialize_daily_rebalance_plan
 
@@ -1266,6 +1286,18 @@ def _materialize_current_plan_and_find_due_context(dates: list[str]) -> dict:
         except Exception as exc:  # noqa: BLE001 - due execution remains independent
             logger.warning("每日正式调仓方案生成失败 trade_date=%s: %s", latest, str(exc)[:200])
             materialization = {"ok": False, "status": "error", "error": str(exc)[:300]}
+            if _is_expected_scheduler_wait(exc):
+                with _plan_materialization_retry_lock:
+                    _plan_materialization_retry_after[retry_key] = (
+                        perf_counter() + _PLAN_MATERIALIZATION_TIMEOUT_COOLDOWN_SEC
+                    )
+                materialization.update({
+                    "status": "database_timeout_cooldown",
+                    "retry_after_seconds": _PLAN_MATERIALIZATION_TIMEOUT_COOLDOWN_SEC,
+                })
+        else:
+            with _plan_materialization_retry_lock:
+                _plan_materialization_retry_after.pop(retry_key, None)
     return {**_build_autonomous_plan_context(dates), "today_materialization": materialization}
 
 

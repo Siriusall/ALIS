@@ -135,7 +135,7 @@ def _missing_defensive_etf_sessions(
     trade_date: str,
     ts_codes: list[str],
     *,
-    limit: int = 10,
+    limit: int = 250,
     include_target: bool = True,
 ) -> list[str]:
     """Return recent open sessions lacking an executable defensive ETF slice."""
@@ -151,7 +151,11 @@ def _missing_defensive_etf_sessions(
         f"""SELECT cal_date FROM dc_trade_calendar
            WHERE exchange='SSE' AND is_open=1 AND cal_date{target_operator}?
            ORDER BY cal_date DESC LIMIT ?""",
-        (target, max(1, min(int(limit), 30))),
+        # Account valuation must remain continuous across the whole retained
+        # simulation history. A rolling ten-session check allowed older ETF
+        # gaps to fall permanently out of view, leaving the portfolio curve
+        # blocked even though daily updates appeared healthy.
+        (target, max(1, min(int(limit), 250))),
     ).fetchall()
     sessions = [str(dict(row).get("cal_date") or "").replace("-", "")[:8] for row in reversed(rows)]
     missing: list[str] = []

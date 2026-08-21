@@ -261,6 +261,7 @@ def test_no_due_plan_does_not_materialize_before_decision_data_is_ready(monkeypa
 
 
 def test_today_materializes_when_no_plan_is_due(monkeypatch):
+    runner._plan_materialization_retry_after.clear()
     materialization = {"status": "planned", "persisted": True}
     monkeypatch.setattr(
         "app.services.profit_loop.materialize_daily_rebalance_plan",
@@ -275,6 +276,32 @@ def test_today_materializes_when_no_plan_is_due(monkeypatch):
 
     assert context["ok"] is False
     assert context["today_materialization"] == materialization
+
+
+def test_plan_query_timeout_enters_bounded_cooldown(monkeypatch):
+    runner._plan_materialization_retry_after.clear()
+    calls = {"count": 0}
+
+    def timeout():
+        calls["count"] += 1
+        raise RuntimeError("canceling statement due to statement timeout")
+
+    monkeypatch.setattr(
+        "app.services.profit_loop.materialize_daily_rebalance_plan",
+        timeout,
+    )
+    monkeypatch.setattr(
+        "app.services.profit_loop.list_pending_daily_rebalance_execution_inputs",
+        lambda: [],
+    )
+
+    first = runner._materialize_current_plan_and_find_due_context(["2026-08-20"])
+    second = runner._materialize_current_plan_and_find_due_context(["2026-08-20"])
+
+    assert first["today_materialization"]["status"] == "database_timeout_cooldown"
+    assert second["today_materialization"]["status"] == "database_timeout_cooldown"
+    assert calls["count"] == 1
+    runner._plan_materialization_retry_after.clear()
 
 
 def test_successful_progress_ignores_uncommitted_task_fields():

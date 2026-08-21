@@ -333,16 +333,19 @@ class BacktestDataSource:
                 projection_columns = _table_columns(schema_conn, "dc_stock_daily_snapshot")
             projection_rank_sql = "0"
             projection_filter_sql = ""
+            version_source_sql = "dc_stock_daily_snapshot_version v"
             if {"ts_code", "trade_date", "content_hash"}.issubset(projection_columns):
-                projection_rank_sql = (
-                    "CASE WHEN EXISTS (SELECT 1 FROM dc_stock_daily_snapshot p "
-                    "WHERE p.ts_code=v.ts_code AND p.trade_date=v.trade_date "
-                    "AND p.content_hash=v.content_hash) THEN 1 ELSE 0 END"
-                )
-                projection_filter_sql = (
-                    "EXISTS (SELECT 1 FROM dc_stock_daily_snapshot p "
-                    "WHERE p.ts_code=v.ts_code AND p.trade_date=v.trade_date "
-                    "AND p.content_hash=v.content_hash)"
+                # The accepted snapshot projection has a unique
+                # (ts_code, trade_date) key. Join it directly to the immutable
+                # version instead of running two correlated EXISTS probes for
+                # every version row. The old form repeatedly scanned hundreds
+                # of thousands of versions during daily plan generation and
+                # exhausted PostgreSQL's statement timeout.
+                version_source_sql = (
+                    "dc_stock_daily_snapshot_version v "
+                    "JOIN dc_stock_daily_snapshot p "
+                    "ON p.ts_code=v.ts_code AND p.trade_date=v.trade_date "
+                    "AND p.content_hash=v.content_hash"
                 )
             predicates: list[str] = [
                 "v.observed_at<>''",
@@ -385,7 +388,7 @@ class BacktestDataSource:
                                   ORDER BY {projection_rank_sql} DESC,
                                            v.observed_at DESC,v.created_at DESC,v.id DESC
                                 ) AS row_rank
-                           FROM dc_stock_daily_snapshot_version v
+                           FROM {version_source_sql}
                           WHERE {where}
                        )
                        SELECT ts_code,trade_date,payload_json,source_code,
