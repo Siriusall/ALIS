@@ -19,6 +19,7 @@ from fastapi.responses import JSONResponse
 
 from app.data_platform.redis_store import delete as redis_delete
 from app.data_platform.redis_store import get_json, set_json
+from app.data_platform.db import _conn as data_platform_conn
 from app.db.store import _conn
 
 
@@ -268,11 +269,38 @@ def _pages_due_for_refresh() -> list[str]:
     return due
 
 
+def _data_platform_is_busy() -> bool:
+    """Defer snapshots while ingestion/large raw-data work owns the database.
+
+    Snapshot freshness is strictly lower priority than daily ingestion and
+    decision data.  This also prevents a control-worker prewarm from adding
+    another wide query during the known ``raw_ranked`` pressure window.
+    """
+    try:
+        with data_platform_conn() as conn:
+            row = conn.execute("""
+                SELECT COUNT(*) AS count
+                FROM pg_stat_activity
+                WHERE datname = current_database()
+                  AND pid <> pg_backend_pid()
+                  AND usename = current_user
+                  AND state IN ('active', 'idle in transaction')
+            """).fetchone()
+        return int(dict(row).get("count") or 0) > 0
+    except Exception:
+        # Connection uncertainty is a reason to protect the authoritative
+        # data pipeline, not to start optional page aggregation.
+        return True
+
+
 def run_snapshot_worker_forever(stop_event: Any | None = None) -> None:
     """Run only on the control worker; serializes all page aggregation."""
     stopper = stop_event
     while stopper is None or not stopper.is_set():
         try:
+            if _data_platform_is_busy():
+                time.sleep(10.0)
+                continue
             due = _pages_due_for_refresh()
             for page_key in due:
                 if stopper is not None and stopper.is_set():
