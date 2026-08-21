@@ -304,26 +304,15 @@ def load_raw_record_versions(
     projection_winner_sql = "0"
     projection_filter_sql = ""
     if {"api_name", "record_key", "content_hash"}.issubset(projection_columns):
-        projection_winner_sql = (
-            "CASE WHEN EXISTS ("
-            "SELECT 1 FROM dc_tushare_raw_records current_projection "
-            "WHERE current_projection.api_name=v.api_name "
-            "AND current_projection.record_key=v.record_key "
-            "AND current_projection.content_hash=v.content_hash"
-            ") THEN 1 ELSE 0 END"
-        )
+        projection_winner_sql = "1"
         # Do not fall back to another immutable version when the accepted
         # projection is outside a requested PIT cutoff.  That is a real data
         # contract gap and must remain empty/blocked instead of being hidden
         # by an older or slower source.
-        projection_filter_sql = (
-            "EXISTS ("
-            "SELECT 1 FROM dc_tushare_raw_records current_projection "
-            "WHERE current_projection.api_name=v.api_name "
-            "AND current_projection.record_key=v.record_key "
-            "AND current_projection.content_hash=v.content_hash"
-            ")"
-        )
+        projection_filter_sql = ""
+        # Join the accepted projection once below. The old correlated EXISTS
+        # was evaluated for every immutable version and made daily planning
+        # scan the full raw-history table.
     normalized_cutoff = normalize_explicit_timestamp(cutoff) if cutoff else ""
     if cutoff and not normalized_cutoff:
         return []
@@ -379,6 +368,12 @@ def load_raw_record_versions(
     if trade_date_end:
         predicates.append("v.trade_date<=?")
         params.append(str(trade_date_end))
+    source_sql = "dc_tushare_raw_record_version v"
+    if {"api_name", "record_key", "content_hash"}.issubset(projection_columns):
+        source_sql = (
+            "dc_tushare_raw_record_version v JOIN dc_tushare_raw_records p "
+            "ON p.api_name=v.api_name AND p.record_key=v.record_key AND p.content_hash=v.content_hash"
+        )
     sql = f"""WITH ranked AS (
                  SELECT v.id,v.api_name,v.record_key,v.ts_code,v.trade_date,
                         v.period,v.ann_date,v.payload_json,v.source_code,
@@ -389,7 +384,7 @@ def load_raw_record_versions(
                             ORDER BY {projection_winner_sql} DESC,
                                      {timestamp_cast} DESC,{created_cast} DESC,v.id DESC
                         ) AS row_rank
-                   FROM dc_tushare_raw_record_version v
+                   FROM {source_sql}
                   WHERE {' AND '.join(predicates)}
              )
              SELECT id,api_name,record_key,ts_code,trade_date,period,ann_date,
