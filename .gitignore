@@ -66,3 +66,11 @@ news/crawler/probe_web_sources.py
 # Finder/conflict duplicate copies; canonical source files have no " 2" suffix.
 * 2.tsx
 * 2.json
+
+# Local agent instructions and machine-specific command scripts are not
+# distributed through the public repository.
+AGENTS.md
+**/AGENTS.md
+*.sh
+*.bat
+*.ps1
