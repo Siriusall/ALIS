@@ -4,7 +4,7 @@ from datetime import datetime, timedelta
 import json
 from typing import Any
 
-from app.db.store import _conn
+from app.db.store import _conn, _read_conn
 
 
 def _now() -> str:
@@ -56,7 +56,10 @@ def _derive_thesis_state(hypotheses: list[dict[str, Any]]) -> tuple[str, float]:
 
 
 def get_thesis(thesis_id: int) -> dict[str, Any] | None:
-    with _conn() as c:
+    # This endpoint is a read-only projection.  Use the server-enforced
+    # autocommit reader so JSON decoding and derived-state calculation cannot
+    # leave an application transaction idle while the client is consuming it.
+    with _read_conn() as c:
         row = c.execute("SELECT * FROM investment_theses WHERE id=?", (thesis_id,)).fetchone()
         if not row:
             return None
@@ -76,7 +79,11 @@ def list_theses(
     *,
     include_hypotheses: bool = True,
 ) -> list[dict[str, Any]]:
-    with _conn() as c:
+    # Listing theses is also a read-only dashboard/research projection.  The
+    # two bounded SELECTs intentionally use an autocommit read connection;
+    # they do not participate in a write transaction and must not hold one
+    # open while Python expands evidence JSON.
+    with _read_conn() as c:
         if include_hypotheses:
             thesis_sql = "SELECT * FROM investment_theses"
         else:
@@ -135,7 +142,7 @@ def list_theses_for_symbols(symbols: list[str]) -> list[dict[str, Any]]:
         return []
 
     thesis_placeholders = ",".join("?" for _ in candidates)
-    with _conn() as c:
+    with _read_conn() as c:
         values = [dict(row) for row in c.execute(
             f"""SELECT id,ts_code,title,thesis_type,core_thesis,status,confidence,
                       next_review_at,created_at,updated_at

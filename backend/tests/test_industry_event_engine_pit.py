@@ -176,3 +176,69 @@ def test_stock_master_clock_is_required_for_formal_research(monkeypatch):
     )
     assert row is None
     assert status == "stock_master_not_visible_at_cutoff"
+
+
+def test_industry_valuation_uses_accepted_snapshot_hash_without_version_ranking(monkeypatch):
+    """A non-selected immutable provider must not change a PIT valuation."""
+    connection = _version_connection()
+    connection.executescript(
+        """
+        CREATE TABLE dc_stock_master(
+            ts_code TEXT PRIMARY KEY, industry TEXT, list_date TEXT,
+            available_time TEXT, updated_at TEXT, source_code TEXT
+        );
+        CREATE TABLE dc_stock_daily_snapshot(
+            ts_code TEXT NOT NULL, trade_date TEXT NOT NULL,
+            content_hash TEXT NOT NULL,
+            PRIMARY KEY(ts_code, trade_date)
+        );
+        CREATE TABLE dc_stock_daily_snapshot_version(
+            id INTEGER PRIMARY KEY, ts_code TEXT NOT NULL, trade_date TEXT NOT NULL,
+            payload_json TEXT NOT NULL, source_code TEXT NOT NULL,
+            economic_available_time TEXT NOT NULL, observed_at TEXT NOT NULL,
+            first_observed_at TEXT NOT NULL, observation_provenance TEXT NOT NULL,
+            content_hash TEXT NOT NULL, created_at TEXT NOT NULL
+        );
+        """
+    )
+    observed = "2026-08-14T14:59:00+08:00"
+    economic = "2026-08-14T15:00:00+08:00"
+    for number in range(1, 4):
+        code = f"00000{number}.SZ"
+        connection.execute(
+            "INSERT INTO dc_stock_master VALUES(?,?,?,?,?,?)",
+            (code, "测试行业", "20100101", observed, observed, "tushare"),
+        )
+        connection.execute(
+            "INSERT INTO dc_stock_daily_snapshot VALUES(?,?,?)",
+            (code, "20260814", f"accepted-{number}"),
+        )
+        connection.execute(
+            "INSERT INTO dc_stock_daily_snapshot_version VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                number, code, "20260814", json.dumps({"pe_ttm": 10}), "tushare",
+                economic, observed, observed, "tushare:direct_fetch",
+                f"accepted-{number}", observed,
+            ),
+        )
+        # This version is still valid evidence, but it was not selected by
+        # the authoritative projection and therefore must be excluded.
+        connection.execute(
+            "INSERT INTO dc_stock_daily_snapshot_version VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                number + 10, code, "20260814", json.dumps({"pe_ttm": 100}), "fallback",
+                economic, observed, observed, "fallback:direct_fetch",
+                f"unaccepted-{number}", observed,
+            ),
+        )
+
+    monkeypatch.setattr(event_engine, "load_raw_record_versions", lambda *_args, **_kwargs: [])
+
+    result = event_engine._derived_industry_proxies(
+        connection,
+        as_of_time="2026-08-14T15:00:00+08:00",
+    )
+
+    valuation = result["测试行业"]
+    assert valuation["evidence"]["company_valuation_points"] == 3
+    assert valuation["observations"]["industry_valuation"] == 96.92307692307692

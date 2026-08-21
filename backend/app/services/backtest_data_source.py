@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import json
 import logging
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Dict, List, Optional
 
+from app.data_platform import db as _data_platform_db
 from app.core.a_share_fees import is_exchange_etf
-from app.data_platform.db import _conn, _is_postgres
+from app.data_platform.db import _conn, _is_postgres, _read_conn
 from app.data_platform.services.observation_clock import (
     _explicit_timestamp_sql,
     _table_columns,
@@ -17,6 +19,25 @@ from app.data_platform.services.observation_clock import (
 from app.services.point_in_time import is_available_at, normalize_explicit_timestamp, normalize_timestamp
 
 logger = logging.getLogger("quant.backtest_data_source")
+
+
+@contextmanager
+def _read_data_conn():
+    """Use autocommit reads on PostgreSQL without breaking SQLite fixtures."""
+
+    # Backtest/replay data reads are never part of an enclosing data-platform
+    # write transaction.  Production therefore uses an autocommit, read-only
+    # session so payload decoding cannot leave an ``idle in transaction``
+    # backend open.  Existing isolated SQLite fixtures keep their injected
+    # ``_conn`` context unchanged.
+    # Tests deliberately replace this module's ``_conn`` with an in-memory
+    # fixture.  Preserve that injection rather than opening a real PostgreSQL
+    # connection merely because the developer environment has a production
+    # URL configured.
+    use_production_reader = _is_postgres() and _conn is _data_platform_db._conn
+    opener = _read_conn if use_production_reader else _conn
+    with opener() as conn:
+        yield conn
 
 
 @dataclass
@@ -256,12 +277,13 @@ class BacktestDataSource:
             # slower source cannot replace the first accepted source merely
             # because its observed_at is later. If the projection table is
             # absent (small legacy fixtures), retain the old version ranking.
-            with _conn() as schema_conn:
+            with _read_data_conn() as schema_conn:
                 projection_columns = _table_columns(schema_conn, "dc_tushare_raw_records")
-            projection_rank_sql = "0"
-            projection_filter_sql = ""
+            has_accepted_projection = {
+                "api_name", "record_key", "content_hash",
+            }.issubset(projection_columns)
             version_source_sql = "dc_tushare_raw_record_version v"
-            if {"api_name", "record_key", "content_hash"}.issubset(projection_columns):
+            if has_accepted_projection:
                 version_source_sql = (
                     "dc_tushare_raw_record_version v "
                     "JOIN dc_tushare_raw_records p "
@@ -278,8 +300,6 @@ class BacktestDataSource:
                 _explicit_timestamp_sql("v.economic_available_time", is_postgres=postgres),
                 _explicit_timestamp_sql("v.created_at", is_postgres=postgres),
             ]
-            if projection_filter_sql:
-                predicates.append(projection_filter_sql)
             params: list = [api_name]
             if ymd:
                 predicates.append("v.trade_date=?")
@@ -301,23 +321,34 @@ class BacktestDataSource:
                 params.append(self._as_of_time)
                 params.append(self._as_of_time)
             where = " AND ".join(predicates)
-            sql = f"""WITH ranked AS (
-                         SELECT v.api_name,v.record_key,v.ts_code,v.trade_date,v.payload_json,
+            if has_accepted_projection:
+                # The accepted projection points at one immutable content hash
+                # per logical raw record.  Ranking that already-unique join
+                # scans the entire version history and was the source of the
+                # production ``raw_ranked`` timeout.
+                sql = f"""SELECT v.api_name,v.record_key,v.ts_code,v.trade_date,v.payload_json,
                                 v.economic_available_time,v.observed_at,v.first_observed_at,
-                                v.observation_provenance,v.content_hash,v.created_at,v.source_code,
-                                ROW_NUMBER() OVER (
-                                  PARTITION BY v.api_name,v.record_key
-                                  ORDER BY {projection_rank_sql} DESC,
-                                           v.observed_at DESC,v.created_at DESC,v.id DESC
-                                ) AS row_rank
+                                v.observation_provenance,v.content_hash,v.created_at,v.source_code
                            FROM {version_source_sql}
                           WHERE {where}
-                       )
-                       SELECT api_name,record_key,ts_code,trade_date,payload_json,
-                              economic_available_time,observed_at,first_observed_at,
-                              observation_provenance,content_hash,created_at,source_code
-                         FROM ranked WHERE row_rank=1"""
-            with _conn() as conn:
+                          ORDER BY v.observed_at,v.id"""
+            else:
+                sql = f"""WITH ranked AS (
+                             SELECT v.api_name,v.record_key,v.ts_code,v.trade_date,v.payload_json,
+                                    v.economic_available_time,v.observed_at,v.first_observed_at,
+                                    v.observation_provenance,v.content_hash,v.created_at,v.source_code,
+                                    ROW_NUMBER() OVER (
+                                      PARTITION BY v.api_name,v.record_key
+                                      ORDER BY v.observed_at DESC,v.created_at DESC,v.id DESC
+                                    ) AS row_rank
+                               FROM {version_source_sql}
+                              WHERE {where}
+                           )
+                           SELECT api_name,record_key,ts_code,trade_date,payload_json,
+                                  economic_available_time,observed_at,first_observed_at,
+                                  observation_provenance,content_hash,created_at,source_code
+                             FROM ranked WHERE row_rank=1"""
+            with _read_data_conn() as conn:
                 rows = [dict(row) for row in conn.execute(sql, tuple(params)).fetchall()]
             return rows
         except Exception as exc:  # migration not installed or incompatible adapter
@@ -335,12 +366,13 @@ class BacktestDataSource:
             return [dict(row) for row in cached]
         try:
             postgres = _is_postgres()
-            with _conn() as schema_conn:
+            with _read_data_conn() as schema_conn:
                 projection_columns = _table_columns(schema_conn, "dc_stock_daily_snapshot")
-            projection_rank_sql = "0"
-            projection_filter_sql = ""
+            has_accepted_projection = {
+                "ts_code", "trade_date", "content_hash",
+            }.issubset(projection_columns)
             version_source_sql = "dc_stock_daily_snapshot_version v"
-            if {"ts_code", "trade_date", "content_hash"}.issubset(projection_columns):
+            if has_accepted_projection:
                 # The accepted snapshot projection has a unique
                 # (ts_code, trade_date) key. Join it directly to the immutable
                 # version instead of running two correlated EXISTS probes for
@@ -362,8 +394,6 @@ class BacktestDataSource:
                 _explicit_timestamp_sql("v.economic_available_time", is_postgres=postgres),
                 _explicit_timestamp_sql("v.created_at", is_postgres=postgres),
             ]
-            if projection_filter_sql:
-                predicates.append(projection_filter_sql)
             params: list = []
             if ymd:
                 predicates.append("v.trade_date=?")
@@ -385,23 +415,30 @@ class BacktestDataSource:
                 params.append(self._as_of_time)
                 params.append(self._as_of_time)
             where = " AND ".join(predicates)
-            sql = f"""WITH ranked AS (
-                         SELECT v.ts_code,v.trade_date,v.payload_json,v.source_code,
+            if has_accepted_projection:
+                sql = f"""SELECT v.ts_code,v.trade_date,v.payload_json,v.source_code,
                                 v.economic_available_time,v.observed_at,v.first_observed_at,
-                                v.observation_provenance,v.content_hash,v.created_at,
-                                ROW_NUMBER() OVER (
-                                  PARTITION BY v.ts_code,v.trade_date
-                                  ORDER BY {projection_rank_sql} DESC,
-                                           v.observed_at DESC,v.created_at DESC,v.id DESC
-                                ) AS row_rank
+                                v.observation_provenance,v.content_hash,v.created_at
                            FROM {version_source_sql}
                           WHERE {where}
-                       )
-                       SELECT ts_code,trade_date,payload_json,source_code,
-                              economic_available_time,observed_at,first_observed_at,
-                              observation_provenance,content_hash,created_at
-                         FROM ranked WHERE row_rank=1"""
-            with _conn() as conn:
+                          ORDER BY v.ts_code,v.trade_date,v.observed_at,v.id"""
+            else:
+                sql = f"""WITH ranked AS (
+                             SELECT v.ts_code,v.trade_date,v.payload_json,v.source_code,
+                                    v.economic_available_time,v.observed_at,v.first_observed_at,
+                                    v.observation_provenance,v.content_hash,v.created_at,
+                                    ROW_NUMBER() OVER (
+                                      PARTITION BY v.ts_code,v.trade_date
+                                      ORDER BY v.observed_at DESC,v.created_at DESC,v.id DESC
+                                    ) AS row_rank
+                               FROM {version_source_sql}
+                              WHERE {where}
+                           )
+                           SELECT ts_code,trade_date,payload_json,source_code,
+                                  economic_available_time,observed_at,first_observed_at,
+                                  observation_provenance,content_hash,created_at
+                             FROM ranked WHERE row_rank=1"""
+            with _read_data_conn() as conn:
                 raw_rows = [dict(row) for row in conn.execute(sql, tuple(params)).fetchall()]
             decoded = [self._decode_versioned_snapshot_row(raw) for raw in raw_rows]
             self._versioned_snapshot_cache[cache_key] = [dict(row) for row in decoded]
@@ -429,14 +466,18 @@ class BacktestDataSource:
         try:
             placeholders = ",".join("?" for _ in ts_codes)
             postgres = _is_postgres()
-            with _conn() as schema_conn:
+            with _read_data_conn() as schema_conn:
                 projection_columns = _table_columns(schema_conn, "dc_stock_daily_snapshot")
-            projection_filter_sql = ""
-            if {"ts_code", "trade_date", "content_hash"}.issubset(projection_columns):
-                projection_filter_sql = (
-                    "EXISTS (SELECT 1 FROM dc_stock_daily_snapshot p "
-                    "WHERE p.ts_code=v.ts_code AND p.trade_date=v.trade_date "
-                    "AND p.content_hash=v.content_hash)"
+            has_accepted_projection = {
+                "ts_code", "trade_date", "content_hash",
+            }.issubset(projection_columns)
+            version_source_sql = "dc_stock_daily_snapshot_version v"
+            if has_accepted_projection:
+                version_source_sql = (
+                    "dc_stock_daily_snapshot_version v "
+                    "JOIN dc_stock_daily_snapshot p "
+                    "ON p.ts_code=v.ts_code AND p.trade_date=v.trade_date "
+                    "AND p.content_hash=v.content_hash"
                 )
             predicates = [
                 f"v.ts_code IN ({placeholders})",
@@ -448,8 +489,6 @@ class BacktestDataSource:
                 _explicit_timestamp_sql("v.economic_available_time", is_postgres=postgres),
                 _explicit_timestamp_sql("v.created_at", is_postgres=postgres),
             ]
-            if projection_filter_sql:
-                predicates.append(projection_filter_sql)
             params: list = list(ts_codes)
             if date_clause:
                 predicates.append(self._normalise_date_clause(date_clause))
@@ -464,23 +503,31 @@ class BacktestDataSource:
                 params.append(self._as_of_time)
                 params.append(self._as_of_time)
             where = " AND ".join(predicates)
-            sql = f"""WITH ranked AS (
-                         SELECT v.ts_code,v.trade_date,v.payload_json,v.source_code,
+            if has_accepted_projection:
+                sql = f"""SELECT v.ts_code,v.trade_date,v.payload_json,v.source_code,
                                 v.economic_available_time,v.observed_at,v.first_observed_at,
-                                v.observation_provenance,v.content_hash,v.created_at,
-                                ROW_NUMBER() OVER (
-                                  PARTITION BY v.ts_code,v.trade_date
-                                  ORDER BY v.observed_at DESC,v.id DESC
-                                ) AS row_rank
-                           FROM dc_stock_daily_snapshot_version v
+                                v.observation_provenance,v.content_hash,v.created_at
+                           FROM {version_source_sql}
                           WHERE {where}
-                       )
-                       SELECT ts_code,trade_date,payload_json,source_code,
-                              economic_available_time,observed_at,first_observed_at,
-                              observation_provenance,content_hash,created_at
-                         FROM ranked WHERE row_rank=1
-                        ORDER BY ts_code,trade_date"""
-            with _conn() as conn:
+                          ORDER BY v.ts_code,v.trade_date,v.observed_at,v.id"""
+            else:
+                sql = f"""WITH ranked AS (
+                             SELECT v.ts_code,v.trade_date,v.payload_json,v.source_code,
+                                    v.economic_available_time,v.observed_at,v.first_observed_at,
+                                    v.observation_provenance,v.content_hash,v.created_at,
+                                    ROW_NUMBER() OVER (
+                                      PARTITION BY v.ts_code,v.trade_date
+                                      ORDER BY v.observed_at DESC,v.id DESC
+                                    ) AS row_rank
+                               FROM {version_source_sql}
+                              WHERE {where}
+                           )
+                           SELECT ts_code,trade_date,payload_json,source_code,
+                                  economic_available_time,observed_at,first_observed_at,
+                                  observation_provenance,content_hash,created_at
+                             FROM ranked WHERE row_rank=1
+                            ORDER BY ts_code,trade_date"""
+            with _read_data_conn() as conn:
                 raw_rows = [dict(row) for row in conn.execute(sql, tuple(params)).fetchall()]
             return [self._decode_versioned_snapshot_row(raw) for raw in raw_rows]
         except Exception as exc:
@@ -489,7 +536,7 @@ class BacktestDataSource:
 
     def _postgres_trade_dates(self, start: str, end: str) -> List[str]:
         try:
-            with _conn() as conn:
+            with _read_data_conn() as conn:
                 rows = conn.execute(
                     """SELECT trade_date FROM dc_available_trade_dates
                        WHERE trade_date BETWEEN ? AND ? ORDER BY trade_date""",
@@ -524,7 +571,7 @@ class BacktestDataSource:
                 suffix = ".SH" if code.startswith(("6", "9")) else ".SZ" if code.startswith(("0", "3")) else ".BJ"
                 sql += " AND ts_code=?"
                 params += (f"{code}{suffix}",)
-            with _conn() as conn:
+            with _read_data_conn() as conn:
                 rows = conn.execute(sql, params).fetchall()
             result = [dict(row) for row in rows]
             self._record_pit_read("tushare.daily", result)
@@ -552,7 +599,7 @@ class BacktestDataSource:
             if self._as_of_time:
                 sql += " AND observed_at<=?"
                 params += (self._as_of_time,)
-            with _conn() as conn:
+            with _read_data_conn() as conn:
                 rows = [dict(row) for row in conn.execute(sql, params).fetchall()]
             self._record_pit_read("snapshot.daily_structured", rows)
             return rows
@@ -582,7 +629,7 @@ class BacktestDataSource:
             if self._as_of_time:
                 sql += " AND observed_at<=?"
                 params += (self._as_of_time,)
-            with _conn() as conn:
+            with _read_data_conn() as conn:
                 raw_rows = [dict(row) for row in conn.execute(sql, params).fetchall()]
         self._record_pit_read("tushare.fund_daily", raw_rows)
         result: List[SnapshotRow] = []
@@ -667,7 +714,7 @@ class BacktestDataSource:
                 if self._as_of_time:
                     sql += " AND observed_at<=?"
                     params += (self._as_of_time,)
-                with _conn() as conn:
+                with _read_data_conn() as conn:
                     rows = [dict(row) for row in conn.execute(sql, params).fetchall()]
                 self._record_pit_read("snapshot.execution_close", rows)
                 for row in rows:
@@ -710,7 +757,7 @@ class BacktestDataSource:
                 sql += " AND observed_at<=?"
                 params += (self._as_of_time,)
             sql += ") SELECT ts_code,payload_json,available_time,observed_at FROM ranked WHERE row_rank=1"
-            with _conn() as conn:
+            with _read_data_conn() as conn:
                 rows = [dict(row) for row in conn.execute(sql, params).fetchall()]
             self._record_pit_read("tushare.fund_daily_execution_close", rows)
             for row in rows:
@@ -763,7 +810,7 @@ class BacktestDataSource:
                 limit_days = max(1, int(lookback or 0) + 5) if lookback else 0
                 start_ymd = ""
                 if limit_days:
-                    with _conn() as conn:
+                    with _read_data_conn() as conn:
                         row = conn.execute(
                             """SELECT MIN(trade_date) AS start_date FROM (
                                  SELECT trade_date FROM dc_available_trade_dates
@@ -798,7 +845,7 @@ class BacktestDataSource:
                         self._record_pit_failure("snapshot.history", "observation_version_table_unavailable")
                         rows = []
                     else:
-                        with _conn() as conn:
+                        with _read_data_conn() as conn:
                             rows = conn.execute(
                                 f"""SELECT ts_code,trade_date,close,volume,turnover,observed_at AS available_time,observed_at,adj_factor
                                     FROM dc_stock_daily_snapshot
@@ -920,7 +967,7 @@ class BacktestDataSource:
                     self._record_pit_failure("snapshot.symbol_history", "observation_version_table_unavailable")
                     self._hist_cache[code] = []
                     return []
-                with _conn() as conn:
+                with _read_data_conn() as conn:
                     rows = conn.execute(
                         f"""SELECT trade_date,close,volume,turnover,observed_at AS available_time,observed_at,adj_factor
                            FROM dc_stock_daily_snapshot
@@ -979,7 +1026,7 @@ class BacktestDataSource:
                     if self._as_of_time:
                         sql += " AND observed_at<=?"
                         params += (self._as_of_time,)
-                    with _conn() as conn:
+                    with _read_data_conn() as conn:
                         raw = conn.execute(sql, params).fetchone()
                     versioned = [dict(raw)] if raw else []
                 if versioned:
@@ -1030,7 +1077,7 @@ class BacktestDataSource:
                     params += (self._as_of_time,)
                 sql += " ORDER BY trade_date DESC LIMIT ?"
                 params += (max(2, min(int(lookback) + 1, 251)),)
-                with _conn() as conn:
+                with _read_data_conn() as conn:
                     raw_rows = [dict(row) for row in conn.execute(sql, params).fetchall()]
             else:
                 raw_rows = sorted(versioned, key=lambda row: str(row.get("trade_date") or ""), reverse=True)[:max(2, min(int(lookback) + 1, 251))]
@@ -1066,7 +1113,7 @@ class BacktestDataSource:
                     self._record_pit_failure("snapshot.daily_basic", "observation_version_table_unavailable")
                     self._daily_basic_cache[ymd] = {}
                     return {}
-                with _conn() as conn:
+                with _read_data_conn() as conn:
                     rows = conn.execute(
                         f"""SELECT ts_code,total_mv,circ_mv,pe_ttm,pb,turnover_rate,observed_at AS available_time,observed_at
                              FROM dc_stock_daily_snapshot WHERE trade_date=?{' AND observed_at<=?' if self._as_of_time else ''}""",

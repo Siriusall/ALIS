@@ -48,11 +48,13 @@ from app.services.evolution_orchestrator import (
     create_strategy_controller_oos_task,
     create_evolution_task,
     evolution_schedule_status,
+    enqueue_all_plan_model_training_task,
     get_evolution_task,
     list_evolution_tasks,
     enqueue_plan_model_autonomy_task,
+    enqueue_plan_model_training_task,
 )
-from app.services.plan_model_control import model_family_status, plan_model_operations_status, request_plan_model_training, review_plan_model_version, train_all_trainable_plan_models, review_all_candidate_plan_models, score_plan_model_features
+from app.services.plan_model_control import model_family_status, plan_model_operations_status, review_plan_model_version, review_all_candidate_plan_models, score_plan_model_features
 from app.services.plan_model_auto_optimizer import build_auto_optimization_status
 from app.services.strategy_controller import (
     create_strategy_policy_candidate,
@@ -322,7 +324,10 @@ def model_strategy_plan_model_operations() -> dict:
 
 @router.post("/model-strategy/plan-models/train")
 def model_strategy_train_plan_model(req: PlanModelTrainRequest) -> dict:
-    result = request_plan_model_training(req.model_key)
+    result = enqueue_plan_model_training_task(
+        req.model_key,
+        trigger="api_plan_model_train",
+    )
     if not result.get("ok"):
         raise HTTPException(status_code=404, detail=result)
     return result
@@ -330,7 +335,9 @@ def model_strategy_train_plan_model(req: PlanModelTrainRequest) -> dict:
 
 @router.post("/model-strategy/plan-models/train-all")
 def model_strategy_train_all_plan_models() -> dict:
-    return train_all_trainable_plan_models()
+    return enqueue_all_plan_model_training_task(
+        trigger="api_plan_model_train_all",
+    )
 
 
 @router.get("/model-strategy/auto-optimization")

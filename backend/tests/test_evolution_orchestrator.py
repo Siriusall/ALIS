@@ -213,6 +213,66 @@ def test_plan_model_autonomy_dispatches_to_research_worker(monkeypatch):
     assert calls[0]["payload"]["production_change_forbidden"] is True
 
 
+def test_explicit_plan_model_training_dispatches_to_research_worker(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        evolution,
+        "create_evolution_task",
+        lambda **kwargs: calls.append(kwargs) or {
+            "id": 93,
+            "status": "queued",
+            "phase": "queued",
+            "progress": 0,
+            "message": "等待研究 Worker",
+            "worker_pool": kwargs.get("worker_pool"),
+        },
+    )
+    monkeypatch.setattr(evolution, "_now", lambda: datetime(2026, 8, 10, 17, 0))
+
+    result = evolution.enqueue_plan_model_training_task(
+        "medium_horizon_lambdarank_v1"
+    )
+
+    assert result["status"] == "delegated"
+    assert result["mode"] == "single_model_training"
+    assert result["worker_pool"] == "research"
+    assert calls[0]["task_type"] == "plan_model_autonomy"
+    assert calls[0]["worker_pool"] == "research"
+    assert calls[0]["dedupe_key"] == (
+        "plan_model_training:single:v1:medium_horizon_lambdarank_v1:2026-08-10"
+    )
+    assert calls[0]["payload"]["target_model_key"] == "medium_horizon_lambdarank_v1"
+    assert calls[0]["payload"]["production_change_forbidden"] is True
+
+
+def test_all_plan_model_training_dispatches_to_research_worker(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        evolution,
+        "create_evolution_task",
+        lambda **kwargs: calls.append(kwargs) or {
+            "id": 94,
+            "status": "queued",
+            "phase": "queued",
+            "progress": 0,
+            "message": "等待研究 Worker",
+            "worker_pool": kwargs.get("worker_pool"),
+        },
+    )
+    monkeypatch.setattr(evolution, "_now", lambda: datetime(2026, 8, 10, 17, 0))
+
+    result = evolution.enqueue_all_plan_model_training_task()
+
+    assert result["status"] == "delegated"
+    assert result["mode"] == "all_trainable_models"
+    assert result["worker_pool"] == "research"
+    assert calls[0]["task_type"] == "plan_model_autonomy"
+    assert calls[0]["worker_pool"] == "research"
+    assert calls[0]["dedupe_key"] == "plan_model_training:all:v1:2026-08-10"
+    assert calls[0]["payload"]["train_all"] is True
+    assert calls[0]["payload"]["production_change_forbidden"] is True
+
+
 def test_plan_model_autonomy_holds_worker_until_training_is_terminal(monkeypatch):
     from app.db import store
     from app.services import plan_model_auto_optimizer
@@ -312,6 +372,110 @@ def test_plan_model_autonomy_dispatches_frozen_targeted_candidate(monkeypatch):
     assert context["model_candidate_spec"][
         "event_head_feature_subset_contract"
     ] == "subsets-v1"
+
+
+def test_plan_model_autonomy_dispatches_explicit_single_model_training(monkeypatch):
+    from app.services import plan_model_control
+
+    requested = []
+    monkeypatch.setattr(
+        plan_model_control,
+        "request_plan_model_training",
+        lambda model_key, *, training_context: requested.append((model_key, training_context))
+        or {"ok": True, "started": True, "run_id": 78, "model_key": model_key},
+    )
+    monkeypatch.setattr(
+        evolution,
+        "_wait_for_model_train_runs",
+        lambda _task_id, run_ids, *, phase_prefix: [
+            {"run_id": run_id, "status": "completed", "model_version_id": 274, "error": None}
+            for run_id in run_ids
+        ],
+    )
+    monkeypatch.setattr(evolution, "_heartbeat", lambda *_args, **_kwargs: None)
+
+    result = evolution.execute_evolution_task({
+        "id": 950,
+        "task_type": "plan_model_autonomy",
+        "payload": {
+            "trigger": "api_plan_model_train",
+            "target_model_key": "medium_horizon_lambdarank_v1",
+            "production_change_forbidden": True,
+        },
+        "checkpoint": {},
+    })
+
+    assert result["mode"] == "targeted_model_training"
+    assert result["completed_training_runs"] == [{
+        "run_id": 78,
+        "status": "completed",
+        "model_version_id": 274,
+        "error": None,
+    }]
+    assert requested[0][0] == "medium_horizon_lambdarank_v1"
+    assert requested[0][1]["requested_by"] == "evolution_explicit_plan_model_training"
+    assert requested[0][1]["production_change_forbidden"] is True
+
+
+def test_plan_model_autonomy_serializes_all_trainable_model_runs(monkeypatch):
+    from app.services import plan_model_control
+
+    events = []
+    monkeypatch.setattr(
+        plan_model_control,
+        "model_family_status",
+        lambda: {"items": [
+            {"model_key": "medium_horizon_lambdarank_v1", "status": "trainable"},
+            {"model_key": "leader_lambdarank_v1", "status": "candidate"},
+            {"model_key": "capital_persistence_multitask_v1", "status": "trainable"},
+        ]},
+    )
+
+    def request(model_key, *, training_context):
+        run_id = 81 if model_key == "medium_horizon_lambdarank_v1" else 82
+        events.append(("request", model_key, training_context))
+        return {"ok": True, "started": True, "run_id": run_id, "model_key": model_key}
+
+    def wait(_task_id, run_ids, *, phase_prefix):
+        events.append(("wait", list(run_ids), phase_prefix))
+        return [
+            {"run_id": run_id, "status": "completed", "model_version_id": run_id + 200, "error": None}
+            for run_id in run_ids
+        ]
+
+    monkeypatch.setattr(plan_model_control, "request_plan_model_training", request)
+    monkeypatch.setattr(evolution, "_wait_for_model_train_runs", wait)
+    monkeypatch.setattr(evolution, "_heartbeat", lambda *_args, **_kwargs: None)
+
+    result = evolution.execute_evolution_task({
+        "id": 951,
+        "task_type": "plan_model_autonomy",
+        "payload": {"trigger": "api_plan_model_train_all", "train_all": True},
+        "checkpoint": {},
+    })
+
+    assert result["mode"] == "all_trainable_models"
+    assert result["started_count"] == 2
+    assert result["skipped"] == [{
+        "model_key": "leader_lambdarank_v1", "reason": "status_candidate"
+    }]
+    # The first run reaches its terminal state before the second starts; no
+    # redundant second wait is issued after those terminal observations.
+    assert [event[:2] for event in events] == [
+        ("request", "medium_horizon_lambdarank_v1"),
+        ("wait", [81]),
+        ("request", "capital_persistence_multitask_v1"),
+        ("wait", [82]),
+    ]
+    assert result["completed_training_runs"] == [
+        {"run_id": 81, "status": "completed", "model_version_id": 281, "error": None},
+        {"run_id": 82, "status": "completed", "model_version_id": 282, "error": None},
+    ]
+    assert all(
+        event[2]["production_change_forbidden"] is True
+        for event in events
+        if event[0] == "request"
+    )
 
 
 def test_hsmm_shadow_training_runs_inside_persistent_evolution_task(monkeypatch):

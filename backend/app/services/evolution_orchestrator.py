@@ -471,7 +471,7 @@ def reconcile_historical_contract_incompatible_tasks(*, limit: int = 200) -> dic
     current operational incident.
     """
     now = _now().isoformat()
-    with _conn() as conn:
+    with _read_conn() as conn:
         rows = conn.execute(
             """SELECT id,task_type,phase,message,error,result_json
                  FROM evolution_tasks
@@ -481,42 +481,47 @@ def reconcile_historical_contract_incompatible_tasks(*, limit: int = 200) -> dic
                 ORDER BY id ASC LIMIT ?""",
             (max(1, min(int(limit), 500)),),
         ).fetchall()
-        reconciled: list[dict[str, Any]] = []
-        for row in rows:
-            task = dict(row)
-            reason = _historical_contract_incompatibility_reason(task)
-            if not reason:
-                continue
-            result = _loads(task.get("result_json"), {})
-            result = result if isinstance(result, dict) else {}
-            classification = result.get("classification") if isinstance(result.get("classification"), dict) else {}
-            result.update({
-                "schema_version": "alis_evolution_failure_classification_v1",
-                "classification": {
-                    **classification,
-                    "category": "historical_contract_incompatible",
-                    "retryable": False,
-                    "recommended_action": "quarantine_historical_contract",
-                    "reconciliation_reason": reason,
-                },
-            })
-            cursor = conn.execute(
-                """UPDATE evolution_tasks
+    pending: list[tuple[dict[str, Any], str, dict[str, Any]]] = []
+    for row in rows:
+        task = dict(row)
+        reason = _historical_contract_incompatibility_reason(task)
+        if not reason:
+            continue
+        result = _loads(task.get("result_json"), {})
+        result = result if isinstance(result, dict) else {}
+        classification = result.get("classification") if isinstance(result.get("classification"), dict) else {}
+        result.update({
+            "schema_version": "alis_evolution_failure_classification_v1",
+            "classification": {
+                **classification,
+                "category": "historical_contract_incompatible",
+                "retryable": False,
+                "recommended_action": "quarantine_historical_contract",
+                "reconciliation_reason": reason,
+            },
+        })
+        pending.append((task, reason, result))
+    reconciled: list[dict[str, Any]] = []
+    if pending:
+        with _conn() as conn:
+            for task, reason, result in pending:
+                cursor = conn.execute(
+                    """UPDATE evolution_tasks
                        SET phase='historical_contract_incompatible',
                            message=?,error=?,result_json=?,updated_at=?
                      WHERE id=? AND status='failed'
                        AND COALESCE(lease_owner,'')=''
                        AND COALESCE(phase,'')<>'historical_contract_incompatible'""",
-                (
-                    "历史冻结合同不兼容，保留证据且不再重试",
-                    reason,
-                    json.dumps(result, ensure_ascii=False, sort_keys=True),
-                    now,
-                    int(task["id"]),
-                ),
-            )
-            if int(cursor.rowcount or 0) > 0:
-                reconciled.append({"id": int(task["id"]), "reason": reason})
+                    (
+                        "历史冻结合同不兼容，保留证据且不再重试",
+                        reason,
+                        json.dumps(result, ensure_ascii=False, sort_keys=True),
+                        now,
+                        int(task["id"]),
+                    ),
+                )
+                if int(cursor.rowcount or 0) > 0:
+                    reconciled.append({"id": int(task["id"]), "reason": reason})
     return {
         "ok": True,
         "schema_version": "alis_historical_contract_task_reconciliation_v1",
@@ -528,7 +533,7 @@ def reconcile_historical_contract_incompatible_tasks(*, limit: int = 200) -> dic
 def reconcile_historical_data_gate_waiting_tasks(*, limit: int = 200) -> dict[str, Any]:
     """Mark proven historical data-gate waits without changing task outcomes."""
     now = _now().isoformat()
-    with _conn() as conn:
+    with _read_conn() as conn:
         rows = conn.execute(
             """SELECT id,task_type,phase,message,error,result_json
                  FROM evolution_tasks
@@ -538,36 +543,41 @@ def reconcile_historical_data_gate_waiting_tasks(*, limit: int = 200) -> dict[st
                 ORDER BY id ASC LIMIT ?""",
             (max(1, min(int(limit), 500)),),
         ).fetchall()
-        reconciled: list[dict[str, Any]] = []
-        for row in rows:
-            task = dict(row)
-            reason = _historical_data_gate_waiting_reason(task)
-            if not reason:
-                continue
-            result = _loads(task.get("result_json"), {})
-            result = result if isinstance(result, dict) else {}
-            result["historical_reconciliation"] = {
-                "schema_version": "alis_historical_data_gate_reconciliation_v1",
-                "reason": reason,
-                "reconciled_at": now,
-            }
-            cursor = conn.execute(
-                """UPDATE evolution_tasks
+    pending: list[tuple[dict[str, Any], str, dict[str, Any]]] = []
+    for row in rows:
+        task = dict(row)
+        reason = _historical_data_gate_waiting_reason(task)
+        if not reason:
+            continue
+        result = _loads(task.get("result_json"), {})
+        result = result if isinstance(result, dict) else {}
+        result["historical_reconciliation"] = {
+            "schema_version": "alis_historical_data_gate_reconciliation_v1",
+            "reason": reason,
+            "reconciled_at": now,
+        }
+        pending.append((task, reason, result))
+    reconciled: list[dict[str, Any]] = []
+    if pending:
+        with _conn() as conn:
+            for task, reason, result in pending:
+                cursor = conn.execute(
+                    """UPDATE evolution_tasks
                        SET phase='historical_data_gate_waiting',
                            message=?,error=?,result_json=?,updated_at=?
                      WHERE id=? AND status='failed'
                        AND COALESCE(lease_owner,'')=''
                        AND COALESCE(phase,'')<>'historical_data_gate_waiting'""",
-                (
-                    "历史数据门等待，保留证据且不再重试",
-                    reason,
-                    json.dumps(result, ensure_ascii=False, sort_keys=True),
-                    now,
-                    int(task["id"]),
-                ),
-            )
-            if int(cursor.rowcount or 0) > 0:
-                reconciled.append({"id": int(task["id"]), "reason": reason})
+                    (
+                        "历史数据门等待，保留证据且不再重试",
+                        reason,
+                        json.dumps(result, ensure_ascii=False, sort_keys=True),
+                        now,
+                        int(task["id"]),
+                    ),
+                )
+                if int(cursor.rowcount or 0) > 0:
+                    reconciled.append({"id": int(task["id"]), "reason": reason})
     return {
         "ok": True,
         "schema_version": "alis_historical_data_gate_reconciliation_v1",
@@ -581,7 +591,7 @@ def reconcile_shadow_equity_evidence_gap_tasks(*, limit: int = 200) -> dict[str,
     from app.services.plan_model_control import classify_plan_model_training_failure
 
     now = _now().isoformat()
-    with _conn() as conn:
+    with _read_conn() as conn:
         rows = conn.execute(
             """SELECT id,task_type,phase,message,error,result_json
                  FROM evolution_tasks
@@ -592,39 +602,44 @@ def reconcile_shadow_equity_evidence_gap_tasks(*, limit: int = 200) -> dict[str,
                 ORDER BY id ASC LIMIT ?""",
             (max(1, min(int(limit), 500)),),
         ).fetchall()
-        reconciled: list[int] = []
-        for row in rows:
-            task = dict(row)
-            classification = classify_plan_model_training_failure(
-                task.get("error") or task.get("message")
-            )
-            if str(classification.get("category") or "") != "shadow_equity_evidence_gap":
-                continue
-            result = _loads(task.get("result_json"), {})
-            result = result if isinstance(result, dict) else {}
-            result["classification"] = classification
-            result["shadow_evidence_reconciliation"] = {
-                "schema_version": "alis_shadow_equity_evidence_gap_v1",
-                "reason": "相邻权益点未形成；不伪造收益、不重放同日结果",
-                "reconciled_at": now,
-            }
-            cursor = conn.execute(
-                """UPDATE evolution_tasks
+    pending: list[tuple[dict[str, Any], dict[str, Any], dict[str, Any]]] = []
+    for row in rows:
+        task = dict(row)
+        classification = classify_plan_model_training_failure(
+            task.get("error") or task.get("message")
+        )
+        if str(classification.get("category") or "") != "shadow_equity_evidence_gap":
+            continue
+        result = _loads(task.get("result_json"), {})
+        result = result if isinstance(result, dict) else {}
+        result["classification"] = classification
+        result["shadow_evidence_reconciliation"] = {
+            "schema_version": "alis_shadow_equity_evidence_gap_v1",
+            "reason": "相邻权益点未形成；不伪造收益、不重放同日结果",
+            "reconciled_at": now,
+        }
+        pending.append((task, classification, result))
+    reconciled: list[int] = []
+    if pending:
+        with _conn() as conn:
+            for task, classification, result in pending:
+                cursor = conn.execute(
+                    """UPDATE evolution_tasks
                        SET phase='shadow_equity_evidence_gap',
                            message=?,error=?,result_json=?,updated_at=?
                      WHERE id=? AND status='failed'
                        AND COALESCE(lease_owner,'')=''
                        AND COALESCE(phase,'')<>'shadow_equity_evidence_gap'""",
-                (
-                    "影子权益证据未形成，保留原始缺口且等待下一自然观察周期",
-                    str(task.get("error") or "")[:2000],
-                    json.dumps(result, ensure_ascii=False, sort_keys=True),
-                    now,
-                    int(task["id"]),
-                ),
-            )
-            if int(cursor.rowcount or 0) > 0:
-                reconciled.append(int(task["id"]))
+                    (
+                        "影子权益证据未形成，保留原始缺口且等待下一自然观察周期",
+                        str(task.get("error") or "")[:2000],
+                        json.dumps(result, ensure_ascii=False, sort_keys=True),
+                        now,
+                        int(task["id"]),
+                    ),
+                )
+                if int(cursor.rowcount or 0) > 0:
+                    reconciled.append(int(task["id"]))
     return {
         "ok": True,
         "schema_version": "alis_shadow_equity_evidence_reconciliation_v1",
@@ -725,7 +740,10 @@ def enqueue_factor_strategy_research_event(
 
 
 def get_evolution_task(task_id: int, *, compact: bool = False) -> dict[str, Any] | None:
-    with _conn() as conn:
+    # Task detail/status reads are independent projections.  Keep JSON
+    # decoding outside a PostgreSQL transaction so a slow dashboard client
+    # cannot leave the worker session idle in transaction.
+    with _read_conn() as conn:
         if compact and getattr(conn, "_is_postgres", False):
             # Keep the task-center projection small while preserving the
             # step-level status needed by the management page.  Full result
@@ -779,7 +797,7 @@ def list_evolution_tasks(limit: int = 20, *, include_details: bool = False) -> l
     columns = _TASK_LIST_COLUMNS
     if include_details:
         columns = columns + ",payload_json,checkpoint_json,result_json"
-    with _conn() as conn:
+    with _read_conn() as conn:
         rows = conn.execute(
             f"SELECT {columns} FROM evolution_tasks ORDER BY id DESC LIMIT ?",
             (max(1, min(int(limit), 200)),),
@@ -1807,6 +1825,93 @@ def enqueue_plan_model_autonomy_task(
     }
 
 
+def enqueue_plan_model_training_task(
+    model_key: str,
+    *,
+    trigger: str = "api_plan_model_train",
+) -> dict[str, Any]:
+    """Queue one explicit plan-model training request on the research pool."""
+    from app.services.plan_model_control import PLAN_MODELS
+
+    normalized_model_key = str(model_key or "").strip()
+    if normalized_model_key not in PLAN_MODELS:
+        return {
+            "ok": False,
+            "status": "unknown_plan_model",
+            "error": "unknown_plan_model",
+            "model_key": normalized_model_key,
+            "production_change_forbidden": True,
+        }
+    date_key = _now().date().isoformat()
+    task = create_evolution_task(
+        task_type="plan_model_autonomy",
+        payload={
+            "trigger": str(trigger or "api_plan_model_train"),
+            "target_model_key": normalized_model_key,
+            "delegated_from": "api_plan_model_training",
+            "production_change_forbidden": True,
+            "execution_contract": "alis_plan_model_explicit_research_task_v1",
+        },
+        dedupe_key=f"plan_model_training:single:v1:{normalized_model_key}:{date_key}",
+        max_attempts=3,
+        priority=60,
+        worker_pool="research",
+    )
+    task_status = str(task.get("status") or "queued")
+    return {
+        "ok": True,
+        "status": "delegated" if task_status in {"queued", "running", "retry_wait"} else task_status,
+        "task_status": task_status,
+        "task_id": int(task.get("id") or 0) or None,
+        "model_key": normalized_model_key,
+        "worker_pool": "research",
+        "execution_mode": "persistent_research_task",
+        "mode": "single_model_training",
+        "task": {
+            key: task.get(key)
+            for key in ("id", "status", "phase", "progress", "message", "worker_pool")
+        },
+        "production_change_forbidden": True,
+    }
+
+
+def enqueue_all_plan_model_training_task(
+    *,
+    trigger: str = "api_plan_model_train_all",
+) -> dict[str, Any]:
+    """Queue a serialized all-trainable-model run on the research pool."""
+    date_key = _now().date().isoformat()
+    task = create_evolution_task(
+        task_type="plan_model_autonomy",
+        payload={
+            "trigger": str(trigger or "api_plan_model_train_all"),
+            "train_all": True,
+            "delegated_from": "api_plan_model_training",
+            "production_change_forbidden": True,
+            "execution_contract": "alis_plan_model_explicit_research_task_v1",
+        },
+        dedupe_key=f"plan_model_training:all:v1:{date_key}",
+        max_attempts=3,
+        priority=65,
+        worker_pool="research",
+    )
+    task_status = str(task.get("status") or "queued")
+    return {
+        "ok": True,
+        "status": "delegated" if task_status in {"queued", "running", "retry_wait"} else task_status,
+        "task_status": task_status,
+        "task_id": int(task.get("id") or 0) or None,
+        "worker_pool": "research",
+        "execution_mode": "persistent_research_task",
+        "mode": "all_trainable_models",
+        "task": {
+            key: task.get(key)
+            for key in ("id", "status", "phase", "progress", "message", "worker_pool")
+        },
+        "production_change_forbidden": True,
+    }
+
+
 def _run_quick_gate(target: dict[str, Any], audit: dict[str, Any]) -> dict[str, Any]:
     dates = BacktestDataSource().get_available_trade_dates(
         str(audit["window_start"]), str(audit["window_end"]),
@@ -2715,11 +2820,15 @@ def execute_evolution_task(
         )
     if task_type == "plan_model_autonomy":
         from app.services.plan_model_auto_optimizer import run_auto_optimization_once
-        from app.services.plan_model_control import request_plan_model_training
+        from app.services.plan_model_control import (
+            model_family_status,
+            request_plan_model_training,
+        )
 
         payload = task.get("payload") if isinstance(task.get("payload"), dict) else {}
         force = bool(payload.get("force", False))
         target_model_key = str(payload.get("target_model_key") or "")
+        train_all = bool(payload.get("train_all", False))
         model_candidate_spec = (
             dict(payload.get("model_candidate_spec") or {})
             if isinstance(payload.get("model_candidate_spec"), dict)
@@ -2769,6 +2878,91 @@ def execute_evolution_task(
                     "skipped_count": 0 if training.get("started") else 1,
                     "production_change_forbidden": True,
                 }
+        elif target_model_key:
+            def model_runner() -> dict[str, Any]:
+                training = request_plan_model_training(
+                    target_model_key,
+                    training_context={
+                        "requested_by": "evolution_explicit_plan_model_training",
+                        "trigger": str(payload.get("trigger") or "explicit_training"),
+                        "production_change_forbidden": True,
+                        "execution_contract": str(
+                            payload.get("execution_contract")
+                            or "alis_plan_model_explicit_research_task_v1"
+                        ),
+                    },
+                )
+                return {
+                    "ok": bool(training.get("ok")),
+                    "mode": "targeted_model_training",
+                    "started": [training] if training.get("started") else [],
+                    "started_count": 1 if training.get("started") else 0,
+                    "skipped": [] if training.get("started") else [training],
+                    "skipped_count": 0 if training.get("started") else 1,
+                    "production_change_forbidden": True,
+                }
+        elif train_all:
+            def model_runner() -> dict[str, Any]:
+                started: list[dict[str, Any]] = []
+                skipped: list[dict[str, Any]] = []
+                completed_training_runs: list[dict[str, Any]] = []
+                # Each model can launch an in-process training thread, so wait
+                # for its terminal run before launching the next candidate.
+                # This preserves the old "train all" intent without creating
+                # concurrent full-history scans on the research database.
+                for item in model_family_status().get("items") or []:
+                    model_key = str(item.get("model_key") or "")
+                    if str(item.get("status") or "") != "trainable":
+                        skipped.append({
+                            "model_key": model_key,
+                            "reason": f"status_{item.get('status')}",
+                        })
+                        continue
+                    training = request_plan_model_training(
+                        model_key,
+                        training_context={
+                            "requested_by": "evolution_explicit_plan_model_training",
+                            "trigger": str(payload.get("trigger") or "explicit_train_all"),
+                            "production_change_forbidden": True,
+                            "execution_contract": str(
+                                payload.get("execution_contract")
+                                or "alis_plan_model_explicit_research_task_v1"
+                            ),
+                        },
+                    )
+                    if not training.get("started"):
+                        skipped.append({
+                            "model_key": model_key,
+                            "reason": str(
+                                training.get("reason")
+                                or training.get("error")
+                                or "not_started"
+                            ),
+                            "training": training,
+                        })
+                        continue
+                    started.append(training)
+                    run_id = int(training.get("run_id") or 0)
+                    if run_id <= 0:
+                        raise RuntimeError(
+                            f"模型训练未返回有效运行 ID：{model_key}"
+                        )
+                    completed_training_runs.extend(_wait_for_model_train_runs(
+                        int(task["id"]),
+                        [run_id],
+                        phase_prefix="plan_model_training",
+                    ))
+                return {
+                    "ok": True,
+                    "mode": "all_trainable_models",
+                    "started": started,
+                    "started_count": len(started),
+                    "skipped": skipped,
+                    "skipped_count": len(skipped),
+                    "completed_training_runs": completed_training_runs,
+                    "production_change_forbidden": True,
+                    "resource_lock_contract": "serialized_model_training_runs_v1",
+                }
         else:
             def model_runner() -> dict[str, Any]:
                 return run_auto_optimization_once(force=force)
@@ -2783,11 +2977,27 @@ def execute_evolution_task(
             for item in result.get("started") or []
             if int(item.get("run_id") or 0) > 0
         ]
-        result["completed_training_runs"] = _wait_for_model_train_runs(
-            int(task["id"]),
-            run_ids,
-            phase_prefix="plan_model_training",
+        completed_training_runs = list(
+            result.get("completed_training_runs") or []
         )
+        already_completed_run_ids = {
+            int(item.get("run_id") or 0)
+            for item in completed_training_runs
+            if isinstance(item, dict) and int(item.get("run_id") or 0) > 0
+        }
+        pending_run_ids = [
+            run_id for run_id in run_ids
+            if run_id not in already_completed_run_ids
+        ]
+        pending_completed_runs = _wait_for_model_train_runs(
+            int(task["id"]),
+            pending_run_ids,
+            phase_prefix="plan_model_training",
+        ) if pending_run_ids else []
+        for completed_run in pending_completed_runs:
+            if int(completed_run.get("run_id") or 0) not in already_completed_run_ids:
+                completed_training_runs.append(completed_run)
+        result["completed_training_runs"] = completed_training_runs
         result["resource_lock_contract"] = "single_worker_held_until_model_train_terminal_v1"
         return result
     if task_type == "strategy_portfolio_formal_queue":

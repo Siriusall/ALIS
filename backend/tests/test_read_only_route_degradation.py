@@ -146,6 +146,69 @@ def test_model_auto_optimization_api_routes_to_persistent_research_task(monkeypa
         {"trigger": "api_auto_optimization", "force": True},
         {"trigger": "api_auto_tune"},
     ]
+
+
+def test_explicit_plan_model_training_api_routes_to_research_task(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        model_strategy,
+        "enqueue_plan_model_training_task",
+        lambda model_key, **kwargs: calls.append((model_key, kwargs)) or {
+            "ok": True,
+            "status": "delegated",
+            "worker_pool": "research",
+            "model_key": model_key,
+        },
+    )
+    monkeypatch.setattr(
+        model_strategy,
+        "enqueue_all_plan_model_training_task",
+        lambda **kwargs: calls.append(("all", kwargs)) or {
+            "ok": True,
+            "status": "delegated",
+            "worker_pool": "research",
+            "mode": "all_trainable_models",
+        },
+    )
+
+    single = model_strategy.model_strategy_train_plan_model(
+        model_strategy.PlanModelTrainRequest(model_key="medium_horizon_lambdarank_v1")
+    )
+    all_models = model_strategy.model_strategy_train_all_plan_models()
+
+    assert single["status"] == "delegated"
+    assert all_models["mode"] == "all_trainable_models"
+    assert calls == [
+        (
+            "medium_horizon_lambdarank_v1",
+            {"trigger": "api_plan_model_train"},
+        ),
+        ("all", {"trigger": "api_plan_model_train_all"}),
+    ]
+
+
+def test_explicit_plan_model_training_api_keeps_unknown_model_404(monkeypatch):
+    from fastapi import HTTPException
+
+    monkeypatch.setattr(
+        model_strategy,
+        "enqueue_plan_model_training_task",
+        lambda *_args, **_kwargs: {
+            "ok": False,
+            "status": "unknown_plan_model",
+            "error": "unknown_plan_model",
+        },
+    )
+
+    try:
+        model_strategy.model_strategy_train_plan_model(
+            model_strategy.PlanModelTrainRequest(model_key="unknown_model_v1")
+        )
+    except HTTPException as exc:
+        assert exc.status_code == 404
+        assert exc.detail["error"] == "unknown_plan_model"
+    else:  # pragma: no cover - explicit route contract assertion
+        raise AssertionError("unknown plan model should return HTTP 404")
 def test_plan_model_console_projection_keeps_governance_summary_without_fold_payload(monkeypatch):
     payload = {
         "items": [{

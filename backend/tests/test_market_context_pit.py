@@ -31,6 +31,59 @@ def test_market_training_requires_trade_date_pit_cutoff(monkeypatch) -> None:
     }
 
 
+def test_market_training_uses_accepted_snapshot_hash_before_aggregation(monkeypatch) -> None:
+    """The full-market aggregate must not rank the raw version archive."""
+    statements: list[str] = []
+
+    class Result:
+        def fetchall(self):
+            return []
+
+    class Connection:
+        _is_postgres = False
+
+        def execute(self, sql, _params=()):
+            statements.append(sql)
+            if "FROM dc_stock_daily_snapshot p" in sql:
+                return Result()
+            raise AssertionError(f"unexpected query: {sql}")
+
+    @contextmanager
+    def fake_conn():
+        yield Connection()
+
+    clock_columns = {
+        "id", "ts_code", "trade_date", "payload_json", "source_code",
+        "economic_available_time", "observed_at", "first_observed_at",
+        "observation_provenance", "content_hash", "created_at",
+    }
+    monkeypatch.setattr(market_context, "_conn", fake_conn)
+    monkeypatch.setattr(
+        market_context,
+        "_table_columns",
+        lambda _conn, table: (
+            clock_columns if table == "dc_stock_daily_snapshot_version"
+            else {"ts_code", "trade_date", "content_hash"}
+            if table == "dc_stock_daily_snapshot" else set()
+        ),
+    )
+    monkeypatch.setattr(
+        market_context,
+        "_strict_raw_payload_rows",
+        lambda *_args, **_kwargs: [
+            {"ts_code": code, "trade_date": "20260814", "payload_json": json.dumps({"close": 10})}
+            for code in ("000300.SH", "000905.SH", "000852.SH")
+        ],
+    )
+
+    result = market_context.materialize_market_training_history()
+
+    assert result["market_sessions"] == 0
+    aggregate_sql = next(sql for sql in statements if "FROM dc_stock_daily_snapshot p" in sql)
+    assert "v.content_hash=p.content_hash" in aggregate_sql
+    assert "ROW_NUMBER() OVER" not in aggregate_sql
+
+
 def test_history_rebuild_blocks_instead_of_reading_mutable_raw_projection(monkeypatch) -> None:
     class Result:
         def fetchall(self):

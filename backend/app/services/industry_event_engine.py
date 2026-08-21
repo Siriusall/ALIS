@@ -13,6 +13,7 @@ from zoneinfo import ZoneInfo
 from app.data_platform.db import _conn
 from app.data_platform.services.observation_clock import (
     _explicit_timestamp_sql,
+    _table_columns,
     _timestamp_value_sql,
     _valid_provenance_sql,
     load_raw_record_versions,
@@ -441,10 +442,24 @@ def _derived_industry_proxies(c, *, as_of_time: str | None = None) -> dict[str, 
     # Valuation is part of the formal industry state.  The mutable snapshot
     # projection can be overwritten by a late repair, so it must not be used
     # when deriving a state that carries an explicit observation cutoff.
-    # Select the latest immutable row per company only after all four clocks
-    # have been constrained to that cutoff.
+    # Select the accepted immutable row per company only after all four clocks
+    # have been constrained to that cutoff.  The normalized projection is the
+    # authority for the selected provider/hash.  Joining it directly avoids a
+    # window rank across the complete append-only snapshot archive; if its
+    # accepted hash is not visible under this cutoff, it stays absent rather
+    # than falling back to an older or future version.
     try:
         is_postgres = bool(getattr(c, "_is_postgres", False))
+        version_columns = _table_columns(c, "dc_stock_daily_snapshot_version")
+        projection_columns = _table_columns(c, "dc_stock_daily_snapshot")
+        required_version_columns = {
+            "id", "ts_code", "trade_date", "payload_json", "source_code",
+            "economic_available_time", "observed_at", "first_observed_at",
+            "observation_provenance", "content_hash", "created_at",
+        }
+        required_projection_columns = {"ts_code", "trade_date", "content_hash"}
+        if not required_version_columns.issubset(version_columns):
+            raise RuntimeError("industry_valuation_snapshot_version_schema_unavailable")
         observed_sql = _timestamp_value_sql("v.observed_at", is_postgres=is_postgres)
         first_observed_sql = _timestamp_value_sql("v.first_observed_at", is_postgres=is_postgres)
         economic_sql = _timestamp_value_sql("v.economic_available_time", is_postgres=is_postgres)
@@ -474,20 +489,49 @@ def _derived_industry_proxies(c, *, as_of_time: str | None = None) -> dict[str, 
             if is_postgres else
             "CAST(json_extract(v.payload_json,'$.pe_ttm') AS REAL)"
         )
-        snapshots = [dict(row) for row in c.execute(
-            f"""WITH ranked AS (
-                       SELECT v.ts_code,{pe_expr} AS pe_ttm,v.trade_date,
-                              ROW_NUMBER() OVER (
-                                  PARTITION BY v.ts_code
-                                  ORDER BY v.trade_date DESC,{observed_sql} DESC,
-                                           {created_sql} DESC,v.id DESC
-                              ) AS row_rank
-                         FROM dc_stock_daily_snapshot_version v
-                        WHERE {' AND '.join(predicates)}
-                   )
-                   SELECT ts_code,pe_ttm FROM ranked WHERE row_rank=1""",
-            tuple(params),
-        ).fetchall()]
+        if required_projection_columns.issubset(projection_columns):
+            # There is one projection row per market bar and an immutable
+            # version is unique by the same key plus content hash.  Group the
+            # already filtered accepted set by symbol to locate the newest
+            # session. This is portable to SQLite and avoids a ROW_NUMBER
+            # across every raw provider version.
+            snapshot_sql = f"""WITH accepted AS (
+                                    SELECT v.ts_code,{pe_expr} AS pe_ttm,v.trade_date
+                                      FROM dc_stock_daily_snapshot p
+                                      JOIN dc_stock_daily_snapshot_version v
+                                        ON v.ts_code=p.ts_code
+                                       AND v.trade_date=p.trade_date
+                                       AND v.content_hash=p.content_hash
+                                     WHERE {' AND '.join(predicates)}
+                               ), latest_dates AS (
+                                    SELECT ts_code,MAX(trade_date) AS trade_date
+                                      FROM accepted
+                                     GROUP BY ts_code
+                               )
+                               SELECT accepted.ts_code,accepted.pe_ttm
+                                 FROM accepted
+                                 JOIN latest_dates latest
+                                   ON latest.ts_code=accepted.ts_code
+                                  AND latest.trade_date=accepted.trade_date"""
+            snapshots = [dict(row) for row in c.execute(snapshot_sql, tuple(params)).fetchall()]
+        else:
+            # A controlled fallback for isolated old-schema fixtures.  It
+            # stays on immutable rows and preserves the explicit four-clock
+            # predicates, but production always takes the accepted-hash path.
+            snapshots = [dict(row) for row in c.execute(
+                f"""WITH ranked AS (
+                           SELECT v.ts_code,{pe_expr} AS pe_ttm,v.trade_date,
+                                  ROW_NUMBER() OVER (
+                                      PARTITION BY v.ts_code
+                                      ORDER BY v.trade_date DESC,{observed_sql} DESC,
+                                               {created_sql} DESC,v.id DESC
+                                  ) AS row_rank
+                             FROM dc_stock_daily_snapshot_version v
+                            WHERE {' AND '.join(predicates)}
+                       )
+                       SELECT ts_code,pe_ttm FROM ranked WHERE row_rank=1""",
+                tuple(params),
+            ).fetchall()]
     except Exception as exc:
         raise RuntimeError(
             "industry_valuation_pit_unavailable: immutable snapshot version required"

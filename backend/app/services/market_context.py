@@ -469,6 +469,19 @@ def materialize_market_training_history() -> dict[str, Any]:
             "created_at", "source_code", "content_hash", "observation_provenance",
         }.issubset(snapshot_columns):
             is_postgres = bool(getattr(c, "_is_postgres", False))
+            # The mutable snapshot projection is the accepted winner for
+            # each (ts_code, trade_date).  When it is present, bind the
+            # immutable archive to that exact hash before aggregating.  The
+            # old window over every version can sort years of duplicate
+            # provider rows and was a frequent source of raw_ranked
+            # statement timeouts.  An accepted hash whose observation clocks
+            # are not visible at the session cutoff simply contributes no
+            # row; do not fall back to an older/future version or the mutable
+            # payload, since that would violate PIT semantics.
+            projection_columns = _table_columns(c, "dc_stock_daily_snapshot")
+            has_accepted_projection = {
+                "ts_code", "trade_date", "content_hash",
+            }.issubset(projection_columns)
             observed_at = _timestamp_value_sql("v.observed_at", is_postgres=is_postgres)
             first_observed_at = _timestamp_value_sql("v.first_observed_at", is_postgres=is_postgres)
             created_at = _timestamp_value_sql("v.created_at", is_postgres=is_postgres)
@@ -492,7 +505,24 @@ def materialize_market_training_history() -> dict[str, Any]:
             else:
                 change_expr = "CAST(json_extract(payload_json,'$.change_pct') AS REAL)"
                 turnover_expr = "CAST(json_extract(payload_json,'$.turnover') AS REAL)"
-            market_sql = """WITH ranked AS (
+            if has_accepted_projection:
+                visible_cte = """accepted AS (
+                    SELECT v.ts_code,v.trade_date,v.payload_json,v.observed_at
+                      FROM dc_stock_daily_snapshot p
+                      JOIN dc_stock_daily_snapshot_version v
+                        ON v.ts_code=p.ts_code
+                       AND v.trade_date=p.trade_date
+                       AND v.content_hash=p.content_hash
+                     WHERE {snapshot_evidence}
+                ), latest AS (
+                    SELECT * FROM accepted
+                )""".format(snapshot_evidence=snapshot_evidence)
+            else:
+                # Isolated pre-projection fixtures retain the historical
+                # immutable ranking path.  Production has the accepted
+                # projection, so this branch is only a controlled schema
+                # compatibility fallback and never reads the mutable table.
+                visible_cte = """ranked AS (
                     SELECT v.ts_code,v.trade_date,v.payload_json,v.observed_at,
                            ROW_NUMBER() OVER (
                               PARTITION BY v.ts_code,v.trade_date
@@ -502,7 +532,12 @@ def materialize_market_training_history() -> dict[str, Any]:
                      WHERE {snapshot_evidence}
                 ), latest AS (
                     SELECT * FROM ranked WHERE row_rank=1
+                )""".format(
+                    observed_at=observed_at,
+                    created_at=created_at,
+                    snapshot_evidence=snapshot_evidence,
                 )
+            market_sql = """WITH {visible_cte}
                 SELECT trade_date,
                       COUNT(*) AS instrument_count,
                       AVG(CASE WHEN {change_expr} > 0 THEN 1.0 ELSE 0.0 END) AS breadth,
@@ -515,9 +550,7 @@ def materialize_market_training_history() -> dict[str, Any]:
                  FROM latest
                 GROUP BY trade_date
                 ORDER BY trade_date""".format(
-                observed_at=observed_at,
-                created_at=created_at,
-                snapshot_evidence=snapshot_evidence,
+                visible_cte=visible_cte,
                 change_expr=change_expr,
                 turnover_expr=turnover_expr,
             )
