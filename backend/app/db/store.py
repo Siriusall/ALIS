@@ -377,8 +377,13 @@ def _read_conn():
 @contextmanager
 def atomic_business_transaction():
     """Make nested business-store mutations one commit/rollback unit."""
-    if _ACTIVE_BUSINESS_TRANSACTION.get() is not None:
-        raise RuntimeError("不允许嵌套开启模拟账本原子事务")
+    active = _ACTIVE_BUSINESS_TRANSACTION.get()
+    if active is not None:
+        # Execution helpers may enforce the same atomic boundary at more than
+        # one layer. Reuse the outer transaction instead of rejecting a valid
+        # nested call and quarantining an otherwise executable daily plan.
+        yield active
+        return
     with _conn() as connection:
         _acquire_simulation_account_lock(connection)
         token = _ACTIVE_BUSINESS_TRANSACTION.set(connection)
