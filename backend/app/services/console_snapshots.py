@@ -492,7 +492,14 @@ def _pages_due_for_refresh() -> list[str]:
     by_page = {str(dict(row).get("page_key")): dict(row) for row in rows}
     now = datetime.now(timezone.utc)
     due: list[str] = []
-    for page_key in PAGE_KEYS:
+    # A browser- or data-triggered invalidation must not wait behind a slow
+    # periodic refresh of an unrelated page.  This keeps user-visible pages
+    # on their latest known-good snapshot while the control worker is serial.
+    ordered_page_keys = tuple(sorted(
+        PAGE_KEYS,
+        key=lambda page_key: 0 if (by_page.get(page_key) or {}).get("invalidated_at") else 1,
+    ))
+    for page_key in ordered_page_keys:
         record = by_page.get(page_key)
         if not record:
             due.append(page_key)
