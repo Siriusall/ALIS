@@ -809,6 +809,23 @@ def start_daily_update() -> dict[str, Any]:
         return {"ok": True, **_state}
 
 
+def _start_derived_research_repair(target: str) -> dict[str, Any]:
+    """Refresh research projections without rerunning upstream market ingestion."""
+    target_s = str(target or "").replace("-", "")[:8]
+    if len(target_s) != 8:
+        return {"ok": False, "reason": "invalid_target"}
+
+    def _run() -> None:
+        try:
+            result = _run_research_maintenance(target_s)
+            logger.info("派生研究快照独立补建完成 target=%s result=%s", target_s, result)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("派生研究快照独立补建失败 target=%s error=%s", target_s, str(exc)[:300])
+
+    threading.Thread(target=_run, name="derived-research-repair", daemon=True).start()
+    return {"ok": True, "reason": "started", "trade_date": target_s}
+
+
 def start_daily_update_scheduler() -> bool:
     """Start an independent close-of-day updater, even with no quant task."""
     global _scheduler_started
@@ -852,7 +869,7 @@ def start_daily_update_scheduler() -> bool:
                     defensive_codes = [str(item["ts_code"]) for item in DEFENSIVE_ASSETS]
                     defensive_execution_slice = defensive_asset_execution_status(target, defensive_codes)
                     if target and derived_research_lag and retry_policy.get("allowed"):
-                        result = start_daily_update()
+                        result = _start_derived_research_repair(target)
                         if result.get("ok"):
                             logger.info("自动日更发现行业/主题派生快照落后，启动补建 target=%s", target)
                         elif result.get("reason") != "already_running":
