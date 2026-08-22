@@ -371,8 +371,10 @@ def _scheduler_should_check(now: datetime, target_trade_date_value: str) -> bool
 def _run_research_maintenance(trade_date: str) -> dict[str, Any]:
     """Refresh research pools after a durable market snapshot without affecting it."""
     from app.services.decision_store import list_pool_members
+    from app.services.industry_event_engine import materialize_industry_state_snapshots
     from app.services.research_workflow import process_watch_pool, stage_watch_pool_candidates
     from app.services.stock_screener import run_daily_screener
+    from app.services.theme_engine import materialize_theme_snapshots
 
     research_limit = max(1, min(int(os.getenv("ALIS_DAILY_RESEARCH_LIMIT", "100")), 500))
     screen = run_daily_screener(
@@ -399,11 +401,20 @@ def _run_research_maintenance(trade_date: str) -> dict[str, Any]:
                 "requested": enriched.get("requested"),
             })
     promote = process_watch_pool(limit=research_limit)
+    # These are daily read models consumed by the research console. Keep them
+    # in the same durable close cycle as the screener so an otherwise healthy
+    # market refresh cannot leave industry/theme dates stranded in the past.
+    industry_states = materialize_industry_state_snapshots(
+        as_of_time=f"{trade_date[:4]}-{trade_date[4:6]}-{trade_date[6:8]}T23:59:59+08:00"
+    )
+    themes = materialize_theme_snapshots(as_of_time=f"{trade_date[:4]}-{trade_date[4:6]}-{trade_date[6:8]}T23:59:59+08:00")
     return {
         "screen": screen,
         "stage": staged,
         "candidate_enrichment": candidate_enrichment,
         "promote": promote,
+        "industry_states": industry_states,
+        "themes": themes,
     }
 
 
