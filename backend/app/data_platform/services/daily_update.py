@@ -387,6 +387,18 @@ def _run_research_maintenance(trade_date: str) -> dict[str, Any]:
         industry_states = {"ok": False, "status": "deferred", "error": str(exc)[:300]}
     try:
         themes = materialize_theme_snapshots()
+        if not themes.get("ok") and themes.get("reason") == "snapshot_versions_missing_dates":
+            missing_dates = [str(item) for item in themes.get("missing_dates") or []][:20]
+            repairs = []
+            for missing_date in missing_dates:
+                try:
+                    repairs.append({"trade_date": missing_date, "result": sync_market_bundle(
+                        missing_date, apis=["daily", "daily_basic", "stk_limit", "adj_factor"],
+                    )})
+                except Exception as exc:  # noqa: BLE001
+                    repairs.append({"trade_date": missing_date, "ok": False, "error": str(exc)[:300]})
+            themes = materialize_theme_snapshots()
+            themes["missing_date_repairs"] = repairs
     except Exception as exc:  # noqa: BLE001
         logger.warning("theme snapshot deferred: %s", str(exc)[:300])
         themes = {"ok": False, "status": "deferred", "error": str(exc)[:300]}
