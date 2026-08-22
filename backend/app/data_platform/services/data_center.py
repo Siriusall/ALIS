@@ -2232,6 +2232,12 @@ def _upsert_raw_records(
                     previous=previous_item,
                     observation_columns_ready=observation_columns_ready,
                 )
+            # Large market slices can take minutes to reconcile. Commit in
+            # bounded batches so PostgreSQL never sits idle inside one giant
+            # transaction while Python decodes the next rows, and so one
+            # stalled slice cannot consume the entire data connection gate.
+            if bool(getattr(c, "_is_postgres", False)) and written % 250 == 0:
+                c.commit()
         for (audit_date, dataset, field), audit in field_audit.items():
             count = int(audit["count"])
             mismatch_count = int(audit["mismatches"])
