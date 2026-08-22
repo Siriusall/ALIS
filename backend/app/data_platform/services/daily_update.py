@@ -418,6 +418,20 @@ def _run_research_maintenance(trade_date: str) -> dict[str, Any]:
     }
 
 
+def _derived_research_lag(c: Any, target: str) -> bool:
+    """Detect durable industry/theme projections stranded behind market data."""
+    target_s = str(target or "").replace("-", "")[:8]
+    if len(target_s) != 8:
+        return False
+    rows = c.execute(
+        """SELECT
+             (SELECT MAX(as_of_date) FROM dc_industry_state_snapshot) industry_date,
+             (SELECT MAX(as_of_date) FROM dc_theme_snapshot) theme_date"""
+    ).fetchone()
+    values = dict(rows) if rows else {}
+    return any(str(values.get(key) or "") < target_s for key in ("industry_date", "theme_date"))
+
+
 def _worker(parent_run_id: int) -> None:
     steps: list[dict[str, Any]] = []
     error = ""
@@ -817,11 +831,13 @@ def start_daily_update_scheduler() -> bool:
                         benchmark_ready = _benchmark_ready_for_date(c, target)
                         adj_factor_ready = _adj_factor_ready_for_date(c, target)
                         retry_policy = _daily_update_retry_policy(c, target, now=now)
+                        derived_research_lag = _derived_research_lag(c, target)
                     else:
                         ready = ""
                         benchmark_ready = False
                         adj_factor_ready = False
                         retry_policy = {"allowed": False, "reason": "before_close_data_window"}
+                        derived_research_lag = _derived_research_lag(c, target)
                 if should_check:
                     # Keep the scheduler's short metadata transaction separate
                     # from the per-ETF immutable-evidence reads. A statement
@@ -833,7 +849,13 @@ def start_daily_update_scheduler() -> bool:
 
                     defensive_codes = [str(item["ts_code"]) for item in DEFENSIVE_ASSETS]
                     defensive_execution_slice = defensive_asset_execution_status(target, defensive_codes)
-                    if target and (
+                    if target and derived_research_lag and retry_policy.get("allowed"):
+                        result = start_daily_update()
+                        if result.get("ok"):
+                            logger.info("自动日更发现行业/主题派生快照落后，启动补建 target=%s", target)
+                        elif result.get("reason") != "already_running":
+                            logger.warning("行业/主题派生快照补建启动失败 target=%s result=%s", target, result)
+                    elif target and (
                         ready != target
                         or not benchmark_ready
                         or not adj_factor_ready
