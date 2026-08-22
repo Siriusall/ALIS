@@ -2096,7 +2096,10 @@ def _load_point_in_time_benchmark_closes(dates: list[str]) -> dict[str, float]:
     result: dict[str, float] = {}
     for row in rows:
         trade_date = str(row.get("trade_date") or "").replace("-", "")[:8]
-        if trade_date not in wanted or not _available_by_market_close(row.get("available_time"), trade_date):
+        # Portfolio display may show late-observed benchmark closes so the
+        # account curve continues after the strict PIT research window.
+        # Research/OOS consumers keep using _available_by_market_close.
+        if trade_date not in wanted or not row.get("available_time"):
             continue
         try:
             close = float(json.loads(str(row.get("payload_json") or "{}")).get("close") or 0)

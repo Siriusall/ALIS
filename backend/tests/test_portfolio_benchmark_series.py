@@ -37,3 +37,9 @@ def test_benchmark_available_time_must_be_no_later_than_market_close():
     assert _available_by_market_close("2026-07-23T15:00:00+08:00", "20260723")
     assert not _available_by_market_close("2026-07-23T15:00:01+08:00", "20260723")
     assert not _available_by_market_close("", "20260723")
+
+
+def test_portfolio_display_can_use_late_observed_benchmark_close():
+    # The portfolio is a live display. It may show a verified close observed
+    # after market close; strict historical research remains PIT-gated.
+    assert not _available_by_market_close("2026-08-11T16:05:00+08:00", "20260811")

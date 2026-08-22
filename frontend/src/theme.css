@@ -1857,7 +1857,12 @@ main {
 
 .curve-plot {
   position: relative;
+  cursor: crosshair;
 }
+
+.curve svg .curve-hover-line { stroke: #8b93a0; stroke-width: .7; stroke-dasharray: 2 2; vector-effect: non-scaling-stroke; }
+.curve-tooltip { position:absolute; top:8px; z-index:2; min-width:132px; padding:8px 10px; border:1px solid #dce1e9; border-radius:6px; background:rgba(255,255,255,.96); box-shadow:0 5px 14px rgba(28,36,52,.14); color:#3b4250; font-size:11px; line-height:1.55; pointer-events:none; transform:translateX(-50%); }
+.curve-tooltip strong,.curve-tooltip span { display:block; white-space:nowrap; }
 
 .curve-plot .portfolio-point {
   position: absolute;
