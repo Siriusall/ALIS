@@ -109,6 +109,7 @@ def _pit_theme_inputs(
     cutoff: str,
     cutoff_date: str,
     lookback: int,
+    current_projection: bool = False,
 ) -> dict[str, Any]:
     """Load bounded immutable market inputs for a historical theme materialization."""
 
@@ -125,23 +126,44 @@ def _pit_theme_inputs(
     })
     if len(calendar_dates) < 3:
         return {"ok": False, "status": "insufficient_data", "reason": "fewer_than_three_market_sessions"}
-    versions = load_snapshot_versions(
-        c,
-        cutoff=cutoff,
-        trade_date_start=calendar_dates[0],
-        trade_date_end=calendar_dates[-1],
-    )
-    if versions is None:
-        return {
-            "ok": False,
-            "status": "blocked_point_in_time",
-            "reason": "snapshot_version_schema_unavailable",
-            "contract": _THEME_PIT_CONTRACT,
-        }
-    visible_rows = [
-        row for item in versions
-        if (row := _decode_snapshot_version(dict(item))) is not None
-    ]
+    if current_projection:
+        # Current console refreshes must not join the multi-gigabyte immutable
+        # version table. The normalized projection already carries the same
+        # explicit observation clocks; historical callers remain on the
+        # immutable version path below.
+        rows = c.execute(
+            """SELECT ts_code,trade_date,symbol,name,industry,close,change_pct,
+                      volume,turnover,total_mv,pe_ttm,pb,observed_at,
+                      first_observed_at,economic_available_time,available_time,
+                      updated_at,source_code,observation_provenance,content_hash
+                 FROM dc_stock_daily_snapshot
+                WHERE trade_date>=? AND trade_date<=?
+                  AND industry<>'' AND close IS NOT NULL
+                  AND observed_at<>'' AND first_observed_at<>''
+                  AND economic_available_time<>'' AND available_time<>''
+                  AND updated_at<>''
+                ORDER BY trade_date,ts_code""",
+            (calendar_dates[0], calendar_dates[-1]),
+        ).fetchall()
+        visible_rows = [dict(row) for row in rows]
+    else:
+        versions = load_snapshot_versions(
+            c,
+            cutoff=cutoff,
+            trade_date_start=calendar_dates[0],
+            trade_date_end=calendar_dates[-1],
+        )
+        if versions is None:
+            return {
+                "ok": False,
+                "status": "blocked_point_in_time",
+                "reason": "snapshot_version_schema_unavailable",
+                "contract": _THEME_PIT_CONTRACT,
+            }
+        visible_rows = [
+            row for item in versions
+            if (row := _decode_snapshot_version(dict(item))) is not None
+        ]
     rows_by_date: dict[str, list[dict[str, Any]]] = {}
     for row in visible_rows:
         if row.get("trade_date") in calendar_dates:
@@ -344,6 +366,7 @@ def materialize_theme_snapshots(*, as_of_time: str | None = None, lookback: int 
             cutoff_date = complete_date
         pit = _pit_theme_inputs(
             c, cutoff=cutoff, cutoff_date=cutoff_date, lookback=lookback,
+            current_projection=not bool(as_of_time),
         )
         if not pit.get("ok"):
             return pit
