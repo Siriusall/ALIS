@@ -70,6 +70,22 @@ def test_compact_frozen_plan_contract_keeps_console_fields_without_heavy_audit_p
     assert "selection_snapshot" not in compact
 
 
+def test_compact_plan_projects_v2_execution_orders_when_legacy_proposal_is_empty():
+    compact = profit_loop._compact_frozen_plan_contract({
+        "proposal": [],
+        "execution_orders": [{
+            "symbol": "510880", "side": "SELL", "intent": "reduce_position",
+            "planned_quantity": 300, "planned_lots": 3, "reference_close": 3.387,
+            "estimated_execution_amount": 1015.5, "post_lot_target_weight": 0.149,
+            "cost": {"commission": 5}, "obligation": {"required": True},
+        }],
+    })
+    assert compact["proposal"][0]["symbol"] == "510880"
+    assert compact["proposal"][0]["controller_action"] == "reduce_position"
+    assert compact["proposal"][0]["planned_side"] == "SELL"
+    assert compact["proposal"][0]["planned_quantity"] == 300
+
+
 class _Rows:
     def __init__(self, rows):
         self.rows = rows

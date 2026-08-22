@@ -3066,12 +3066,37 @@ def _compact_plan_proposal_item(item: Any) -> dict[str, Any]:
 
 def _compact_frozen_plan_contract(contract: dict[str, Any]) -> dict[str, Any]:
     proposal = contract.get("proposal")
-    controller = contract.get("pretrade_controller")
-    expected = contract.get("expected_return_contract")
-    risk_budget = contract.get("risk_budget")
-    risk_limits = contract.get("risk_limit_contract")
+    execution_orders = contract.get("execution_orders")
+    controller = contract.get("pretrade_controller") or {}
+    expected = contract.get("expected_return_contract") or {}
+    risk_budget = contract.get("risk_budget") or {}
+    risk_limits = contract.get("risk_limit_contract") or {}
+    compact_proposal = [_compact_plan_proposal_item(item) for item in proposal] if isinstance(proposal, list) else []
+    if not compact_proposal and isinstance(execution_orders, list):
+        # V2 contracts keep executable orders in the authoritative frozen
+        # execution_orders list. Project its display fields for the console.
+        compact_proposal = []
+        for order in execution_orders:
+            if not isinstance(order, dict):
+                continue
+            side = str(order.get("side") or "").upper()
+            intent = str(order.get("intent") or "")
+            compact_proposal.append({
+                "symbol": str(order.get("symbol") or ""),
+                "controller_action": intent or ("buy_candidate" if side == "BUY" else "sell_exit"),
+                "controller_intent": intent,
+                "target_weight": order.get("post_lot_target_weight"),
+                "planned_quantity": order.get("planned_quantity"),
+                "planned_lots": order.get("planned_lots"),
+                "planned_side": side,
+                "reference_close": order.get("reference_close"),
+                "estimated_execution_amount": order.get("estimated_execution_amount"),
+                "planned_cost": order.get("cost") or {},
+                "controller_obligation": order.get("obligation") or {},
+                "reason": "冻结执行订单",
+            })
     return {
-        "proposal": [_compact_plan_proposal_item(item) for item in proposal] if isinstance(proposal, list) else [],
+        "proposal": compact_proposal,
         "risk_budget": {
             field: risk_budget[field]
             for field in ("status", "equity_budget", "cash_target")
