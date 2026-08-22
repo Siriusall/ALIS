@@ -8,7 +8,7 @@ const actions = ["buy_candidate", "add_position", "reduce_position", "sell_exit"
 const actionNames: Record<string, string> = { buy_candidate: "买入候选", add_position: "加仓", reduce_position: "减仓", sell_exit: "退出", research_only:"研究观察", hold: "保持", defensive_switch: "防御切换" };
 const actionIcons: Record<string, typeof Activity> = { buy_candidate: CirclePlus, add_position: TrendingUp, reduce_position: TrendingDown, sell_exit: LogOut, research_only: Telescope, hold: Pause, defensive_switch: Shield };
 function canonicalAction(value: unknown){const raw=String(value||"");return ({buy:"buy_candidate",add:"add_position",reduce:"reduce_position",sell:"sell_exit",observe:"research_only"} as Record<string,string>)[raw]||raw;}
-function displayedAction(row:Json){if(Number(row.planned_quantity||0)<=0)return String(row.controller_intent||"")==="research_only"?"research_only":"hold";return canonicalAction(row.action||row.action_type);}
+function displayedAction(row:Json){if(Number(row.planned_quantity||0)<=0)return String(row.controller_intent||"")==="research_only"?"research_only":"hold";return canonicalAction(row.action||row.action_type||row.controller_action||row.controller_intent);}
 
 function ownerState(owner?: Json, tradingReady?: Json) {
   const contract = pick(owner, [
