@@ -18,7 +18,7 @@ from app.services.narrative_lifecycle_contract import (
     crowding_risk as _crowding_risk,
     transition_state as _transition_lifecycle_state,
 )
-from app.services.point_in_time import is_available_at, normalize_explicit_timestamp
+from app.services.point_in_time import is_available_at, normalize_explicit_timestamp, normalize_timestamp
 
 
 _BUSINESS_TZ = ZoneInfo("Asia/Shanghai")
