@@ -390,7 +390,10 @@ def _run_research_maintenance(trade_date: str) -> dict[str, Any]:
     try:
         themes = materialize_theme_snapshots()
         if not themes.get("ok") and themes.get("reason") in {"snapshot_versions_missing_dates", "snapshot_versions_incomplete"}:
-            missing_dates = [str(item) for item in themes.get("missing_dates") or []][:20]
+            # Keep each retry bounded; the scheduler will advance the next
+            # missing sessions on subsequent cycles without monopolizing the
+            # data connection pool for an entire historical range.
+            missing_dates = [str(item) for item in themes.get("missing_dates") or []][:2]
             if not missing_dates:
                 with _conn() as c:
                     calendar = [str(row["cal_date"]) for row in c.execute(
