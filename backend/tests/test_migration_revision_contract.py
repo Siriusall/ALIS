@@ -91,23 +91,6 @@ def test_console_snapshot_privilege_migration_validates_minimum_runtime_access(m
     assert "grant" not in normalized
 
 
-def test_raw_accepted_join_index_is_concurrent_and_date_bounded(monkeypatch) -> None:
-    from migrations.data.versions import data_0014_raw_accepted_join_index as migration
-
-    statements: list[str] = []
-    monkeypatch.setattr(migration.op, "execute", lambda sql: statements.append(str(sql)))
-    monkeypatch.setattr(
-        migration.op,
-        "get_context",
-        lambda: type("Context", (), {"autocommit_block": lambda self: nullcontext()})(),
-    )
-
-    migration.upgrade()
-
-    statement = " ".join(statements).lower()
-    assert "create index concurrently" in statement
-    assert "idx_dc_raw_accepted_date_join" in statement
-    assert "trade_date, api_name, record_key, content_hash" in statement
 
 
 def test_console_snapshot_privilege_migration_is_forward_only() -> None:
