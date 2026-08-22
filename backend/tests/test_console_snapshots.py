@@ -45,17 +45,17 @@ def test_build_preserves_section_failure(monkeypatch):
 
 def test_control_snapshot_readers_do_not_require_api_loopback_redis(monkeypatch):
     from app import main
-    from app.api.routes import health
 
     seen: dict[str, object] = {}
     monkeypatch.setattr(main, "_health_payload", lambda *, require_redis=True: seen.setdefault("health", require_redis) or {})
-    monkeypatch.setattr(health, "trading_readiness", lambda *, detail, require_redis=True: seen.setdefault("trading", (detail, require_redis)) or {})
 
     readers = snapshots._readers("decision")
     readers["health"]()
-    readers["tradingReady"]()
 
-    assert seen == {"health": False, "trading": ("compact", False)}
+    assert seen == {"health": False}
+    projection = readers["tradingReady"]()
+    assert projection["schema_version"] == "alis_trading_readiness_projection_v1"
+    assert projection["status"] == "waiting"
 
 
 def test_durable_snapshot_is_returned_stale_while_queued(monkeypatch):

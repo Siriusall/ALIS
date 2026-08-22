@@ -152,14 +152,27 @@ def _readers(page_key: str) -> dict[str, Callable[[], Any]]:
     from app.data_platform.routes import data_center
     from app.main import _health_payload
 
+    def control_trading_ready() -> dict[str, Any]:
+        # Full trading readiness performs strict immutable raw evidence scans
+        # and is owned by the API's live gate. The control worker only builds
+        # durable read snapshots; repeating that gate here can hold a data DB
+        # transaction for minutes and starve normal requests.
+        return {
+            "schema_version": "alis_trading_readiness_projection_v1",
+            "status": "waiting",
+            "trading_ready": False,
+            "summary": "控制节点快照不执行实时交易就绪检查；请以应用节点实时门为准。",
+            "hard_blockers": [],
+            "gates": [],
+            "policy": {"read_only": True, "source": "control_snapshot_projection"},
+        }
+
     common = {
         # The control worker builds durable PostgreSQL snapshots. It must not
         # inherit the API host's loopback Redis requirement: browser reads and
         # stream consumption remain checked by the API's normal health route.
         "health": lambda: _health_payload(require_redis=False),
-        "tradingReady": lambda: health.trading_readiness(
-            detail="compact", require_redis=False,
-        ),
+        "tradingReady": control_trading_ready,
     }
     pages: dict[str, dict[str, Callable[[], Any]]] = {
         "overview": {
