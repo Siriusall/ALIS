@@ -141,21 +141,22 @@ def _pit_theme_inputs(
         # version table. The normalized projection already carries the same
         # explicit observation clocks; historical callers remain on the
         # immutable version path below.
-        rows = c.execute(
-            """SELECT ts_code,trade_date,symbol,name,industry,close,change_pct,
-                      volume,turnover,total_mv,pe_ttm,pb,observed_at,
-                      first_observed_at,economic_available_time,available_time,
-                      updated_at,source_code,observation_provenance,content_hash
-                 FROM dc_stock_daily_snapshot
-                WHERE trade_date>=? AND trade_date<=?
-                  AND industry<>'' AND close IS NOT NULL
-                  AND observed_at<>'' AND first_observed_at<>''
-                  AND economic_available_time<>'' AND available_time<>''
-                  AND updated_at<>''
-                ORDER BY trade_date,ts_code""",
-            (calendar_dates[0], calendar_dates[-1]),
-        ).fetchall()
-        visible_rows = [dict(row) for row in rows]
+        visible_rows = []
+        for session in calendar_dates:
+            rows = c.execute(
+                """SELECT ts_code,trade_date,symbol,name,industry,close,change_pct,
+                          volume,turnover,total_mv,pe_ttm,pb,observed_at,
+                          first_observed_at,economic_available_time,available_time,
+                          updated_at,source_code,observation_provenance,content_hash
+                     FROM dc_stock_daily_snapshot
+                    WHERE trade_date=? AND industry<>'' AND close IS NOT NULL
+                      AND observed_at<>'' AND first_observed_at<>''
+                      AND economic_available_time<>'' AND available_time<>''
+                      AND updated_at<>''
+                    ORDER BY ts_code""",
+                (session,),
+            ).fetchall()
+            visible_rows.extend(dict(row) for row in rows)
     else:
         versions = load_snapshot_versions(
             c,
