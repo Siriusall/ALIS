@@ -407,7 +407,9 @@ def _run_research_maintenance(trade_date: str) -> dict[str, Any]:
     industry_states = materialize_industry_state_snapshots(
         as_of_time=f"{trade_date[:4]}-{trade_date[4:6]}-{trade_date[6:8]}T23:59:59+08:00"
     )
-    themes = materialize_theme_snapshots(as_of_time=f"{trade_date[:4]}-{trade_date[4:6]}-{trade_date[6:8]}T23:59:59+08:00")
+    # Current daily refresh uses the bounded normalized-snapshot path. Explicit
+    # historical cutoffs remain reserved for PIT replay/backfill jobs.
+    themes = materialize_theme_snapshots()
     return {
         "screen": screen,
         "stage": staged,
