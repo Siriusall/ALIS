@@ -54,8 +54,8 @@ def _theme_snapshot_visible_at(
         # the old derivation as unverified. Historical/PIT consumers never
         # enable this compatibility path.
         return all(
-            (clock := normalize_explicit_timestamp(row.get(field)))
-            and is_available_at(clock, cutoff, require_explicit_offset=True)
+            (clock := normalize_timestamp(row.get(field)))
+            and is_available_at(clock, cutoff)
             for field in ("available_time", "created_at", "updated_at")
         )
     source_cutoff = normalize_explicit_timestamp(marker.get("source_observation_cutoff"))
