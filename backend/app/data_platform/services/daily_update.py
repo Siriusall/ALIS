@@ -387,8 +387,26 @@ def _run_research_maintenance(trade_date: str) -> dict[str, Any]:
         industry_states = {"ok": False, "status": "deferred", "error": str(exc)[:300]}
     try:
         themes = materialize_theme_snapshots()
-        if not themes.get("ok") and themes.get("reason") == "snapshot_versions_missing_dates":
+        if not themes.get("ok") and themes.get("reason") in {"snapshot_versions_missing_dates", "snapshot_versions_incomplete"}:
             missing_dates = [str(item) for item in themes.get("missing_dates") or []][:20]
+            if not missing_dates:
+                with _conn() as c:
+                    calendar = [str(row["cal_date"]) for row in c.execute(
+                        "SELECT cal_date FROM dc_trade_calendar WHERE is_open=1 AND cal_date<=? ORDER BY cal_date DESC LIMIT 20",
+                        (trade_date,),
+                    ).fetchall()]
+                    stock_count = int(c.execute("SELECT COUNT(*) n FROM dc_stock_master").fetchone()["n"] or 0)
+                    minimum = max(1, int(stock_count * 0.8))
+                    for session in calendar:
+                        eligible = int(c.execute(
+                            """SELECT COUNT(*) n FROM dc_stock_daily_snapshot
+                               WHERE trade_date=? AND industry<>'' AND close IS NOT NULL
+                                 AND observed_at<>'' AND first_observed_at<>''
+                                 AND economic_available_time<>'' AND available_time<>''
+                                 AND updated_at<>''""", (session,),
+                        ).fetchone()["n"] or 0)
+                        if eligible < minimum:
+                            missing_dates.append(session)
             repairs = []
             for missing_date in missing_dates:
                 try:
