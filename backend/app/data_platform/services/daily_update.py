@@ -377,11 +377,22 @@ def _run_research_maintenance(trade_date: str) -> dict[str, Any]:
     from app.services.theme_engine import materialize_theme_snapshots
 
     research_limit = max(1, min(int(os.getenv("ALIS_DAILY_RESEARCH_LIMIT", "100")), 500))
-    screen = run_daily_screener(
-        top_n=max(100, research_limit * 3),
-        research_limit=research_limit,
-        trade_date=trade_date,
+    # Independent read-models must not be stranded by one stale security in
+    # the optional screener/valuation path. Materialize them first and keep
+    # the rest of research maintenance best-effort.
+    industry_states = materialize_industry_state_snapshots(
+        as_of_time=f"{trade_date[:4]}-{trade_date[4:6]}-{trade_date[6:8]}T23:59:59+08:00"
     )
+    themes = materialize_theme_snapshots()
+    try:
+        screen = run_daily_screener(
+            top_n=max(100, research_limit * 3),
+            research_limit=research_limit,
+            trade_date=trade_date,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("daily screener deferred while preserving research snapshots: %s", str(exc)[:300])
+        screen = {"ok": False, "status": "deferred", "error": str(exc)[:300]}
     staged = stage_watch_pool_candidates(limit=min(50, research_limit))
     candidate_enrichment = []
     enrichment_limit = max(1, min(int(os.getenv("ALIS_DAILY_CANDIDATE_ENRICH_LIMIT", "5")), 20))
@@ -401,15 +412,6 @@ def _run_research_maintenance(trade_date: str) -> dict[str, Any]:
                 "requested": enriched.get("requested"),
             })
     promote = process_watch_pool(limit=research_limit)
-    # These are daily read models consumed by the research console. Keep them
-    # in the same durable close cycle as the screener so an otherwise healthy
-    # market refresh cannot leave industry/theme dates stranded in the past.
-    industry_states = materialize_industry_state_snapshots(
-        as_of_time=f"{trade_date[:4]}-{trade_date[4:6]}-{trade_date[6:8]}T23:59:59+08:00"
-    )
-    # Current daily refresh uses the bounded normalized-snapshot path. Explicit
-    # historical cutoffs remain reserved for PIT replay/backfill jobs.
-    themes = materialize_theme_snapshots()
     return {
         "screen": screen,
         "stage": staged,
