@@ -269,6 +269,29 @@ def _theme_query_cutoff(value: str | None, *, default_now: bool = False) -> str:
     return ""
 
 
+def _latest_complete_theme_trade_date(c: Any, *, cutoff_date: str) -> str:
+    """Return the newest market session with sufficient normalized coverage.
+
+    A current-time materialization may run before the next trading session has
+    a complete market snapshot (including weekends).  It must derive from the
+    latest complete observed session instead of treating that absence as a
+    reason to hide every previously valid current theme.
+    """
+    stock_count_row = c.execute("SELECT COUNT(*) cnt FROM dc_stock_master").fetchone()
+    stock_count = int(dict(stock_count_row).get("cnt") or 0) if stock_count_row else 0
+    minimum_rows = max(1, int(ceil(stock_count * .80))) if stock_count else 1
+    row = c.execute(
+        """SELECT trade_date
+             FROM dc_stock_daily_snapshot
+             WHERE trade_date<=?
+             GROUP BY trade_date
+             HAVING COUNT(DISTINCT ts_code)>=?
+             ORDER BY trade_date DESC LIMIT 1""",
+        (cutoff_date, minimum_rows),
+    ).fetchone()
+    return str(dict(row).get("trade_date") or "") if row else ""
+
+
 
 def _clip(value: float, low: float = 0.0, high: float = 1.0) -> float:
     return max(low, min(high, float(value)))
@@ -307,6 +330,18 @@ def materialize_theme_snapshots(*, as_of_time: str | None = None, lookback: int 
     cutoff = _theme_query_cutoff(as_of_time, default_now=True)
     cutoff_date = cutoff[:10].replace("-", "")
     with _conn() as c:
+        # Historical callers deliberately pin their own cutoff.  Only a
+        # current refresh may fall back from a non-session/incomplete day to
+        # the newest complete observed market session.
+        if not as_of_time:
+            complete_date = _latest_complete_theme_trade_date(c, cutoff_date=cutoff_date)
+            if not complete_date:
+                return {
+                    "ok": False, "status": "insufficient_data",
+                    "reason": "no_complete_market_snapshot_for_current_theme",
+                    "contract": _THEME_PIT_CONTRACT,
+                }
+            cutoff_date = complete_date
         pit = _pit_theme_inputs(
             c, cutoff=cutoff, cutoff_date=cutoff_date, lookback=lookback,
         )
