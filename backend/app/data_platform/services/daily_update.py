@@ -381,9 +381,9 @@ def _run_research_maintenance(trade_date: str) -> dict[str, Any]:
     # the optional screener/valuation path. Materialize them first and keep
     # the rest of research maintenance best-effort.
     try:
-        industry_states = materialize_industry_state_snapshots(
-            as_of_time=f"{trade_date[:4]}-{trade_date[4:6]}-{trade_date[6:8]}T23:59:59+08:00"
-        )
+        # Current daily refresh uses the bounded normalized projection. PIT
+        # replay callers continue to pass an explicit historical cutoff.
+        industry_states = materialize_industry_state_snapshots()
     except Exception as exc:  # noqa: BLE001
         logger.warning("industry snapshot deferred while preserving themes: %s", str(exc)[:300])
         industry_states = {"ok": False, "status": "deferred", "error": str(exc)[:300]}
