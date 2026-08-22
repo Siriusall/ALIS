@@ -150,9 +150,26 @@ def cluster_news_themes(*, as_of_time: str | None = None) -> dict[str, Any]:
                        ts_code,id
                 FROM dc_tushare_raw_records
                 WHERE api_name='major_news' {cutoff_clause}
-                ORDER BY COALESCE(NULLIF(payload_json::jsonb->>'pub_time',''),available_time) DESC
+                -- ``available_time`` is covered by the raw API/time index.
+                -- Fetch a bounded recent candidate set first; sorting the
+                -- JSON publication timestamp across the complete append-only
+                -- history would force PostgreSQL to scan and sort the table.
+                ORDER BY available_time DESC,id DESC
                 LIMIT 2000""", params
         ).fetchall()]
+
+    # A delayed provider can publish an article with a publication timestamp
+    # older than its observation time.  Preserve the former publication-time
+    # ordering contract within the bounded candidate set without making the
+    # database sort on a JSON expression.
+    def _publication_sort_key(row: dict[str, Any]) -> str:
+        try:
+            payload = json.loads(row.get("payload_json") or "{}")
+        except (TypeError, json.JSONDecodeError):
+            payload = {}
+        return str(payload.get("pub_time") or row.get("available_time") or "")
+
+    rows.sort(key=_publication_sort_key, reverse=True)
 
     if not rows:
         return {"ok": False, "reason": "no_news_data", "count": 0}

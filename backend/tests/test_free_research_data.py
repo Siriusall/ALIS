@@ -39,7 +39,7 @@ def test_materialize_financial_series_keeps_cutoff_availability(monkeypatch) -> 
     written_defs: list[dict] = []
     written_values: list[dict] = []
     monkeypatch.setattr(service, "_cutoff_dates", lambda _: ["2026-03-31"])
-    monkeypatch.setattr(service, "_conn", lambda: nullcontext(object()))
+    monkeypatch.setattr(service, "_read_conn", lambda: nullcontext(object()))
     monkeypatch.setattr(service, "_derived_industry_proxies", lambda _conn, *, as_of_time: {
         "铜": {"observations": {
             "demand_orders_sales": 58.0,
@@ -85,7 +85,7 @@ def test_materialize_financial_series_retries_statement_timeout_with_fresh_conne
         return {}
 
     monkeypatch.setattr(service, "_cutoff_dates", lambda _: ["2026-06-30"])
-    monkeypatch.setattr(service, "_conn", ConnectionContext)
+    monkeypatch.setattr(service, "_read_conn", ConnectionContext)
     monkeypatch.setattr(service, "_derived_industry_proxies", derive)
     monkeypatch.setattr(service.time, "sleep", lambda _: None)
     monkeypatch.setattr(service, "_upsert_industry_metric_definitions", lambda rows: len(rows))

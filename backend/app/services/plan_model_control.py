@@ -2631,9 +2631,13 @@ def _build_plan_training_dataset(
                     """SELECT payload_json,available_time
                        FROM dc_tushare_raw_records
                        WHERE api_name='major_news'
+                         AND available_time>=?
                          AND available_time<=?
                        ORDER BY available_time,id""",
-                    (f"{ascending_dates[-1][:4]}-{ascending_dates[-1][4:6]}-{ascending_dates[-1][6:]}T23:59:59",),
+                    (
+                        f"{ascending_dates[0][:4]}-{ascending_dates[0][4:6]}-{ascending_dates[0][6:]}",
+                        f"{ascending_dates[-1][:4]}-{ascending_dates[-1][4:6]}-{ascending_dates[-1][6:]}T23:59:59",
+                    ),
                 ).fetchall()
             except Exception:
                 news_rows = []

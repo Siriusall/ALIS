@@ -225,12 +225,47 @@ def build_analyst_consensus(ts_code: str, *, as_of_time: str | None = None) -> d
 def batch_analyst_consensus(*, limit: int = 100, as_of_time: str | None = None) -> dict[str, Any]:
     """Batch build analyst consensus for all stocks with report data."""
     cutoff = str(as_of_time or "")[:10].replace("-", "")
+    requested_limit = max(0, int(limit))
+    if requested_limit == 0:
+        return {
+            "ok": True,
+            "total_stocks": 0,
+            "with_consensus": 0,
+            "with_target_price": 0,
+            "with_multi_metric_consensus": 0,
+            "model_version": "analyst_consensus_v3",
+            "samples": [],
+        }
+    cutoff_time = (
+        f"{cutoff[:4]}-{cutoff[4:6]}-{cutoff[6:]}T23:59:59"
+        if len(cutoff) == 8 else ""
+    )
+    cutoff_clause = ""
+    cutoff_params: list[Any] = []
+    if cutoff_time:
+        # The master table is a small, indexed universe. A semi-join keeps
+        # discovery bounded without DISTINCT/sorting the append-only archive.
+        cutoff_clause = " AND r.trade_date<=? AND r.available_time<=?"
+        cutoff_params.extend((cutoff, cutoff_time))
     with _conn() as c:
         rows = [dict(row) for row in c.execute(
-            "SELECT DISTINCT ts_code FROM dc_tushare_raw_records WHERE api_name='report_rc' ORDER BY ts_code"
+            f"""SELECT m.ts_code
+                 FROM dc_stock_master m
+                WHERE COALESCE(m.ts_code,'')<>''
+                  AND EXISTS (
+                      SELECT 1
+                        FROM dc_tushare_raw_records r
+                       WHERE r.api_name='report_rc'
+                         AND r.ts_code=m.ts_code
+                         AND COALESCE(r.available_time,'')<>''
+                         {cutoff_clause}
+                  )
+                ORDER BY m.ts_code
+                LIMIT ?""",
+            tuple(cutoff_params + [requested_limit]),
         ).fetchall()]
 
-    codes = [str(r.get("ts_code", "")) for r in rows[:limit]]
+    codes = [str(r.get("ts_code", "")) for r in rows]
     results = []
     for code in codes:
         try:

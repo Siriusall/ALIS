@@ -53,7 +53,7 @@ def test_company_exposure_is_deterministic_and_uses_latest_period_segments():
     assert exposures == same_exposures
 
 
-def test_initial_company_discovery_uses_bounded_distinct_index_query(monkeypatch):
+def test_initial_company_discovery_uses_bounded_master_exists_query(monkeypatch):
     captured = {}
 
     def fail_if_history_loader_is_used(*_args, **_kwargs):
@@ -73,7 +73,10 @@ def test_initial_company_discovery_uses_bounded_distinct_index_query(monkeypatch
     rows = _initial_company_rows(Connection(), limit=8000)
 
     assert rows == [{"ts_code": "000001.SZ"}]
-    assert "SELECT DISTINCT ts_code" in captured["sql"]
+    assert "FROM dc_stock_master m" in captured["sql"]
+    assert "EXISTS" in captured["sql"]
+    assert "api_name='fina_mainbz'" in captured["sql"]
+    assert "SELECT DISTINCT ts_code" not in captured["sql"]
     assert "GROUP BY" not in captured["sql"]
     assert captured["params"] == (8001,)
 

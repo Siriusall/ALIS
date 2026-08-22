@@ -17,7 +17,7 @@ from typing import Any
 
 import pandas as pd
 
-from app.data_platform.db import _conn
+from app.data_platform.db import _conn, _read_conn
 from app.data_platform.services.data_center import _now, _upsert_industry_metric_definitions, _upsert_industry_metric_values
 from app.services.industry_event_engine import _derived_industry_proxies, _is_statement_timeout
 
@@ -127,17 +127,62 @@ def _metric_code(prefix: str, component: str, industry: str) -> str:
 
 def _cutoff_dates(max_periods: int) -> list[str]:
     """Return one latest source-availability date for every observed quarter."""
-    with _conn() as conn:
-        rows = conn.execute(
-            """SELECT MAX(SUBSTR(available_time,1,10)) AS cutoff
-                 FROM dc_tushare_raw_records
-                WHERE api_name IN ('income','balancesheet')
-                  AND COALESCE(available_time,'')<>''
-                GROUP BY SUBSTR(available_time,1,4),
-                         ((CAST(SUBSTR(available_time,6,2) AS INTEGER)-1)/3)"""
-        ).fetchall()
-    values = sorted({str(dict(row).get("cutoff") or "") for row in rows if dict(row).get("cutoff")})
-    return values[-max(1, int(max_periods)):]
+    requested = max(1, int(max_periods))
+    with _read_conn() as conn:
+        # Discover the time span with a pair of index-friendly aggregates.
+        span = conn.execute(
+            """SELECT MIN(available_time) AS earliest,
+                              MAX(available_time) AS latest
+                         FROM dc_tushare_raw_records
+                        WHERE api_name IN ('income','balancesheet')
+                          AND COALESCE(available_time,'')<>''"""
+        ).fetchone()
+        span_item = dict(span or {})
+        earliest_text = str(span_item.get("earliest") or "")[:10]
+        latest_text = str(span_item.get("latest") or "")[:10]
+        try:
+            earliest = date.fromisoformat(earliest_text)
+            latest = date.fromisoformat(latest_text)
+        except ValueError:
+            return []
+
+        def quarter_start(value: date) -> date:
+            return date(value.year, ((value.month - 1) // 3) * 3 + 1, 1)
+
+        def previous_quarter(value: date) -> date:
+            return date(value.year - 1, 10, 1) if value.month == 1 else date(
+                value.year, value.month - 3, 1
+            )
+
+        def next_quarter(value: date) -> date:
+            return date(value.year + 1, 1, 1) if value.month == 10 else date(
+                value.year, value.month + 3, 1
+            )
+
+        cursor = quarter_start(latest)
+        oldest_quarter = quarter_start(earliest)
+        values: list[str] = []
+        # At most 256 short, range-indexed probes for sparse histories.
+        for _ in range(256):
+            if cursor < oldest_quarter:
+                break
+            next_start = next_quarter(cursor)
+            row = conn.execute(
+                """SELECT MAX(available_time) AS cutoff
+                           FROM dc_tushare_raw_records
+                          WHERE api_name IN ('income','balancesheet')
+                            AND available_time>=? AND available_time<?
+                            AND COALESCE(available_time,'')<>''""",
+                (cursor.isoformat(), next_start.isoformat()),
+            ).fetchone()
+            cutoff = str(dict(row or {}).get("cutoff") or "")[:10]
+            if cutoff:
+                values.append(cutoff)
+                if len(values) >= requested:
+                    break
+            cursor = previous_quarter(cursor)
+
+    return sorted(set(values))[-requested:]
 
 
 def materialize_financial_industry_series(*, max_periods: int = 12) -> dict[str, Any]:
@@ -155,7 +200,7 @@ def materialize_financial_industry_series(*, max_periods: int = 12) -> dict[str,
         for attempt in range(2):
             query_attempts += 1
             try:
-                with _conn() as conn:
+                with _read_conn() as conn:
                     # Formal industry proxies use the shared explicit-clock
                     # contract.  A date-only/naive timestamp could otherwise
                     # be interpreted in the host timezone and silently

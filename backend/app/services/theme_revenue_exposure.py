@@ -117,20 +117,27 @@ def _initial_company_rows(conn: Any, *, limit: int) -> list[dict[str, Any]]:
     replay.  Calling ``load_raw_record_versions`` here forces PostgreSQL to
     join/rank the append-only ``fina_mainbz`` history before applying the
     caller's limit; that table is large enough for the otherwise harmless
-    discovery step to become a long ``raw_ranked`` query.  The current
-    projection already contains the accepted winner and is the correct source
-    for this non-historical discovery.  Historical materialization below keeps
-    the immutable loader and its explicit cutoff unchanged.
+    discovery step to become a long ``raw_ranked`` query.  Enumerate the small
+    stock-master universe and use an indexed existence probe against the
+    accepted current projection instead.  This keeps one row per security
+    without a global ``DISTINCT``/sort over ``fina_mainbz``.  Historical
+    materialization below keeps the immutable loader and its explicit cutoff
+    unchanged.
     """
     cap = max(1, int(limit)) + 1
     try:
         rows = conn.execute(
-            """SELECT DISTINCT ts_code
-                 FROM dc_tushare_raw_records
-                WHERE api_name='fina_mainbz'
-                  AND available_time<>''
-                  AND COALESCE(ts_code,'')<>''
-                ORDER BY ts_code LIMIT ?""",
+            """SELECT m.ts_code
+                 FROM dc_stock_master m
+                WHERE COALESCE(m.ts_code,'')<>''
+                  AND EXISTS (
+                      SELECT 1
+                        FROM dc_tushare_raw_records r
+                       WHERE r.api_name='fina_mainbz'
+                         AND r.ts_code=m.ts_code
+                         AND r.available_time<>''
+                  )
+                ORDER BY m.ts_code LIMIT ?""",
             (cap,),
         ).fetchall()
     except Exception:

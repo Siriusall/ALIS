@@ -24,7 +24,7 @@ def test_market_state_model_governance_tracks_live_shadow_observation(monkeypatc
         def __exit__(self, exc_type, exc, tb):
             return False
 
-    monkeypatch.setattr(market_context, "_conn", lambda: _Conn())
+    monkeypatch.setattr(market_context, "_read_conn", lambda: _Conn())
     monkeypatch.setattr(
         "app.db.store.list_model_versions",
         lambda model_key, limit=5: [{
@@ -62,7 +62,7 @@ def test_market_state_model_governance_marks_pending_when_no_live_period(monkeyp
         def __exit__(self, exc_type, exc, tb):
             return False
 
-    monkeypatch.setattr(market_context, "_conn", lambda: _Conn())
+    monkeypatch.setattr(market_context, "_read_conn", lambda: _Conn())
     monkeypatch.setattr(
         "app.db.store.list_model_versions",
         lambda model_key, limit=5: [{

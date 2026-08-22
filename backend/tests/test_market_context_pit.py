@@ -41,8 +41,8 @@ def test_market_training_requires_trade_date_pit_cutoff(monkeypatch) -> None:
     def fake_conn():
         yield object()
 
-    monkeypatch.setattr(market_context, "_conn", fake_conn)
-    monkeypatch.setattr(market_context, "_strict_raw_payload_rows", strict_rows)
+    monkeypatch.setattr(market_context, "_read_conn", fake_conn)
+    monkeypatch.setattr(market_context, "load_raw_record_versions", strict_rows)
 
     result = market_context.materialize_market_training_history()
 
@@ -81,7 +81,7 @@ def test_market_training_uses_accepted_snapshot_hash_before_aggregation(monkeypa
         "economic_available_time", "observed_at", "first_observed_at",
         "observation_provenance", "content_hash", "created_at",
     }
-    monkeypatch.setattr(market_context, "_conn", fake_conn)
+    monkeypatch.setattr(market_context, "_read_conn", fake_conn)
     monkeypatch.setattr(
         market_context,
         "_table_columns",
@@ -93,7 +93,7 @@ def test_market_training_uses_accepted_snapshot_hash_before_aggregation(monkeypa
     )
     monkeypatch.setattr(
         market_context,
-        "_strict_raw_payload_rows",
+        "load_raw_record_versions",
         lambda *_args, **_kwargs: [
             {"ts_code": code, "trade_date": "20260814", "payload_json": json.dumps({"close": 10})}
             for code in ("000300.SH", "000905.SH", "000852.SH")

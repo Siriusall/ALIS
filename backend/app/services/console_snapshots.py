@@ -72,26 +72,44 @@ def _ensure_table() -> None:
         if _schema_ready:
             return
         with _conn() as conn:
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS console_page_snapshots (
-                    page_key VARCHAR(32) PRIMARY KEY,
-                    version VARCHAR(64) NOT NULL,
-                    generated_at VARCHAR(64) NOT NULL,
-                    as_of VARCHAR(64) NOT NULL,
-                    status VARCHAR(32) NOT NULL,
-                    invalidated_at VARCHAR(64),
-                    payload_json TEXT NOT NULL,
-                    updated_at VARCHAR(64) NOT NULL,
-                    refresh_generation BIGINT NOT NULL DEFAULT 0,
-                    last_attempt_generation BIGINT NOT NULL DEFAULT -1,
-                    last_attempt_at VARCHAR(64),
-                    last_error_code VARCHAR(64) NOT NULL DEFAULT ''
+            if bool(getattr(conn, "_is_postgres", False)):
+                # Production schema changes belong to the explicit Alembic
+                # release migration.  The API and control worker run with
+                # the restricted application role and must never attempt DDL
+                # (which previously caused an endless InsufficientPrivilege
+                # retry loop after the snapshot worker was enabled).
+                row = conn.execute(
+                    "SELECT to_regclass(?) AS table_name",
+                    ("public.console_page_snapshots",),
+                ).fetchone()
+                table_name = str((dict(row) if row else {}).get("table_name") or "")
+                if not table_name:
+                    raise RuntimeError(
+                        "console_page_snapshots schema is missing; run sim migrations before starting the worker"
+                    )
+            else:
+                # Keep the explicit SQLite compatibility path for isolated
+                # unit fixtures.  Production never reaches this branch.
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS console_page_snapshots (
+                        page_key VARCHAR(32) PRIMARY KEY,
+                        version VARCHAR(64) NOT NULL,
+                        generated_at VARCHAR(64) NOT NULL,
+                        as_of VARCHAR(64) NOT NULL,
+                        status VARCHAR(32) NOT NULL,
+                        invalidated_at VARCHAR(64),
+                        payload_json TEXT NOT NULL,
+                        updated_at VARCHAR(64) NOT NULL,
+                        refresh_generation BIGINT NOT NULL DEFAULT 0,
+                        last_attempt_generation BIGINT NOT NULL DEFAULT -1,
+                        last_attempt_at VARCHAR(64),
+                        last_error_code VARCHAR(64) NOT NULL DEFAULT ''
+                    )
+                """)
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_console_page_snapshots_updated "
+                    "ON console_page_snapshots(updated_at DESC)"
                 )
-            """)
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_console_page_snapshots_updated "
-                "ON console_page_snapshots(updated_at DESC)"
-            )
         _schema_ready = True
 
 

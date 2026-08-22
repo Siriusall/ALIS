@@ -4227,7 +4227,10 @@ def financial_research_completeness(
 ) -> dict[str, Any]:
     """Measure field-level research readiness; row/request coverage is not sufficient."""
     code = str(ts_code or "").strip().upper()
-    with _conn() as c:
+    # This path only reads and then decodes/merges many JSON payloads.  Use a
+    # server-enforced autocommit reader so Python-side work cannot leave an
+    # ``idle in transaction`` session on the data database.
+    with _read_conn() as c:
         master = c.execute("SELECT industry FROM dc_stock_master WHERE ts_code=?", (code,)).fetchone()
         industry = str(dict(master).get("industry") or "") if master else ""
         required_contract = (
@@ -4236,54 +4239,56 @@ def financial_research_completeness(
             else FINANCIAL_RESEARCH_REQUIRED_FIELDS
         )
         if periods:
-            target_periods = [str(value) for value in periods if str(value)]
+            target_periods = list(dict.fromkeys(str(value) for value in periods if str(value)))
         else:
-            cutoff_sql = " AND available_time<=?" if as_of_time else ""
-            params: tuple[Any, ...] = (code, str(as_of_time), max(1, min(int(period_limit), 12))) if as_of_time else (code, max(1, min(int(period_limit), 12)))
-            rows = c.execute(
-                """SELECT DISTINCT period FROM dc_tushare_raw_records
-                   WHERE api_name='income' AND ts_code=? AND period<>''
-                   """ + cutoff_sql + " ORDER BY period DESC LIMIT ?",
-                params,
-            ).fetchall()
-            target_periods = [str(dict(row).get("period") or "") for row in rows]
-        details: list[dict[str, Any]] = []
-        for period in target_periods:
-            for api_name, required in required_contract.items():
-                cutoff_sql = " AND available_time<=?" if as_of_time else ""
-                params = (api_name, code, period, str(as_of_time)) if as_of_time else (api_name, code, period)
-                rows = c.execute(
-                    """SELECT payload_json FROM dc_tushare_raw_records
-                       WHERE api_name=? AND ts_code=? AND period=?
-                       """ + cutoff_sql + " ORDER BY available_time DESC,length(payload_json) DESC,id DESC",
-                    params,
-                ).fetchall()
-                merged: dict[str, Any] = {}
-                returned_fields: set[str] = set()
-                for row in reversed(rows):
-                    try:
-                        payload = json.loads(dict(row).get("payload_json") or "{}")
-                    except (TypeError, json.JSONDecodeError):
-                        payload = {}
-                    returned_fields.update(str(field) for field in (payload.get("_returned_fields") or []))
-                    merged.update({key: value for key, value in payload.items() if value is not None})
-                missing = [field for field in required if merged.get(field) is None and field not in returned_fields]
-                any_of_fields: list[str] = []
-                if required_contract is FINANCIAL_RESEARCH_REQUIRED_FIELDS and api_name == "balancesheet":
-                    any_of_fields = ["accounts_receiv", "inventories", "goodwill"]
-                    if not any(merged.get(field) is not None or field in returned_fields for field in any_of_fields):
-                        missing.append("accounts_receiv|inventories|goodwill")
-                elif required_contract is FINANCIAL_RESEARCH_REQUIRED_FIELDS and api_name == "cashflow":
-                    any_of_fields = ["free_cashflow", "c_pay_acq_const_fiolta"]
-                    if not any(merged.get(field) is not None or field in returned_fields for field in any_of_fields):
-                        missing.append("free_cashflow|c_pay_acq_const_fiolta")
-                details.append({
-                    "period": period, "api": api_name, "required_fields": list(required),
-                    "any_of_fields": any_of_fields,
-                    "present_fields": [field for field in required if merged.get(field) is not None or field in returned_fields]
-                                      + ([next((field for field in any_of_fields if merged.get(field) is not None or field in returned_fields), "")] if any_of_fields and any(merged.get(field) is not None or field in returned_fields for field in any_of_fields) else []),
-                    "missing_fields": missing, "complete": not missing,
-                })
+            income_rows = load_raw_record_versions(
+                c, "income", cutoff=str(as_of_time or ""), ts_codes=[code],
+                period_limit=max(1, min(int(period_limit), 12)),
+            )
+            target_periods = sorted({str(row.get("period") or "") for row in (income_rows or []) if str(row.get("period") or "")}, reverse=True)
+        payloads: dict[tuple[str, str], list[str]] = {}
+        for api_name in required_contract:
+            rows = load_raw_record_versions(
+                c, api_name, cutoff=str(as_of_time or ""), ts_codes=[code], periods=target_periods,
+            )
+            if rows is None:
+                continue
+            for row in rows:
+                period = str(row.get("period") or "")
+                if period in target_periods:
+                    payloads.setdefault((period, api_name), []).append(str(row.get("payload_json") or "{}"))
+    # The database connection is deliberately closed before JSON decoding and
+    # contract evaluation.  This keeps the read session in autocommit mode and
+    # prevents CPU-side payload work from pinning a PostgreSQL transaction.
+    details: list[dict[str, Any]] = []
+    for period in target_periods:
+        for api_name, required in required_contract.items():
+            merged: dict[str, Any] = {}
+            returned_fields: set[str] = set()
+            for payload_json in payloads.get((period, api_name), []):
+                try:
+                    payload = json.loads(payload_json)
+                except (TypeError, json.JSONDecodeError):
+                    payload = {}
+                returned_fields.update(str(field) for field in (payload.get("_returned_fields") or []))
+                merged.update({key: value for key, value in payload.items() if value is not None})
+            missing = [field for field in required if merged.get(field) is None and field not in returned_fields]
+            any_of_fields: list[str] = []
+            if required_contract is FINANCIAL_RESEARCH_REQUIRED_FIELDS and api_name == "balancesheet":
+                any_of_fields = ["accounts_receiv", "inventories", "goodwill"]
+                if not any(merged.get(field) is not None or field in returned_fields for field in any_of_fields):
+                    missing.append("accounts_receiv|inventories|goodwill")
+            elif required_contract is FINANCIAL_RESEARCH_REQUIRED_FIELDS and api_name == "cashflow":
+                any_of_fields = ["free_cashflow", "c_pay_acq_const_fiolta"]
+                if not any(merged.get(field) is not None or field in returned_fields for field in any_of_fields):
+                    missing.append("free_cashflow|c_pay_acq_const_fiolta")
+            details.append({
+                "period": period, "api": api_name, "required_fields": list(required),
+                "any_of_fields": any_of_fields,
+                "present_fields": [field for field in required if merged.get(field) is not None or field in returned_fields]
+                                  + ([next((field for field in any_of_fields if merged.get(field) is not None or field in returned_fields), "")] if any_of_fields and any(merged.get(field) is not None or field in returned_fields for field in any_of_fields) else []),
+                "missing_fields": missing, "complete": not missing,
+            })
     checks = len(details)
     complete = sum(1 for item in details if item["complete"])
     required_field_checks = sum(len(item["required_fields"]) + (1 if item.get("any_of_fields") else 0) for item in details)
@@ -4304,22 +4309,21 @@ def financial_research_completeness(
 
 
 def financial_research_periods_completeness(periods: list[str]) -> dict[str, dict[str, Any]]:
-    """Audit multiple report periods in one raw-data pass."""
+    """Audit report periods from accepted immutable raw observations.
+
+    This powers readiness and background maintenance.  It deliberately reads
+    each API in small stock-master batches rather than decoding every mutable
+    raw-history row for a reporting period in one transaction.
+    """
     targets = list(dict.fromkeys(str(period or "").strip() for period in periods if str(period or "").strip()))
     if not targets:
         return {}
     apis = tuple(FINANCIAL_RESEARCH_REQUIRED_FIELDS)
-    with _conn() as c:
+    with _read_conn() as c:
         masters = [dict(row) for row in c.execute(
             "SELECT ts_code,industry,list_date FROM dc_stock_master WHERE ts_code<>''"
         ).fetchall()]
-        api_placeholders = ",".join("?" for _ in apis)
         period_placeholders = ",".join("?" for _ in targets)
-        rows = c.execute(
-            f"""SELECT period,api_name,ts_code,payload_json FROM dc_tushare_raw_records
-                WHERE period IN ({period_placeholders}) AND api_name IN ({api_placeholders}) AND ts_code<>''""",
-            (*targets, *apis),
-        ).fetchall()
         attempted_by_period: dict[str, set[str]] = {target: set() for target in targets}
         for row in c.execute(
             f"""SELECT DISTINCT period,api_name FROM dc_tushare_request_coverage
@@ -4329,16 +4333,32 @@ def financial_research_periods_completeness(periods: list[str]) -> dict[str, dic
         ).fetchall():
             item = dict(row)
             attempted_by_period.setdefault(str(item.get("period") or ""), set()).add(str(item.get("api_name") or ""))
+        codes = [str(item.get("ts_code") or "") for item in masters if str(item.get("ts_code") or "")]
+        raw_payloads: list[tuple[str, str, str, str]] = []
+        for api_name in apis:
+            for start in range(0, len(codes), 250):
+                versions = load_raw_record_versions(
+                    c, api_name, ts_codes=codes[start:start + 250], periods=targets,
+                )
+                if versions is None:
+                    continue
+                raw_payloads.extend(
+                    (
+                        str(row.get("period") or ""), str(row.get("api_name") or ""),
+                        str(row.get("ts_code") or ""), str(row.get("payload_json") or "{}"),
+                    )
+                    for row in versions
+                    if str(row.get("period") or "") in targets
+                )
     present: dict[tuple[str, str, str], set[str]] = {}
-    for raw in rows:
-        item = dict(raw)
+    for period, api_name, ts_code, payload_json in raw_payloads:
         try:
-            payload = json.loads(item.get("payload_json") or "{}")
+            payload = json.loads(payload_json)
         except (TypeError, json.JSONDecodeError):
             payload = {}
         fields = {str(key) for key, value in payload.items() if value is not None}
         fields.update(str(value) for value in payload.get("_returned_fields") or [])
-        present.setdefault((str(item.get("period") or ""), str(item.get("ts_code") or ""), str(item.get("api_name") or "")), set()).update(fields)
+        present.setdefault((period, ts_code, api_name), set()).update(fields)
     results: dict[str, dict[str, Any]] = {}
     for target in targets:
         missing_by_api = {api: 0 for api in apis}

@@ -3,6 +3,8 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
+import pytest
+
 from app.services.system_release_center import DATA_SCHEMA_HEAD, SIM_SCHEMA_HEAD
 
 
@@ -68,3 +70,29 @@ def test_model_autonomy_route_migration_only_moves_pending_tasks(monkeypatch) ->
     assert "status in ('queued','retry_wait')" in statement
     assert "worker_pool='research'" in statement
     assert "running" not in statement
+
+
+def test_console_snapshot_privilege_migration_validates_minimum_runtime_access(monkeypatch) -> None:
+    from migrations.sim.versions import sim_0012_console_snapshot_privileges as migration
+
+    statements: list[str] = []
+    monkeypatch.setattr(migration.op, "execute", lambda sql: statements.append(str(sql)))
+
+    migration.upgrade()
+
+    normalized = " ".join(statement.lower() for statement in statements)
+    assert "to_regclass('public.console_page_snapshots')" in normalized
+    assert "has_schema_privilege(current_user, 'public', 'usage')" in normalized
+    assert normalized.count("has_table_privilege") == 3
+    assert "'select'" in normalized
+    assert "'insert'" in normalized
+    assert "'update'" in normalized
+    assert "grant" not in normalized
+    assert "delete" not in normalized
+
+
+def test_console_snapshot_privilege_migration_is_forward_only() -> None:
+    from migrations.sim.versions import sim_0012_console_snapshot_privileges as migration
+
+    with pytest.raises(RuntimeError, match="forward-only"):
+        migration.downgrade()

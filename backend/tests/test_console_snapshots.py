@@ -93,6 +93,61 @@ def test_snapshot_refresh_defaults_match_page_freshness_contract():
     assert snapshots._ttl("models") == 300
 
 
+def test_postgres_snapshot_schema_check_never_attempts_runtime_ddl(monkeypatch):
+    calls: list[str] = []
+
+    class Result:
+        def fetchone(self):
+            return {"table_name": "console_page_snapshots"}
+
+    class Connection:
+        _is_postgres = True
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, sql, _params=()):
+            calls.append(str(sql))
+            return Result()
+
+    monkeypatch.setattr(snapshots, "_schema_ready", False)
+    monkeypatch.setattr(snapshots, "_conn", lambda: Connection())
+
+    snapshots._ensure_table()
+
+    assert len(calls) == 1
+    assert "to_regclass" in calls[0]
+    assert "create table" not in calls[0].lower()
+    assert "create index" not in calls[0].lower()
+
+
+def test_postgres_snapshot_schema_check_fails_closed_when_table_is_missing(monkeypatch):
+    class Result:
+        def fetchone(self):
+            return {"table_name": None}
+
+    class Connection:
+        _is_postgres = True
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, _sql, _params=()):
+            return Result()
+
+    monkeypatch.setattr(snapshots, "_schema_ready", False)
+    monkeypatch.setattr(snapshots, "_conn", lambda: Connection())
+
+    with pytest.raises(RuntimeError, match="schema is missing"):
+        snapshots._ensure_table()
+
+
 def test_as_json_serializes_positions_list_response_for_durable_payload():
     response = PositionsListResponse(
         positions=[

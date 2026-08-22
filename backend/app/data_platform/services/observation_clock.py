@@ -265,6 +265,7 @@ def load_raw_record_versions(
     cutoff_by_trade_date: bool = False,
     observed_start: str = "",
     ts_codes: list[str] | tuple[str, ...] | None = None,
+    periods: list[str] | tuple[str, ...] | None = None,
     trade_date_start: str = "",
     trade_date_end: str = "",
     period_limit: int = 0,
@@ -377,6 +378,12 @@ def load_raw_record_versions(
         if values:
             placeholders = ",".join("?" for _ in values)
             predicates.append(f"v.ts_code IN ({placeholders})")
+            params.extend(values)
+    if periods:
+        values = [str(value) for value in periods if str(value)]
+        if values:
+            placeholders = ",".join("?" for _ in values)
+            predicates.append(f"v.period IN ({placeholders})")
             params.extend(values)
     if trade_date_start:
         predicates.append("v.trade_date>=?")

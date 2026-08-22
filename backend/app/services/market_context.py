@@ -17,7 +17,7 @@ import threading
 import time
 from statistics import median
 
-from app.data_platform.db import _conn
+from app.data_platform.db import _conn, _read_conn
 from app.data_platform.services.market_calendar import target_trade_date
 from app.data_platform.services.observation_clock import (
     _explicit_timestamp_sql,
@@ -340,7 +340,7 @@ def _market_change_signal(history: list[dict[str, Any]], current: dict[str, Any]
 
 
 def market_state_model_governance() -> dict[str, Any]:
-    with _conn() as c:
+    with _read_conn() as c:
         try:
             row = c.execute(
                 "SELECT MIN(trade_date) first_date,MAX(trade_date) last_date,COUNT(*) sessions FROM dc_available_trade_dates"
@@ -438,28 +438,21 @@ def materialize_market_training_history() -> dict[str, Any]:
     using the complete cross-section available in the data platform.
     """
     index_codes = ("000300.SH", "000905.SH", "000852.SH")
-    with _conn() as c:
-        versioned_index = _strict_raw_payload_rows(
+    # Reads use a server-enforced autocommit connection so Python-side
+    # payload decoding and feature calculation cannot leave an
+    # ``idle in transaction`` session on PostgreSQL.
+    with _read_conn() as c:
+        versioned_index = load_raw_record_versions(
             c, "index_daily", ts_codes=list(index_codes), cutoff_by_trade_date=True,
         )
         if versioned_index is not None:
-            rows = versioned_index
+            rows = [dict(row) for row in versioned_index]
         else:
             # Training features are historical evidence.  A mutable raw
             # projection cannot tell whether a late correction replaced the
             # version visible at that session's 15:00 cutoff, even on a local
             # SQLite fixture.  Do not silently downgrade this path.
             return {"ok": False, "status": "blocked", "reason": "observation_clock_unavailable", "written": 0}
-        by_code: dict[str, dict[str, dict[str, Any]]] = {code: {} for code in index_codes}
-        for row in rows:
-            try:
-                payload = json.loads(row.get("payload_json") or "{}")
-            except (TypeError, json.JSONDecodeError):
-                continue
-            close = payload.get("close")
-            if close is None:
-                continue
-            by_code[str(row.get("ts_code") or "")][str(row.get("trade_date") or "")] = {"close": float(close), "amount": float(payload.get("amount") or 0), "available_time": row.get("available_time")}
         # The raw daily table is a large JSON archive.  Aggregating it on
         # every autonomy cycle causes a full JSONB scan and can monopolize the
         # data database.  The normalized, point-in-time snapshot is the
@@ -562,50 +555,67 @@ def materialize_market_training_history() -> dict[str, Any]:
             # snapshot can no longer prove whether an earlier, complete
             # version was replaced by a later partial refresh.
             return {"ok": False, "status": "blocked", "reason": "snapshot_observation_clock_unavailable", "written": 0}
-        market_by_date = {str(row.get("trade_date") or ""): row for row in market_rows}
-        common_dates = sorted(
-            set.intersection(*(set(by_code[code]) for code in index_codes), set(market_by_date))
-        ) if all(by_code.values()) and market_by_date else []
-        written = 0
-        now = now_observed_at()
-        for index, feature_date in enumerate(common_dates):
-            if index < 120:
-                continue
-            features: dict[str, Any] = {}
-            source_times: list[str] = []
-            for code in index_codes:
-                closes = [by_code[code][value]["close"] for value in common_dates[:index + 1]]
-                returns = [closes[position] / closes[position - 1] - 1.0 for position in range(max(1, len(closes) - 120), len(closes)) if closes[position - 1] > 0]
-                prefix = code.split(".")[0]
-                for window in (20, 60, 120):
-                    features[f"{prefix}_return_{window}d"] = closes[-1] / closes[-window - 1] - 1.0 if len(closes) > window and closes[-window - 1] > 0 else None
-                recent_returns = returns[-20:]
-                features[f"{prefix}_realized_vol_20d"] = (sum(value * value for value in recent_returns) / len(recent_returns)) ** .5 if recent_returns else None
-                features[f"{prefix}_amount"] = by_code[code][feature_date]["amount"]
-                source_times.append(str(by_code[code][feature_date].get("available_time") or ""))
-            market = market_by_date[feature_date]
-            recent_dates = common_dates[max(0, index - 19):index + 1]
-            recent_amounts = [float(market_by_date[value].get("total_amount") or 0.0) for value in recent_dates]
-            amount_baseline = sum(recent_amounts[:-1]) / len(recent_amounts[:-1]) if len(recent_amounts) > 1 else 0.0
-            total_amount = float(market.get("total_amount") or 0.0)
-            features.update({
-                "market_breadth": float(market.get("breadth") or 0.0),
-                "market_average_return": float(market.get("average_return") or 0.0),
-                "market_return_dispersion": float(market.get("return_dispersion") or 0.0),
-                "market_limit_up_ratio": float(market.get("limit_up_ratio") or 0.0),
-                "market_limit_down_ratio": float(market.get("limit_down_ratio") or 0.0),
-                "market_limit_balance": float(market.get("limit_up_ratio") or 0.0) - float(market.get("limit_down_ratio") or 0.0),
-                "market_amount_ratio_20d": total_amount / amount_baseline if amount_baseline > 0 else 1.0,
-                "market_instrument_count": int(market.get("instrument_count") or 0),
-            })
-            source_times.append(str(market.get("source_as_of_time") or ""))
-            c.execute(
-                """INSERT INTO model_training_history(feature_date,feature_set,features_json,source_as_of_time,created_at,updated_at)
-                   VALUES(?,?,?,?,?,?) ON CONFLICT(feature_date) DO UPDATE SET feature_set=excluded.feature_set,
-                   features_json=excluded.features_json,source_as_of_time=excluded.source_as_of_time,updated_at=excluded.updated_at""",
-                (feature_date, "market_regime_full_market_v2", json.dumps(features, ensure_ascii=False), max(source_times), now, now),
-            )
-            written += 1
+    by_code: dict[str, dict[str, dict[str, Any]]] = {code: {} for code in index_codes}
+    for row in rows:
+        try:
+            payload = json.loads(row.get("payload_json") or "{}")
+        except (TypeError, json.JSONDecodeError):
+            continue
+        close = payload.get("close")
+        if close is None:
+            continue
+        by_code[str(row.get("ts_code") or "")][str(row.get("trade_date") or "")] = {"close": float(close), "amount": float(payload.get("amount") or 0), "available_time": row.get("observed_at")}
+    market_by_date = {str(row.get("trade_date") or ""): row for row in market_rows}
+    common_dates = sorted(
+        set.intersection(*(set(by_code[code]) for code in index_codes), set(market_by_date))
+    ) if all(by_code.values()) and market_by_date else []
+    written = 0
+    pending_writes: list[tuple[Any, ...]] = []
+    now = now_observed_at()
+    for index, feature_date in enumerate(common_dates):
+        if index < 120:
+            continue
+        features: dict[str, Any] = {}
+        source_times: list[str] = []
+        for code in index_codes:
+            closes = [by_code[code][value]["close"] for value in common_dates[:index + 1]]
+            returns = [closes[position] / closes[position - 1] - 1.0 for position in range(max(1, len(closes) - 120), len(closes)) if closes[position - 1] > 0]
+            prefix = code.split(".")[0]
+            for window in (20, 60, 120):
+                features[f"{prefix}_return_{window}d"] = closes[-1] / closes[-window - 1] - 1.0 if len(closes) > window and closes[-window - 1] > 0 else None
+            recent_returns = returns[-20:]
+            features[f"{prefix}_realized_vol_20d"] = (sum(value * value for value in recent_returns) / len(recent_returns)) ** .5 if recent_returns else None
+            features[f"{prefix}_amount"] = by_code[code][feature_date]["amount"]
+            source_times.append(str(by_code[code][feature_date].get("available_time") or ""))
+        market = market_by_date[feature_date]
+        recent_dates = common_dates[max(0, index - 19):index + 1]
+        recent_amounts = [float(market_by_date[value].get("total_amount") or 0.0) for value in recent_dates]
+        amount_baseline = sum(recent_amounts[:-1]) / len(recent_amounts[:-1]) if len(recent_amounts) > 1 else 0.0
+        total_amount = float(market.get("total_amount") or 0.0)
+        features.update({
+            "market_breadth": float(market.get("breadth") or 0.0),
+            "market_average_return": float(market.get("average_return") or 0.0),
+            "market_return_dispersion": float(market.get("return_dispersion") or 0.0),
+            "market_limit_up_ratio": float(market.get("limit_up_ratio") or 0.0),
+            "market_limit_down_ratio": float(market.get("limit_down_ratio") or 0.0),
+            "market_limit_balance": float(market.get("limit_up_ratio") or 0.0) - float(market.get("limit_down_ratio") or 0.0),
+            "market_amount_ratio_20d": total_amount / amount_baseline if amount_baseline > 0 else 1.0,
+            "market_instrument_count": int(market.get("instrument_count") or 0),
+        })
+        source_times.append(str(market.get("source_as_of_time") or ""))
+        pending_writes.append(
+            (feature_date, "market_regime_full_market_v2", json.dumps(features, ensure_ascii=False), max(source_times), now, now)
+        )
+        written += 1
+    if pending_writes:
+        with _conn() as writer:
+            for params in pending_writes:
+                writer.execute(
+                    """INSERT INTO model_training_history(feature_date,feature_set,features_json,source_as_of_time,created_at,updated_at)
+                       VALUES(?,?,?,?,?,?) ON CONFLICT(feature_date) DO UPDATE SET feature_set=excluded.feature_set,
+                       features_json=excluded.features_json,source_as_of_time=excluded.source_as_of_time,updated_at=excluded.updated_at""",
+                    params,
+                )
     return {
         "ok": bool(written),
         "feature_set": "market_regime_full_market_v2",
