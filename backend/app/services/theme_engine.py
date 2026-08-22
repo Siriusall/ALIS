@@ -383,6 +383,11 @@ def materialize_theme_snapshots(*, as_of_time: str | None = None, lookback: int 
             c, cutoff=cutoff, cutoff_date=cutoff_date, lookback=lookback,
             current_projection=not bool(as_of_time),
         )
+        # The PIT loader materializes a bounded read set before Python scoring.
+        # End that read transaction before CPU-side aggregation so the write
+        # connection is not left idle in transaction for the duration.
+        if bool(getattr(c, "_is_postgres", False)):
+            c.commit()
         if not pit.get("ok"):
             return pit
         dates = list(pit["dates"])
