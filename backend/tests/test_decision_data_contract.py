@@ -278,6 +278,7 @@ def test_contract_query_guards_bad_persisted_timestamp_before_casting():
     # a rewritten projection date.
     all_contract_sql = "\n".join(sql for sql, _params in conn.queries)
     assert all_contract_sql.count("raw.trade_date=accepted.trade_date") == 4
+    assert "COUNT(DISTINCT raw.ts_code)" not in all_contract_sql
     assert strict_params == (
         "20260724", "2026-07-24T18:00:00+08:00", "2026-07-24T18:00:00+08:00",
         "2026-07-24T18:00:00+08:00", "2026-07-24T18:00:00+08:00",

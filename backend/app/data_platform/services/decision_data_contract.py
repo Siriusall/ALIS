@@ -431,7 +431,12 @@ def _strict_evidence_query() -> str:
 def _base_counts_query() -> str:
     observed_at = _safe_timestamp_value("raw", "observed_at")
     created_at = _safe_timestamp_value("raw", "created_at")
-    return f"""SELECT raw.api_name,COUNT(DISTINCT raw.ts_code) AS rows
+    # ``dc_tushare_raw_records`` has one accepted projection per logical
+    # record and the exact content-hash join selects at most one immutable
+    # version. Counting the joined accepted rows is therefore exact. A
+    # DISTINCT aggregate here forced a large sort/hash during console
+    # prewarming and could exceed the data database statement timeout.
+    return f"""SELECT raw.api_name,COUNT(*) AS rows
                    FROM dc_tushare_raw_records accepted
                    JOIN dc_tushare_raw_record_version raw
                      ON raw.api_name=accepted.api_name
@@ -451,7 +456,7 @@ def _base_counts_query() -> str:
 def _provider_counts_query() -> str:
     observed_at = _safe_timestamp_value("raw", "observed_at")
     created_at = _safe_timestamp_value("raw", "created_at")
-    return f"""SELECT raw.api_name,raw.source_code,COUNT(DISTINCT raw.ts_code) AS rows
+    return f"""SELECT raw.api_name,raw.source_code,COUNT(*) AS rows
                    FROM dc_tushare_raw_records accepted
                    JOIN dc_tushare_raw_record_version raw
                      ON raw.api_name=accepted.api_name
