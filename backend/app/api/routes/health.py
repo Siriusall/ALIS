@@ -80,7 +80,11 @@ def _frozen_plan_execution_is_due(plan: dict[str, Any], now: datetime | None = N
 
 
 @router.get("/trading-ready")
-def trading_readiness(detail: str = Query("full", pattern="^(full|compact)$")) -> JSONResponse:
+def trading_readiness(
+    detail: str = Query("full", pattern="^(full|compact)$"),
+    *,
+    require_redis: bool = True,
+) -> JSONResponse:
     """Aggregate the read-only gates that decide whether automation may act."""
     global _readiness_cache
     cache_key = str(detail or "full").strip().lower()
@@ -92,7 +96,7 @@ def trading_readiness(detail: str = Query("full", pattern="^(full|compact)$")) -
 
     from app.main import _health_payload
 
-    infrastructure = _health_payload()
+    infrastructure = _health_payload(require_redis=require_redis)
     # These checks use independent short-lived connections. Running them
     # concurrently keeps one slow diagnostic from serially blocking the
     # whole readiness response, while the connection gate still bounds the

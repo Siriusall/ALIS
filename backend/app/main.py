@@ -340,7 +340,15 @@ for protected_router in (
     )
 
 
-def _health_payload() -> dict:
+def _health_payload(*, require_redis: bool = True) -> dict:
+    """Return runtime health for an API process or an offline reader.
+
+    Console snapshots are constructed on the control worker and committed to
+    PostgreSQL.  That node must verify the durable databases, migrations and
+    release binding, but it deliberately has no connection to the API host's
+    loopback Redis.  Callers that do not consume durable streams can therefore
+    opt out of Redis as a readiness prerequisite without weakening API health.
+    """
     primary = primary_database_health()
     data_platform = data_platform_database_health()
     databases_ready = primary.get("status") == "ok" and data_platform.get("status") == "ok"
@@ -379,7 +387,7 @@ def _health_payload() -> dict:
     if background_owner and unhealthy_heartbeats:
         runtime_issues.append(f"Background component errors: {', '.join(unhealthy_heartbeats)}")
     issues = (
-        ([] if redis.get("available", False) else ["Redis unavailable: durable stream tasks are disabled"])
+        ([] if not require_redis or redis.get("available", False) else ["Redis unavailable: durable stream tasks are disabled"])
         + ([] if revisions_ready else [
             "Database migration revision mismatch: "
             f"current={current_revisions}, expected={expected_revisions}"
@@ -406,7 +414,7 @@ def _health_payload() -> dict:
         and revisions_ready
         and runtime_code_ready
         and release_binding_ready
-        and bool(redis.get("available", False))
+        and (not require_redis or bool(redis.get("available", False)))
         and runtime_ready
     )
     return {

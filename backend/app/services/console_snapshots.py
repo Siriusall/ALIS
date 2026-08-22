@@ -153,8 +153,13 @@ def _readers(page_key: str) -> dict[str, Callable[[], Any]]:
     from app.main import _health_payload
 
     common = {
-        "health": _health_payload,
-        "tradingReady": lambda: health.trading_readiness(detail="compact"),
+        # The control worker builds durable PostgreSQL snapshots. It must not
+        # inherit the API host's loopback Redis requirement: browser reads and
+        # stream consumption remain checked by the API's normal health route.
+        "health": lambda: _health_payload(require_redis=False),
+        "tradingReady": lambda: health.trading_readiness(
+            detail="compact", require_redis=False,
+        ),
     }
     pages: dict[str, dict[str, Callable[[], Any]]] = {
         "overview": {
