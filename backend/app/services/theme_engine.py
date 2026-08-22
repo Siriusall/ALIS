@@ -302,16 +302,20 @@ def _latest_complete_theme_trade_date(c: Any, *, cutoff_date: str) -> str:
     stock_count_row = c.execute("SELECT COUNT(*) cnt FROM dc_stock_master").fetchone()
     stock_count = int(dict(stock_count_row).get("cnt") or 0) if stock_count_row else 0
     minimum_rows = max(1, int(ceil(stock_count * .80))) if stock_count else 1
-    row = c.execute(
-        """SELECT trade_date
-             FROM dc_stock_daily_snapshot
-             WHERE trade_date<=?
-             GROUP BY trade_date
-             HAVING COUNT(DISTINCT ts_code)>=?
-             ORDER BY trade_date DESC LIMIT 1""",
-        (cutoff_date, minimum_rows),
-    ).fetchone()
-    return str(dict(row).get("trade_date") or "") if row else ""
+    dates = c.execute(
+        """SELECT DISTINCT trade_date FROM dc_stock_daily_snapshot
+           WHERE trade_date<=? ORDER BY trade_date DESC LIMIT 12""",
+        (cutoff_date,),
+    ).fetchall()
+    for date_row in dates:
+        date = str(dict(date_row).get("trade_date") or "")
+        count_row = c.execute(
+            "SELECT COUNT(DISTINCT ts_code) cnt FROM dc_stock_daily_snapshot WHERE trade_date=?",
+            (date,),
+        ).fetchone()
+        if count_row and int(dict(count_row).get("cnt") or 0) >= minimum_rows:
+            return date
+    return ""
 
 
 
