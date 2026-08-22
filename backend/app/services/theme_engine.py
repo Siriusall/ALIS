@@ -40,6 +40,7 @@ def _theme_snapshot_visible_at(
     cutoff: str,
     *,
     row: dict[str, Any] | None = None,
+    allow_legacy_current: bool = False,
 ) -> bool:
     """Accept only a derived snapshot whose source and row clocks are visible."""
 
@@ -47,7 +48,16 @@ def _theme_snapshot_visible_at(
         return False
     marker = payload.get("point_in_time")
     if not isinstance(marker, dict) or marker.get("contract") != _THEME_PIT_CONTRACT:
-        return False
+        if not allow_legacy_current or row is None:
+            return False
+        # Current console fallback only: retain explicit row clocks but mark
+        # the old derivation as unverified. Historical/PIT consumers never
+        # enable this compatibility path.
+        return all(
+            (clock := normalize_explicit_timestamp(row.get(field)))
+            and is_available_at(clock, cutoff, require_explicit_offset=True)
+            for field in ("available_time", "created_at", "updated_at")
+        )
     source_cutoff = normalize_explicit_timestamp(marker.get("source_observation_cutoff"))
     boundary = normalize_explicit_timestamp(cutoff)
     if not (
@@ -721,7 +731,12 @@ def list_themes(
                 payload = json.loads(row.get("payload_json") or "{}")
             except (TypeError, json.JSONDecodeError):
                 payload = {}
-            if not _theme_snapshot_visible_at(payload, visibility_cutoff, row=row):
+            if not _theme_snapshot_visible_at(
+                payload,
+                visibility_cutoff,
+                row=row,
+                allow_legacy_current=not bool(as_of_time),
+            ):
                 continue
             theme_code = str(row.get("theme_code") or "")
             if not theme_code or theme_code in visible_by_theme:
@@ -762,6 +777,8 @@ def list_themes(
                 company_counts[key] = company_counts.get(key, 0) + 1
         for row in rows:
             row["payload"] = row.pop("_decoded_payload", None) or json.loads(row.pop("payload_json") or "{}")
+            if not isinstance(row["payload"].get("point_in_time"), dict):
+                row["evidence_status"] = "legacy_unverified_pending_current_rematerialization"
             row["company_count"] = company_counts.get(
                 (str(row.get("as_of_date") or ""), str(row.get("theme_code") or "")),
                 0,
