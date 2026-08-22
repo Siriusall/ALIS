@@ -33,6 +33,8 @@ from app.core.error_evidence import error_evidence
 _lock = threading.Lock()
 _state: dict[str, Any] = {"running": False, "phase": "idle", "message": "等待更新"}
 _scheduler_lock = threading.Lock()
+_derived_research_lock = threading.Lock()
+_derived_research_running = False
 
 
 def _is_expected_scheduler_wait(exc: BaseException) -> bool:
@@ -849,16 +851,25 @@ def start_daily_update() -> dict[str, Any]:
 
 def _start_derived_research_repair(target: str) -> dict[str, Any]:
     """Refresh research projections without rerunning upstream market ingestion."""
+    global _derived_research_running
     target_s = str(target or "").replace("-", "")[:8]
     if len(target_s) != 8:
         return {"ok": False, "reason": "invalid_target"}
+    with _derived_research_lock:
+        if _derived_research_running:
+            return {"ok": False, "reason": "already_running", "trade_date": target_s}
+        _derived_research_running = True
 
     def _run() -> None:
+        global _derived_research_running
         try:
             result = _run_research_maintenance(target_s)
             logger.info("派生研究快照独立补建完成 target=%s result=%s", target_s, result)
         except Exception as exc:  # noqa: BLE001
             logger.warning("派生研究快照独立补建失败 target=%s error=%s", target_s, str(exc)[:300])
+        finally:
+            with _derived_research_lock:
+                _derived_research_running = False
 
     threading.Thread(target=_run, name="derived-research-repair", daemon=True).start()
     return {"ok": True, "reason": "started", "trade_date": target_s}
