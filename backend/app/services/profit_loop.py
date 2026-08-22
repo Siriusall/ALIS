@@ -2082,7 +2082,7 @@ def _load_point_in_time_benchmark_closes(dates: list[str]) -> dict[str, float]:
         with data_conn() as c:
             rows = [
                 dict(row) for row in c.execute(
-                    """SELECT id,trade_date,payload_json,available_time
+                    """SELECT id,trade_date,payload_json,available_time,observed_at,first_observed_at
                        FROM dc_tushare_raw_records
                        WHERE api_name='index_daily' AND ts_code='000300.SH'
                          AND trade_date>=? AND trade_date<=?
@@ -2099,7 +2099,12 @@ def _load_point_in_time_benchmark_closes(dates: list[str]) -> dict[str, float]:
         # Portfolio display may show late-observed benchmark closes so the
         # account curve continues after the strict PIT research window.
         # Research/OOS consumers keep using _available_by_market_close.
-        if trade_date not in wanted or not row.get("available_time"):
+        observation_time = (
+            row.get("available_time")
+            or row.get("observed_at")
+            or row.get("first_observed_at")
+        )
+        if trade_date not in wanted or not observation_time:
             continue
         try:
             close = float(json.loads(str(row.get("payload_json") or "{}")).get("close") or 0)
