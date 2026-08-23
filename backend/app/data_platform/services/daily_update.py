@@ -316,6 +316,14 @@ def _daily_update_retry_policy(c: Any, trade_date: str, *, now: datetime | None 
         return {"allowed": True, "reason": "legacy_failure_without_policy"}
     if str(meta.get("trade_date") or "") != str(trade_date):
         return {"allowed": True, "reason": "different_trade_date"}
+    # A failed provider attempt may leave a cooldown behind even after a
+    # later hedge/manual repair has made the strict decision contract ready.
+    # Do not delay the successful confirmation run in that case.
+    try:
+        if decision_data_contract(trade_date, conn=c).get("ok"):
+            return {"allowed": True, "reason": "decision_contract_recovered"}
+    except Exception:  # noqa: BLE001 - retain the normal cooldown fallback
+        pass
     category = str(meta.get("failure_category") or "")
     retry_after_seconds = int(meta.get("retry_after_seconds") or 0)
     if retry_after_seconds <= 0:
