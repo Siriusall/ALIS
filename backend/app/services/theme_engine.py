@@ -831,7 +831,7 @@ def get_theme(theme_code: str, *, as_of_date: str = "") -> dict[str, Any] | None
                 payload = json.loads(candidate_dict.get("payload_json") or "{}")
             except (TypeError, json.JSONDecodeError):
                 payload = {}
-            if _theme_snapshot_visible_at(payload, visibility_cutoff, row=candidate_dict):
+            if _theme_snapshot_visible_at(payload, visibility_cutoff, row=candidate_dict, allow_legacy_current=not bool(as_of_date)):
                 row = candidate_dict
                 row["_decoded_payload"] = payload
                 break
@@ -839,6 +839,8 @@ def get_theme(theme_code: str, *, as_of_date: str = "") -> dict[str, Any] | None
             return None
         item = dict(row)
         item["payload"] = item.pop("_decoded_payload", None) or json.loads(item.pop("payload_json") or "{}")
+        if not isinstance(item["payload"].get("point_in_time"), dict):
+            item["evidence_status"] = "legacy_unverified_pending_current_rematerialization"
         mapping_rows = [dict(mapping) for mapping in c.execute(
             "SELECT ts_code,exposure_score,evidence_json,updated_at FROM dc_theme_company_mapping WHERE as_of_date=? AND theme_code=? ORDER BY exposure_score DESC LIMIT 200",
             (item.get("as_of_date"), code),

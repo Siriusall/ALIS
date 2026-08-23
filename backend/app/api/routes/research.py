@@ -344,6 +344,7 @@ def research_industry_allocation(
             "lifecycle", "status", "selection_score", "narrative_score",
             "narrative_lifecycle", "narrative_promotable", "combined_score",
             "eligible", "strong_in_weak_market", "blockers", "target_weight",
+            "evidence_status",
         }
         return {
             **{key: value for key, value in result.items() if key not in {"items", "symbol_industries", "industry_targets"}},
