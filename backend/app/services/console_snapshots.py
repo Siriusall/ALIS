@@ -25,7 +25,7 @@ from app.data_platform.redis_store import get_json, set_json
 from app.db.store import _conn
 
 
-PAGE_KEYS = ("overview", "decision", "portfolio", "operations", "data", "models")
+PAGE_KEYS = ("overview", "decision", "portfolio", "operations", "data", "models", "research", "factors", "evidence")
 _DEFAULT_TTLS = {
     "overview": 30,
     "decision": 30,
@@ -33,6 +33,9 @@ _DEFAULT_TTLS = {
     "operations": 15,
     "data": 60,
     "models": 300,
+    "research": 120,
+    "factors": 120,
+    "evidence": 60,
 }
 _FAILURE_RETRY_SECONDS = 15
 _schema_ready = False
@@ -252,6 +255,43 @@ def _readers(page_key: str) -> dict[str, Callable[[], Any]]:
             "factorResearchCompact": lambda: __import__("app.api.routes.factors", fromlist=["factor_research_status"]).factor_research_status(compact=True, console=False),
             "evolutionTasks": lambda: model_strategy.model_strategy_evolution_tasks(limit=30),
             "modelTasksLive": lambda: model_strategy.model_strategy_task_center(limit=24, log_limit=40, compact=True),
+        },
+        "research": {
+            "researchContracts": research.research_capabilities,
+            "researchGovernance": research.research_governance_overview,
+            "researchPositionState": research.research_position_states,
+            "researchDataAssets": lambda: model_strategy.model_strategy_evolution_research_data_assets() if hasattr(model_strategy, "model_strategy_evolution_research_data_assets") else {},
+            "analystConsensus": lambda: model_strategy.model_strategy_analyst_consensus_batch(limit=100),
+            "theses": research.research_thesis_list,
+            "industries": lambda: research.research_industries(compact=True),
+            "industryAllocation": lambda: research.research_industry_allocation(compact=True),
+            "themes": research.research_themes,
+            "events": research.research_events,
+            "pools": research.research_pools,
+            "modelMarketLive": model_strategy.model_strategy_live_market_context,
+        },
+        "factors": {
+            "owner": model_strategy.model_strategy_owner_summary,
+            "strategy": model_strategy.model_strategy_strategy_controller,
+            "sealed": lambda: data_center.data_center_sealed_strategy_holdout(include_dates=False),
+            "factors": lambda: __import__("app.api.routes.factors", fromlist=["factor_registry"]).factor_registry(),
+            "factorStatus": lambda: __import__("app.api.routes.factors", fromlist=["factor_research_status"]).factor_research_status(),
+            "factorResearch": lambda: __import__("app.api.routes.factors", fromlist=["factor_research_status"]).factor_research_status(console=True, compact=True),
+            "factorLineage": lambda: __import__("app.api.routes.factors", fromlist=["factor_strategy_lineage"]).factor_strategy_lineage(),
+            "evolutionTasks": lambda: model_strategy.model_strategy_evolution_tasks(limit=30),
+        },
+        "evidence": {
+            "decisionAudit": research.research_decision_audit,
+            "decisions": lambda: decision_summary(limit_days=30),
+            "reviews": lambda: research.research_reviews(limit=100),
+            "reviewLearning": research.research_review_learning_overview,
+            "llmBudget": research.research_llm_token_budget,
+            "llmProposals": lambda: research.research_llm_proposals(limit=50),
+            "performanceReports": lambda: quant_runs.quant_run_performance_reports(limit=30),
+            "ledgerDetail": lambda: quant_runs.quant_run_simulation_ledger(limit=20),
+            "reportCompact": lambda: decision_summary(limit_days=30),
+            "backtests": lambda: quant_runs.quant_run_performance_reports(limit=30),
+            "ledgerAudit": model_strategy.model_strategy_ledger_audit,
         },
     }
     return pages[page_key]
