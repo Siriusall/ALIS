@@ -214,7 +214,15 @@ def cluster_news_themes(*, as_of_time: str | None = None) -> dict[str, Any]:
             all_companies: list[dict] = []
             for article in articles_list:
                 all_companies.extend(article.get("companies", []))
-            unique_companies = {c["ts_code"]: c for c in all_companies}.values()
+            company_mentions: dict[str, int] = {}
+            company_rows: dict[str, dict] = {}
+            for company in all_companies:
+                code = str(company.get("ts_code") or "")
+                if not code:
+                    continue
+                company_mentions[code] = company_mentions.get(code, 0) + 1
+                company_rows[code] = company
+            unique_companies = company_rows.values()
             score = min(100, len(articles_list) * 5 + len(unique_companies) * 3)
             promotable = 1 if score >= 20 and len(unique_companies) >= 3 else 0
 
@@ -239,15 +247,17 @@ def cluster_news_themes(*, as_of_time: str | None = None) -> dict[str, Any]:
             )
             themes_written += 1
 
+            max_mentions = max(company_mentions.values(), default=1)
             for company in unique_companies:
+                mention_ratio = company_mentions.get(str(company["ts_code"]), 0) / max_mentions
                 c.execute(
                     """INSERT INTO dc_theme_company_mapping(as_of_date, theme_code, ts_code, exposure_score, evidence_json, updated_at)
                        VALUES(?,?,?,?,?,?)
                        ON CONFLICT(as_of_date, theme_code, ts_code) DO UPDATE SET
                        exposure_score=excluded.exposure_score, evidence_json=excluded.evidence_json, updated_at=excluded.updated_at""",
                     (as_of_date, theme_code, company["ts_code"],
-                     round(70.0 + 30.0 * (1.0 / max(1, len(unique_companies))), 2),
-                     json.dumps({"source": "news_mention", "article_count": len(articles_list), "trade_date": as_of_date}, ensure_ascii=False),
+                     round(55.0 + 45.0 * mention_ratio, 2),
+                     json.dumps({"source": "news_mention", "article_count": len(articles_list), "mention_count": company_mentions.get(str(company["ts_code"]), 0), "trade_date": as_of_date}, ensure_ascii=False),
                      now),
                 )
                 company_mappings += 1
