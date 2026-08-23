@@ -1016,15 +1016,6 @@ def compact_research_runtime_metrics(retention_days: int = 30) -> dict[str, Any]
     )).isoformat()
     archived_at = _now()
     with _conn() as conn:
-        heatmap_rows = [dict(row) for row in conn.execute(
-            """SELECT c.factor_key,c.environment_id,
-                      AVG(c.signed_contribution) AS mean_contribution,
-                      COUNT(*) AS observations,
-                      m.name AS environment_name
-                 FROM strategy_factor_contributions c
-                 LEFT JOIN dynamic_market_environments m ON m.environment_id=c.environment_id
-                GROUP BY c.factor_key,c.environment_id,m.name"""
-        ).fetchall()]
         rows = [dict(row) for row in conn.execute(
             """SELECT SUBSTR(observed_at,1,10) AS metric_date,metric_type,
                       COUNT(*) AS observation_count,AVG(value) AS average_value,
@@ -4038,6 +4029,15 @@ def strategy_research_factor_analytics(
         params.append(str(factor_key))
     params.append(bounded)
     with _conn() as conn:
+        heatmap_rows = [dict(row) for row in conn.execute(
+            """SELECT c.factor_key,c.environment_id,
+                      AVG(c.signed_contribution) AS mean_contribution,
+                      COUNT(*) AS observations,
+                      m.name AS environment_name
+                 FROM strategy_factor_contributions c
+                 LEFT JOIN dynamic_market_environments m ON m.environment_id=c.environment_id
+                GROUP BY c.factor_key,c.environment_id,m.name"""
+        ).fetchall()]
         rows = [dict(row) for row in conn.execute(
             f"""SELECT c.*,m.name AS environment_name,m.environment_type
                 FROM strategy_factor_contributions c
