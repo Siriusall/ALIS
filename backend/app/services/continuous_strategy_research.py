@@ -1016,6 +1016,15 @@ def compact_research_runtime_metrics(retention_days: int = 30) -> dict[str, Any]
     )).isoformat()
     archived_at = _now()
     with _conn() as conn:
+        heatmap_rows = [dict(row) for row in conn.execute(
+            """SELECT c.factor_key,c.environment_id,
+                      AVG(c.signed_contribution) AS mean_contribution,
+                      COUNT(*) AS observations,
+                      m.name AS environment_name
+                 FROM strategy_factor_contributions c
+                 LEFT JOIN dynamic_market_environments m ON m.environment_id=c.environment_id
+                GROUP BY c.factor_key,c.environment_id,m.name"""
+        ).fetchall()]
         rows = [dict(row) for row in conn.execute(
             """SELECT SUBSTR(observed_at,1,10) AS metric_date,metric_type,
                       COUNT(*) AS observation_count,AVG(value) AS average_value,
@@ -4086,21 +4095,13 @@ def strategy_research_factor_analytics(
         by_factor_environment.setdefault((factor, environment), []).append(value)
         by_factor_wave.setdefault((factor, wave), []).append(value)
     heatmap = [{
-        "factor_key": key[0],
-        "environment_id": key[1],
-        "environment_key": key[1],
-        "environment_name": next(
-            (
-                str(item.get("environment_name") or key[1])
-                for item in enriched
-                if str(item.get("factor_key")) == key[0]
-                and str(item.get("environment_id")) == key[1]
-            ),
-            key[1],
-        ),
-        "mean_contribution": round(sum(values) / len(values), 8),
-        "observations": len(values),
-    } for key, values in sorted(by_factor_environment.items())]
+        "factor_key": str(row.get("factor_key") or ""),
+        "environment_id": str(row.get("environment_id") or ""),
+        "environment_key": str(row.get("environment_id") or ""),
+        "environment_name": str(row.get("environment_name") or row.get("environment_id") or ""),
+        "mean_contribution": round(float(row.get("mean_contribution") or 0.0), 8),
+        "observations": int(row.get("observations") or 0),
+    } for row in sorted(heatmap_rows, key=lambda item: (str(item.get("factor_key")), str(item.get("environment_id"))))]
     probability_trend = [{
         "factor_key": key[0],
         "wave_id": key[1],
