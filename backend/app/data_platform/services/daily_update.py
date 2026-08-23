@@ -749,7 +749,30 @@ def _worker(parent_run_id: int) -> None:
         # misreport a successfully completed market-data update.
         _set_state(phase="research", message="正在更新候选池和核心池研究", progress=95)
         try:
-            steps.append({"step": "research_pool", "result": _run_research_maintenance(trade_date)})
+            # Research projections are optional for the daily market contract.
+            # They may contain large historical joins, so bound their impact on
+            # the ingestion worker and let the next cycle retry them.
+            research_result: dict[str, Any] = {}
+            research_error: list[BaseException] = []
+
+            def _research_worker() -> None:
+                try:
+                    research_result.update(_run_research_maintenance(trade_date))
+                except BaseException as exc:  # noqa: BLE001 - report below
+                    research_error.append(exc)
+
+            research_thread = threading.Thread(
+                target=_research_worker,
+                name=f"daily-research-{trade_date}",
+                daemon=True,
+            )
+            research_thread.start()
+            research_thread.join(timeout=120)
+            if research_thread.is_alive():
+                raise TimeoutError("daily research maintenance timed out after 120 seconds")
+            if research_error:
+                raise research_error[0]
+            steps.append({"step": "research_pool", "result": research_result})
         except Exception as exc:  # noqa: BLE001
             logger.warning("daily research maintenance deferred: %s", str(exc)[:300])
             steps.append({"step": "research_pool", "result": error_evidence(
