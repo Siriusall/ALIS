@@ -125,11 +125,12 @@ def _as_json(value: Any) -> Any:
 def _section(page_key: str, name: str, reader: Callable[[], Any]) -> tuple[Any, dict[str, Any]]:
     try:
         value = _as_json(reader())
-        unhealthy = isinstance(value, dict) and (
-            value.get("ok") is False
-            or value.get("status") in {"blocked", "error", "failed", "degraded", "unavailable", "warming_up"}
-        )
-        return value, {"status": "degraded" if unhealthy else "ready", "error": ""}
+        # Route payloads can correctly describe a blocked model, historical
+        # failure, or partial research evidence while still carrying a complete
+        # readable document.  A page snapshot is degraded only when the read
+        # itself failed or the endpoint explicitly says no data is available.
+        unavailable = isinstance(value, dict) and value.get("data_available") is False
+        return value, {"status": "degraded" if unavailable else "ready", "error": ""}
     except Exception as exc:  # a page can surface partial evidence safely
         logger.warning(
             "Console snapshot section unavailable page=%s section=%s error_type=%s",
