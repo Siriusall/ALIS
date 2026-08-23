@@ -129,7 +129,7 @@ def _section(page_key: str, name: str, reader: Callable[[], Any]) -> tuple[Any, 
         # failure, or partial research evidence while still carrying a complete
         # readable document.  A page snapshot is degraded only when the read
         # itself failed or the endpoint explicitly says no data is available.
-        unavailable = isinstance(value, dict) and value.get("data_available") is False
+        unavailable = isinstance(value, dict) and value.get("data_available") is False and not _has_readable_evidence(value)
         return value, {"status": "degraded" if unavailable else "ready", "error": ""}
     except Exception as exc:  # a page can surface partial evidence safely
         logger.warning(
@@ -145,6 +145,15 @@ def _section(page_key: str, name: str, reader: Callable[[], Any]) -> tuple[Any, 
         return {"ok": False, "status": "unavailable", "error": error}, {
             "status": "error", "error": error,
         }
+
+
+def _has_readable_evidence(value: dict[str, Any]) -> bool:
+    """Keep partial business documents visible when they contain evidence."""
+    if any(key in value and value.get(key) not in (None, "", [], {}) for key in (
+        "items", "gates", "capabilities", "market_state", "observations",
+    )):
+        return True
+    return any(key not in {"ok", "status", "data_available", "available", "error", "errors"} for key in value)
 
 
 def _readers(page_key: str) -> dict[str, Callable[[], Any]]:
