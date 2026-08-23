@@ -4074,12 +4074,21 @@ def strategy_research_factor_analytics(
         factor = str(row.get("factor_key") or "")
         environment = str(row.get("environment_id") or "")
         wave = str(row.get("wave_id") or "legacy")
-        value = float(row.get("signed_contribution") or 0.0)
+        # Historical rows may use ``contribution``/``weighted_contribution``;
+        # preserve those values instead of silently turning the heatmap cell
+        # into zero when the newer column is absent.
+        value = float(
+            row.get("signed_contribution")
+            or row.get("weighted_contribution")
+            or row.get("contribution")
+            or 0.0
+        )
         by_factor_environment.setdefault((factor, environment), []).append(value)
         by_factor_wave.setdefault((factor, wave), []).append(value)
     heatmap = [{
         "factor_key": key[0],
         "environment_id": key[1],
+        "environment_key": key[1],
         "environment_name": next(
             (
                 str(item.get("environment_name") or key[1])
