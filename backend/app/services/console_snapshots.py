@@ -268,7 +268,9 @@ def _readers(page_key: str) -> dict[str, Callable[[], Any]]:
             # Route handlers use FastAPI Query defaults.  The control worker
             # calls them directly, so provide concrete bounded values rather
             # than passing Query instances into service logic.
-            "themes": lambda: research.research_themes(as_of_time="", lookback=20),
+            "themes": lambda: research.research_themes(
+                as_of_time="", promotable_only=False, limit=100, compact=True
+            ),
             "events": lambda: research.research_events(ts_code="", limit=100),
             "pools": research.research_pools,
             "modelMarketLive": model_strategy.model_strategy_live_market_context,
