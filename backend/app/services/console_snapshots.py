@@ -292,10 +292,14 @@ def _readers(page_key: str) -> dict[str, Callable[[], Any]]:
             "reviewLearning": research.research_review_learning_overview,
             "llmBudget": research.research_llm_token_budget,
             "llmProposals": lambda: research.research_llm_proposals(limit=50),
-            "performanceReports": lambda: quant_runs.quant_run_performance_reports(limit=30),
+            "performanceReports": lambda: quant_runs.quant_run_performance_reports(
+                task_id=None, limit=30
+            ),
             "ledgerDetail": lambda: quant_runs.quant_run_simulation_ledger(limit=20),
             "reportCompact": lambda: decision_summary(limit_days=30),
-            "backtests": lambda: quant_runs.quant_run_performance_reports(limit=30),
+            "backtests": lambda: quant_runs.quant_run_performance_reports(
+                task_id=None, limit=30
+            ),
             "ledgerAudit": model_strategy.model_strategy_ledger_audit,
         },
     }
