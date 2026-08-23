@@ -135,9 +135,15 @@ function snapshotSectionMessage(key: string, section: Json) {
 function snapshotSectionErrors(payload: Json) {
   const sections = payload.sections;
   if (!sections || typeof sections !== "object" || Array.isArray(sections)) return {};
+  const readableResearchSections = new Set(["researchGovernance", "theses", "industryAllocation", "modelMarketLive"]);
   return Object.entries(sections).reduce<Record<string, string>>((result, [key, value]) => {
     const section = value && typeof value === "object" && !Array.isArray(value) ? value as Json : {};
     const status = String(section.status || "").trim().toLowerCase();
+    // These research routes return structured business conclusions even when
+    // one sub-check is blocked or historical evidence is partial.  Do not
+    // label the whole section as unavailable; the section body shows its
+    // exact governance/data state.
+    if (payload.page === "research" && readableResearchSections.has(key)) return result;
     if (status === "error" || status === "degraded") result[key] = snapshotSectionMessage(key, section);
     return result;
   }, {});
