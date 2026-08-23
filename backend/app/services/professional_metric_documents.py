@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import Counter
-from datetime import datetime
+from datetime import datetime, timedelta
 import hashlib
 import json
 import os
@@ -524,6 +524,22 @@ def sync_professional_metric_candidates(*, limit: int = 1) -> dict[str, Any]:
     """Process at most five reports; intended default is one report per cycle."""
 
     documents = _next_documents(limit)
+    # The ordinary daily announcement feed is intentionally narrow and may
+    # not include the annual-report category.  Repair that boundary lazily
+    # when the candidate queue is empty, keeping the discovery bounded and
+    # candidate-only so it cannot affect production signals.
+    if not documents:
+        from app.data_platform.services.data_center import sync_cninfo_announcements
+
+        today = datetime.now().date()
+        sync_cninfo_announcements(
+            start_date=(today - timedelta(days=210)).strftime("%Y%m%d"),
+            end_date=today.strftime("%Y%m%d"),
+            page_size=30,
+            max_pages=20,
+            category="category_ndbg_szsh",
+        )
+        documents = _next_documents(limit)
     results: list[dict[str, Any]] = []
     for announcement in documents:
         template_kind = str(announcement.get("template_kind") or "")
