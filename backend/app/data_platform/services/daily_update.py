@@ -943,7 +943,17 @@ def start_daily_update_scheduler() -> bool:
 
                     defensive_codes = [str(item["ts_code"]) for item in DEFENSIVE_ASSETS]
                     defensive_execution_slice = defensive_asset_execution_status(target, defensive_codes)
-                    if target and derived_research_lag and retry_policy.get("allowed"):
+                    # Core market data must catch up before optional research
+                    # projections.  Running the expensive derived repair first
+                    # can monopolize the worker while the next trading day's
+                    # raw slices remain missing indefinitely.
+                    core_market_ready = (
+                        ready == target
+                        and benchmark_ready
+                        and adj_factor_ready
+                        and defensive_execution_slice.get("ok")
+                    )
+                    if target and derived_research_lag and core_market_ready and retry_policy.get("allowed"):
                         result = _start_derived_research_repair(target)
                         if result.get("ok"):
                             logger.info("自动日更发现行业/主题派生快照落后，启动补建 target=%s", target)
