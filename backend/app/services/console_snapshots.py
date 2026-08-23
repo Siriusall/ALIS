@@ -265,8 +265,11 @@ def _readers(page_key: str) -> dict[str, Callable[[], Any]]:
             "theses": research.research_thesis_list,
             "industries": lambda: research.research_industries(compact=True),
             "industryAllocation": lambda: research.research_industry_allocation(compact=True),
-            "themes": research.research_themes,
-            "events": research.research_events,
+            # Route handlers use FastAPI Query defaults.  The control worker
+            # calls them directly, so provide concrete bounded values rather
+            # than passing Query instances into service logic.
+            "themes": lambda: research.research_themes(as_of_time="", lookback=20),
+            "events": lambda: research.research_events(ts_code="", limit=100),
             "pools": research.research_pools,
             "modelMarketLive": model_strategy.model_strategy_live_market_context,
         },
