@@ -300,7 +300,10 @@ def _readers(page_key: str) -> dict[str, Callable[[], Any]]:
         },
         "evidence": {
             "decisionAudit": research.research_decision_audit,
-            "decisions": lambda: decision_summary(limit_days=30),
+            # EvidenceChain expects the frozen decision rows (id, action,
+            # timestamps and point-in-time evidence), not the dashboard
+            # summary object whose nested fields would render as undefined.
+            "decisions": lambda: research.research_decisions(limit=100, compact=True),
             "reviews": lambda: research.research_reviews(limit=100),
             "reviewLearning": research.research_review_learning_overview,
             "llmBudget": research.research_llm_token_budget,
