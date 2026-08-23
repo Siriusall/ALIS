@@ -34,6 +34,7 @@ _lock = threading.Lock()
 _state: dict[str, Any] = {"running": False, "phase": "idle", "message": "等待更新"}
 _scheduler_lock = threading.Lock()
 _derived_research_lock = threading.Lock()
+_research_maintenance_lock = threading.Lock()
 _derived_research_running = False
 
 
@@ -763,11 +764,16 @@ def _worker(parent_run_id: int) -> None:
             research_result: dict[str, Any] = {}
             research_error: list[BaseException] = []
 
+            if not _research_maintenance_lock.acquire(blocking=False):
+                raise RuntimeError("daily research maintenance already running")
+
             def _research_worker() -> None:
                 try:
                     research_result.update(_run_research_maintenance(trade_date))
                 except BaseException as exc:  # noqa: BLE001 - report below
                     research_error.append(exc)
+                finally:
+                    _research_maintenance_lock.release()
 
             research_thread = threading.Thread(
                 target=_research_worker,
