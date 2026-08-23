@@ -498,6 +498,10 @@ def _derived_industry_proxies(c, *, as_of_time: str | None = None) -> dict[str, 
             # already filtered accepted set by symbol to locate the newest
             # session. This is portable to SQLite and avoids a ROW_NUMBER
             # across every raw provider version.
+            latest_projection_predicate = (
+                "AND p.trade_date=(SELECT MAX(trade_date) FROM dc_stock_daily_snapshot)"
+                if not as_of_time else ""
+            )
             snapshot_sql = f"""WITH accepted AS (
                                     SELECT v.ts_code,{pe_expr} AS pe_ttm,v.trade_date
                                       FROM dc_stock_daily_snapshot p
@@ -506,6 +510,7 @@ def _derived_industry_proxies(c, *, as_of_time: str | None = None) -> dict[str, 
                                        AND v.trade_date=p.trade_date
                                        AND v.content_hash=p.content_hash
                                      WHERE {' AND '.join(predicates)}
+                                       {latest_projection_predicate}
                                ), latest_dates AS (
                                     SELECT ts_code,MAX(trade_date) AS trade_date
                                       FROM accepted
