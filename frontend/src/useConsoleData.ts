@@ -41,6 +41,11 @@ const snapshotPages: Record<string, string> = {
   "/operations": "operations",
   "/data": "data",
   "/models": "models",
+  "/research": "research",
+  "/factors": "factors",
+  "/evolution/factors": "factors",
+  "/evolution/metrics": "factors",
+  "/evidence": "evidence",
 };
 
 const cache = new Map<string, { value: Json; readAt: number }>();
