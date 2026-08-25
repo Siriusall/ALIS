@@ -186,6 +186,44 @@ def test_adj_factor_gate_requires_retained_parseable_rows() -> None:
     assert daily_update._adj_factor_ready_for_date(_Conn(), "20260813") is False
 
 
+def test_start_daily_update_reuses_recent_persisted_running_parent(monkeypatch) -> None:
+    started_at = (daily_update._business_now() - timedelta(minutes=15)).isoformat(timespec="seconds")
+
+    class _Result:
+        def __init__(self, row=None):
+            self._row = row
+
+        def fetchone(self):
+            return self._row
+
+    class _Conn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def execute(self, sql, _params=()):
+            if "FROM data_ingestion_runs" in sql and "status=?" in sql:
+                return _Result({"id": 730693, "started_at": started_at})
+            raise AssertionError(f"unexpected query after persistent running guard: {sql}")
+
+    monkeypatch.setattr(daily_update, "_state", {"running": False, "phase": "waiting_data_probe"})
+    monkeypatch.setattr(daily_update, "_conn", lambda: _Conn())
+    monkeypatch.setattr(daily_update, "target_trade_date", lambda _c: "20260825")
+
+    result = daily_update.start_daily_update()
+
+    assert result == {
+        "ok": False,
+        "reason": "already_running",
+        "running": True,
+        "run_id": 730693,
+        "started_at": started_at,
+        "source": "persistent_run_ledger",
+    }
+
+
 def test_persisted_data_failure_suppresses_minute_level_retry() -> None:
     finished_at = (datetime(2026, 7, 24, 17, 0, 0) - timedelta(minutes=5)).isoformat(timespec="seconds")
 

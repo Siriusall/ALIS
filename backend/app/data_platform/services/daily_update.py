@@ -909,6 +909,35 @@ def start_daily_update() -> dict[str, Any]:
             _set_state(running=False, **blocked)
             return {**blocked, **_state}
         with _conn() as c:
+            running_row = c.execute(
+                """SELECT id,started_at FROM data_ingestion_runs
+                   WHERE job_name=? AND status=? ORDER BY id DESC LIMIT 1""",
+                ("data_platform.daily_update", "running"),
+            ).fetchone()
+            if running_row:
+                running_item = dict(running_row)
+                try:
+                    running_started = datetime.fromisoformat(
+                        str(running_item.get("started_at") or "").replace("Z", "+00:00")
+                    )
+                    if running_started.tzinfo is None:
+                        running_started = running_started.replace(tzinfo=_BUSINESS_TZ)
+                    running_age = (_business_now() - running_started.astimezone(_BUSINESS_TZ)).total_seconds()
+                except (TypeError, ValueError):
+                    running_age = 0
+                # A market refresh normally completes well inside this bound.
+                # The persisted guard survives state resets and prevents a
+                # scheduler probe timeout from launching a second full-market
+                # writer while the first daemon thread is still alive.
+                if running_age < 7200:
+                    return {
+                        "ok": False,
+                        "reason": "already_running",
+                        "running": True,
+                        "run_id": int(running_item.get("id") or 0),
+                        "started_at": str(running_item.get("started_at") or ""),
+                        "source": "persistent_run_ledger",
+                    }
             success_policy = _recent_success_policy(c, target)
             if not success_policy.get("allowed"):
                 return {
