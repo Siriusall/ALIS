@@ -938,45 +938,15 @@ def live_market_context(*, persist: bool = False) -> dict[str, Any]:
                 "incomplete_dates": incomplete_dates,
             }
 
-        latest_rows = load_snapshot_versions(
-            c,
-            cutoff=live_observation_cutoff,
-            trade_date=latest,
-        )
-        if latest_rows is None or not latest_rows:
-            return {
-                "ok": False,
-                "status": "blocked",
-                "reason": "immutable_snapshot_concentration_rows_missing",
-                "trade_date": latest,
-            }
-        amounts: list[float] = []
-        for item in latest_rows:
-            try:
-                payload = json.loads(item.get("payload_json") or "{}")
-            except (TypeError, json.JSONDecodeError):
-                continue
-            if not isinstance(payload, dict):
-                continue
-            try:
-                value = float(payload.get("turnover"))
-            except (TypeError, ValueError):
-                continue
-            if math.isfinite(value) and value >= 0:
-                amounts.append(value)
-        if not amounts:
-            return {
-                "ok": False,
-                "status": "blocked",
-                "reason": "immutable_snapshot_turnover_missing",
-                "trade_date": latest,
-            }
-        amounts.sort(reverse=True)
-        top_count = max(1, int(math.ceil(len(amounts) / 20)))
-        total_amount = sum(amounts)
-        concentration = sum(amounts[:top_count]) / total_amount if total_amount > 0 else 0.0
         breadth_row = dict(aggregates[latest])
         limit_row = dict(aggregates[latest])
+        # Concentration is calculated by the same bounded, immutable aggregate
+        # query.  The old second full-payload read transferred another 5,500
+        # JSON documents and could hit the 30-second budget immediately after
+        # close even when the aggregate itself completed successfully.
+        concentration = float(
+            breadth_row.get("top_5pct_turnover_concentration") or 0.0
+        )
         amount_rows = [
             {"trade_date": date, "total_amount": float(dict(aggregates[date]).get("amount") or 0.0)}
             for date in dates

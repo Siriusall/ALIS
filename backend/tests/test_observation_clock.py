@@ -256,6 +256,7 @@ def test_market_aggregate_uses_only_immutable_versions_visible_at_session_close(
             "amount": 400.0,
             "limit_up_ratio": 0.0,
             "limit_down_ratio": 0.0,
+            "top_5pct_turnover_concentration": 0.75,
         },
     }
 
@@ -527,6 +528,7 @@ def test_market_aggregate_uses_same_projection_selected_snapshot_version():
             "amount": 100.0,
             "limit_up_ratio": 0.0,
             "limit_down_ratio": 0.0,
+            "top_5pct_turnover_concentration": 1.0,
         },
     }
 

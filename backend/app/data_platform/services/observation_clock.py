@@ -874,6 +874,17 @@ def load_snapshot_market_aggregates(
                  ), numeric_values AS {numeric_materialization}(
                      SELECT ts_code,trade_date,{change_pct} AS change_pct,{turnover} AS turnover
                        FROM decoded
+                 ), ranked_values AS (
+                     SELECT numeric_values.*,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY trade_date
+                                ORDER BY
+                                  CASE WHEN change_pct IS NOT NULL AND turnover IS NOT NULL THEN 0 ELSE 1 END,
+                                  turnover DESC
+                            ) AS turnover_rank,
+                            COUNT(CASE WHEN change_pct IS NOT NULL AND turnover IS NOT NULL THEN 1 END)
+                              OVER (PARTITION BY trade_date) AS turnover_count
+                       FROM numeric_values
                  )
                  SELECT trade_date,
                         COUNT(*) AS rows_total,
@@ -888,7 +899,15 @@ def load_snapshot_market_aggregates(
                                  THEN CASE WHEN change_pct>=9.7 THEN 1.0 ELSE 0.0 END END) AS limit_up_ratio,
                         AVG(CASE WHEN change_pct IS NOT NULL AND turnover IS NOT NULL
                                  THEN CASE WHEN change_pct<=-9.7 THEN 1.0 ELSE 0.0 END END) AS limit_down_ratio
-                   FROM numeric_values
+                        ,CASE WHEN SUM(CASE WHEN change_pct IS NOT NULL AND turnover IS NOT NULL
+                                           THEN turnover ELSE 0.0 END)>0
+                              THEN SUM(CASE WHEN turnover_rank<=((turnover_count+19)/20)
+                                                 AND change_pct IS NOT NULL AND turnover IS NOT NULL
+                                            THEN turnover ELSE 0.0 END)
+                                   / SUM(CASE WHEN change_pct IS NOT NULL AND turnover IS NOT NULL
+                                              THEN turnover ELSE 0.0 END)
+                              ELSE 0.0 END AS top_5pct_turnover_concentration
+                   FROM ranked_values
                   GROUP BY trade_date
                   ORDER BY trade_date"""
     params: list[Any] = []
