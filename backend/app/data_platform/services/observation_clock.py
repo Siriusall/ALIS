@@ -528,10 +528,7 @@ def load_current_raw_record_versions(
     if not required_projection.issubset(projection_columns) or not required_version.issubset(version_columns):
         return None
     is_postgres = bool(getattr(c, "_is_postgres", False))
-    predicates = [
-        "p.api_name=?",
-        "p.trade_date=?",
-        "NULLIF(TRIM(COALESCE(p.content_hash,'')),'') IS NOT NULL",
+    version_predicates = [
         "NULLIF(TRIM(COALESCE(v.source_code,'')),'') IS NOT NULL",
         _valid_provenance_sql("v.observation_provenance"),
         _explicit_timestamp_sql("v.observed_at", is_postgres=is_postgres),
@@ -539,20 +536,48 @@ def load_current_raw_record_versions(
         _explicit_timestamp_sql("v.economic_available_time", is_postgres=is_postgres),
         _explicit_timestamp_sql("v.created_at", is_postgres=is_postgres),
     ]
-    sql = f"""
-        SELECT v.id,v.api_name,v.record_key,v.ts_code,v.trade_date,
-               v.period,v.ann_date,v.payload_json,v.source_code,
-               v.economic_available_time,v.observed_at,v.first_observed_at,
-               v.observation_provenance,v.content_hash,v.created_at
-        FROM dc_tushare_raw_records p
-        JOIN dc_tushare_raw_record_version v
-          ON v.api_name=p.api_name
-         AND v.record_key=p.record_key
-         AND v.content_hash=p.content_hash
-         AND v.trade_date=p.trade_date
-         WHERE {' AND '.join(predicates)}
-         ORDER BY v.observed_at,v.id
-    """
+    if is_postgres:
+        # PostgreSQL can badly underestimate the correlation between API and
+        # date on the append-only table and start from tens of millions of
+        # versions.  Freeze the exact accepted session first; this is the same
+        # authoritative hash join with a bounded and deterministic join side.
+        sql = f"""
+            WITH accepted AS MATERIALIZED (
+                SELECT api_name,record_key,trade_date,content_hash
+                  FROM dc_tushare_raw_records
+                 WHERE api_name=? AND trade_date=?
+                   AND NULLIF(TRIM(COALESCE(content_hash,'')),'') IS NOT NULL
+            )
+            SELECT v.id,v.api_name,v.record_key,v.ts_code,v.trade_date,
+                   v.period,v.ann_date,v.payload_json,v.source_code,
+                   v.economic_available_time,v.observed_at,v.first_observed_at,
+                   v.observation_provenance,v.content_hash,v.created_at
+              FROM accepted p
+              JOIN dc_tushare_raw_record_version v
+                ON v.api_name=p.api_name
+               AND v.record_key=p.record_key
+               AND v.content_hash=p.content_hash
+               AND v.trade_date=p.trade_date
+             WHERE {' AND '.join(version_predicates)}
+             ORDER BY v.observed_at,v.id
+        """
+    else:
+        sql = f"""
+            SELECT v.id,v.api_name,v.record_key,v.ts_code,v.trade_date,
+                   v.period,v.ann_date,v.payload_json,v.source_code,
+                   v.economic_available_time,v.observed_at,v.first_observed_at,
+                   v.observation_provenance,v.content_hash,v.created_at
+              FROM dc_tushare_raw_records p
+              JOIN dc_tushare_raw_record_version v
+                ON v.api_name=p.api_name
+               AND v.record_key=p.record_key
+               AND v.content_hash=p.content_hash
+               AND v.trade_date=p.trade_date
+             WHERE p.api_name=? AND p.trade_date=?
+               AND NULLIF(TRIM(COALESCE(p.content_hash,'')),'') IS NOT NULL
+               AND {' AND '.join(version_predicates)}
+             ORDER BY v.observed_at,v.id
+        """
     return [dict(row) for row in c.execute(sql, (str(api_name), str(trade_date))).fetchall()]
 
 
