@@ -2829,12 +2829,38 @@ def list_pending_daily_rebalance_execution_inputs() -> list[dict[str, Any]]:
     """
     _ensure_tables()
     with business_conn() as c:
-        rows = c.execute(
-            """SELECT id,trade_date,planned_execute_date,version,status,proposal_json
+        metadata_rows = c.execute(
+            """SELECT id,trade_date,planned_execute_date,version,status
                FROM daily_rebalance_plans
                WHERE status IN ('planned','blocked_by_contract_validation','blocked_by_contract_revision','blocked_by_execution_recovery','missed_execution_window')
                ORDER BY trade_date ASC, version DESC"""
         ).fetchall()
+        latest_by_signal: dict[str, dict[str, Any]] = {}
+        for row in metadata_rows:
+            item = dict(row)
+            signal_date = str(item.get("trade_date") or "").replace("-", "")[:8]
+            if signal_date and signal_date not in latest_by_signal:
+                latest_by_signal[signal_date] = item
+        planned_rows = [
+            item for item in latest_by_signal.values()
+            if str(item.get("status") or "") == "planned"
+            and len(str(item.get("trade_date") or "").replace("-", "")[:8]) == 8
+            and len(str(item.get("planned_execute_date") or "").replace("-", "")[:8]) == 8
+        ]
+        if not planned_rows:
+            return []
+        planned_ids = [int(item.get("id") or 0) for item in planned_rows if int(item.get("id") or 0) > 0]
+        if not planned_ids:
+            return []
+        placeholders = ",".join("?" for _ in planned_ids)
+        contract_rows = c.execute(
+            f"SELECT id,proposal_json FROM daily_rebalance_plans WHERE id IN ({placeholders})",
+            tuple(planned_ids),
+        ).fetchall()
+    contracts_by_id = {
+        int(dict(row).get("id") or 0): str(dict(row).get("proposal_json") or "{}")
+        for row in contract_rows
+    }
     from app.services.defensive_assets import DEFENSIVE_ASSETS
 
     registered = {
@@ -2847,20 +2873,12 @@ def list_pending_daily_rebalance_execution_inputs() -> list[dict[str, Any]]:
         if str(position.get("symbol") or "").split(".")[0] in registered
         and int(position.get("quantity") or 0) > 0
     }
-    latest_by_signal: dict[str, dict[str, Any]] = {}
-    for row in rows:
-        item = dict(row)
+    pending_inputs: list[dict[str, Any]] = []
+    for item in planned_rows:
         signal_date = str(item.get("trade_date") or "").replace("-", "")[:8]
         execute_date = str(item.get("planned_execute_date") or "").replace("-", "")[:8]
-        if signal_date in latest_by_signal:
-            continue
-        latest_by_signal[signal_date] = {"status": str(item.get("status") or "")}
-        if str(item.get("status") or "") != "planned":
-            continue
-        if len(signal_date) != 8 or len(execute_date) != 8:
-            continue
         try:
-            contract = json.loads(item.get("proposal_json") or "{}")
+            contract = json.loads(contracts_by_id.get(int(item.get("id") or 0), "{}"))
         except (TypeError, json.JSONDecodeError):
             contract = {}
         plan_symbols = {
@@ -2892,8 +2910,8 @@ def list_pending_daily_rebalance_execution_inputs() -> list[dict[str, Any]]:
                 "schema_version": str(contract.get("schema_version") or ""),
                 "execution_orders": execution_orders,
             }
-        latest_by_signal[signal_date] = pending_item
-    return [item for item in latest_by_signal.values() if item.get("plan_id")]
+        pending_inputs.append(pending_item)
+    return pending_inputs
 
 
 def count_pending_daily_rebalance_execution_inputs() -> int:

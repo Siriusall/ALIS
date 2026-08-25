@@ -755,6 +755,34 @@ def test_pending_plan_lists_defensive_assets_needed_by_plan_and_holdings(monkeyp
     }]
 
 
+def test_pending_plan_loads_contract_only_for_latest_planned_rows(monkeypatch):
+    calls = []
+
+    @contextmanager
+    def fake_conn():
+        class Conn:
+            def execute(self, sql, params=()):
+                calls.append((sql, tuple(params)))
+                if "proposal_json" not in sql:
+                    return _Rows([
+                        {"id": 31, "trade_date": "20260821", "planned_execute_date": "20260824", "version": 1, "status": "missed_execution_window"},
+                        {"id": 46, "trade_date": "20260824", "planned_execute_date": "20260825", "version": 1, "status": "planned"},
+                    ])
+                return _Rows([{"id": 46, "proposal_json": "{}"}])
+
+        yield Conn()
+
+    monkeypatch.setattr(profit_loop, "_ensure_tables", lambda: None)
+    monkeypatch.setattr(profit_loop, "business_conn", fake_conn)
+    monkeypatch.setattr(profit_loop, "get_positions", lambda: [])
+
+    pending = profit_loop.list_pending_daily_rebalance_execution_inputs()
+
+    assert [item["plan_id"] for item in pending] == [46]
+    assert "proposal_json" not in calls[0][0]
+    assert calls[1][1] == (46,)
+
+
 def test_missed_formal_plans_leave_pending_state_and_cannot_execute_late(monkeypatch):
     captured = {}
     state = {"status": "planned"}
