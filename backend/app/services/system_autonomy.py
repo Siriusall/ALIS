@@ -479,7 +479,6 @@ def _owner_summary(steps: list[dict[str, Any]]) -> dict[str, Any]:
 def run_system_autonomy_cycle(*, trade_date: str = "") -> dict[str, Any]:
     """Run the existing deterministic modules as one auditable daily bus cycle."""
     from app.data_platform.services.oos_hard_data import audit_oos_hard_data
-    from app.services.auto_pipeline import run_daily_maintenance
     from app.services.corporate_actions import run_corporate_action_cycle
     from app.services.execution_cost_calibration import calibrate_execution_cost_model
     from app.services.factor_platform import run_factor_daily_cycle
@@ -487,6 +486,7 @@ def run_system_autonomy_cycle(*, trade_date: str = "") -> dict[str, Any]:
     from app.services.review_data_quality_governance import run_review_data_quality_governance
     from app.services.evolution_orchestrator import (
         enqueue_plan_model_autonomy_task,
+        enqueue_research_maintenance_task,
         enqueue_strategy_shadow_daily_task,
     )
     from app.services.research_data_assets import audit_research_data_assets
@@ -608,7 +608,14 @@ def run_system_autonomy_cycle(*, trade_date: str = "") -> dict[str, Any]:
         ),
         experimental_step("strategy_policy_maturity", advance_waiting_strategy_policy_candidates),
         experimental_step("strategy_policy_candidates", lambda: run_strategy_policy_auto_optimization(force=False)),
-        _run_step("research_maintenance", lambda: run_daily_maintenance(max_candidates=50)),
+        _run_step(
+            "research_maintenance",
+            lambda: enqueue_research_maintenance_task(
+                frozen_trade_date or current_market_date,
+                max_candidates=50,
+                trigger="daily_system_autonomy",
+            ),
+        ),
         _run_step("free_industry_financials", lambda: materialize_financial_industry_series(max_periods=1)),
         _run_step("pmi_demand_proxies", sync_pmi_industry_proxies),
         _run_step("cn_ppi_raw", refresh_cn_ppi_from_first_source),

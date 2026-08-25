@@ -93,6 +93,7 @@ LONG_RESEARCH_TASK_TYPES = frozenset({
     "strategy_failure_model_training", "model_candidate_research",
     "model_strategy_impact_validation", "hsmm_shadow_training",
     "controller_candidate_observation", "plan_model_autonomy",
+    "research_maintenance",
 })
 
 
@@ -1825,6 +1826,43 @@ def enqueue_plan_model_autonomy_task(
     }
 
 
+def enqueue_research_maintenance_task(
+    trade_date: str = "",
+    *,
+    max_candidates: int = 50,
+    trigger: str = "daily_system_autonomy",
+) -> dict[str, Any]:
+    """Delegate heavy company/research-pool maintenance to research worker."""
+
+    normalized_date = str(trade_date or "").replace("-", "")[:8]
+    date_key = normalized_date or _now().date().isoformat().replace("-", "")
+    task = create_evolution_task(
+        task_type="research_maintenance",
+        payload={
+            "trigger": str(trigger or "daily_system_autonomy"),
+            "trade_date": normalized_date or None,
+            "max_candidates": max(1, min(int(max_candidates), 200)),
+            "delegated_from": "system_autonomy_cycle",
+            "execution_contract": "alis_research_maintenance_worker_task_v1",
+            "production_change_forbidden": True,
+        },
+        dedupe_key=f"research_maintenance:daily:v1:{date_key}",
+        max_attempts=3,
+        priority=78,
+        worker_pool="research",
+    )
+    task_status = str(task.get("status") or "queued")
+    return {
+        "ok": True,
+        "status": "delegated" if task_status in {"queued", "running", "retry_wait"} else task_status,
+        "task_status": task_status,
+        "task_id": int(task.get("id") or 0) or None,
+        "trade_date": normalized_date,
+        "worker_pool": "research",
+        "execution_mode": "persistent_research_task",
+    }
+
+
 def enqueue_plan_model_training_task(
     model_key: str,
     *,
@@ -2437,6 +2475,17 @@ def execute_evolution_task(
             "ppi": ppi, "futures": futures,
             "policy": "bounded_parallel_probe; first_valid_source; exact_date_cache; no_stale_data_claim",
         }
+    if task_type == "research_maintenance":
+        from app.services.auto_pipeline import run_daily_maintenance
+
+        payload = task.get("payload") if isinstance(task.get("payload"), dict) else {}
+        max_candidates = max(1, min(int(payload.get("max_candidates") or 50), 200))
+        return _run_with_heartbeat_pulse(
+            int(task["id"]),
+            phase="research_maintenance",
+            message="正在维护公司研究、论点与研究池",
+            runner=lambda: run_daily_maintenance(max_candidates=max_candidates),
+        )
     if _current_experiment_gate_required(task_type):
         gate = _experiment_data_gate()
         gate_ok = bool(gate.get("ok", gate.get("experiment_ready")))
@@ -3045,6 +3094,7 @@ def _finish_success(task_id: int, result: dict[str, Any]) -> None:
     message = {
         "system_release_governance": "系统版本变更发现与发布前硬门完成",
         "research_data_publication_probe": "研究数据多源发布探测完成",
+        "research_maintenance": "公司研究、论点与研究池维护完成",
         "sealed_holdout_adj_factor_backfill": "密封验证集批量补全并复核完成",
         "factor_daily_cycle": "因子日物化与评价完成",
         "factor_research_cycle": "连续因子、模型与策略研究完成",
