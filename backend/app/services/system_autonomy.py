@@ -714,11 +714,20 @@ def _build_latest_owner_summary() -> dict[str, Any]:
     # the database call.  Use an autocommit connection so that decoding a
     # large completed cycle cannot leave ``idle in transaction`` on PostgreSQL.
     with _read_conn() as conn:
-        row = conn.execute(
-            """SELECT id,status,result_json,finished_at FROM evolution_tasks
-               WHERE task_type='system_autonomy_cycle' AND status='completed'
-               ORDER BY id DESC LIMIT 1"""
-        ).fetchone()
+        if bool(getattr(conn, "_is_postgres", False)):
+            row = conn.execute(
+                """SELECT id,status,finished_at,
+                          (result_json::jsonb->'owner_summary')::text owner_summary_json
+                     FROM evolution_tasks
+                    WHERE task_type='system_autonomy_cycle' AND status='completed'
+                    ORDER BY id DESC LIMIT 1"""
+            ).fetchone()
+        else:
+            row = conn.execute(
+                """SELECT id,status,result_json,finished_at FROM evolution_tasks
+                   WHERE task_type='system_autonomy_cycle' AND status='completed'
+                   ORDER BY id DESC LIMIT 1"""
+            ).fetchone()
     if not row:
         return {
             "ok": True,
@@ -726,11 +735,27 @@ def _build_latest_owner_summary() -> dict[str, Any]:
             "message": "等待首个每日系统自治周期",
         }
     item = dict(row)
+    result: dict[str, Any] = {}
     try:
-        result = json.loads(item.get("result_json") or "{}")
+        summary = json.loads(item.get("owner_summary_json") or "null")
     except Exception:
-        result = {}
-    summary = result.get("owner_summary") or {}
+        summary = None
+    if not isinstance(summary, dict):
+        # Compatibility fallback for SQLite and old rows without the compact
+        # owner summary. PostgreSQL only transfers the full evidence when the
+        # latest row genuinely predates that projection.
+        if "result_json" not in item:
+            with _read_conn() as conn:
+                fallback = conn.execute(
+                    "SELECT result_json FROM evolution_tasks WHERE id=?",
+                    (int(item.get("id") or 0),),
+                ).fetchone()
+            item["result_json"] = dict(fallback).get("result_json") if fallback else "{}"
+        try:
+            result = json.loads(item.get("result_json") or "{}")
+        except Exception:
+            result = {}
+        summary = result.get("owner_summary") or {}
     def append_read_error(exc: BaseException, operation: str) -> None:
         questions = summary.setdefault("questions", {})
         questions.setdefault("evidence_errors", []).append(

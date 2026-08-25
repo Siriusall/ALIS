@@ -11,8 +11,15 @@ from app.db.store import _conn as business_conn
 def build_portfolio_console_research() -> dict[str, Any]:
     """Read frozen portfolio competition evidence without rerunning research."""
     with business_conn() as c:
+        proposal_column = "proposal_json"
+        if bool(getattr(c, "_is_postgres", False)):
+            proposal_column = """jsonb_build_object(
+                'portfolio_method_competition',
+                    COALESCE(proposal_json::jsonb->'portfolio_method_competition','{}'::jsonb),
+                'risk_budget',COALESCE(proposal_json::jsonb->'risk_budget','{}'::jsonb)
+            )::text AS proposal_json"""
         row = c.execute(
-            """SELECT id,trade_date,version,status,proposal_json,generated_at
+            f"""SELECT id,trade_date,version,status,{proposal_column},generated_at
                FROM daily_rebalance_plans
                ORDER BY trade_date DESC,version DESC,id DESC LIMIT 1"""
         ).fetchone()

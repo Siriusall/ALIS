@@ -10,6 +10,51 @@ from app.services import decision_version_manifest
 from app.services.quant_run_contracts import ReplayRiskGateError
 
 
+def test_compact_latest_plan_projects_frozen_json_in_postgres(monkeypatch):
+    captured = {}
+    contract = {
+        "proposal": [{"symbol": "510300", "reason": "test", "nested": {"large": True}}],
+        "risk_budget": {"status": "ready", "equity_budget": 1.0},
+        "execution_authorized": True,
+        "schema_version": "alis_unified_daily_decision_v2",
+    }
+
+    class Result:
+        @staticmethod
+        def fetchone():
+            return {
+                "id": 47, "trade_date": "20260825", "planned_execute_date": "20260826",
+                "planned_execute_at": "", "version": 1, "status": "planned",
+                "proposal_json": json.dumps(contract), "execution_id": None,
+                "generated_at": "2026-08-25T19:04:56+08:00", "executed_at": None,
+                "execution_claim_token": "", "execution_claimed_at": None,
+                "validation_error_code": "", "validation_errors_json": "[]", "validated_at": None,
+                "execution_data_evidence_json": "{}", "next_probe_at": None,
+            }
+
+    class Connection:
+        _is_postgres = True
+
+        def execute(self, sql, params=()):
+            captured["sql"] = str(sql)
+            captured["params"] = params
+            return Result()
+
+    @contextmanager
+    def connection():
+        yield Connection()
+
+    monkeypatch.setattr(profit_loop, "_ensure_tables", lambda: None)
+    monkeypatch.setattr(profit_loop, "business_conn", connection)
+
+    result = profit_loop.get_latest_daily_rebalance_plan(compact=True)
+
+    assert "jsonb_build_object" in captured["sql"]
+    assert "selection_snapshot" not in captured["sql"]
+    assert result["id"] == 47
+    assert result["execution_authorized"] is True
+
+
 def test_proposal_reason_prefers_frozen_defensive_buy_over_small_weight_delta():
     assert profit_loop._proposal_reason(
         controller_evidence={"intent": "defensive_switch"},

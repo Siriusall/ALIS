@@ -3155,14 +3155,29 @@ def _compact_frozen_plan_contract(contract: dict[str, Any]) -> dict[str, Any]:
 def get_latest_daily_rebalance_plan(trade_date: str = "", *, compact: bool = False) -> dict[str, Any]:
     """Read the latest persisted plan without generating a new version."""
     _ensure_tables()
-    columns = (
-        "id,trade_date,planned_execute_date,planned_execute_at,version,status,proposal_json,"
+    base_columns = (
+        "id,trade_date,planned_execute_date,planned_execute_at,version,status,{proposal_column},"
         "execution_id,generated_at,executed_at,execution_claim_token,execution_claimed_at,"
         "validation_error_code,validation_errors_json,validated_at,"
         "execution_data_evidence_json,next_probe_at"
     )
     today = datetime.now(_BUSINESS_TZ).strftime("%Y%m%d")
     with business_conn() as c:
+        proposal_column = "proposal_json"
+        if compact and bool(getattr(c, "_is_postgres", False)):
+            proposal_column = """jsonb_build_object(
+                'proposal',COALESCE(proposal_json::jsonb->'proposal','[]'::jsonb),
+                'execution_orders',COALESCE(proposal_json::jsonb->'execution_orders','[]'::jsonb),
+                'risk_budget',COALESCE(proposal_json::jsonb->'risk_budget','{}'::jsonb),
+                'decision_data_gate',COALESCE(proposal_json::jsonb->'decision_data_gate','{}'::jsonb),
+                'pretrade_controller',COALESCE(proposal_json::jsonb->'pretrade_controller','{}'::jsonb),
+                'expected_return_contract',COALESCE(proposal_json::jsonb->'expected_return_contract','{}'::jsonb),
+                'schema_version',COALESCE(proposal_json::jsonb->'schema_version','null'::jsonb),
+                'risk_limit_contract',COALESCE(proposal_json::jsonb->'risk_limit_contract','{}'::jsonb),
+                'decision_version_manifest',COALESCE(proposal_json::jsonb->'decision_version_manifest','{}'::jsonb),
+                'execution_authorized',COALESCE(proposal_json::jsonb->'execution_authorized','false'::jsonb)
+            )::text AS proposal_json"""
+        columns = base_columns.format(proposal_column=proposal_column)
         row = c.execute(
             f"""SELECT {columns}
                FROM daily_rebalance_plans

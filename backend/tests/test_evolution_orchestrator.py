@@ -137,6 +137,59 @@ def test_superseded_task_reconciliation_reads_autocommit_then_writes(monkeypatch
     ]
 
 
+def test_postgres_superseded_reconciliation_projects_only_predecessor_ids(monkeypatch):
+    statements = []
+
+    class Result:
+        rowcount = 1
+
+        def __init__(self, rows=()):
+            self.rows = list(rows)
+
+        def fetchall(self):
+            return self.rows
+
+    class ReadConnection:
+        _is_postgres = True
+
+        def execute(self, sql, params=()):  # noqa: ANN001
+            statements.append((str(sql), params))
+            if "ORDER BY id ASC LIMIT" in str(sql):
+                return Result([{
+                    "id": 21,
+                    "task_type": "strategy_candidate_generation",
+                    "status": "queued",
+                    "payload_json": '{"predecessor_task_id":12}',
+                }])
+            assert "payload_json::jsonb->>'predecessor_task_id'" in str(sql)
+            assert "SELECT id,task_type,status,payload_json" not in str(sql)
+            return Result([{
+                "task_type": "strategy_cluster_distillation",
+                "predecessor_task_id": "12",
+            }])
+
+    class WriteConnection:
+        def execute(self, _sql, _params=()):
+            return Result()
+
+    @contextmanager
+    def read_connection():
+        yield ReadConnection()
+
+    @contextmanager
+    def write_connection():
+        yield WriteConnection()
+
+    monkeypatch.setattr(evolution, "_read_conn", read_connection)
+    monkeypatch.setattr(evolution, "_conn", write_connection)
+    monkeypatch.setattr(evolution, "V10_RESEARCH_ENABLED", True)
+
+    result = evolution.reconcile_superseded_evolution_tasks(limit=10)
+
+    assert result["count"] == 1
+    assert len(statements) == 2
+
+
 def test_checkpoint_recovery_claim_does_not_consume_failure_attempt(monkeypatch):
     statements = []
 

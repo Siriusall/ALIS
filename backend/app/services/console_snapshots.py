@@ -25,7 +25,10 @@ from app.data_platform.redis_store import get_json, set_json
 from app.db.store import _conn, _read_conn
 
 
-PAGE_KEYS = ("overview", "decision", "portfolio", "operations", "data", "models", "research", "factors", "evidence")
+PAGE_KEYS = (
+    "overview", "decision", "portfolio", "operations", "versions", "data",
+    "models", "research", "factors", "waves", "evidence",
+)
 _DEFAULT_TTLS = {
     # Event invalidation is the freshness authority.  Periodic rebuilds are a
     # safety net, not a second polling system: sub-minute TTLs kept the single
@@ -35,10 +38,12 @@ _DEFAULT_TTLS = {
     "decision": 180,
     "portfolio": 300,
     "operations": 180,
+    "versions": 600,
     "data": 180,
     "models": 600,
     "research": 600,
     "factors": 600,
+    "waves": 600,
     "evidence": 600,
 }
 _FAILURE_RETRY_SECONDS = 15
@@ -215,7 +220,7 @@ def _has_readable_evidence(value: dict[str, Any]) -> bool:
 def _readers(page_key: str) -> dict[str, Callable[[], Any]]:
     # Imports are intentionally lazy: this service is used from startup paths
     # and must not create a main.py import cycle.
-    from app.api.routes import health, model_strategy, quant_runs, research
+    from app.api.routes import health, model_strategy, quant_runs, research, system_versions
     from app.api.routes.decision import decision_latest_plan, decision_summary
     from app.api.routes.positions import get_positions
     from app.data_platform.routes import data_center
@@ -315,6 +320,7 @@ def _readers(page_key: str) -> dict[str, Callable[[], Any]]:
         "operations": {
             **common,
             "owner": model_strategy.model_strategy_owner_summary,
+            "adminTasksLive": lambda: model_strategy.model_strategy_task_center(limit=30, log_limit=20, compact=True),
             "tasks": lambda: model_strategy.model_strategy_task_center(limit=16, log_limit=40, compact=True),
             "evolutionTasks": lambda: model_strategy.model_strategy_evolution_tasks(limit=30),
             "evolutionSchedule": model_strategy.model_strategy_evolution_schedule,
@@ -326,6 +332,11 @@ def _readers(page_key: str) -> dict[str, Callable[[], Any]]:
             "ledgerAudit": model_strategy.model_strategy_ledger_audit,
             "oos": compact_oos,
             "sealed": compact_sealed,
+        },
+        "versions": {
+            "systemVersionStatus": system_versions.system_version_status,
+            "systemReleases": lambda: system_versions.system_version_releases(limit=30),
+            "systemContracts": system_versions.system_version_contracts,
         },
         "data": {
             "watermarks": data_center.data_center_asset_watermarks,
@@ -393,6 +404,14 @@ def _readers(page_key: str) -> dict[str, Callable[[], Any]]:
             "researchFactorAnalytics": lambda: __import__("app.api.routes.factors", fromlist=["factor_research_analytics_factors"]).factor_research_analytics_factors(limit=200),
             "researchTimeseries": lambda: __import__("app.api.routes.factors", fromlist=["factor_research_analytics_timeseries"]).factor_research_analytics_timeseries(limit=500),
             "evolutionTasks": lambda: model_strategy.model_strategy_evolution_tasks(limit=30),
+            "candidateObservations": lambda: model_strategy.model_strategy_candidate_observations(limit=200),
+            "ledger": quant_runs.quant_run_ledger_summary,
+        },
+        "waves": {
+            "researchAnalyticsConsole": lambda: __import__("app.api.routes.factors", fromlist=["factor_research_analytics_console"]).factor_research_analytics_console(),
+            "researchExpertHistory": lambda: __import__("app.api.routes.factors", fromlist=["factor_research_analytics_experts"]).factor_research_analytics_experts(limit=100),
+            "researchEnvironmentSimilarity": lambda: __import__("app.api.routes.factors", fromlist=["factor_research_analytics_environment_similarity"]).factor_research_analytics_environment_similarity(),
+            "researchArchive": lambda: __import__("app.api.routes.factors", fromlist=["factor_research_analytics_archive"]).factor_research_analytics_archive(),
         },
         "evidence": {
             "decisionAudit": research.research_decision_audit,

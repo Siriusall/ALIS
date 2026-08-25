@@ -39,12 +39,16 @@ const snapshotPages: Record<string, string> = {
   "/decision": "decision",
   "/portfolio": "portfolio",
   "/operations": "operations",
+  "/system": "operations",
+  "/system/versions": "versions",
   "/data": "data",
   "/models": "models",
   "/research": "research",
   "/factors": "factors",
   "/evolution/factors": "factors",
   "/evolution/metrics": "factors",
+  "/evolution": "factors",
+  "/evolution/waves": "waves",
   "/evidence": "evidence",
 };
 

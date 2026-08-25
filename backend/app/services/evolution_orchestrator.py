@@ -435,11 +435,6 @@ def reconcile_superseded_evolution_tasks(*, limit: int = 200) -> dict[str, Any]:
                ORDER BY id ASC LIMIT ?""",
             (max(1, min(int(limit), 500)),),
         ).fetchall()
-        all_rows = conn.execute(
-            """SELECT id,task_type,status,payload_json
-               FROM evolution_tasks
-               WHERE status IN ('completed','running','queued','retry_wait')""",
-        ).fetchall()
         successor_edges: set[tuple[int, str]] = set()
         successor_types = {
             "strategy_cluster_distillation",
@@ -447,12 +442,35 @@ def reconcile_superseded_evolution_tasks(*, limit: int = 200) -> dict[str, Any]:
             "strategy_portfolio_formal_queue",
             "strategy_evolution_cycle",
         }
-        for row in all_rows:
-            item = dict(row)
-            payload = _loads(item.get("payload_json"), {})
-            predecessor = int(payload.get("predecessor_task_id") or 0) if isinstance(payload, dict) else 0
-            if predecessor and str(item.get("task_type") or "") in successor_types:
-                successor_edges.add((predecessor, str(item.get("task_type") or "")))
+        if bool(getattr(conn, "_is_postgres", False)):
+            placeholders = ",".join("?" for _ in successor_types)
+            edge_rows = conn.execute(
+                f"""SELECT task_type,
+                            NULLIF(payload_json::jsonb->>'predecessor_task_id','') predecessor_task_id
+                       FROM evolution_tasks
+                      WHERE status IN ('completed','running','queued','retry_wait')
+                        AND task_type IN ({placeholders})
+                        AND payload_json LIKE '%predecessor_task_id%'""",
+                tuple(sorted(successor_types)),
+            ).fetchall()
+            for row in edge_rows:
+                item = dict(row)
+                predecessor = int(item.get("predecessor_task_id") or 0)
+                if predecessor:
+                    successor_edges.add((predecessor, str(item.get("task_type") or "")))
+        else:
+            # Small SQLite fixtures retain the portable JSON parser path.
+            edge_rows = conn.execute(
+                """SELECT task_type,payload_json
+                   FROM evolution_tasks
+                   WHERE status IN ('completed','running','queued','retry_wait')""",
+            ).fetchall()
+            for row in edge_rows:
+                item = dict(row)
+                payload = _loads(item.get("payload_json"), {})
+                predecessor = int(payload.get("predecessor_task_id") or 0) if isinstance(payload, dict) else 0
+                if predecessor and str(item.get("task_type") or "") in successor_types:
+                    successor_edges.add((predecessor, str(item.get("task_type") or "")))
 
     superseded: list[tuple[dict[str, Any], str]] = []
     for row in rows:
