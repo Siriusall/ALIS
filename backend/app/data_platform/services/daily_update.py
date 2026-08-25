@@ -33,9 +33,6 @@ from app.core.error_evidence import error_evidence
 _lock = threading.Lock()
 _state: dict[str, Any] = {"running": False, "phase": "idle", "message": "等待更新"}
 _scheduler_lock = threading.Lock()
-_derived_research_lock = threading.Lock()
-_research_maintenance_lock = threading.Lock()
-_derived_research_running = False
 
 
 def _is_expected_scheduler_wait(exc: BaseException) -> bool:
@@ -529,6 +526,17 @@ def _run_research_maintenance(trade_date: str) -> dict[str, Any]:
     }
 
 
+def _enqueue_research_maintenance(trade_date: str, *, trigger: str) -> dict[str, Any]:
+    """Persist optional research work for the dedicated research pool."""
+    from app.services.evolution_orchestrator import enqueue_research_maintenance_task
+
+    return enqueue_research_maintenance_task(
+        trade_date,
+        max_candidates=max(1, min(int(os.getenv("ALIS_DAILY_RESEARCH_LIMIT", "100")), 500)),
+        trigger=trigger,
+    )
+
+
 def _derived_research_lag(c: Any, target: str) -> bool:
     """Detect durable industry/theme projections stranded behind market data."""
     target_s = str(target or "").replace("-", "")[:8]
@@ -810,40 +818,18 @@ def _worker(parent_run_id: int) -> None:
         steps.append({"step": "quality", "result": run_data_quality_checks(trade_date)})
         steps.append({"step": "oos_hard_data", "result": audit_oos_hard_data(end_date=trade_date, include_dates=False)})
 
-        # Research maintenance is downstream of a durable market snapshot. It
-        # is deliberately non-fatal: a research failure must not roll back or
-        # misreport a successfully completed market-data update.
+        # Research maintenance is downstream of a durable market snapshot and
+        # belongs to the dedicated research worker.  Do not start a bounded
+        # daemon thread here: Python cannot cancel it after ``join`` times out,
+        # so the orphan used to retain data-platform connections and make the
+        # final decision-contract read fail with a misleading capacity error.
         _set_state(phase="research", message="正在更新候选池和核心池研究", progress=95)
         try:
-            # Research projections are optional for the daily market contract.
-            # They may contain large historical joins, so bound their impact on
-            # the ingestion worker and let the next cycle retry them.
-            research_result: dict[str, Any] = {}
-            research_error: list[BaseException] = []
-
-            if not _research_maintenance_lock.acquire(blocking=False):
-                raise RuntimeError("daily research maintenance already running")
-
-            def _research_worker() -> None:
-                try:
-                    research_result.update(_run_research_maintenance(trade_date))
-                except BaseException as exc:  # noqa: BLE001 - report below
-                    research_error.append(exc)
-                finally:
-                    _research_maintenance_lock.release()
-
-            research_thread = threading.Thread(
-                target=_research_worker,
-                name=f"daily-research-{trade_date}",
-                daemon=True,
+            research_task = _enqueue_research_maintenance(
+                trade_date,
+                trigger="daily_market_update",
             )
-            research_thread.start()
-            research_thread.join(timeout=120)
-            if research_thread.is_alive():
-                raise TimeoutError("daily research maintenance timed out after 120 seconds")
-            if research_error:
-                raise research_error[0]
-            steps.append({"step": "research_pool", "result": research_result})
+            steps.append({"step": "research_pool", "result": research_task})
         except Exception as exc:  # noqa: BLE001
             logger.warning("daily research maintenance deferred: %s", str(exc)[:300])
             steps.append({"step": "research_pool", "result": error_evidence(
@@ -955,32 +941,6 @@ def start_daily_update() -> dict[str, Any]:
         return {"ok": True, **_state}
 
 
-def _start_derived_research_repair(target: str) -> dict[str, Any]:
-    """Refresh research projections without rerunning upstream market ingestion."""
-    global _derived_research_running
-    target_s = str(target or "").replace("-", "")[:8]
-    if len(target_s) != 8:
-        return {"ok": False, "reason": "invalid_target"}
-    with _derived_research_lock:
-        if _derived_research_running:
-            return {"ok": False, "reason": "already_running", "trade_date": target_s}
-        _derived_research_running = True
-
-    def _run() -> None:
-        global _derived_research_running
-        try:
-            result = _run_research_maintenance(target_s)
-            logger.info("派生研究快照独立补建完成 target=%s result=%s", target_s, result)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("派生研究快照独立补建失败 target=%s error=%s", target_s, str(exc)[:300])
-        finally:
-            with _derived_research_lock:
-                _derived_research_running = False
-
-    threading.Thread(target=_run, name="derived-research-repair", daemon=True).start()
-    return {"ok": True, "reason": "started", "trade_date": target_s}
-
-
 def start_daily_update_scheduler() -> bool:
     """Start an independent close-of-day updater, even with no quant task."""
     global _scheduler_started
@@ -1038,11 +998,14 @@ def start_daily_update_scheduler() -> bool:
                         and defensive_execution_slice.get("ok")
                     )
                     if target and derived_research_lag and core_market_ready and retry_policy.get("allowed"):
-                        result = _start_derived_research_repair(target)
-                        if result.get("ok"):
-                            logger.info("自动日更发现行业/主题派生快照落后，启动补建 target=%s", target)
-                        elif result.get("reason") != "already_running":
-                            logger.warning("行业/主题派生快照补建启动失败 target=%s result=%s", target, result)
+                        result = _enqueue_research_maintenance(
+                            target,
+                            trigger="daily_derived_research_repair",
+                        )
+                        if result.get("ok") or result.get("status") in {"delegated", "queued", "running", "completed"}:
+                            logger.info("自动日更发现行业/主题派生快照落后，已委派研究节点 target=%s", target)
+                        else:
+                            logger.warning("行业/主题派生快照委派失败 target=%s result=%s", target, result)
                     elif target and (
                         ready != target
                         or not benchmark_ready

@@ -42,3 +42,25 @@ def test_daily_research_maintenance_enriches_only_incomplete_candidates(monkeypa
         {"ts_code": "000002.SZ", "before": "partial", "after": "complete", "requested": 7},
         {"ts_code": "000003.SZ", "before": "partial", "after": "complete", "requested": 7},
     ]
+
+
+def test_daily_research_maintenance_is_delegated_to_research_pool(monkeypatch):
+    captured = {}
+    monkeypatch.setenv("ALIS_DAILY_RESEARCH_LIMIT", "37")
+    monkeypatch.setattr(
+        "app.services.evolution_orchestrator.enqueue_research_maintenance_task",
+        lambda trade_date, **kwargs: captured.update({"trade_date": trade_date, **kwargs})
+        or {"ok": True, "status": "delegated", "worker_pool": "research"},
+    )
+
+    result = daily_update._enqueue_research_maintenance(
+        "20260825",
+        trigger="daily_market_update",
+    )
+
+    assert result["worker_pool"] == "research"
+    assert captured == {
+        "trade_date": "20260825",
+        "max_candidates": 37,
+        "trigger": "daily_market_update",
+    }
