@@ -252,7 +252,7 @@ def test_persisted_data_failure_suppresses_minute_level_retry() -> None:
     assert result["retry_after_seconds"] == 300
 
 
-def test_recent_success_paces_duplicate_full_market_refresh() -> None:
+def test_completed_trade_date_permanently_blocks_duplicate_full_market_refresh() -> None:
     class _Conn:
         def execute(self, _sql, _params=()):
             class _Result:
@@ -266,12 +266,12 @@ def test_recent_success_paces_duplicate_full_market_refresh() -> None:
             return _Result()
 
     result = daily_update._recent_success_policy(
-        _Conn(), "20260724", now=datetime.fromisoformat("2026-07-24T17:00:00+08:00"),
+        _Conn(), "20260724", now=datetime.fromisoformat("2026-07-24T23:00:00+08:00"),
     )
 
     assert result["allowed"] is False
-    assert result["reason"] == "recent_success_cooldown"
-    assert result["retry_after_seconds"] == daily_update._DAILY_UPDATE_SUCCESS_COOLDOWN_SEC - 60
+    assert result["reason"] == "same_trade_date_completed"
+    assert result["retry_after_seconds"] == 0
 
 
 def test_scheduler_retries_an_overdue_trade_date_before_today_close() -> None:

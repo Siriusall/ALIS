@@ -54,10 +54,6 @@ _DAILY_UPDATE_INTERNAL_FAULT_COOLDOWN_SEC = max(
     300,
     min(int(os.getenv("ALIS_DAILY_UPDATE_INTERNAL_FAULT_COOLDOWN_SEC", "1800")), 21600),
 )
-_DAILY_UPDATE_SUCCESS_COOLDOWN_SEC = max(
-    60,
-    min(int(os.getenv("ALIS_DAILY_UPDATE_SUCCESS_COOLDOWN_SEC", "300")), 1800),
-)
 logger = logging.getLogger("quant.daily_update")
 _BUSINESS_TZ = ZoneInfo("Asia/Shanghai")
 
@@ -359,13 +355,13 @@ def _daily_update_retry_policy(c: Any, trade_date: str, *, now: datetime | None 
 
 
 def _recent_success_policy(c: Any, trade_date: str, *, now: datetime | None = None) -> dict[str, Any]:
-    """Pace duplicate callers after a completed same-session refresh.
+    """Make a completed same-session refresh idempotent.
 
     The scheduler, execution probe and deterministic healer may all observe a
     transient read timeout immediately after the same successful update.  A
-    short persisted cooldown prevents them from starting another full-market
-    run while PostgreSQL is still flushing the first one.  This does not mark
-    the decision contract ready; callers retry the read after the cooldown.
+    persisted completion prevents them from starting another full-market run.
+    Optional derived research has its own repair queue; an explicit historical
+    correction belongs to backfill, not to the minute scheduler.
     """
 
     row = c.execute(
@@ -382,30 +378,11 @@ def _recent_success_policy(c: Any, trade_date: str, *, now: datetime | None = No
         return {"allowed": True, "reason": "legacy_success_without_metadata"}
     if str(meta.get("trade_date") or "") != str(trade_date):
         return {"allowed": True, "reason": "different_trade_date"}
-    try:
-        finished_at = datetime.fromisoformat(str(item.get("finished_at") or ""))
-    except ValueError:
-        return {"allowed": True, "reason": "invalid_success_timestamp"}
-    current = (
-        now.astimezone(_BUSINESS_TZ)
-        if now and now.tzinfo
-        else now.replace(tzinfo=_BUSINESS_TZ)
-        if now
-        else _business_now()
-    )
-    if finished_at.tzinfo is None:
-        finished_at = finished_at.replace(tzinfo=_BUSINESS_TZ)
-    else:
-        finished_at = finished_at.astimezone(_BUSINESS_TZ)
-    remaining = max(
-        0,
-        int(_DAILY_UPDATE_SUCCESS_COOLDOWN_SEC - (current - finished_at).total_seconds()),
-    )
     return {
-        "allowed": remaining <= 0,
-        "reason": "success_cooldown_elapsed" if remaining <= 0 else "recent_success_cooldown",
-        "retry_after_seconds": remaining,
-        "next_retry_at": (current + timedelta(seconds=remaining)).isoformat(timespec="seconds"),
+        "allowed": False,
+        "reason": "same_trade_date_completed",
+        "retry_after_seconds": 0,
+        "finished_at": str(item.get("finished_at") or ""),
     }
 
 
@@ -943,7 +920,7 @@ def start_daily_update() -> dict[str, Any]:
                 return {
                     **success_policy,
                     "ok": False,
-                    "reason": "cooldown_active",
+                    "reason": "already_completed",
                     "trade_date": target,
                     "cooldown_reason": success_policy.get("reason"),
                 }
