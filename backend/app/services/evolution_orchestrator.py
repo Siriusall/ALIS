@@ -93,7 +93,7 @@ LONG_RESEARCH_TASK_TYPES = frozenset({
     "strategy_failure_model_training", "model_candidate_research",
     "model_strategy_impact_validation", "hsmm_shadow_training",
     "controller_candidate_observation", "plan_model_autonomy",
-    "research_maintenance",
+    "research_maintenance", "factor_daily_cycle",
 })
 
 

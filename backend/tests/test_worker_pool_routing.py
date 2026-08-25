@@ -8,6 +8,7 @@ def test_default_worker_pool_routes_only_long_research_to_research_pool():
     assert evolution._default_worker_pool("strategy_controller_oos") == "research"
     assert evolution._default_worker_pool("plan_model_autonomy") == "research"
     assert evolution._default_worker_pool("research_maintenance") == "research"
+    assert evolution._default_worker_pool("factor_daily_cycle") == "research"
     assert evolution._default_worker_pool("strategy_shadow_cycle") == "control"
     assert evolution._default_worker_pool("system_autonomy_cycle") == "control"
     assert evolution._default_worker_pool("system_release_governance") == "api_local"
