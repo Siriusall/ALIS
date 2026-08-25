@@ -22,7 +22,7 @@ from fastapi.responses import JSONResponse
 
 from app.data_platform.redis_store import delete as redis_delete
 from app.data_platform.redis_store import get_json, set_json
-from app.db.store import _conn
+from app.db.store import _conn, _read_conn
 
 
 PAGE_KEYS = ("overview", "decision", "portfolio", "operations", "data", "models", "research", "factors", "evidence")
@@ -587,11 +587,29 @@ def _wait_or_stop(stopper: Any | None, seconds: float) -> bool:
     return bool(stopper.wait(seconds))
 
 
+def _control_work_active() -> bool:
+    """Do not make page aggregation compete with control-plane autonomy."""
+
+    with _read_conn() as conn:
+        row = conn.execute(
+            """SELECT 1 AS active
+                 FROM evolution_tasks
+                WHERE status='running'
+                  AND COALESCE(worker_pool,'control')='control'
+                LIMIT 1"""
+        ).fetchone()
+    return bool(row)
+
+
 def run_snapshot_worker_forever(stop_event: Any | None = None) -> None:
     """Run only on the control worker; serialize expensive page aggregation."""
     stopper = stop_event
     while stopper is None or not stopper.is_set():
         try:
+            if _control_work_active():
+                if _wait_or_stop(stopper, 5.0):
+                    return
+                continue
             due = _pages_due_for_refresh()
         except Exception as exc:  # database failures must not involve the API host
             logger.warning("Console snapshot due scan unavailable error_type=%s", type(exc).__name__)
