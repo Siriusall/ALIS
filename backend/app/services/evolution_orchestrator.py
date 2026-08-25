@@ -1972,6 +1972,48 @@ def enqueue_plan_model_training_task(
     }
 
 
+def enqueue_factor_daily_task(
+    trade_date: str = "",
+    *,
+    trigger: str = "daily_system_autonomy",
+) -> dict[str, Any]:
+    """Delegate the daily factor materialization to the research worker.
+
+    The continuous scheduler already created this task in the research pool,
+    but the system-autonomy bus also called the runner directly.  Reuse the
+    same date-level dedupe key so both entry points converge on one persistent
+    task instead of running a hidden copy on the control node.
+    """
+
+    normalized_date = str(trade_date or "").replace("-", "")[:8]
+    date_key = normalized_date or _now().date().isoformat().replace("-", "")
+    task = create_evolution_task(
+        task_type="factor_daily_cycle",
+        payload={
+            "trigger": str(trigger or "daily_system_autonomy"),
+            "trade_date": normalized_date or None,
+            "delegated_from": "system_autonomy_cycle",
+            "execution_contract": "alis_factor_daily_research_worker_task_v1",
+            "production_change_forbidden": True,
+        },
+        dedupe_key=f"factor_daily_cycle:{date_key}",
+        max_attempts=3,
+        priority=20,
+        worker_pool="research",
+    )
+    task_status = str(task.get("status") or "queued")
+    return {
+        "ok": True,
+        "status": "delegated" if task_status in {"queued", "running", "retry_wait"} else task_status,
+        "task_status": task_status,
+        "task_id": int(task.get("id") or 0) or None,
+        "trade_date": normalized_date,
+        "worker_pool": "research",
+        "execution_mode": "persistent_research_task",
+        "production_change_forbidden": True,
+    }
+
+
 def enqueue_all_plan_model_training_task(
     *,
     trigger: str = "api_plan_model_train_all",

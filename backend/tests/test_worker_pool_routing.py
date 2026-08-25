@@ -90,3 +90,22 @@ def test_research_worker_executes_maintenance_task(monkeypatch):
 
     assert result["ok"] is True
     assert calls == [{"max_candidates": 37}]
+
+
+def test_system_autonomy_factor_entry_reuses_research_daily_task(monkeypatch):
+    captured = {}
+
+    def create_task(**kwargs):
+        captured.update(kwargs)
+        return {"id": 1871, "status": "completed"}
+
+    monkeypatch.setattr(evolution, "create_evolution_task", create_task)
+
+    result = evolution.enqueue_factor_daily_task("20260825")
+
+    assert result["status"] == "completed"
+    assert result["worker_pool"] == "research"
+    assert captured["task_type"] == "factor_daily_cycle"
+    assert captured["worker_pool"] == "research"
+    assert captured["dedupe_key"] == "factor_daily_cycle:20260825"
+    assert captured["payload"]["delegated_from"] == "system_autonomy_cycle"

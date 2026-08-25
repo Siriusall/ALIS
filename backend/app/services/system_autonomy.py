@@ -481,11 +481,11 @@ def run_system_autonomy_cycle(*, trade_date: str = "") -> dict[str, Any]:
     from app.data_platform.services.oos_hard_data import audit_oos_hard_data
     from app.services.corporate_actions import run_corporate_action_cycle
     from app.services.execution_cost_calibration import calibrate_execution_cost_model
-    from app.services.factor_platform import run_factor_daily_cycle
     from app.services.performance_reports import run_periodic_performance_review
     from app.services.review_data_quality_governance import run_review_data_quality_governance
     from app.services.evolution_orchestrator import (
         enqueue_plan_model_autonomy_task,
+        enqueue_factor_daily_task,
         enqueue_research_maintenance_task,
         enqueue_strategy_shadow_daily_task,
     )
@@ -574,7 +574,13 @@ def run_system_autonomy_cycle(*, trade_date: str = "") -> dict[str, Any]:
                 else build_profit_loop()
             ),
         ),
-        experimental_step("factor_daily_cycle", run_factor_daily_cycle),
+        experimental_step(
+            "factor_daily_cycle",
+            lambda: enqueue_factor_daily_task(
+                frozen_trade_date or current_market_date,
+                trigger="daily_system_autonomy",
+            ),
+        ),
         # Model training is a large historical read and belongs to the
         # research worker.  The control-plane daily bus only persists an
         # idempotent task and continues immediately, preserving the production
