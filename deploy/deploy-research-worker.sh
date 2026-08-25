@@ -43,7 +43,10 @@ worker_ssh() { ssh "${ssh_opts[@]}" -i "$ALIS_RESEARCH_WORKER_SSH_KEY" "$ALIS_RE
 
 scp -q "${ssh_opts[@]}" -i "$ALIS_RESEARCH_WORKER_SSH_KEY" "$bundle" "$ALIS_RESEARCH_WORKER_SSH_TARGET:$remote_archive"
 old_release=$(worker_ssh 'readlink -f /opt/alis-research-worker/backend 2>/dev/null || true')
-research_running=$(worker_ssh "set -a; . /etc/alis/research-worker.env; set +a; psql \"\$DATABASE_URL\" -X -Atqc \"SELECT COUNT(*) FROM evolution_tasks WHERE status='running' AND COALESCE(worker_pool,'control')='research'\"")
+protection_code=$(printf '%s' \
+  'from app.db.store import _read_conn; scope=_read_conn(); conn=scope.__enter__(); row=conn.execute("SELECT COUNT(*) AS count FROM evolution_tasks WHERE status=\x27running\x27 AND COALESCE(worker_pool,\x27control\x27)=\x27research\x27").fetchone(); print(int(dict(row).get("count") or 0)); scope.__exit__(None,None,None)' \
+  | base64 | tr -d '\n')
+research_running=$(worker_ssh "sudo bash -lc 'set -a; . /etc/alis/research-worker.env; set +a; cd /opt/alis-research-worker/backend; echo $protection_code | base64 -d | /opt/alis-research-worker/shared/app-venv/bin/python -'")
 if [[ ! $research_running =~ ^[0-9]+$ ]]; then
   echo "research_worker_protection_probe_failed; refusing release switch" >&2
   exit 1
