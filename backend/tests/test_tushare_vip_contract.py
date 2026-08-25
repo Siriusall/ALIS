@@ -475,7 +475,6 @@ def test_history_backfill_uses_exact_exchange_resume_and_hk_cutoff(monkeypatch):
         "_safe_sync_raw",
         lambda api, params: calls.append((api, params)) or {"ok": True, "rows_written": 1},
     )
-
     result = data_center.backfill_capital_structure_history(
         start_date="20240816", end_date="20240819", limit_dates=2
     )
@@ -513,12 +512,22 @@ def test_etf_history_filters_unlisted_and_uses_listing_date(monkeypatch):
         "_safe_sync_raw",
         lambda api, params: calls.append((api, params)) or {"ok": True, "rows_written": 1},
     )
+    monkeypatch.setattr(
+        data_center,
+        "_sync_tushare_compatible_range",
+        lambda api, params, **_kwargs: calls.append((api, params)) or {"ok": True, "rows_written": 1},
+    )
     result = data_center.backfill_etf_price_history(
         start_date="20200101", end_date="20260717", limit_funds=20
     )
     assert result["funds_processed"] == 1
-    assert {api for api, _ in calls} == {"fund_daily", "fund_nav"}
-    assert all(params["start_date"] == "20200101" for _, params in calls)
+    # Other tests intentionally launch bounded daemon metadata reconciliation
+    # threads.  If one completes during this assertion it can observe the
+    # monkeypatched shared helper, so scope this contract to the two requests
+    # owned by the ETF history call itself.
+    fund_calls = [item for item in calls if item[0] in {"fund_daily", "fund_nav"}]
+    assert {api for api, _ in fund_calls} == {"fund_daily", "fund_nav"}
+    assert all(params["start_date"] == "20200101" for _, params in fund_calls)
 
 
 def test_major_news_history_batches_days_by_source_and_preserves_daily_coverage(monkeypatch):
