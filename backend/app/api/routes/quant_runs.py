@@ -1033,7 +1033,11 @@ def build_quant_run_performance(
                 attribution_by_date[exit_date]["execution"] += float(attribution.get("execution_attribution") or 0)
     except Exception:
         attribution_by_date = defaultdict(lambda: defaultdict(float))
-    market_states = load_market_state_history()
+    series_dates = [str(point.get("date") or "")[:10] for point in series if point.get("date")]
+    market_states = load_market_state_history(
+        start_date=min(series_dates) if series_dates else None,
+        end_date=max(series_dates) if series_dates else None,
+    )
     try:
         from app.services.decision_version_manifest import build_decision_version_manifest
         version_manifest = build_decision_version_manifest(

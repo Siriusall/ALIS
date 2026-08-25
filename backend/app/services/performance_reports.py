@@ -17,13 +17,25 @@ from app.data_platform.db import _conn as data_conn
 from app.db.store import _conn as business_conn
 
 
-def load_market_state_history() -> dict[str, dict[str, Any]]:
-    """Load the frozen market regime attached to each historical trade date."""
+def load_market_state_history(
+    *, start_date: str | None = None, end_date: str | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Load frozen market regimes, bounded to the requested trade-date window."""
     try:
         with data_conn() as conn:
+            clauses: list[str] = []
+            params: list[str] = []
+            if start_date:
+                clauses.append("trade_date >= ?")
+                params.append(str(start_date))
+            if end_date:
+                clauses.append("trade_date <= ?")
+                params.append(str(end_date))
+            where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
             rows = conn.execute(
-                """SELECT trade_date,market_state,state_confidence,model_version
-                   FROM dc_market_context_snapshot ORDER BY trade_date"""
+                f"""SELECT trade_date,market_state,state_confidence,model_version
+                   FROM dc_market_context_snapshot{where} ORDER BY trade_date""",
+                tuple(params),
             ).fetchall()
     except Exception:
         return {}
@@ -381,7 +393,10 @@ def validate_performance_reports() -> dict[str, Any]:
     """
     with business_conn() as c:
         rows = [dict(row) for row in c.execute(
-            "SELECT * FROM quant_performance_reports ORDER BY period_type, period"
+            """SELECT id,task_id,period_type,scope_key,period,payload_json,created_at
+               FROM quant_performance_reports
+               ORDER BY period_type,period,id
+               LIMIT 5000"""
         ).fetchall()]
 
     by_type: dict[str, list[dict]] = {}

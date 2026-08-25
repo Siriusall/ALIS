@@ -76,7 +76,13 @@ def _ensure_triage_table() -> None:
 def list_manual_review_triage() -> dict[str, dict[str, Any]]:
     _ensure_triage_table()
     with _conn() as c:
-        rows = c.execute("SELECT * FROM manual_review_triage").fetchall()
+        rows = c.execute(
+            """SELECT review_key,item_kind,status,can_handle,confidence,summary,
+                      escalation_reason,draft_json,model,updated_at
+               FROM manual_review_triage
+               ORDER BY updated_at DESC,review_key
+               LIMIT 5000"""
+        ).fetchall()
     result: dict[str, dict[str, Any]] = {}
     for raw in rows:
         row = dict(raw)
