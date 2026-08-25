@@ -179,7 +179,7 @@ def audit_caam_ocr_candidates() -> dict[str, Any]:
     """Cross-check duplicate CAAM images without promoting OCR to production."""
     with _conn() as conn:
         rows = [dict(row) for row in conn.execute(
-            "SELECT * FROM dc_research_ocr_observation WHERE source_code=? ORDER BY observation_date,field_code,document_id",
+            "SELECT * FROM dc_research_ocr_observation WHERE source_code=? ORDER BY observation_date,field_code,document_id LIMIT 10000",
             (CAAM_OCR_SOURCE,),
         ).fetchall()]
         assessments = _cross_document_assessment(rows)
@@ -316,7 +316,7 @@ def reconcile_caam_ocr_with_miit(*, max_documents: int = 5) -> dict[str, Any]:
             for item in observations:
                 peers = [dict(row) for row in conn.execute(
                     """SELECT * FROM dc_research_ocr_observation
-                       WHERE source_code=? AND observation_date=? AND field_code=?""",
+                       WHERE source_code=? AND observation_date=? AND field_code=? LIMIT 5000""",
                     (CAAM_OCR_SOURCE, observation_date, item["field_code"]),
                 ).fetchall()]
                 for peer in peers:

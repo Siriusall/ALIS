@@ -821,12 +821,12 @@ def get_theme(theme_code: str, *, as_of_date: str = "") -> dict[str, Any] | None
     with _conn() as c:
         if cutoff:
             candidates = c.execute(
-                "SELECT * FROM dc_theme_snapshot WHERE theme_code=? AND as_of_date<=? ORDER BY as_of_date DESC",
+                "SELECT * FROM dc_theme_snapshot WHERE theme_code=? AND as_of_date<=? ORDER BY as_of_date DESC LIMIT 1000",
                 (code, cutoff),
             ).fetchall()
         else:
             candidates = c.execute(
-                "SELECT * FROM dc_theme_snapshot WHERE theme_code=? ORDER BY as_of_date DESC",
+                "SELECT * FROM dc_theme_snapshot WHERE theme_code=? ORDER BY as_of_date DESC LIMIT 1000",
                 (code,),
             ).fetchall()
         row = None

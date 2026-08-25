@@ -155,7 +155,7 @@ def get_candidate_lifecycle(model_version_id: int) -> dict[str, Any] | None:
             return None
         result = dict(row)
         events = conn.execute(
-            "SELECT * FROM candidate_lifecycle_events WHERE model_version_id=? ORDER BY id",
+            "SELECT * FROM candidate_lifecycle_events WHERE model_version_id=? ORDER BY id LIMIT 5000",
             (int(model_version_id),),
         ).fetchall()
     try:
