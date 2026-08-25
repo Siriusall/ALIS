@@ -98,3 +98,20 @@ def test_console_snapshot_privilege_migration_is_forward_only() -> None:
 
     with pytest.raises(RuntimeError, match="forward-only"):
         migration.downgrade()
+
+
+def test_raw_date_statistics_migration_collects_correlated_planner_evidence(monkeypatch) -> None:
+    from migrations.data.versions import data_0014_raw_date_stats as migration
+
+    statements: list[str] = []
+    monkeypatch.setattr(migration.op, "execute", lambda sql: statements.append(str(sql)))
+
+    migration.upgrade()
+
+    normalized = " ".join(statements).lower()
+    assert normalized.count("create statistics if not exists") == 2
+    assert "dependencies, mcv, ndistinct" in normalized
+    assert normalized.count("set statistics 1000") == 4
+    assert normalized.count("analyze public.") == 2
+    assert "dc_tushare_raw_record_version" in normalized
+    assert "dc_tushare_raw_records" in normalized
