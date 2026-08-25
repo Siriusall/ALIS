@@ -17,10 +17,7 @@ branch_labels = None
 depends_on = None
 
 
-_TABLES = (
-    "dc_tushare_raw_record_version",
-    "dc_tushare_raw_records",
-)
+_TABLES = ("dc_tushare_raw_record_version",)
 
 
 def upgrade() -> None:

@@ -109,9 +109,8 @@ def test_raw_date_statistics_migration_collects_correlated_planner_evidence(monk
     migration.upgrade()
 
     normalized = " ".join(statements).lower()
-    assert normalized.count("create statistics if not exists") == 2
+    assert normalized.count("create statistics if not exists") == 1
     assert "dependencies, mcv, ndistinct" in normalized
-    assert normalized.count("set statistics 1000") == 4
-    assert normalized.count("analyze public.") == 2
+    assert normalized.count("set statistics 1000") == 2
+    assert normalized.count("analyze public.") == 1
     assert "dc_tushare_raw_record_version" in normalized
-    assert "dc_tushare_raw_records" in normalized
