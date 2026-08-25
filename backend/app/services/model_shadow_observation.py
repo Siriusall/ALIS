@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from typing import Any, Callable
 
 import numpy as np
@@ -32,8 +33,11 @@ MAXIMUM_RETURN_SESSIONS = 60
 MINIMUM_EFFECT_DAYS = 4
 
 
+_BUSINESS_TZ = ZoneInfo("Asia/Shanghai")
+
+
 def _now() -> str:
-    return datetime.now().astimezone().isoformat()
+    return datetime.now(_BUSINESS_TZ).isoformat()
 
 
 def _ymd(value: Any) -> str:

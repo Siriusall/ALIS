@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from collections import Counter
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from typing import Any
 
 from app.db.store import _conn
@@ -11,8 +12,11 @@ from app.data_platform.db import _conn as data_conn
 HORIZONS = (5, 20, 60)
 
 
+_BUSINESS_TZ = ZoneInfo("Asia/Shanghai")
+
+
 def _now() -> str:
-    return datetime.now().isoformat(timespec="seconds")
+    return datetime.now(_BUSINESS_TZ).isoformat(timespec="seconds")
 
 
 def _ensure_tables() -> None:

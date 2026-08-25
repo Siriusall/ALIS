@@ -9,10 +9,13 @@ from __future__ import annotations
 import json
 import re
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from typing import Any
 from collections import Counter
 
 from app.data_platform.db import _conn
+
+_BUSINESS_TZ = ZoneInfo("Asia/Shanghai")
 
 
 # 行业关键词映射
@@ -201,10 +204,10 @@ def cluster_news_themes(*, as_of_time: str | None = None) -> dict[str, Any]:
             theme_articles.setdefault(kw, []).append(article)
 
     # Score each theme
-    now = datetime.now().isoformat(timespec="seconds")
+    now = datetime.now(_BUSINESS_TZ).isoformat(timespec="seconds")
     themes_written = 0
     company_mappings = 0
-    as_of_date = cutoff or datetime.now().strftime("%Y%m%d")
+    as_of_date = cutoff or datetime.now(_BUSINESS_TZ).strftime("%Y%m%d")
 
     with _conn() as c:
         for theme_name, articles_list in sorted(theme_articles.items(), key=lambda x: len(x[1]), reverse=True):

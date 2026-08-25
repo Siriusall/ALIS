@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from typing import Any
 
 
@@ -13,8 +14,11 @@ AWAITING_FIRST_REPLAY = "awaiting_first_replay"
 DEFAULT_INITIAL_CASH = 200_000.0
 
 
+_BUSINESS_TZ = ZoneInfo("Asia/Shanghai")
+
+
 def _now() -> str:
-    return datetime.now().astimezone().isoformat()
+    return datetime.now(_BUSINESS_TZ).isoformat()
 
 
 def _stable_hash(value: Any) -> str:

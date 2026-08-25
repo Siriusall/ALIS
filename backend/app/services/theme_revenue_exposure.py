@@ -5,12 +5,15 @@ from __future__ import annotations
 import json
 import hashlib
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from typing import Any
 
 from app.data_platform.db import _conn
 from app.data_platform.services.observation_clock import load_raw_record_versions
 from app.core.sql_compat import qmark_to_pyformat
 from app.services.news_theme_cluster import INDUSTRY_KEYWORDS
+
+_BUSINESS_TZ = ZoneInfo("Asia/Shanghai")
 
 
 def _ensure_tables() -> None:
@@ -298,7 +301,7 @@ def materialize_theme_revenue_exposure(*, as_of_time: str | None = None, limit_c
             tuple(change_params),
         ).fetchone()
         if not changed_codes:
-            now = datetime.now().isoformat(timespec="seconds")
+            now = datetime.now(_BUSINESS_TZ).isoformat(timespec="seconds")
             run_status = "historical_no_change" if cutoff else "completed"
             result_status = "historical_no_change" if cutoff else "no_change"
             if not cutoff:
@@ -316,7 +319,7 @@ def materialize_theme_revenue_exposure(*, as_of_time: str | None = None, limit_c
         code = str(row.get("ts_code") or "")
         if code:
             by_company.setdefault(code, []).append(row)
-    now = datetime.now().isoformat(timespec="seconds")
+    now = datetime.now(_BUSINESS_TZ).isoformat(timespec="seconds")
     written = 0
     companies_changed = 0
     with _conn() as conn:

@@ -1,14 +1,18 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 import json
 from typing import Any
 
 from app.db.store import _conn, _read_conn
 
 
+_BUSINESS_TZ = ZoneInfo("Asia/Shanghai")
+
+
 def _now() -> str:
-    return datetime.now().isoformat(timespec="seconds")
+    return datetime.now(_BUSINESS_TZ).isoformat(timespec="seconds")
 
 
 def _loads(value: Any, default: Any) -> Any:
@@ -20,7 +24,7 @@ def _loads(value: Any, default: Any) -> Any:
 
 def create_thesis(payload: dict[str, Any]) -> dict[str, Any]:
     now = _now()
-    next_review_at = payload.get("next_review_at") or (datetime.now() + timedelta(days=30)).isoformat(timespec="seconds")
+    next_review_at = payload.get("next_review_at") or (datetime.now(_BUSINESS_TZ) + timedelta(days=30)).isoformat(timespec="seconds")
     with _conn() as c:
         row = c.execute(
             """INSERT INTO investment_theses(ts_code,title,thesis_type,core_thesis,status,confidence,next_review_at,created_at,updated_at)

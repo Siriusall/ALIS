@@ -166,7 +166,12 @@ def _metrics() -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
     indicator_available, indicator_expected = financial_pair_coverage.get("fina_indicator", (0, 0))
     ann_fresh = False
     try:
-        ann_fresh = bool(latest_ann) and (datetime.now() - datetime.fromisoformat(latest_ann)).days <= 7
+        observed_at = datetime.fromisoformat(latest_ann) if latest_ann else None
+        if observed_at and observed_at.tzinfo is None:
+            observed_at = observed_at.replace(tzinfo=_BUSINESS_TZ)
+        elif observed_at:
+            observed_at = observed_at.astimezone(_BUSINESS_TZ)
+        ann_fresh = bool(observed_at) and (datetime.now(_BUSINESS_TZ) - observed_at).days <= 7
     except ValueError:
         pass
     from app.data_platform.services.data_center import get_vip_backfill_status

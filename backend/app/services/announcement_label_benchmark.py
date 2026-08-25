@@ -10,6 +10,7 @@ provider categories and therefore must never be presented as a full gold set.
 from __future__ import annotations
 
 from datetime import datetime
+from zoneinfo import ZoneInfo
 import hashlib
 import json
 import math
@@ -56,8 +57,11 @@ MIN_MANUAL_EVENT_TYPES = 3
 MANUAL_REVIEW_QUEUE_CONTRACT = "alis_announcement_manual_gold_review_queue_v1"
 
 
+_BUSINESS_TZ = ZoneInfo("Asia/Shanghai")
+
+
 def _now() -> str:
-    return datetime.now().isoformat(timespec="seconds")
+    return datetime.now(_BUSINESS_TZ).isoformat(timespec="seconds")
 
 
 def _normalise_label(row: dict[str, Any]) -> dict[str, Any]:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from typing import Any
 
 
@@ -13,8 +14,11 @@ ELIGIBILITY_STATUSES = {"ineligible", "evaluating", "eligible", "promoted", "rol
 CHANGE_TYPES = {"bugfix", "performance_tuning", "structural_change"}
 
 
+_BUSINESS_TZ = ZoneInfo("Asia/Shanghai")
+
+
 def _now() -> str:
-    return datetime.now().astimezone().isoformat()
+    return datetime.now(_BUSINESS_TZ).isoformat()
 
 
 def _candidate_type(model_key: str, config: dict[str, Any]) -> str:

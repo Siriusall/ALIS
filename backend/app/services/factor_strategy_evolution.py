@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from datetime import datetime
+from zoneinfo import ZoneInfo
 import hashlib
 import json
 from statistics import mean
@@ -29,8 +30,11 @@ MAX_COMBINATION_FACTORS = 8
 CONTINUOUS_RESEARCH_COMBINATION_STATUS = "research_confirmed"
 
 
+_BUSINESS_TZ = ZoneInfo("Asia/Shanghai")
+
+
 def _now() -> str:
-    return datetime.now().astimezone().isoformat()
+    return datetime.now(_BUSINESS_TZ).isoformat()
 
 
 def _ensure_tables() -> None:
