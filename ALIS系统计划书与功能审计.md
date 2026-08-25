@@ -1888,3 +1888,4 @@ ALIS 的目标运行方式调整为“系统自治、结果可见、异常才打
 - [x] 市场状态先完成六日聚合后，又用通用版本读取器把最新日5,500余份完整快照 JSON 全量传回应用机，只为计算成交额前5%集中度；高峰期第二次传输仍会触发30秒 `statement_timeout`，使已完整的日更被记为 `market_context_materialization_failed`。集中度现进入同一份先物化日期切片的不可变聚合 SQL，市场状态不再二次读取全量 JSON；点时聚合、市场状态、快照和日历专项回归 `36 passed`。
 - [x] 当前日 `adj_factor` 已有5,564条严格不可变证据，但就绪检查的通用“投影哈希连版本”SQL仍可能从41GB版本表起步并超时；异常被安全降级为空集合后，日更会误判复权因子缺失并重复下载。当前会话读取现先物化精确 `api_name+trade_date` 的接受投影小切片，再连接不可变版本；历史 OOS/PIT 截止读取仍走原严格路径。相关点时、日更状态与快照回归 `38 passed`。
 - [x] 继续清理来源审计歧义：股票主表、财务 VIP 批量和按报告期批量现在均记录具体活跃 provider（默认 `tushare_proxy`），不再把代理请求泛写为 `tushare`；规范快照和日期水位标记为内部 `data_platform` 派生，巨潮与人工导入分别标记 `cninfo/manual`。这只修正新运行和新投影的真实来源，不改写历史原始证据。数据中台、财务、日历和端点专项回归 `64 passed、6 subtests passed`。
+- [x] 应用机在日更持有一条长数据连接时，状态调度、计划检查和页面/API会把本地 `business=4/data=3` 连接闸门占满，线上出现5秒 `DatabaseConnectionCapacity/ConnectionTimeout`，而数据库真实 `max_connections=30`、现场仅11条连接。应用机预算小幅调整为 `business=5/data=4`，仍为单 API worker，四节点理论上限保留数据库管理余量；语句30秒和空闲事务15秒硬上限不放宽，不能用增加连接掩盖慢 SQL。
