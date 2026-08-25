@@ -78,6 +78,10 @@ def _now() -> str:
     return datetime.now(_BUSINESS_TZ).isoformat(timespec="seconds")
 
 
+def _business_today() -> date:
+    return datetime.now(_BUSINESS_TZ).date()
+
+
 def _resume_due(value: Any, *, now: datetime | None = None) -> bool:
     try:
         resume_at = datetime.fromisoformat(str(value or "").replace("Z", "+00:00"))
@@ -240,7 +244,7 @@ def _latest_snapshot_date_on_or_before(end: str) -> str:
 
 def build_backfill_plan(*, market_batch_days: int = 30, financial_batch_size: int = 100) -> dict[str, Any]:
     """Build a prioritized historical completion plan from current gaps."""
-    today = date.today()
+    today = _business_today()
     with _conn() as c:
         end = target_trade_day(c)
     start = end - timedelta(days=DAILY_LOOKBACK_DAYS)
@@ -1995,7 +1999,7 @@ def _moneyflow_required_coverage() -> tuple[list[str], set[str], list[str]]:
                    LIMIT ?
                ) cal
                ORDER BY cal.cal_date ASC""",
-            (datetime.now().strftime("%Y%m%d"), required_raw),
+            (_business_today().strftime("%Y%m%d"), required_raw),
         ).fetchall()
     trade_dates = [str(dict(row).get("cal_date") or "") for row in rows]
     covered_dates = {
@@ -2037,7 +2041,7 @@ def _model_moneyflow_checklist() -> dict[str, Any]:
 
 def _news_source_progress(*, phase: str, cursor: str, status: str) -> dict[str, Any]:
     start = date(2020, 1, 1)
-    end = datetime.now().date()
+    end = _business_today()
     total_days = max(1, (end - start).days + 1)
     processed_days = 0
     if phase == "major_news":
@@ -2073,7 +2077,7 @@ def _news_source_progress(*, phase: str, cursor: str, status: str) -> dict[str, 
 
 def _event_research_progress(*, phase: str, cursor: str, status: str) -> dict[str, Any]:
     start = date(2019, 1, 1)
-    end = datetime.now().date()
+    end = _business_today()
     total_days = max(1, (end - start).days + 1)
     processed_days = 0
     if phase == "event_research":
@@ -2106,7 +2110,7 @@ def _event_research_progress(*, phase: str, cursor: str, status: str) -> dict[st
 
 def _event_financial_periods() -> list[str]:
     periods: list[str] = []
-    today = datetime.now().date()
+    today = _business_today()
     for year in range(2019, today.year + 1):
         for month, day in ((3, 31), (6, 30), (9, 30), (12, 31)):
             end = date(year, month, day)
@@ -2418,7 +2422,7 @@ def _process_plan_model_data_backfill(payload: dict[str, Any]) -> dict[str, Any]
                    WHERE exchange='SSE' AND is_open=1 AND cal_date<=?
                    ORDER BY cal_date DESC LIMIT ?""",
                 (
-                    datetime.now().strftime("%Y%m%d"),
+                    _business_today().strftime("%Y%m%d"),
                     PLAN_MODEL_REQUIRED_LABELED_SESSIONS + 30,
                 ),
             ).fetchall()
@@ -2595,7 +2599,7 @@ def _process_plan_model_data_backfill(payload: dict[str, Any]) -> dict[str, Any]
                 "redirected_to": "moneyflow_residual",
                 "residual_count": len(moneyflow_missing),
             }
-        end_date = datetime.now().strftime("%Y%m%d")
+        end_date = _business_today().strftime("%Y%m%d")
         result = backfill_major_news_history(
             start_date="20200101",
             end_date=end_date,
@@ -2645,7 +2649,7 @@ def _process_plan_model_data_backfill(payload: dict[str, Any]) -> dict[str, Any]
         )
         result = backfill_event_research_history(
             start_date="20190101",
-            end_date=datetime.now().strftime("%Y%m%d"),
+            end_date=_business_today().strftime("%Y%m%d"),
             cursor=cursor,
             limit_months=1,
         )

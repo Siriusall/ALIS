@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import json
-from datetime import date
+from datetime import date, datetime
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from app.data_platform.db import _conn
 from app.data_platform.services.market_calendar import TradeCalendarNotReady, target_trade_date
 from app.data_platform.services.runtime_logs import list_runtime_logs
 from app.data_platform.redis_store import health as redis_health, stream_health
 from app.data_platform.services.snapshot_health import latest_usable_snapshot_date
+
+_BUSINESS_TZ = ZoneInfo("Asia/Shanghai")
 
 
 def _dict(row: Any) -> dict[str, Any]:
@@ -48,7 +51,7 @@ def _quality_issue(
 
 
 def _quality_audit(c: Any) -> dict[str, Any]:
-    today_s = date.today().strftime("%Y%m%d")
+    today_s = datetime.now(_BUSINESS_TZ).strftime("%Y%m%d")
     pending_total = int(_value(c.execute(
         "SELECT COUNT(*) n FROM dc_tushare_failed_requests WHERE status='pending'"
     ).fetchone(), "n"))

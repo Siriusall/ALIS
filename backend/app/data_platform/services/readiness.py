@@ -4,6 +4,7 @@ from datetime import date, datetime, timedelta
 import threading
 import time
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from app.data_platform.contracts import CONTRACTS
 from app.data_platform.db import _read_conn
@@ -17,6 +18,12 @@ _cache: dict[str, Any] = {"at": 0.0, "value": None}
 _CACHE_TTL = 30.0
 _refresh_lock = threading.Lock()
 _refresh_state: dict[str, Any] = {"running": False, "last_started_at": "", "last_finished_at": "", "last_error": "", "last_result": None}
+_BUSINESS_TZ = ZoneInfo("Asia/Shanghai")
+
+
+def _business_today() -> date:
+    """Use the ALIS business date, independent of the host OS timezone."""
+    return datetime.now(_BUSINESS_TZ).date()
 
 
 def invalidate_readiness_cache() -> None:
@@ -43,7 +50,7 @@ def _recent_report_periods(today: date) -> list[str]:
 
 
 def _metrics() -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
-    today_d = date.today()
+    today_d = _business_today()
     today = today_d.strftime("%Y%m%d")
     with _read_conn() as c:
         target = target_trade_date(c)
@@ -53,7 +60,7 @@ def _metrics() -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
     # Only published dates through today are eligible. Future calendar rows
     # must not inflate the denominator and create a false gap.
     calendar_end = today
-    calendar_expected = (date.today() - (date.today() - timedelta(days=730))).days + 1
+    calendar_expected = (today_d - (today_d - timedelta(days=730))).days + 1
     with _read_conn() as c:
         stock_count = int(_value(c.execute("SELECT COUNT(*) n FROM dc_stock_master").fetchone(), "n"))
         latest = target
@@ -74,7 +81,7 @@ def _metrics() -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
                     AND result_status IN ('success','not_applicable','valid_empty','deferred_empty')""",
                 (api, window_start, history_end),
             ).fetchone())
-        report_periods = _recent_report_periods(date.today())
+        report_periods = _recent_report_periods(today_d)
         financial_pair_coverage: dict[str, tuple[int, int]] = {}
         financial_expected = stock_count * len(report_periods)
         period_placeholders = ",".join("?" for _ in report_periods)

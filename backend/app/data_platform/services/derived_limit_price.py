@@ -7,6 +7,7 @@ import json
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from app.data_platform.db import _conn
 from app.data_platform.services.observation_clock import upsert_raw_record
@@ -18,10 +19,11 @@ SCHEMA_VERSION = "alis_exchange_rule_limit_price_v1"
 MAIN_BOARD_ST_RATE_CHANGE_DATE = "20260706"
 MIN_CALIBRATION_OBSERVATIONS = 500
 MIN_CALIBRATION_MATCH_RATE = 0.995
+_BUSINESS_TZ = ZoneInfo("Asia/Shanghai")
 
 
 def _now() -> str:
-    return datetime.now().isoformat(timespec="seconds")
+    return datetime.now(_BUSINESS_TZ).isoformat(timespec="seconds")
 
 
 def _economic_available_time(trade_date: str) -> str:
@@ -343,7 +345,7 @@ def repair_stk_limit_from_exchange_rules(trade_date: str) -> dict[str, Any]:
 
     tencent_quotes: dict[str, dict[str, Any]] = {}
     tencent_evidence: dict[str, Any] = {"attempted": False, "reason": "historical_date"}
-    if target == date.today().strftime("%Y%m%d") and eligible:
+    if target == datetime.now(_BUSINESS_TZ).strftime("%Y%m%d") and eligible:
         from app.data_platform.services.tencent_limit_fallback import fetch_tencent_limit_quotes
 
         tencent_evidence = {"attempted": True}

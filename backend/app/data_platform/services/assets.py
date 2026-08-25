@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import threading
 import time
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from app.data_platform.db import _conn
 from app.data_platform.redis_store import delete as redis_delete, get_json, set_json
@@ -24,6 +25,7 @@ _assets_cache_lock = threading.Lock()
 _assets_cache: dict[str, Any] = {"at": 0.0, "value": None}
 _assets_refresh_lock = threading.Lock()
 _assets_refresh_state: dict[str, Any] = {"running": False, "last_error": None}
+_BUSINESS_TZ = ZoneInfo("Asia/Shanghai")
 
 # Sparse / non-daily APIs that need a whole-table sample (usually tiny vs daily).
 _SPARSE_RAW_APIS = (
@@ -79,7 +81,7 @@ def _status(actual: int, expected: int | None, coverage: float | None, *, event_
 
 def _report_periods(today: date | None = None) -> list[str]:
     """Latest N report periods whose normal disclosure deadline has passed."""
-    today = today or date.today()
+    today = today or datetime.now(_BUSINESS_TZ).date()
     candidates: list[tuple[date, str]] = []
     for year in range(today.year, today.year - 5, -1):
         candidates.extend([
@@ -93,7 +95,7 @@ def _report_periods(today: date | None = None) -> list[str]:
 
 
 def _annual_periods(today: date | None = None) -> list[str]:
-    today = today or date.today()
+    today = today or datetime.now(_BUSINESS_TZ).date()
     # Prefer completed annual reports; if before April use previous year.
     latest_year = today.year - 1 if today.month < 4 else today.year - 1
     return [f"{year}1231" for year in range(latest_year, latest_year - FINANCIAL_ANNUAL_YEARS, -1)]
@@ -182,7 +184,7 @@ def invalidate_data_assets_cache() -> None:
 
 
 def _compute_data_assets() -> dict[str, Any]:
-    today = date.today()
+    today = datetime.now(_BUSINESS_TZ).date()
     with _conn() as c:
         end = target_trade_day(c)
     start = end - timedelta(days=DAILY_LOOKBACK_DAYS)

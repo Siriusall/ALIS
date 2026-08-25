@@ -513,8 +513,9 @@ def _optional_daily_retry_allowed(api_name: str, params: dict[str, Any]) -> bool
 
 
 def _recent_calendar_window(days_back: int = 30, days_forward: int = 60) -> tuple[str, str]:
-    start = (date.today() - timedelta(days=days_back)).strftime("%Y%m%d")
-    end = (date.today() + timedelta(days=days_forward)).strftime("%Y%m%d")
+    today = _business_today()
+    start = (today - timedelta(days=days_back)).strftime("%Y%m%d")
+    end = (today + timedelta(days=days_forward)).strftime("%Y%m%d")
     return start, end
 
 
@@ -2111,7 +2112,7 @@ def _upsert_raw_records(
             if api_name == "stk_holdernumber":
                 end_date = str(payload.get("end_date") or "")
                 holder_num = payload.get("holder_num")
-                invalid_date = bool(end_date and (not end_date.isdigit() or len(end_date) != 8 or end_date > date.today().strftime("%Y%m%d")))
+                invalid_date = bool(end_date and (not end_date.isdigit() or len(end_date) != 8 or end_date > _business_today().strftime("%Y%m%d")))
                 if invalid_date or holder_num is None:
                     reason = "invalid_future_end_date" if invalid_date else "missing_holder_num"
                     c.execute(

@@ -12,6 +12,7 @@ import re
 import tempfile
 from typing import Any
 from urllib.parse import urlparse
+from zoneinfo import ZoneInfo
 
 from pypdf import PdfReader
 import requests
@@ -531,7 +532,7 @@ def sync_professional_metric_candidates(*, limit: int = 1) -> dict[str, Any]:
     if not documents:
         from app.data_platform.services.data_center import sync_cninfo_announcements
 
-        today = datetime.now().date()
+        today = datetime.now(ZoneInfo("Asia/Shanghai")).date()
         sync_cninfo_announcements(
             start_date=(today - timedelta(days=210)).strftime("%Y%m%d"),
             end_date=today.strftime("%Y%m%d"),
