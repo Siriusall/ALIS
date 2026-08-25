@@ -521,7 +521,9 @@ def freeze_research_snapshot(
     evidence_signature = _research_evidence_signature(evidence_identity)
     with _conn() as conn:
         previous_rows = [dict(row) for row in conn.execute(
-            "SELECT * FROM factor_research_snapshots ORDER BY created_at DESC"
+            "SELECT snapshot_id,data_as_of,factor_universe_hash,factor_count,"
+            "research_windows_json,contract_json,created_at "
+            "FROM factor_research_snapshots ORDER BY created_at DESC LIMIT 1000"
         ).fetchall()]
     same_evidence = [
         row for row in previous_rows

@@ -366,6 +366,7 @@ def _archive_marker(
 
 def _raw_audit() -> dict[str, Any]:
     placeholders = ",".join("?" for _ in MODEL_KEYS)
+    history_limit = 10_000
     # This audit only reads and then decodes JSON outside the database call.
     # Keep the session autocommit/read-only so a large historical scan cannot
     # leave the business database idle in transaction.
@@ -381,7 +382,10 @@ def _raw_audit() -> dict[str, Any]:
         runs = [
             dict(row)
             for row in c.execute(
-                "SELECT * FROM model_train_runs ORDER BY id"
+                "SELECT id,status,phase,progress,message,model_version_id,"
+                "metrics_json,error,started_at,finished_at,created_at,updated_at "
+                "FROM model_train_runs ORDER BY id LIMIT ?",
+                (history_limit,),
             ).fetchall()
         ]
         tasks = [
@@ -445,6 +449,7 @@ def _raw_audit() -> dict[str, Any]:
         "tasks": tasks,
         "artifact_paths": artifact_paths,
         "current_artifact_paths": current_artifact_paths,
+        "train_runs_truncated": len(runs) >= history_limit,
     }
 
 
@@ -462,6 +467,7 @@ def audit_legacy_model_evaluations() -> dict[str, Any]:
         "affected_evolution_task_count": len(raw["tasks"]),
         "old_artifact_json_count": len(raw["artifact_paths"]),
         "current_artifact_json_count": len(raw["current_artifact_paths"]),
+        "train_runs_truncated": bool(raw.get("train_runs_truncated")),
         "active_runtime_bindings_preserved": [
             {
                 "id": int(row["id"]),

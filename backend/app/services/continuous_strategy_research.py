@@ -869,7 +869,7 @@ def _candidate_event(candidate_id: str) -> dict[str, Any] | None:
                 """SELECT * FROM strategy_research_events
                    WHERE research_line='candidate_generation'
                      AND event_type='candidate_strategy_generated'
-                   ORDER BY created_at ASC"""
+                   ORDER BY created_at ASC LIMIT 5000"""
             ).fetchall()
     for raw in rows:
         row = dict(raw)
