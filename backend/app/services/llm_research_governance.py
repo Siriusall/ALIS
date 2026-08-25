@@ -218,15 +218,22 @@ def llm_research_proposal_quality_report(*, limit: int = 200) -> dict[str, Any]:
         proposals = [dict(row) for row in conn.execute(
             "SELECT * FROM llm_research_proposals ORDER BY id ASC LIMIT ?", (cap,)
         ).fetchall()]
-        assessments = {
-            int(row["proposal_id"]): dict(row)
-            for row in conn.execute(
-                "SELECT * FROM llm_research_proposal_assessments ORDER BY proposal_id ASC"
-            ).fetchall()
-        }
-        routes = [dict(row) for row in conn.execute(
-            "SELECT * FROM llm_research_routes ORDER BY id ASC"
-        ).fetchall()]
+        proposal_ids = [int(row["id"]) for row in proposals]
+        assessments: dict[int, dict[str, Any]] = {}
+        routes: list[dict[str, Any]] = []
+        if proposal_ids:
+            placeholders = ",".join("?" for _ in proposal_ids)
+            assessments = {
+                int(row["proposal_id"]): dict(row)
+                for row in conn.execute(
+                    f"SELECT * FROM llm_research_proposal_assessments WHERE proposal_id IN ({placeholders}) ORDER BY proposal_id ASC",
+                    tuple(proposal_ids),
+                ).fetchall()
+            }
+            routes = [dict(row) for row in conn.execute(
+                f"SELECT * FROM llm_research_routes WHERE proposal_id IN ({placeholders}) ORDER BY id ASC LIMIT ?",
+                (*proposal_ids, cap * 10),
+            ).fetchall()]
 
     hypothesis_count = 0
     accepted_count = 0

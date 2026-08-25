@@ -408,7 +408,7 @@ def _matched_execution_outcome(decision: dict[str, Any]) -> dict[str, Any] | Non
             return sum(float(row.get(k) or 0) for k in fee_keys) * used / row_qty
 
         ledger = [dict(row) for row in c.execute(
-            "SELECT * FROM operations WHERE symbol=? ORDER BY at,id", (symbol,)
+            "SELECT * FROM operations WHERE symbol=? ORDER BY at,id LIMIT 5000", (symbol,)
         ).fetchall()]
 
         if side == "BUY":

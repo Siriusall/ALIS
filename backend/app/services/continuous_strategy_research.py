@@ -861,7 +861,7 @@ def _candidate_event(candidate_id: str) -> dict[str, Any] | None:
                WHERE research_line='candidate_generation'
                  AND event_type='candidate_strategy_generated'
                  AND (source_id=? OR source_id IS NULL)
-               ORDER BY created_at ASC""",
+               ORDER BY created_at ASC LIMIT 5000""",
             (str(candidate_id),),
         ).fetchall()
         if not rows:
