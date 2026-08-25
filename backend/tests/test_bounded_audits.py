@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 
-from app.services import manual_review_queue, performance_reports
+from app.services import decision_store, manual_review_queue, performance_reports
 
 
 class _Cursor:
@@ -76,3 +76,16 @@ def test_manual_review_triage_has_explicit_projection_and_bound(monkeypatch):
     assert "SELECT *" not in sql
     assert "ORDER BY UPDATED_AT DESC" in sql
     assert "LIMIT 5000" in sql
+
+
+def test_pool_members_default_read_is_bounded(monkeypatch):
+    conn = _Conn([])
+
+    @contextmanager
+    def fake_conn():
+        yield conn
+
+    monkeypatch.setattr(decision_store, "_conn", fake_conn)
+    assert decision_store.list_pool_members("candidate") == []
+    assert "LIMIT ?" in conn.sql[0].upper()
+    assert conn.params[0][-1] == 5000

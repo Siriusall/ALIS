@@ -2206,15 +2206,16 @@ def _prototype_maturity(member_count: int, representative_fitness: float) -> str
 
 def _load_completed_v10_candidates(snapshot_id: str) -> list[dict[str, Any]]:
     ensure_strategy_research_tables()
+    read_limit = 10000
     with _conn() as conn:
         events = [dict(row) for row in conn.execute(
             """SELECT * FROM strategy_research_events
                WHERE research_line='candidate_generation'
                  AND event_type='candidate_strategy_generated'
-                 AND status='completed' ORDER BY created_at ASC"""
+                 AND status='completed' ORDER BY created_at ASC LIMIT ?""", (read_limit,)
         ).fetchall()]
         backtests = [dict(row) for row in conn.execute(
-            "SELECT * FROM strategy_environment_backtests ORDER BY candidate_id,environment_id"
+            "SELECT * FROM strategy_environment_backtests ORDER BY candidate_id,environment_id LIMIT ?", (read_limit,)
         ).fetchall()]
     by_candidate: dict[str, list[dict[str, Any]]] = {}
     for row in backtests:

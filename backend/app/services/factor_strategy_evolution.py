@@ -727,15 +727,16 @@ def run_factor_strategy_evolution_cycle() -> dict[str, Any]:
 
 def factor_strategy_lineage_status() -> dict[str, Any]:
     _ensure_tables()
+    read_limit = 5000
     with _conn() as conn:
         combinations = [dict(row) for row in conn.execute(
-            "SELECT * FROM factor_combinations ORDER BY updated_at DESC"
+            "SELECT * FROM factor_combinations ORDER BY updated_at DESC LIMIT ?", (read_limit,)
         ).fetchall()]
         members = [dict(row) for row in conn.execute(
-            "SELECT * FROM factor_combination_members ORDER BY combination_key,factor_key"
+            "SELECT * FROM factor_combination_members ORDER BY combination_key,factor_key LIMIT ?", (read_limit,)
         ).fetchall()]
         links = [dict(row) for row in conn.execute(
-            "SELECT * FROM factor_strategy_links ORDER BY created_at DESC"
+            "SELECT * FROM factor_strategy_links ORDER BY created_at DESC LIMIT ?", (read_limit,)
         ).fetchall()]
     by_combination: dict[str, list[dict[str, Any]]] = {}
     for member in members:
@@ -761,4 +762,6 @@ def factor_strategy_lineage_status() -> dict[str, Any]:
         "schema_version": "alis_factor_strategy_lineage_v1",
         "combinations": combinations,
         "strategy_links": links,
+        "read_limit": read_limit,
+        "possibly_truncated": any(len(items) >= read_limit for items in (combinations, members, links)),
     }

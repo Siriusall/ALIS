@@ -65,14 +65,15 @@ def upsert_pool_member(*, ts_code: str, pool_type: str, reason: str) -> dict[str
     return dict(row)
 
 
-def list_pool_members(pool_type: str = "", limit: int | None = None) -> list[dict[str, Any]]:
+def list_pool_members(pool_type: str = "", limit: int | None = 5000) -> list[dict[str, Any]]:
+    """Return active memberships with a hard upper bound for API/worker reads."""
     with _conn() as c:
         params: tuple[Any, ...] = (pool_type,) if pool_type else ()
         where = "pool_type=? AND status='active'" if pool_type else "status='active'"
         sql = f"SELECT * FROM stock_pool_memberships WHERE {where} ORDER BY updated_at DESC"
         if limit is not None:
             sql += " LIMIT ?"
-            params += (max(1, min(int(limit), 500)),)
+            params += (max(1, min(int(limit), 5000)),)
         rows = c.execute(sql, params).fetchall()
     return [dict(x) for x in rows]
 
@@ -667,7 +668,9 @@ def list_position_state_history(ts_code: str = "", limit: int = 500) -> list[dic
 def list_position_states() -> list[dict[str, Any]]:
     """Return the latest auditable state for each investment position."""
     with _conn() as c:
-        rows = c.execute("SELECT * FROM position_states ORDER BY updated_at DESC, ts_code").fetchall()
+        rows = c.execute(
+            "SELECT * FROM position_states ORDER BY updated_at DESC, ts_code LIMIT 10000"
+        ).fetchall()
     return [dict(row) for row in rows]
 
 
