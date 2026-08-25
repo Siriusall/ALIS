@@ -414,7 +414,10 @@ def _readers(page_key: str) -> dict[str, Callable[[], Any]]:
             "researchArchive": lambda: __import__("app.api.routes.factors", fromlist=["factor_research_analytics_archive"]).factor_research_analytics_archive(),
         },
         "evidence": {
-            "decisionAudit": research.research_decision_audit,
+            # Direct route calls must replace FastAPI Query defaults with
+            # concrete values; Query instances are request metadata, not
+            # valid service-layer limits or filters.
+            "decisionAudit": lambda: research.research_decision_audit(limit=100, compact=False),
             # EvidenceChain expects the frozen decision rows (id, action,
             # timestamps and point-in-time evidence), not the dashboard
             # summary object whose nested fields would render as undefined.
@@ -428,7 +431,7 @@ def _readers(page_key: str) -> dict[str, Callable[[], Any]]:
             "performanceReports": lambda: quant_runs.quant_run_performance_reports(
                 task_id=None, limit=30
             ),
-            "ledgerDetail": lambda: quant_runs.quant_run_simulation_ledger(limit=20),
+            "ledgerDetail": lambda: quant_runs.quant_run_simulation_ledger(execution_id=None, limit=20),
             "reportCompact": lambda: decision_summary(limit_days=30),
             "backtests": lambda: quant_runs.quant_run_performance_reports(
                 task_id=None, limit=30

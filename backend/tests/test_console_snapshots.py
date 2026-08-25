@@ -453,3 +453,25 @@ def test_repeated_page_builds_reuse_formal_audit_summaries(monkeypatch):
     assert first["oos"]() == second["oos"]()
     assert first["sealed"]() == second["sealed"]()
     assert calls == ["oos", "sealed"]
+
+
+def test_evidence_snapshot_replaces_fastapi_query_defaults(monkeypatch):
+    from app.api.routes import quant_runs, research
+
+    calls = []
+    monkeypatch.setattr(
+        research,
+        "research_decision_audit",
+        lambda *, limit, compact: calls.append(("audit", limit, compact)) or {"ok": True},
+    )
+    monkeypatch.setattr(
+        quant_runs,
+        "quant_run_simulation_ledger",
+        lambda *, execution_id, limit: calls.append(("ledger", execution_id, limit)) or {"ok": True},
+    )
+
+    readers = snapshots._readers("evidence")
+
+    assert readers["decisionAudit"]() == {"ok": True}
+    assert readers["ledgerDetail"]() == {"ok": True}
+    assert calls == [("audit", 100, False), ("ledger", None, 20)]
