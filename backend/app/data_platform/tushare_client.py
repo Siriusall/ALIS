@@ -75,6 +75,33 @@ def configured_tushare_probe_endpoints() -> tuple[tuple[str, str], ...]:
     return tuple(dict.fromkeys(result))
 
 
+def active_tushare_provider_codes() -> tuple[str, ...]:
+    """Return only endpoints that may make new upstream requests.
+
+    ``tushare`` used to be both a product-family label and an independently
+    raced provider.  The primary client and ``tushare_proxy`` nevertheless
+    resolved to the same configured URL, so every close probe could hit the
+    same proxy twice and persist misleading provider evidence.  Active
+    routing is now derived exclusively from the configured endpoint names.
+    Historical rows labelled ``tushare`` remain readable through
+    :func:`tushare_compatible_source_codes` below.
+    """
+    return tuple(
+        dict.fromkeys(
+            name for name, _endpoint in configured_tushare_probe_endpoints()
+            if str(name or "").strip()
+        )
+    )
+
+
+def primary_tushare_provider_code() -> str:
+    """Canonical source label for the configured primary proxy."""
+    providers = active_tushare_provider_codes()
+    if not providers:
+        raise RuntimeError("no configured TuShare-compatible endpoint")
+    return providers[0]
+
+
 def tushare_compatible_source_codes() -> tuple[str, ...]:
     """Return source identifiers backed by a TuShare-compatible endpoint.
 
@@ -83,10 +110,10 @@ def tushare_compatible_source_codes() -> tuple[str, ...]:
     configured compatible endpoint rather than assuming the primary source
     is always available.
     """
-    return ("tushare",) + tuple(
-        name for name, _endpoint in configured_tushare_probe_endpoints()
-        if name and name != "tushare"
-    )
+    # ``tushare`` is retained only as a read-compatibility alias for evidence
+    # written before proxy source attribution became explicit.  It must not
+    # be used to schedule a second request to the primary endpoint.
+    return tuple(dict.fromkeys(active_tushare_provider_codes() + ("tushare",)))
 
 
 def is_tushare_compatible_source(provider: str) -> bool:

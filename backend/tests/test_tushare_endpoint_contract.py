@@ -28,6 +28,9 @@ def test_probe_endpoints_default_to_primary_proxy_only(monkeypatch):
     endpoints = dict(tushare_client.configured_tushare_probe_endpoints())
 
     assert endpoints == {"tushare_proxy": "http://lianghua.nanyangqiankun.top"}
+    assert tushare_client.active_tushare_provider_codes() == ("tushare_proxy",)
+    assert tushare_client.primary_tushare_provider_code() == "tushare_proxy"
+    assert tushare_client.tushare_compatible_source_codes() == ("tushare_proxy", "tushare")
 
 
 def test_probe_endpoints_allow_explicit_compatible_fallbacks(monkeypatch):

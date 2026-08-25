@@ -1172,9 +1172,16 @@ def daily_update_status(*, compact: bool = False) -> dict[str, Any]:
                    ORDER BY dataset,probed_at,latency_ms""",
                 (target,),
             ).fetchall()
+            from app.data_platform.services.market_data_discovery import DATASET_PROVIDERS
+
+            current_probe_rows = [
+                dict(row) for row in probe_rows
+                if str(dict(row).get("provider") or "")
+                in set(DATASET_PROVIDERS.get(str(dict(row).get("dataset") or ""), ()))
+            ]
             state["provider_discovery"] = {
                 "trade_date": target,
-                "items": [dict(row) for row in probe_rows],
+                "items": current_probe_rows,
                 "policy": "adaptive_probe_then_hedged_first_complete_slice_v2",
             }
             performance_rows = c.execute(
@@ -1183,7 +1190,11 @@ def daily_update_status(*, compact: bool = False) -> dict[str, Any]:
                    WHERE sample_date=(SELECT MAX(sample_date) FROM dc_market_provider_performance)
                    ORDER BY dataset,provider"""
             ).fetchall()
-            state["provider_performance"] = [dict(row) for row in performance_rows]
+            state["provider_performance"] = [
+                dict(row) for row in performance_rows
+                if str(dict(row).get("provider") or "")
+                in set(DATASET_PROVIDERS.get(str(dict(row).get("dataset") or ""), ()))
+            ]
             if not compact:
                 # These are useful for the full data-center diagnostics but
                 # are too expensive for the task-center poll: calibration

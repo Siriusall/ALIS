@@ -18,10 +18,12 @@ import requests
 
 from app.data_platform.db import _conn, _is_mysql, _read_conn
 from app.data_platform.tushare_client import (
+    active_tushare_provider_codes,
     configured_tushare_probe_endpoints,
     get_tushare_client,
     get_tushare_client_for_provider,
     is_tushare_compatible_source,
+    primary_tushare_provider_code,
     reset_tushare_client,
     tushare_compatible_source_codes,
 )
@@ -1197,6 +1199,11 @@ def sync_tushare_api_raw(
         _emit_tushare_activity("cooldown", api_name, params or {}, seconds=cooldown)
         raise TushareCoolingDown(api_name, cooldown)
     provider = str(provider or SOURCE_TUSHARE).strip() or SOURCE_TUSHARE
+    # ``SOURCE_TUSHARE`` is the catalog/product-family key.  New requests and
+    # raw evidence must carry the concrete configured endpoint name so the UI
+    # and audit ledger never imply that the official host was contacted.
+    if provider == SOURCE_TUSHARE:
+        provider = primary_tushare_provider_code()
     run_meta = {
         "api": api_name,
         "params": params or {},
@@ -2924,7 +2931,7 @@ def _sync_discovered_market_bundle(
             str(item.get("provider") or "")
             for item in available_bulk_candidates(api_name, trade_date)
         )
-        providers.extend(tushare_compatible_source_codes())
+        providers.extend(active_tushare_provider_codes())
         providers = list(dict.fromkeys(provider for provider in providers if provider))
         attempts: list[dict[str, Any]] = []
         result: dict[str, Any] | None = None
@@ -5133,7 +5140,7 @@ def _sync_tushare_compatible_range(
             "provider_policy": "publication_probe_required_before_range_fetch",
         }
     providers = [winner] if is_tushare_compatible_source(winner) else []
-    providers.extend(provider for provider in tushare_compatible_source_codes() if provider not in providers)
+    providers.extend(provider for provider in active_tushare_provider_codes() if provider not in providers)
     attempts: list[dict[str, Any]] = []
     for provider in providers:
         started = time.monotonic()
@@ -5341,7 +5348,7 @@ def sync_training_market_date_vip(trade_date: str) -> dict[str, Any]:
 
         discovery = discover_first_published(api_name, value)
         discovered_provider = str(discovery.get("winner") or "")
-        compatible_providers = list(tushare_compatible_source_codes())
+        compatible_providers = list(active_tushare_provider_codes())
         provider_order = (
             [discovered_provider]
             if is_tushare_compatible_source(discovered_provider)
@@ -5548,8 +5555,20 @@ def build_stock_daily_snapshot(trade_date: str) -> dict[str, Any]:
             limits = raw_dependencies["payloads"]["stk_limit"]
             suspended = set(raw_dependencies["payloads"]["suspend_d"].keys())
             source_metadata = raw_dependencies["source_metadata"]
+            date_marker = c.execute(
+                "SELECT updated_at FROM dc_available_trade_dates WHERE trade_date=? LIMIT 1",
+                (trade_date,),
+            ).fetchone()
+            date_marker_exists = bool(date_marker)
+            marker_updated_at = str(dict(date_marker).get("updated_at") or "") if date_marker else ""
+            projection_changed_before_run = bool(date_marker_exists and c.execute(
+                """SELECT 1 FROM dc_stock_daily_snapshot
+                     WHERE trade_date=? AND updated_at>? LIMIT 1""",
+                (trade_date, marker_updated_at),
+            ).fetchone())
         now = _now()
         written = 0
+        projection_changed = not date_marker_exists or projection_changed_before_run
         stock_codes = set(stocks.keys())
         all_codes = sorted((set(daily_basic) | set(daily) | set(adj_factors) | set(limits) | suspended) & stock_codes)
         with _conn() as c:
@@ -5684,7 +5703,7 @@ def build_stock_daily_snapshot(trade_date: str) -> dict[str, Any]:
                     snapshot_hash,
                     now,
                 )
-                _upsert_snapshot_row(c, values)
+                projection_changed = _upsert_snapshot_row(c, values) or projection_changed
                 written += 1
                 if written % SNAPSHOT_MATERIALIZATION_BATCH_SIZE == 0:
                     # Each row's immutable append and overwrite projection
@@ -5692,7 +5711,7 @@ def build_stock_daily_snapshot(trade_date: str) -> dict[str, Any]:
                     # data contract incomplete rather than exposing a false
                     # full-day success.
                     c.commit()
-            if written > 0:
+            if written > 0 and projection_changed:
                 # The date marker is only a freshness watermark.  It must
                 # carry the actual latest observation, not the market close.
                 watermark_values = [
@@ -6244,7 +6263,7 @@ def _oos_hard_stats_target_dates(c: Any, trade_dates: list[str]) -> set[str]:
     return targets | (candidates & rolling_dates)
 
 
-def _upsert_snapshot_row(c: Any, values: tuple[Any, ...]) -> None:
+def _upsert_snapshot_row(c: Any, values: tuple[Any, ...]) -> bool:
     # 27 legacy fields + five observation-clock fields + updated_at.
     has_clock = False
     try:
@@ -6263,7 +6282,7 @@ def _upsert_snapshot_row(c: Any, values: tuple[Any, ...]) -> None:
             raise RuntimeError("observation_clock_schema_inspection_failed")
     if not has_clock:
         values = values[:26] + (values[-1],)
-        c.execute(
+        cursor = c.execute(
             """INSERT INTO dc_stock_daily_snapshot
                (ts_code,trade_date,symbol,name,industry,close,open,high,low,pre_close,adj_factor,change_pct,volume,turnover,
                 total_mv,circ_mv,pe_ttm,pb,turnover_rate,up_limit,down_limit,is_suspended,data_quality_score,quality_flags_json,
@@ -6279,9 +6298,9 @@ def _upsert_snapshot_row(c: Any, values: tuple[Any, ...]) -> None:
                 source_code=excluded.source_code,available_time=excluded.available_time,updated_at=excluded.updated_at""",
             values,
         )
-        return
+        return int(getattr(cursor, "rowcount", 0) or 0) > 0
     if c._is_mysql:
-        c.execute(
+        cursor = c.execute(
             """
             INSERT INTO dc_stock_daily_snapshot
                 (ts_code, trade_date, symbol, name, industry, close, open, high, low, pre_close, adj_factor, change_pct, volume, turnover, total_mv, circ_mv, pe_ttm, pb,
@@ -6301,8 +6320,9 @@ def _upsert_snapshot_row(c: Any, values: tuple[Any, ...]) -> None:
             """,
             values,
         )
+        return int(getattr(cursor, "rowcount", 0) or 0) > 0
     else:
-        c.execute(
+        cursor = c.execute(
             """
             INSERT INTO dc_stock_daily_snapshot
                 (ts_code, trade_date, symbol, name, industry, close, open, high, low, pre_close, adj_factor, change_pct, volume, turnover, total_mv, circ_mv, pe_ttm, pb,
@@ -6340,9 +6360,11 @@ def _upsert_snapshot_row(c: Any, values: tuple[Any, ...]) -> None:
                 observation_provenance = excluded.observation_provenance,
                 content_hash = excluded.content_hash,
                 updated_at = excluded.updated_at
+            WHERE dc_stock_daily_snapshot.content_hash IS DISTINCT FROM excluded.content_hash
             """,
             values,
         )
+        return int(getattr(cursor, "rowcount", 0) or 0) > 0
 
 
 def run_data_quality_checks(trade_date: str | None = None) -> dict[str, Any]:

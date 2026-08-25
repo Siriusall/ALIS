@@ -2,19 +2,21 @@ from app.data_platform.services import market_data_discovery as discovery
 
 
 def test_defensive_fund_discovery_includes_all_configured_tushare_compatible_sources(monkeypatch):
-    from app.data_platform.tushare_client import tushare_compatible_source_codes
+    from app.data_platform.tushare_client import active_tushare_provider_codes
 
     providers = discovery.DATASET_PROVIDERS["defensive_fund_daily"]
     assert providers[0] == "tencent_etf_quote"
-    assert set(tushare_compatible_source_codes()).issubset(providers)
+    assert set(active_tushare_provider_codes()).issubset(providers)
+    assert "tushare" not in providers
 
 
 def test_core_market_discovery_includes_all_configured_tushare_compatible_sources():
-    from app.data_platform.tushare_client import tushare_compatible_source_codes
+    from app.data_platform.tushare_client import active_tushare_provider_codes
 
-    compatible = set(tushare_compatible_source_codes())
+    compatible = set(active_tushare_provider_codes())
     for dataset in ("daily", "daily_basic", "stk_limit", "index_daily", "adj_factor"):
         assert compatible.issubset(discovery.DATASET_PROVIDERS[dataset])
+        assert "tushare" not in discovery.DATASET_PROVIDERS[dataset]
 
 
 def test_tencent_etf_probe_fetches_once_and_rejects_partial_execution_bar(monkeypatch):

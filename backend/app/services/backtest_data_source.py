@@ -372,6 +372,8 @@ class BacktestDataSource:
                 "ts_code", "trade_date", "content_hash",
             }.issubset(projection_columns)
             version_source_sql = "dc_stock_daily_snapshot_version v"
+            accepted_slice_cte = ""
+            accepted_slice_params: list[str] = []
             if has_accepted_projection:
                 # The accepted snapshot projection has a unique
                 # (ts_code, trade_date) key. Join it directly to the immutable
@@ -379,12 +381,27 @@ class BacktestDataSource:
                 # every version row. The old form repeatedly scanned hundreds
                 # of thousands of versions during daily plan generation and
                 # exhausted PostgreSQL's statement timeout.
-                version_source_sql = (
-                    "dc_stock_daily_snapshot_version v "
-                    "JOIN dc_stock_daily_snapshot p "
-                    "ON p.ts_code=v.ts_code AND p.trade_date=v.trade_date "
-                    "AND p.content_hash=v.content_hash"
-                )
+                if postgres and ymd:
+                    accepted_slice_cte = (
+                        "WITH accepted_snapshot AS MATERIALIZED ("
+                        "SELECT ts_code,trade_date,content_hash "
+                        "FROM dc_stock_daily_snapshot WHERE trade_date=?"
+                        ") "
+                    )
+                    accepted_slice_params.append(ymd)
+                    version_source_sql = (
+                        "accepted_snapshot p "
+                        "JOIN dc_stock_daily_snapshot_version v "
+                        "ON p.ts_code=v.ts_code AND p.trade_date=v.trade_date "
+                        "AND p.content_hash=v.content_hash"
+                    )
+                else:
+                    version_source_sql = (
+                        "dc_stock_daily_snapshot_version v "
+                        "JOIN dc_stock_daily_snapshot p "
+                        "ON p.ts_code=v.ts_code AND p.trade_date=v.trade_date "
+                        "AND p.content_hash=v.content_hash"
+                    )
             predicates: list[str] = [
                 "v.observed_at<>''",
                 "v.content_hash<>''",
@@ -416,7 +433,7 @@ class BacktestDataSource:
                 params.append(self._as_of_time)
             where = " AND ".join(predicates)
             if has_accepted_projection:
-                sql = f"""SELECT v.ts_code,v.trade_date,v.payload_json,v.source_code,
+                sql = f"""{accepted_slice_cte}SELECT v.ts_code,v.trade_date,v.payload_json,v.source_code,
                                 v.economic_available_time,v.observed_at,v.first_observed_at,
                                 v.observation_provenance,v.content_hash,v.created_at
                            FROM {version_source_sql}
@@ -439,7 +456,9 @@ class BacktestDataSource:
                                   observation_provenance,content_hash,created_at
                              FROM ranked WHERE row_rank=1"""
             with _read_data_conn() as conn:
-                raw_rows = [dict(row) for row in conn.execute(sql, tuple(params)).fetchall()]
+                raw_rows = [dict(row) for row in conn.execute(
+                    sql, tuple(accepted_slice_params + params),
+                ).fetchall()]
             decoded = [self._decode_versioned_snapshot_row(raw) for raw in raw_rows]
             self._versioned_snapshot_cache[cache_key] = [dict(row) for row in decoded]
             return decoded

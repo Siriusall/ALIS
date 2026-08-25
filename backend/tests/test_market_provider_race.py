@@ -87,7 +87,7 @@ def test_targeted_market_repair_keeps_probe_winner_source(monkeypatch):
     assert result["results"][0]["provider"] == "tushare_proxy"
 
 
-def test_targeted_market_repair_falls_back_only_after_winner_bulk_failure(monkeypatch):
+def test_targeted_market_repair_does_not_retry_primary_proxy_through_legacy_alias(monkeypatch):
     calls = []
     monkeypatch.setattr(
         discovery,
@@ -96,22 +96,21 @@ def test_targeted_market_repair_falls_back_only_after_winner_bulk_failure(monkey
     )
     monkeypatch.setattr(discovery, "available_bulk_candidates", lambda *_args: [])
     monkeypatch.setattr(discovery, "mark_provider_bulk_result", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(data_center, "tushare_compatible_source_codes", lambda: ("tushare_proxy", "tushare"))
+    monkeypatch.setattr(data_center, "active_tushare_provider_codes", lambda: ("tushare_proxy",))
     monkeypatch.setattr(data_center, "build_stock_daily_snapshot", lambda _date: {"ok": True})
 
     def sync(api, params, **kwargs):
         provider = kwargs.get("provider", "tushare")
         calls.append(provider)
-        return {"ok": provider == "tushare", "status": "failed" if provider == "tushare_proxy" else "completed"}
+        return {"ok": False, "status": "failed"}
 
     monkeypatch.setattr(data_center, "_safe_sync_raw", sync)
     result = data_center.sync_market_bundle("20260810", apis=["adj_factor"])
 
-    assert result["ok"] is True
-    assert calls == ["tushare_proxy", "tushare"]
+    assert result["ok"] is False
+    assert calls == ["tushare_proxy"]
     assert result["results"][0]["provider_attempts"] == [
         {"provider": "tushare_proxy", "ok": False, "status": "failed"},
-        {"provider": "tushare", "ok": True, "status": "completed"},
     ]
 
 

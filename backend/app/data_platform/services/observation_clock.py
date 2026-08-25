@@ -816,7 +816,30 @@ def load_snapshot_market_aggregates(
             "THEN CAST(json_extract(payload,'$.turnover') AS REAL) END"
         )
 
-    if has_accepted_projection:
+    materialized_accepted_slice = bool(has_accepted_projection and is_postgres)
+    if materialized_accepted_slice:
+        # PostgreSQL previously started from immutable versions because the
+        # clock predicates made the six-date slice look like a single row.
+        # It then performed tens of thousands of random lookups against the
+        # 7 GB accepted projection and regularly hit the 30-second budget.
+        # Materializing the explicitly bounded accepted-date slice fixes the
+        # join direction without disabling planner choices for other readers.
+        version_predicates = predicates[:-1]
+        visible_sql = f"""accepted_rows AS MATERIALIZED (
+                         SELECT ts_code,trade_date,content_hash
+                           FROM dc_stock_daily_snapshot
+                          WHERE trade_date IN ({placeholders})
+                     ), visible AS (
+                         SELECT v.ts_code,v.trade_date,v.payload_json
+                           FROM accepted_rows accepted
+                           JOIN dc_stock_daily_snapshot_version v
+                             ON v.ts_code=accepted.ts_code
+                            AND v.trade_date=accepted.trade_date
+                            AND v.content_hash=accepted.content_hash
+                          WHERE {' AND '.join(version_predicates)}
+                     ), decoded AS (
+        """
+    elif has_accepted_projection:
         # The accepted hash is authoritative for each date/code.  Joining it
         # directly avoids sorting every immutable version and keeps late
         # repairs invisible when they are not the accepted projection.
@@ -844,10 +867,11 @@ def load_snapshot_market_aggregates(
                            FROM ranked WHERE row_rank=1
                      ), decoded AS (
         """
+    numeric_materialization = "MATERIALIZED " if is_postgres else ""
     sql = f"""WITH {visible_sql}
                      SELECT ts_code,trade_date,{payload} AS payload
                        FROM visible v
-                 ), numeric_values AS (
+                 ), numeric_values AS {numeric_materialization}(
                      SELECT ts_code,trade_date,{change_pct} AS change_pct,{turnover} AS turnover
                        FROM decoded
                  )
@@ -868,9 +892,12 @@ def load_snapshot_market_aggregates(
                   GROUP BY trade_date
                   ORDER BY trade_date"""
     params: list[Any] = []
+    if materialized_accepted_slice:
+        params.extend(compact_dates)
     if observed_cutoff:
         params.extend([observed_cutoff] * 3)
-    params.extend(compact_dates)
+    if not materialized_accepted_slice:
+        params.extend(compact_dates)
     rows = c.execute(sql, tuple(params)).fetchall()
     return {
         str(dict(row).get("trade_date") or ""): dict(row)

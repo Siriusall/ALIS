@@ -44,6 +44,8 @@ def test_clocked_snapshot_upsert_has_one_parameter_per_column(is_mysql: bool):
     assert len(connection.calls) == 1
     sql, params = connection.calls[0]
     assert sql.count("?") == len(params) == 32
+    if not is_mysql:
+        assert "content_hash IS DISTINCT FROM excluded.content_hash" in sql
 
 
 def test_strict_benchmark_accepts_audited_fallback_previous_close(monkeypatch):

@@ -26,14 +26,14 @@ from app.data_platform.services.eastmoney_index_daily_fallback import (
 )
 from app.data_platform.services.tencent_market_snapshot import _fetch_batch
 from app.data_platform.tushare_client import (
+    active_tushare_provider_codes,
     get_tushare_client_for_provider,
-    tushare_compatible_source_codes,
 )
 
 
 STOCK_PROBE_CODE = "600000.SH"
 INDEX_PROBE_CODE = "000300.SH"
-_TUSHARE_COMPATIBLE_PROVIDERS = tushare_compatible_source_codes()
+_TUSHARE_COMPATIBLE_PROVIDERS = active_tushare_provider_codes()
 DATASET_PROVIDERS: dict[str, tuple[str, ...]] = {
     "daily": tuple(dict.fromkeys(("tencent_market_snapshot",) + _TUSHARE_COMPATIBLE_PROVIDERS)),
     "daily_basic": tuple(dict.fromkeys(("tencent_market_snapshot",) + _TUSHARE_COMPATIBLE_PROVIDERS)),
@@ -47,7 +47,7 @@ DATASET_PROVIDERS: dict[str, tuple[str, ...]] = {
     # availability.
     "adj_factor": _TUSHARE_COMPATIBLE_PROVIDERS,
     "defensive_fund_daily": tuple(dict.fromkeys(
-        ("tencent_etf_quote",) + tushare_compatible_source_codes()
+        ("tencent_etf_quote",) + active_tushare_provider_codes()
     )),
 }
 _HARD_PROBE_FAILURE_CATEGORIES = frozenset({
