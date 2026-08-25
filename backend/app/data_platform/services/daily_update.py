@@ -404,7 +404,9 @@ def _run_research_maintenance(trade_date: str) -> dict[str, Any]:
             # data connection pool for an entire historical range.
             missing_dates = [str(item) for item in themes.get("missing_dates") or []][:2]
             if not missing_dates:
-                with _conn() as c:
+                # This calendar lookup is read-only and does not belong to
+                # the later theme-history materialization transaction.
+                with _read_conn() as c:
                     calendar = [str(row["cal_date"]) for row in c.execute(
                         "SELECT cal_date FROM dc_trade_calendar WHERE is_open=1 AND cal_date<=? ORDER BY cal_date DESC LIMIT 20",
                         (trade_date,),
@@ -931,7 +933,11 @@ def start_daily_update_scheduler() -> bool:
         while True:
             try:
                 now = _business_now()
-                with _conn() as c:
+                # Every scheduler probe is read-only.  PostgreSQL autocommit
+                # gives each statement an independent transaction, so one
+                # bounded statement timeout cannot poison all later metadata
+                # checks with ``current transaction is aborted``.
+                with _read_conn() as c:
                     target = target_trade_date(c, now=now)
                     should_check = _scheduler_should_check(now, target)
                     if should_check:

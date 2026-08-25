@@ -266,7 +266,7 @@ def test_scheduler_reads_etf_execution_evidence_after_metadata_transaction_close
     monkeypatch.setattr(daily_update, "_DAILY_UPDATE_INTERVAL_SEC", 0)
     monkeypatch.setattr("app.services.runtime_heartbeat.mark_started", lambda *_args, **_kwargs: None)
     monkeypatch.setattr("app.services.runtime_heartbeat.beat", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(daily_update, "_conn", lambda: _Conn())
+    monkeypatch.setattr(daily_update, "_read_conn", lambda: _Conn())
     monkeypatch.setattr(daily_update, "_scheduler_should_check", lambda *_args: True)
     monkeypatch.setattr(daily_update, "target_trade_date", lambda *_args, **_kwargs: "20260729")
     monkeypatch.setattr(daily_update, "_latest_decision_ready_trade_date", lambda *_args: "20260729")
