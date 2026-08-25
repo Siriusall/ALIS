@@ -794,7 +794,12 @@ def sync_trade_calendar(
     if not start_date or not end_date:
         start_date, end_date = _recent_calendar_window()
     exchange = exchange or "SSE"
-    run_id = start_ingestion_run("tushare.trade_cal", {"api": "trade_cal", "exchange": exchange, "start_date": start_date, "end_date": end_date})
+    provider = primary_tushare_provider_code()
+    run_id = start_ingestion_run(
+        f"{provider}.trade_cal",
+        {"api": "trade_cal", "exchange": exchange, "start_date": start_date, "end_date": end_date, "provider": provider},
+        source_code=provider,
+    )
     try:
         client = get_tushare_client()
         df = client.pro.trade_cal(
@@ -804,7 +809,7 @@ def sync_trade_calendar(
             fields="exchange,cal_date,is_open,pretrade_date",
         )
         df = df if isinstance(df, pd.DataFrame) else pd.DataFrame()
-        written = _upsert_trade_calendar(df)
+        written = _upsert_trade_calendar(df, source_code=provider)
         finish_ingestion_run(run_id, status="completed", rows_read=len(df), rows_written=written)
         _record_probe("trade_cal", "ok" if written else "empty", len(df))
         return {

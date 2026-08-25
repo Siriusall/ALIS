@@ -3,6 +3,7 @@ from __future__ import annotations
 import sqlite3
 from contextlib import contextmanager
 
+import pandas as pd
 import pytest
 
 from app.data_platform.services import data_center, daily_update
@@ -166,6 +167,38 @@ def test_historical_calendar_sync_does_not_enable_current_day_fallback_by_defaul
 
     with pytest.raises(RuntimeError, match="token invalid"):
         data_center.sync_trade_calendar("20260714", "20260825")
+
+
+def test_trade_calendar_sync_records_concrete_proxy_provider(monkeypatch):
+    captured: dict[str, object] = {}
+
+    class _Pro:
+        @staticmethod
+        def trade_cal(**_kwargs):
+            return pd.DataFrame([{
+                "exchange": "SSE",
+                "cal_date": "20260825",
+                "is_open": 1,
+                "pretrade_date": "20260824",
+            }])
+
+    class _Client:
+        pro = _Pro()
+
+    monkeypatch.setattr(data_center, "ensure_data_center_seeded", lambda: None)
+    monkeypatch.setattr(data_center, "primary_tushare_provider_code", lambda: "tushare_proxy")
+    monkeypatch.setattr(data_center, "get_tushare_client", lambda: _Client())
+    monkeypatch.setattr(data_center, "start_ingestion_run", lambda name, meta, **kwargs: captured.update(name=name, meta=meta, kwargs=kwargs) or 7)
+    monkeypatch.setattr(data_center, "finish_ingestion_run", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(data_center, "_record_probe", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(data_center, "_upsert_trade_calendar", lambda _frame, **kwargs: captured.update(upsert=kwargs) or 1)
+
+    result = data_center.sync_trade_calendar("20260825", "20260825")
+
+    assert result["ok"] is True
+    assert captured["name"] == "tushare_proxy.trade_cal"
+    assert captured["kwargs"] == {"source_code": "tushare_proxy"}
+    assert captured["upsert"] == {"source_code": "tushare_proxy"}
 
 
 def test_daily_update_calendar_auth_failure_is_bounded(monkeypatch):
