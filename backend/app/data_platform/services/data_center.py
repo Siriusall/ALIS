@@ -706,11 +706,15 @@ def sync_tushare_catalog_from_probe(probe_results: list[dict[str, Any]]) -> dict
 
 def sync_stock_basic() -> dict[str, Any]:
     ensure_data_center_seeded()
-    run_id = start_ingestion_run("tushare.stock_basic", {"api": "stock_basic"})
+    provider = primary_tushare_provider_code()
+    run_id = start_ingestion_run(
+        f"{provider}.stock_basic", {"api": "stock_basic", "provider": provider},
+        source_code=provider,
+    )
     try:
         client = get_tushare_client()
         df = client.stock_basic(list_status="L", fields="ts_code,symbol,name,area,industry,market,list_date")
-        written = _upsert_stock_master(df)
+        written = _upsert_stock_master(df, source_code=provider)
         finish_ingestion_run(run_id, status="completed", rows_read=len(df), rows_written=written)
         _record_probe("stock_basic", "ok" if written else "empty", len(df))
         return {"ok": True, "run_id": run_id, "rows_read": len(df), "rows_written": written}
@@ -720,7 +724,7 @@ def sync_stock_basic() -> dict[str, Any]:
         raise
 
 
-def _upsert_stock_master(df: pd.DataFrame) -> int:
+def _upsert_stock_master(df: pd.DataFrame, *, source_code: str = SOURCE_TUSHARE) -> int:
     if not isinstance(df, pd.DataFrame) or df.empty:
         return 0
     now = _now()
@@ -735,7 +739,7 @@ def _upsert_stock_master(df: pd.DataFrame) -> int:
                 str(row.get("industry") or "").strip(),
                 str(row.get("market") or "").strip(),
                 str(row.get("list_date") or "").strip(),
-                SOURCE_TUSHARE,
+                str(source_code or SOURCE_TUSHARE),
                 now,
                 now,
             )
@@ -4483,7 +4487,8 @@ def sync_financial_vip_period(period: str, *, contract_mode: str = "core") -> di
     endpoints return the whole period in one request; unsupported VIP APIs
     are reported as unavailable so the caller can fall back to stock batches.
     """
-    client = get_tushare_client()
+    provider = primary_tushare_provider_code()
+    client = get_tushare_client_for_provider(provider)
     results: list[dict[str, Any]] = []
     vip_fields = {
         "income": "ts_code,ann_date,f_ann_date,end_date,report_type,revenue,total_revenue,operate_profit,total_profit,n_income,n_income_attr_p,basic_eps,diluted_eps",
@@ -4493,14 +4498,18 @@ def sync_financial_vip_period(period: str, *, contract_mode: str = "core") -> di
     }
     for api in ("income", "balancesheet", "cashflow", "fina_indicator"):
         vip_api = f"{api}_vip"
-        run_id = start_ingestion_run(f"data_platform.{vip_api}", {"period": period, "mode": "vip_batch"})
+        run_id = start_ingestion_run(
+            f"{provider}.{vip_api}",
+            {"period": period, "mode": "vip_batch", "provider": provider},
+            source_code=provider,
+        )
         try:
             frame = getattr(client.pro, vip_api)(period=period, fields=vip_fields[api])
             if not isinstance(frame, pd.DataFrame) or frame.empty:
                 raise EmptyTushareResult(f"{vip_api} period={period} returned empty")
             frame = frame.copy()
             # VIP results use end_date; our raw store normalizes it to period.
-            written = _upsert_raw_records(api, frame)
+            written = _upsert_raw_records(api, frame, source_code=provider)
             finish_ingestion_run(run_id, status="completed", rows_read=len(frame), rows_written=written,
                                  meta={"api": vip_api, "period": period, "mode": "vip_batch"})
             _record_probe(vip_api, "ok", len(frame))
@@ -4724,21 +4733,26 @@ def sync_tushare_stock_batch(
     batch_api = period_vip.get(api_name) or period_batch.get(api_name)
     if batch_api and period:
         vip_api, extra_params = batch_api
+        provider = primary_tushare_provider_code()
         if api_name == "stk_holdernumber":
             try:
                 year = int(period[:4])
                 extra_params = {"start_date": f"{year - 2}{period[4:]}", "end_date": period}
             except (TypeError, ValueError):
                 extra_params = {"end_date": period}
-        run_id = start_ingestion_run(f"data_platform.{vip_api}", {"period": period, "mode": "vip_batch"})
+        run_id = start_ingestion_run(
+            f"{provider}.{vip_api}",
+            {"period": period, "mode": "vip_batch", "provider": provider},
+            source_code=provider,
+        )
         try:
             request_params = {"period": period, **extra_params}
             if api_name == "stk_holdernumber":
                 request_params.pop("period", None)
-            frame = getattr(get_tushare_client().pro, vip_api)(fields=item.fields, **request_params)
+            frame = getattr(get_tushare_client_for_provider(provider).pro, vip_api)(fields=item.fields, **request_params)
             if not isinstance(frame, pd.DataFrame) or frame.empty:
                 raise EmptyTushareResult(f"{vip_api} period={period} returned empty")
-            written = _upsert_raw_records(api_name, frame)
+            written = _upsert_raw_records(api_name, frame, source_code=provider)
             finish_ingestion_run(run_id, status="completed", rows_read=len(frame), rows_written=written,
                                  meta={"api": vip_api, "period": period, "mode": "vip_batch"})
             _record_request_coverage(api_name, {"period": period, "mode": "vip_batch"}, None, len(frame))
@@ -5534,7 +5548,10 @@ def purge_temporary_training_market_data(*, fetched_dates: list[str], online_win
 def build_stock_daily_snapshot(trade_date: str) -> dict[str, Any]:
     """Build one-day stock snapshot from raw daily_basic, daily, stk_limit and suspend_d rows."""
 
-    run_id = start_ingestion_run("data_center.stock_daily_snapshot", {"trade_date": trade_date})
+    run_id = start_ingestion_run(
+        "data_center.stock_daily_snapshot", {"trade_date": trade_date},
+        source_code="data_platform",
+    )
     try:
         # All dependency reads are independent of the subsequent writes.
         # Autocommit/read-only prevents Python decoding of the full market
@@ -5735,7 +5752,7 @@ def build_stock_daily_snapshot(trade_date: str) -> dict[str, Any]:
                          source_code=excluded.source_code,
                          available_time=excluded.available_time,
                          updated_at=excluded.updated_at""",
-                    (trade_date, SOURCE_TUSHARE, available_time, now),
+                    (trade_date, "data_platform", available_time, now),
                 )
             _refresh_snapshot_stats(c, trade_date, now)
         finish_ingestion_run(run_id, status="completed", rows_read=len(all_codes), rows_written=written, meta={"trade_date": trade_date})
@@ -6484,6 +6501,7 @@ def sync_cninfo_announcements(
     run_id = start_ingestion_run(
         "cninfo.announcements",
         {"start_date": start_date, "end_date": end_date, "ts_code": ts_code or "", "page_size": page_size, "max_pages": max_pages, "category": category},
+        source_code=SOURCE_CNINFO,
     )
     try:
         rows: list[dict[str, Any]] = []
@@ -6853,7 +6871,10 @@ def import_industry_metrics(path: str) -> dict[str, Any]:
     source_path = Path(path).expanduser()
     if not source_path.exists():
         raise FileNotFoundError(str(source_path))
-    run_id = start_ingestion_run("manual.industry_metrics", {"path": str(source_path)})
+    run_id = start_ingestion_run(
+        "manual.industry_metrics", {"path": str(source_path)},
+        source_code=SOURCE_MANUAL,
+    )
     try:
         definitions, values = _load_industry_metric_file(source_path)
         def_count = _upsert_industry_metric_definitions(definitions)
