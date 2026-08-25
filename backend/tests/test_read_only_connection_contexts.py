@@ -117,7 +117,7 @@ def test_data_platform_read_connection_is_autocommit_and_server_read_only(monkey
     assert raw.commits == 0
     assert raw.rollbacks == 0
     assert raw.closed is True
-    assert _has_session_setting(raw, "idle_in_transaction_session_timeout", "60000")
+    assert _has_session_setting(raw, "idle_in_transaction_session_timeout", "15000")
     assert any("default_transaction_read_only" in sql for sql, _params in raw.calls)
 
 
@@ -146,7 +146,7 @@ def test_business_read_connection_is_autocommit_and_default_write_path_commits(m
         conn.execute("SELECT 1").fetchone()
     assert opened["autocommit"] is True
     assert read_raw.commits == 0
-    assert _has_session_setting(read_raw, "idle_in_transaction_session_timeout", "60000")
+    assert _has_session_setting(read_raw, "idle_in_transaction_session_timeout", "15000")
     assert any("default_transaction_read_only" in sql for sql, _params in read_raw.calls)
 
     write_raw = _RawConnection()
@@ -218,7 +218,7 @@ def test_postgres_read_connection_enforces_read_only_for_each_autocommit_stateme
         ).fetchone())
         assert str(settings["default_read_only"]).lower() == "on"
         assert str(settings["transaction_read_only"]).lower() == "on"
-        assert int(settings["idle_seconds"]) == 60
+        assert int(settings["idle_seconds"]) == 15
 
         # A temporary table is still a write.  Rejecting it proves the server
         # applies read-only semantics to the statement transaction itself.

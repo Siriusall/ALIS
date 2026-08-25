@@ -10,7 +10,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from typing import Any
 
-from app.data_platform.db import _conn
+from app.data_platform.db import _read_conn
 from app.data_platform.services.observation_clock import load_raw_record_versions
 from app.services.event_impact_features import (
     ANALYST_CONSENSUS_CONTRACT,
@@ -40,7 +40,7 @@ def build_analyst_consensus(ts_code: str, *, as_of_time: str | None = None) -> d
     cutoff_clause = " AND trade_date<=? AND available_time<=?" if cutoff else ""
     params: tuple[Any, ...] = (cutoff, cutoff_time) if cutoff else ()
 
-    with _conn() as c:
+    with _read_conn() as c:
         rows = None
         if cutoff:
             versioned = load_raw_record_versions(

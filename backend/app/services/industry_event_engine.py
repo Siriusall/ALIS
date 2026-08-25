@@ -10,7 +10,7 @@ import time
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from app.data_platform.db import _conn
+from app.data_platform.db import _conn, _read_conn
 from app.data_platform.services.observation_clock import (
     _explicit_timestamp_sql,
     _table_columns,
@@ -651,7 +651,7 @@ def _industry_pmi_signal(*, industry_name: str, as_of_time: str | None = None) -
     pmi_pattern = "cn_pmi_manufacturing_demand_%" if is_manufacturing else "cn_pmi_service_demand_%"
 
     try:
-        with _conn() as c:
+        with _read_conn() as c:
             rows = [dict(row) for row in c.execute(
                 """SELECT d.metric_code, d.industry_name,
                           v.data_date, v.value
@@ -1023,6 +1023,10 @@ def _is_statement_timeout(exc: BaseException) -> bool:
 
 def _materialize_industry_state_snapshots_once(*, as_of_time: str | None = None) -> dict[str, Any]:
     cutoff = str(as_of_time or "")
+    # Keep the expensive immutable financial/snapshot reads separate from the
+    # materialization transaction.  The previous single scope stayed idle in
+    # transaction while Python decoded rows and while one PMI query per
+    # industry opened additional connections.
     with _conn() as c:
         if cutoff:
             as_of_date = cutoff[:10].replace("-", "")
@@ -1050,12 +1054,20 @@ def _materialize_industry_state_snapshots_once(*, as_of_time: str | None = None)
         if not as_of_date:
             raise RuntimeError("industry_state_anchor_missing")
         proxies = _derived_industry_proxies(c, as_of_time=cutoff or None)
-        now = datetime.now().isoformat(timespec="seconds")
+    pmi_by_industry = {
+        industry_name: _industry_pmi_signal(
+            industry_name=industry_name,
+            as_of_time=cutoff or None,
+        )
+        for industry_name in proxies
+    }
+    now = datetime.now().isoformat(timespec="seconds")
+    with _conn() as c:
         written = 0
         ready = 0
         for industry_name, proxy in proxies.items():
             observations = proxy.get("observations") or {}
-            pmi = _industry_pmi_signal(industry_name=industry_name, as_of_time=cutoff or None)
+            pmi = pmi_by_industry[industry_name]
             state = _industry_dynamic_factor_score(
                 observations, pmi,
                 history_points=int(proxy.get("evidence_points") or 0),

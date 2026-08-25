@@ -9,7 +9,7 @@ class _FakePro:
     pass
 
 
-def test_primary_tushare_endpoint_is_configurable_and_does_not_bypass_proxy(monkeypatch):
+def test_primary_tushare_endpoint_defaults_to_configured_proxy(monkeypatch):
     fake = _FakePro()
     monkeypatch.setattr(tushare_client.ts, "pro_api", lambda _token: fake)
     monkeypatch.delenv("TUSHARE_HTTP_URL", raising=False)
@@ -18,18 +18,28 @@ def test_primary_tushare_endpoint_is_configurable_and_does_not_bypass_proxy(monk
     result = tushare_client.create_strict_tushare_pro("token")
 
     assert result is fake
-    assert result._DataApi__http_url == "https://api.tushare.pro"
-    assert "api.tushare.pro" not in str(tushare_client.os.getenv("NO_PROXY"))
+    assert result._DataApi__http_url == "http://lianghua.nanyangqiankun.top"
 
 
-def test_probe_endpoints_include_independent_official_and_fallback_sources(monkeypatch):
+def test_probe_endpoints_default_to_primary_proxy_only(monkeypatch):
     monkeypatch.delenv("TUSHARE_PROBE_ENDPOINTS", raising=False)
+    monkeypatch.setenv("TUSHARE_HTTP_URL", "http://lianghua.nanyangqiankun.top")
 
     endpoints = dict(tushare_client.configured_tushare_probe_endpoints())
 
-    assert endpoints["tushare_official"] == "https://api.tushare.pro"
-    assert "tushare_waditu" in endpoints
-    assert "tushare_proxy" in endpoints
+    assert endpoints == {"tushare_proxy": "http://lianghua.nanyangqiankun.top"}
+
+
+def test_probe_endpoints_allow_explicit_compatible_fallbacks(monkeypatch):
+    monkeypatch.setenv(
+        "TUSHARE_PROBE_ENDPOINTS",
+        "tushare_proxy=http://proxy.test,tushare_backup=https://backup.test/",
+    )
+
+    assert dict(tushare_client.configured_tushare_probe_endpoints()) == {
+        "tushare_proxy": "http://proxy.test",
+        "tushare_backup": "https://backup.test",
+    }
 
 
 def test_ingestion_run_retains_the_winning_provider_source(tmp_path: Path):

@@ -55,10 +55,18 @@ def create_tushare_pro_for_endpoint(token: str, endpoint: str, *, timeout_second
 
 
 def configured_tushare_probe_endpoints() -> tuple[tuple[str, str], ...]:
-    configured = os.getenv(
-        "TUSHARE_PROBE_ENDPOINTS",
-        "tushare_official=https://api.tushare.pro,tushare_waditu=http://api.waditu.com/dataapi,tushare_proxy=http://lianghua.nanyangqiankun.top",
-    )
+    configured = os.getenv("TUSHARE_PROBE_ENDPOINTS", "").strip()
+    if not configured:
+        # ALIS uses a token issued for a TuShare-compatible proxy.  Such a
+        # token is not expected to authenticate against the official or
+        # Waditu endpoints.  Probing those hosts by default creates false
+        # ``invalid token`` incidents and wastes requests.  Operators may
+        # still opt into compatible alternatives explicitly.
+        primary = str(
+            os.getenv("TUSHARE_HTTP_URL")
+            or "http://lianghua.nanyangqiankun.top"
+        ).strip().rstrip("/")
+        return (("tushare_proxy", primary),)
     result: list[tuple[str, str]] = []
     for item in configured.split(","):
         name, separator, endpoint = item.strip().partition("=")
@@ -90,7 +98,10 @@ def tushare_endpoint_for_provider(provider: str) -> str:
     """Resolve a named TuShare-compatible provider without exposing credentials."""
     name = str(provider or "tushare").strip()
     if name == "tushare":
-        return str(os.getenv("TUSHARE_HTTP_URL") or "https://api.tushare.pro").strip().rstrip("/")
+        return str(
+            os.getenv("TUSHARE_HTTP_URL")
+            or "http://lianghua.nanyangqiankun.top"
+        ).strip().rstrip("/")
     configured = dict(configured_tushare_probe_endpoints())
     endpoint = str(configured.get(name) or "").strip()
     if not endpoint:

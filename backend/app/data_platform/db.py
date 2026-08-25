@@ -708,7 +708,7 @@ class Connection:
 # transaction while application-side decoding or aggregation continued.  Keep
 # the guard short by default; an operator can still set a deliberate bounded
 # override for a maintenance operation.
-_DEFAULT_IDLE_IN_TRANSACTION_TIMEOUT_MS = "60000"
+_DEFAULT_IDLE_IN_TRANSACTION_TIMEOUT_MS = "15000"
 
 
 def _idle_in_transaction_timeout_ms() -> str:

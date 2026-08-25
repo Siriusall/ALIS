@@ -1864,3 +1864,8 @@ ALIS 的目标运行方式调整为“系统自治、结果可见、异常才打
 - [x] 2026-08-17 兼容选股入口移除 `all_in_one`、本地快照和实时行情回退：`stock_selector` 现在只读取目标交易日、非 `legacy_*` 观察证据的规范 PostgreSQL 快照；缺失时返回空候选，由 API 明确 503，不把旧缓存或实时价当作正式候选输入。持仓 API 新增缺精确切片必定 `503 position_market_data_not_ready` 的回归；本轮最终全量回归 `1303 passed、1 skipped、2 warnings、6 subtests passed`。
 - [x] 2026-08-17 继续收口目标日缺失语义：账户净值/绩效报告、账户 K 线和组合风险页遇到持仓或基准精确行情缺口时分别返回明确 `blocked`，不延用前收、成交价、成本价或最新可得日期；前端曲线同步展示数据不可用原因。组合重优化现先验证决策门和全部持仓的目标日点时估值，失败即停止选股、风险、优化与冻结计划写入，不再在中间预览使用成本价计算权重或盈亏；计划接口返回对应的可重试 `blocked_by_decision_data` 或 `blocked_by_position_valuation`。剩余 `MAX(trade_date)` 仅位于因子/主题历史物化与研究诊断，不进入正式决策、模拟执行或账户估值。新增目标日短路和持仓估值回归；完整后端回归 `1325 passed、1 skipped、2 warnings、6 subtests passed`。
 - [x] 2026-08-19 修复 PostgreSQL 超时后的中止事务复用：线上日志确认 `statement_timeout` 后，部分调度路径在同一连接上继续执行，产生误导性的 `current transaction is aborted`，并与间歇性连接建立超时叠加。业务库嵌套事务、业务库独立连接和数据平台连接现在均在异常路径显式 `ROLLBACK` 后再向上抛出，禁止调度器或诊断层复用中毒事务；正常提交和账本原子事务语义不变。定向 PostgreSQL/账本/数据平台回归 `21 passed、1 skipped`，Python 编译和 `git diff --check` 通过。连接建立超时仍保留为真实外部网络/数据库可达性异常，下一步单独做运行态探针与网络抖动治理，不以重试掩盖。
+
+# 2026-08-25：代理源语义与数据库短事务治理
+
+- [x] 线上环境确认 `TUSHARE_HTTP_URL=http://lianghua.nanyangqiankun.top`，主采集客户端一直使用南阳乾坤兼容代理；此前“token 无效”来自研究发布探测器默认并发访问官方 TuShare 与 Waditu，两端不接受代理专用 token。现未显式配置 `TUSHARE_PROBE_ENDPOINTS` 时只探测 `TUSHARE_HTTP_URL` 指向的主代理，官方或其他兼容备用端点必须由运维明确登记才会请求；两套客户端的无配置默认值也统一为该代理地址，不输出或修改 token。
+- [x] 数据库活动审计发现应用机与 control worker 在不可变财务读取、行业状态构建和主题公司映射期间存在 `idle in transaction`，并与 3～4 个本地连接槽、5秒连接等待和30秒语句上限叠加。现业务库与数据平台默认空闲事务上限统一收紧为15秒；分析师一致预期和 PMI 改用只读自动提交连接；行业状态将重型读取、逐行业 PMI 和物化写入拆成三个事务阶段；主题公司映射按主题幂等短事务提交。专项回归 `50 passed`，不修改计划、账本、持仓、成交、Champion 或模型生产权限。

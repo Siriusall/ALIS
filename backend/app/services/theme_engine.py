@@ -560,6 +560,11 @@ def materialize_theme_snapshots(*, as_of_time: str | None = None, lookback: int 
                     (dates[-1], theme_code, company.get("ts_code"), exposure, json.dumps(evidence, ensure_ascii=False), now),
                 )
                 mappings += 1
+            # Each theme is an independent idempotent projection.  Bound the
+            # write transaction to one theme so later Python scoring cannot
+            # retain hundreds of mapping writes in an idle transaction.
+            if bool(getattr(c, "_is_postgres", False)):
+                c.commit()
     return {"ok": True, "as_of_date": dates[-1], "themes_written": written, "company_mappings_written": mappings, "promotable": sum(1 for item in scored if item["promotable"]), "model_version": "industry_price_fundamental_theme_v3"}
 
 

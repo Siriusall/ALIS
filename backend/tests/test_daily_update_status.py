@@ -272,6 +272,7 @@ def test_scheduler_reads_etf_execution_evidence_after_metadata_transaction_close
     monkeypatch.setattr(daily_update, "_latest_decision_ready_trade_date", lambda *_args: "20260729")
     monkeypatch.setattr(daily_update, "_benchmark_ready_for_date", lambda *_args: True)
     monkeypatch.setattr(daily_update, "_adj_factor_ready_for_date", lambda *_args: True)
+    monkeypatch.setattr(daily_update, "_derived_research_lag", lambda *_args: False)
     monkeypatch.setattr(daily_update, "_daily_update_retry_policy", lambda *_args, **_kwargs: {"allowed": False})
     monkeypatch.setattr(daily_update, "_set_state", lambda **_kwargs: None)
     monkeypatch.setattr(daily_update, "_business_now", lambda: datetime(2026, 7, 29, 16, 0, 0))

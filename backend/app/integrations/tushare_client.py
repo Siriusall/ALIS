@@ -43,10 +43,13 @@ def load_tushare_token_from_env() -> str:
 
 
 def create_strict_tushare_pro(token: str):
-    """Create the primary client without hard-coding a fragile proxy host."""
+    """Create the primary TuShare-compatible proxy client."""
     pro = ts.pro_api(token)
     pro._DataApi__token = token  # type: ignore[attr-defined]
-    pro._DataApi__http_url = str(os.getenv("TUSHARE_HTTP_URL") or "https://api.tushare.pro").rstrip("/")  # type: ignore[attr-defined]
+    pro._DataApi__http_url = str(  # type: ignore[attr-defined]
+        os.getenv("TUSHARE_HTTP_URL")
+        or "http://lianghua.nanyangqiankun.top"
+    ).rstrip("/")
     return pro
 
 
@@ -64,7 +67,10 @@ class TushareClient:
     def __init__(self) -> None:
         token = _load_token_from_env()
         self.token = token
-        self.http_url = str(os.getenv("TUSHARE_HTTP_URL") or "https://api.tushare.pro").strip()
+        self.http_url = str(
+            os.getenv("TUSHARE_HTTP_URL")
+            or "http://lianghua.nanyangqiankun.top"
+        ).strip()
         self.pro = create_strict_tushare_pro(token)
 
     # ---- 轻量封装 TuShare 接口，统一 DataFrame 返回 ----

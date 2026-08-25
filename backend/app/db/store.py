@@ -75,7 +75,7 @@ _BUSINESS_DB_CONNECTION_GATE = DatabaseConnectionGate(
 _ACTIVE_BUSINESS_TRANSACTION: ContextVar[Optional["_ConnWrapper"]] = ContextVar(
     "alis_active_business_transaction", default=None,
 )
-_DEFAULT_IDLE_IN_TRANSACTION_TIMEOUT_MS = "60000"
+_DEFAULT_IDLE_IN_TRANSACTION_TIMEOUT_MS = "15000"
 
 
 def _json_load(s: Any, default: Any) -> Any:
