@@ -20,9 +20,11 @@ class _Connection:
         self._is_postgres = True
         self._is_mysql = is_mysql
         self.calls: list[tuple[str, tuple[object, ...]]] = []
+        self.schema_checks = 0
 
     def execute(self, sql, params=()):
         if "information_schema.columns" in sql:
+            self.schema_checks += 1
             return _Result([{"column_name": column} for column in (
                 "economic_available_time",
                 "observed_at",
@@ -46,6 +48,16 @@ def test_clocked_snapshot_upsert_has_one_parameter_per_column(is_mysql: bool):
     assert sql.count("?") == len(params) == 32
     if not is_mysql:
         assert "content_hash IS DISTINCT FROM excluded.content_hash" in sql
+
+
+def test_clocked_snapshot_upsert_reuses_materialization_schema_check():
+    connection = _Connection(is_mysql=False)
+
+    _upsert_snapshot_row(connection, tuple(range(32)), has_clock=True)
+    _upsert_snapshot_row(connection, tuple(range(32)), has_clock=True)
+
+    assert connection.schema_checks == 0
+    assert len(connection.calls) == 2
 
 
 def test_strict_benchmark_accepts_audited_fallback_previous_close(monkeypatch):

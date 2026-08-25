@@ -5582,6 +5582,7 @@ def build_stock_daily_snapshot(trade_date: str) -> dict[str, Any]:
                     "SELECT set_config('statement_timeout', ?, false)",
                     (str(SNAPSHOT_MATERIALIZATION_TIMEOUT_MS),),
                 )
+            snapshot_has_clock = _snapshot_table_has_observation_clock(c)
             day_observed_times: list[str] = []
             for ts_code in all_codes:
                 info = stocks.get(ts_code, {})
@@ -5708,7 +5709,9 @@ def build_stock_daily_snapshot(trade_date: str) -> dict[str, Any]:
                     snapshot_hash,
                     now,
                 )
-                projection_changed = _upsert_snapshot_row(c, values) or projection_changed
+                projection_changed = _upsert_snapshot_row(
+                    c, values, has_clock=snapshot_has_clock,
+                ) or projection_changed
                 written += 1
                 if written % SNAPSHOT_MATERIALIZATION_BATCH_SIZE == 0:
                     # Each row's immutable append and overwrite projection
@@ -6268,9 +6271,9 @@ def _oos_hard_stats_target_dates(c: Any, trade_dates: list[str]) -> set[str]:
     return targets | (candidates & rolling_dates)
 
 
-def _upsert_snapshot_row(c: Any, values: tuple[Any, ...]) -> bool:
-    # 27 legacy fields + five observation-clock fields + updated_at.
-    has_clock = False
+def _snapshot_table_has_observation_clock(c: Any) -> bool:
+    """Inspect the projection schema once per materialization, not per stock."""
+
     try:
         if bool(getattr(c, "_is_postgres", False)):
             columns = {
@@ -6281,10 +6284,19 @@ def _upsert_snapshot_row(c: Any, values: tuple[Any, ...]) -> bool:
             }
         else:
             columns = {str(row["name"]) for row in c.execute("PRAGMA table_info(dc_stock_daily_snapshot)").fetchall()}
-        has_clock = {"economic_available_time", "observed_at", "first_observed_at", "observation_provenance", "content_hash"}.issubset(columns)
     except Exception:
         if bool(getattr(c, "_is_postgres", False)):
             raise RuntimeError("observation_clock_schema_inspection_failed")
+        return False
+    return {"economic_available_time", "observed_at", "first_observed_at", "observation_provenance", "content_hash"}.issubset(columns)
+
+
+def _upsert_snapshot_row(
+    c: Any, values: tuple[Any, ...], *, has_clock: bool | None = None,
+) -> bool:
+    # 27 legacy fields + five observation-clock fields + updated_at.
+    if has_clock is None:
+        has_clock = _snapshot_table_has_observation_clock(c)
     if not has_clock:
         values = values[:26] + (values[-1],)
         cursor = c.execute(
