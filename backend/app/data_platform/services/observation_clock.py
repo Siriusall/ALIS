@@ -547,18 +547,24 @@ def load_current_raw_record_versions(
                   FROM dc_tushare_raw_records
                  WHERE api_name=? AND trade_date=?
                    AND NULLIF(TRIM(COALESCE(content_hash,'')),'') IS NOT NULL
+            ), versions AS MATERIALIZED (
+                SELECT id,api_name,record_key,ts_code,trade_date,period,ann_date,
+                       payload_json,source_code,economic_available_time,observed_at,
+                       first_observed_at,observation_provenance,content_hash,created_at
+                  FROM dc_tushare_raw_record_version v
+                 WHERE v.api_name=? AND v.trade_date=?
+                   AND {' AND '.join(version_predicates)}
             )
             SELECT v.id,v.api_name,v.record_key,v.ts_code,v.trade_date,
                    v.period,v.ann_date,v.payload_json,v.source_code,
                    v.economic_available_time,v.observed_at,v.first_observed_at,
                    v.observation_provenance,v.content_hash,v.created_at
               FROM accepted p
-              JOIN dc_tushare_raw_record_version v
+              JOIN versions v
                 ON v.api_name=p.api_name
                AND v.record_key=p.record_key
                AND v.content_hash=p.content_hash
                AND v.trade_date=p.trade_date
-             WHERE {' AND '.join(version_predicates)}
              ORDER BY v.observed_at,v.id
         """
     else:
@@ -578,7 +584,12 @@ def load_current_raw_record_versions(
                AND {' AND '.join(version_predicates)}
              ORDER BY v.observed_at,v.id
         """
-    return [dict(row) for row in c.execute(sql, (str(api_name), str(trade_date))).fetchall()]
+    params = (
+        (str(api_name), str(trade_date), str(api_name), str(trade_date))
+        if is_postgres
+        else (str(api_name), str(trade_date))
+    )
+    return [dict(row) for row in c.execute(sql, params).fetchall()]
 
 
 def load_snapshot_versions(

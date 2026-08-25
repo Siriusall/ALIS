@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 
+from app.data_platform.services import observation_clock
 from app.data_platform.services.observation_clock import (
     load_current_raw_record_versions,
     load_raw_record_versions,
@@ -421,6 +422,40 @@ def test_current_projection_loader_requires_its_immutable_version():
     assert [(row["ts_code"], row["content_hash"]) for row in rows or []] == [
         ("000001.SZ", "accepted"),
     ]
+
+
+def test_postgres_current_projection_materializes_both_exact_date_sides(monkeypatch):
+    captured = {}
+
+    class Result:
+        def fetchall(self):
+            return []
+
+    class Connection:
+        _is_postgres = True
+
+        def execute(self, sql, params=()):
+            captured["sql"] = sql
+            captured["params"] = params
+            return Result()
+
+    projection_columns = {"api_name", "record_key", "trade_date", "content_hash"}
+    version_columns = {
+        "api_name", "record_key", "ts_code", "trade_date", "period", "ann_date",
+        "payload_json", "source_code", "economic_available_time", "observed_at",
+        "first_observed_at", "observation_provenance", "content_hash", "created_at", "id",
+    }
+    monkeypatch.setattr(
+        observation_clock,
+        "_table_columns",
+        lambda _connection, table: projection_columns
+        if table == "dc_tushare_raw_records"
+        else version_columns,
+    )
+
+    assert load_current_raw_record_versions(Connection(), "adj_factor", "20260825") == []
+    assert "versions AS MATERIALIZED" in captured["sql"]
+    assert captured["params"] == ("adj_factor", "20260825", "adj_factor", "20260825")
 
 
 def test_raw_loader_does_not_move_an_accepted_hash_between_trade_dates():
