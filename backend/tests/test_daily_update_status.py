@@ -214,6 +214,28 @@ def test_persisted_data_failure_suppresses_minute_level_retry() -> None:
     assert result["retry_after_seconds"] == 300
 
 
+def test_recent_success_paces_duplicate_full_market_refresh() -> None:
+    class _Conn:
+        def execute(self, _sql, _params=()):
+            class _Result:
+                @staticmethod
+                def fetchone():
+                    return {
+                        "finished_at": "2026-07-24T16:59:00+08:00",
+                        "meta_json": json.dumps({"trade_date": "20260724"}),
+                    }
+
+            return _Result()
+
+    result = daily_update._recent_success_policy(
+        _Conn(), "20260724", now=datetime.fromisoformat("2026-07-24T17:00:00+08:00"),
+    )
+
+    assert result["allowed"] is False
+    assert result["reason"] == "recent_success_cooldown"
+    assert result["retry_after_seconds"] == daily_update._DAILY_UPDATE_SUCCESS_COOLDOWN_SEC - 60
+
+
 def test_scheduler_retries_an_overdue_trade_date_before_today_close() -> None:
     assert daily_update._scheduler_should_check(
         datetime(2026, 7, 29, 9, 30, 0),

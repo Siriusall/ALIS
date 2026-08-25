@@ -13,7 +13,7 @@ import logging
 import os
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from threading import Lock
 from typing import Any, Callable
 
@@ -27,19 +27,37 @@ from app.db.store import _conn, _read_conn
 
 PAGE_KEYS = ("overview", "decision", "portfolio", "operations", "data", "models", "research", "factors", "evidence")
 _DEFAULT_TTLS = {
-    "overview": 30,
-    "decision": 30,
-    "portfolio": 30,
-    "operations": 15,
-    "data": 60,
-    "models": 300,
-    "research": 120,
-    "factors": 120,
-    "evidence": 60,
+    # Event invalidation is the freshness authority.  Periodic rebuilds are a
+    # safety net, not a second polling system: sub-minute TTLs kept the single
+    # control worker permanently rebuilding pages and repeatedly ran formal
+    # historical audits beside the close update and execution probes.
+    "overview": 180,
+    "decision": 180,
+    "portfolio": 300,
+    "operations": 180,
+    "data": 180,
+    "models": 600,
+    "research": 600,
+    "factors": 600,
+    "evidence": 600,
 }
 _FAILURE_RETRY_SECONDS = 15
+_DIAGNOSTIC_CACHE_SECONDS = 300
+_DB_HEAVY_TASK_TYPES = frozenset({
+    "factor_daily_cycle",
+    "factor_research_cycle",
+    "model_candidate_research",
+    "model_strategy_impact_validation",
+    "plan_model_autonomy",
+    "research_maintenance",
+    "strategy_controller_oos",
+    "strategy_environment_backtest",
+    "strategy_evolution_cycle",
+})
 _schema_ready = False
 _schema_lock = Lock()
+_diagnostic_cache: dict[str, tuple[float, Callable[..., Any], Any]] = {}
+_diagnostic_cache_lock = Lock()
 logger = logging.getLogger(__name__)
 
 
@@ -65,6 +83,32 @@ def _failure_retry_seconds() -> int:
         return max(5, min(120, int(raw))) if raw else _FAILURE_RETRY_SECONDS
     except ValueError:
         return _FAILURE_RETRY_SECONDS
+
+
+def _cached_diagnostic(
+    key: str,
+    reader: Callable[..., Any],
+    /,
+    **kwargs: Any,
+) -> Any:
+    """Reuse immutable historical audit summaries across page documents.
+
+    A control-worker cycle builds several pages that expose the same OOS and
+    sealed summaries.  Re-running each formal audit per page scans the full
+    immutable history several times.  The callable identity is part of the
+    cache contract so tests, hot reloads and monkey-patched readers cannot
+    inherit another implementation's value.
+    """
+
+    now = time.monotonic()
+    with _diagnostic_cache_lock:
+        cached = _diagnostic_cache.get(key)
+        if cached and cached[1] is reader and now - cached[0] < _DIAGNOSTIC_CACHE_SECONDS:
+            return copy.deepcopy(cached[2])
+    value = reader(**kwargs)
+    with _diagnostic_cache_lock:
+        _diagnostic_cache[key] = (time.monotonic(), reader, copy.deepcopy(value))
+    return value
 
 
 def _ensure_table() -> None:
@@ -151,9 +195,21 @@ def _has_readable_evidence(value: dict[str, Any]) -> bool:
     """Keep partial business documents visible when they contain evidence."""
     if any(key in value and value.get(key) not in (None, "", [], {}) for key in (
         "items", "gates", "capabilities", "market_state", "observations",
+        "decisions", "reviews", "quality", "counts", "results",
     )):
         return True
-    return any(key not in {"ok", "status", "data_available", "available", "error", "errors"} for key in value)
+    # A degraded-read envelope still contains bookkeeping such as component,
+    # checked_at and count=0.  Those fields prove that the fallback ran, not
+    # that business evidence was returned.  Treating them as evidence made a
+    # failed audit section look ready while the UI rendered empty fields.
+    envelope_keys = {
+        "ok", "status", "data_available", "available", "error", "errors",
+        "component", "checked_at", "count", "id", "reason",
+    }
+    return any(
+        key not in envelope_keys and item not in (None, "", [], {})
+        for key, item in value.items()
+    )
 
 
 def _readers(page_key: str) -> dict[str, Callable[[], Any]]:
@@ -180,6 +236,46 @@ def _readers(page_key: str) -> dict[str, Callable[[], Any]]:
             "policy": {"read_only": True, "source": "control_snapshot_projection"},
         }
 
+    def compact_oos() -> dict[str, Any]:
+        return _cached_diagnostic(
+            "oos_hard_data_compact",
+            data_center.data_center_oos_hard_data,
+            include_dates=False,
+        )
+
+    def compact_sealed() -> dict[str, Any]:
+        return _cached_diagnostic(
+            "sealed_strategy_holdout_compact",
+            data_center.data_center_sealed_strategy_holdout,
+            include_dates=False,
+        )
+
+    latest_decision_bundle: dict[str, Any] = {}
+
+    def latest_decision_evidence() -> dict[str, Any]:
+        """Freeze the first visible decision's full document beside its list.
+
+        The evidence page must remain complete when the application database
+        is busy.  Previously it snapshotted only compact rows and immediately
+        issued two live requests for the selected row, so a transient timeout
+        rendered valid nested evidence as ``undefined``/``未记录``.
+        """
+
+        if latest_decision_bundle:
+            return latest_decision_bundle
+        summaries = research.research_decisions(limit=1, compact=True)
+        items = summaries.get("items") if isinstance(summaries, dict) else []
+        first = items[0] if isinstance(items, list) and items else None
+        decision_id = int(first.get("id") or 0) if isinstance(first, dict) else 0
+        if not decision_id:
+            latest_decision_bundle.update({"detail": {}, "verification": {}})
+            return latest_decision_bundle
+        latest_decision_bundle.update({
+            "detail": research.research_decision_detail(decision_id),
+            "verification": research.research_evidence_verify(decision_id),
+        })
+        return latest_decision_bundle
+
     common = {
         # The control worker builds durable PostgreSQL snapshots. It must not
         # inherit the API host's loopback Redis requirement: browser reads and
@@ -198,8 +294,8 @@ def _readers(page_key: str) -> dict[str, Callable[[], Any]]:
             "dailyUpdateStatus": lambda: data_center.data_center_daily_update_status(compact=True),
             "watermarks": data_center.data_center_asset_watermarks,
             "ledgerAudit": model_strategy.model_strategy_ledger_audit,
-            "oos": lambda: data_center.data_center_oos_hard_data(include_dates=False),
-            "sealed": lambda: data_center.data_center_sealed_strategy_holdout(include_dates=False),
+            "oos": compact_oos,
+            "sealed": compact_sealed,
         },
         "decision": {
             **common,
@@ -228,8 +324,8 @@ def _readers(page_key: str) -> dict[str, Callable[[], Any]]:
             "operationsPage": lambda: __import__("app.api.routes.positions", fromlist=["get_operations_page"]).get_operations_page(execution_id=None, limit=20, offset=0),
             "executionsPage": lambda: __import__("app.api.routes.positions", fromlist=["get_executions_page"]).get_executions_page(limit=20, offset=0),
             "ledgerAudit": model_strategy.model_strategy_ledger_audit,
-            "oos": lambda: data_center.data_center_oos_hard_data(include_dates=False),
-            "sealed": lambda: data_center.data_center_sealed_strategy_holdout(include_dates=False),
+            "oos": compact_oos,
+            "sealed": compact_sealed,
         },
         "data": {
             "watermarks": data_center.data_center_asset_watermarks,
@@ -246,8 +342,8 @@ def _readers(page_key: str) -> dict[str, Callable[[], Any]]:
                 rebuild=False,
             ),
             "tasks": lambda: model_strategy.model_strategy_task_center(limit=16, log_limit=40, compact=True),
-            "oos": lambda: data_center.data_center_oos_hard_data(include_dates=False),
-            "sealed": lambda: data_center.data_center_sealed_strategy_holdout(include_dates=False),
+            "oos": compact_oos,
+            "sealed": compact_sealed,
         },
         "models": {
             "planModels": lambda: model_strategy.model_strategy_plan_models(console=True),
@@ -288,7 +384,7 @@ def _readers(page_key: str) -> dict[str, Callable[[], Any]]:
         "factors": {
             "owner": model_strategy.model_strategy_owner_summary,
             "strategy": model_strategy.model_strategy_strategy_controller,
-            "sealed": lambda: data_center.data_center_sealed_strategy_holdout(include_dates=False),
+            "sealed": compact_sealed,
             "factors": lambda: __import__("app.api.routes.factors", fromlist=["factor_registry"]).factor_registry(),
             "factorStatus": lambda: __import__("app.api.routes.factors", fromlist=["factor_research_status"]).factor_research_status(),
             "factorResearch": lambda: __import__("app.api.routes.factors", fromlist=["factor_research_status"]).factor_research_status(console=True, compact=True),
@@ -304,6 +400,8 @@ def _readers(page_key: str) -> dict[str, Callable[[], Any]]:
             # timestamps and point-in-time evidence), not the dashboard
             # summary object whose nested fields would render as undefined.
             "decisions": lambda: research.research_decisions(limit=100, compact=True),
+            "decisionDetail": lambda: latest_decision_evidence()["detail"],
+            "evidenceVerification": lambda: latest_decision_evidence()["verification"],
             "reviews": lambda: research.research_reviews(limit=100),
             "reviewLearning": research.research_review_learning_overview,
             "llmBudget": research.research_llm_token_budget,
@@ -588,17 +686,53 @@ def _wait_or_stop(stopper: Any | None, seconds: float) -> bool:
 
 
 def _control_work_active() -> bool:
-    """Do not make page aggregation compete with control-plane autonomy."""
+    """Do not make page aggregation compete with database-heavy autonomy."""
 
     with _read_conn() as conn:
+        placeholders = ",".join("?" for _ in _DB_HEAVY_TASK_TYPES)
         row = conn.execute(
-            """SELECT 1 AS active
+            f"""SELECT 1 AS active
                  FROM evolution_tasks
                 WHERE status='running'
-                  AND COALESCE(worker_pool,'control')='control'
-                LIMIT 1"""
+                  AND (
+                    COALESCE(worker_pool,'control')='control'
+                    OR task_type IN ({placeholders})
+                  )
+                LIMIT 1""",
+            tuple(sorted(_DB_HEAVY_TASK_TYPES)),
         ).fetchone()
     return bool(row)
+
+
+def _data_ingestion_active() -> bool:
+    """Yield snapshots while a live data-platform ingestion owns the DB."""
+
+    from app.data_platform.db import _read_conn as data_read_conn
+
+    with data_read_conn() as conn:
+        row = conn.execute(
+            """SELECT started_at
+                 FROM data_ingestion_runs
+                WHERE status='running' AND finished_at IS NULL
+                ORDER BY id DESC LIMIT 1"""
+        ).fetchone()
+    if not row:
+        return False
+    started_at = str(dict(row).get("started_at") or "")
+    try:
+        started = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+        if started.tzinfo is None:
+            started = started.replace(tzinfo=timezone.utc)
+        return datetime.now(timezone.utc) - started.astimezone(timezone.utc) <= timedelta(hours=6)
+    except ValueError:
+        # A malformed live row is not trustworthy enough to let a costly
+        # snapshot audit start beside it.  The ingestion recovery path will
+        # reconcile the row; fail closed here meanwhile.
+        return True
+
+
+def _snapshot_build_should_yield() -> bool:
+    return _control_work_active() or _data_ingestion_active()
 
 
 def run_snapshot_worker_forever(stop_event: Any | None = None) -> None:
@@ -606,7 +740,7 @@ def run_snapshot_worker_forever(stop_event: Any | None = None) -> None:
     stopper = stop_event
     while stopper is None or not stopper.is_set():
         try:
-            if _control_work_active():
+            if _snapshot_build_should_yield():
                 if _wait_or_stop(stopper, 5.0):
                     return
                 continue
@@ -619,6 +753,15 @@ def run_snapshot_worker_forever(stop_event: Any | None = None) -> None:
         for page_key in due:
             if stopper is not None and stopper.is_set():
                 return
+            try:
+                if _snapshot_build_should_yield():
+                    break
+            except Exception as exc:
+                logger.warning(
+                    "Console snapshot workload gate unavailable error_type=%s",
+                    type(exc).__name__,
+                )
+                break
             try:
                 build(page_key)
             except Exception as exc:  # retain any LKG; the next scan retries safely

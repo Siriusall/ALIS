@@ -12,6 +12,8 @@ def test_long_research_claims_are_deferred_after_trade_day_cutoff(monkeypatch):
     monkeypatch.setattr(evolution, "RESEARCH_RESUME_HOUR", 16)
     monkeypatch.setattr(evolution, "RESEARCH_RESUME_MINUTE", 30)
     monkeypatch.setattr(evolution, "_is_scheduled_trade_day", lambda _value: True)
+    monkeypatch.setattr(evolution, "_data_ingestion_active", lambda _value=None: False)
+    monkeypatch.setattr(evolution, "_snapshot_refresh_pending", lambda: False)
 
     assert evolution._defer_long_research_claims(datetime(2026, 8, 12, 10, 29)) is False
     assert evolution._defer_long_research_claims(datetime(2026, 8, 12, 10, 30)) is True
@@ -21,8 +23,46 @@ def test_long_research_claims_are_deferred_after_trade_day_cutoff(monkeypatch):
 
 def test_long_research_claims_continue_on_non_trade_days(monkeypatch):
     monkeypatch.setattr(evolution, "_is_scheduled_trade_day", lambda _value: False)
+    monkeypatch.setattr(evolution, "_data_ingestion_active", lambda _value=None: False)
+    monkeypatch.setattr(evolution, "_snapshot_refresh_pending", lambda: False)
 
     assert evolution._defer_long_research_claims(datetime(2026, 8, 15, 18, 0)) is False
+
+
+def test_long_research_claims_yield_to_live_data_ingestion(monkeypatch):
+    monkeypatch.setattr(evolution, "_is_scheduled_trade_day", lambda _value: False)
+    monkeypatch.setattr(evolution, "_data_ingestion_active", lambda _value=None: True)
+    monkeypatch.setattr(evolution, "_snapshot_refresh_pending", lambda: False)
+
+    assert evolution._defer_long_research_claims(datetime(2026, 8, 15, 18, 0)) is True
+
+
+def test_long_research_claims_yield_to_invalidated_console_snapshot(monkeypatch):
+    monkeypatch.setattr(evolution, "_is_scheduled_trade_day", lambda _value: False)
+    monkeypatch.setattr(evolution, "_data_ingestion_active", lambda _value=None: False)
+    monkeypatch.setattr(evolution, "_snapshot_refresh_pending", lambda: True)
+
+    assert evolution._defer_long_research_claims(datetime(2026, 8, 15, 18, 0)) is True
+
+
+def test_data_ingestion_gate_ignores_abandoned_running_row(monkeypatch):
+    class Result:
+        def fetchone(self):
+            return {"started_at": "2026-08-25T08:00:00+08:00"}
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, _sql):
+            return Result()
+
+    monkeypatch.setattr(evolution, "data_conn", lambda: Connection())
+
+    assert evolution._data_ingestion_active(datetime.fromisoformat("2026-08-25T15:00:01+08:00")) is False
 
 
 def test_superseded_task_reconciliation_reads_autocommit_then_writes(monkeypatch):

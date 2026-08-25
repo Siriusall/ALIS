@@ -231,9 +231,68 @@ def _defer_long_research_claims(value: datetime) -> bool:
         hour=RESEARCH_RESUME_HOUR, minute=RESEARCH_RESUME_MINUTE,
         second=0, microsecond=0,
     )
-    return cutoff <= value < resume and _is_scheduled_trade_day(value)
+    return (
+        cutoff <= value < resume and _is_scheduled_trade_day(value)
+    ) or _data_ingestion_active(value) or _snapshot_refresh_pending()
 
 
+def _data_ingestion_active(value: datetime | None = None) -> bool:
+    """Do not claim another long research task while daily data owns the DB.
+
+    A worker cannot safely preempt a task already inside a model/backtest
+    transaction, but it can stop extending the overlap.  Ignore abandoned
+    rows older than six hours; data-platform recovery remains responsible for
+    reconciling those records.
+    """
+
+    now = value or _now()
+    try:
+        with data_conn() as conn:
+            row = conn.execute(
+                """SELECT started_at FROM data_ingestion_runs
+                    WHERE status='running' AND finished_at IS NULL
+                    ORDER BY id DESC LIMIT 1"""
+            ).fetchone()
+        if not row:
+            return False
+        started_at = str(row["started_at"] or "")
+        started = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+        if started.tzinfo is None and now.tzinfo is not None:
+            started = started.replace(tzinfo=now.tzinfo)
+        elif started.tzinfo is not None and now.tzinfo is None:
+            now = now.replace(tzinfo=started.tzinfo)
+        elif started.tzinfo is not None and now.tzinfo is not None:
+            started = started.astimezone(now.tzinfo)
+        return timedelta(0) <= now - started <= timedelta(hours=6)
+    except (TypeError, ValueError):
+        return True
+    except Exception as exc:  # fail closed without taking down the worker
+        logger.warning(
+            "data-ingestion workload gate unavailable error_type=%s",
+            type(exc).__name__,
+        )
+        return True
+
+
+def _snapshot_refresh_pending() -> bool:
+    """Give an event-invalidated console snapshot one turn between tasks."""
+
+    try:
+        with _read_conn() as conn:
+            row = conn.execute(
+                """SELECT 1 AS pending FROM console_page_snapshots
+                    WHERE invalidated_at IS NOT NULL OR COALESCE(version,'')=''
+                    LIMIT 1"""
+            ).fetchone()
+        return bool(row)
+    except Exception as exc:
+        # A missing/unreachable coordination table means the worker cannot
+        # prove that starting another heavy query is safe.
+        logger.warning(
+            "console-snapshot workload gate unavailable error_type=%s",
+            type(exc).__name__,
+        )
+        return True
 def _lease_owner_process_alive(owner: Any) -> bool | None:
     """Return local owner liveness; remote or legacy owner formats are unknown."""
     value = str(owner or "").strip()

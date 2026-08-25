@@ -100,12 +100,66 @@ def test_missing_snapshot_never_builds_in_browser_read(monkeypatch):
 
 
 def test_snapshot_refresh_defaults_match_page_freshness_contract():
-    assert snapshots._ttl("overview") == 30
-    assert snapshots._ttl("decision") == 30
-    assert snapshots._ttl("portfolio") == 30
-    assert snapshots._ttl("operations") == 15
-    assert snapshots._ttl("data") == 60
-    assert snapshots._ttl("models") == 300
+    assert snapshots._ttl("overview") == 180
+    assert snapshots._ttl("decision") == 180
+    assert snapshots._ttl("portfolio") == 300
+    assert snapshots._ttl("operations") == 180
+    assert snapshots._ttl("data") == 180
+    assert snapshots._ttl("models") == 600
+    assert snapshots._ttl("research") == 600
+    assert snapshots._ttl("factors") == 600
+    assert snapshots._ttl("evidence") == 600
+
+
+def test_degraded_envelope_metadata_is_not_readable_evidence():
+    value = {
+        "ok": False,
+        "status": "degraded",
+        "data_available": False,
+        "component": "decision_audit",
+        "checked_at": "2026-08-25T16:35:00+08:00",
+        "decisions": [],
+        "reviews": [],
+        "error": {"code": "diagnostic_unavailable"},
+    }
+
+    assert snapshots._has_readable_evidence(value) is False
+    _, section = snapshots._section("evidence", "decisionAudit", lambda: value)
+    assert section["status"] == "degraded"
+
+
+def test_evidence_snapshot_freezes_first_decision_detail_and_verification(monkeypatch):
+    from app.api.routes import research
+
+    calls: list[tuple[str, int]] = []
+    monkeypatch.setattr(
+        research,
+        "research_decisions",
+        lambda *, limit, compact: {"ok": True, "items": [{"id": 51}], "compact": compact},
+    )
+    monkeypatch.setattr(
+        research,
+        "research_decision_detail",
+        lambda decision_id: calls.append(("detail", decision_id)) or {
+            "id": decision_id,
+            "market_state": {"state": "S1"},
+        },
+    )
+    monkeypatch.setattr(
+        research,
+        "research_evidence_verify",
+        lambda decision_id: calls.append(("verify", decision_id)) or {
+            "id": decision_id,
+            "verified": True,
+            "status": "verified",
+        },
+    )
+
+    readers = snapshots._readers("evidence")
+
+    assert readers["decisionDetail"]()["market_state"]["state"] == "S1"
+    assert readers["evidenceVerification"]()["verified"] is True
+    assert calls == [("detail", 51), ("verify", 51)]
 
 
 def test_postgres_snapshot_schema_check_never_attempts_runtime_ddl(monkeypatch):
@@ -374,3 +428,28 @@ def test_snapshot_oos_and_sealed_readers_request_compact_audits(monkeypatch, pag
     assert readers["oos"]() == {"include_dates": False}
     assert readers["sealed"]() == {"include_dates": False}
     assert calls == [("oos", False), ("sealed", False)]
+
+
+def test_repeated_page_builds_reuse_formal_audit_summaries(monkeypatch):
+    from app.data_platform.routes import data_center
+
+    calls: list[str] = []
+
+    def fake_oos(*, include_dates: bool):
+        calls.append("oos")
+        return {"include_dates": include_dates, "status": "ready"}
+
+    def fake_sealed(*, include_dates: bool):
+        calls.append("sealed")
+        return {"include_dates": include_dates, "status": "ready"}
+
+    monkeypatch.setattr(data_center, "data_center_oos_hard_data", fake_oos)
+    monkeypatch.setattr(data_center, "data_center_sealed_strategy_holdout", fake_sealed)
+    monkeypatch.setattr(snapshots, "_diagnostic_cache", {})
+
+    first = snapshots._readers("overview")
+    second = snapshots._readers("operations")
+
+    assert first["oos"]() == second["oos"]()
+    assert first["sealed"]() == second["sealed"]()
+    assert calls == ["oos", "sealed"]

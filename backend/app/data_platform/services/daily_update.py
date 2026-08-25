@@ -57,6 +57,10 @@ _DAILY_UPDATE_INTERNAL_FAULT_COOLDOWN_SEC = max(
     300,
     min(int(os.getenv("ALIS_DAILY_UPDATE_INTERNAL_FAULT_COOLDOWN_SEC", "1800")), 21600),
 )
+_DAILY_UPDATE_SUCCESS_COOLDOWN_SEC = max(
+    60,
+    min(int(os.getenv("ALIS_DAILY_UPDATE_SUCCESS_COOLDOWN_SEC", "300")), 1800),
+)
 logger = logging.getLogger("quant.daily_update")
 _BUSINESS_TZ = ZoneInfo("Asia/Shanghai")
 
@@ -352,6 +356,57 @@ def _daily_update_retry_policy(c: Any, trade_date: str, *, now: datetime | None 
         "allowed": remaining <= 0,
         "reason": "cooldown_elapsed" if remaining <= 0 else "data_refresh_cooldown",
         "category": category,
+        "retry_after_seconds": remaining,
+        "next_retry_at": (current + timedelta(seconds=remaining)).isoformat(timespec="seconds"),
+    }
+
+
+def _recent_success_policy(c: Any, trade_date: str, *, now: datetime | None = None) -> dict[str, Any]:
+    """Pace duplicate callers after a completed same-session refresh.
+
+    The scheduler, execution probe and deterministic healer may all observe a
+    transient read timeout immediately after the same successful update.  A
+    short persisted cooldown prevents them from starting another full-market
+    run while PostgreSQL is still flushing the first one.  This does not mark
+    the decision contract ready; callers retry the read after the cooldown.
+    """
+
+    row = c.execute(
+        """SELECT finished_at,meta_json FROM data_ingestion_runs
+           WHERE job_name='data_platform.daily_update' AND status='completed'
+           ORDER BY id DESC LIMIT 1"""
+    ).fetchone()
+    if not row:
+        return {"allowed": True, "reason": "no_completed_run"}
+    item = dict(row)
+    try:
+        meta = json.loads(item.get("meta_json") or "{}")
+    except (TypeError, json.JSONDecodeError):
+        return {"allowed": True, "reason": "legacy_success_without_metadata"}
+    if str(meta.get("trade_date") or "") != str(trade_date):
+        return {"allowed": True, "reason": "different_trade_date"}
+    try:
+        finished_at = datetime.fromisoformat(str(item.get("finished_at") or ""))
+    except ValueError:
+        return {"allowed": True, "reason": "invalid_success_timestamp"}
+    current = (
+        now.astimezone(_BUSINESS_TZ)
+        if now and now.tzinfo
+        else now.replace(tzinfo=_BUSINESS_TZ)
+        if now
+        else _business_now()
+    )
+    if finished_at.tzinfo is None:
+        finished_at = finished_at.replace(tzinfo=_BUSINESS_TZ)
+    else:
+        finished_at = finished_at.astimezone(_BUSINESS_TZ)
+    remaining = max(
+        0,
+        int(_DAILY_UPDATE_SUCCESS_COOLDOWN_SEC - (current - finished_at).total_seconds()),
+    )
+    return {
+        "allowed": remaining <= 0,
+        "reason": "success_cooldown_elapsed" if remaining <= 0 else "recent_success_cooldown",
         "retry_after_seconds": remaining,
         "next_retry_at": (current + timedelta(seconds=remaining)).isoformat(timespec="seconds"),
     }
@@ -868,6 +923,15 @@ def start_daily_update() -> dict[str, Any]:
             _set_state(running=False, **blocked)
             return {**blocked, **_state}
         with _conn() as c:
+            success_policy = _recent_success_policy(c, target)
+            if not success_policy.get("allowed"):
+                return {
+                    **success_policy,
+                    "ok": False,
+                    "reason": "cooldown_active",
+                    "trade_date": target,
+                    "cooldown_reason": success_policy.get("reason"),
+                }
             retry_policy = _daily_update_retry_policy(c, target)
             if not retry_policy.get("allowed"):
                 return {
