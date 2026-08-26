@@ -206,6 +206,7 @@ def test_unified_plan_identity_mismatch_rejects_before_market_or_execution(
 
 
 def test_unified_t1_execution_does_not_rerun_investment_opinion(monkeypatch):
+    loaded_dates = []
     signal_row = SnapshotRow(
         symbol="000001", date="20260724", open=10, high=10, low=10,
         close=10, prev_close=9.9, change_pct=1, volume=1000, turnover=10000,
@@ -220,6 +221,7 @@ def test_unified_t1_execution_does_not_rerun_investment_opinion(monkeypatch):
             return None
 
         def load_snapshot(self, value):
+            loaded_dates.append(str(value).replace("-", ""))
             return [signal_row] if str(value).replace("-", "") == "20260724" else [execute_row]
 
     frozen_controller = {
@@ -333,6 +335,8 @@ def test_unified_t1_execution_does_not_rerun_investment_opinion(monkeypatch):
     assert execution_kwargs["max_correlated_industry_pct"] == 0.35
     assert execution_kwargs["high_risk_symbols"] == set()
     assert execution_kwargs["residual_sweep_symbol"] is None
+    assert "20260724" not in loaded_dates
+    assert "20260727" in loaded_dates
 
 
 def test_defensive_execution_row_never_relabels_stale_bar(monkeypatch):

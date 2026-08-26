@@ -1170,11 +1170,16 @@ def run_for_trade_date(
         hold_days = int(config.hold_days) if config and config.hold_days else None
         if champion_quarantined:
             hold_days = None
-    signal_rows = _load_validated_signal_rows(
-        ds,
-        signal_date,
-        strict_no_future=strict_no_future,
-    )
+    # Unified V2 plans carry the signal-day selection and exact quantities in
+    # their immutable contract.  The old snapshot read was not consumed below
+    # and could reject a still-valid frozen plan after retention compaction.
+    # Non-frozen research/replay execution retains its signal-day PIT gate.
+    if not frozen_unified_plan:
+        _load_validated_signal_rows(
+            ds,
+            signal_date,
+            strict_no_future=strict_no_future,
+        )
     # T+1 开盘行情只用于成交观察；风险历史仍显式截止到 signal_date。
     # It must stay on the same immutable timestamp that passed the order audit.
     if hasattr(ds, "set_as_of_time"):

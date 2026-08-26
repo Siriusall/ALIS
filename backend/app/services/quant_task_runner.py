@@ -1843,12 +1843,22 @@ def run_quant_task_async(task_id: int) -> bool:
                 if signal_date in done_signals:
                     processed_total += 1
                     continue
-                pre_decision = _preflight_check_step(
-                    signal_date=signal_date,
-                    execute_date=execute_date,
-                    min_account_balance=min_account_balance,
-                    enforce_session_gate=enforce_session_gate and not frozen_autonomous_execution,
-                    require_min_account_balance=not frozen_autonomous_execution,
+                # A frozen V2 autonomous plan has already fixed its signal-day
+                # selection and the execution gate above has just audited the
+                # exact T+1 order slice.  Re-reading the mutable full-market
+                # signal snapshot here adds no execution evidence and can
+                # strand a valid claimed plan when historical replay storage
+                # is compacted.  Research replay keeps the full preflight.
+                pre_decision = (
+                    no_pause()
+                    if frozen_autonomous_execution
+                    else _preflight_check_step(
+                        signal_date=signal_date,
+                        execute_date=execute_date,
+                        min_account_balance=min_account_balance,
+                        enforce_session_gate=enforce_session_gate,
+                        require_min_account_balance=True,
+                    )
                 )
                 if pre_decision.should_pause:
                     _handle_pause(
