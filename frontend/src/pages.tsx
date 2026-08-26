@@ -896,35 +896,43 @@ function runtimeStatusLabel(value: unknown) {
   } as Record<string, string>)[String(value || "unknown")] || String(value || "未知");
 }
 
+function heartbeatText(value: unknown) {
+  const seconds = Number(value);
+  if (!Number.isFinite(seconds)) return "暂无心跳";
+  if (seconds < 60) return `${Math.round(seconds)} 秒前`;
+  if (seconds < 3600) return `${Math.round(seconds / 60)} 分钟前`;
+  return `${Math.round(seconds / 3600)} 小时前`;
+}
+
+function RuntimeTaskRow({ row, queueIndex }: { row: Json; queueIndex?: number }) {
+  const raw = Number(pick(row, ["progress", "progress_pct"], 0));
+  const progress = Math.max(0, Math.min(100, raw <= 1 ? raw * 100 : raw));
+  return <article className="runtime-task-row">
+    {queueIndex !== undefined && <span className="runtime-queue-index">{queueIndex + 1}</span>}
+    <div className="runtime-task-main"><div><strong>{taskTextLabel(pick(row, ["name", "task_name", "task_type"], ""), "计划任务")}</strong><span>{pick(row, ["execution_node"], "待分配节点")}</span></div><p>{taskTextLabel(pick(row, ["current_step", "message", "phase"], ""), "等待后台调度")}</p>{pick(row, ["status"], "") === "running" && <div className="runtime-progress"><i style={{ width: `${progress}%` }}/></div>}</div>
+    <div className="runtime-task-state"><Status>{pick(row, ["status", "state"], "waiting")}</Status><small>{pick(row, ["status"], "") === "running" ? `${Math.round(progress)}% · ${formatSystemTime(pick(row, ["heartbeat_at", "updated_at"], ""))}` : formatSystemTime(pick(row, ["next_run_at", "created_at"], ""), "条件满足后执行")}</small></div>
+  </article>;
+}
+
 export function SystemObservatory({ data }: { data: ConsoleData }) {
   const payload = data.adminTasksLive || data.tasks || {};
-  const taskRows = firstArray(payload, ["tasks", "items"]);
-  const businessTasks = firstArray(payload, ["active_business_tasks"]);
-  const runtimeServices = firstArray(payload, ["runtime_services"]);
-  const modules = firstArray(payload, ["modules"]);
-  const legacyBusinessTasks = taskRows.filter((task) => pick(task, ["source"], "") !== "runtime" && pick(task, ["activity_scope"], "current") !== "history" && /running|waiting|recovery_pending|observing|blocked|degraded|partial|failed/.test(String(pick(task, ["status", "state"], "")).toLowerCase()));
-  const visibleBusinessTasks = businessTasks.length ? businessTasks : legacyBusinessTasks;
-  const legacyRuntime = taskRows.filter((task) => pick(task, ["source"], "") === "runtime");
-  const visibleRuntime = runtimeServices.length ? runtimeServices : legacyRuntime;
-  const summary = pick(payload, ["business_summary"], {
-    active: visibleBusinessTasks.length,
-    running: visibleBusinessTasks.filter((task) => pick(task, ["status"], "") === "running").length,
-    blocked: visibleBusinessTasks.filter((task) => pick(task, ["status"], "") === "blocked").length,
-    failed: visibleBusinessTasks.filter((task) => pick(task, ["status"], "") === "failed").length,
-  }) as Json;
-  const recentBusiness = taskRows.filter((task) => pick(task, ["source"], "") !== "runtime").slice(0, 6);
-  const activeCount = Number(pick(summary, ["active"], visibleBusinessTasks.length));
-  const runningCount = Number(pick(summary, ["running"], 0));
-  const waitingCount = Number(pick(summary, ["waiting"], 0));
-  const blockedCount = Number(pick(summary, ["blocked"], 0)) + Number(pick(summary, ["failed"], 0));
-  const healthStatus = pick(data.health, ["status"], "unknown");
-  const tradingStatus = pick(data.tradingReady, ["status"], "unknown");
-  return <><PageHeader eyebrow="SYSTEM OBSERVATORY" title="系统运行" summary="业务推进、运行服务与近期记录。" />
-    <div className="system-hero-grid"><article className={`system-overview-card system-business-card ${blockedCount?"is-blocked":""}`}><header><span className="system-card-icon"><Workflow size={19}/></span><Status tone={blockedCount?"danger":runningCount?"info":waitingCount?"watch":"good"}>{blockedCount?"存在阻断":runningCount?"正在推进":waitingCount?"等待中":"当前空闲"}</Status></header><span>当前业务</span><h2>{activeCount?`${activeCount} 个任务处于活动状态`:"当前没有业务任务"}</h2><p>{blockedCount?`${blockedCount} 个任务阻断或失败，详情保留在下方任务证据。`:runningCount?`${runningCount} 个任务正在实际执行。`:waitingCount?`${waitingCount} 个任务正在等待时间窗口、上游数据或调度条件。`:"等待下一次数据、决策、执行或研究调度。"}</p><footer><div><span>活动任务</span><strong>{activeCount}</strong></div><div><span>实际运行</span><strong>{runningCount}</strong></div><div><span>阻断 / 失败</span><strong className={blockedCount?"negative":""}>{blockedCount}</strong></div></footer></article><article className="system-overview-card system-foundation-card"><header><span className="system-card-icon"><ServerCog size={19}/></span><Status>{runtimeStatusLabel(healthStatus)}</Status></header><span>运行底座</span><h2>{visibleRuntime.length} 个服务已登记</h2><p>Worker 与 Scheduler 心跳统一转换为 UTC+8 展示。</p><dl><div><dt>交易业务</dt><dd><Status>{runtimeStatusLabel(tradingStatus)}</Status></dd></div><div><dt>检查时间</dt><dd>{formatSystemTime(pick(data.health,["checked_at","generated_at"]))}</dd></div></dl></article></div>
-    <Section title="当前业务推进" className="system-business-section">{visibleBusinessTasks.length ? <TaskCategory rows={visibleBusinessTasks.slice(0, 12)} className="system-business-list"/> : <Empty title="当前没有业务任务" detail="等待下一次调度。" />}</Section>
-    <Section title="运行底座" detail="常驻服务不计入正在执行的业务任务。" className="system-runtime-section">{visibleRuntime.length ? <TaskCategory rows={visibleRuntime} className="system-runtime-grid"/> : <Empty title="暂无运行服务记录" />}</Section>
-    <Section title="关键组件">{modules.length ? <div className="health-chain system-component-grid">{modules.slice(0, 8).map((module, index) => <article key={String(pick(module, ["key", "name"], index))}><Status>{runtimeStatusLabel(pick(module, ["status"], "unknown"))}</Status><strong>{pick(module, ["name", "key"], "组件")}</strong><p>{pick(module, ["current_step", "next_step", "message"], "等待下一步")}</p></article>)}</div> : <Empty title="暂无组件状态" />}</Section>
-    <Section title="最近业务记录">{recentBusiness.length ? <TaskCategory rows={recentBusiness} className="system-recent-list"/> : <Empty title="暂无近期业务记录" />}</Section>
+  const nodes = firstArray(payload, ["nodes"]);
+  const running = firstArray(payload, ["execution_stream.running"]);
+  const queued = firstArray(payload, ["queue.items"]);
+  const upcoming = firstArray(payload, ["upcoming"]);
+  const incidents = firstArray(payload, ["incidents"]);
+  const stream = pick(payload, ["execution_stream.stream_health"], {}) as Json;
+  const healthyNodes = nodes.filter(node => ["healthy", "running"].includes(String(pick(node, ["status"], "")))).length;
+  const queueCount = Number(pick(payload, ["queue.count"], queued.length));
+  const retryCount = Number(pick(payload, ["queue.retry_wait_count"], 0));
+  const streamPending = Number(pick(stream, ["pending"], 0));
+  const streamLag = Number(pick(stream, ["lag"], 0));
+  return <><PageHeader eyebrow="SYSTEM OBSERVATORY" title="系统运行" summary="实时查看四台服务器正在执行什么、排队顺序、后续安排与任务健康。" />
+    <div className="runtime-summary-grid"><Metric label="正在执行" value={running.length} note={`更新于 ${formatSystemTime(pick(payload,["generated_at"],""))}`} tone={running.length?"info":"neutral"} icon={Activity}/><Metric label="待执行队列" value={queueCount} note={retryCount?`${retryCount} 个任务等待重试`:"按优先级与创建时间排序"} tone={retryCount?"watch":"neutral"} icon={ListTree}/><Metric label="节点健康" value={`${healthyNodes}/${nodes.length||4}`} note="应用、数据库、控制与研究节点" tone={healthyNodes===(nodes.length||4)?"good":"watch"} icon={ServerCog}/><Metric label="Stream 积压" value={streamPending+streamLag} note={`待确认 ${streamPending} · 未投递 ${streamLag}`} tone={streamPending+streamLag?"watch":"good"} icon={Radio}/></div>
+    <Section title="四服务器实时状态" detail="节点心跳、当前任务和本节点排队数量统一展示；没有任务不等于节点故障。"><div className="runtime-node-grid">{nodes.map((node,index)=>{const current=firstArray(node,["current_tasks"]);return <article className={`runtime-node-card runtime-node-${String(pick(node,["status"],"unknown"))}`} key={String(pick(node,["node"],index))}><header><div><span>{pick(node,["node"],"节点")}</span><h3>{pick(node,["name"],"运行节点")}</h3></div><Status>{pick(node,["status"],"unknown")}</Status></header><p>{pick(node,["responsibility"],"系统运行节点")}</p><dl><div><dt>正在执行</dt><dd>{pick(node,["running_count"],0)}</dd></div><div><dt>本节点排队</dt><dd>{pick(node,["queued_count"],0)}</dd></div><div><dt>最近心跳</dt><dd>{heartbeatText(pick(node,["heartbeat_age_seconds"],null))}</dd></div></dl><div className="runtime-node-current">{current.length?current.slice(0,2).map((task,taskIndex)=><div key={String(pick(task,["id"],taskIndex))}><Activity size={13}/><span><strong>{taskTextLabel(pick(task,["name","task_type"],""),"任务")}</strong><small>{Math.round(Number(pick(task,["progress"],0))*100)}% · {pick(task,["phase"],"执行中")}</small></span></div>):<div className="is-idle"><Clock3 size={13}/><span><strong>当前无执行任务</strong><small>{pick(node,["status_reason"],"等待队列任务")}</small></span></div>}</div></article>})}</div></Section>
+    <div className="runtime-work-grid"><Section title="实时执行流" detail="只显示真正处于 running 的业务任务，不把常驻服务算作任务。">{running.length?<div className="runtime-task-list">{running.map((row,index)=><RuntimeTaskRow row={row} key={String(pick(row,["id"],index))}/>)}</div>:<Empty title="当前没有正在执行的业务任务" detail="节点仍可能保持健康并等待下一项调度。" />}</Section><Section title="待执行队列" detail="按重试优先、任务优先级和创建时间排序。">{queued.length?<div className="runtime-task-list">{queued.slice(0,12).map((row,index)=><RuntimeTaskRow row={row} queueIndex={index} key={String(pick(row,["id"],index))}/>)}</div>:<Empty title="队列为空" detail="没有等待领取或等待重试的任务。" />}</Section></div>
+    <Section title="后续安排" detail="系统调度器已计算出的下一批计划；条件未满足时会明确标注。"><div className="runtime-upcoming-grid">{upcoming.map((item,index)=><article key={String(pick(item,["task_type"],index))}><header><Clock3 size={15}/><Status>{pick(item,["status"],"scheduled")}</Status></header><strong>{pick(item,["name"],"计划任务")}</strong><p>{pick(item,["execution_node"],"待分配节点")}</p><time>{formatSystemTime(pick(item,["scheduled_at"],""),"等待交易日或数据条件")}</time></article>)}</div></Section>
+    <Section title="任务健康与异常" detail="只保留当前未解决的阻断、失败或心跳停滞任务；历史已恢复事项不显示。">{incidents.length?<div className="runtime-incident-list">{incidents.map((item,index)=><article key={String(pick(item,["id"],index))}><TriangleAlert size={16}/><div><strong>{taskTextLabel(pick(item,["name","task_type"],""),"异常任务")}</strong><p>{pick(item,["incident_reason","error","message"],"任务状态异常")}</p><small>{pick(item,["execution_node"],"待确认节点")} · {formatSystemTime(pick(item,["updated_at","heartbeat_at"],""))}</small></div><Status tone="danger">{pick(item,["status"],"failed")}</Status></article>)}</div>:<Empty title="当前没有未解决异常" detail="任务心跳、队列和四节点状态均未发现需要处理的问题。" />}</Section>
   </>;
 }
 

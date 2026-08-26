@@ -148,6 +148,7 @@ _scheduler_started = False
 _lease_recovery_started = False
 _start_lock = threading.Lock()
 _runtime_lock = threading.Lock()
+_runtime_persisted_at: dict[str, float] = {}
 _active_task_lock = threading.Lock()
 _active_task_ids: set[int] = set()
 _runtime_status: dict[str, dict[str, Any]] = {
@@ -169,13 +170,46 @@ def _now() -> datetime:
 
 
 def _runtime_heartbeat(component: str, *, alive: bool = True, error: str = "") -> None:
+    now = _now()
     with _runtime_lock:
         state = _runtime_status.setdefault(component, {})
-        state.update({"started": True, "alive": bool(alive), "heartbeat_at": _now().isoformat()})
+        state.update({"started": True, "alive": bool(alive), "heartbeat_at": now.isoformat()})
         if error:
             state["last_error"] = str(error)[:500]
         elif alive:
             state["last_error"] = ""
+        last_persisted = float(_runtime_persisted_at.get(component) or 0.0)
+        should_persist = time.monotonic() - last_persisted >= 10 or bool(error)
+        if should_persist:
+            _runtime_persisted_at[component] = time.monotonic()
+    if not should_persist:
+        return
+    node_name = str(os.getenv("ALIS_NODE_NAME") or {
+        "api_local": "alis-app",
+        "control": "alis-control-worker",
+        "research": "alis-research-worker",
+    }.get(WORKER_POOL, socket.gethostname()))
+    with _active_task_lock:
+        active_task_ids = sorted(_active_task_ids)
+    try:
+        with _conn() as conn:
+            conn.execute(
+                """INSERT INTO runtime_worker_heartbeats
+                   (worker_pool,component,worker_id,node_name,heartbeat_at,alive,last_error,active_task_ids_json,updated_at)
+                   VALUES(?,?,?,?,?,?,?,?,?)
+                   ON CONFLICT(worker_pool,component) DO UPDATE SET
+                    worker_id=excluded.worker_id,node_name=excluded.node_name,
+                    heartbeat_at=excluded.heartbeat_at,alive=excluded.alive,
+                    last_error=excluded.last_error,active_task_ids_json=excluded.active_task_ids_json,
+                    updated_at=excluded.updated_at""",
+                (
+                    WORKER_POOL, component, WORKER_ID, node_name, now.isoformat(),
+                    1 if alive else 0, str(error or "")[:500],
+                    json.dumps(active_task_ids), now.isoformat(),
+                ),
+            )
+    except Exception:
+        logger.debug("runtime heartbeat persistence failed", exc_info=True)
 
 
 def mark_evolution_component_disabled(component: str, *, reason: str) -> None:

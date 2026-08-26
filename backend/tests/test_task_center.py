@@ -35,6 +35,11 @@ def test_task_center_unifies_modules_tasks_next_time_and_logs(monkeypatch):
     })
     monkeypatch.setattr(task_center, "_data_runs", lambda limit: [])
     monkeypatch.setattr(task_center, "_quant_tasks", lambda limit: [])
+    monkeypatch.setattr(task_center, "stream_admin_status", lambda **_kwargs: {
+        "ok": True, "health": "healthy", "pending": 0, "lag": 0,
+        "pending_messages": [], "consumers": [],
+    })
+    monkeypatch.setattr(task_center, "_persistent_worker_heartbeats", lambda: [])
     monkeypatch.setattr(
         task_center,
         "get_plan_model_data_backfill_status",
@@ -53,7 +58,7 @@ def test_task_center_unifies_modules_tasks_next_time_and_logs(monkeypatch):
 
     result = task_center.build_task_center(limit=20, log_limit=20)
 
-    assert result["schema_version"] == "alis_task_center_v2"
+    assert result["schema_version"] == "alis_task_center_v3"
     assert len(result["modules"]) == 10
     assert result["summary"]["running"] == 1
     strategy = next(item for item in result["modules"] if item["key"] == "strategy")
@@ -94,6 +99,11 @@ def test_compact_task_center_uses_bounded_data_status_and_health_reads(monkeypat
     monkeypatch.setattr(task_center, "_data_runs", lambda limit: [])
     monkeypatch.setattr(task_center, "_quant_tasks", lambda limit: [])
     monkeypatch.setattr(task_center, "list_runtime_logs", lambda limit=200: [])
+    monkeypatch.setattr(task_center, "stream_admin_status", lambda **_kwargs: {
+        "ok": True, "health": "healthy", "pending": 0, "lag": 0,
+        "pending_messages": [], "consumers": [],
+    })
+    monkeypatch.setattr(task_center, "_persistent_worker_heartbeats", lambda: [])
 
     task_center.build_task_center(
         limit=20,

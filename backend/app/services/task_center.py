@@ -8,7 +8,8 @@ from app.data_platform.db import _conn as data_conn
 from app.data_platform.services.daily_update import daily_update_status
 from app.data_platform.services.backfill import get_plan_model_data_backfill_status
 from app.data_platform.services.runtime_logs import list_runtime_logs
-from app.db.store import list_quant_run_tasks
+from app.data_platform.services.stream_admin import stream_admin_status
+from app.db.store import _read_conn as sim_read_conn, list_quant_run_tasks
 from app.services.evolution_orchestrator import (
     evolution_runtime_status,
     evolution_schedule_status,
@@ -484,6 +485,9 @@ def _normalise_evolution(task: dict[str, Any], schedule: dict[str, Any]) -> dict
         "id": f"evolution:{task.get('id')}", "source": "evolution", "source_id": int(task.get("id") or 0),
         "module": module, "task_type": task_type, "name": TASK_TYPE_LABEL.get(task_type, task_type or "自治任务"),
         "worker_pool": str(task.get("worker_pool") or "control"),
+        "priority": int(task.get("priority") or 100),
+        "lease_owner": _iso(task.get("lease_owner")),
+        "lease_expires_at": _iso(task.get("lease_expires_at")),
         "status": display_status, "raw_status": raw_status,
         "phase": str(task.get("phase") or ""), "progress": float(task.get("progress") or 0),
         "message": str(task.get("message") or ""), "error": _iso(task.get("error")),
@@ -580,6 +584,7 @@ def _normalise_cycle_steps(task: dict[str, Any], schedule: dict[str, Any]) -> li
         items.append({
             "id": f"cycle:{task.get('id')}:{name}", "source": "autonomy_step", "source_id": int(task.get("id") or 0),
             "module": module, "task_type": name, "name": STEP_LABELS.get(name, name.replace("_", " ")),
+            "worker_pool": str(task.get("worker_pool") or "control"),
             "status": display_status, "raw_status": raw_status, "phase": name,
             "progress": step_progress, "message": message,
             "error": _iso(step.get("error")), "current_step": "本周期步骤已完成" if step.get("ok") else "步骤保留隔离证据",
@@ -602,6 +607,101 @@ def _normalise_cycle_steps(task: dict[str, Any], schedule: dict[str, Any]) -> li
             } if historical_pit_wait else {}),
         })
     return items
+
+
+_NODE_DEFINITIONS = (
+    ("alis-app", "应用与数据流", "API、Redis Stream、日更调度与模拟执行"),
+    ("alis-db", "数据库", "PostgreSQL 业务库与数据平台库"),
+    ("alis-control-worker", "控制工作节点", "自治编排、快照构建与控制类任务"),
+    ("alis-research-worker", "研究工作节点", "模型、因子、回测与长时研究任务"),
+)
+
+
+def _task_execution_node(task: dict[str, Any]) -> str:
+    pool = str(task.get("worker_pool") or "").lower()
+    if pool == "research":
+        return "alis-research-worker"
+    if pool == "control":
+        return "alis-control-worker"
+    if pool == "api_local":
+        return "alis-app"
+    source = str(task.get("source") or "")
+    task_type = str(task.get("task_type") or "")
+    if source in {"data_ingestion", "quant"} or "daily_update" in task_type or "stream" in task_type:
+        return "alis-app"
+    return "alis-control-worker"
+
+
+def _persistent_worker_heartbeats() -> list[dict[str, Any]]:
+    with sim_read_conn() as conn:
+        return [dict(row) for row in conn.execute(
+            "SELECT * FROM runtime_worker_heartbeats ORDER BY worker_pool,component"
+        ).fetchall()]
+
+
+def _node_views(
+    tasks: list[dict[str, Any]],
+    runtime_services: list[dict[str, Any]],
+    heartbeats: list[dict[str, Any]],
+    *,
+    database_healthy: bool,
+    generated_at: datetime,
+) -> list[dict[str, Any]]:
+    heartbeat_by_node: dict[str, list[dict[str, Any]]] = {}
+    for item in heartbeats:
+        heartbeat_by_node.setdefault(str(item.get("node_name") or ""), []).append(item)
+    nodes = []
+    for node_name, label, responsibility in _NODE_DEFINITIONS:
+        node_tasks = [item for item in tasks if item.get("execution_node") == node_name]
+        running = [item for item in node_tasks if item.get("status") == "running"]
+        queued = [item for item in node_tasks if str(item.get("raw_status") or item.get("status")) in {"queued", "retry_wait"}]
+        services = [item for item in runtime_services if item.get("execution_node") == node_name]
+        node_heartbeats = heartbeat_by_node.get(node_name, [])
+        heartbeat_times = [_parse(item.get("heartbeat_at")) for item in node_heartbeats]
+        heartbeat_times = [item for item in heartbeat_times if item is not None]
+        latest_heartbeat = max(heartbeat_times).isoformat() if heartbeat_times else None
+        heartbeat_age = min(
+            [max(0.0, (generated_at - item.astimezone(generated_at.tzinfo)).total_seconds()) for item in heartbeat_times],
+            default=None,
+        )
+        heartbeat_healthy = bool(node_heartbeats) and all(
+            bool(item.get("alive")) and (_parse(item.get("heartbeat_at")) is not None)
+            and max(0.0, (generated_at - _parse(item.get("heartbeat_at")).astimezone(generated_at.tzinfo)).total_seconds()) <= 90
+            for item in node_heartbeats
+        )
+        if node_name == "alis-db":
+            status = "healthy" if database_healthy else "failed"
+            status_reason = "数据库连接与只读检查正常" if database_healthy else "数据库健康检查失败"
+        elif node_name == "alis-app":
+            service_failures = [item for item in services if item.get("status") == "failed"]
+            status = "failed" if service_failures else "running"
+            status_reason = "应用常驻服务心跳正常" if not service_failures else "应用常驻服务存在异常"
+        else:
+            status = "running" if heartbeat_healthy else "degraded" if node_heartbeats else "unknown"
+            status_reason = "Worker 心跳正常" if heartbeat_healthy else "Worker 心跳缺失或已超时"
+        nodes.append({
+            "node": node_name, "name": label, "responsibility": responsibility,
+            "status": status, "status_reason": status_reason,
+            "heartbeat_at": latest_heartbeat, "heartbeat_age_seconds": heartbeat_age,
+            "running_count": len(running), "queued_count": len(queued),
+            "service_count": len(services),
+            "current_tasks": running[:4], "queued_tasks": queued[:4], "services": services,
+            "worker_components": [str(item.get("component") or "") for item in node_heartbeats],
+        })
+    return nodes
+
+
+def _upcoming_schedule(schedule: dict[str, Any]) -> list[dict[str, Any]]:
+    definitions = (
+        ("factor_daily_cycle", "下次因子日循环", schedule.get("next_factor_cycle_at"), "alis-research-worker"),
+        ("system_autonomy_cycle", "下次系统自治周期", schedule.get("next_system_cycle_at"), "alis-control-worker"),
+        ("formal_oos_cycle", "下次正式 OOS 周期", schedule.get("next_formal_cycle_at"), "alis-research-worker"),
+    )
+    return [
+        {"task_type": task_type, "name": name, "scheduled_at": scheduled_at, "execution_node": node,
+         "status": "scheduled" if scheduled_at else "waiting_condition"}
+        for task_type, name, scheduled_at, node in definitions
+    ]
 
 
 def _data_runs(limit: int) -> list[dict[str, Any]]:
@@ -984,6 +1084,7 @@ def _evolution_runtime_tasks() -> list[dict[str, Any]]:
             "heartbeat_at": heartbeat, "updated_at": updated_at, "finished_at": None,
             "attempt": 1, "max_attempts": 1, "activity_scope": "current",
             "checkpoint": {"heartbeat_age_seconds": state.get("heartbeat_age_seconds")},
+            "worker_pool": "api_local",
         })
     return items
 
@@ -1021,6 +1122,7 @@ def _background_runtime_tasks() -> list[dict[str, Any]]:
             "updated_at": heartbeat or observed_at, "finished_at": None,
             "attempt": 1, "max_attempts": 1, "activity_scope": "current",
             "checkpoint": {"heartbeat_age_seconds": state.get("heartbeat_age_seconds"), "errors": state.get("errors", 0)},
+            "worker_pool": "api_local",
         })
     return items
 
@@ -1090,6 +1192,8 @@ def build_task_center(
     tasks.extend(_background_runtime_tasks())
     tasks.extend(safe_read("data_ingestion_runs", lambda: _data_runs(min(limit, 50)), []))
     tasks.extend(safe_read("quant_run_tasks", lambda: _quant_tasks(min(limit, 30)), []))
+    for item in tasks:
+        item["execution_node"] = _task_execution_node(item)
     tasks.sort(key=lambda item: str(item.get("updated_at") or item.get("created_at") or ""), reverse=True)
     _assign_activity_scope(tasks)
     completed_holdout = next(
@@ -1107,6 +1211,39 @@ def build_task_center(
     unresolved_failures, failed_records = _latest_failure_summary(tasks)
     current_tasks = [item for item in tasks if item.get("activity_scope") != "history"]
     active_business_tasks, runtime_services, business_summary = _business_task_views(tasks)
+    stream_status = safe_read(
+        "redis_stream",
+        lambda: stream_admin_status(limit=20, pending_limit=20),
+        {"ok": False, "available": False, "health": "unavailable", "pending": 0, "lag": 0, "consumers": []},
+    )
+    worker_heartbeats = safe_read("worker_heartbeats", _persistent_worker_heartbeats, [])
+    nodes = _node_views(
+        current_tasks,
+        runtime_services,
+        worker_heartbeats,
+        database_healthy=bool(health.get("ok", str(health.get("status") or "") in {"healthy", "ready", "ok"})),
+        generated_at=generated,
+    )
+    running_tasks = [item for item in current_tasks if item.get("status") == "running"]
+    queued_tasks = [
+        item for item in current_tasks
+        if str(item.get("raw_status") or item.get("status") or "") in {"queued", "retry_wait"}
+    ]
+    queued_tasks.sort(key=lambda item: (
+        0 if str(item.get("raw_status") or "") == "retry_wait" else 1,
+        int(item.get("priority") or 100),
+        str(item.get("created_at") or ""),
+    ))
+    stalled_tasks = []
+    for item in running_tasks:
+        heartbeat = _parse(item.get("heartbeat_at") or item.get("updated_at"))
+        age = max(0.0, (generated - heartbeat.astimezone(generated.tzinfo)).total_seconds()) if heartbeat else None
+        if age is None or age > 180:
+            stalled_tasks.append({**item, "heartbeat_age_seconds": age, "incident_reason": "任务心跳超过 180 秒"})
+    incidents = [
+        {**item, "incident_reason": str(item.get("error") or item.get("message") or "任务阻断")}
+        for item in current_tasks if item.get("status") in {"failed", "blocked"}
+    ] + stalled_tasks
     if include_slo:
         from app.services.system_autonomy import build_autonomy_slo
         try:
@@ -1146,7 +1283,7 @@ def build_task_center(
         })
 
     return {
-        "ok": True, "schema_version": "alis_task_center_v2", "generated_at": generated.isoformat(),
+        "ok": True, "schema_version": "alis_task_center_v3", "generated_at": generated.isoformat(),
         "summary": {
             "running": sum(1 for item in current_tasks if item.get("status") == "running"),
             "waiting": sum(1 for item in current_tasks if item.get("status") in {"waiting", "waiting_schedule", "recovery_pending", "observing"}),
@@ -1161,6 +1298,24 @@ def build_task_center(
         "active_business_tasks": active_business_tasks,
         "runtime_services": runtime_services,
         "business_summary": business_summary,
+        "nodes": nodes,
+        "execution_stream": {
+            "running": running_tasks,
+            "running_count": len(running_tasks),
+            "stream_health": stream_status,
+            "stream_pending": stream_status.get("pending_messages") or [],
+        },
+        "queue": {
+            "items": queued_tasks,
+            "count": len(queued_tasks),
+            "retry_wait_count": sum(1 for item in queued_tasks if str(item.get("raw_status") or "") == "retry_wait"),
+            "by_node": {
+                node["node"]: sum(1 for item in queued_tasks if item.get("execution_node") == node["node"])
+                for node in nodes
+            },
+        },
+        "upcoming": _upcoming_schedule(schedule),
+        "incidents": incidents,
         "autonomy_slo": autonomy_slo,
         "execution_slo": execution_slo,
         "logs": safe_read(

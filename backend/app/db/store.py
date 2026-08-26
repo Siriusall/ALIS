@@ -1003,6 +1003,18 @@ CREATE INDEX IF NOT EXISTS idx_evolution_tasks_status_next
 ON evolution_tasks(status, next_run_at, priority, created_at);
 CREATE INDEX IF NOT EXISTS idx_evolution_tasks_type_id
 ON evolution_tasks(task_type, id DESC);
+CREATE TABLE IF NOT EXISTS runtime_worker_heartbeats (
+    worker_pool TEXT NOT NULL,
+    component TEXT NOT NULL,
+    worker_id TEXT NOT NULL,
+    node_name TEXT NOT NULL,
+    heartbeat_at TEXT NOT NULL,
+    alive INTEGER NOT NULL DEFAULT 1,
+    last_error TEXT NOT NULL DEFAULT '',
+    active_task_ids_json TEXT NOT NULL DEFAULT '[]',
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (worker_pool, component)
+);
 CREATE TABLE IF NOT EXISTS strategy_shadow_observations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     model_version_id INTEGER NOT NULL,
