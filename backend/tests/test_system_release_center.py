@@ -17,7 +17,7 @@ def _components(commit="a" * 40):
 
 
 def test_release_manifest_is_stable_and_compatibility_gated(monkeypatch):
-    monkeypatch.setattr(releases, "_component_payloads", _components)
+    monkeypatch.setattr(releases, "_software_component_payloads", _components)
     first = releases.build_release_manifest()
     second = releases.build_release_manifest()
     assert first == second
@@ -31,6 +31,20 @@ def test_release_manifest_is_stable_and_compatibility_gated(monkeypatch):
     assert validation["gates"]["component_compatibility"] is False
 
 
+def test_software_release_manifest_ignores_mutable_autonomy_authority(monkeypatch):
+    components = _components()
+    monkeypatch.setattr(releases, "_software_component_payloads", lambda: components)
+    first = releases.build_release_manifest()
+    components["strategy.champion"]["version"] = "autonomy-promoted-v2"
+    components["strategy.controller"]["version"] = "controller-v2"
+    components["factor.production_set"]["bindings"] = {"new_factor": {"id": 2}}
+    second = releases.build_release_manifest()
+
+    assert first == second
+    assert first["authority_scope"] == "software_only"
+    assert "strategy.champion" not in first["components"]
+
+
 def test_release_catalog_publishes_immutable_sealed_holdout_contract():
     assert releases.CONTRACT_CATALOG["contract.sealed_holdout"]["version"] == (
         "alis_sealed_strategy_holdout_v4_immutable_observation"
@@ -38,7 +52,7 @@ def test_release_catalog_publishes_immutable_sealed_holdout_contract():
 
 
 def test_release_creation_is_idempotent_and_only_validated_release_activates(monkeypatch):
-    monkeypatch.setattr(releases, "_component_payloads", _components)
+    monkeypatch.setattr(releases, "_software_component_payloads", _components)
     with releases.business_conn() as conn:
         conn.execute("DELETE FROM system_release_events")
         conn.execute("DELETE FROM system_release_components")
@@ -97,7 +111,7 @@ def test_governance_cycle_does_not_create_candidate_for_dirty_worktree(monkeypat
 
 
 def test_governance_cycle_activates_only_after_preflight(monkeypatch):
-    monkeypatch.setattr(releases, "_component_payloads", lambda: _components("b" * 40))
+    monkeypatch.setattr(releases, "_software_component_payloads", lambda: _components("b" * 40))
     monkeypatch.setattr(releases, "discover_release_change", lambda: {
         "changed": True, "restart_required": False,
     })

@@ -2240,7 +2240,9 @@ def _persist_candidate_result(target: dict[str, Any], result: dict[str, Any]) ->
 
 def _oos_hard_data_block(task: dict[str, Any], audit: dict[str, Any]) -> dict[str, Any]:
     """Return the common fail-closed result for a frozen-history consumer."""
-    legacy = str((audit.get("legacy_reference") or {}).get("status") or "") == "legacy_economic_time_reference"
+    legacy = str((audit.get("legacy_reference") or {}).get("status") or "") in {
+        "legacy_economic_time_reference", "retired_unrecoverable",
+    }
     return {
         "status": "blocked_by_legacy_oos_reference" if legacy else "blocked_by_oos_hard_data",
         "reason": "legacy_pit_evidence_retired_accumulating_new_baseline" if legacy else "permanent_oos_hard_data_not_ready",
@@ -3276,7 +3278,37 @@ def _defer_for_oos_hard_data(task: dict[str, Any], result: dict[str, Any]) -> bo
     """Keep formal OOS evidence pending while an external hard-data gate blocks it."""
     now = _now()
     audit = result.get("hard_data_audit") if isinstance(result.get("hard_data_audit"), dict) else {}
-    legacy_reference = str((audit.get("legacy_reference") or {}).get("status") or "") == "legacy_economic_time_reference"
+    legacy_reference = str((audit.get("legacy_reference") or {}).get("status") or "") in {
+        "legacy_economic_time_reference", "retired_unrecoverable",
+    }
+    if legacy_reference:
+        # The v4 history can never become valid through waiting or refetching.
+        # Close the old task with an auditable terminal result so it no longer
+        # occupies the active queue or interferes with software releases.  New
+        # v5 prospective cohorts are scheduled under their own contract.
+        return _update_active_task(
+            int(task["id"]),
+            statuses=("running",),
+            require_not_stopped=True,
+            expected_lease_owner=WORKER_ID,
+            status="completed",
+            phase="retired_legacy_oos_contract",
+            progress=1.0,
+            message="旧 OOS v4 合同已退役；任务终止等待并保留审计证据",
+            result={
+                **result,
+                "status": "retired_legacy_oos_contract",
+                "legacy_contract_terminal": True,
+                "next_contract": "alis_progressive_oos_v5",
+                "production_change_forbidden": True,
+            },
+            error=None,
+            next_run_at=None,
+            lease_owner=None,
+            lease_expires_at=None,
+            deadline_at=None,
+            heartbeat_at=now.isoformat(),
+        )
     non_repairable = list(audit.get("non_repairable_dates") or [])
     historical_evidence_wait = bool(non_repairable) and not bool(audit.get("repair_dates"))
     return _update_active_task(

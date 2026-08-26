@@ -36,7 +36,9 @@ def classify_step_health(step: dict[str, Any]) -> dict[str, str]:
         return {"status": "waiting_condition", "reason": "historical_point_in_time_unavailable"}
     if (
         str(step.get("name") or "") == "hard_data_gate"
-        and str((result.get("legacy_reference") or {}).get("status") or "") == "legacy_economic_time_reference"
+        and str((result.get("legacy_reference") or {}).get("status") or "") in {
+            "legacy_economic_time_reference", "retired_unrecoverable",
+        }
     ):
         return {"status": "waiting_condition", "reason": "legacy_oos_reference_accumulating_new_pit"}
     if step.get("error") or not bool(step.get("ok", True)):

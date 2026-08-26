@@ -332,6 +332,7 @@ def _owner_summary(steps: list[dict[str, Any]]) -> dict[str, Any]:
         }
         for step in steps
         if str(step.get("name") or "") not in {"autonomous_self_healing", "llm_incident_supervisor"}
+        if str(step.get("name") or "") not in {"hard_data_gate", "sealed_holdout_data_gate"}
         if str((step.get("health") or {}).get("status") or ("healthy" if step.get("ok") else "failed")) in {"failed", "degraded"}
     ]
     # The supervisor and self-healing layers are not allowed to erase their
@@ -356,8 +357,17 @@ def _owner_summary(steps: list[dict[str, Any]]) -> dict[str, Any]:
             "module": "champion_execution_gate",
             "message": f"live_champion_gate_unavailable:{champion_gate_error}",
         })
+    operational_healthy = (
+        not anomalies
+        and (
+            int(incident_supervisor.get("owner_action_required_count") or 0) == 0
+            if incident_supervisor
+            else True
+        )
+    )
+    research_readiness = "accumulating" if historical_gate_waits else "ready"
     return {
-        "schema_version": "alis_owner_daily_summary_v3",
+        "schema_version": "alis_owner_daily_summary_v4_split_health",
         "generated_at": datetime.now().astimezone().isoformat(),
         "questions": {
             "today_rebalance": {
@@ -464,21 +474,20 @@ def _owner_summary(steps: list[dict[str, Any]]) -> dict[str, Any]:
         # an authority that may erase deterministic step failures.  A timeout
         # or degraded module must keep the daily cycle non-green even when the
         # supervisor decides that no owner action is necessary.
-        "healthy": (
-            not anomalies
-            and not historical_gate_waits
-            and (
-                int(incident_supervisor.get("owner_action_required_count") or 0) == 0
-                if incident_supervisor
-                else True
-            )
-        ),
+        # Historical OOS/holdout evidence is a promotion concern, not an
+        # operational outage.  Keep it visible above while preventing an
+        # unrecoverable research wait from painting the whole system red.
+        "healthy": operational_healthy,
+        "operational_health": "healthy" if operational_healthy else "degraded",
+        "trading_readiness": "ready" if operational_healthy else "blocked",
+        "research_readiness": research_readiness,
+        "promotion_readiness": "blocked" if historical_gate_waits else "ready",
     }
 
 
 def run_system_autonomy_cycle(*, trade_date: str = "") -> dict[str, Any]:
     """Run the existing deterministic modules as one auditable daily bus cycle."""
-    from app.data_platform.services.oos_hard_data import audit_oos_hard_data
+    from app.data_platform.services.oos_hard_data import audit_progressive_oos
     from app.services.corporate_actions import run_corporate_action_cycle
     from app.services.execution_cost_calibration import calibrate_execution_cost_model
     from app.services.performance_reports import run_periodic_performance_review
@@ -509,7 +518,7 @@ def run_system_autonomy_cycle(*, trade_date: str = "") -> dict[str, Any]:
     from app.services.sealed_strategy_holdout import audit_sealed_strategy_holdout
     from app.services.data_health import assess_latest_decision_data_health
 
-    hard_data_step = _run_step("hard_data_gate", lambda: audit_oos_hard_data(include_dates=False))
+    hard_data_step = _run_step("hard_data_gate", lambda: audit_progressive_oos(include_dates=False))
     sealed_holdout_step = _run_step("sealed_holdout_data_gate", lambda: audit_sealed_strategy_holdout(include_dates=False))
     frozen_trade_date = str(trade_date or "").replace("-", "")[:8]
     decision_data_step = _run_step(

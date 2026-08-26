@@ -356,7 +356,7 @@ def _health_payload(*, require_redis: bool = True) -> dict:
     expected_revisions = {"sim": SIM_SCHEMA_HEAD, "data": DATA_SCHEMA_HEAD}
     revisions_ready = current_revisions == expected_revisions
     release_drift = discover_release_change()
-    runtime_code_ready = not bool(release_drift.get("restart_required"))
+    deployment_pending = bool(release_drift.get("restart_required"))
     # A process can be running the current source while the active immutable
     # release still points at an older manifest.  That state is intentionally
     # execution-blocking and must not be reported as a healthy runtime.
@@ -392,11 +392,6 @@ def _health_payload(*, require_redis: bool = True) -> dict:
             "Database migration revision mismatch: "
             f"current={current_revisions}, expected={expected_revisions}"
         ])
-        + ([] if runtime_code_ready else [
-            "Runtime code is stale: "
-            f"runtime_commit={release_drift.get('runtime_commit')}, "
-            f"repository_commit={release_drift.get('repository_commit')}; restart required"
-        ])
         + ([] if release_binding_ready else [
             "Active system release does not match observed runtime bindings; execution is blocked"
         ])
@@ -412,7 +407,6 @@ def _health_payload(*, require_redis: bool = True) -> dict:
     ready = (
         databases_ready
         and revisions_ready
-        and runtime_code_ready
         and release_binding_ready
         and (not require_redis or bool(redis.get("available", False)))
         and runtime_ready
@@ -422,6 +416,13 @@ def _health_payload(*, require_redis: bool = True) -> dict:
         "ready": ready,
         "degraded": databases_ready and bool(issues),
         "issues": issues,
+        "advisories": ([] if not deployment_pending else [{
+            "code": "deployment_pending_restart",
+            "message": "A newer repository revision is staged; the current immutable runtime remains active until restart",
+            "runtime_commit": release_drift.get("runtime_commit"),
+            "repository_commit": release_drift.get("repository_commit"),
+            "blocking": False,
+        }]),
         "dependencies": {
             "primary_database": primary,
             "data_platform_database": data_platform,

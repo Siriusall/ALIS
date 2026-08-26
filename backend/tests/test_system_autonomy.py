@@ -197,7 +197,7 @@ def test_owner_summary_uses_current_profit_and_autonomy_contracts():
             ]
         )
 
-    assert summary["schema_version"] == "alis_owner_daily_summary_v3"
+    assert summary["schema_version"] == "alis_owner_daily_summary_v4_split_health"
     assert summary["questions"]["profit"]["daily_return_pct"] == 0.12
     assert summary["questions"]["profit"]["monthly_return_pct"] == 1.34
     assert summary["questions"]["profit"]["trading_cost_contribution"] == -0.03
@@ -362,7 +362,10 @@ def test_historical_gate_is_visible_as_research_wait_without_disabling_shadow(mo
 
     result = system_autonomy.run_system_autonomy_cycle(trade_date="20260813")
     summary = result["owner_summary"]["questions"]
-    assert result["status"] == "completed_with_anomalies"
+    assert result["status"] == "completed"
+    assert result["owner_summary"]["operational_health"] == "healthy"
+    assert result["owner_summary"]["research_readiness"] == "accumulating"
+    assert result["owner_summary"]["promotion_readiness"] == "blocked"
     assert summary["historical_research_waits"][0]["scope"] == "formal_oos_or_sealed_holdout_only"
     assert summary["today_rebalance"] is not None
     shadow = next(item for item in result["steps"] if item["name"] == "strategy_shadow_recovery")

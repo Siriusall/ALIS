@@ -387,16 +387,19 @@ def test_repair_entry_rejects_non_repairable_or_unclassified_dates():
     }
 
 
-def test_oos_hard_contract_requires_five_formal_windows(monkeypatch):
+def test_legacy_oos_is_retired_when_strict_history_is_unrecoverable(monkeypatch):
     assert oos_hard_data.REQUIRED_SESSIONS == 1537
     monkeypatch.setattr(oos_hard_data, "_conn", lambda: FakeConn())
     monkeypatch.setattr(oos_hard_data, "_late_arrival_hard_api_sets", lambda _details: {})
     result = oos_hard_data.audit_oos_hard_data(end_date="20260722")
-    assert result["status"] == "blocked"
+    assert result["status"] == "accumulating"
     assert result["eligible_sessions"] == 0
     assert result["calendar_missing_sessions"] == 1535
     assert "historical_observation_evidence_missing" in result["dates"][1]["reasons"]
-    assert result["hard_requirement"] is True
+    assert result["hard_requirement"] is False
+    assert result["legacy_reference"]["status"] == "retired_unrecoverable"
+    assert result["legacy_reference"]["runtime_health_impact"] is False
+    assert result["promotion_authorized"] is False
 
 
 def test_oos_benchmark_set_filters_late_revisions_in_sql(monkeypatch):
@@ -480,16 +483,16 @@ def test_late_arrival_classification_uses_immutable_observation_versions(monkeyp
     assert "dc_tushare_raw_record_version" in queries[0]
 
 
-def test_oos_asset_is_permanent_blocking_asset(monkeypatch):
-    monkeypatch.setattr(oos_hard_data, "audit_oos_hard_data", lambda include_dates=False: {
+def test_oos_asset_is_progressive_non_runtime_blocking_asset(monkeypatch):
+    monkeypatch.setattr(oos_hard_data, "audit_progressive_oos", lambda include_dates=False: {
         "consumer": "Champion", "window_start": "20200101", "window_end": "20260722",
         "eligible_sessions": 1000, "required_sessions": 1537, "coverage": .650618, "status": "blocked",
     })
     asset = oos_hard_data.oos_hard_data_asset()
     assert asset["key"] == "oos_hard_data"
-    assert asset["hard_requirement"] is True
+    assert asset["hard_requirement"] is False
     assert asset["status"] == "partial"
-    assert asset["weight"] == 100
+    assert asset["weight"] == 30
 
 
 def test_default_audit_keeps_last_complete_frozen_window_when_cutoff_is_open(monkeypatch):
@@ -600,12 +603,13 @@ def test_default_audit_keeps_elapsed_historical_evidence_gaps_visible(monkeypatc
 
     result = oos_hard_data.audit_oos_hard_data(include_dates=False)
 
-    assert result["status"] == "blocked"
+    assert result["status"] == "accumulating"
+    assert result["legacy_reference"]["status"] == "retired_unrecoverable"
     assert result["trailing_pending_dates"] == []
     assert result["non_repairable_dates"] == dates
 
 
-def test_new_strict_baseline_is_progress_only_and_never_promotion_authorized():
+def test_new_strict_baseline_exposes_progressive_simulation_tiers():
     details = [
         {"trade_date": "20260814", "eligible": True},
         {"trade_date": "20260817", "eligible": True},
@@ -614,8 +618,34 @@ def test_new_strict_baseline_is_progress_only_and_never_promotion_authorized():
     result = oos_hard_data._new_strict_baseline(details)
     assert result["eligible_sessions"] == 0
     assert result["required_sessions"] == 126
-    assert result["promotion_authorized"] is False
+    assert result["live_promotion_authorized"] is False
+    assert result["simulation_evaluation_data_ready"] is False
     assert result["formal_oos_required_sessions"] == oos_hard_data.REQUIRED_SESSIONS
+
+
+def test_progressive_oos_tiers_authorize_only_the_matching_simulation_scope():
+    diagnostic = oos_hard_data._new_strict_baseline([
+        {"trade_date": f"d{index:03d}", "eligible": True}
+        for index in range(oos_hard_data.PROGRESSIVE_DIAGNOSTIC_SESSIONS)
+    ])
+    simulation = oos_hard_data._new_strict_baseline([
+        {"trade_date": f"d{index:03d}", "eligible": True}
+        for index in range(oos_hard_data.PROGRESSIVE_SIMULATION_SESSIONS)
+    ])
+    champion = oos_hard_data._new_strict_baseline([
+        {"trade_date": f"d{index:03d}", "eligible": True}
+        for index in range(oos_hard_data.PROGRESSIVE_SIMULATION_CHAMPION_SESSIONS)
+    ])
+
+    assert diagnostic["status"] == "diagnostic_data_ready"
+    assert diagnostic["simulation_evaluation_data_ready"] is False
+    assert simulation["status"] == "simulation_evaluation_data_ready"
+    assert simulation["simulation_evaluation_data_ready"] is True
+    assert simulation["simulation_champion_evaluation_data_ready"] is False
+    assert champion["status"] == "simulation_champion_evaluation_data_ready"
+    assert champion["simulation_champion_evaluation_data_ready"] is True
+    assert champion["qualification_authority"] == "data_gate_only"
+    assert champion["live_promotion_authorized"] is False
 
 
 def test_compact_audit_returns_nonrepairable_count_with_bounded_date_samples(monkeypatch):

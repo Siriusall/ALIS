@@ -12,14 +12,9 @@ from typing import Any
 
 from app.data_platform.db import _conn as data_conn
 from app.db.store import _conn as business_conn
-from app.db.store import get_active_model_version
-from app.services.factor_platform import FACTOR_SCHEMA_VERSION, active_factor_bindings
-from app.services.plan_model_control import PLAN_MODELS, audit_plan_model_production_eligibility
-from app.services.production_strategy import resolve_production_strategy_champion
-from app.services.strategy_controller import active_strategy_policy_context
 
 
-RELEASE_SCHEMA_VERSION = "alis_system_release_manifest_v1"
+RELEASE_SCHEMA_VERSION = "alis_software_release_manifest_v2"
 DECISION_MANIFEST_SCHEMA_VERSION = "alis_decision_version_manifest_v3"
 SIM_SCHEMA_HEAD = "sim_0013_factor_values_maint"
 DATA_SCHEMA_HEAD = "data_0015_churn_maint"
@@ -33,7 +28,7 @@ CONTRACT_CATALOG: dict[str, dict[str, Any]] = {
     "contract.point_in_time": {"version": "alis_market_observation_clock_v1", "critical": True},
     "contract.execution": {"version": "alis_t1_execution_safety_v2", "critical": True},
     "contract.unified_decision": {"version": "alis_unified_daily_decision_v2", "critical": True},
-    "contract.oos_hard_data": {"version": "alis_oos_hard_data_v4_immutable_observation", "critical": False},
+    "contract.oos_hard_data": {"version": "alis_progressive_oos_v5", "critical": False},
     "contract.sealed_holdout": {"version": "alis_sealed_strategy_holdout_v4_immutable_observation", "critical": False},
 }
 COMPATIBILITY_RULES = (
@@ -113,55 +108,37 @@ def _safe_config() -> dict[str, str]:
     return {key: str(os.getenv(key) or "") for key in SAFE_CONFIG_KEYS}
 
 
-def _component_payloads() -> dict[str, dict[str, Any]]:
+def _software_component_payloads() -> dict[str, dict[str, Any]]:
+    """Collect release inputs without touching mutable autonomy authority."""
     git = process_git_state()
     revisions = database_revisions()
-    champion = resolve_production_strategy_champion()
-    controller = active_strategy_policy_context()
-    models = {}
-    for key in PLAN_MODELS:
-        active = get_active_model_version(key)
-        if active:
-            eligibility = audit_plan_model_production_eligibility(active)
-            models[key] = {
-                "id": int(active["id"]), "version": str(active.get("version") or ""),
-                "status": str(active.get("status") or ""),
-                "production_eligible": bool(eligibility.get("passed")),
-                "blocked_reasons": list(eligibility.get("blocked_reasons") or []),
-            }
-    factors = active_factor_bindings()
     payloads: dict[str, dict[str, Any]] = {
         "code.backend": {"version": git.get("commit") or "unknown", **git},
         "database.sim": {"version": revisions["sim"] or "unversioned", "expected": SIM_SCHEMA_HEAD},
         "database.data": {"version": revisions["data"] or "unversioned", "expected": DATA_SCHEMA_HEAD},
-        "strategy.champion": {
-            "version": str(champion.get("champion_version") or ""),
-            "native_table": "model_versions", "native_id": int(champion.get("champion_id") or 0),
-            "strategy_id": int(champion.get("strategy_id") or 0),
-        },
-        "strategy.controller": {
-            "version": str(controller.get("strategy_policy_version") or ""),
-            "native_table": "model_versions",
-            "native_id": int(controller.get("strategy_policy_version_id") or 0),
-        },
-        "factor.production_set": {
-            "version": FACTOR_SCHEMA_VERSION, "bindings": factors, "bindings_hash": _hash(factors),
-        },
         "config.runtime": {"version": _hash(_safe_config())[:16], "values": _safe_config()},
     }
-    for key, value in models.items():
-        payloads[f"model.{key}"] = {"native_table": "model_versions", **value}
     for key, value in CONTRACT_CATALOG.items():
         payloads[key] = dict(value)
     return payloads
 
 
 def build_release_manifest() -> dict[str, Any]:
-    components = _component_payloads()
+    # A software release is deliberately independent from mutable decision
+    # authority.  Champion/controller/model/factor bindings are frozen by the
+    # per-decision manifest; including them here made every autonomous research
+    # change look like a code deployment and could block an otherwise safe
+    # restart indefinitely.
+    components = {
+        key: value
+        for key, value in _software_component_payloads().items()
+        if key.startswith(("code.", "database.", "config.", "contract."))
+    }
     manifest = {
         "schema_version": RELEASE_SCHEMA_VERSION,
         "components": {key: components[key] for key in sorted(components)},
         "simulation_only": True,
+        "authority_scope": "software_only",
     }
     manifest["manifest_hash"] = _hash(manifest)
     return manifest
@@ -182,13 +159,6 @@ def validate_release_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
         "git_clean": not bool((components.get("code.backend") or {}).get("dirty")),
         "sim_db_at_head": str((components.get("database.sim") or {}).get("version") or "") == SIM_SCHEMA_HEAD,
         "data_db_at_head": str((components.get("database.data") or {}).get("version") or "") == DATA_SCHEMA_HEAD,
-        "champion_bound": bool((components.get("strategy.champion") or {}).get("version")),
-        "controller_bound": bool((components.get("strategy.controller") or {}).get("version")),
-        "factor_bindings_present": bool((components.get("factor.production_set") or {}).get("bindings")),
-        "active_models_production_eligible": all(
-            bool(payload.get("production_eligible"))
-            for key, payload in components.items() if key.startswith("model.")
-        ),
         "required_contracts_present": all(key in components for key in CONTRACT_CATALOG),
         "component_compatibility": all(compatibility.values()),
         "simulation_only": manifest.get("simulation_only") is True,
@@ -546,6 +516,8 @@ def validate_release_preflight(release: dict[str, Any]) -> dict[str, Any]:
             "frozen_plan_count": frozen_count,
             "current_execution_contract": current_execution,
             "target_execution_contract": target_execution,
+            "autonomy_tasks_blocking": False,
+            "blocking_scope": "executing_trade_and_frozen_execution_contract_only",
         },
     }
 

@@ -84,7 +84,7 @@ def test_health_is_not_ready_when_runtime_schema_revision_is_stale(monkeypatch):
     assert any("migration revision mismatch" in item for item in result["issues"])
 
 
-def test_health_is_not_ready_when_runtime_code_is_behind_repository(monkeypatch):
+def test_health_keeps_current_runtime_ready_while_new_repository_is_staged(monkeypatch):
     _healthy_dependencies(monkeypatch)
     monkeypatch.setattr(main, "redis_health", lambda: {"available": True})
     monkeypatch.setattr(main, "runtime_heartbeat_status", lambda: {"scheduler": {"healthy": True}})
@@ -95,9 +95,10 @@ def test_health_is_not_ready_when_runtime_code_is_behind_repository(monkeypatch)
 
     result = _payload(main.readiness())
 
-    assert result["ready"] is False
+    assert result["ready"] is True
     assert result["dependencies"]["release_runtime"]["restart_required"] is True
-    assert any("Runtime code is stale" in item for item in result["issues"])
+    assert result["advisories"][0]["code"] == "deployment_pending_restart"
+    assert result["advisories"][0]["blocking"] is False
 
 
 def test_health_is_not_ready_when_active_release_manifest_drifts(monkeypatch):

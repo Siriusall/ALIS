@@ -1,4 +1,4 @@
-"""Permanent hard-data contract for formal Champion OOS validation."""
+"""Progressive PIT evidence contract for OOS simulation qualification."""
 
 from __future__ import annotations
 
@@ -11,7 +11,8 @@ from app.data_platform.services.market_calendar import TradeCalendarNotReady, ta
 from app.data_platform.services.observation_clock import _valid_provenance_sql
 from app.data_platform.services.snapshot_health import snapshot_stats_for_range
 
-CONTRACT_VERSION = "alis_oos_hard_data_v4_immutable_observation"
+LEGACY_CONTRACT_VERSION = "alis_oos_hard_data_v4_immutable_observation"
+CONTRACT_VERSION = "alis_progressive_oos_v5"
 TRAIN_SESSIONS = 756
 PURGE_SESSIONS = 20
 VALIDATION_SESSIONS = 126
@@ -27,6 +28,9 @@ MAX_COMPACT_NON_REPAIRABLE_DATE_SAMPLES = 20
 # A visible progress target for the post-observation-clock evidence run.  It
 # is not an alternative to the full formal OOS requirement below.
 NEW_STRICT_BASELINE_SESSIONS = 126
+PROGRESSIVE_DIAGNOSTIC_SESSIONS = 60
+PROGRESSIVE_SIMULATION_SESSIONS = 126
+PROGRESSIVE_SIMULATION_CHAMPION_SESSIONS = 252
 HARD_APIS = ("daily", "daily_basic", "stk_limit", "adj_factor")
 BENCHMARK_INDEX_CODE = "000300.SH"
 BENCHMARK_API_KEY = f"index_daily:{BENCHMARK_INDEX_CODE}"
@@ -744,7 +748,11 @@ def _repair_benchmark_gaps(
     return results
 
 
-def _calendar_not_ready_audit(exc: TradeCalendarNotReady) -> dict[str, Any]:
+def _calendar_not_ready_audit(
+    exc: TradeCalendarNotReady,
+    *,
+    required_sessions: int = REQUIRED_SESSIONS,
+) -> dict[str, Any]:
     """Return an explicit hard-data block without inventing an OOS window."""
     return {
         "ok": False,
@@ -755,11 +763,11 @@ def _calendar_not_ready_audit(exc: TradeCalendarNotReady) -> dict[str, Any]:
         "reason": str(exc),
         "hard_requirement": True,
         "consumer": "Champion Purged Walk-Forward OOS",
-        "required_sessions": REQUIRED_SESSIONS,
+        "required_sessions": required_sessions,
         "calendar_sessions": 0,
         "eligible_sessions": 0,
-        "missing_sessions": REQUIRED_SESSIONS,
-        "calendar_missing_sessions": REQUIRED_SESSIONS,
+        "missing_sessions": required_sessions,
+        "calendar_missing_sessions": required_sessions,
         "coverage": 0.0,
         "window_start": "",
         "window_end": "",
@@ -792,33 +800,58 @@ def _new_strict_baseline(details: list[dict[str, Any]]) -> dict[str, Any]:
         contiguous.append(str(item.get("trade_date") or ""))
     contiguous.reverse()
     observed = len(contiguous)
+    if observed >= PROGRESSIVE_SIMULATION_CHAMPION_SESSIONS:
+        status = "simulation_champion_evaluation_data_ready"
+    elif observed >= PROGRESSIVE_SIMULATION_SESSIONS:
+        status = "simulation_evaluation_data_ready"
+    elif observed >= PROGRESSIVE_DIAGNOSTIC_SESSIONS:
+        status = "diagnostic_data_ready"
+    else:
+        status = "accumulating"
     return {
-        "status": "ready_for_initial_frozen_research" if observed >= NEW_STRICT_BASELINE_SESSIONS else "accumulating",
+        "schema_version": CONTRACT_VERSION,
+        "status": status,
         "eligible_sessions": observed,
         "required_sessions": NEW_STRICT_BASELINE_SESSIONS,
         "coverage": round(min(1.0, observed / NEW_STRICT_BASELINE_SESSIONS), 6),
         "window_start": contiguous[0] if contiguous else "",
         "window_end": contiguous[-1] if contiguous else "",
-        "promotion_authorized": False,
+        "qualification_authority": "data_gate_only",
+        "strategy_validation_required": True,
+        "diagnostic_data_ready": observed >= PROGRESSIVE_DIAGNOSTIC_SESSIONS,
+        "simulation_evaluation_data_ready": observed >= PROGRESSIVE_SIMULATION_SESSIONS,
+        "simulation_champion_evaluation_data_ready": observed >= PROGRESSIVE_SIMULATION_CHAMPION_SESSIONS,
+        "live_promotion_authorized": False,
+        "tiers": {
+            "diagnostic": PROGRESSIVE_DIAGNOSTIC_SESSIONS,
+            "simulation": PROGRESSIVE_SIMULATION_SESSIONS,
+            "simulation_champion": PROGRESSIVE_SIMULATION_CHAMPION_SESSIONS,
+        },
         "formal_oos_required_sessions": REQUIRED_SESSIONS,
         "note": "仅用于新严格 PIT 证据积累；不替代正式五窗口 OOS 或 Champion 晋升门",
     }
 
 
-def audit_oos_hard_data(*, end_date: str | None = None, include_dates: bool = True) -> dict[str, Any]:
+def audit_oos_hard_data(
+    *,
+    end_date: str | None = None,
+    include_dates: bool = True,
+    window_sessions: int | None = None,
+) -> dict[str, Any]:
     """Audit the latest contiguous protocol-sized calendar window.
 
     A session is eligible only when every hard API has a retained slice, the
     normalized snapshot has broad OHLC-volume coverage, and its availability
     timestamp is no later than the T-day close cutoff.
     """
+    required_sessions = max(1, int(window_sessions or REQUIRED_SESSIONS))
     try:
         with _conn() as conn:
             end = str(end_date or target_trade_date(conn)).replace("-", "")[:8]
     except TradeCalendarNotReady as exc:
-        return _calendar_not_ready_audit(exc)
+        return _calendar_not_ready_audit(exc, required_sessions=required_sessions)
     with _conn() as conn:
-        calendar_limit = REQUIRED_SESSIONS if end_date else REQUIRED_SESSIONS + PENDING_TRADE_DAY_BUFFER
+        calendar_limit = required_sessions if end_date else required_sessions + PENDING_TRADE_DAY_BUFFER
         calendar_rows = conn.execute(
             """SELECT cal_date FROM dc_trade_calendar
                WHERE exchange='SSE' AND is_open=1 AND cal_date<=?
@@ -947,13 +980,13 @@ def audit_oos_hard_data(*, end_date: str | None = None, include_dates: bool = Tr
                 break
             started = True
             contiguous_newest_first.append(item)
-        if len(contiguous_newest_first) >= REQUIRED_SESSIONS:
-            details = list(reversed(contiguous_newest_first[:REQUIRED_SESSIONS]))
+        if len(contiguous_newest_first) >= required_sessions:
+            details = list(reversed(contiguous_newest_first[:required_sessions]))
         else:
             usable = [item for item in details if str(item["trade_date"]) not in set(trailing_pending_dates)]
-            details = usable[-REQUIRED_SESSIONS:]
+            details = usable[-required_sessions:]
     else:
-        details = details[-REQUIRED_SESSIONS:]
+        details = details[-required_sessions:]
     required_dates = [str(item["trade_date"]) for item in details]
     start = required_dates[0] if required_dates else end
     effective_end = required_dates[-1] if required_dates else end
@@ -969,8 +1002,8 @@ def audit_oos_hard_data(*, end_date: str | None = None, include_dates: bool = Tr
         if include_dates
         else all_non_repairable_dates[:MAX_COMPACT_NON_REPAIRABLE_DATE_SAMPLES]
     )
-    calendar_missing = max(0, REQUIRED_SESSIONS - len(required_dates))
-    coverage = len(eligible_dates) / REQUIRED_SESSIONS
+    calendar_missing = max(0, required_sessions - len(required_dates))
+    coverage = len(eligible_dates) / required_sessions
     baseline = _new_strict_baseline(details)
     legacy_reasons = {
         "historical_observation_evidence_missing",
@@ -981,14 +1014,24 @@ def audit_oos_hard_data(*, end_date: str | None = None, include_dates: bool = Tr
         bool(set(item.get("reasons") or []) & legacy_reasons)
         for item in details if not item["eligible"]
     )
+    formal_ready = required_sessions >= REQUIRED_SESSIONS and len(eligible_dates) >= REQUIRED_SESSIONS
+    active_status = (
+        "ready" if formal_ready
+        else "accumulating" if legacy_reference_mode or required_sessions < REQUIRED_SESSIONS
+        else "blocked"
+    )
     result = {
-        "ok": len(eligible_dates) >= REQUIRED_SESSIONS,
+        # The audit completed successfully even while evidence accumulates.
+        # Formal consumers must use promotion_authorized/status, not turn a
+        # normal prospective wait into an operational failure.
+        "ok": active_status != "blocked",
         "audit_completed": True,
         "schema_version": CONTRACT_VERSION,
-        "status": "ready" if len(eligible_dates) >= REQUIRED_SESSIONS else "blocked",
-        "hard_requirement": True, "consumer": "Champion Purged Walk-Forward OOS",
-        "required_sessions": REQUIRED_SESSIONS, "calendar_sessions": len(required_dates),
-        "eligible_sessions": len(eligible_dates), "missing_sessions": REQUIRED_SESSIONS - len(eligible_dates),
+        "status": active_status,
+        "hard_requirement": False,
+        "consumer": "Progressive simulation qualification; live promotion remains separate",
+        "required_sessions": required_sessions, "calendar_sessions": len(required_dates),
+        "eligible_sessions": len(eligible_dates), "missing_sessions": max(0, required_sessions - len(eligible_dates)),
         "calendar_missing_sessions": calendar_missing, "coverage": round(min(1.0, coverage), 6),
         "window_start": start, "window_end": effective_end,
         "hard_apis": [*HARD_APIS, BENCHMARK_API_KEY],
@@ -1006,15 +1049,21 @@ def audit_oos_hard_data(*, end_date: str | None = None, include_dates: bool = Tr
         "non_repairable_dates_truncated": len(non_repairable_dates) < len(all_non_repairable_dates),
         "trailing_pending_dates": list(reversed(trailing_pending_dates)),
         "legacy_reference": {
-            "status": "legacy_economic_time_reference" if legacy_reference_mode else "not_activated",
+            "contract_version": LEGACY_CONTRACT_VERSION,
+            "status": "retired_unrecoverable" if legacy_reference_mode else "not_activated",
             "strict_pit_recovery": "external_immutable_evidence_only" if legacy_reference_mode else "not_applicable",
             "repair_loop_disabled": legacy_reference_mode,
+            "runtime_health_impact": False,
+            "current_decision_impact": False,
+            "promotion_authority": False,
             "note": (
                 "旧窗口缺少可验证的不可变观测证据，仅保留经济时间诊断价值；不得重抓后追认为历史 PIT。"
                 if legacy_reference_mode else ""
             ),
         },
         "new_strict_baseline": baseline,
+        "promotion_authorized": formal_ready,
+        "qualification": baseline,
         "generated_at": datetime.now().isoformat(timespec="seconds"),
     }
     if include_dates:
@@ -1022,20 +1071,37 @@ def audit_oos_hard_data(*, end_date: str | None = None, include_dates: bool = Tr
     return result
 
 
+def audit_progressive_oos(*, end_date: str | None = None, include_dates: bool = False) -> dict[str, Any]:
+    """Bounded daily audit for simulation qualification and UI health.
+
+    Full legacy-sized evidence is no longer scanned by routine autonomy.  A
+    formal historical replay may still request the default full window for an
+    explicit archived comparison, but that retired contract has no runtime
+    health authority.
+    """
+    return audit_oos_hard_data(
+        end_date=end_date,
+        include_dates=include_dates,
+        window_sessions=PROGRESSIVE_SIMULATION_CHAMPION_SESSIONS,
+    )
+
+
 def oos_hard_data_asset() -> dict[str, Any]:
-    audit = audit_oos_hard_data(include_dates=False)
+    audit = audit_progressive_oos(include_dates=False)
     return {
-        "key": "oos_hard_data", "name": "Champion OOS 永久硬数据", "domain": "模型验证",
-        "consumer": audit["consumer"], "weight": 100, "target_scope": f"最近 {REQUIRED_SESSIONS} 个交易日",
+        "key": "oos_hard_data", "name": "渐进 OOS 点时证据", "domain": "模型验证",
+        "consumer": audit["consumer"], "weight": 30,
+        "target_scope": f"最近 {PROGRESSIVE_SIMULATION_CHAMPION_SESSIONS} 个交易日",
         "frequency": "daily", "source": "TuShare + 标准化日截面", "window_start": audit["window_start"],
-        "window_end": audit["window_end"], "window_depth": f"{REQUIRED_SESSIONS} sessions",
-        "rationale": "不足时禁止正式 Champion OOS 验收；每日自检并进入统一补全计划",
-        "actual_records": audit["eligible_sessions"], "expected_records": REQUIRED_SESSIONS,
+        "window_end": audit["window_end"], "window_depth": f"{PROGRESSIVE_SIMULATION_CHAMPION_SESSIONS} sessions",
+        "rationale": "按 60/126/252 日逐级开放策略诊断与模拟资格验证；样本数量本身不授予策略权限",
+        "actual_records": audit["eligible_sessions"], "expected_records": PROGRESSIVE_SIMULATION_CHAMPION_SESSIONS,
         "coverage": audit["coverage"], "coverage_basis": audit["eligible_sessions"],
-        "coverage_expected": REQUIRED_SESSIONS, "symbols": 0, "dates": audit["eligible_sessions"],
+        "coverage_expected": PROGRESSIVE_SIMULATION_CHAMPION_SESSIONS, "symbols": 0, "dates": audit["eligible_sessions"],
         "periods_actual": None, "periods_expected": None, "min_date": audit["window_start"],
         "max_date": audit["window_end"], "status": "complete" if audit["status"] == "ready" else "partial",
-        "measurement": "eligible_sessions", "period_details": None, "hard_requirement": True,
+        "measurement": "eligible_sessions", "period_details": audit.get("qualification"),
+        "hard_requirement": False,
     }
 
 

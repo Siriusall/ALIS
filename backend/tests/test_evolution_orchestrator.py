@@ -948,6 +948,32 @@ def test_nonrepairable_oos_deferral_reuses_task_id_without_retrying_every_few_mi
     assert datetime.fromisoformat(transition["next_run_at"]) >= datetime.now().astimezone() + timedelta(hours=23)
 
 
+def test_retired_legacy_oos_task_becomes_terminal_instead_of_blocking_queue(monkeypatch):
+    transition = {}
+    monkeypatch.setattr(
+        evolution,
+        "_update_active_task",
+        lambda task_id, **fields: transition.update({"task_id": task_id, **fields}) or True,
+    )
+    blocked = {
+        "status": "blocked_by_legacy_oos_reference",
+        "hard_data_audit": {
+            "status": "accumulating",
+            "legacy_reference": {"status": "retired_unrecoverable"},
+        },
+    }
+
+    assert evolution._defer_for_oos_hard_data({"id": 93, "attempt": 1}, blocked) is True
+
+    assert transition["task_id"] == 93
+    assert transition["status"] == "completed"
+    assert transition["phase"] == "retired_legacy_oos_contract"
+    assert transition["result"]["legacy_contract_terminal"] is True
+    assert transition["result"]["next_contract"] == "alis_progressive_oos_v5"
+    assert transition["next_run_at"] is None
+    assert transition["lease_owner"] is None
+
+
 def test_cycle_uses_checkpoint_and_reports_overall_progress(monkeypatch):
     monkeypatch.setattr(evolution, "audit_oos_hard_data", lambda **kwargs: {
         "status": "ready", "window_start": "20200101", "window_end": "20261231",

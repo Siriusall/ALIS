@@ -93,7 +93,7 @@ def build_decision_version_manifest(
         "trade_date": str(trade_date).replace("-", "")[:8],
         "data_contract": {
             "schema_version": "alis_decision_data_contract_v3",
-            "oos_hard_data_schema": "alis_oos_hard_data_v4_immutable_observation",
+            "oos_hard_data_schema": "alis_progressive_oos_v5",
             "market_ingestion_schema": "alis_market_progress_aware_hedged_checkpoint_v3",
             "point_in_time_cutoff": selection_cutoff,
             "observation_clock_schema": "alis_market_observation_clock_v1",

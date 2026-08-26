@@ -27,7 +27,7 @@ from app.data_platform.services.market_calendar import TradeCalendarNotReady, ta
 from app.data_platform.services.snapshot_health import estimated_table_count, latest_usable_snapshot_date
 from app.data_platform.tushare_client import is_tushare_compatible_source
 from app.data_platform.services.exchange_etf_pcf import sync_exchange_etf_pcf
-from app.data_platform.services.oos_hard_data import audit_oos_hard_data
+from app.data_platform.services.oos_hard_data import audit_progressive_oos
 from app.core.error_evidence import error_evidence
 
 _lock = threading.Lock()
@@ -793,7 +793,7 @@ def _worker(parent_run_id: int) -> None:
 
         _set_state(phase="quality", message="正在检查数据完整性", progress=90)
         steps.append({"step": "quality", "result": run_data_quality_checks(trade_date)})
-        steps.append({"step": "oos_hard_data", "result": audit_oos_hard_data(end_date=trade_date, include_dates=False)})
+        steps.append({"step": "oos_hard_data", "result": audit_progressive_oos(end_date=trade_date, include_dates=False)})
 
         # Research maintenance is downstream of a durable market snapshot and
         # belongs to the dedicated research worker.  Do not start a bounded
