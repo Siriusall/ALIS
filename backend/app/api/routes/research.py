@@ -33,6 +33,7 @@ from app.services.decision_store import build_review_outcome_suggestion, create_
 from app.services.operations_overview import build_decision_audit, build_governance_overview, build_live_portfolio_risk
 from app.services.position_valuation import build_position_market_series_cache
 from app.services.stock_pool_sync import stage_candidates_in_watch_pool
+from app.data_platform.db import _read_conn as data_platform_read_conn
 from app.services.research_workflow import build_console_stock_evidence, evaluate_core_pool_eligibility, process_watch_pool
 from app.services.advanced_controls import bayesian_update, freeze_evidence, trade_attribution
 from app.services.theme_engine import get_theme, list_themes, materialize_theme_snapshots
@@ -417,7 +418,28 @@ def research_event_followup_update(event_key: str, req: EventFollowupUpdateReque
 
 
 @router.get("/research/pools")
-def research_pools(pool_type:str="")->dict[str,Any]: return {"ok":True,"items":list_pool_members(pool_type)}
+def research_pools(pool_type:str="")->dict[str,Any]:
+    items = list_pool_members(pool_type)
+    codes = sorted({str(item.get("ts_code") or "").strip().upper() for item in items if item.get("ts_code")})
+    names: dict[str, str] = {}
+    if codes:
+        placeholders = ",".join("?" for _ in codes)
+        try:
+            with data_platform_read_conn() as conn:
+                rows = conn.execute(
+                    f"SELECT ts_code,name FROM dc_stock_master WHERE ts_code IN ({placeholders})",
+                    tuple(codes),
+                ).fetchall()
+            names = {str(dict(row).get("ts_code") or "").upper(): str(dict(row).get("name") or "") for row in rows}
+        except Exception:
+            # Pool membership remains usable when the optional name lookup is
+            # unavailable; the UI will show the code instead of inventing a name.
+            names = {}
+    for item in items:
+        code = str(item.get("ts_code") or "").strip().upper()
+        item["name"] = names.get(code, "")
+        item["symbol_name"] = item["name"]
+    return {"ok": True, "items": items}
 
 
 @router.get("/research/pools/eligibility/{ts_code}")
