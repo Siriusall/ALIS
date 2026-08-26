@@ -381,7 +381,9 @@ def _readers(page_key: str) -> dict[str, Callable[[], Any]]:
             "strategy": model_strategy.model_strategy_strategy_controller,
             "factors": lambda: __import__("app.api.routes.factors", fromlist=["factor_registry"]).factor_registry(),
             "factorStatus": lambda: __import__("app.api.routes.factors", fromlist=["factor_research_status"]).factor_research_status(),
-            "factorResearch": lambda: __import__("app.api.routes.factors", fromlist=["factor_research_status"]).factor_research_status(console=True, compact=True),
+            # Evolution pages need the bounded v10 expert/matrix projection;
+            # compact=True intentionally returns a deferred placeholder.
+            "factorResearch": lambda: __import__("app.api.routes.factors", fromlist=["factor_research_status"]).factor_research_status(console=True, compact=False),
             "factorLineage": lambda: __import__("app.api.routes.factors", fromlist=["factor_strategy_lineage"]).factor_strategy_lineage(),
             "researchAnalytics": lambda: __import__("app.api.routes.factors", fromlist=["factor_research_analytics"]).factor_research_analytics(),
             "researchFactorAnalytics": lambda: __import__("app.api.routes.factors", fromlist=["factor_research_analytics_factors"]).factor_research_analytics_factors(limit=200),
