@@ -380,24 +380,8 @@ export function Evolution({ data }: { data: ConsoleData }) {
   const [matrixExpanded,setMatrixExpanded]=useState(false);
   const [matrixSort,setMatrixSort]=useState<{key:string;direction:"asc"|"desc"}>({key:"fitness",direction:"desc"});
   const [candidateAccountFilter,setCandidateAccountFilter]=useState<"observing"|"stopped"|"all">("observing");
-  useEffect(()=>{
-    let active=true;let inFlight=false;const controller=new AbortController();
-    const poll=async()=>{
-      if(inFlight)return;
-      inFlight=true;
-      const results=await Promise.allSettled([
-        readApi("/api/factors/research/status?console=true",controller.signal,60_000),
-        readApi("/api/model-strategy/evolution/tasks?limit=60",controller.signal,60_000),
-      ]);
-      inFlight=false;
-      if(!active)return;
-      if(results[0].status==="fulfilled")setLiveResearch(results[0].value);
-      if(results[1].status==="fulfilled")setLiveTasks(results[1].value);
-      if(results.some(result=>result.status==="fulfilled"))setUpdatedAt(new Date().toLocaleTimeString("zh-CN",{hour12:false}));
-    };
-    const timer=window.setInterval(()=>void poll(),5000);
-    return()=>{active=false;controller.abort();window.clearInterval(timer)};
-  },[]);
+  // Snapshot-backed route: refreshes are owned by useConsoleData so this page
+  // never fans out into live research/task reads from the browser.
   useEffect(()=>{if(data.factorResearchConsole)setLiveResearch(data.factorResearchConsole)},[data.factorResearchConsole]);
   useEffect(()=>{if(data.evolutionTasks)setLiveTasks(data.evolutionTasks)},[data.evolutionTasks]);
 
@@ -748,15 +732,8 @@ export function ModelGovernance({data}:{data:ConsoleData}){
   useEffect(()=>setLiveOperations(data.modelOperations),[data.modelOperations]);
   useEffect(()=>setLiveResearch(data.factorResearch||data.factorResearchCompact),[data.factorResearch,data.factorResearchCompact]);
   useEffect(()=>setLiveEvolutionTasks(data.evolutionTasks),[data.evolutionTasks]);
-  useEffect(()=>{
-    let active=true;let busy=false;
-    const refresh=async()=>{if(busy)return;busy=true;let logSourcesUpdated=0;const markLogSourceUpdated=()=>{logSourcesUpdated+=1;if(active){setLogRefreshedAt(new Date().toLocaleString("sv-SE",{hour12:false}));setLogStreamHealth(logSourcesUpdated>=2?"healthy":"partial")}};try{await Promise.allSettled([
-      readApi(endpoints.modelOperations).then(value=>{if(active){setLiveOperations(value);markLogSourceUpdated()}}),
-      readApi(endpoints.modelTasksLive).then(value=>{if(active){setLiveTasks(value);markLogSourceUpdated()}}),
-    ]);if(active&&logSourcesUpdated===0)setLogStreamHealth("degraded")}finally{busy=false}};
-    const timer=window.setInterval(refresh,15000);
-    return()=>{active=false;window.clearInterval(timer)};
-  },[]);
+  // Live task/log polling was intentionally removed: model snapshots contain
+  // bounded task and operation projections and are the only initial-read path.
   useEffect(()=>{if(details.planModels)setLivePlanModels(details.planModels)},[details.planModels]);
   const operationItems=firstArray(liveOperations,["items"]);const operationByKey=new Map(operationItems.map(row=>[String(row.model_key),row]));const modelsReady=Boolean(livePlanModels);const planModels=firstArray(livePlanModels,["items"]);const planModelByKey=new Map(planModels.map(row=>[String(row.model_key),row]));const candidateObservationFor=(modelKey:string)=>{const operation=operationByKey.get(modelKey)||{};const explicit=pick(operation,["candidate_observation"],{}) as Json;if(explicit.candidate_active||explicit.status&&explicit.status!=="not_applicable")return explicit;const family=planModelByKey.get(modelKey)||{};const latest=pick(family,["latest_version"],{}) as Json;const shadow=pick(latest,["validation.model_shadow"],{}) as Json;return shadow.status?{scope:"candidate_future_shadow",status:shadow.status,candidate_active:true,model_version_id:latest.id||null,version:latest.version||null,signal_start_trade_date:shadow.signal_start_trade_date||null,observed_return_sessions:Number(shadow.observed_return_sessions||0),required_return_sessions:Number(shadow.required_return_sessions||20),minimum_effect_days:Number(shadow.minimum_effect_days||4),last_observed_trade_date:shadow.last_observed_trade_date||null,autonomous_management:true,manager:"model_shadow_observation",production_change_forbidden:true}:{status:"not_applicable",candidate_active:false,observed_return_sessions:0,required_return_sessions:20}};const registryVersions=rowsFrom(pageData.models,["versions"]);const counts=(livePlanModels?.counts||{}) as Json;
   const hsmmGovernance=pick(pageData.modelGovernance,["hsmm"],{}) as Json;const hsmmEligible=Boolean(hsmmGovernance.production_eligible);const hsmmVersion=pick(hsmmGovernance,["latest_shadow_version"],null);const hsmmValidation=pick(hsmmGovernance,["validation"],{}) as Json;const hsmmValidationPassed=String(hsmmValidation.status||"")==="passed";const hsmmLiveWeeks=Number(pick(hsmmGovernance,["live_observation_weeks"],0));const hsmmMinimumWeeks=Number(pick(hsmmGovernance,["minimum_live_observation_weeks"],4));const hsmm={model_key:"market_regime_hsmm_v1",name:"市场状态 HSMM",role:"识别市场状态、风险预算和防御切换",family:"Student-t 显式时长隐半马尔可夫模型",status:hsmmEligible?"production_current_standard":pick(hsmmGovernance,["status"],"not_applicable"),active_version:hsmmEligible&&hsmmVersion?{version:hsmmVersion}:null,latest_version:hsmmVersion?{version:hsmmVersion,metrics:{validation:hsmmValidation}}:null,coverage:{effective_sessions:pick(pageData.modelGovernance,["market_training_history.observations"],"正在读取"),minimum_sessions:1512},blocked_reasons:hsmmEligible?[]:[pick(hsmmGovernance,["blocking_reason"],"尚未通过生产激活门")],current_gate_audit:{status:hsmmEligible?"current_gate_passed":hsmmValidationPassed?"shadow_live_observation":"shadow_validation_failed",passed:hsmmEligible,gates:{历史独立验证:hsmmValidationPassed,真实影子观察:hsmmValidationPassed&&hsmmLiveWeeks>=hsmmMinimumWeeks,生产评审:Boolean(hsmmGovernance.review_completed)},blocked_reasons:hsmmEligible?[]:[pick(hsmmGovernance,["blocking_reason"],"尚未通过生产激活门")]},live_health:{status:hsmmEligible?"healthy":hsmmValidationPassed?"observing":"shadow_validation_failed",mature_20d_outcomes:hsmmLiveWeeks,minimum_required:hsmmMinimumWeeks,observation_unit:"周",updated_at:pick(pageData.modelMarketLive,["available_time","trade_date"],null)},active_artifact:{artifact_ready:Boolean(hsmmVersion),model_type:"Student-t explicit-duration HSMM",training_dataset:pick(pageData.modelGovernance,["market_training_history"],{})}};
@@ -854,42 +831,8 @@ export function AdminOverview({ data }: { data: ConsoleData }) {
     setLiveReadiness(data.tradingReady);
     setLiveTaskPayload(data.adminTasksLive || data.tasks);
   }, [data.adminTasksLive, data.tasks, data.tradingReady]);
-  useEffect(() => {
-    let active = true;
-    let inFlight = false;
-    const controller = new AbortController();
-    const refreshLiveTasks = async () => {
-      if (inFlight) return;
-      inFlight = true;
-      try {
-        const payload = await readApi("/api/model-strategy/task-center?compact=true&limit=30&log_limit=20", controller.signal);
-        if (active) setLiveTaskPayload(payload);
-      } catch {
-      } finally {
-        inFlight = false;
-      }
-    };
-    const timer = window.setInterval(refreshLiveTasks, 5_000);
-    return () => { active = false; controller.abort(); window.clearInterval(timer); };
-  }, []);
-  useEffect(() => {
-    let active = true;
-    let inFlight = false;
-    const controller = new AbortController();
-    const refreshReadiness = async () => {
-      if (inFlight) return;
-      inFlight = true;
-      try {
-        const payload = await readApi("/api/trading-ready?detail=compact", controller.signal, 30_000);
-        if (active) setLiveReadiness(payload);
-      } catch {
-      } finally {
-        inFlight = false;
-      }
-    };
-    const timer = window.setInterval(refreshReadiness, 15_000);
-    return () => { active = false; controller.abort(); window.clearInterval(timer); };
-  }, []);
+  // System observatory is snapshot-backed; readiness and task projections are
+  // refreshed together by the page snapshot worker.
   const readiness = liveReadiness || {};
   const readinessStatus = String(pick(readiness, ["status"], "unknown"));
   const readinessLabels: Record<string, string> = {

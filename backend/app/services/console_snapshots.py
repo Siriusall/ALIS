@@ -241,20 +241,6 @@ def _readers(page_key: str) -> dict[str, Callable[[], Any]]:
             "policy": {"read_only": True, "source": "control_snapshot_projection"},
         }
 
-    def compact_oos() -> dict[str, Any]:
-        return _cached_diagnostic(
-            "oos_hard_data_compact",
-            data_center.data_center_oos_hard_data,
-            include_dates=False,
-        )
-
-    def compact_sealed() -> dict[str, Any]:
-        return _cached_diagnostic(
-            "sealed_strategy_holdout_compact",
-            data_center.data_center_sealed_strategy_holdout,
-            include_dates=False,
-        )
-
     latest_decision_bundle: dict[str, Any] = {}
 
     def latest_decision_evidence() -> dict[str, Any]:
@@ -299,8 +285,6 @@ def _readers(page_key: str) -> dict[str, Callable[[], Any]]:
             "dailyUpdateStatus": lambda: data_center.data_center_daily_update_status(compact=True),
             "watermarks": data_center.data_center_asset_watermarks,
             "ledgerAudit": model_strategy.model_strategy_ledger_audit,
-            "oos": compact_oos,
-            "sealed": compact_sealed,
         },
         "decision": {
             **common,
@@ -330,8 +314,6 @@ def _readers(page_key: str) -> dict[str, Callable[[], Any]]:
             "operationsPage": lambda: __import__("app.api.routes.positions", fromlist=["get_operations_page"]).get_operations_page(execution_id=None, limit=20, offset=0),
             "executionsPage": lambda: __import__("app.api.routes.positions", fromlist=["get_executions_page"]).get_executions_page(limit=20, offset=0),
             "ledgerAudit": model_strategy.model_strategy_ledger_audit,
-            "oos": compact_oos,
-            "sealed": compact_sealed,
         },
         "versions": {
             "systemVersionStatus": system_versions.system_version_status,
@@ -353,8 +335,6 @@ def _readers(page_key: str) -> dict[str, Callable[[], Any]]:
                 rebuild=False,
             ),
             "tasks": lambda: model_strategy.model_strategy_task_center(limit=16, log_limit=40, compact=True),
-            "oos": compact_oos,
-            "sealed": compact_sealed,
         },
         "models": {
             "planModels": lambda: model_strategy.model_strategy_plan_models(console=True),
@@ -391,11 +371,14 @@ def _readers(page_key: str) -> dict[str, Callable[[], Any]]:
             "events": lambda: research.research_events(ts_code="", limit=100),
             "pools": research.research_pools,
             "modelMarketLive": model_strategy.model_strategy_live_market_context,
+            # Detail evidence is materialized with the research page so the
+            # browser never turns the first render into a live fan-out.
+            "researchStockEvidence": lambda: _research_detail_evidence(research, "stock"),
+            "researchIndustryEvidence": lambda: _research_detail_evidence(research, "industry"),
         },
         "factors": {
             "owner": model_strategy.model_strategy_owner_summary,
             "strategy": model_strategy.model_strategy_strategy_controller,
-            "sealed": compact_sealed,
             "factors": lambda: __import__("app.api.routes.factors", fromlist=["factor_registry"]).factor_registry(),
             "factorStatus": lambda: __import__("app.api.routes.factors", fromlist=["factor_research_status"]).factor_research_status(),
             "factorResearch": lambda: __import__("app.api.routes.factors", fromlist=["factor_research_status"]).factor_research_status(console=True, compact=True),
@@ -440,6 +423,24 @@ def _readers(page_key: str) -> dict[str, Callable[[], Any]]:
         },
     }
     return pages[page_key]
+
+
+def _research_detail_evidence(research: Any, kind: str) -> dict[str, Any]:
+    """Return one bounded detail document for the research landing page."""
+    pools = research.research_pools()
+    industries = research.research_industries(compact=True)
+    if kind == "stock":
+        items = pools.get("items", []) if isinstance(pools, dict) else []
+        code = str(items[0].get("ts_code") or items[0].get("symbol") or "") if items else ""
+        return research.research_console_stock_evidence(code) if code else {"data_available": False, "items": []}
+    items = industries.get("items", []) if isinstance(industries, dict) else []
+    code = ""
+    for item in items:
+        candidate = str(item.get("industry_code") or item.get("code") or item.get("name") or "")
+        if candidate and candidate.lower() != "nan":
+            code = candidate
+            break
+    return research.research_industry_detail(code) if code else {"data_available": False, "items": []}
 
 
 def _serialize(payload: dict[str, Any]) -> str:

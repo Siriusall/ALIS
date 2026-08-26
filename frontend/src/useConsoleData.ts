@@ -389,6 +389,9 @@ type InitialDynamicRequest = {
 };
 
 function initialDynamicRequests(pathname: string, data: ConsoleData): InitialDynamicRequest[] {
+  // Snapshot-backed routes must never fan out into live detail reads. The
+  // control worker materializes the bounded detail sections with the page.
+  if (snapshotPages[pathname]) return [];
   if (pathname === "/research") {
     const pools = firstArray(data.pools, ["items", "members", "pools"]);
     const industries = firstArray(data.industries, ["items", "industries"]);
