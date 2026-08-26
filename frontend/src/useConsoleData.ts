@@ -471,9 +471,12 @@ export function useConsoleData(pathname: string) {
         setData(visibleSnapshot);
         setLoadedRoute({ pathname, generation: activeRouteGeneration });
       };
-      const scheduleSnapshotRetry = (message: string, hasVisibleData: boolean) => {
+      const scheduleSnapshotRetry = (
+        message: string,
+        hasVisibleData: boolean,
+        retryInMs = snapshotPollInterval(pathname),
+      ) => {
         retryAttempt.current += 1;
-        const retryInMs = snapshotPollInterval(pathname);
         if (controller.current !== activeController) return;
         setProgress({ completed: 0, total: 1 });
         setLoading(!hasVisibleData);
@@ -521,7 +524,11 @@ export function useConsoleData(pathname: string) {
         const sectionErrors = snapshotSectionErrors(payload);
         sectionErrors.snapshot = snapshotRetryMessage(payload, Boolean(fallbackData));
         setErrors(sectionErrors);
-        scheduleSnapshotRetry(sectionErrors.snapshot, Boolean(fallbackData));
+        scheduleSnapshotRetry(
+          sectionErrors.snapshot,
+          Boolean(fallbackData),
+          payload.refreshing || payload.stale ? 5_000 : snapshotPollInterval(pathname),
+        );
       } catch (error: any) {
         if (activeController.signal.aborted || controller.current !== activeController) return;
         const message = error?.name === "AbortError"
