@@ -79,6 +79,78 @@ def test_owner_summary_keeps_completed_cycle_visible_when_live_champion_gate_rea
     assert summary["questions"]["anomalies"][0]["module"] == "champion_execution_gate"
 
 
+def test_owner_summary_ignores_accumulation_but_surfaces_oos_audit_failure(monkeypatch):
+    monkeypatch.setattr(
+        "app.services.production_strategy.champion_execution_gate",
+        lambda: {"status": "allowed", "mode": "normal"},
+    )
+    summary = _owner_summary([
+        {
+            "name": "hard_data_gate",
+            "ok": True,
+            "result": {"status": "accumulating", "eligible_sessions": 59},
+            "health": {"status": "healthy"},
+        },
+        {
+            "name": "sealed_holdout_data_gate",
+            "ok": False,
+            "result": {
+                "status": "blocked",
+                "failure_category": "trade_calendar_unavailable",
+            },
+            "health": {"status": "degraded", "reason": "trade_calendar_unavailable"},
+        },
+    ])
+
+    assert summary["questions"]["historical_research_waits"] == [{
+        "module": "hard_data_gate",
+        "status": "accumulating",
+        "scope": "formal_oos_or_sealed_holdout_only",
+        "eligible_sessions": 59,
+        "required_sessions": None,
+        "repair_dates": [],
+        "non_repairable_dates": [],
+        "non_repairable_sessions": None,
+        "non_repairable_dates_truncated": False,
+    }]
+    assert summary["questions"]["anomalies"] == [{
+        "module": "sealed_holdout_data_gate",
+        "message": "trade_calendar_unavailable",
+    }]
+    assert summary["operational_health"] == "degraded"
+
+
+def test_owner_summary_never_drops_blocked_historical_gate_between_anomalies_and_waits(monkeypatch):
+    monkeypatch.setattr(
+        "app.services.production_strategy.champion_execution_gate",
+        lambda: {"status": "allowed", "mode": "normal"},
+    )
+    summary = _owner_summary([
+        {
+            "name": "hard_data_gate",
+            "ok": False,
+            "result": {
+                "status": "blocked",
+                "failure_category": "oos_audit_backend_unavailable",
+                "non_repairable_dates": ["20260701"],
+                "repair_dates": [],
+            },
+            # Simulate stale persisted health from the former classifier.
+            "health": {
+                "status": "waiting_condition",
+                "reason": "historical_point_in_time_unavailable",
+            },
+        },
+    ])
+
+    assert summary["questions"]["historical_research_waits"] == []
+    assert summary["questions"]["anomalies"] == [{
+        "module": "hard_data_gate",
+        "message": "oos_audit_backend_unavailable",
+    }]
+    assert summary["operational_health"] == "degraded"
+
+
 def test_owner_summary_uses_current_profit_and_autonomy_contracts():
     summary = _owner_summary(
         [
@@ -334,12 +406,13 @@ def test_historical_gate_is_visible_as_research_wait_without_disabling_shadow(mo
     def controlled_run_step(name, fn):
         if name == "hard_data_gate":
             result = {
-                "ok": False, "status": "blocked",
+                "ok": True, "status": "accumulating",
                 "non_repairable_dates": ["20260701"], "repair_dates": [],
+                "legacy_reference": {"status": "retired_unrecoverable"},
             }
         elif name == "sealed_holdout_data_gate":
             result = {
-                "ok": False, "status": "blocked",
+                "ok": True, "status": "accumulating",
                 "non_repairable_dates": ["20190910"], "repair_dates": [],
             }
         elif name == "decision_data_gate":

@@ -76,7 +76,7 @@ from app.services.announcement_label_benchmark import (
     sync_cninfo_category_reference_labels,
 )
 from app.data_platform.services.exchange_etf_pcf import backfill_exchange_etf_pcf, sync_exchange_etf_pcf
-from app.data_platform.services.oos_hard_data import audit_oos_hard_data
+from app.data_platform.services.oos_hard_data import audit_progressive_oos
 from app.services.sealed_strategy_holdout import audit_sealed_strategy_holdout
 from app.services.llm_data_operations import list_llm_data_operation_cases
 from app.core.read_only_diagnostics import degraded_read
@@ -201,7 +201,7 @@ def data_center_asset_watermarks() -> dict[str, Any]:
 @router.get("/data-center/oos-hard-data")
 def data_center_oos_hard_data(include_dates: bool = Query(default=False)) -> dict[str, Any]:
     try:
-        return audit_oos_hard_data(include_dates=include_dates)
+        return audit_progressive_oos(include_dates=include_dates)
     except Exception as exc:  # noqa: BLE001 - optional diagnostic must not become a 500
         return degraded_read("oos_hard_data", exc, include_dates=include_dates)
 

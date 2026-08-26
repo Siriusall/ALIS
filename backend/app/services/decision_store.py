@@ -65,15 +65,15 @@ def upsert_pool_member(*, ts_code: str, pool_type: str, reason: str) -> dict[str
     return dict(row)
 
 
-def list_pool_members(pool_type: str = "", limit: int | None = 5000) -> list[dict[str, Any]]:
-    """Return active memberships with a hard upper bound for API/worker reads."""
+def list_pool_members(pool_type: str = "", limit: int | None = None) -> list[dict[str, Any]]:
+    """Return all active memberships unless a caller explicitly requests a page."""
     with _conn() as c:
         params: tuple[Any, ...] = (pool_type,) if pool_type else ()
         where = "pool_type=? AND status='active'" if pool_type else "status='active'"
         sql = f"SELECT * FROM stock_pool_memberships WHERE {where} ORDER BY updated_at DESC"
         if limit is not None:
             sql += " LIMIT ?"
-            params += (max(1, min(int(limit), 5000)),)
+            params += (max(1, int(limit)),)
         rows = c.execute(sql, params).fetchall()
     return [dict(x) for x in rows]
 
@@ -407,9 +407,23 @@ def _matched_execution_outcome(decision: dict[str, Any]) -> dict[str, Any] | Non
                 return 0.0
             return sum(float(row.get(k) or 0) for k in fee_keys) * used / row_qty
 
-        ledger = [dict(row) for row in c.execute(
-            "SELECT * FROM operations WHERE symbol=? ORDER BY at,id LIMIT 5000", (symbol,)
-        ).fetchall()]
+        # FIFO is a ledger-wide invariant.  A global oldest-N cap silently
+        # changes which lots are consumed once a symbol has enough history.
+        # SELL outcomes only need events through the target key; BUY outcomes
+        # also need later exits and therefore read the complete symbol ledger.
+        if side == "SELL":
+            ledger_rows = c.execute(
+                """SELECT * FROM operations
+                   WHERE symbol=? AND (at<? OR (at=? AND id<=?))
+                   ORDER BY at,id""",
+                (symbol, at, at, int(operation_id)),
+            ).fetchall()
+        else:
+            ledger_rows = c.execute(
+                "SELECT * FROM operations WHERE symbol=? ORDER BY at,id",
+                (symbol,),
+            ).fetchall()
+        ledger = [dict(row) for row in ledger_rows]
 
         if side == "BUY":
             lots: list[dict[str, Any]] = []

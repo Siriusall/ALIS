@@ -12,7 +12,13 @@ import uuid
 from copy import deepcopy
 from typing import Any, Callable
 
-from app.data_platform.services.oos_hard_data import audit_oos_hard_data
+from app.data_platform.services.oos_hard_data import (
+    CONTRACT_VERSION as OOS_CONTRACT_VERSION,
+    LEGACY_CONTRACT_VERSION as LEGACY_OOS_CONTRACT_VERSION,
+    audit_oos_hard_data,
+    audit_progressive_oos,
+    progressive_oos_consumer_eligibility,
+)
 from app.data_platform.db import _conn as data_conn
 from app.core.trade_calendar import is_trade_day
 from app.data_platform.services.market_calendar import TradeCalendarNotReady
@@ -127,6 +133,15 @@ FORMAL_OOS_TASK_TYPES = frozenset({
     "strategy_evolution_cycle",
     "strategy_controller_oos",
     "model_strategy_impact_validation",
+})
+PROGRESSIVE_OOS_TASK_CONSUMERS = {
+    "model_candidate_research": "diagnostic_research",
+    "strategy_environment_backtest": "simulation_evaluation",
+    "strategy_portfolio_research": "simulation_champion_evaluation",
+}
+OOS_CONTRACT_TASK_TYPES = FORMAL_OOS_TASK_TYPES | frozenset(PROGRESSIVE_OOS_TASK_CONSUMERS)
+LEGACY_OOS_TASK_CONTRACTS = frozenset({
+    "v4", "legacy", "alis_oos_hard_data_v4", LEGACY_OOS_CONTRACT_VERSION,
 })
 _worker_started = False
 _scheduler_started = False
@@ -739,6 +754,8 @@ def create_evolution_task(
 ) -> dict[str, Any]:
     now = _now().isoformat()
     payload = dict(payload or {})
+    if str(task_type or "") in OOS_CONTRACT_TASK_TYPES:
+        payload.setdefault("contract_version", OOS_CONTRACT_VERSION)
     resolved_worker_pool = _normalise_worker_pool(worker_pool, task_type=task_type)
     key = str(dedupe_key or f"{task_type}:{now[:10]}")
     if force:
@@ -1446,6 +1463,36 @@ def _current_experiment_gate_required(task_type: str) -> bool:
 
 def _formal_oos_gate_required(task_type: str) -> bool:
     return str(task_type or "") in FORMAL_OOS_TASK_TYPES
+
+
+def _task_oos_contract_version(task: dict[str, Any]) -> str:
+    payload = task.get("payload") if isinstance(task.get("payload"), dict) else {}
+    return str(payload.get("contract_version") or "").strip()
+
+
+def _is_explicit_legacy_oos_task(task: dict[str, Any]) -> bool:
+    return _task_oos_contract_version(task).lower() in LEGACY_OOS_TASK_CONTRACTS
+
+
+def _blocked_by_progressive_oos(
+    task: dict[str, Any],
+    audit: dict[str, Any],
+    qualification: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "ok": True,
+        "schema_version": OOS_CONTRACT_VERSION,
+        "status": "blocked_by_progressive_oos",
+        "reason": (
+            "progressive_oos_audit_failed"
+            if str(qualification.get("status") or "") == "blocked"
+            else "progressive_oos_evidence_accumulating"
+        ),
+        "task_type": str(task.get("task_type") or ""),
+        "hard_data_audit": audit,
+        "qualification": qualification,
+        "production_change_forbidden": True,
+    }
 
 
 def _blocked_by_decision_data(task: dict[str, Any], gate: dict[str, Any]) -> dict[str, Any]:
@@ -2240,9 +2287,10 @@ def _persist_candidate_result(target: dict[str, Any], result: dict[str, Any]) ->
 
 def _oos_hard_data_block(task: dict[str, Any], audit: dict[str, Any]) -> dict[str, Any]:
     """Return the common fail-closed result for a frozen-history consumer."""
-    legacy = str((audit.get("legacy_reference") or {}).get("status") or "") in {
+    legacy_audit = str((audit.get("legacy_reference") or {}).get("status") or "") in {
         "legacy_economic_time_reference", "retired_unrecoverable",
     }
+    legacy = legacy_audit and _is_explicit_legacy_oos_task(task)
     return {
         "status": "blocked_by_legacy_oos_reference" if legacy else "blocked_by_oos_hard_data",
         "reason": "legacy_pit_evidence_retired_accumulating_new_baseline" if legacy else "permanent_oos_hard_data_not_ready",
@@ -2607,6 +2655,14 @@ def execute_evolution_task(
             message="正在维护公司研究、论点与研究池",
             runner=lambda: run_daily_maintenance(max_candidates=max_candidates),
         )
+    progressive_consumer = PROGRESSIVE_OOS_TASK_CONSUMERS.get(task_type)
+    if progressive_consumer:
+        audit = audit_progressive_oos(include_dates=False)
+        qualification = progressive_oos_consumer_eligibility(
+            audit, progressive_consumer,
+        )
+        if not bool(qualification.get("eligible")):
+            return _blocked_by_progressive_oos(task, audit, qualification)
     if _current_experiment_gate_required(task_type):
         gate = _experiment_data_gate()
         gate_ok = bool(gate.get("ok", gate.get("experiment_ready")))
@@ -3280,7 +3336,7 @@ def _defer_for_oos_hard_data(task: dict[str, Any], result: dict[str, Any]) -> bo
     audit = result.get("hard_data_audit") if isinstance(result.get("hard_data_audit"), dict) else {}
     legacy_reference = str((audit.get("legacy_reference") or {}).get("status") or "") in {
         "legacy_economic_time_reference", "retired_unrecoverable",
-    }
+    } and _is_explicit_legacy_oos_task(task)
     if legacy_reference:
         # The v4 history can never become valid through waiting or refetching.
         # Close the old task with an auditable terminal result so it no longer
@@ -3715,7 +3771,11 @@ def _run_claimed_task(task: dict[str, Any]) -> dict[str, Any]:
         if str(result.get("status") or "") == "blocked_by_decision_data":
             _defer_for_decision_data(task, result)
             return get_evolution_task(task_id) or task
-        if str(result.get("status") or "") in {"blocked_by_oos_hard_data", "blocked_by_legacy_oos_reference"}:
+        if str(result.get("status") or "") in {
+            "blocked_by_oos_hard_data",
+            "blocked_by_legacy_oos_reference",
+            "blocked_by_progressive_oos",
+        }:
             _defer_for_oos_hard_data(task, result)
             return get_evolution_task(task_id) or task
         if str(result.get("status") or "") == "blocked_incomplete_factor_bindings":

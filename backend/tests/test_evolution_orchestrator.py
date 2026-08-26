@@ -1,5 +1,6 @@
 from contextlib import contextmanager
 from datetime import datetime, timedelta
+import json
 import time
 import pytest
 
@@ -963,7 +964,11 @@ def test_retired_legacy_oos_task_becomes_terminal_instead_of_blocking_queue(monk
         },
     }
 
-    assert evolution._defer_for_oos_hard_data({"id": 93, "attempt": 1}, blocked) is True
+    assert evolution._defer_for_oos_hard_data({
+        "id": 93,
+        "attempt": 1,
+        "payload": {"contract_version": evolution.LEGACY_OOS_CONTRACT_VERSION},
+    }, blocked) is True
 
     assert transition["task_id"] == 93
     assert transition["status"] == "completed"
@@ -972,6 +977,105 @@ def test_retired_legacy_oos_task_becomes_terminal_instead_of_blocking_queue(monk
     assert transition["result"]["next_contract"] == "alis_progressive_oos_v5"
     assert transition["next_run_at"] is None
     assert transition["lease_owner"] is None
+
+
+def test_missing_contract_task_cannot_retire_from_legacy_audit_alone(monkeypatch):
+    transition = {}
+    monkeypatch.setattr(
+        evolution,
+        "_update_active_task",
+        lambda task_id, **fields: transition.update({"task_id": task_id, **fields}) or True,
+    )
+    blocked = {
+        "status": "blocked_by_oos_hard_data",
+        "hard_data_audit": {
+            "status": "accumulating",
+            "legacy_reference": {"status": "retired_unrecoverable"},
+            "non_repairable_dates": ["20200102"],
+            "repair_dates": [],
+        },
+    }
+
+    assert evolution._defer_for_oos_hard_data(
+        {"id": 94, "attempt": 1, "payload": {}}, blocked,
+    ) is True
+
+    assert transition["status"] == "retry_wait"
+    assert transition["phase"] == "waiting_for_historical_pit_evidence"
+    assert transition["result"] == blocked
+
+
+def test_new_oos_task_is_not_labelled_legacy_from_audit_reference():
+    result = evolution._oos_hard_data_block({
+        "task_type": "strategy_controller_oos",
+        "payload": {"contract_version": evolution.OOS_CONTRACT_VERSION},
+    }, {
+        "status": "accumulating",
+        "legacy_reference": {"status": "retired_unrecoverable"},
+    })
+
+    assert result["status"] == "blocked_by_oos_hard_data"
+    assert result["production_change_forbidden"] is True
+
+
+def test_new_formal_oos_task_persists_v5_contract(monkeypatch):
+    captured = {}
+
+    class Result:
+        def fetchone(self):
+            return None
+
+    class Connection:
+        _is_postgres = False
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def execute(self, sql, params=()):
+            if "INSERT INTO evolution_tasks" in sql:
+                captured["payload"] = json.loads(params[4])
+            return Result()
+
+        def last_insert_id(self):
+            return 501
+
+    monkeypatch.setattr(evolution, "_conn", lambda: Connection())
+    monkeypatch.setattr(
+        evolution,
+        "_get_evolution_task_summary",
+        lambda task_id: {"id": task_id, "status": "queued"},
+    )
+
+    result = evolution.create_evolution_task(
+        task_type="strategy_controller_oos",
+        payload={"targets": []},
+        dedupe_key="test-v5-contract",
+    )
+
+    assert result["id"] == 501
+    assert captured["payload"]["contract_version"] == evolution.OOS_CONTRACT_VERSION
+
+
+def test_progressive_task_uses_its_backend_consumer_tier(monkeypatch):
+    monkeypatch.setattr(evolution, "audit_progressive_oos", lambda **_kwargs: {
+        "audit_completed": True,
+        "status": "accumulating",
+        "new_strict_baseline": {"eligible_sessions": 59},
+    })
+
+    result = evolution.execute_evolution_task({
+        "id": 95,
+        "task_type": "model_candidate_research",
+        "payload": {"contract_version": evolution.OOS_CONTRACT_VERSION},
+    })
+
+    assert result["status"] == "blocked_by_progressive_oos"
+    assert result["qualification"]["consumer"] == "diagnostic_research"
+    assert result["qualification"]["required_sessions"] == 60
+    assert result["production_change_forbidden"] is True
 
 
 def test_cycle_uses_checkpoint_and_reports_overall_progress(monkeypatch):

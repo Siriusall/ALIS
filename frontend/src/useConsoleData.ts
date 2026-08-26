@@ -6,6 +6,7 @@ export type ConsoleData = Partial<Record<keyof typeof endpoints, Json>> & {
   researchIndustryEvidence?: Json;
   evidenceVerification?: Json;
   decisionDetail?: Json;
+  __snapshot?: Json;
 };
 
 const routeKeys: Record<string, Array<keyof typeof endpoints>> = {
@@ -65,6 +66,27 @@ type PendingRequest = {
 const inFlight = new Map<string, PendingRequest>();
 const snapshotRequestGeneration = new Map<string, number>();
 const CACHE_TTL_MS = 60_000;
+const SNAPSHOT_POLL_INTERVAL_MS: Record<string, number> = {
+  "/overview": 180_000,
+  "/decision": 180_000,
+  "/portfolio": 300_000,
+  "/operations": 5_000,
+  "/system": 5_000,
+  "/system/versions": 600_000,
+  "/data": 180_000,
+  "/models": 15_000,
+  "/research": 600_000,
+  "/factors": 600_000,
+  "/evolution": 5_000,
+  "/evolution/factors": 600_000,
+  "/evolution/metrics": 600_000,
+  "/evolution/waves": 600_000,
+  "/evidence": 600_000,
+};
+
+function snapshotPollInterval(pathname: string) {
+  return SNAPSHOT_POLL_INTERVAL_MS[pathname] || 180_000;
+}
 
 const initialRequestLabels: Record<string, string> = {
   owner: "系统摘要",
@@ -540,26 +562,53 @@ export function useConsoleData(pathname: string) {
       const visibleBeforeRead = priorGood || priorVisible;
       if (force) cache.delete(snapshotCacheKey);
 
-      const showSnapshotData = (snapshot: ConsoleData) => {
-        lastVisibleSnapshot.current = { page: snapshotPage, data: snapshot };
-        setData(snapshot);
+      const showSnapshotData = (
+        snapshot: ConsoleData,
+        payload?: Json,
+        readHealth?: "healthy" | "partial" | "degraded",
+      ) => {
+        const sourceStatus = payload ? snapshotStatus(payload) : "unavailable";
+        const health = readHealth || (
+          payload?.stale || payload?.refreshing
+            ? "degraded"
+            : sourceStatus === "degraded"
+              ? "partial"
+              : "healthy"
+        );
+        const visibleSnapshot = {
+          ...snapshot,
+          __snapshot: {
+            page: snapshotPage,
+            version: String(payload?.version || snapshot.__snapshot?.version || ""),
+            generatedAt: String(payload?.generated_at || snapshot.__snapshot?.generatedAt || ""),
+            checkedAt: payload ? new Date().toISOString() : String(snapshot.__snapshot?.checkedAt || ""),
+            attemptedAt: new Date().toISOString(),
+            sourceStatus,
+            health,
+            stale: Boolean(payload?.stale),
+            refreshing: Boolean(payload?.refreshing),
+          },
+        };
+        lastVisibleSnapshot.current = { page: snapshotPage, data: visibleSnapshot };
+        setData(visibleSnapshot);
         setLoadedRoute({ pathname, generation: activeRouteGeneration });
       };
       const scheduleSnapshotRetry = (message: string, hasVisibleData: boolean) => {
         retryAttempt.current += 1;
-        const retryInMs = Math.min(15_000, 1_000 * 2 ** Math.min(retryAttempt.current - 1, 4));
+        const retryInMs = snapshotPollInterval(pathname);
         if (controller.current !== activeController) return;
         setProgress({ completed: 0, total: 1 });
         setLoading(!hasVisibleData);
         setRefreshing(true);
         setLoadingMessage(`${message}；${Math.ceil(retryInMs / 1000)} 秒后自动重试`);
-        retryTimer.current = window.setTimeout(() => {
-          retryTimer.current = null;
-          if (controller.current === activeController) void refresh(false);
-        }, retryInMs);
       };
 
-      if (visibleBeforeRead) showSnapshotData(visibleBeforeRead);
+      if (visibleBeforeRead) {
+        const priorPayload = lastGoodSnapshot.current?.page === snapshotPage
+          ? lastGoodSnapshot.current.payload
+          : undefined;
+        showSnapshotData(visibleBeforeRead, priorPayload);
+      }
       setLoading(!visibleBeforeRead);
       setLoadingMessage("正在读取服务端页面快照");
       setRefreshing(Boolean(visibleBeforeRead) || force);
@@ -576,7 +625,7 @@ export function useConsoleData(pathname: string) {
         const nextSnapshot = snapshotData(payload);
         if (snapshotIsHealthy(payload) && nextSnapshot) {
           lastGoodSnapshot.current = { page: snapshotPage, payload };
-          showSnapshotData(nextSnapshot);
+          showSnapshotData(nextSnapshot, payload);
           retryAttempt.current = 0;
           setProgress({ completed: 1, total: 1 });
           setLoading(false);
@@ -590,7 +639,7 @@ export function useConsoleData(pathname: string) {
         // visible data. It remains in component state, never in browser cache.
         const fallbackData = priorGood || priorVisible
           || (snapshotStatus(payload) === "warming_up" ? null : nextSnapshot);
-        if (fallbackData) showSnapshotData(fallbackData);
+        if (fallbackData) showSnapshotData(fallbackData, payload, "degraded");
         const sectionErrors = snapshotSectionErrors(payload);
         sectionErrors.snapshot = snapshotRetryMessage(payload, Boolean(fallbackData));
         setErrors(sectionErrors);
@@ -600,7 +649,7 @@ export function useConsoleData(pathname: string) {
         const message = error?.name === "AbortError"
           ? "页面快照读取超时，不能据此判断为无数据"
           : "页面快照暂不可读，正在等待下一个完整版本";
-        if (visibleBeforeRead) showSnapshotData(visibleBeforeRead);
+        if (visibleBeforeRead) showSnapshotData(visibleBeforeRead, undefined, "degraded");
         setErrors({ snapshot: message });
         scheduleSnapshotRetry(message, Boolean(visibleBeforeRead));
       }
@@ -727,12 +776,22 @@ export function useConsoleData(pathname: string) {
   }, [keys, pathname, activeRouteGeneration]);
 
   useEffect(() => {
-    refresh(false);
+    let stopped = false;
+    let pollTimer: number | null = null;
+    const poll = async () => {
+      await refresh(false);
+      if (!stopped && snapshotPage) {
+        pollTimer = window.setTimeout(poll, snapshotPollInterval(pathname));
+      }
+    };
+    void poll();
     return () => {
+      stopped = true;
+      if (pollTimer !== null) window.clearTimeout(pollTimer);
       controller.current?.abort();
       if (retryTimer.current !== null) window.clearTimeout(retryTimer.current);
     };
-  }, [refresh]);
+  }, [pathname, refresh, snapshotPage]);
 
   const cachedSnapshot = snapshotPage ? cachedHealthySnapshot(snapshotPage) : null;
   const cachedSnapshotData = snapshotData(cachedSnapshot);
@@ -740,7 +799,9 @@ export function useConsoleData(pathname: string) {
     || (loadedRoute.pathname === pathname && loadedRoute.generation === activeRouteGeneration);
   const stateMatchesSnapshotRoute = loadedRoute.pathname === pathname
     && loadedRoute.generation === activeRouteGeneration;
-  const visibleData = cachedSnapshotData || data;
+  const visibleData = snapshotPage
+    ? stateMatchesSnapshotRoute ? data : cachedSnapshotData || data
+    : data;
   const visibleLoading = snapshotPage ? loading || !snapshotRouteReady : loading;
   const cachedSnapshotErrors = cachedSnapshot ? snapshotSectionErrors(cachedSnapshot) : {};
   const visibleErrors = snapshotPage

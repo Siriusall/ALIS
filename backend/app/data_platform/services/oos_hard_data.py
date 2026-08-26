@@ -31,6 +31,11 @@ NEW_STRICT_BASELINE_SESSIONS = 126
 PROGRESSIVE_DIAGNOSTIC_SESSIONS = 60
 PROGRESSIVE_SIMULATION_SESSIONS = 126
 PROGRESSIVE_SIMULATION_CHAMPION_SESSIONS = 252
+PROGRESSIVE_CONSUMER_TIERS = {
+    "diagnostic_research": PROGRESSIVE_DIAGNOSTIC_SESSIONS,
+    "simulation_evaluation": PROGRESSIVE_SIMULATION_SESSIONS,
+    "simulation_champion_evaluation": PROGRESSIVE_SIMULATION_CHAMPION_SESSIONS,
+}
 HARD_APIS = ("daily", "daily_basic", "stk_limit", "adj_factor")
 BENCHMARK_INDEX_CODE = "000300.SH"
 BENCHMARK_API_KEY = f"index_daily:{BENCHMARK_INDEX_CODE}"
@@ -754,6 +759,15 @@ def _calendar_not_ready_audit(
     required_sessions: int = REQUIRED_SESSIONS,
 ) -> dict[str, Any]:
     """Return an explicit hard-data block without inventing an OOS window."""
+    consumer_eligibility = {
+        name: {
+            "eligible": False,
+            "required_sessions": sessions,
+            "eligible_sessions": 0,
+            "production_change_authorized": False,
+        }
+        for name, sessions in PROGRESSIVE_CONSUMER_TIERS.items()
+    }
     return {
         "ok": False,
         "audit_completed": False,
@@ -761,8 +775,8 @@ def _calendar_not_ready_audit(
         "status": "blocked",
         "failure_category": exc.code,
         "reason": str(exc),
-        "hard_requirement": True,
-        "consumer": "Champion Purged Walk-Forward OOS",
+        "hard_requirement": False,
+        "consumer": "Progressive OOS simulation qualification",
         "required_sessions": required_sessions,
         "calendar_sessions": 0,
         "eligible_sessions": 0,
@@ -779,7 +793,9 @@ def _calendar_not_ready_audit(
         "new_strict_baseline": {
             "status": "unavailable", "eligible_sessions": 0,
             "required_sessions": NEW_STRICT_BASELINE_SESSIONS,
+            "consumer_eligibility": consumer_eligibility,
         },
+        "consumer_eligibility": consumer_eligibility,
         "trailing_pending_dates": [],
         "observation_evidence": {
             "required": True,
@@ -822,6 +838,15 @@ def _new_strict_baseline(details: list[dict[str, Any]]) -> dict[str, Any]:
         "simulation_evaluation_data_ready": observed >= PROGRESSIVE_SIMULATION_SESSIONS,
         "simulation_champion_evaluation_data_ready": observed >= PROGRESSIVE_SIMULATION_CHAMPION_SESSIONS,
         "live_promotion_authorized": False,
+        "consumer_eligibility": {
+            name: {
+                "eligible": observed >= sessions,
+                "required_sessions": sessions,
+                "eligible_sessions": observed,
+                "production_change_authorized": False,
+            }
+            for name, sessions in PROGRESSIVE_CONSUMER_TIERS.items()
+        },
         "tiers": {
             "diagnostic": PROGRESSIVE_DIAGNOSTIC_SESSIONS,
             "simulation": PROGRESSIVE_SIMULATION_SESSIONS,
@@ -1015,8 +1040,11 @@ def audit_oos_hard_data(
         for item in details if not item["eligible"]
     )
     formal_ready = required_sessions >= REQUIRED_SESSIONS and len(eligible_dates) >= REQUIRED_SESSIONS
+    audit_backend_failed = not strict_evidence_backend_available
+    actionable_gate_failure = bool(repair_dates)
     active_status = (
         "ready" if formal_ready
+        else "blocked" if audit_backend_failed or actionable_gate_failure
         else "accumulating" if legacy_reference_mode or required_sessions < REQUIRED_SESSIONS
         else "blocked"
     )
@@ -1028,8 +1056,15 @@ def audit_oos_hard_data(
         "audit_completed": True,
         "schema_version": CONTRACT_VERSION,
         "status": active_status,
+        "failure_category": (
+            "oos_audit_backend_unavailable"
+            if audit_backend_failed
+            else "repairable_oos_data_gap"
+            if actionable_gate_failure
+            else None
+        ),
         "hard_requirement": False,
-        "consumer": "Progressive simulation qualification; live promotion remains separate",
+        "consumer": "Progressive OOS simulation qualification",
         "required_sessions": required_sessions, "calendar_sessions": len(required_dates),
         "eligible_sessions": len(eligible_dates), "missing_sessions": max(0, required_sessions - len(eligible_dates)),
         "calendar_missing_sessions": calendar_missing, "coverage": round(min(1.0, coverage), 6),
@@ -1062,6 +1097,7 @@ def audit_oos_hard_data(
             ),
         },
         "new_strict_baseline": baseline,
+        "consumer_eligibility": baseline["consumer_eligibility"],
         "promotion_authorized": formal_ready,
         "qualification": baseline,
         "generated_at": datetime.now().isoformat(timespec="seconds"),
@@ -1084,6 +1120,38 @@ def audit_progressive_oos(*, end_date: str | None = None, include_dates: bool = 
         include_dates=include_dates,
         window_sessions=PROGRESSIVE_SIMULATION_CHAMPION_SESSIONS,
     )
+
+
+def progressive_oos_consumer_eligibility(
+    audit: dict[str, Any],
+    consumer: str,
+) -> dict[str, Any]:
+    """Resolve one bounded OOS consumer without granting production authority."""
+
+    name = str(consumer or "")
+    required = PROGRESSIVE_CONSUMER_TIERS.get(name)
+    if required is None:
+        raise ValueError(f"unknown progressive OOS consumer: {name}")
+    baseline = audit.get("new_strict_baseline") if isinstance(
+        audit.get("new_strict_baseline"), dict
+    ) else audit.get("qualification") if isinstance(audit.get("qualification"), dict) else {}
+    observed = int((baseline or {}).get("eligible_sessions") or 0)
+    audit_status = str(audit.get("status") or "")
+    eligible = (
+        bool(audit.get("audit_completed", True))
+        and audit_status != "blocked"
+        and observed >= required
+    )
+    return {
+        "schema_version": CONTRACT_VERSION,
+        "consumer": name,
+        "status": "eligible" if eligible else "blocked" if audit_status == "blocked" else "accumulating",
+        "eligible": eligible,
+        "eligible_sessions": observed,
+        "required_sessions": required,
+        "production_change_authorized": False,
+        "formal_oos_required_sessions": REQUIRED_SESSIONS,
+    }
 
 
 def oos_hard_data_asset() -> dict[str, Any]:

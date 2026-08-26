@@ -390,6 +390,7 @@ def test_repair_entry_rejects_non_repairable_or_unclassified_dates():
 def test_legacy_oos_is_retired_when_strict_history_is_unrecoverable(monkeypatch):
     assert oos_hard_data.REQUIRED_SESSIONS == 1537
     monkeypatch.setattr(oos_hard_data, "_conn", lambda: FakeConn())
+    monkeypatch.setattr(oos_hard_data, "_strict_observation_schema_available", lambda: True)
     monkeypatch.setattr(oos_hard_data, "_late_arrival_hard_api_sets", lambda _details: {})
     result = oos_hard_data.audit_oos_hard_data(end_date="20260722")
     assert result["status"] == "accumulating"
@@ -646,6 +647,45 @@ def test_progressive_oos_tiers_authorize_only_the_matching_simulation_scope():
     assert champion["simulation_champion_evaluation_data_ready"] is True
     assert champion["qualification_authority"] == "data_gate_only"
     assert champion["live_promotion_authorized"] is False
+    assert diagnostic["consumer_eligibility"]["diagnostic_research"]["eligible"] is True
+    assert diagnostic["consumer_eligibility"]["simulation_evaluation"]["eligible"] is False
+    assert simulation["consumer_eligibility"]["simulation_evaluation"]["eligible"] is True
+    assert champion["consumer_eligibility"]["simulation_champion_evaluation"]["eligible"] is True
+    assert all(
+        item["production_change_authorized"] is False
+        for item in champion["consumer_eligibility"].values()
+    )
+
+
+def test_progressive_consumer_gate_preserves_real_audit_failure():
+    audit = {
+        "audit_completed": False,
+        "status": "blocked",
+        "new_strict_baseline": {"eligible_sessions": 252},
+    }
+
+    result = oos_hard_data.progressive_oos_consumer_eligibility(
+        audit, "diagnostic_research",
+    )
+
+    assert result["status"] == "blocked"
+    assert result["eligible"] is False
+    assert result["production_change_authorized"] is False
+
+
+def test_calendar_unavailable_uses_progressive_consumer_semantics():
+    result = oos_hard_data._calendar_not_ready_audit(
+        oos_hard_data.TradeCalendarNotReady(
+            today="20260826",
+            include_today=True,
+        ),
+        required_sessions=oos_hard_data.PROGRESSIVE_SIMULATION_CHAMPION_SESSIONS,
+    )
+
+    assert result["status"] == "blocked"
+    assert result["hard_requirement"] is False
+    assert result["consumer"] == "Progressive OOS simulation qualification"
+    assert result["new_strict_baseline"]["consumer_eligibility"]["diagnostic_research"]["eligible"] is False
 
 
 def test_compact_audit_returns_nonrepairable_count_with_bounded_date_samples(monkeypatch):

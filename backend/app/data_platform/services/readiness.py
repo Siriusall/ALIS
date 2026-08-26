@@ -26,6 +26,10 @@ def _business_today() -> date:
     return datetime.now(_BUSINESS_TZ).date()
 
 
+def _now() -> str:
+    return datetime.now(_BUSINESS_TZ).isoformat(timespec="seconds")
+
+
 def invalidate_readiness_cache() -> None:
     redis_delete("alis:data-platform:readiness:v2")
     with _cache_lock:
@@ -290,7 +294,7 @@ def readiness_overview() -> dict[str, Any]:
                 "unknown": "尚无足够证据",
             },
         }
-        _refresh_state.update({"last_result": blocked, "last_finished_at": datetime.now().isoformat(timespec="seconds"), "last_error": str(exc)})
+        _refresh_state.update({"last_result": blocked, "last_finished_at": _now(), "last_error": str(exc)})
         return blocked
     redis_cached = get_json("alis:data-platform:readiness:v2")
     if isinstance(redis_cached, dict):
@@ -321,7 +325,7 @@ def readiness_overview() -> dict[str, Any]:
     with _cache_lock:
         _cache.update({"at": time.monotonic(), "value": payload})
     set_json("alis:data-platform:readiness:v2", payload, ttl=30)
-    _refresh_state.update({"last_result": payload, "last_finished_at": datetime.now().isoformat(timespec="seconds"), "last_error": ""})
+    _refresh_state.update({"last_result": payload, "last_finished_at": _now(), "last_error": ""})
     return payload
 
 
@@ -342,16 +346,16 @@ def start_readiness_refresh() -> dict[str, Any]:
     with _refresh_lock:
         if _refresh_state.get("running"):
             return {**readiness_refresh_status(), "started": False, "reason": "already_running"}
-        _refresh_state.update({"running": True, "last_started_at": datetime.now().isoformat(timespec="seconds"), "last_error": ""})
+        _refresh_state.update({"running": True, "last_started_at": _now(), "last_error": ""})
 
     def worker() -> None:
         try:
             with _cache_lock:
                 _cache.update({"at": 0.0, "value": None})
             result = readiness_overview()
-            _refresh_state.update({"last_result": result, "last_finished_at": datetime.now().isoformat(timespec="seconds"), "last_error": ""})
+            _refresh_state.update({"last_result": result, "last_finished_at": _now(), "last_error": ""})
         except Exception as exc:
-            _refresh_state.update({"last_error": str(exc)[:500], "last_finished_at": datetime.now().isoformat(timespec="seconds")})
+            _refresh_state.update({"last_error": str(exc)[:500], "last_finished_at": _now()})
         finally:
             _refresh_state["running"] = False
 

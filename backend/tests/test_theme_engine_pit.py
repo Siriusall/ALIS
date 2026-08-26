@@ -78,7 +78,7 @@ def test_list_themes_filters_late_rows_before_applying_limit(monkeypatch):
         _row(created_at="2026-08-14T15:01:00+08:00", theme_code="industry:visible"),
         _row(theme_code="industry:visible", as_of_date="20260813"),
     ])
-    monkeypatch.setattr(theme_engine, "_conn", lambda: conn)
+    monkeypatch.setattr(theme_engine, "_read_conn", lambda: conn)
 
     result = theme_engine.list_themes(
         as_of_time="2026-08-14T15:00:00+08:00",
@@ -94,7 +94,7 @@ def test_list_themes_filters_late_rows_before_applying_limit(monkeypatch):
 
 def test_list_themes_reports_missing_visible_snapshot_as_blocked(monkeypatch):
     conn = _Connection([_row(created_at="2026-08-14T15:01:00+08:00")])
-    monkeypatch.setattr(theme_engine, "_conn", lambda: conn)
+    monkeypatch.setattr(theme_engine, "_read_conn", lambda: conn)
 
     result = theme_engine.list_themes(
         as_of_time="2026-08-14T15:00:00+08:00",
@@ -106,6 +106,46 @@ def test_list_themes_reports_missing_visible_snapshot_as_blocked(monkeypatch):
     assert result["ok"] is False
     assert result["status"] == "blocked"
     assert result["reason"] == "no_theme_snapshot_visible_at_cutoff"
+
+
+def test_get_theme_exhausts_mapping_pages_without_truncation(monkeypatch):
+    snapshot = _row()
+    mappings = [
+        {
+            "ts_code": f"{index:06d}.SZ",
+            "exposure_score": 1.0,
+            "evidence_json": "{}",
+            "updated_at": "2026-08-14T14:59:00+08:00",
+        }
+        for index in range(theme_engine._THEME_MAPPING_BATCH_SIZE + 5)
+    ]
+
+    class PagedConnection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, sql, params=()):
+            if "FROM dc_theme_snapshot" in sql:
+                return _Rows([snapshot])
+            if "FROM dc_theme_company_mapping" in sql:
+                last_code = str(params[-2]) if "ts_code>?" in sql else ""
+                page = [item for item in mappings if item["ts_code"] > last_code]
+                return _Rows(page[:theme_engine._THEME_MAPPING_BATCH_SIZE])
+            raise AssertionError(sql)
+
+    monkeypatch.setattr(theme_engine, "_read_conn", lambda: PagedConnection())
+
+    result = theme_engine.get_theme(
+        "industry:电子",
+        as_of_date="2026-08-14T15:00:00+08:00",
+    )
+
+    assert result is not None
+    assert result["company_count"] == len(mappings)
+    assert len(result["companies"]) == len(mappings)
 
 
 def test_theme_mapping_requires_its_own_write_clock_at_formal_cutoff():

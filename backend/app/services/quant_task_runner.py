@@ -49,15 +49,16 @@ _account_execution_lock = threading.Lock()
 _REPLAY_BATCH_STEPS = max(1, min(int(os.getenv("QUANT_REPLAY_BATCH_STEPS", "3")), 5))
 _PRAGMATIC_MAX_GAP_DAYS = max(1, min(int(os.getenv("QUANT_PRAGMATIC_MAX_GAP_DAYS", "5")), 30))
 
-# These failures mean that the exact-date market slice is not available yet.
+# These failures mean execution inputs must be refreshed and prepared again.
 # They must leave a frozen plan retryable; turning one into a contract terminal
-# state would prevent the publication probe/backfill loop from ever recovering.
-_RETRYABLE_EXECUTION_DATA_CODES = {
+# state would prevent the publication/account-snapshot loop from recovering.
+_RETRYABLE_EXECUTION_CODES = {
     "paused_frozen_execution_data_not_ready",
     "paused_frozen_execution_order_data_not_ready",
     "paused_data_not_ready",
     "future_guard_execute_snapshot",
     "historical_data_missing_508",
+    "execution_account_snapshot_changed",
 }
 _ENFORCE_TRADING_SESSION_GATE = str(os.getenv("QUANT_ENFORCE_TRADING_SESSION_GATE", "0")).strip().lower() in {"1", "true", "yes", "on"}
 _DEFAULT_SCORING_TIMEOUT_SEC = max(10, min(int(os.getenv("QUANT_SCORING_TIMEOUT_SEC", "90")), 1800))
@@ -108,6 +109,25 @@ def _is_expected_scheduler_wait(exc: BaseException) -> bool:
         "current transaction is aborted", "connection timeout",
         "connection timeout expired",
     ))
+
+
+def _release_retryable_execution_claim(
+    active_claim: tuple[str, str] | None,
+    *,
+    reason: BaseException,
+) -> bool:
+    """Release a recoverable execution lease so the next run prepares anew."""
+    if not active_claim:
+        return False
+    from app.services.profit_loop import release_daily_rebalance_execution_claim
+
+    signal_date, claim_token = active_claim
+    release_daily_rebalance_execution_claim(
+        signal_date,
+        claim_token=claim_token,
+        reason=reason,
+    )
+    return True
 
 
 def _trade_date_key(value: object) -> str:
@@ -1030,6 +1050,26 @@ def _preflight_check_step(
     return no_pause()
 
 
+def _step_preflight_decision(
+    *,
+    frozen_autonomous_execution: bool,
+    signal_date: str,
+    execute_date: str,
+    min_account_balance: float,
+    enforce_session_gate: bool,
+) -> RiskPauseDecision:
+    """Skip mutable research preflight only for an already-frozen formal plan."""
+    if frozen_autonomous_execution:
+        return no_pause()
+    return _preflight_check_step(
+        signal_date=signal_date,
+        execute_date=execute_date,
+        min_account_balance=min_account_balance,
+        enforce_session_gate=enforce_session_gate,
+        require_min_account_balance=True,
+    )
+
+
 def _plan_replay_window(dates: list[str], last_exec_date: str, mode: str, start_idx_override: int | None = None) -> dict:
     end_idx = len(dates) - 2
     if end_idx < 0:
@@ -1130,7 +1170,7 @@ def _execute_step_with_retry(
                 claim_observer(signal_date, claim_token)
         except ReplayRiskGateError as exc:
             error_code = str(getattr(exc, "code", "") or "invalid_authoritative_plan")
-            if error_code not in {"formal_plan_not_due", *_RETRYABLE_EXECUTION_DATA_CODES}:
+            if error_code not in {"formal_plan_not_due", *_RETRYABLE_EXECUTION_CODES}:
                 block_daily_rebalance_plan_contract(
                     signal_date,
                     execute_date,
@@ -1846,16 +1886,12 @@ def run_quant_task_async(task_id: int) -> bool:
                 # signal snapshot here adds no execution evidence and can
                 # strand a valid claimed plan when historical replay storage
                 # is compacted.  Research replay keeps the full preflight.
-                pre_decision = (
-                    no_pause()
-                    if frozen_autonomous_execution
-                    else _preflight_check_step(
-                        signal_date=signal_date,
-                        execute_date=execute_date,
-                        min_account_balance=min_account_balance,
-                        enforce_session_gate=enforce_session_gate,
-                        require_min_account_balance=True,
-                    )
+                pre_decision = _step_preflight_decision(
+                    frozen_autonomous_execution=frozen_autonomous_execution,
+                    signal_date=signal_date,
+                    execute_date=execute_date,
+                    min_account_balance=min_account_balance,
+                    enforce_session_gate=enforce_session_gate,
                 )
                 if pre_decision.should_pause:
                     _handle_pause(
@@ -2066,20 +2102,16 @@ def run_quant_task_async(task_id: int) -> bool:
             )
         except ReplayRiskGateError as e:
             error_code = str(getattr(e, "code", "") or "replay_risk_gate")
-            retryable_execution_data_codes = _RETRYABLE_EXECUTION_DATA_CODES
-            if error_code in retryable_execution_data_codes and active_claim:
-                signal_claim, token_claim = active_claim
+            retryable_execution_codes = _RETRYABLE_EXECUTION_CODES
+            if error_code in retryable_execution_codes and active_claim:
                 try:
-                    from app.services.profit_loop import release_daily_rebalance_execution_claim
-
-                    release_daily_rebalance_execution_claim(
-                        signal_claim,
-                        claim_token=token_claim,
+                    _release_retryable_execution_claim(
+                        active_claim,
                         reason=e,
                     )
                 finally:
                     active_claim = None
-            elif error_code not in retryable_execution_data_codes:
+            elif error_code not in retryable_execution_codes:
                 _quarantine_active_claim(str(e))
             contract_rejections = {
                 "legacy_authoritative_plan",
@@ -2103,17 +2135,26 @@ def run_quant_task_async(task_id: int) -> bool:
                 )
                 logger.info("autonomous plan is not claimable yet task_id=%s code=%s", task_id, error_code)
                 return
-            if mode == "autonomous_daily" and error_code in retryable_execution_data_codes:
+            if mode == "autonomous_daily" and error_code in retryable_execution_codes:
+                account_snapshot_changed = error_code == "execution_account_snapshot_changed"
                 _transition_task_status(
                     task_id,
                     "pending",
                     "schedule_wait",
-                    replay_status="waiting_execution_data",
+                    replay_status=(
+                        "waiting_execution_reprepare"
+                        if account_snapshot_changed
+                        else "waiting_execution_data"
+                    ),
                     error=None,
                     finished_at=None,
                     **_waiting_schedule_projection(),
                 )
-                logger.info("autonomous plan is waiting for exact execution data task_id=%s code=%s", task_id, error_code)
+                logger.info(
+                    "autonomous plan will release claim and prepare again task_id=%s code=%s",
+                    task_id,
+                    error_code,
+                )
                 return
             if mode == "autonomous_daily" and error_code in contract_rejections:
                 committed_records = list_quant_run_task_records(task_id, limit=5000)

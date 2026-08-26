@@ -856,21 +856,25 @@ def _candidate_id_from_event(row: dict[str, Any]) -> str:
 def _candidate_event(candidate_id: str) -> dict[str, Any] | None:
     ensure_strategy_research_tables()
     with _conn() as conn:
+        exact = conn.execute(
+            """SELECT * FROM strategy_research_events
+               WHERE research_line='candidate_generation'
+                 AND event_type='candidate_strategy_generated'
+                 AND source_id=?
+               ORDER BY created_at DESC,event_id DESC LIMIT 1""",
+            (str(candidate_id),),
+        ).fetchone()
+        if exact:
+            return dict(exact)
+        # Legacy rows may predate source_id.  Search only that legacy subset;
+        # unrelated NULL history must never push the target beyond a cap.
         rows = conn.execute(
             """SELECT * FROM strategy_research_events
                WHERE research_line='candidate_generation'
                  AND event_type='candidate_strategy_generated'
-                 AND (source_id=? OR source_id IS NULL)
-               ORDER BY created_at ASC LIMIT 5000""",
-            (str(candidate_id),),
+                 AND source_id IS NULL
+               ORDER BY created_at DESC,event_id DESC"""
         ).fetchall()
-        if not rows:
-            rows = conn.execute(
-                """SELECT * FROM strategy_research_events
-                   WHERE research_line='candidate_generation'
-                     AND event_type='candidate_strategy_generated'
-                   ORDER BY created_at ASC LIMIT 5000"""
-            ).fetchall()
     for raw in rows:
         row = dict(raw)
         if str(row.get("source_id") or "") == str(candidate_id) or _candidate_id_from_event(row) == str(candidate_id):
@@ -2206,16 +2210,35 @@ def _prototype_maturity(member_count: int, representative_fitness: float) -> str
 
 def _load_completed_v10_candidates(snapshot_id: str) -> list[dict[str, Any]]:
     ensure_strategy_research_tables()
-    read_limit = 10000
     with _conn() as conn:
+        wave_rows = conn.execute(
+            """SELECT candidate_ids_json FROM strategy_research_waves
+               WHERE research_snapshot_id=? ORDER BY created_at""",
+            (str(snapshot_id),),
+        ).fetchall()
+        candidate_ids = sorted({
+            str(candidate_id)
+            for raw in wave_rows
+            for candidate_id in json.loads(dict(raw).get("candidate_ids_json") or "[]")
+            if str(candidate_id)
+        })
+        if not candidate_ids:
+            return []
+        placeholders = ",".join("?" for _ in candidate_ids)
         events = [dict(row) for row in conn.execute(
-            """SELECT * FROM strategy_research_events
+            f"""SELECT * FROM strategy_research_events
                WHERE research_line='candidate_generation'
                  AND event_type='candidate_strategy_generated'
-                 AND status='completed' ORDER BY created_at ASC LIMIT ?""", (read_limit,)
+                 AND status='completed'
+                 AND source_id IN ({placeholders})
+               ORDER BY created_at ASC,event_id ASC""",
+            tuple(candidate_ids),
         ).fetchall()]
         backtests = [dict(row) for row in conn.execute(
-            "SELECT * FROM strategy_environment_backtests ORDER BY candidate_id,environment_id LIMIT ?", (read_limit,)
+            f"""SELECT * FROM strategy_environment_backtests
+                WHERE candidate_id IN ({placeholders})
+                ORDER BY candidate_id,environment_id""",
+            tuple(candidate_ids),
         ).fetchall()]
     by_candidate: dict[str, list[dict[str, Any]]] = {}
     for row in backtests:
@@ -2225,9 +2248,12 @@ def _load_completed_v10_candidates(snapshot_id: str) -> list[dict[str, Any]]:
     candidates: list[dict[str, Any]] = []
     for event in events:
         payload = json.loads(event.get("payload_json") or "{}")
+        candidate_id = str(payload.get("candidate_id") or event.get("source_id") or "")
+        if candidate_id not in candidate_ids:
+            continue
         if str(payload.get("snapshot_id") or "") != str(snapshot_id):
             continue
-        payload["environment_results"] = by_candidate.get(str(payload.get("candidate_id") or ""), [])
+        payload["environment_results"] = by_candidate.get(candidate_id, [])
         if payload["environment_results"]:
             candidates.append(payload)
     return candidates

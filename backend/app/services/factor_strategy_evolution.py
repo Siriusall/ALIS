@@ -727,17 +727,27 @@ def run_factor_strategy_evolution_cycle() -> dict[str, Any]:
 
 def factor_strategy_lineage_status() -> dict[str, Any]:
     _ensure_tables()
-    read_limit = 5000
     with _conn() as conn:
         combinations = [dict(row) for row in conn.execute(
-            "SELECT * FROM factor_combinations ORDER BY updated_at DESC LIMIT ?", (read_limit,)
+            "SELECT * FROM factor_combinations ORDER BY updated_at DESC,combination_key"
         ).fetchall()]
-        members = [dict(row) for row in conn.execute(
-            "SELECT * FROM factor_combination_members ORDER BY combination_key,factor_key LIMIT ?", (read_limit,)
-        ).fetchall()]
-        links = [dict(row) for row in conn.execute(
-            "SELECT * FROM factor_strategy_links ORDER BY created_at DESC LIMIT ?", (read_limit,)
-        ).fetchall()]
+        combination_keys = [str(row["combination_key"]) for row in combinations]
+        if combination_keys:
+            placeholders = ",".join("?" for _ in combination_keys)
+            members = [dict(row) for row in conn.execute(
+                f"""SELECT * FROM factor_combination_members
+                    WHERE combination_key IN ({placeholders})
+                    ORDER BY combination_key,factor_key""",
+                tuple(combination_keys),
+            ).fetchall()]
+            links = [dict(row) for row in conn.execute(
+                f"""SELECT * FROM factor_strategy_links
+                    WHERE combination_key IN ({placeholders})
+                    ORDER BY created_at DESC,combination_key,model_version_id""",
+                tuple(combination_keys),
+            ).fetchall()]
+        else:
+            members, links = [], []
     by_combination: dict[str, list[dict[str, Any]]] = {}
     for member in members:
         try:
@@ -762,6 +772,6 @@ def factor_strategy_lineage_status() -> dict[str, Any]:
         "schema_version": "alis_factor_strategy_lineage_v1",
         "combinations": combinations,
         "strategy_links": links,
-        "read_limit": read_limit,
-        "possibly_truncated": any(len(items) >= read_limit for items in (combinations, members, links)),
+        "read_limit": None,
+        "possibly_truncated": False,
     }

@@ -22,7 +22,7 @@ from urllib.parse import urljoin, urlparse
 
 import requests
 
-from app.data_platform.db import _conn
+from app.data_platform.db import _conn, _read_conn
 from app.data_platform.services.data_center import _now
 from app.services.official_policy_data import _LinkParser, _published_time, _request_text, _save_documents, _text
 
@@ -32,6 +32,7 @@ CAAM_INDEX_URLS = ("http://www.caam.org.cn/", "http://www.caam.org.cn/tjsj")
 OCR_SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "macos_vision_ocr.swift"
 MAX_NEW_DOCUMENTS_PER_CYCLE = 1
 OCR_TIMEOUT_SECONDS = 90
+OCR_AUDIT_WRITE_BATCH_SIZE = 200
 MIIT_AUTO_INDEX_URL = "https://www.miit.gov.cn/jgsj/zbys/qcgy/index.html"
 MIIT_AUTO_SOURCE = "official.miit.auto_operations"
 
@@ -177,44 +178,57 @@ def _cross_document_assessment(rows: list[dict[str, Any]], *, tolerance: float =
 
 def audit_caam_ocr_candidates() -> dict[str, Any]:
     """Cross-check duplicate CAAM images without promoting OCR to production."""
-    with _conn() as conn:
+    with _read_conn() as conn:
         rows = [dict(row) for row in conn.execute(
-            "SELECT * FROM dc_research_ocr_observation WHERE source_code=? ORDER BY observation_date,field_code,document_id LIMIT 10000",
+            "SELECT * FROM dc_research_ocr_observation WHERE source_code=? ORDER BY observation_date,field_code,document_id",
             (CAAM_OCR_SOURCE,),
         ).fetchall()]
-        assessments = _cross_document_assessment(rows)
-        now = _now()
-        updated = 0
-        for row in rows:
-            if str(row.get("validation_status") or "").startswith("structured_"):
-                continue
-            key = (str(row.get("observation_date") or ""), str(row.get("field_code") or ""))
-            status = assessments[key]
-            try:
-                evidence = json.loads(row.get("evidence_json") or "{}")
-            except (TypeError, json.JSONDecodeError):
-                evidence = {}
-            peers = [
-                {"document_id": peer.get("document_id"), "value": peer.get("value"), "confidence": peer.get("confidence")}
-                for peer in rows
-                if (str(peer.get("observation_date") or ""), str(peer.get("field_code") or "")) == key
-            ]
-            evidence["cross_document_validation"] = {
-                "status": status,
-                "same_publisher_independent_images": len({str(item["document_id"]) for item in peers}),
-                "peers": peers,
-                "structured_source_reconciled": False,
-                "production_eligible": False,
-            }
-            conn.execute(
-                """UPDATE dc_research_ocr_observation SET validation_status=?,evidence_json=?,updated_at=?
-                   WHERE source_code=? AND document_id=? AND field_code=? AND observation_date=?""",
-                (
-                    status, json.dumps(evidence, ensure_ascii=False), now, CAAM_OCR_SOURCE, row["document_id"],
-                    row["field_code"], row["observation_date"],
-                ),
-            )
-            updated += 1
+    assessments = _cross_document_assessment(rows)
+    peers_by_key: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    document_counts: dict[tuple[str, str], int] = {}
+    for row in rows:
+        key = (str(row.get("observation_date") or ""), str(row.get("field_code") or ""))
+        peers_by_key.setdefault(key, []).append({
+            "document_id": row.get("document_id"),
+            "value": row.get("value"),
+            "confidence": row.get("confidence"),
+        })
+    for key, peers in peers_by_key.items():
+        document_counts[key] = len({str(item["document_id"]) for item in peers})
+
+    now = _now()
+    updates: list[tuple[Any, ...]] = []
+    for row in rows:
+        if str(row.get("validation_status") or "").startswith("structured_"):
+            continue
+        key = (str(row.get("observation_date") or ""), str(row.get("field_code") or ""))
+        status = assessments[key]
+        try:
+            evidence = json.loads(row.get("evidence_json") or "{}")
+        except (TypeError, json.JSONDecodeError):
+            evidence = {}
+        evidence["cross_document_validation"] = {
+            "status": status,
+            "same_publisher_independent_images": document_counts[key],
+            "peers": peers_by_key[key],
+            "structured_source_reconciled": False,
+            "production_eligible": False,
+        }
+        updates.append((
+            status, json.dumps(evidence, ensure_ascii=False), now, CAAM_OCR_SOURCE,
+            row["document_id"], row["field_code"], row["observation_date"],
+        ))
+    # JSON decoding/grouping happens before any write transaction.  Bound each
+    # mutation transaction without dropping rows from the complete audit.
+    for start in range(0, len(updates), OCR_AUDIT_WRITE_BATCH_SIZE):
+        with _conn() as conn:
+            for params in updates[start:start + OCR_AUDIT_WRITE_BATCH_SIZE]:
+                conn.execute(
+                    """UPDATE dc_research_ocr_observation SET validation_status=?,evidence_json=?,updated_at=?
+                       WHERE source_code=? AND document_id=? AND field_code=? AND observation_date=?""",
+                    params,
+                )
+    updated = len(updates)
     counts: dict[str, int] = {}
     for status in assessments.values():
         counts[status] = counts.get(status, 0) + 1
@@ -316,7 +330,8 @@ def reconcile_caam_ocr_with_miit(*, max_documents: int = 5) -> dict[str, Any]:
             for item in observations:
                 peers = [dict(row) for row in conn.execute(
                     """SELECT * FROM dc_research_ocr_observation
-                       WHERE source_code=? AND observation_date=? AND field_code=? LIMIT 5000""",
+                       WHERE source_code=? AND observation_date=? AND field_code=?
+                       ORDER BY document_id""",
                     (CAAM_OCR_SOURCE, observation_date, item["field_code"]),
                 ).fetchall()]
                 for peer in peers:

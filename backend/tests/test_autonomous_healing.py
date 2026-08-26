@@ -26,20 +26,50 @@ def test_classify_step_health_never_reports_retryable_data_gap_as_healthy() -> N
         assert result == {"status": "failed", "reason": "execution_slice_blocked"}
 
 
-def test_classify_step_health_keeps_nonrepairable_oos_gap_as_waiting_condition() -> None:
+def test_classify_step_health_keeps_explicit_oos_accumulation_as_waiting_condition() -> None:
     result = healing.classify_step_health({
         "name": "hard_data_gate", "ok": True,
-        "result": {"status": "blocked", "non_repairable_dates": ["20260701"], "repair_dates": []},
+        "result": {"status": "accumulating", "non_repairable_dates": ["20260701"], "repair_dates": []},
     })
-    assert result == {"status": "waiting_condition", "reason": "historical_point_in_time_unavailable"}
+    assert result == {"status": "waiting_condition", "reason": "accumulating"}
 
 
-def test_classify_step_health_keeps_nonrepairable_sealed_gap_as_waiting_condition() -> None:
-    result = healing.classify_step_health({
-        "name": "sealed_holdout_data_gate", "ok": False,
+def test_classify_historical_gate_waits_only_for_explicit_normal_statuses() -> None:
+    for status in ("accumulating", "retired", "retired_legacy_oos_contract"):
+        result = healing.classify_step_health({
+            "name": "sealed_holdout_data_gate", "ok": True,
+            "result": {"status": status, "non_repairable_dates": ["20190910"], "repair_dates": []},
+        })
+        assert result == {"status": "waiting_condition", "reason": status}
+
+    blocked = healing.classify_step_health({
+        "name": "sealed_holdout_data_gate", "ok": True,
         "result": {"status": "blocked", "non_repairable_dates": ["20190910"], "repair_dates": []},
     })
-    assert result == {"status": "waiting_condition", "reason": "historical_point_in_time_unavailable"}
+    assert blocked == {"status": "failed", "reason": "blocked"}
+
+
+def test_historical_gate_failure_evidence_precedes_wait_status() -> None:
+    cases = [
+        (
+            {"name": "hard_data_gate", "ok": True, "result": {
+                "status": "accumulating", "failure_category": "trade_calendar_unavailable",
+            }},
+            "trade_calendar_unavailable",
+        ),
+        (
+            {"name": "hard_data_gate", "ok": False, "result": {"status": "accumulating"}},
+            "module_returned_not_ok",
+        ),
+        (
+            {"name": "sealed_holdout_data_gate", "ok": True, "result": {
+                "status": "accumulating", "backend_available": False,
+            }},
+            "historical_data_backend_unavailable",
+        ),
+    ]
+    for step, reason in cases:
+        assert healing.classify_step_health(step) == {"status": "failed", "reason": reason}
 
 
 def test_self_healing_repairs_only_explicit_hard_data_gaps(monkeypatch) -> None:
@@ -72,7 +102,7 @@ def test_self_healing_does_not_retry_historical_point_in_time_gaps(monkeypatch) 
     )
 
     result = healing.run_autonomous_self_healing([
-        {"name": "hard_data_gate", "ok": True, "result": {"status": "blocked", "non_repairable_dates": ["20260701"], "repair_dates": []}},
+        {"name": "hard_data_gate", "ok": True, "result": {"status": "accumulating", "non_repairable_dates": ["20260701"], "repair_dates": []}},
     ])
 
     assert result["status"] == "healthy"
@@ -89,8 +119,8 @@ def test_factor_repair_uses_current_experiment_gate_not_historical_oos_gate(monk
 
     result = healing.run_autonomous_self_healing([
         {
-            "name": "hard_data_gate", "ok": False,
-            "result": {"status": "blocked", "non_repairable_dates": ["20260701"], "repair_dates": []},
+            "name": "hard_data_gate", "ok": True,
+            "result": {"status": "accumulating", "non_repairable_dates": ["20260701"], "repair_dates": []},
         },
         {
             "name": "decision_data_gate", "ok": True,

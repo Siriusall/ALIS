@@ -709,8 +709,8 @@ def _experiment_rows(snapshot_id: str) -> list[dict[str, Any]]:
         rows = [
             dict(row) for row in conn.execute(
                 """SELECT * FROM factor_combination_experiments
-                   WHERE snapshot_id=? ORDER BY fitness DESC,created_at ASC LIMIT ?""",
-                (snapshot_id, 5000),
+                   WHERE snapshot_id=? ORDER BY fitness DESC,created_at ASC""",
+                (snapshot_id,),
             ).fetchall()
         ]
     for row in rows:

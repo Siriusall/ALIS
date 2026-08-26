@@ -48,6 +48,7 @@ _DEFAULT_TTLS = {
 }
 _FAILURE_RETRY_SECONDS = 15
 _DIAGNOSTIC_CACHE_SECONDS = 300
+_DIAGNOSTIC_PAGE_KEYS = frozenset({"overview", "operations", "data"})
 _DB_HEAVY_TASK_TYPES = frozenset({
     "factor_daily_cycle",
     "factor_research_cycle",
@@ -63,6 +64,7 @@ _schema_ready = False
 _schema_lock = Lock()
 _diagnostic_cache: dict[str, tuple[float, Callable[..., Any], Any]] = {}
 _diagnostic_cache_lock = Lock()
+_diagnostic_cache_generation = 0
 logger = logging.getLogger(__name__)
 
 
@@ -107,13 +109,28 @@ def _cached_diagnostic(
 
     now = time.monotonic()
     with _diagnostic_cache_lock:
+        generation = _diagnostic_cache_generation
         cached = _diagnostic_cache.get(key)
         if cached and cached[1] is reader and now - cached[0] < _DIAGNOSTIC_CACHE_SECONDS:
             return copy.deepcopy(cached[2])
     value = reader(**kwargs)
     with _diagnostic_cache_lock:
-        _diagnostic_cache[key] = (time.monotonic(), reader, copy.deepcopy(value))
+        # An invalidation may run while the formal audit is outside the lock.
+        # Never let that old result repopulate the cache for a newer snapshot
+        # generation; the in-flight page build itself is rejected by its
+        # durable refresh-generation compare-and-swap.
+        if generation == _diagnostic_cache_generation:
+            _diagnostic_cache[key] = (time.monotonic(), reader, copy.deepcopy(value))
     return value
+
+
+def _clear_diagnostic_cache() -> None:
+    """Synchronously retire cached and in-flight diagnostic generations."""
+
+    global _diagnostic_cache_generation
+    with _diagnostic_cache_lock:
+        _diagnostic_cache.clear()
+        _diagnostic_cache_generation += 1
 
 
 def _ensure_table() -> None:
@@ -242,6 +259,32 @@ def _readers(page_key: str) -> dict[str, Callable[[], Any]]:
         }
 
     latest_decision_bundle: dict[str, Any] = {}
+    research_inputs: dict[str, tuple[bool, Any]] = {}
+
+    def research_input(name: str, reader: Callable[[], Any]) -> Any:
+        """Read each research selector once so list and detail stay coherent."""
+        cached = research_inputs.get(name)
+        if cached:
+            succeeded, value = cached
+            if succeeded:
+                return value
+            raise value
+        try:
+            value = reader()
+        except Exception as exc:
+            research_inputs[name] = (False, exc)
+            raise
+        research_inputs[name] = (True, value)
+        return value
+
+    def research_pools() -> Any:
+        return research_input("pools", research.research_pools)
+
+    def research_industries() -> Any:
+        return research_input(
+            "industries",
+            lambda: research.research_industries(compact=True),
+        )
 
     def latest_decision_evidence() -> dict[str, Any]:
         """Freeze the first visible decision's full document beside its list.
@@ -274,9 +317,26 @@ def _readers(page_key: str) -> dict[str, Callable[[], Any]]:
         "health": lambda: _health_payload(require_redis=False),
         "tradingReady": control_trading_ready,
     }
+
+    def bounded_oos() -> dict[str, Any]:
+        return _cached_diagnostic(
+            "progressive_oos",
+            data_center.data_center_oos_hard_data,
+            include_dates=False,
+        )
+
+    def bounded_sealed() -> dict[str, Any]:
+        return _cached_diagnostic(
+            "sealed_holdout",
+            data_center.data_center_sealed_strategy_holdout,
+            include_dates=False,
+        )
+
     pages: dict[str, dict[str, Callable[[], Any]]] = {
         "overview": {
             **common,
+            "oos": bounded_oos,
+            "sealed": bounded_sealed,
             "owner": model_strategy.model_strategy_owner_summary,
             "ledger": quant_runs.quant_run_ledger_summary,
             "portfolio": lambda: research.research_portfolio_candles(limit=90),
@@ -303,6 +363,8 @@ def _readers(page_key: str) -> dict[str, Callable[[], Any]]:
         },
         "operations": {
             **common,
+            "oos": bounded_oos,
+            "sealed": bounded_sealed,
             "owner": model_strategy.model_strategy_owner_summary,
             "adminTasksLive": lambda: model_strategy.model_strategy_task_center(limit=30, log_limit=20, compact=True),
             "tasks": lambda: model_strategy.model_strategy_task_center(limit=16, log_limit=40, compact=True),
@@ -321,6 +383,8 @@ def _readers(page_key: str) -> dict[str, Callable[[], Any]]:
             "systemContracts": system_versions.system_version_contracts,
         },
         "data": {
+            "oos": bounded_oos,
+            "sealed": bounded_sealed,
             "watermarks": data_center.data_center_asset_watermarks,
             "failedRequests": lambda: data_center.data_center_failed_tushare_requests(request_status="pending", limit=100),
             "dataOperations": lambda: data_center.data_center_llm_data_operations(limit=20),
@@ -360,7 +424,7 @@ def _readers(page_key: str) -> dict[str, Callable[[], Any]]:
             "researchDataAssets": lambda: model_strategy.model_strategy_evolution_research_data_assets() if hasattr(model_strategy, "model_strategy_evolution_research_data_assets") else {},
             "analystConsensus": lambda: model_strategy.model_strategy_analyst_consensus_batch(limit=100),
             "theses": research.research_thesis_list,
-            "industries": lambda: research.research_industries(compact=True),
+            "industries": research_industries,
             "industryAllocation": lambda: research.research_industry_allocation(compact=True),
             # Route handlers use FastAPI Query defaults.  The control worker
             # calls them directly, so provide concrete bounded values rather
@@ -369,12 +433,16 @@ def _readers(page_key: str) -> dict[str, Callable[[], Any]]:
                 as_of_time="", promotable_only=False, limit=100, compact=True
             ),
             "events": lambda: research.research_events(ts_code="", limit=100),
-            "pools": research.research_pools,
+            "pools": research_pools,
             "modelMarketLive": model_strategy.model_strategy_live_market_context,
             # Detail evidence is materialized with the research page so the
             # browser never turns the first render into a live fan-out.
-            "researchStockEvidence": lambda: _research_detail_evidence(research, "stock"),
-            "researchIndustryEvidence": lambda: _research_detail_evidence(research, "industry"),
+            "researchStockEvidence": lambda: _research_detail_evidence(
+                research, "stock", research_pools
+            ),
+            "researchIndustryEvidence": lambda: _research_detail_evidence(
+                research, "industry", research_industries
+            ),
         },
         "factors": {
             "owner": model_strategy.model_strategy_owner_summary,
@@ -427,22 +495,68 @@ def _readers(page_key: str) -> dict[str, Callable[[], Any]]:
     return pages[page_key]
 
 
-def _research_detail_evidence(research: Any, kind: str) -> dict[str, Any]:
-    """Return one bounded detail document for the research landing page."""
-    pools = research.research_pools()
-    industries = research.research_industries(compact=True)
-    if kind == "stock":
-        items = pools.get("items", []) if isinstance(pools, dict) else []
-        code = str(items[0].get("ts_code") or items[0].get("symbol") or "") if items else ""
-        return research.research_console_stock_evidence(code) if code else {"data_available": False, "items": []}
-    items = industries.get("items", []) if isinstance(industries, dict) else []
-    code = ""
-    for item in items:
-        candidate = str(item.get("industry_code") or item.get("code") or item.get("name") or "")
-        if candidate and candidate.lower() != "nan":
-            code = candidate
-            break
-    return research.research_industry_detail(code) if code else {"data_available": False, "items": []}
+def _research_detail_evidence(
+    research: Any,
+    kind: str,
+    source_reader: Callable[[], Any],
+) -> dict[str, Any]:
+    """Return one optional detail without invalidating the research document."""
+    component = (
+        "researchStockEvidence" if kind == "stock"
+        else "researchIndustryEvidence"
+    )
+    try:
+        source = source_reader()
+        items = source.get("items", []) if isinstance(source, dict) else []
+        if kind == "stock":
+            code = (
+                str(items[0].get("ts_code") or items[0].get("symbol") or "")
+                if items else ""
+            )
+            value = research.research_console_stock_evidence(code) if code else None
+        else:
+            code = ""
+            for item in items:
+                candidate = str(
+                    item.get("industry_code")
+                    or item.get("code")
+                    or item.get("name")
+                    or ""
+                )
+                if candidate and candidate.lower() != "nan":
+                    code = candidate
+                    break
+            value = research.research_industry_detail(code) if code else None
+        if value is not None:
+            return value
+        return {
+            "ok": False,
+            "status": "partial",
+            "data_available": False,
+            "component": component,
+            "items": [],
+            "error": {
+                "code": "research_detail_not_selected",
+                "message": "当前列表没有可用于预载的详情项。",
+            },
+        }
+    except Exception as exc:
+        logger.warning(
+            "Optional research snapshot detail unavailable component=%s error_type=%s",
+            component,
+            type(exc).__name__,
+        )
+        return {
+            "ok": False,
+            "status": "degraded",
+            "data_available": False,
+            "component": component,
+            "items": [],
+            "error": {
+                "code": "research_detail_unavailable",
+                "message": "可选研究详情暂不可读；研究列表与其他快照分区仍然有效。",
+            },
+        }
 
 
 def _serialize(payload: dict[str, Any]) -> str:
@@ -621,13 +735,19 @@ def _record_failed_build(
 def invalidate(page_keys: list[str] | tuple[str, ...] = PAGE_KEYS, *, reason: str = "source_changed") -> None:
     """Durably advance a page generation before invalidating the app cache."""
     del reason  # The durable generation is the cross-node invalidation evidence.
+    valid_page_keys = tuple(page_key for page_key in page_keys if page_key in PAGE_KEYS)
+    # These pages materialize progressive OOS and sealed-holdout diagnostics.
+    # Retire their shared 300-second cache before exposing a newer durable
+    # generation, so the next builder cannot stamp old evidence with a fresh
+    # generated_at.  The generation also prevents an audit already in flight
+    # from restoring its pre-invalidation value after this clear.
+    if _DIAGNOSTIC_PAGE_KEYS.intersection(valid_page_keys):
+        _clear_diagnostic_cache()
     _ensure_table()
     now = _now()
     invalidated: list[str] = []
     with _conn() as conn:
-        for page_key in page_keys:
-            if page_key not in PAGE_KEYS:
-                continue
+        for page_key in valid_page_keys:
             sentinel = _serialize(_warming_payload(page_key, 1))
             conn.execute(
                 """INSERT INTO console_page_snapshots

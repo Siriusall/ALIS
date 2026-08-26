@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from threading import Event, Thread
 
 import pytest
 
@@ -160,6 +161,115 @@ def test_evidence_snapshot_freezes_first_decision_detail_and_verification(monkey
     assert readers["decisionDetail"]()["market_state"]["state"] == "S1"
     assert readers["evidenceVerification"]()["verified"] is True
     assert calls == [("detail", 51), ("verify", 51)]
+
+
+def test_research_snapshot_reuses_selector_lists_for_optional_details(monkeypatch):
+    from app.api.routes import research
+
+    calls: list[tuple[str, object]] = []
+    pools = {"items": [{"ts_code": "600000.SH", "name": "浦发银行"}]}
+    industries = {"items": [{"industry_code": "bank", "industry": "银行"}]}
+    monkeypatch.setattr(
+        research,
+        "research_pools",
+        lambda: calls.append(("pools", None)) or pools,
+    )
+    monkeypatch.setattr(
+        research,
+        "research_industries",
+        lambda *, compact: calls.append(("industries", compact)) or industries,
+    )
+    monkeypatch.setattr(
+        research,
+        "research_console_stock_evidence",
+        lambda code: calls.append(("stock", code)) or {"ts_code": code},
+    )
+    monkeypatch.setattr(
+        research,
+        "research_industry_detail",
+        lambda code: calls.append(("industry", code)) or {"industry_code": code},
+    )
+
+    readers = snapshots._readers("research")
+
+    assert readers["pools"]() is pools
+    assert readers["researchStockEvidence"]()["ts_code"] == "600000.SH"
+    assert readers["industries"]() is industries
+    assert readers["researchIndustryEvidence"]()["industry_code"] == "bank"
+    assert calls == [
+        ("pools", None),
+        ("stock", "600000.SH"),
+        ("industries", True),
+        ("industry", "bank"),
+    ]
+
+
+def test_optional_research_detail_failure_degrades_only_its_section():
+    class Research:
+        @staticmethod
+        def research_console_stock_evidence(_code):
+            raise RuntimeError("detail database timeout")
+
+    value, section = snapshots._section(
+        "research",
+        "researchStockEvidence",
+        lambda: snapshots._research_detail_evidence(
+            Research,
+            "stock",
+            lambda: {"items": [{"ts_code": "600000.SH"}]},
+        ),
+    )
+
+    assert value["status"] == "degraded"
+    assert value["data_available"] is False
+    assert value["error"]["code"] == "research_detail_unavailable"
+    assert "database timeout" not in json.dumps(value)
+    assert section["status"] == "degraded"
+
+
+def test_optional_research_detail_failure_still_commits_partial_snapshot(monkeypatch):
+    monkeypatch.setattr(snapshots, "_readers", lambda _page: {
+        "pools": lambda: {"items": [{"ts_code": "600000.SH"}]},
+        "researchStockEvidence": lambda: {
+            "ok": False,
+            "status": "degraded",
+            "data_available": False,
+            "component": "researchStockEvidence",
+            "items": [],
+            "error": {"code": "research_detail_unavailable"},
+        },
+    })
+    monkeypatch.setattr(
+        snapshots,
+        "_ensure_snapshot_record",
+        lambda _page: {
+            "page_key": "research",
+            "version": "research-lkg",
+            "status": "ready",
+            "invalidated_at": None,
+            "refresh_generation": 4,
+        },
+    )
+    failed = []
+    saved = []
+    monkeypatch.setattr(
+        snapshots,
+        "_record_failed_build",
+        lambda *args: failed.append(args) or True,
+    )
+    monkeypatch.setattr(
+        snapshots,
+        "_save_durable",
+        lambda *args: saved.append(args) or True,
+    )
+
+    payload = snapshots.build("research")
+
+    assert payload["status"] == "degraded"
+    assert payload["sections"]["pools"]["status"] == "ready"
+    assert payload["sections"]["researchStockEvidence"]["status"] == "degraded"
+    assert failed == []
+    assert len(saved) == 1
 
 
 def test_postgres_snapshot_schema_check_never_attempts_runtime_ddl(monkeypatch):
@@ -430,6 +540,26 @@ def test_snapshot_oos_and_sealed_readers_request_compact_audits(monkeypatch, pag
     assert calls == [("oos", False), ("sealed", False)]
 
 
+def test_oos_api_uses_bounded_progressive_audit_and_preserves_status(monkeypatch):
+    from app.data_platform.routes import data_center
+
+    received = []
+    monkeypatch.setattr(
+        data_center,
+        "audit_progressive_oos",
+        lambda *, include_dates: received.append(include_dates) or {
+            "status": "accumulating",
+            "required_sessions": 252,
+        },
+    )
+
+    result = data_center.data_center_oos_hard_data(include_dates=False)
+
+    assert received == [False]
+    assert result["status"] == "accumulating"
+    assert result["required_sessions"] == 252
+
+
 def test_repeated_page_builds_reuse_formal_audit_summaries(monkeypatch):
     from app.data_platform.routes import data_center
 
@@ -453,6 +583,70 @@ def test_repeated_page_builds_reuse_formal_audit_summaries(monkeypatch):
     assert first["oos"]() == second["oos"]()
     assert first["sealed"]() == second["sealed"]()
     assert calls == ["oos", "sealed"]
+
+
+def test_related_page_invalidation_retires_shared_diagnostic_cache(monkeypatch):
+    from app.data_platform.routes import data_center
+
+    calls: list[int] = []
+
+    def fake_oos(*, include_dates: bool):
+        calls.append(len(calls) + 1)
+        return {"include_dates": include_dates, "revision": calls[-1]}
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, _sql, _params=()):
+            return None
+
+    monkeypatch.setattr(data_center, "data_center_oos_hard_data", fake_oos)
+    monkeypatch.setattr(snapshots, "_diagnostic_cache", {})
+    monkeypatch.setattr(snapshots, "_diagnostic_cache_generation", 0)
+    monkeypatch.setattr(snapshots, "_ensure_table", lambda: None)
+    monkeypatch.setattr(snapshots, "_conn", lambda: Connection())
+    monkeypatch.setattr(snapshots, "redis_delete", lambda _key: True)
+
+    assert snapshots._readers("overview")["oos"]()["revision"] == 1
+    assert snapshots._readers("operations")["oos"]()["revision"] == 1
+
+    snapshots.invalidate(["data"])
+
+    assert snapshots._readers("overview")["oos"]()["revision"] == 2
+    assert calls == [1, 2]
+
+
+def test_inflight_diagnostic_cannot_restore_cache_after_invalidation(monkeypatch):
+    started = Event()
+    release = Event()
+    result: list[dict[str, bool]] = []
+
+    def slow_reader():
+        started.set()
+        assert release.wait(timeout=2)
+        return {"old": True}
+
+    monkeypatch.setattr(snapshots, "_diagnostic_cache", {})
+    monkeypatch.setattr(snapshots, "_diagnostic_cache_generation", 0)
+    worker = Thread(
+        target=lambda: result.append(
+            snapshots._cached_diagnostic("progressive_oos", slow_reader)
+        )
+    )
+    worker.start()
+    assert started.wait(timeout=2)
+
+    snapshots._clear_diagnostic_cache()
+    release.set()
+    worker.join(timeout=2)
+
+    assert not worker.is_alive()
+    assert result == [{"old": True}]
+    assert snapshots._diagnostic_cache == {}
 
 
 def test_evidence_snapshot_replaces_fastapi_query_defaults(monkeypatch):

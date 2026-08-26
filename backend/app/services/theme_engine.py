@@ -6,7 +6,7 @@ from math import ceil
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from app.data_platform.db import _conn
+from app.data_platform.db import _conn, _read_conn
 from app.data_platform.services.observation_clock import load_snapshot_versions
 from app.services.market_context import score_theme_narratives
 from app.services.narrative_lifecycle_contract import (
@@ -313,20 +313,15 @@ def _latest_complete_theme_trade_date(c: Any, *, cutoff_date: str) -> str:
     stock_count_row = c.execute("SELECT COUNT(*) cnt FROM dc_stock_master").fetchone()
     stock_count = int(dict(stock_count_row).get("cnt") or 0) if stock_count_row else 0
     minimum_rows = max(1, int(ceil(stock_count * .80))) if stock_count else 1
-    dates = c.execute(
-        """SELECT DISTINCT trade_date FROM dc_stock_daily_snapshot
-           WHERE trade_date<=? ORDER BY trade_date DESC LIMIT 12""",
-        (cutoff_date,),
-    ).fetchall()
-    for date_row in dates:
-        date = str(dict(date_row).get("trade_date") or "")
-        count_row = c.execute(
-            "SELECT COUNT(DISTINCT ts_code) cnt FROM dc_stock_daily_snapshot WHERE trade_date=?",
-            (date,),
-        ).fetchone()
-        if count_row and int(dict(count_row).get("cnt") or 0) >= minimum_rows:
-            return date
-    return ""
+    row = c.execute(
+        """SELECT trade_date FROM dc_stock_daily_snapshot
+           WHERE trade_date<=?
+           GROUP BY trade_date
+           HAVING COUNT(DISTINCT ts_code)>=?
+           ORDER BY trade_date DESC LIMIT 1""",
+        (cutoff_date, minimum_rows),
+    ).fetchone()
+    return str(dict(row).get("trade_date") or "") if row else ""
 
 
 
@@ -678,6 +673,141 @@ def materialize_theme_snapshot_history(*, end_date: str = "", target_sessions: i
     }
 
 
+_THEME_READ_BATCH_SIZE = 100
+_THEME_MAPPING_BATCH_SIZE = 200
+
+
+def _theme_snapshot_candidates(
+    c: Any,
+    *,
+    theme_code: str,
+    cutoff_date: str,
+    visibility_cutoff: str,
+    promotable_only: bool = False,
+):
+    """Yield every matching snapshot in bounded, newest-first statements."""
+
+    clauses = ["theme_code=?"]
+    params: list[Any] = [theme_code]
+    if cutoff_date:
+        clauses.append("as_of_date<=?")
+        params.append(cutoff_date)
+    if promotable_only:
+        clauses.append("promotable=1")
+    if visibility_cutoff:
+        clauses.extend([
+            "available_time<>''", "created_at<>''", "updated_at<>''",
+            "available_time<=?", "created_at<=?", "updated_at<=?",
+        ])
+        params.extend([visibility_cutoff, visibility_cutoff, visibility_cutoff])
+    last_date = ""
+    while True:
+        batch_clauses = list(clauses)
+        batch_params = list(params)
+        if last_date:
+            batch_clauses.append("as_of_date<?")
+            batch_params.append(last_date)
+        batch = c.execute(
+            f"""SELECT * FROM dc_theme_snapshot
+                WHERE {' AND '.join(batch_clauses)}
+                ORDER BY as_of_date DESC,promotable DESC,score DESC
+                LIMIT ?""",
+            tuple(batch_params) + (_THEME_READ_BATCH_SIZE,),
+        ).fetchall()
+        if not batch:
+            return
+        for row in batch:
+            yield dict(row)
+        if len(batch) < _THEME_READ_BATCH_SIZE:
+            return
+        last_date = str(dict(batch[-1]).get("as_of_date") or "")
+        if not last_date:
+            return
+
+
+def _theme_mappings(
+    c: Any,
+    *,
+    as_of_date: str,
+    theme_code: str,
+    visibility_cutoff: str,
+) -> list[dict[str, Any]]:
+    """Load a theme's complete mapping set through bounded keyset pages."""
+
+    rows: list[dict[str, Any]] = []
+    last_exposure: float | None = None
+    last_code = ""
+    while True:
+        keyset = ""
+        params: list[Any] = [as_of_date, theme_code]
+        if last_exposure is not None:
+            keyset = " AND (exposure_score<? OR (exposure_score=? AND ts_code>?))"
+            params.extend([last_exposure, last_exposure, last_code])
+        batch = [
+            dict(item)
+            for item in c.execute(
+                f"""SELECT ts_code,exposure_score,evidence_json,updated_at
+                    FROM dc_theme_company_mapping
+                    WHERE as_of_date=? AND theme_code=?{keyset}
+                    ORDER BY exposure_score DESC,ts_code ASC LIMIT ?""",
+                tuple(params) + (_THEME_MAPPING_BATCH_SIZE,),
+            ).fetchall()
+        ]
+        if not batch:
+            break
+        rows.extend(
+            item
+            for item in batch
+            if _theme_mapping_visible_at(item, visibility_cutoff)
+        )
+        if len(batch) < _THEME_MAPPING_BATCH_SIZE:
+            break
+        last_exposure = float(batch[-1].get("exposure_score") or 0.0)
+        last_code = str(batch[-1].get("ts_code") or "")
+    return rows
+
+
+def _theme_mapping_count(
+    c: Any,
+    *,
+    as_of_date: str,
+    theme_code: str,
+    visibility_cutoff: str,
+) -> int:
+    """Count the complete visible mapping set without loading evidence JSON."""
+
+    count = 0
+    last_code = ""
+    while True:
+        keyset = " AND ts_code>?" if last_code else ""
+        params: tuple[Any, ...] = (
+            (as_of_date, theme_code, last_code, _THEME_MAPPING_BATCH_SIZE)
+            if last_code
+            else (as_of_date, theme_code, _THEME_MAPPING_BATCH_SIZE)
+        )
+        batch = [
+            dict(item)
+            for item in c.execute(
+                f"""SELECT ts_code,updated_at FROM dc_theme_company_mapping
+                    WHERE as_of_date=? AND theme_code=?{keyset}
+                    ORDER BY ts_code ASC LIMIT ?""",
+                params,
+            ).fetchall()
+        ]
+        if not batch:
+            break
+        count += sum(
+            1 for item in batch
+            if _theme_mapping_visible_at(item, visibility_cutoff)
+        )
+        if len(batch) < _THEME_MAPPING_BATCH_SIZE:
+            break
+        last_code = str(batch[-1].get("ts_code") or "")
+        if not last_code:
+            break
+    return count
+
+
 def list_themes(
     *,
     as_of_time: str | None = None,
@@ -701,7 +831,7 @@ def list_themes(
     if include_company_counts is None:
         include_company_counts = bool(compact)
     mapping_cutoff = visibility_cutoff if as_of_time else ""
-    with _conn() as c:
+    with _read_conn() as c:
         clauses = []
         params: list[Any] = []
         if cutoff:
@@ -721,39 +851,57 @@ def list_themes(
                 "available_time<=?", "created_at<=?", "updated_at<=?",
             ])
             params.extend([visibility_cutoff, visibility_cutoff, visibility_cutoff])
-        where = "WHERE " + " AND ".join(clauses) if clauses else ""
-        if bool(getattr(c, "_is_postgres", False)):
-            candidate_sql = f"""SELECT DISTINCT ON (theme_code) *
-                                  FROM dc_theme_snapshot s {where}
-                                 ORDER BY theme_code,as_of_date DESC,
-                                          promotable DESC,score DESC"""
-        else:
-            candidate_sql = f"""WITH ranked AS (
-                                  SELECT s.*,ROW_NUMBER() OVER (
-                                      PARTITION BY theme_code
-                                      ORDER BY as_of_date DESC,promotable DESC,score DESC
-                                  ) AS row_rank
-                                    FROM dc_theme_snapshot s {where}
-                                ) SELECT * FROM ranked WHERE row_rank=1"""
-        candidates = [dict(row) for row in c.execute(candidate_sql, tuple(params)).fetchall()]
+        # Enumerate lightweight keys first, then search each theme's history in
+        # bounded date pages.  Every page has an exact theme/date predicate and
+        # the loop is exhaustive, so an invalid recent PIT envelope cannot hide
+        # an older valid row and no fixed transport cap changes the result.
+        theme_codes: list[str] = []
+        last_code = ""
+        while True:
+            key_clauses = list(clauses)
+            key_params = list(params)
+            if last_code:
+                key_clauses.append("theme_code>?")
+                key_params.append(last_code)
+            where = "WHERE " + " AND ".join(key_clauses) if key_clauses else ""
+            batch = c.execute(
+                f"""SELECT DISTINCT theme_code FROM dc_theme_snapshot {where}
+                    ORDER BY theme_code LIMIT ?""",
+                tuple(key_params) + (_THEME_READ_BATCH_SIZE,),
+            ).fetchall()
+            codes = [str(dict(row).get("theme_code") or "") for row in batch]
+            codes = [code for code in codes if code]
+            if not codes:
+                break
+            theme_codes.extend(codes)
+            if len(codes) < _THEME_READ_BATCH_SIZE:
+                break
+            last_code = codes[-1]
         visible_by_theme: dict[str, dict[str, Any]] = {}
-        for row in candidates:
-            try:
-                payload = json.loads(row.get("payload_json") or "{}")
-            except (TypeError, json.JSONDecodeError):
-                payload = {}
-            if not _theme_snapshot_visible_at(
-                payload,
-                visibility_cutoff,
-                row=row,
-                allow_legacy_current=not bool(as_of_time),
+        candidate_rows = 0
+        for theme_code in theme_codes:
+            for row in _theme_snapshot_candidates(
+                c,
+                theme_code=theme_code,
+                cutoff_date=cutoff,
+                visibility_cutoff=visibility_cutoff,
+                promotable_only=promotable_only,
             ):
-                continue
-            theme_code = str(row.get("theme_code") or "")
-            if not theme_code or theme_code in visible_by_theme:
-                continue
-            row["_decoded_payload"] = payload
-            visible_by_theme[theme_code] = row
+                candidate_rows += 1
+                try:
+                    payload = json.loads(row.get("payload_json") or "{}")
+                except (TypeError, json.JSONDecodeError):
+                    payload = {}
+                if not _theme_snapshot_visible_at(
+                    payload,
+                    visibility_cutoff,
+                    row=row,
+                    allow_legacy_current=not bool(as_of_time),
+                ):
+                    continue
+                row["_decoded_payload"] = payload
+                visible_by_theme[theme_code] = row
+                break
         rows = sorted(
             visible_by_theme.values(),
             key=lambda item: (
@@ -770,22 +918,22 @@ def list_themes(
                 "as_of_time": as_of_time,
                 "items": [],
                 "count": 0,
-                "candidate_rows": len(candidates),
+                "candidate_rows": candidate_rows,
                 "point_in_time_contract": _THEME_PIT_CONTRACT,
             }
         company_counts: dict[tuple[str, str], int] = {}
         if rows and include_company_counts:
-            count_where = " OR ".join("(as_of_date=? AND theme_code=?)" for _ in rows)
-            count_params = tuple(value for row in rows for value in (row.get("as_of_date"), row.get("theme_code")))
-            mapping_rows = [dict(item) for item in c.execute(
-                f"SELECT as_of_date,theme_code,updated_at FROM dc_theme_company_mapping WHERE {count_where}",
-                count_params,
-            ).fetchall()]
-            for mapping in mapping_rows:
-                if not _theme_mapping_visible_at(mapping, mapping_cutoff):
-                    continue
-                key = (str(mapping.get("as_of_date") or ""), str(mapping.get("theme_code") or ""))
-                company_counts[key] = company_counts.get(key, 0) + 1
+            for row in rows:
+                key = (
+                    str(row.get("as_of_date") or ""),
+                    str(row.get("theme_code") or ""),
+                )
+                company_counts[key] = _theme_mapping_count(
+                    c,
+                    as_of_date=key[0],
+                    theme_code=key[1],
+                    visibility_cutoff=mapping_cutoff,
+                )
         for row in rows:
             row["payload"] = row.pop("_decoded_payload", None) or json.loads(row.pop("payload_json") or "{}")
             if not isinstance(row["payload"].get("point_in_time"), dict):
@@ -799,12 +947,12 @@ def list_themes(
                 row["payload"] = {"knowledge_graph": payload.get("knowledge_graph") or {}}
             mappings = []
             if include_companies:
-                mapping_rows = [dict(item) for item in c.execute(
-                    """SELECT ts_code,exposure_score,evidence_json,updated_at FROM dc_theme_company_mapping
-                       WHERE as_of_date=? AND theme_code=? ORDER BY exposure_score DESC LIMIT 50""",
-                    (row["as_of_date"], row["theme_code"]),
-                ).fetchall()]
-                mappings = [item for item in mapping_rows if _theme_mapping_visible_at(item, mapping_cutoff)]
+                mappings = _theme_mappings(
+                    c,
+                    as_of_date=str(row["as_of_date"]),
+                    theme_code=str(row["theme_code"]),
+                    visibility_cutoff=mapping_cutoff,
+                )
                 for mapping in mappings:
                     mapping.pop("updated_at", None)
                     mapping["evidence"] = json.loads(mapping.pop("evidence_json") or "{}")
@@ -818,20 +966,14 @@ def get_theme(theme_code: str, *, as_of_date: str = "") -> dict[str, Any] | None
     code = str(theme_code or "").strip()
     cutoff = str(as_of_date or "")[:10].replace("-", "")
     visibility_cutoff = _theme_query_cutoff(as_of_date, default_now=not bool(as_of_date))
-    with _conn() as c:
-        if cutoff:
-            candidates = c.execute(
-                "SELECT * FROM dc_theme_snapshot WHERE theme_code=? AND as_of_date<=? ORDER BY as_of_date DESC LIMIT 1000",
-                (code, cutoff),
-            ).fetchall()
-        else:
-            candidates = c.execute(
-                "SELECT * FROM dc_theme_snapshot WHERE theme_code=? ORDER BY as_of_date DESC LIMIT 1000",
-                (code,),
-            ).fetchall()
+    with _read_conn() as c:
         row = None
-        for candidate in candidates:
-            candidate_dict = dict(candidate)
+        for candidate_dict in _theme_snapshot_candidates(
+            c,
+            theme_code=code,
+            cutoff_date=cutoff,
+            visibility_cutoff=visibility_cutoff,
+        ):
             try:
                 payload = json.loads(candidate_dict.get("payload_json") or "{}")
             except (TypeError, json.JSONDecodeError):
@@ -846,12 +988,13 @@ def get_theme(theme_code: str, *, as_of_date: str = "") -> dict[str, Any] | None
         item["payload"] = item.pop("_decoded_payload", None) or json.loads(item.pop("payload_json") or "{}")
         if not isinstance(item["payload"].get("point_in_time"), dict):
             item["evidence_status"] = "legacy_unverified_pending_current_rematerialization"
-        mapping_rows = [dict(mapping) for mapping in c.execute(
-            "SELECT ts_code,exposure_score,evidence_json,updated_at FROM dc_theme_company_mapping WHERE as_of_date=? AND theme_code=? ORDER BY exposure_score DESC LIMIT 200",
-            (item.get("as_of_date"), code),
-        ).fetchall()]
         mapping_cutoff = visibility_cutoff if as_of_date else ""
-        mappings = [mapping for mapping in mapping_rows if _theme_mapping_visible_at(mapping, mapping_cutoff)]
+        mappings = _theme_mappings(
+            c,
+            as_of_date=str(item.get("as_of_date") or ""),
+            theme_code=code,
+            visibility_cutoff=mapping_cutoff,
+        )
     for mapping in mappings:
         mapping.pop("updated_at", None)
         mapping["evidence"] = json.loads(mapping.pop("evidence_json") or "{}")

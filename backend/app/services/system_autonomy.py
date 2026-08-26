@@ -289,12 +289,25 @@ def _owner_summary(steps: list[dict[str, Any]]) -> dict[str, Any]:
     llm_data_operations = (((by_name.get("data_operations") or by_name.get("llm_data_operations") or {}).get("result")) or {})
     incident_supervisor = ((by_name.get("llm_incident_supervisor") or {}).get("result") or {})
     healing = ((by_name.get("autonomous_self_healing") or {}).get("result") or {})
+    from app.services.autonomous_healing import classify_step_health
+
+    def normal_historical_wait(step: dict[str, Any]) -> bool:
+        return classify_step_health(step).get("status") == "waiting_condition"
+
+    def effective_health(step: dict[str, Any]) -> dict[str, str]:
+        if str(step.get("name") or "") in {"hard_data_gate", "sealed_holdout_data_gate"}:
+            # Recompute these two contracts from raw evidence. Persisted or
+            # caller-supplied health must not hide a blocked backend failure.
+            return classify_step_health(step)
+        health = step.get("health") if isinstance(step.get("health"), dict) else {}
+        return health or classify_step_health(step)
+
     historical_gate_waits = []
     for gate_name in ("hard_data_gate", "sealed_holdout_data_gate"):
         gate_step = by_name.get(gate_name) or {}
         gate_result = gate_step.get("result") if isinstance(gate_step.get("result"), dict) else {}
         gate_status = str(gate_result.get("status") or "")
-        if gate_status and gate_status != "ready":
+        if gate_status and gate_status != "ready" and normal_historical_wait(gate_step):
             historical_gate_waits.append({
                 "module": gate_name,
                 "status": gate_status,
@@ -325,16 +338,18 @@ def _owner_summary(steps: list[dict[str, Any]]) -> dict[str, Any]:
             "mode": "fail_closed",
             "reason": f"live_champion_gate_unavailable:{champion_gate_error}",
         }
-    anomalies = [
-        {
-            "module": str(step["name"]),
-            "message": str(step.get("error") or ((step.get("health") or {}).get("reason")) or "模块返回未通过"),
-        }
-        for step in steps
-        if str(step.get("name") or "") not in {"autonomous_self_healing", "llm_incident_supervisor"}
-        if str(step.get("name") or "") not in {"hard_data_gate", "sealed_holdout_data_gate"}
-        if str((step.get("health") or {}).get("status") or ("healthy" if step.get("ok") else "failed")) in {"failed", "degraded"}
-    ]
+    anomalies = []
+    for step in steps:
+        name = str(step.get("name") or "")
+        if name in {"autonomous_self_healing", "llm_incident_supervisor"}:
+            continue
+        health = effective_health(step)
+        if health.get("status") not in {"failed", "degraded"}:
+            continue
+        anomalies.append({
+            "module": name,
+            "message": str(step.get("error") or health.get("reason") or "模块返回未通过"),
+        })
     # The supervisor and self-healing layers are not allowed to erase their
     # own timeout/failure.  Their *cases* are handled separately, but a
     # failed wrapper remains a deterministic cycle anomaly.

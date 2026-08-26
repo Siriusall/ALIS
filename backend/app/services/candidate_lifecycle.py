@@ -155,7 +155,7 @@ def get_candidate_lifecycle(model_version_id: int) -> dict[str, Any] | None:
             return None
         result = dict(row)
         events = conn.execute(
-            "SELECT * FROM candidate_lifecycle_events WHERE model_version_id=? ORDER BY id LIMIT 5000",
+            "SELECT * FROM candidate_lifecycle_events WHERE model_version_id=? ORDER BY id",
             (int(model_version_id),),
         ).fetchall()
     try:
@@ -230,7 +230,7 @@ def reconcile_existing_candidates(*, limit: int = 1000) -> dict[str, Any]:
                  LEFT JOIN candidate_lifecycle_records c ON c.model_version_id=v.id
                 WHERE v.is_active=0 AND c.model_version_id IS NULL
                   AND v.status IN ('candidate','shadow_observation','promoted_cooling')
-                ORDER BY v.id LIMIT ?""",
+                ORDER BY v.id DESC LIMIT ?""",
             (max(1, min(int(limit), 5000)),),
         ).fetchall()
         registered: list[int] = []
@@ -258,8 +258,7 @@ def reconcile_existing_candidates(*, limit: int = 1000) -> dict[str, Any]:
                  FROM candidate_lifecycle_records c
                  JOIN model_versions v ON v.id=c.model_version_id
                 WHERE c.runtime_status='observing'
-                ORDER BY c.model_version_id LIMIT ?""",
-            (max(1, min(int(limit), 5000)),),
+                ORDER BY c.model_version_id""",
         ).fetchall()
         missing_accounts = conn.execute(
             """SELECT c.model_version_id,v.model_key,v.version
@@ -268,8 +267,7 @@ def reconcile_existing_candidates(*, limit: int = 1000) -> dict[str, Any]:
                  LEFT JOIN candidate_simulation_accounts a
                    ON a.model_version_id=c.model_version_id
                 WHERE c.runtime_status='observing' AND a.id IS NULL
-                ORDER BY c.model_version_id LIMIT ?""",
-            (max(1, min(int(limit), 5000)),),
+                ORDER BY c.model_version_id""",
         ).fetchall()
         from app.services.candidate_simulation_ledger import initialize_candidate_account
 

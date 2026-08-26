@@ -1,4 +1,6 @@
 from contextlib import contextmanager
+from contextvars import ContextVar
+from copy import deepcopy
 from types import SimpleNamespace
 
 import pytest
@@ -130,6 +132,164 @@ def test_plan_terminal_write_failure_rolls_back_ledger_scope(monkeypatch):
     ]
 
 
+def test_formal_ledger_mutation_requires_finalizer_before_transaction(monkeypatch):
+    entered = []
+    monkeypatch.setattr(
+        store,
+        "atomic_business_transaction",
+        lambda: (_ for _ in ()).throw(AssertionError("transaction must not open")),
+    )
+    monkeypatch.setattr(
+        quant_run_engine,
+        "sell_position",
+        lambda *_args, **_kwargs: entered.append("sell"),
+    )
+    monkeypatch.setattr(
+        quant_run_engine,
+        "create_and_apply_buy_execution",
+        lambda **_kwargs: entered.append("buy"),
+    )
+
+    with pytest.raises(quant_run_engine.ReplayRiskGateError) as captured:
+        quant_run_engine._commit_prepared_execution(
+            strategy_id=3,
+            execute_date="20260811",
+            executed_at="2026-08-11T09:30:00",
+            top_n=10,
+            total_buy_cost=1000.0,
+            orders_payload=[{"symbol": "600000", "quantity": 100, "price": 10.0}],
+            sold_ops_payload=[],
+            positions_before_execution={},
+            pretrade_positions=[],
+            pretrade_cash_balance=10_000.0,
+            frozen_exact_quantity_orders=True,
+            release_id=None,
+            finalize_execution=None,
+        )
+
+    assert captured.value.code == "finalize_execution_required"
+    assert entered == []
+
+
+def test_read_only_no_fill_path_does_not_require_finalizer(monkeypatch):
+    monkeypatch.setattr(
+        store,
+        "atomic_business_transaction",
+        lambda: (_ for _ in ()).throw(AssertionError("read-only path must not open transaction")),
+    )
+
+    assert quant_run_engine._commit_prepared_execution(
+        strategy_id=3,
+        execute_date="20260811",
+        executed_at="2026-08-11T09:30:00",
+        top_n=10,
+        total_buy_cost=0.0,
+        orders_payload=[],
+        sold_ops_payload=[],
+        positions_before_execution={},
+        pretrade_positions=[],
+        pretrade_cash_balance=10_000.0,
+        frozen_exact_quantity_orders=True,
+        release_id=None,
+        finalize_execution=None,
+    ) is None
+
+
+def test_finalize_failure_rolls_back_sell_buy_link_and_terminal_state(monkeypatch):
+    initial_state = {
+        "cash": 10_000.0,
+        "positions": {"000001": 500},
+        "operations": [],
+        "executions": [],
+        "plan_status": "claimed",
+    }
+    state = deepcopy(initial_state)
+    active_connection = ContextVar("test_atomic_connection", default=None)
+    observed_connections = []
+
+    @contextmanager
+    def atomic_scope():
+        snapshot = deepcopy(state)
+        connection = object()
+        token = active_connection.set(connection)
+        try:
+            yield connection
+        except BaseException:
+            state.clear()
+            state.update(snapshot)
+            raise
+        finally:
+            active_connection.reset(token)
+
+    def current_connection():
+        connection = active_connection.get()
+        assert connection is not None
+        observed_connections.append(connection)
+
+    def sell(*_args, **kwargs):
+        current_connection()
+        state["positions"]["000001"] -= int(kwargs["quantity"])
+        state["cash"] += int(kwargs["quantity"]) * float(kwargs["price"])
+        state["operations"].append({"side": "SELL", "execution_id": None})
+
+    def buy(**kwargs):
+        current_connection()
+        order = kwargs["orders"][0]
+        state["cash"] -= float(kwargs["budget"])
+        state["positions"][order["symbol"]] = int(order["quantity"])
+        state["operations"].append({"side": "BUY", "execution_id": 91})
+        state["executions"].append(91)
+        return 91
+
+    def link(execution_id, _orders):
+        current_connection()
+        state["operations"][0]["execution_id"] = execution_id
+        return 1
+
+    def finalize(execution_id):
+        current_connection()
+        assert execution_id == 91
+        state["plan_status"] = "executed"
+        raise RuntimeError("terminal write failed")
+
+    monkeypatch.setattr(store, "atomic_business_transaction", atomic_scope)
+    monkeypatch.setattr(quant_run_engine, "get_positions", lambda: [{
+        "id": 1, "symbol": "000001", "quantity": 500, "price": 8.0,
+        "bought_at": "2026-08-01",
+    }])
+    monkeypatch.setattr(quant_run_engine, "get_account_balance", lambda: 10_000.0)
+    monkeypatch.setattr(quant_run_engine, "sell_position", sell)
+    monkeypatch.setattr(quant_run_engine, "create_and_apply_buy_execution", buy)
+    monkeypatch.setattr(quant_run_engine, "link_recorded_operations_to_execution", link)
+
+    with pytest.raises(RuntimeError, match="terminal write failed"):
+        quant_run_engine._commit_prepared_execution(
+            strategy_id=3,
+            execute_date="20260811",
+            executed_at="2026-08-11T09:30:00",
+            top_n=10,
+            total_buy_cost=1000.0,
+            orders_payload=[{"symbol": "600000", "quantity": 100, "price": 10.0}],
+            sold_ops_payload=[{
+                "symbol": "000001", "quantity": 100, "price": 9.0,
+                "at": "2026-08-11T09:30:00",
+            }],
+            positions_before_execution={"000001": {"id": 1}},
+            pretrade_positions=[{
+                "id": 1, "symbol": "000001", "quantity": 500, "price": 8.0,
+                "bought_at": "2026-08-01",
+            }],
+            pretrade_cash_balance=10_000.0,
+            frozen_exact_quantity_orders=True,
+            release_id=7,
+            finalize_execution=finalize,
+        )
+
+    assert state == initial_state
+    assert len(observed_connections) == 4
+    assert len({id(connection) for connection in observed_connections}) == 1
+
+
 def test_frozen_sell_preparation_does_not_mutate_account(monkeypatch):
     mutations = []
     blocked = []
@@ -210,7 +370,8 @@ def test_frozen_order_audit_uses_autocommit_read_scope(monkeypatch):
     assert result["ok"] is False
 
 
-def test_account_snapshot_fingerprint_detects_non_sell_position_change():
+@pytest.mark.parametrize("mutation", ["cash", "position_added", "position_removed", "quantity"])
+def test_account_snapshot_fingerprint_covers_all_mutation_dimensions(mutation):
     prepared = [{
         "id": 1,
         "symbol": "000001",
@@ -225,12 +386,96 @@ def test_account_snapshot_fingerprint_detects_non_sell_position_change():
         "bought_at": "2026-08-19",
     }]
     current = [dict(item) for item in prepared]
-    current[1]["quantity"] = 400
+    prepared_cash = current_cash = 10_000.0
+    if mutation == "cash":
+        current_cash += 1.0
+    elif mutation == "position_added":
+        current.append({
+            "id": 3, "symbol": "000002", "quantity": 100,
+            "price": 12.0, "bought_at": "2026-08-21",
+        })
+    elif mutation == "position_removed":
+        current.pop()
+    else:
+        current[1]["quantity"] = 400
 
     assert (
-        quant_run_engine._account_position_fingerprint(current)
-        != quant_run_engine._account_position_fingerprint(prepared)
+        quant_run_engine._account_snapshot_fingerprint(current, current_cash)
+        != quant_run_engine._account_snapshot_fingerprint(prepared, prepared_cash)
     )
+
+
+def test_autonomous_frozen_execution_skips_mutable_preflight(monkeypatch):
+    monkeypatch.setattr(
+        quant_task_runner,
+        "_preflight_check_step",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("preflight must be skipped")),
+    )
+
+    decision = quant_task_runner._step_preflight_decision(
+        frozen_autonomous_execution=True,
+        signal_date="20260810",
+        execute_date="20260811",
+        min_account_balance=0.0,
+        enforce_session_gate=False,
+    )
+
+    assert decision.should_pause is False
+
+
+def test_research_execution_keeps_full_preflight(monkeypatch):
+    calls = []
+    expected = quant_task_runner.pause_decision(
+        code="research_preflight",
+        message="research gate",
+        recovery_condition="retry",
+        exit_condition="stop",
+    )
+    monkeypatch.setattr(
+        quant_task_runner,
+        "_preflight_check_step",
+        lambda **kwargs: calls.append(kwargs) or expected,
+    )
+
+    decision = quant_task_runner._step_preflight_decision(
+        frozen_autonomous_execution=False,
+        signal_date="20260810",
+        execute_date="20260811",
+        min_account_balance=100.0,
+        enforce_session_gate=True,
+    )
+
+    assert decision is expected
+    assert calls == [{
+        "signal_date": "20260810",
+        "execute_date": "20260811",
+        "min_account_balance": 100.0,
+        "enforce_session_gate": True,
+        "require_min_account_balance": True,
+    }]
+
+
+def test_account_snapshot_change_releases_claim_for_reprepare(monkeypatch):
+    released = []
+    error = quant_task_runner.ReplayRiskGateError(
+        "account changed",
+        code="execution_account_snapshot_changed",
+    )
+    monkeypatch.setattr(
+        profit_loop,
+        "release_daily_rebalance_execution_claim",
+        lambda signal_date, **kwargs: released.append((signal_date, kwargs)),
+    )
+
+    assert error.code in quant_task_runner._RETRYABLE_EXECUTION_CODES
+    assert quant_task_runner._release_retryable_execution_claim(
+        ("20260810", "claim-token"),
+        reason=error,
+    ) is True
+    assert released == [("20260810", {
+        "claim_token": "claim-token",
+        "reason": error,
+    })]
 
 
 def test_not_due_formal_plan_is_not_quarantined(monkeypatch):

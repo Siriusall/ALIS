@@ -15,6 +15,15 @@ def _now() -> str:
     return datetime.now(_BUSINESS_TZ).isoformat(timespec="seconds")
 
 
+def _business_timestamp(value: Any) -> str:
+    parsed = datetime.fromisoformat(str(value))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=_BUSINESS_TZ)
+    else:
+        parsed = parsed.astimezone(_BUSINESS_TZ)
+    return parsed.isoformat(timespec="seconds")
+
+
 def _loads(value: Any, default: Any) -> Any:
     try:
         return json.loads(value) if isinstance(value, str) else value
@@ -24,7 +33,10 @@ def _loads(value: Any, default: Any) -> Any:
 
 def create_thesis(payload: dict[str, Any]) -> dict[str, Any]:
     now = _now()
-    next_review_at = payload.get("next_review_at") or (datetime.now(_BUSINESS_TZ) + timedelta(days=30)).isoformat(timespec="seconds")
+    next_review_at = _business_timestamp(
+        payload.get("next_review_at")
+        or datetime.now(_BUSINESS_TZ) + timedelta(days=30)
+    )
     with _conn() as c:
         row = c.execute(
             """INSERT INTO investment_theses(ts_code,title,thesis_type,core_thesis,status,confidence,next_review_at,created_at,updated_at)
@@ -257,7 +269,9 @@ def review_due_theses(*, limit: int = 100, review_interval_days: int = 30) -> di
         ).fetchall()
     reviewed: list[dict[str, Any]] = []
     failed: list[dict[str, Any]] = []
-    next_review_at = (datetime.now() + timedelta(days=max(1, int(review_interval_days)))).isoformat(timespec="seconds")
+    next_review_at = (
+        datetime.now(_BUSINESS_TZ) + timedelta(days=max(1, int(review_interval_days)))
+    ).isoformat(timespec="seconds")
     for row in rows:
         thesis_id = int(dict(row)["id"])
         try:
@@ -339,7 +353,7 @@ def generate_thesis_for_stock(
         "title": f"{profile.get('name') or code} · {classification}",
         "thesis_type": "system_research_v1",
         "core_thesis": f"系统基于{dimension_summary}形成候选逻辑；只有必要条件持续成立且组合风险允许时才可建仓。",
-        "next_review_at": datetime.now().isoformat(timespec="seconds"),
+        "next_review_at": _now(),
         "hypotheses": hypotheses,
     })
     reviewed = (

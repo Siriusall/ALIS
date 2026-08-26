@@ -16,39 +16,50 @@ _RETRYABLE_DATA_CATEGORIES = {
     "execution_slice_check_failed", "provider_bulk_contract_failed",
     "waiting_stk_limit_gap_repair", "bulk_slice_contract_failed",
 }
+_HISTORICAL_DATA_GATES = {"hard_data_gate", "sealed_holdout_data_gate"}
+_NORMAL_HISTORICAL_WAIT_STATUSES = {
+    "accumulating",
+    "retired",
+    "retired_legacy_oos_contract",
+}
+
+
+def _failure_category(step: dict[str, Any], result: dict[str, Any]) -> str:
+    return str(
+        result.get("failure_category")
+        or step.get("failure_category")
+        or result.get("error_category")
+        or ""
+    ).strip().lower()
+
+
+def _backend_unavailable(result: dict[str, Any], status: str) -> bool:
+    if status in {"backend_unavailable", "unavailable"}:
+        return True
+    for key in ("backend_available", "audit_backend_available", "strict_evidence_backend_available"):
+        if key in result and result.get(key) is False:
+            return True
+    return result.get("audit_completed") is False
 
 
 def classify_step_health(step: dict[str, Any]) -> dict[str, str]:
     """Normalise heterogeneous service results into one health contract."""
     result = step.get("result") if isinstance(step.get("result"), dict) else {}
     status = str(result.get("status") or "").lower()
-    # Historical OOS/sealed PIT evidence is a durable research wait, not a
-    # current-cycle code failure.  Audit functions correctly return
-    # ``ok=false`` while the evidence is unavailable, so classify this before
-    # the generic step-error branch below.  Otherwise the same condition is
-    # misreported as an internal outage and its repair loop keeps firing.
-    if (
-        str(step.get("name") or "") in {"hard_data_gate", "sealed_holdout_data_gate"}
-        and status == "blocked"
-        and bool(result.get("non_repairable_dates"))
-        and not bool(result.get("repair_dates"))
-    ):
-        return {"status": "waiting_condition", "reason": "historical_point_in_time_unavailable"}
-    if (
-        str(step.get("name") or "") == "hard_data_gate"
-        and str((result.get("legacy_reference") or {}).get("status") or "") in {
-            "legacy_economic_time_reference", "retired_unrecoverable",
-        }
-    ):
-        return {"status": "waiting_condition", "reason": "legacy_oos_reference_accumulating_new_pit"}
+    failure_category = _failure_category(step, result)
+    if str(step.get("name") or "") in _HISTORICAL_DATA_GATES:
+        # A historical gate is a normal wait only when its producer says so
+        # explicitly.  Failure evidence always wins over dates/legacy hints.
+        if failure_category:
+            return {"status": "failed", "reason": failure_category}
+        if step.get("error") or step.get("ok") is False or result.get("ok") is False:
+            return {"status": "failed", "reason": str(step.get("error") or "module_returned_not_ok")}
+        if _backend_unavailable(result, status):
+            return {"status": "failed", "reason": "historical_data_backend_unavailable"}
+        if status in _NORMAL_HISTORICAL_WAIT_STATUSES:
+            return {"status": "waiting_condition", "reason": status}
     if step.get("error") or not bool(step.get("ok", True)):
         return {"status": "failed", "reason": str(step.get("error") or "module_returned_not_ok")}
-    failure_category = str(
-        result.get("failure_category")
-        or step.get("failure_category")
-        or result.get("error_category")
-        or ""
-    ).strip().lower()
     if failure_category in _RETRYABLE_DATA_CATEGORIES:
         # A producer may have persisted a partial/completed result while the
         # upstream slice is still absent.  Keep the autonomous cycle blocked

@@ -17,6 +17,15 @@ from app.data_platform.db import _conn as data_conn
 from app.db.store import _conn as business_conn
 
 
+def _database_date(value: str) -> str:
+    """Normalize a supported date boundary to the database YYYYMMDD key."""
+    text = str(value or "").strip()
+    compact = text.replace("-", "")[:8]
+    if len(compact) != 8 or not compact.isdigit():
+        raise ValueError(f"invalid trade date: {value}")
+    return compact
+
+
 def load_market_state_history(
     *, start_date: str | None = None, end_date: str | None = None,
 ) -> dict[str, dict[str, Any]]:
@@ -27,10 +36,10 @@ def load_market_state_history(
             params: list[str] = []
             if start_date:
                 clauses.append("trade_date >= ?")
-                params.append(str(start_date))
+                params.append(_database_date(start_date))
             if end_date:
                 clauses.append("trade_date <= ?")
-                params.append(str(end_date))
+                params.append(_database_date(end_date))
             where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
             rows = conn.execute(
                 f"""SELECT trade_date,market_state,state_confidence,model_version
@@ -353,19 +362,23 @@ def materialize_formal_performance_reports() -> dict[str, Any]:
     return {"ok": True, "updated": updated, "total": len(rows), "schema_version": "formal_performance_report_v1"}
 
 
-def list_performance_reports(*, period_type: str | None = None, limit: int = 12) -> dict[str, Any]:
+def list_performance_reports(*, period_type: str | None = None, limit: int | None = 12) -> dict[str, Any]:
     """List performance reports with validation."""
     columns = "id,task_id,period_type,scope_key,period,payload_json,created_at"
     with business_conn() as c:
+        suffix = " LIMIT ?" if limit is not None else ""
+        bounded_params: tuple[Any, ...] = (
+            (max(1, int(limit)),) if limit is not None else ()
+        )
         if period_type:
             rows = [dict(row) for row in c.execute(
-                f"SELECT {columns} FROM quant_performance_reports WHERE period_type=? ORDER BY period DESC,id DESC LIMIT ?",
-                (period_type, limit)
+                f"SELECT {columns} FROM quant_performance_reports WHERE period_type=? ORDER BY period DESC,id DESC{suffix}",
+                (period_type, *bounded_params)
             ).fetchall()]
         else:
             rows = [dict(row) for row in c.execute(
-                f"SELECT {columns} FROM quant_performance_reports ORDER BY period DESC,id DESC LIMIT ?",
-                (limit,)
+                f"SELECT {columns} FROM quant_performance_reports ORDER BY period DESC,id DESC{suffix}",
+                bounded_params
             ).fetchall()]
 
     items = []
@@ -395,8 +408,7 @@ def validate_performance_reports() -> dict[str, Any]:
         rows = [dict(row) for row in c.execute(
             """SELECT id,task_id,period_type,scope_key,period,payload_json,created_at
                FROM quant_performance_reports
-               ORDER BY period_type,period,id
-               LIMIT 5000"""
+               ORDER BY period_type,period,id"""
         ).fetchall()]
 
     by_type: dict[str, list[dict]] = {}
@@ -461,7 +473,10 @@ def build_multi_period_validation() -> dict[str, Any]:
     from app.services.production_strategy import resolve_production_strategy_champion
 
     champion = resolve_production_strategy_champion()
-    reports = list_performance_reports(limit=100)
+    # This is an acceptance calculation, not a dashboard preview.  Reading a
+    # global top-N can omit a whole period type or hide an older malformed
+    # report, so validate the complete durable set.
+    reports = list_performance_reports(limit=None)
     items = reports.get("items", [])
 
     if not items:

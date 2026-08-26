@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from contextlib import nullcontext
 from datetime import datetime, timezone
 import math
 import os
@@ -423,6 +422,107 @@ def _account_position_fingerprint(positions: List[Dict[str, Any]]) -> tuple[tupl
         )
         for position in positions
     ))
+
+
+def _account_snapshot_fingerprint(
+    positions: List[Dict[str, Any]],
+    cash_balance: float,
+) -> tuple[float, tuple[tuple[Any, ...], ...]]:
+    """Fingerprint every account field that can invalidate prepared orders."""
+    return round(float(cash_balance or 0), 2), _account_position_fingerprint(positions)
+
+
+def _commit_prepared_execution(
+    *,
+    strategy_id: int,
+    execute_date: str,
+    executed_at: str,
+    top_n: int,
+    total_buy_cost: float,
+    orders_payload: List[Dict[str, Any]],
+    sold_ops_payload: List[Dict[str, Any]],
+    positions_before_execution: Dict[str, Dict[str, Any]],
+    pretrade_positions: List[Dict[str, Any]],
+    pretrade_cash_balance: float,
+    frozen_exact_quantity_orders: bool,
+    release_id: int | None,
+    finalize_execution: Optional[Callable[[int | None], None]],
+) -> int | None:
+    """Commit prepared ledger writes and the formal-plan terminal transition."""
+    has_ledger_mutations = bool(orders_payload or sold_ops_payload)
+    if frozen_exact_quantity_orders and has_ledger_mutations and finalize_execution is None:
+        raise ReplayRiskGateError(
+            "正式冻结计划执行账本写入时必须提供同事务终态回调",
+            code="finalize_execution_required",
+        )
+    if not has_ledger_mutations and finalize_execution is None:
+        return None
+
+    from app.db.store import atomic_business_transaction
+
+    execution_id: int | None = None
+    with atomic_business_transaction():
+        if frozen_exact_quantity_orders:
+            current_positions = get_positions()
+            current_cash = float(get_account_balance())
+            if _account_snapshot_fingerprint(
+                current_positions,
+                current_cash,
+            ) != _account_snapshot_fingerprint(
+                pretrade_positions,
+                pretrade_cash_balance,
+            ):
+                raise ReplayRiskGateError(
+                    "冻结计划准备期间账户余额或持仓发生变化，已拒绝基于过期快照成交",
+                    code="execution_account_snapshot_changed",
+                )
+            for order in sold_ops_payload:
+                symbol = str(order.get("symbol") or "").strip()
+                position = positions_before_execution.get(symbol)
+                if not position:
+                    raise ReplayRiskGateError(
+                        f"冻结卖单对应持仓已变化：{symbol}",
+                        code="execution_account_snapshot_changed",
+                    )
+                sell_position(
+                    int(position["id"]),
+                    quantity=int(order.get("quantity") or 0),
+                    price=float(order.get("price") or 0),
+                    trade_date=execute_date,
+                    record_operation=True,
+                    operation_at=executed_at,
+                    operation_remark=str(order.get("remark") or "量化任务卖出（关联执行）"),
+                    fee_breakdown={
+                        key: order.get(key)
+                        for key in (
+                            "commission", "transfer_fee", "stamp_tax",
+                            "slippage_bps", "fee_schedule_version",
+                        )
+                    },
+                )
+        if orders_payload:
+            execution_id = create_and_apply_buy_execution(
+                strategy_id=int(strategy_id),
+                executed_at=executed_at,
+                budget=total_buy_cost,
+                top_n=int(top_n),
+                orders=orders_payload,
+                release_id=release_id,
+            )
+        elif sold_ops_payload:
+            execution_id = create_execution(
+                strategy_id=int(strategy_id),
+                executed_at=executed_at,
+                budget=0.0,
+                top_n=int(top_n),
+                orders=[],
+                release_id=release_id,
+            )
+        if execution_id is not None and sold_ops_payload:
+            link_recorded_operations_to_execution(execution_id, sold_ops_payload)
+        if finalize_execution is not None:
+            finalize_execution(execution_id)
+    return execution_id
 
 
 def _monthly_turnover_budget(execute_date: str, total_equity: float) -> Dict[str, float]:
@@ -1838,76 +1938,25 @@ def run_for_trade_date(
             "正常交易日未形成任何可执行订单；全仓策略禁止将 no_trade 标记为成功",
             code="blocked_zero_order_full_investment",
         )
-    from app.db.store import atomic_business_transaction
-
     # All external data reads, PIT checks, JSON decoding and portfolio
     # calculations are complete above. Keep only account mutations and the
     # terminal plan transition in this transaction so PostgreSQL never waits
     # idle while the application performs market-side work.
-    mutation_scope = (
-        atomic_business_transaction()
-        if orders_payload or sold_ops_payload or finalize_execution is not None
-        else nullcontext()
+    execution_id = _commit_prepared_execution(
+        strategy_id=int(strategy_id),
+        execute_date=execute_date,
+        executed_at=executed_at,
+        top_n=int(top_n),
+        total_buy_cost=total_buy_cost,
+        orders_payload=orders_payload,
+        sold_ops_payload=sold_ops_payload,
+        positions_before_execution=positions_before_execution,
+        pretrade_positions=pretrade_portfolio["positions"],
+        pretrade_cash_balance=float(pretrade_portfolio["cash_balance"]),
+        frozen_exact_quantity_orders=frozen_exact_quantity_orders,
+        release_id=int((authoritative_plan or {}).get("release_id") or 0) or None,
+        finalize_execution=finalize_execution,
     )
-    with mutation_scope:
-        if frozen_exact_quantity_orders:
-            current_positions = get_positions()
-            current_cash = float(get_account_balance())
-            if (
-                _account_position_fingerprint(current_positions)
-                != _account_position_fingerprint(pretrade_portfolio["positions"])
-                or abs(current_cash - float(pretrade_portfolio["cash_balance"])) > 0.005
-            ):
-                raise ReplayRiskGateError(
-                    "冻结计划准备期间账户余额或持仓发生变化，已拒绝基于过期快照成交",
-                    code="execution_account_snapshot_changed",
-                )
-            for order in sold_ops_payload:
-                symbol = str(order.get("symbol") or "").strip()
-                position = positions_before_execution.get(symbol)
-                if not position:
-                    raise ReplayRiskGateError(
-                        f"冻结卖单对应持仓已变化：{symbol}",
-                        code="execution_account_snapshot_changed",
-                    )
-                sell_position(
-                    int(position["id"]),
-                    quantity=int(order.get("quantity") or 0),
-                    price=float(order.get("price") or 0),
-                    trade_date=execute_date,
-                    record_operation=True,
-                    operation_at=executed_at,
-                    operation_remark=str(order.get("remark") or "量化任务卖出（关联执行）"),
-                    fee_breakdown={
-                        key: order.get(key)
-                        for key in (
-                            "commission", "transfer_fee", "stamp_tax",
-                            "slippage_bps", "fee_schedule_version",
-                        )
-                    },
-                )
-        if orders_payload:
-            execution_id = create_and_apply_buy_execution(
-                strategy_id=int(strategy_id),
-                executed_at=executed_at,
-                budget=total_buy_cost,
-                top_n=int(top_n),
-                orders=orders_payload,
-                release_id=int((authoritative_plan or {}).get("release_id") or 0) or None,
-            )
-        elif sold_ops_payload:
-            execution_id = create_execution(
-                strategy_id=int(strategy_id),
-                executed_at=executed_at,
-                budget=0.0,
-                top_n=int(top_n),
-                orders=[],
-                release_id=int((authoritative_plan or {}).get("release_id") or 0) or None,
-            )
-        if execution_id is not None and sold_ops_payload:
-            link_recorded_operations_to_execution(execution_id, sold_ops_payload)
-        if finalize_execution is not None:
-            finalize_execution(execution_id)
 
     planned_buy_count = len(order_requests)
     bought_count = len(filled)

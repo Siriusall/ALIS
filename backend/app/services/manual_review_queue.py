@@ -80,8 +80,7 @@ def list_manual_review_triage() -> dict[str, dict[str, Any]]:
             """SELECT review_key,item_kind,status,can_handle,confidence,summary,
                       escalation_reason,draft_json,model,updated_at
                FROM manual_review_triage
-               ORDER BY updated_at DESC,review_key
-               LIMIT 5000"""
+               ORDER BY updated_at DESC,review_key"""
         ).fetchall()
     result: dict[str, dict[str, Any]] = {}
     for raw in rows:
