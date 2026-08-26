@@ -3,8 +3,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from app.services import profit_loop, quant_task_runner
 from app.db import store
+from app.services import profit_loop, quant_run_engine, quant_task_runner
 
 
 def _task():
@@ -37,10 +37,17 @@ def test_formal_plan_ledger_and_terminal_status_share_one_atomic_scope(monkeypat
         "claim_daily_rebalance_execution_input",
         lambda *_args, **_kwargs: {"execution_claim_token": "quant-task:8:20260810:20260811"},
     )
+
+    def run_in_engine_scope(**kwargs):
+        with store.atomic_business_transaction():
+            events.append("ledger_mutated")
+            kwargs["finalize_execution"](91)
+        return SimpleNamespace(execution_id=91)
+
     monkeypatch.setattr(
         quant_task_runner,
         "run_for_trade_date",
-        lambda **_kwargs: events.append("ledger_mutated") or SimpleNamespace(execution_id=91),
+        run_in_engine_scope,
     )
     monkeypatch.setattr(
         profit_loop,
@@ -86,10 +93,17 @@ def test_plan_terminal_write_failure_rolls_back_ledger_scope(monkeypatch):
         "claim_daily_rebalance_execution_input",
         lambda *_args, **_kwargs: {"execution_claim_token": "quant-task:8:20260810:20260811"},
     )
+
+    def run_in_engine_scope(**kwargs):
+        with store.atomic_business_transaction():
+            events.append("ledger_mutated")
+            kwargs["finalize_execution"](91)
+        return SimpleNamespace(execution_id=91)
+
     monkeypatch.setattr(
         quant_task_runner,
         "run_for_trade_date",
-        lambda **_kwargs: events.append("ledger_mutated") or SimpleNamespace(execution_id=91),
+        run_in_engine_scope,
     )
 
     def fail_plan_write(*_args, **_kwargs):
@@ -114,6 +128,109 @@ def test_plan_terminal_write_failure_rolls_back_ledger_scope(monkeypatch):
         "plan_write_failed",
         "transaction_rollback",
     ]
+
+
+def test_frozen_sell_preparation_does_not_mutate_account(monkeypatch):
+    mutations = []
+    blocked = []
+    triggers = []
+    prepared = []
+    monkeypatch.setattr(
+        quant_run_engine,
+        "sell_position",
+        lambda *_args, **_kwargs: mutations.append((_args, _kwargs)),
+    )
+
+    sold, remaining, code = quant_run_engine._sell_position_for_rebalance(
+        pos={
+            "id": 7,
+            "symbol": "000001",
+            "quantity": 500,
+            "name": "测试股票",
+            "bought_at": "2026-08-20",
+        },
+        quantity=100,
+        price_row=SimpleNamespace(
+            open=10.0,
+            prev_close=10.0,
+            change_pct=0.0,
+            volume=100_000,
+        ),
+        execute_date="2026-08-26",
+        executed_at="2026-08-26T09:30:00",
+        reason="冻结卖出",
+        detail="准备阶段",
+        turnover_remaining=100_000,
+        hard_risk_exit=False,
+        blocked_events=blocked,
+        sell_triggers=triggers,
+        sold_ops_payload=prepared,
+        persist=False,
+    )
+
+    assert sold is True
+    assert code is None
+    assert remaining < 100_000
+    assert mutations == []
+    assert prepared[0]["symbol"] == "000001"
+    assert prepared[0]["quantity"] == 100
+
+
+def test_frozen_order_audit_uses_autocommit_read_scope(monkeypatch):
+    scopes = []
+
+    @contextmanager
+    def read_scope():
+        scopes.append("read_enter")
+        yield object()
+        scopes.append("read_exit")
+
+    monkeypatch.setattr(profit_loop, "data_read_conn", read_scope)
+    monkeypatch.setattr(
+        profit_loop,
+        "data_conn",
+        lambda: (_ for _ in ()).throw(AssertionError("write transaction must not be opened")),
+    )
+    monkeypatch.setattr(profit_loop, "_raw_record_for_execution", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(profit_loop, "_snapshot_record_for_execution", lambda *_args, **_kwargs: {})
+
+    result = profit_loop.audit_frozen_execution_orders(
+        {
+            "execution_orders": [{
+                "symbol": "000001",
+                "side": "BUY",
+                "planned_quantity": 100,
+            }],
+        },
+        "20260826",
+        observed_at="2026-08-26T09:30:00+08:00",
+    )
+
+    assert scopes == ["read_enter", "read_exit"]
+    assert result["ok"] is False
+
+
+def test_account_snapshot_fingerprint_detects_non_sell_position_change():
+    prepared = [{
+        "id": 1,
+        "symbol": "000001",
+        "quantity": 500,
+        "price": 10.0,
+        "bought_at": "2026-08-20",
+    }, {
+        "id": 2,
+        "symbol": "600000",
+        "quantity": 300,
+        "price": 8.0,
+        "bought_at": "2026-08-19",
+    }]
+    current = [dict(item) for item in prepared]
+    current[1]["quantity"] = 400
+
+    assert (
+        quant_run_engine._account_position_fingerprint(current)
+        != quant_run_engine._account_position_fingerprint(prepared)
+    )
 
 
 def test_not_due_formal_plan_is_not_quarantined(monkeypatch):

@@ -816,7 +816,7 @@ def _worker(parent_run_id: int) -> None:
         # The market updater is successful only after the same strict decision
         # contract used by the executor passes.  A raw fetch/coverage row by
         # itself must never produce a healthy completion.
-        with _conn() as c:
+        with _read_conn() as c:
             final_contract = decision_data_contract(trade_date, conn=c)
         if not final_contract.get("ok"):
             raise DailyUpdateDataBlocked(
@@ -844,7 +844,7 @@ def _worker(parent_run_id: int) -> None:
                    finished_at=_now(), steps=steps)
     if final_status == "completed" and trade_date:
         try:
-            with _conn() as c:
+            with _read_conn() as c:
                 recovered_contract = decision_data_contract(trade_date, conn=c)
             if recovered_contract.get("ok"):
                 from app.services.evolution_orchestrator import enqueue_system_autonomy_recovery

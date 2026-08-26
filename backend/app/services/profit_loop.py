@@ -10,7 +10,7 @@ from statistics import mean
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from app.data_platform.db import _conn as data_conn
+from app.data_platform.db import _conn as data_conn, _read_conn as data_read_conn
 from app.core.a_share_fees import is_exchange_etf, normalize_exchange_etf_ts_code
 from app.db.store import _conn as business_conn, get_account_baseline, get_positions
 from app.data_platform.services.market_calendar import target_trade_date
@@ -503,7 +503,7 @@ def audit_frozen_execution_orders(
             "next_probe_at": None,
         }
     items: list[dict[str, Any]] = []
-    with data_conn() as c:
+    with data_read_conn() as c:
         for order in orders:
             symbol = str(order.get("symbol") or order.get("ts_code") or "").strip().upper()
             ts_code = _normalize_execution_ts_code(symbol)

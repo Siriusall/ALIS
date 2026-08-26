@@ -813,7 +813,11 @@ def _market_enrichment_observations(
 
 
 def live_market_context(*, persist: bool = False) -> dict[str, Any]:
-    with _conn() as c:
+    # The live projection performs Redis checks, immutable aggregate reads and
+    # JSON validation before any optional write. Use statement-scoped,
+    # read-only transactions so those application steps cannot retain an idle
+    # PostgreSQL transaction.
+    with _read_conn() as c:
         target_date = target_trade_date(c)
         cached = get_json("alis:market-context:live:v5")
         if (

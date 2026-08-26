@@ -6,7 +6,7 @@ from datetime import datetime, timezone, time as dtime, timedelta
 from zoneinfo import ZoneInfo
 import os
 from time import perf_counter
-from typing import Any, Callable, Tuple
+from typing import Any, Callable, Optional
 
 from app.integrations.tushare_client import reset_tushare_client
 from app.data_platform.db import _conn as data_conn, _read_conn as data_read_conn
@@ -1143,65 +1143,62 @@ def _execute_step_with_retry(
             "正式调仓计划不存在、已执行或已被其他执行器领取",
             code="formal_plan_not_claimable",
         )
-    def _run_atomically():
-        from app.db.store import atomic_business_transaction
+    def _run_execution():
         from app.services.profit_loop import (
             _persist_frozen_order_audit,
             audit_frozen_execution_orders,
             frozen_order_data_gate_error,
+            mark_daily_rebalance_plan_executed,
         )
 
-        with atomic_business_transaction() as business_tx:
-            if str(task_live.get("replay_mode") or "") == "autonomous_daily":
-                contract = (authoritative_plan or {}).get("decision_contract") or {}
-                order_audit = audit_frozen_execution_orders(
-                    contract,
-                    execute_date,
-                    observed_at=str((authoritative_plan or {}).get("execution_observation_cutoff") or ""),
-                )
-                if not order_audit.get("ok"):
-                    # Raising rolls back all ledger mutations. The outer
-                    # retryable error path then releases the claim and stores
-                    # this exact evidence without quarantining the plan.
-                    raise frozen_order_data_gate_error(order_audit)
-                # Keep the claim and transaction checks on one immutable
-                # observation clock. The execution engine receives this same
-                # cutoff after the transaction scope has been opened.
-                if authoritative_plan is not None:
-                    authoritative_plan["execution_observation_cutoff"] = str(order_audit.get("checked_at") or "")
-                    authoritative_plan["execution_data_evidence"] = order_audit
-                plan_id = int((authoritative_plan or {}).get("plan_id") or 0)
-                if plan_id:
-                    _persist_frozen_order_audit(
-                        plan_id=plan_id,
-                        audit=order_audit,
-                        conn=business_tx,
-                    )
-            result = run_for_trade_date(
-                strategy_id=int(task_live.get("strategy_id") or 0),
-                signal_date=signal_date,
-                execute_date=execute_date,
-                top_n=int(task_live.get("top_n") or 10),
-                budget_ratio=float(task_live.get("budget_ratio") or 1.0),
-                exchange_group=str(task_live.get("exchange_group") or "HS"),
-                progress_callback=progress_callback,
-                strict_no_future=True,
-                scoring_timeout_sec=scoring_timeout_sec,
-                authoritative_plan=authoritative_plan,
+        autonomous = str(task_live.get("replay_mode") or "") == "autonomous_daily"
+        if autonomous:
+            contract = (authoritative_plan or {}).get("decision_contract") or {}
+            order_audit = audit_frozen_execution_orders(
+                contract,
+                execute_date,
+                observed_at=str((authoritative_plan or {}).get("execution_observation_cutoff") or ""),
             )
-            if str(task_live.get("replay_mode") or "") == "autonomous_daily":
-                from app.services.profit_loop import mark_daily_rebalance_plan_executed
+            if not order_audit.get("ok"):
+                raise frozen_order_data_gate_error(order_audit)
+            if authoritative_plan is not None:
+                authoritative_plan["execution_observation_cutoff"] = str(order_audit.get("checked_at") or "")
+                authoritative_plan["execution_data_evidence"] = order_audit
+            plan_id = int((authoritative_plan or {}).get("plan_id") or 0)
+            if plan_id:
+                # Evidence persistence is intentionally a separate short
+                # transaction. Market/PIT preparation must never keep the
+                # simulation-account transaction open.
+                _persist_frozen_order_audit(
+                    plan_id=plan_id,
+                    audit=order_audit,
+                )
 
+        def _finalize(execution_id: int | None) -> None:
+            if autonomous:
                 mark_daily_rebalance_plan_executed(
                     signal_date,
                     execute_date,
-                    result.execution_id,
+                    execution_id,
                     claim_token=str((authoritative_plan or {}).get("execution_claim_token") or ""),
                 )
-            return result
+
+        return run_for_trade_date(
+            strategy_id=int(task_live.get("strategy_id") or 0),
+            signal_date=signal_date,
+            execute_date=execute_date,
+            top_n=int(task_live.get("top_n") or 10),
+            budget_ratio=float(task_live.get("budget_ratio") or 1.0),
+            exchange_group=str(task_live.get("exchange_group") or "HS"),
+            progress_callback=progress_callback,
+            strict_no_future=True,
+            scoring_timeout_sec=scoring_timeout_sec,
+            authoritative_plan=authoritative_plan,
+            finalize_execution=_finalize,
+        )
 
     try:
-        return _run_atomically()
+        return _run_execution()
     except Exception as e_step:  # noqa: BLE001
         if not _is_tushare_auth_error(e_step):
             raise
@@ -1212,7 +1209,7 @@ def _execute_step_with_retry(
             str(e_step)[:160],
         )
         reset_tushare_client()
-        return _run_atomically()
+        return _run_execution()
 
 
 def _build_replay_plan_context(

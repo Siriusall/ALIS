@@ -214,7 +214,7 @@ def test_live_market_context_rebuild_uses_immutable_aggregates_after_cache_miss(
         }
         for date in dates
     }
-    monkeypatch.setattr(market_context, "_conn", fake_conn)
+    monkeypatch.setattr(market_context, "_read_conn", fake_conn)
     monkeypatch.setattr(market_context, "target_trade_date", lambda _conn: dates[0])
     monkeypatch.setattr(market_context, "get_json", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(market_context, "load_snapshot_market_aggregates", lambda *_args, **_kwargs: aggregates)
@@ -280,7 +280,7 @@ def test_live_market_context_reuses_valid_durable_snapshot_after_redis_miss(monk
     def fake_conn():
         yield Connection()
 
-    monkeypatch.setattr(market_context, "_conn", fake_conn)
+    monkeypatch.setattr(market_context, "_read_conn", fake_conn)
     monkeypatch.setattr(market_context, "target_trade_date", lambda _conn: dates[0])
     monkeypatch.setattr(market_context, "get_json", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
@@ -314,7 +314,7 @@ def test_live_market_context_rejects_stale_cache_when_target_session_is_missing(
     def fake_conn():
         yield Connection()
 
-    monkeypatch.setattr(market_context, "_conn", fake_conn)
+    monkeypatch.setattr(market_context, "_read_conn", fake_conn)
     monkeypatch.setattr(market_context, "target_trade_date", lambda _conn: "20260815")
     monkeypatch.setattr(
         market_context,

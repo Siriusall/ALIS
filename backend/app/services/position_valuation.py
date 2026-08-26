@@ -5,7 +5,7 @@ from datetime import datetime
 from typing import Any, Iterable
 from zoneinfo import ZoneInfo
 
-from app.data_platform.db import _conn as data_conn
+from app.data_platform.db import _read_conn as data_conn
 from app.core.a_share_fees import is_exchange_etf
 from app.services.backtest_data_source import BacktestDataSource
 from app.services.defensive_assets import defensive_asset_series, defensive_asset_series_batch

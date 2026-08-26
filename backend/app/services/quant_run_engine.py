@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 from datetime import datetime, timezone
 import math
 import os
@@ -280,6 +281,7 @@ def _sell_position_for_rebalance(
     blocked_events: List[Dict[str, Any]],
     sell_triggers: List[Dict[str, Any]],
     sold_ops_payload: List[Dict[str, Any]],
+    persist: bool = True,
 ) -> tuple[bool, float, str | None]:
     sym = str(pos.get("symbol") or "").strip()
     if not sym or quantity <= 0:
@@ -329,16 +331,17 @@ def _sell_position_for_rebalance(
         # for the later execution binding is derived from that persisted
         # value.  Keep the payload on the same representation.
         exec_price = round(float(fee["executed_price"]), 2)
-        sell_position(
-            int(pos["id"]),
-            quantity=quantity,
-            price=exec_price,
-            trade_date=execute_date,
-            record_operation=True,
-            operation_at=executed_at,
-            operation_remark="量化任务卖出（关联执行）",
-            fee_breakdown=fee,
-        )
+        if persist:
+            sell_position(
+                int(pos["id"]),
+                quantity=quantity,
+                price=exec_price,
+                trade_date=execute_date,
+                record_operation=True,
+                operation_at=executed_at,
+                operation_remark="量化任务卖出（关联执行）",
+                fee_breakdown=fee,
+            )
     except ValueError:
         return False, turnover_remaining, "t_plus_one_or_position_constraint"
     turnover_after = max(0.0, turnover_remaining - proposed_turnover)
@@ -406,6 +409,20 @@ def _compute_buy_budget(
         target_position_pct=target_position_pct,
         budget_ratio=budget_ratio,
     )
+
+
+def _account_position_fingerprint(positions: List[Dict[str, Any]]) -> tuple[tuple[Any, ...], ...]:
+    """Return the mutation-relevant account projection for optimistic locking."""
+    return tuple(sorted(
+        (
+            int(position.get("id") or 0),
+            str(position.get("symbol") or "").strip(),
+            int(position.get("quantity") or 0),
+            round(float(position.get("price") or 0), 6),
+            str(position.get("bought_at") or "")[:10],
+        )
+        for position in positions
+    ))
 
 
 def _monthly_turnover_budget(execute_date: str, total_equity: float) -> Dict[str, float]:
@@ -870,6 +887,7 @@ def run_for_trade_date(
     strict_no_future: bool = True,
     scoring_timeout_sec: Optional[int] = None,
     authoritative_plan: Dict[str, Any] | None = None,
+    finalize_execution: Optional[Callable[[int | None], None]] = None,
 ) -> QuantRunExecResult:
     # Every ledger-mutating execution must be bound to a persisted, immutable
     # daily rebalance plan.  The old caller-supplied selection path could read
@@ -1246,13 +1264,14 @@ def run_for_trade_date(
                 "冻结计划所需防御ETF缺少执行日精确行情：" + ",".join(missing_defensive_execution_rows),
                 code="paused_frozen_execution_data_not_ready",
             )
+    pretrade_portfolio = _portfolio_state(ds, execute_date, execution_rows=exec_map)
     if frozen_exact_quantity_orders:
         # A cost-price fallback is not a market observation.  Every existing
         # holding that participates in T+1 sizing must have an exact-date
         # execution row before the frozen plan can mutate the ledger.
         missing_position_rows = []
         target_execute_date = str(execute_date or "").replace("-", "")[:8]
-        for position in get_positions():
+        for position in pretrade_portfolio["positions"]:
             symbol = str(position.get("symbol") or "").strip()
             if int(position.get("quantity") or 0) <= 0 or not symbol:
                 continue
@@ -1268,7 +1287,6 @@ def run_for_trade_date(
                 code="paused_frozen_execution_data_not_ready",
             )
     executed_at = f"{execute_date}T09:30:00"
-    pretrade_portfolio = _portfolio_state(ds, execute_date, execution_rows=exec_map)
     if frozen_unified_plan:
         # Turnover was already priced into the T-day method competition.  The
         # legacy monthly cap is an investment-policy decision, not a T+1 trade
@@ -1297,7 +1315,12 @@ def run_for_trade_date(
     sold_count = 0
     sold_ops_payload: List[Dict[str, Any]] = []
     blocked_count = 0
-    rows = get_positions()
+    rows = list(pretrade_portfolio["positions"])
+    positions_before_execution = {
+        str(position.get("symbol") or "").strip(): dict(position)
+        for position in rows
+        if str(position.get("symbol") or "").strip()
+    }
     for pos in rows:
         sym = str(pos.get("symbol") or "").strip()
         frozen_sell_order = frozen_order_by_symbol.get(sym) or {}
@@ -1337,6 +1360,10 @@ def run_for_trade_date(
             blocked_events=blocked_events,
             sell_triggers=sell_triggers,
             sold_ops_payload=sold_ops_payload,
+            # A formal V2 plan must finish all market/PIT/portfolio work before
+            # opening the account transaction. The prepared sells are applied
+            # together with buys and the terminal plan write below.
+            persist=not frozen_exact_quantity_orders,
         )
         if not sold:
             blocked_count += 1
@@ -1357,7 +1384,22 @@ def run_for_trade_date(
             })
 
     # 再买入（等权资金，按总权益目标仓位与单票上限）
-    held_after_sell = {str(p.get("symbol") or "").strip() for p in get_positions()}
+    if frozen_exact_quantity_orders:
+        remaining_quantities = {
+            symbol: int(position.get("quantity") or 0)
+            for symbol, position in positions_before_execution.items()
+        }
+        for order in sold_ops_payload:
+            symbol = str(order.get("symbol") or "").strip()
+            remaining_quantities[symbol] = max(
+                0,
+                remaining_quantities.get(symbol, 0) - int(order.get("quantity") or 0),
+            )
+        held_after_sell = {
+            symbol for symbol, quantity in remaining_quantities.items() if quantity > 0
+        }
+    else:
+        held_after_sell = {str(p.get("symbol") or "").strip() for p in get_positions()}
     # Existing targets may still be below today's optimizer weight. Include
     # them so idle cash is deployed instead of treating every held name as a
     # permanent no-op.
@@ -1390,7 +1432,34 @@ def run_for_trade_date(
     risk_budget = selection_detail.get("risk_budget") if isinstance(selection_detail.get("risk_budget"), dict) else {}
     _strategy_target_position_pct, max_single_position_pct = _parse_risk_budget(risk_budget)
     target_position_pct = 1.0
-    portfolio = _portfolio_state(ds, execute_date, execution_rows=exec_map)
+    if frozen_exact_quantity_orders:
+        position_values = dict(pretrade_portfolio["position_value_by_symbol"])
+        cash_after_sells = float(pretrade_portfolio["cash_balance"])
+        for order in sold_ops_payload:
+            symbol = str(order.get("symbol") or "").strip()
+            quantity = int(order.get("quantity") or 0)
+            market_price = _row_trade_price(exec_map.get(symbol), prefer_open=True)
+            position_values[symbol] = max(
+                0.0,
+                float(position_values.get(symbol) or 0.0) - market_price * quantity,
+            )
+            if position_values[symbol] <= 0.005:
+                position_values.pop(symbol, None)
+            cash_after_sells += max(
+                0.0,
+                float(order.get("price") or 0) * quantity
+                - sum(float(order.get(key) or 0) for key in ("commission", "transfer_fee", "stamp_tax")),
+            )
+        position_market_value = sum(position_values.values())
+        portfolio = {
+            **pretrade_portfolio,
+            "cash_balance": round(cash_after_sells, 2),
+            "position_market_value": position_market_value,
+            "position_value_by_symbol": position_values,
+            "total_equity": round(cash_after_sells + position_market_value, 2),
+        }
+    else:
+        portfolio = _portfolio_state(ds, execute_date, execution_rows=exec_map)
     defensive_target_weight = sum(defensive_weights.values())
     effective_budget_ratio = (
         1.0
@@ -1769,26 +1838,76 @@ def run_for_trade_date(
             "正常交易日未形成任何可执行订单；全仓策略禁止将 no_trade 标记为成功",
             code="blocked_zero_order_full_investment",
         )
-    if orders_payload:
-        execution_id = create_and_apply_buy_execution(
-            strategy_id=int(strategy_id),
-            executed_at=executed_at,
-            budget=total_buy_cost,
-            top_n=int(top_n),
-            orders=orders_payload,
-            release_id=int((authoritative_plan or {}).get("release_id") or 0) or None,
-        )
-    elif sold_ops_payload:
-        execution_id = create_execution(
-            strategy_id=int(strategy_id),
-            executed_at=executed_at,
-            budget=0.0,
-            top_n=int(top_n),
-            orders=[],
-            release_id=int((authoritative_plan or {}).get("release_id") or 0) or None,
-        )
-    if execution_id is not None and sold_ops_payload:
-        link_recorded_operations_to_execution(execution_id, sold_ops_payload)
+    from app.db.store import atomic_business_transaction
+
+    # All external data reads, PIT checks, JSON decoding and portfolio
+    # calculations are complete above. Keep only account mutations and the
+    # terminal plan transition in this transaction so PostgreSQL never waits
+    # idle while the application performs market-side work.
+    mutation_scope = (
+        atomic_business_transaction()
+        if orders_payload or sold_ops_payload or finalize_execution is not None
+        else nullcontext()
+    )
+    with mutation_scope:
+        if frozen_exact_quantity_orders:
+            current_positions = get_positions()
+            current_cash = float(get_account_balance())
+            if (
+                _account_position_fingerprint(current_positions)
+                != _account_position_fingerprint(pretrade_portfolio["positions"])
+                or abs(current_cash - float(pretrade_portfolio["cash_balance"])) > 0.005
+            ):
+                raise ReplayRiskGateError(
+                    "冻结计划准备期间账户余额或持仓发生变化，已拒绝基于过期快照成交",
+                    code="execution_account_snapshot_changed",
+                )
+            for order in sold_ops_payload:
+                symbol = str(order.get("symbol") or "").strip()
+                position = positions_before_execution.get(symbol)
+                if not position:
+                    raise ReplayRiskGateError(
+                        f"冻结卖单对应持仓已变化：{symbol}",
+                        code="execution_account_snapshot_changed",
+                    )
+                sell_position(
+                    int(position["id"]),
+                    quantity=int(order.get("quantity") or 0),
+                    price=float(order.get("price") or 0),
+                    trade_date=execute_date,
+                    record_operation=True,
+                    operation_at=executed_at,
+                    operation_remark=str(order.get("remark") or "量化任务卖出（关联执行）"),
+                    fee_breakdown={
+                        key: order.get(key)
+                        for key in (
+                            "commission", "transfer_fee", "stamp_tax",
+                            "slippage_bps", "fee_schedule_version",
+                        )
+                    },
+                )
+        if orders_payload:
+            execution_id = create_and_apply_buy_execution(
+                strategy_id=int(strategy_id),
+                executed_at=executed_at,
+                budget=total_buy_cost,
+                top_n=int(top_n),
+                orders=orders_payload,
+                release_id=int((authoritative_plan or {}).get("release_id") or 0) or None,
+            )
+        elif sold_ops_payload:
+            execution_id = create_execution(
+                strategy_id=int(strategy_id),
+                executed_at=executed_at,
+                budget=0.0,
+                top_n=int(top_n),
+                orders=[],
+                release_id=int((authoritative_plan or {}).get("release_id") or 0) or None,
+            )
+        if execution_id is not None and sold_ops_payload:
+            link_recorded_operations_to_execution(execution_id, sold_ops_payload)
+        if finalize_execution is not None:
+            finalize_execution(execution_id)
 
     planned_buy_count = len(order_requests)
     bought_count = len(filled)
