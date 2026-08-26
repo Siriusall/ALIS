@@ -9,7 +9,7 @@ export type ConsoleData = Partial<Record<keyof typeof endpoints, Json>> & {
 };
 
 const routeKeys: Record<string, Array<keyof typeof endpoints>> = {
-  "/overview": ["owner", "ledger", "portfolio", "tradingReady", "latestPlan", "health", "adminTasksLive", "dailyUpdateStatus", "watermarks", "ledgerAudit", "oos", "sealed"],
+  "/overview": ["owner", "ledger", "portfolio", "tradingReady", "latestPlan", "health", "adminTasksLive", "dailyUpdateStatus", "watermarks", "ledgerAudit"],
   "/system": ["health", "tradingReady", "adminTasksLive"],
   "/system/versions": ["systemVersionStatus", "systemReleases", "systemContracts"],
   "/decision": ["owner", "decision", "tradingReady", "latestPlan"],
@@ -18,15 +18,15 @@ const routeKeys: Record<string, Array<keyof typeof endpoints>> = {
   "/evolution/factors": ["factors", "researchAnalytics", "researchFactorAnalytics"],
   "/evolution/metrics": ["researchAnalytics", "researchTimeseries", "evolutionTasks"],
   "/evolution/waves": ["researchAnalyticsConsole", "researchExpertHistory", "researchEnvironmentSimilarity", "researchArchive"],
-  "/admin": ["health", "tradingReady", "tasks", "adminTasksLive", "dailyUpdateStatus", "watermarks", "ledgerAudit", "oos", "sealed"],
-  "/admin/operations": ["health", "owner", "tasks", "evolutionTasks", "evolutionSchedule", "quantTasks", "quantStatus", "quantRecent", "executionsPage", "operationsPage", "ledgerAudit", "oos", "sealed"],
-  "/factors": ["owner", "strategy", "sealed", "factors", "factorStatus", "factorResearch", "factorLineage", "evolutionTasks"],
+  "/admin": ["health", "tradingReady", "tasks", "adminTasksLive", "dailyUpdateStatus", "watermarks", "ledgerAudit"],
+  "/admin/operations": ["health", "owner", "tasks", "evolutionTasks", "evolutionSchedule", "quantTasks", "quantStatus", "quantRecent", "executionsPage", "operationsPage", "ledgerAudit"],
+  "/factors": ["owner", "strategy", "factors", "factorStatus", "factorResearch", "factorLineage", "evolutionTasks"],
   "/admin/models": ["planModels", "modelOperations", "models", "modelMarketLive", "modelGovernance", "modelReports", "modelProduction", "modelController", "modelOutputContracts", "modelEvidenceBindings", "modelValidation", "modelMarketHistory", "factorResearchCompact", "evolutionTasks", "modelTasksLive"],
-  "/admin/data": ["watermarks", "failedRequests", "dataOperations", "runtimeLogs", "dataObservability", "dataStreams", "dailyUpdateStatus", "backfillStatus", "backfillPlan", "tasks", "oos", "sealed"],
+  "/admin/data": ["watermarks", "failedRequests", "dataOperations", "runtimeLogs", "dataObservability", "dataStreams", "dailyUpdateStatus", "backfillStatus", "backfillPlan", "tasks"],
   "/admin/evidence": ["decisionAudit", "decisions", "reviews", "reviewLearning", "llmBudget", "llmProposals", "performanceReports", "ledgerDetail", "reportCompact", "backtests", "ledgerAudit"],
-  "/operations": ["health", "owner", "tasks", "evolutionTasks", "evolutionSchedule", "quantTasks", "quantStatus", "quantRecent", "executionsPage", "operationsPage", "ledgerAudit", "oos", "sealed"],
+  "/operations": ["health", "owner", "tasks", "evolutionTasks", "evolutionSchedule", "quantTasks", "quantStatus", "quantRecent", "executionsPage", "operationsPage", "ledgerAudit"],
   "/models": ["planModels", "modelOperations", "models", "modelMarketLive", "modelGovernance", "modelReports", "modelProduction", "modelController", "modelOutputContracts", "modelEvidenceBindings", "modelValidation", "modelMarketHistory", "factorResearchCompact", "evolutionTasks", "modelTasksLive"],
-  "/data": ["watermarks", "failedRequests", "dataOperations", "runtimeLogs", "dataObservability", "dataStreams", "dailyUpdateStatus", "backfillStatus", "backfillPlan", "tasks", "oos", "sealed"],
+  "/data": ["watermarks", "failedRequests", "dataOperations", "runtimeLogs", "dataObservability", "dataStreams", "dailyUpdateStatus", "backfillStatus", "backfillPlan", "tasks"],
   "/evidence": ["decisionAudit", "decisions", "reviews", "reviewLearning", "llmBudget", "llmProposals", "performanceReports", "ledgerDetail", "reportCompact", "backtests", "ledgerAudit"],
   "/research": ["researchContracts", "researchGovernance", "researchPositionState", "researchDataAssets", "analystConsensus", "theses", "industries", "industryAllocation", "themes", "events", "pools", "modelMarketLive"],
 };
