@@ -155,7 +155,7 @@ def audit_research_data_assets() -> dict[str, Any]:
         "latest_available_time": str(_value(ocr, "latest_available_time", "")),
         "status": "reconciled" if int(_value(ocr, "observations")) and int(_value(ocr, "observations")) == int(_value(ocr, "reconciled")) else "candidate_only" if int(_value(ocr, "observations")) else "missing",
         "production_eligible": False,
-        "contract": "alis_caam_macos_vision_ocr_candidate_v1",
+        "contract": "alis_caam_cross_platform_ocr_candidate_v2",
     }
     gaps = []
     for key, item in industry.items():

@@ -372,6 +372,21 @@ CREATE TABLE dc_stock_master (
             available_time TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
+CREATE TABLE dc_stock_master_version (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts_code TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            name TEXT NOT NULL,
+            area TEXT NOT NULL DEFAULT '',
+            industry TEXT NOT NULL DEFAULT '',
+            market TEXT NOT NULL DEFAULT '',
+            list_date TEXT NOT NULL DEFAULT '',
+            source_code TEXT NOT NULL,
+            observed_at TEXT NOT NULL,
+            content_hash TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE (ts_code, content_hash)
+        );
 CREATE TABLE dc_trade_calendar (
             exchange TEXT NOT NULL,
             cal_date TEXT NOT NULL,
@@ -972,6 +987,21 @@ def init_db() -> None:
                 first_observed_at TEXT NOT NULL DEFAULT '', observation_provenance TEXT NOT NULL DEFAULT '', content_hash TEXT NOT NULL,
                 created_at TEXT NOT NULL, UNIQUE(ts_code,trade_date,content_hash))"""
             conn.execute(snapshot_version_sql)
+            stock_master_version_sql = """CREATE TABLE IF NOT EXISTS dc_stock_master_version (
+                id BIGSERIAL PRIMARY KEY,
+                ts_code VARCHAR(32) NOT NULL, symbol VARCHAR(32) NOT NULL,
+                name VARCHAR(255) NOT NULL, area VARCHAR(128) NOT NULL DEFAULT '',
+                industry VARCHAR(255) NOT NULL DEFAULT '', market VARCHAR(64) NOT NULL DEFAULT '',
+                list_date VARCHAR(16) NOT NULL DEFAULT '', source_code VARCHAR(128) NOT NULL,
+                observed_at VARCHAR(64) NOT NULL, content_hash VARCHAR(128) NOT NULL,
+                created_at VARCHAR(64) NOT NULL, UNIQUE(ts_code,content_hash))""" if bool(getattr(conn, "_is_postgres", False)) else """CREATE TABLE IF NOT EXISTS dc_stock_master_version (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, ts_code TEXT NOT NULL, symbol TEXT NOT NULL,
+                name TEXT NOT NULL, area TEXT NOT NULL DEFAULT '', industry TEXT NOT NULL DEFAULT '',
+                market TEXT NOT NULL DEFAULT '', list_date TEXT NOT NULL DEFAULT '', source_code TEXT NOT NULL,
+                observed_at TEXT NOT NULL, content_hash TEXT NOT NULL, created_at TEXT NOT NULL,
+                UNIQUE(ts_code,content_hash))"""
+            conn.execute(stock_master_version_sql)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_dc_stock_master_version_cutoff ON dc_stock_master_version (observed_at,ts_code)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_dc_snapshot_ts_date_bars ON dc_stock_daily_snapshot (ts_code,trade_date) INCLUDE (close,volume,turnover)")
             # History replay only accepts rows with a real point-in-time
             # adjustment factor. Keep that predicate in the index so a

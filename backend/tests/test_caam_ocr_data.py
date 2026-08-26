@@ -34,6 +34,28 @@ def test_article_images_only_keeps_caam_file_evidence() -> None:
     ]
 
 
+def test_linux_ocr_uses_tesseract_tsv(monkeypatch) -> None:
+    payload = (
+        "level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\theight\tconf\ttext\n"
+        "5\t1\t1\t1\t1\t1\t0\t0\t10\t10\t90\t汽车\n"
+        "5\t1\t1\t1\t1\t2\t10\t0\t10\t10\t80\t销量\n"
+    ).encode("utf-8")
+
+    monkeypatch.setattr(service.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(service.shutil, "which", lambda command: "/usr/bin/tesseract" if command == "tesseract" else None)
+    monkeypatch.setattr(
+        service.subprocess,
+        "run",
+        lambda *args, **kwargs: type("Completed", (), {"stdout": payload})(),
+    )
+
+    assert service._ocr_image(b"image") == [{
+        "text": "汽车 销量",
+        "confidence": 0.85,
+        "engine": "tesseract_chi_sim_eng",
+    }]
+
+
 def test_parse_monthly_observations_keeps_ocr_confidence_and_exact_period() -> None:
     lines = [
         {"confidence": 0.5, "text": "2026年5月，汽车产销分别完成 261.6万辆和 262.9万辆，环比增长。"},

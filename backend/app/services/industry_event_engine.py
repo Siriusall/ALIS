@@ -207,6 +207,33 @@ def _store_financial_proxy_cache(
     )
 
 
+def _visible_stock_master_rows(c: Any, *, as_of_time: str | None = None) -> list[dict[str, Any]]:
+    if not as_of_time:
+        return [dict(row) for row in c.execute(
+            "SELECT ts_code,industry FROM dc_stock_master WHERE COALESCE(industry,'')<>''"
+        ).fetchall()]
+    cutoff = normalize_explicit_timestamp(as_of_time)
+    if not cutoff:
+        raise RuntimeError("industry_stock_master_cutoff_invalid")
+    cutoff_date = cutoff[:10].replace("-", "")
+    try:
+        rows = [dict(row) for row in c.execute(
+            """SELECT ts_code,industry FROM (
+                   SELECT ts_code,industry,list_date,
+                          ROW_NUMBER() OVER (PARTITION BY ts_code ORDER BY observed_at DESC,id DESC) AS rank
+                     FROM dc_stock_master_version
+                    WHERE observed_at<=? AND COALESCE(industry,'')<>''
+                          AND (COALESCE(list_date,'')='' OR list_date<=?)
+               ) visible WHERE rank=1""",
+            (cutoff, cutoff_date),
+        ).fetchall()]
+    except Exception as exc:
+        raise RuntimeError("industry_stock_master_pit_unavailable") from exc
+    if not rows:
+        raise RuntimeError("industry_stock_master_not_visible_at_cutoff")
+    return rows
+
+
 def _derived_industry_proxies(c, *, as_of_time: str | None = None) -> dict[str, dict[str, Any]]:
     """Build auditable P1 industry proxies from company financial and valuation facts."""
     target_rows: dict[str, list[dict[str, Any]]] | None = None
@@ -397,37 +424,7 @@ def _derived_industry_proxies(c, *, as_of_time: str | None = None) -> dict[str, 
             target_rows = grouped
         return list(target_rows.get(api_name, []))
 
-    master_query = (
-        "SELECT ts_code,industry,list_date,available_time,updated_at,source_code "
-        "FROM dc_stock_master WHERE COALESCE(industry,'')<>''"
-        if as_of_time else
-        "SELECT ts_code,industry FROM dc_stock_master WHERE COALESCE(industry,'')<>''"
-    )
-    try:
-        master_rows = [dict(row) for row in c.execute(master_query).fetchall()]
-    except Exception as exc:
-        if as_of_time:
-            raise RuntimeError("industry_stock_master_pit_unavailable") from exc
-        raise
-    if as_of_time:
-        cutoff = normalize_explicit_timestamp(as_of_time)
-        if not cutoff:
-            raise RuntimeError("industry_stock_master_cutoff_invalid")
-        visible_master: list[dict[str, Any]] = []
-        for row in master_rows:
-            available = normalize_explicit_timestamp(row.get("available_time"))
-            updated = normalize_explicit_timestamp(row.get("updated_at"))
-            list_date = str(row.get("list_date") or "").replace("-", "")[:8]
-            cutoff_date = cutoff[:10].replace("-", "")
-            if (
-                not str(row.get("source_code") or "").strip()
-                or not available or not updated
-                or available > cutoff or updated > cutoff
-                or (list_date and list_date > cutoff_date)
-            ):
-                raise RuntimeError("industry_stock_master_not_visible_at_cutoff")
-            visible_master.append(row)
-        master_rows = visible_master
+    master_rows = _visible_stock_master_rows(c, as_of_time=as_of_time)
     master = {
         str(row["ts_code"]): str(row["industry"] or "").strip()
         for row in master_rows

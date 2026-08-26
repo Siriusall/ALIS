@@ -3,6 +3,7 @@ import time
 
 from app.services import system_autonomy
 from app.services.system_autonomy import _owner_rebalance_action, _owner_summary, _skip_decision_step, _skip_experimental_step
+from app.services.system_autonomy import _prune_resolved_completed_cycle_evidence
 
 
 def test_owner_rebalance_action_keeps_weights_and_trade_amount():
@@ -41,6 +42,33 @@ def test_owner_summary_cannot_hide_deterministic_failure_behind_incident_supervi
 
     assert summary["healthy"] is False
     assert summary["questions"]["anomalies"][0]["module"] == "theme_revenue_exposure"
+
+
+def test_resolved_completed_cycle_evidence_is_removed_from_anomalies_and_cases():
+    summary = {
+        "healthy": False,
+        "questions": {
+            "anomalies": [
+                {"module": "decision_data_gate", "message": "degraded"},
+                {"module": "free_industry_financials", "message": "failed"},
+            ],
+            "historical_research_waits": [],
+            "incident_supervision": {
+                "cases": [
+                    {"module": "decision_data_gate", "resolution_class": "waiting_condition"},
+                    {"module": "free_industry_financials", "resolution_class": "internal_fault"},
+                ],
+            },
+        },
+    }
+
+    _prune_resolved_completed_cycle_evidence(summary, {"decision_data_gate"})
+
+    assert [item["module"] for item in summary["questions"]["anomalies"]] == ["free_industry_financials"]
+    supervision = summary["questions"]["incident_supervision"]
+    assert [item["module"] for item in supervision["cases"]] == ["free_industry_financials"]
+    assert supervision["waiting_condition_count"] == 0
+    assert supervision["internal_fault_count"] == 1
 
 
 def test_owner_summary_cannot_hide_incident_supervisor_timeout(monkeypatch):

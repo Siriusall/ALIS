@@ -725,12 +725,53 @@ def sync_stock_basic() -> dict[str, Any]:
         raise
 
 
+def _stock_master_version_values(row: dict[str, Any], *, observed_at: str) -> tuple[Any, ...]:
+    payload = {
+        "ts_code": str(row.get("ts_code") or "").strip(),
+        "symbol": str(row.get("symbol") or "").strip(),
+        "name": str(row.get("name") or "").strip(),
+        "area": str(row.get("area") or "").strip(),
+        "industry": str(row.get("industry") or "").strip(),
+        "market": str(row.get("market") or "").strip(),
+        "list_date": str(row.get("list_date") or "").strip(),
+        "source_code": str(row.get("source_code") or SOURCE_TUSHARE).strip(),
+    }
+    content_hash = hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return (*payload.values(), observed_at, content_hash, observed_at)
+
+
+def _append_stock_master_version(c: Any, values: tuple[Any, ...]) -> None:
+    if c._is_mysql:
+        c.execute(
+            """INSERT IGNORE INTO dc_stock_master_version
+               (ts_code,symbol,name,area,industry,market,list_date,source_code,observed_at,content_hash,created_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+            values,
+        )
+        return
+    c.execute(
+        """INSERT INTO dc_stock_master_version
+           (ts_code,symbol,name,area,industry,market,list_date,source_code,observed_at,content_hash,created_at)
+           VALUES(?,?,?,?,?,?,?,?,?,?,?)
+           ON CONFLICT(ts_code,content_hash) DO NOTHING""",
+        values,
+    )
+
+
 def _upsert_stock_master(df: pd.DataFrame, *, source_code: str = SOURCE_TUSHARE) -> int:
     if not isinstance(df, pd.DataFrame) or df.empty:
         return 0
     now = _now()
     written = 0
     with _conn() as c:
+        existing_versions = int(dict(c.execute("SELECT COUNT(*) count FROM dc_stock_master_version").fetchone()).get("count") or 0)
+        if existing_versions == 0:
+            for existing in c.execute("SELECT * FROM dc_stock_master").fetchall():
+                item = dict(existing)
+                observed_at = str(item.get("available_time") or item.get("updated_at") or now)
+                _append_stock_master_version(c, _stock_master_version_values(item, observed_at=observed_at))
         for _, row in df.iterrows():
             values = (
                 str(row.get("ts_code") or "").strip(),
@@ -746,6 +787,11 @@ def _upsert_stock_master(df: pd.DataFrame, *, source_code: str = SOURCE_TUSHARE)
             )
             if not values[0]:
                 continue
+            _append_stock_master_version(c, _stock_master_version_values({
+                "ts_code": values[0], "symbol": values[1], "name": values[2],
+                "area": values[3], "industry": values[4], "market": values[5],
+                "list_date": values[6], "source_code": values[7],
+            }, observed_at=now))
             if c._is_mysql:
                 c.execute(
                     """

@@ -10,11 +10,13 @@ import time
 from datetime import timedelta
 from typing import Any, Callable
 import uuid
+from zoneinfo import ZoneInfo
 
 from app.core.error_evidence import error_evidence
 from app.db.store import _conn, _read_conn
 
 
+_BUSINESS_TZ = ZoneInfo("Asia/Shanghai")
 _STEP_TIMEOUT_SECONDS = max(15, min(int(os.getenv("ALIS_AUTONOMY_STEP_TIMEOUT_SECONDS", "120")), 900))
 _LONG_STEP_TIMEOUT_SECONDS = max(
     _STEP_TIMEOUT_SECONDS,
@@ -733,6 +735,57 @@ def _owner_rebalance_action(action: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _resolved_completed_cycle_modules(anomalies: list[dict[str, Any]]) -> set[str]:
+    modules = {str(item.get("module") or "") for item in anomalies if isinstance(item, dict)}
+    resolved: set[str] = set()
+    if "decision_data_gate" in modules:
+        try:
+            from app.services.data_health import _latest_adj_factor_coverage, _latest_benchmark_coverage
+
+            anomaly = next(
+                item for item in anomalies
+                if isinstance(item, dict) and str(item.get("module") or "") == "decision_data_gate"
+            )
+            observed_at = str(anomaly.get("observed_at") or "")
+            trade_date = observed_at[:10].replace("-", "") or datetime.now(_BUSINESS_TZ).strftime("%Y%m%d")
+            if (
+                bool(_latest_adj_factor_coverage(trade_date).get("ready"))
+                and bool(_latest_benchmark_coverage(trade_date).get("ready"))
+            ):
+                resolved.add("decision_data_gate")
+        except Exception:
+            pass
+    return resolved
+
+
+def _prune_resolved_completed_cycle_evidence(summary: dict[str, Any], resolved_modules: set[str]) -> None:
+    if not resolved_modules:
+        return
+    questions = summary.get("questions") if isinstance(summary.get("questions"), dict) else {}
+    anomalies = questions.get("anomalies") if isinstance(questions.get("anomalies"), list) else []
+    questions["anomalies"] = [
+        item for item in anomalies
+        if not isinstance(item, dict) or str(item.get("module") or "") not in resolved_modules
+    ]
+    supervision = questions.get("incident_supervision") if isinstance(questions.get("incident_supervision"), dict) else {}
+    cases = supervision.get("cases") if isinstance(supervision.get("cases"), list) else []
+    supervision["cases"] = [
+        item for item in cases
+        if not isinstance(item, dict) or str(item.get("module") or "") not in resolved_modules
+    ]
+    supervision["owner_action_required_count"] = sum(1 for case in supervision["cases"] if case.get("owner_action_required"))
+    supervision["internal_fault_count"] = sum(1 for case in supervision["cases"] if case.get("resolution_class") == "internal_fault")
+    supervision["waiting_condition_count"] = sum(1 for case in supervision["cases"] if case.get("resolution_class") == "waiting_condition")
+    supervision["status"] = "owner_action_required" if supervision["owner_action_required_count"] else "self_managed" if supervision["cases"] else "healthy"
+    questions["incident_supervision"] = supervision
+    summary["questions"] = questions
+    summary["healthy"] = bool(
+        not questions.get("anomalies")
+        and not questions.get("historical_research_waits")
+        and int(supervision.get("owner_action_required_count") or 0) == 0
+    )
+
+
 def _build_latest_owner_summary() -> dict[str, Any]:
     # This projection is read-only and is followed by JSON decoding outside
     # the database call.  Use an autocommit connection so that decoding a
@@ -816,6 +869,10 @@ def _build_latest_owner_summary() -> dict[str, Any]:
         if isinstance(case, dict):
             case.setdefault("evidence_scope", "completed_cycle")
             case.setdefault("observed_at", str(item.get("finished_at") or ""))
+    resolved_modules = _resolved_completed_cycle_modules(anomalies)
+    _prune_resolved_completed_cycle_evidence(summary, resolved_modules)
+    summary["evidence_source"]["live_rechecked"] = bool(resolved_modules)
+    summary["evidence_source"]["resolved_modules"] = sorted(resolved_modules)
     try:
         from app.services.acceptance_progress import build_acceptance_progress
 

@@ -4,6 +4,7 @@ from contextlib import nullcontext
 from app.services import free_research_data as service
 from app.services.announcement_label_benchmark import _normalise_label
 from app.services.industry_event_engine import _metric_signal
+from app.services.industry_event_engine import _visible_stock_master_rows
 
 
 def test_metric_code_is_stable_and_industry_specific() -> None:
@@ -33,6 +34,22 @@ def test_industry_signal_obeys_futures_transmission_lag() -> None:
 
     assert lagged is not None and unlagged is not None
     assert lagged < unlagged
+
+
+def test_stock_master_point_in_time_reader_uses_version_cutoff() -> None:
+    class Result:
+        def fetchall(self):
+            return [{"ts_code": "000001.SZ", "industry": "银行"}]
+
+    class Connection:
+        def execute(self, sql, params=()):
+            assert "dc_stock_master_version" in sql
+            assert params == ("2026-08-26T15:00:00+08:00", "20260826")
+            return Result()
+
+    rows = _visible_stock_master_rows(Connection(), as_of_time="2026-08-26T15:00:00+08:00")
+
+    assert rows == [{"ts_code": "000001.SZ", "industry": "银行"}]
 
 
 def test_materialize_financial_series_keeps_cutoff_availability(monkeypatch) -> None:

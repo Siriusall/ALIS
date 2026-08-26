@@ -86,7 +86,37 @@ def _ocr_image(content: bytes) -> list[dict[str, Any]]:
     if not swift and command_line_swift.exists():
         swift = str(command_line_swift)
     if platform.system() != "Darwin" or not swift or not OCR_SCRIPT.exists():
-        raise RuntimeError("macos_vision_ocr_unavailable")
+        tesseract = shutil.which("tesseract")
+        if not tesseract:
+            raise RuntimeError("ocr_backend_unavailable")
+        with tempfile.TemporaryDirectory(prefix="alis-caam-ocr-") as directory:
+            image_path = Path(directory) / "source-image"
+            image_path.write_bytes(content)
+            completed = subprocess.run(
+                [tesseract, str(image_path), "stdout", "-l", "chi_sim+eng", "tsv"],
+                capture_output=True,
+                check=True,
+                timeout=OCR_TIMEOUT_SECONDS,
+            )
+        rows: dict[tuple[str, str, str, str], list[tuple[str, float]]] = {}
+        for raw_line in completed.stdout.decode("utf-8", errors="replace").splitlines()[1:]:
+            columns = raw_line.split("\t")
+            if len(columns) < 12 or not columns[11].strip():
+                continue
+            try:
+                confidence = max(0.0, min(1.0, float(columns[10]) / 100.0))
+            except ValueError:
+                confidence = 0.0
+            key = (columns[1], columns[2], columns[3], columns[4])
+            rows.setdefault(key, []).append((columns[11].strip(), confidence))
+        return [
+            {
+                "text": " ".join(word for word, _confidence in words),
+                "confidence": round(sum(confidence for _word, confidence in words) / len(words), 6),
+                "engine": "tesseract_chi_sim_eng",
+            }
+            for words in rows.values() if words
+        ]
     with tempfile.TemporaryDirectory(prefix="alis-caam-ocr-") as directory:
         image_path = Path(directory) / "source-image"
         image_path.write_bytes(content)
@@ -100,7 +130,8 @@ def _ocr_image(content: bytes) -> list[dict[str, Any]]:
     if not isinstance(payload, list):
         raise RuntimeError("macos_vision_ocr_invalid_payload")
     return [
-        {"text": str(item.get("text") or "").strip(), "confidence": round(float(item.get("confidence") or 0), 6)}
+        {"text": str(item.get("text") or "").strip(), "confidence": round(float(item.get("confidence") or 0), 6),
+         "engine": "macos_vision_accurate_zh_hans"}
         for item in payload if isinstance(item, dict) and str(item.get("text") or "").strip()
     ]
 
@@ -477,14 +508,14 @@ def sync_caam_ocr_candidates(*, max_documents: int = MAX_NEW_DOCUMENTS_PER_CYCLE
                 documents.append({"url": page_url, "status": "ocr_no_structured_fields", "ocr_lines": len(lines)})
                 continue
             evidence = {
-                "contract": "alis_caam_macos_vision_ocr_candidate_v1",
+                "contract": "alis_caam_cross_platform_ocr_candidate_v2",
                 "page_url": page_url,
                 "image_url": image_urls[0],
                 "title": title,
                 "publish_time": _published_time(html),
                 "observation_date": observation_date,
                 "image_sha256": sha256(image_content).hexdigest(),
-                "ocr_engine": "macos_vision_accurate_zh_hans",
+                "ocr_engine": str((lines[0] if lines else {}).get("engine") or "unknown"),
                 "ocr_lines": lines,
                 "validation_status": "pending_structured_reconciliation",
                 "production_eligible": False,
@@ -515,6 +546,6 @@ def sync_caam_ocr_candidates(*, max_documents: int = MAX_NEW_DOCUMENTS_PER_CYCLE
         "observations_written": written,
         "documents": documents,
         "indexes": index_results,
-        "contract": "alis_caam_macos_vision_ocr_candidate_v1",
+        "contract": "alis_caam_cross_platform_ocr_candidate_v2",
         "production_eligible": False,
     }
