@@ -31,6 +31,8 @@ export function Status({ children, tone }: { children: ReactNode; tone?: Tone })
     missed_execution_window: "已错过执行窗口",
     research_shadow_observing: "研究影子观察",
     owner: "本机持有", follower: "跟随实例", disabled: "已委托",
+    unknown: "未知", retry_wait: "等待重试", scheduled: "已排期",
+    waiting_condition: "等待条件", stopping: "正在停止", alive: "存活", error: "错误",
   };
   const label = typeof value === "string" ? labels[value.toLowerCase()] || value : value;
   return <span className={`status status-${tone || toneOf(value)}`}><i />{label}</span>;
