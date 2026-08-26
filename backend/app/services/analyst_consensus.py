@@ -247,7 +247,7 @@ def batch_analyst_consensus(*, limit: int = 100, as_of_time: str | None = None) 
         # discovery bounded without DISTINCT/sorting the append-only archive.
         cutoff_clause = " AND r.trade_date<=? AND r.available_time<=?"
         cutoff_params.extend((cutoff, cutoff_time))
-    with _conn() as c:
+    with _read_conn() as c:
         rows = [dict(row) for row in c.execute(
             f"""SELECT m.ts_code
                  FROM dc_stock_master m

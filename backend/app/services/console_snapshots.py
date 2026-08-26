@@ -423,7 +423,7 @@ def _readers(page_key: str) -> dict[str, Callable[[], Any]]:
             "researchPositionState": research.research_position_states,
             "researchDataAssets": lambda: model_strategy.model_strategy_evolution_research_data_assets() if hasattr(model_strategy, "model_strategy_evolution_research_data_assets") else {},
             "analystConsensus": lambda: model_strategy.model_strategy_analyst_consensus_batch(limit=100),
-            "theses": research.research_thesis_list,
+            "theses": lambda: research.research_thesis_list(limit=100),
             "industries": research_industries,
             "industryAllocation": lambda: research.research_industry_allocation(compact=True),
             # Route handlers use FastAPI Query defaults.  The control worker

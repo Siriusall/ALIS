@@ -851,43 +851,18 @@ def list_themes(
                 "available_time<=?", "created_at<=?", "updated_at<=?",
             ])
             params.extend([visibility_cutoff, visibility_cutoff, visibility_cutoff])
-        # Enumerate lightweight keys first, then search each theme's history in
-        # bounded date pages.  Every page has an exact theme/date predicate and
-        # the loop is exhaustive, so an invalid recent PIT envelope cannot hide
-        # an older valid row and no fixed transport cap changes the result.
-        theme_codes: list[str] = []
-        last_code = ""
-        while True:
-            key_clauses = list(clauses)
-            key_params = list(params)
-            if last_code:
-                key_clauses.append("theme_code>?")
-                key_params.append(last_code)
-            where = "WHERE " + " AND ".join(key_clauses) if key_clauses else ""
-            batch = c.execute(
-                f"""SELECT DISTINCT theme_code FROM dc_theme_snapshot {where}
-                    ORDER BY theme_code LIMIT ?""",
-                tuple(key_params) + (_THEME_READ_BATCH_SIZE,),
-            ).fetchall()
-            codes = [str(dict(row).get("theme_code") or "") for row in batch]
-            codes = [code for code in codes if code]
-            if not codes:
-                break
-            theme_codes.extend(codes)
-            if len(codes) < _THEME_READ_BATCH_SIZE:
-                break
-            last_code = codes[-1]
-        visible_by_theme: dict[str, dict[str, Any]] = {}
-        candidate_rows = 0
-        for theme_code in theme_codes:
-            for row in _theme_snapshot_candidates(
-                c,
-                theme_code=theme_code,
-                cutoff_date=cutoff,
-                visibility_cutoff=visibility_cutoff,
-                promotable_only=promotable_only,
-            ):
-                candidate_rows += 1
+        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        if bool(getattr(c, "_is_postgres", False)):
+            batch = [
+                dict(r)
+                for r in c.execute(
+                    f"""SELECT DISTINCT ON (theme_code) * FROM dc_theme_snapshot {where}
+                        ORDER BY theme_code, as_of_date DESC, promotable DESC, score DESC""",
+                    tuple(params),
+                ).fetchall()
+            ]
+            visible_by_theme: dict[str, dict[str, Any]] = {}
+            for row in batch:
                 try:
                     payload = json.loads(row.get("payload_json") or "{}")
                 except (TypeError, json.JSONDecodeError):
@@ -900,8 +875,58 @@ def list_themes(
                 ):
                     continue
                 row["_decoded_payload"] = payload
-                visible_by_theme[theme_code] = row
-                break
+                code = str(row.get("theme_code") or "")
+                if code:
+                    visible_by_theme[code] = row
+            candidate_rows = len(batch)
+        else:
+            theme_codes: list[str] = []
+            last_code = ""
+            while True:
+                key_clauses = list(clauses)
+                key_params = list(params)
+                if last_code:
+                    key_clauses.append("theme_code>?")
+                    key_params.append(last_code)
+                where_clause = "WHERE " + " AND ".join(key_clauses) if key_clauses else ""
+                batch = c.execute(
+                    f"""SELECT DISTINCT theme_code FROM dc_theme_snapshot {where_clause}
+                        ORDER BY theme_code LIMIT ?""",
+                    tuple(key_params) + (_THEME_READ_BATCH_SIZE,),
+                ).fetchall()
+                codes = [str(dict(row).get("theme_code") or "") for row in batch]
+                codes = [code for code in codes if code]
+                if not codes:
+                    break
+                theme_codes.extend(codes)
+                if len(codes) < _THEME_READ_BATCH_SIZE:
+                    break
+                last_code = codes[-1]
+            visible_by_theme = {}
+            candidate_rows = 0
+            for theme_code in theme_codes:
+                for row in _theme_snapshot_candidates(
+                    c,
+                    theme_code=theme_code,
+                    cutoff_date=cutoff,
+                    visibility_cutoff=visibility_cutoff,
+                    promotable_only=promotable_only,
+                ):
+                    candidate_rows += 1
+                    try:
+                        payload = json.loads(row.get("payload_json") or "{}")
+                    except (TypeError, json.JSONDecodeError):
+                        payload = {}
+                    if not _theme_snapshot_visible_at(
+                        payload,
+                        visibility_cutoff,
+                        row=row,
+                        allow_legacy_current=not bool(as_of_time),
+                    ):
+                        continue
+                    row["_decoded_payload"] = payload
+                    visible_by_theme[theme_code] = row
+                    break
         rows = sorted(
             visible_by_theme.values(),
             key=lambda item: (
@@ -923,17 +948,25 @@ def list_themes(
             }
         company_counts: dict[tuple[str, str], int] = {}
         if rows and include_company_counts:
-            for row in rows:
-                key = (
-                    str(row.get("as_of_date") or ""),
-                    str(row.get("theme_code") or ""),
-                )
-                company_counts[key] = _theme_mapping_count(
-                    c,
-                    as_of_date=key[0],
-                    theme_code=key[1],
-                    visibility_cutoff=mapping_cutoff,
-                )
+            pairs = [(str(row.get("as_of_date") or ""), str(row.get("theme_code") or "")) for row in rows]
+            if bool(getattr(c, "_is_postgres", False)) and pairs and not mapping_cutoff:
+                values_tuples = ",".join(["(?, ?)"] * len(pairs))
+                flat_params = [v for p in pairs for v in p]
+                cnt_sql = f"SELECT as_of_date, theme_code, COUNT(*) as cnt FROM dc_theme_company_mapping WHERE (as_of_date, theme_code) IN ({values_tuples}) GROUP BY as_of_date, theme_code"
+                for cr in c.execute(cnt_sql, tuple(flat_params)).fetchall():
+                    company_counts[(str(cr["as_of_date"]), str(cr["theme_code"]))] = int(cr["cnt"] or 0)
+            else:
+                for row in rows:
+                    key = (
+                        str(row.get("as_of_date") or ""),
+                        str(row.get("theme_code") or ""),
+                    )
+                    company_counts[key] = _theme_mapping_count(
+                        c,
+                        as_of_date=key[0],
+                        theme_code=key[1],
+                        visibility_cutoff=mapping_cutoff,
+                    )
         for row in rows:
             row["payload"] = row.pop("_decoded_payload", None) or json.loads(row.pop("payload_json") or "{}")
             if not isinstance(row["payload"].get("point_in_time"), dict):
