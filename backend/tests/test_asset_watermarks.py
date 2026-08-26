@@ -48,18 +48,24 @@ def test_watermark_status_prefers_data_max_date_and_flags_stale_audit(tmp_path, 
             "coverage_basis": 10,
             "coverage_expected": 10,
             "source": "test",
-            "max_date": "20260826",
-            "window_end": "20260826",
+            "max_date": "20260724",
+            "window_end": "20260724",
             "period_details": [],
         }]})
         monkeypatch.setattr(watermarks, "_live_market_max_trade_date", lambda: "20260826")
         refresh_calls = {"n": 0}
+        patch_calls = {"n": 0}
 
         def _fake_refresh(**_kwargs):
             refresh_calls["n"] += 1
             return {"started": True, "running": True}
 
+        def _fake_patch(**_kwargs):
+            patch_calls["n"] += 1
+            return {"ok": True, "patched": 1, "live_max_trade_date": "20260826"}
+
         monkeypatch.setattr(watermarks, "request_data_assets_refresh", _fake_refresh)
+        monkeypatch.setattr(watermarks, "patch_live_market_frontier", _fake_patch)
 
         with db._conn() as conn:
             conn.execute(
@@ -71,10 +77,12 @@ def test_watermark_status_prefers_data_max_date_and_flags_stale_audit(tmp_path, 
         daily = next(item for item in status["items"] if item["asset_key"] == "daily")
         assert daily["watermark"] == "20260826"
         assert daily["data_max_date"] == "20260826"
+        assert daily["live_frontier_override"] is True
         assert daily["audit_checked_at"] == "2026-07-26T17:48:24"
         assert status["freshness"]["stale"] is True
         assert status["freshness"]["live_max_trade_date"] == "20260826"
         assert status["refresh"]["triggered"] is True
         assert refresh_calls["n"] == 1
+        assert patch_calls["n"] == 1
     finally:
         db.DB_PATH = original

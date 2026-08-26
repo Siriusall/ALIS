@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 from datetime import date, datetime, timedelta
@@ -191,6 +192,14 @@ def invalidate_data_assets_cache() -> None:
 def _compute_data_assets() -> dict[str, Any]:
     today = datetime.now(_BUSINESS_TZ).date()
     with _conn() as c:
+        # Full catalog rebuild scans many coverage tables. Keep a bounded but
+        # longer budget than interactive API reads so statement_timeout does
+        # not permanently freeze the watermark directory.
+        if bool(getattr(c, "_is_postgres", False)):
+            c.execute(
+                "SELECT set_config('statement_timeout', ?, false)",
+                (os.getenv("ASSET_CATALOG_STATEMENT_TIMEOUT_MS", "300000"),),
+            )
         end = target_trade_day(c)
     start = end - timedelta(days=DAILY_LOOKBACK_DAYS)
     start_s, end_s = start.strftime("%Y%m%d"), end.strftime("%Y%m%d")

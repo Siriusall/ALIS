@@ -19,6 +19,25 @@ OPTIONAL_ASSETS = {"web_fallback", "shareholder_return", "namechange", "pledge_d
 _BUSINESS_TZ = ZoneInfo("Asia/Shanghai")
 # Watermark audits older than this, or lagging the live market day, must refresh.
 _WATERMARK_STALE_HOURS = 12
+# These assets share the market trade-date frontier and can be patched cheaply.
+_MARKET_FRONTIER_ASSETS = frozenset({
+    "daily",
+    "adj_factor",
+    "valuation",
+    "limit_price",
+    "snapshot",
+    "suspension",
+    "moneyflow",
+    "industry_index",
+    "vip_fund_daily",
+    "vip_margin",
+    "vip_margin_detail",
+    "vip_moneyflow_hsgt",
+    "vip_top_inst",
+    "vip_top_list",
+    "etf_price_nav_vip",
+})
+_ASSET_CATALOG_STATEMENT_TIMEOUT_MS = "300000"
 
 
 def _tier(asset_key: str) -> str:
@@ -153,7 +172,11 @@ def apply_terminal_states(payload: dict[str, Any]) -> dict[str, Any]:
     return payload
 
 
-def _enrich_watermark_item(item: dict[str, Any]) -> dict[str, Any]:
+def _enrich_watermark_item(
+    item: dict[str, Any],
+    *,
+    live_max_trade_date: str = "",
+) -> dict[str, Any]:
     metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
     snapshot = metadata.get("asset_snapshot") if isinstance(metadata.get("asset_snapshot"), dict) else {}
     data_max_date = (
@@ -166,6 +189,17 @@ def _enrich_watermark_item(item: dict[str, Any]) -> dict[str, Any]:
         or _normalize_trade_date(snapshot.get("window_end"))
         or data_max_date
     )
+    live_override = False
+    asset_key = str(item.get("asset_key") or "")
+    if (
+        live_max_trade_date
+        and str(item.get("slice_key") or "") == "overall"
+        and asset_key in _MARKET_FRONTIER_ASSETS
+        and (not data_max_date or data_max_date < live_max_trade_date)
+    ):
+        data_max_date = live_max_trade_date
+        window_end = live_max_trade_date
+        live_override = True
     item["name"] = snapshot.get("name") or item.get("asset_key")
     item["data_max_date"] = data_max_date or None
     item["window_end"] = window_end or None
@@ -174,7 +208,65 @@ def _enrich_watermark_item(item: dict[str, Any]) -> dict[str, Any]:
     item["audit_checked_at"] = item.get("checked_at")
     # Keep `watermark` as the data frontier, not the audit write time.
     item["watermark"] = data_max_date or window_end or None
+    item["live_frontier_override"] = live_override
     return item
+
+
+def patch_live_market_frontier(*, live_max_trade_date: str | None = None) -> dict[str, Any]:
+    """Persist cheap live market dates without waiting for the full catalog rebuild."""
+    live_max = _normalize_trade_date(live_max_trade_date) or _live_market_max_trade_date()
+    if not live_max:
+        return {"ok": False, "patched": 0, "reason": "live_max_unavailable"}
+    now = datetime.now(_BUSINESS_TZ).isoformat(timespec="seconds")
+    patched = 0
+    with _conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT asset_key, metadata_json
+            FROM dc_asset_watermark
+            WHERE slice_key='overall'
+            """
+        ).fetchall()
+        for raw in rows:
+            row = dict(raw)
+            asset_key = str(row.get("asset_key") or "")
+            if asset_key not in _MARKET_FRONTIER_ASSETS:
+                continue
+            metadata = json.loads(row.get("metadata_json") or "{}")
+            if not isinstance(metadata, dict):
+                metadata = {}
+            snapshot = metadata.get("asset_snapshot") if isinstance(metadata.get("asset_snapshot"), dict) else {}
+            current = (
+                _normalize_trade_date(metadata.get("data_max_date"))
+                or _normalize_trade_date(snapshot.get("max_date"))
+                or _normalize_trade_date(metadata.get("window_end"))
+                or _normalize_trade_date(snapshot.get("window_end"))
+            )
+            if current and current >= live_max:
+                continue
+            metadata["data_max_date"] = live_max
+            metadata["window_end"] = live_max
+            if snapshot:
+                snapshot = dict(snapshot)
+                snapshot["max_date"] = live_max
+                snapshot["window_end"] = live_max
+                metadata["asset_snapshot"] = snapshot
+            metadata["live_frontier_patched_at"] = now
+            conn.execute(
+                """
+                UPDATE dc_asset_watermark
+                SET metadata_json=?, updated_at=?
+                WHERE asset_key=? AND slice_key='overall'
+                """,
+                (json.dumps(metadata, ensure_ascii=False, default=str), now, asset_key),
+            )
+            patched += 1
+    return {
+        "ok": True,
+        "patched": patched,
+        "live_max_trade_date": live_max,
+        "patched_at": now,
+    }
 
 
 def _watermark_freshness(items: list[dict[str, Any]]) -> dict[str, Any]:
@@ -240,15 +332,27 @@ def asset_watermark_status(*, trigger_refresh_if_stale: bool = True) -> dict[str
         rows = conn.execute("""SELECT asset_key,slice_key,contract_tier,expected_count,available_count,
             missing_count,status,terminal_reason,repair_priority,source_code,metadata_json,checked_at,updated_at
             FROM dc_asset_watermark ORDER BY repair_priority,asset_key,slice_key""").fetchall()
+    live_max_trade_date = _live_market_max_trade_date()
     items = []
     for row in rows:
         item = dict(row)
         item["metadata"] = json.loads(item.pop("metadata_json") or "{}")
-        items.append(_enrich_watermark_item(item))
+        items.append(_enrich_watermark_item(item, live_max_trade_date=live_max_trade_date))
     freshness = _watermark_freshness(items)
-    refresh = {"started": False, "running": False, "triggered": False}
+    # Recompute with the true live probe so lag detection is independent of
+    # per-row overrides that already surface the frontier on the page.
+    freshness["live_max_trade_date"] = live_max_trade_date or freshness.get("live_max_trade_date")
+    if live_max_trade_date and freshness.get("audit_trade_date") and freshness["audit_trade_date"] < live_max_trade_date:
+        freshness["stale"] = True
+        freshness["reason"] = "audit_behind_live_market"
+    refresh = {"started": False, "running": False, "triggered": False, "frontier_patch": None}
     if trigger_refresh_if_stale and freshness["stale"]:
-        refresh = {**request_data_assets_refresh(invalidate=True), "triggered": True}
+        refresh["frontier_patch"] = patch_live_market_frontier(live_max_trade_date=live_max_trade_date)
+        refresh = {
+            **refresh,
+            **request_data_assets_refresh(invalidate=True),
+            "triggered": True,
+        }
     return {
         "ok": True,
         "items": items,
