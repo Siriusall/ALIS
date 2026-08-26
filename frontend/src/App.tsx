@@ -6,6 +6,7 @@ import { AuthPage, RequireAuth, useAuth } from "./auth";
 import { ConsoleLoading, ErrorStrip } from "./components";
 import { DataAssets, EvidenceChain, Evolution, FactorGuidance, ModelGovernance, Operations, Overview, Portfolio, Research, ResearchEfficiency, ResearchWaves, SystemObservatory, SystemVersions, TodayDecision } from "./pages";
 import { preloadConsoleRoutes, useConsoleData } from "./useConsoleData";
+import type { ConsoleData } from "./useConsoleData";
 
 type NavItem = {
   key: string;
@@ -43,6 +44,81 @@ function formatCheckedAt(value: unknown) {
   const text = String(value || "").trim();
   if (!text) return "更新于当前会话";
   return `快照 ${text.replace("T", " ").replace(/([+-]\d\d:\d\d|Z)$/, "").split(".")[0]}`;
+}
+
+function formatSnapshotTime(value: unknown) {
+  const text = String(value || "").trim();
+  if (!text) return "尚未生成";
+  const parsed = new Date(text);
+  if (Number.isNaN(parsed.getTime())) return text.replace("T", " ").replace(/([+-]\d\d:\d\d|Z)$/, "").split(".")[0];
+  return new Intl.DateTimeFormat("zh-CN", {
+    timeZone: "Asia/Shanghai",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  }).format(parsed).replace(/\//g, "-");
+}
+
+const snapshotPageLabels: Record<string, string> = {
+  overview: "系统总览",
+  decision: "今日决策",
+  portfolio: "账户与组合",
+  operations: "系统与任务",
+  versions: "版本发布",
+  data: "数据日更",
+  models: "模型治理",
+  research: "公司与行业研究",
+  factors: "模型与因子",
+  waves: "实验批次",
+  evidence: "证据审计",
+};
+
+function SnapshotStatusBar({
+  snapshot,
+  refreshing,
+  progress,
+}: {
+  snapshot?: ConsoleData["__snapshot"];
+  refreshing: boolean;
+  progress: { completed: number; total: number };
+}) {
+  if (!snapshot?.page) return null;
+  const sourceStatus = String(snapshot.sourceStatus || "").toLowerCase();
+  const stale = Boolean(snapshot.stale);
+  const serverRefreshing = Boolean(snapshot.refreshing);
+  const active = refreshing || serverRefreshing;
+  const latest = Boolean(snapshot.generatedAt)
+    && !stale
+    && !active
+    && !["warming_up", "unavailable", "error"].includes(sourceStatus);
+  const failed = sourceStatus === "error" || sourceStatus === "unavailable";
+  const stateLabel = failed
+    ? "快照刷新异常"
+    : latest
+      ? sourceStatus === "degraded" ? "最新快照 · 部分可用" : "已是最新快照"
+      : serverRefreshing || stale
+        ? "正在生成新快照"
+        : "正在检查最新快照";
+  const progressLabel = failed
+    ? "等待后台重试"
+    : latest
+      ? "刷新已完成"
+      : serverRefreshing || stale
+        ? "后台生成中，完成后自动切换"
+        : progress.total > 0 && progress.completed >= progress.total
+          ? "正在确认服务端版本"
+          : "正在读取快照状态";
+  const tone = failed ? "error" : latest ? "latest" : "refreshing";
+
+  return <div className={`snapshot-status-bar is-${tone}`} role="status" aria-live="polite">
+    <div className="snapshot-status-main"><span className="snapshot-state-dot"/><strong>{stateLabel}</strong><small>页面快照：{snapshotPageLabels[String(snapshot.page)] || "当前页面"}</small></div>
+    <div className="snapshot-status-time"><span>快照刷新时间</span><strong>{formatSnapshotTime(snapshot.generatedAt)}</strong></div>
+    <div className="snapshot-status-progress"><div><span>后台刷新进度</span><strong>{progressLabel}</strong></div><span className={`snapshot-progress-track ${latest ? "is-complete" : "is-active"}`}><i/></span></div>
+  </div>;
 }
 
 function ConsoleApp() {
@@ -87,9 +163,7 @@ function ConsoleApp() {
           <ConsoleLoading page={currentPage} completed={progress.completed} total={progress.total} message={loadingMessage}/>
         ) : (
           <>
-            {refreshing && hasVisibleData && (
-              <div className="refresh-banner" role="status" aria-live="polite">正在后台刷新页面快照</div>
-            )}
+            {hasVisibleData && <SnapshotStatusBar snapshot={data.__snapshot} refreshing={refreshing} progress={progress}/>}
             <ErrorStrip errors={errors}/>
             <Routes>
               <Route path="/overview" element={<Overview data={data}/>}/><Route path="/system" element={<SystemObservatory data={data}/>}/><Route path="/system/versions" element={<SystemVersions data={data}/>}/><Route path="/decision" element={<TodayDecision data={data}/>}/><Route path="/portfolio" element={<Portfolio data={data}/>}/><Route path="/evolution" element={<Evolution data={data}/>}/><Route path="/evolution/factors" element={<FactorGuidance data={data}/>}/><Route path="/evolution/metrics" element={<ResearchEfficiency data={data}/>}/><Route path="/evolution/waves" element={<ResearchWaves data={data}/>}/><Route path="/research" element={<Research data={data}/>}/>
