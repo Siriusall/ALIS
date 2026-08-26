@@ -133,6 +133,22 @@ def test_manual_refresh_coalesces_an_already_queued_snapshot(monkeypatch):
     assert deleted == []
 
 
+@pytest.mark.parametrize("page_key", ("overview", "data"))
+def test_snapshot_watermarks_do_not_trigger_another_refresh(monkeypatch, page_key):
+    from app.data_platform.routes import data_center
+
+    received: list[bool] = []
+    monkeypatch.setattr(
+        data_center,
+        "data_center_asset_watermarks",
+        lambda *, trigger_refresh_if_stale: received.append(trigger_refresh_if_stale) or {},
+    )
+
+    snapshots._readers(page_key)["watermarks"]()
+
+    assert received == [False]
+
+
 def test_snapshot_refresh_defaults_match_page_freshness_contract():
     assert snapshots._ttl("overview") == 180
     assert snapshots._ttl("decision") == 180

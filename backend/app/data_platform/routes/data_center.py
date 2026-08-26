@@ -191,9 +191,11 @@ def data_center_assets() -> dict[str, Any]:
 
 
 @router.get("/data-center/assets/watermarks")
-def data_center_asset_watermarks() -> dict[str, Any]:
+def data_center_asset_watermarks(
+    trigger_refresh_if_stale: bool = Query(default=True, include_in_schema=False),
+) -> dict[str, Any]:
     try:
-        return asset_watermark_status()
+        return asset_watermark_status(trigger_refresh_if_stale=trigger_refresh_if_stale)
     except Exception as exc:  # noqa: BLE001 - optional asset evidence must degrade safely
         return degraded_read("asset_watermarks", exc, items=[])
 

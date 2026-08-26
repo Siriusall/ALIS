@@ -343,7 +343,12 @@ def _readers(page_key: str) -> dict[str, Callable[[], Any]]:
             "latestPlan": lambda: decision_latest_plan(compact=True),
             "adminTasksLive": lambda: model_strategy.model_strategy_task_center(limit=30, log_limit=20, compact=True),
             "dailyUpdateStatus": lambda: data_center.data_center_daily_update_status(compact=True),
-            "watermarks": data_center.data_center_asset_watermarks,
+            # A stale watermark can request its own catalog rebuild, which in
+            # turn invalidates this page. Snapshot assembly must only read the
+            # current projection or it can continuously invalidate itself.
+            "watermarks": lambda: data_center.data_center_asset_watermarks(
+                trigger_refresh_if_stale=False,
+            ),
             "ledgerAudit": model_strategy.model_strategy_ledger_audit,
         },
         "decision": {
@@ -385,7 +390,9 @@ def _readers(page_key: str) -> dict[str, Callable[[], Any]]:
         "data": {
             "oos": bounded_oos,
             "sealed": bounded_sealed,
-            "watermarks": data_center.data_center_asset_watermarks,
+            "watermarks": lambda: data_center.data_center_asset_watermarks(
+                trigger_refresh_if_stale=False,
+            ),
             "failedRequests": lambda: data_center.data_center_failed_tushare_requests(request_status="pending", limit=100),
             "dataOperations": lambda: data_center.data_center_llm_data_operations(limit=20),
             "runtimeLogs": lambda: data_center.data_center_runtime_logs(after_id=0, limit=100, wait_seconds=0.0),
