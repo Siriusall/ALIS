@@ -1,7 +1,7 @@
 import { Activity, ArrowUpRight, Banknote, BookOpen, Boxes, BrainCircuit, Building2, ChartNoAxesCombined, ChartPie, ChevronLeft, ChevronRight, CirclePlus, Clock3, Database, FileSearch, FlaskConical, Gauge, GitBranch, Layers3, ListTree, LogOut, Pause, Radio, ScanSearch, Search, ServerCog, Shield, ShieldCheck, Sigma, Sparkles, Telescope, TrendingDown, TrendingUp, TriangleAlert, WalletCards, Workflow } from "lucide-react";
 import { endpoints, firstArray, number, pick, readApi, Json, unwrapOwner } from "./api";
 import { useEffect, useRef, useState } from "react";
-import { Empty, EvidenceDetails, fmtMoney, fmtPct, fmtPoints, Metric, PageHeader, Progress, Section, Status, toneOf } from "./components";
+import { Empty, EvidenceDetails, fmtMoney, fmtPct, fmtPoints, Metric, PageHeader, Section, Status, toneOf } from "./components";
 import type { ConsoleData } from "./useConsoleData";
 
 const actions = ["buy_candidate", "add_position", "reduce_position", "sell_exit", "research_only", "hold", "defensive_switch"];
@@ -40,18 +40,6 @@ function ownerState(owner?: Json, tradingReady?: Json) {
             : readinessKnown ? "执行状态待确认" : "执行状态证据未返回";
   const statusLabel = isolated ? "研究隔离" : readinessStatus === "blocked" ? "今日阻断" : readinessStatus === "ready" ? "允许执行" : readinessStatus === "waiting" ? "等待执行窗口" : readinessStatus === "running" ? "执行中" : "证据缺失";
   return { status, mode, reason, isolated, defensiveContinuity, defensiveMaximum, readinessStatus, tradingBlocked, label, statusLabel };
-}
-
-function acceptance(owner?: Json) {
-  const raw = pick(owner, ["acceptance_progress", "acceptance", "progress"], {});
-  const items = firstArray(raw, ["items", "stages"]);
-  if (items.length) return items;
-  return [
-    { name: "候选因子评价", current: number(raw, ["factor.current", "factor_evaluations.current"]), target: number(raw, ["factor.target", "factor_evaluations.target"], 20) },
-    { name: "成本候选", current: number(raw, ["cost_candidate.current", "trades.total"]), target: number(raw, ["cost_candidate.target"], 20) },
-    { name: "成本自动激活", current: number(raw, ["cost_activation.current", "trades.total"]), target: number(raw, ["cost_activation.target"], 50) },
-    { name: "跨日自治", current: number(raw, ["autonomy.current", "autonomous_days"]), target: number(raw, ["autonomy.target"], 20) },
-  ];
 }
 
 function metricTone(value: unknown) {
@@ -307,7 +295,6 @@ export function Overview({ data }: { data: ConsoleData }) {
     </div>
     {state.isolated&&<div className="overview-risk-note"><TriangleAlert size={18}/><div><strong>当前策略处于研究隔离</strong><span>{state.defensiveContinuity?`仅允许减仓、卖出及最多 ${fmtPct(state.defensiveMaximum)} 的登记防御 ETF。`:"仅允许减仓、卖出、账本审计和候选研究。"}</span></div></div>}
     <HomeRuntimeSummary data={data}/>
-    <Section title="距离下一次验收还差多少" detail="进度取各硬门的最短板，不用平均值掩盖缺口。"><div className="progress-grid">{acceptance(owner).map((item, index) => <Progress key={index} label={String(item.name || item.label || "验收项")} current={Number(item.current ?? item.value ?? 0)} target={Number(item.target ?? 1)} suffix={String(item.unit || "")} />)}</div></Section>
     <Section title="历史周期异常与系统自行处理事项" detail="周期证据与当前实时 readiness 分开显示；只有需要所有者授权的事项会提升为强通知。">{incidents.length ? <div className="incident-list">{incidents.slice(0, 6).map((item, i) => {const historical=String(pick(item,["evidence_scope"],""))==="completed_cycle";return <div key={i}><Status>{pick(item, ["disposition", "status"], "观察")}</Status><div><strong>{historical ? "历史周期证据 · " : ""}{pick(item, ["title", "summary", "name"], "运行事项")}</strong><p>{pick(item, ["next_review", "reason", "detail"], "等待下一周期复核")}{historical && pick(item,["observed_at"],"") ? ` · 观测于 ${String(pick(item,["observed_at"],""))}` : ""}</p></div></div>})}</div> : <Empty title="没有需要所有者处理的事项" detail="等待未来样本和冷却期不计为故障。" />}<a className="text-link" href="/operations">查看系统运行证据 →</a></Section>
   </>;
 }
