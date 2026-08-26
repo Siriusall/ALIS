@@ -2,7 +2,7 @@
 
 from fastapi import APIRouter, HTTPException, Query
 
-from app.services.console_snapshots import PAGE_KEYS, invalidate, read, status
+from app.services.console_snapshots import PAGE_KEYS, read, request_refresh, status
 
 
 router = APIRouter(tags=["console-snapshots"])
@@ -16,8 +16,9 @@ def console_page_snapshot(
     try:
         if refresh:
             # The browser can request freshness but never executes a build.
-            # The control worker observes this durable invalidation.
-            invalidate((page_key,), reason="manual_console_refresh")
+            # Coalesce repeated clicks while a control-worker build is already
+            # in flight, so its compare-and-swap can still commit the result.
+            request_refresh(page_key)
         return read(page_key, force=refresh)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail={"code": "unknown_snapshot_page", "pages": PAGE_KEYS}) from exc

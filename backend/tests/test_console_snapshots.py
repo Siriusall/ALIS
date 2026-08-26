@@ -100,6 +100,39 @@ def test_missing_snapshot_never_builds_in_browser_read(monkeypatch):
     assert payload["refreshing"] is True
 
 
+def test_manual_refresh_coalesces_an_already_queued_snapshot(monkeypatch):
+    calls: list[tuple[str, tuple[object, ...]]] = []
+    deleted: list[str] = []
+
+    class Result:
+        def __init__(self, row):
+            self.row = row
+
+        def fetchone(self):
+            return self.row
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, sql, params=()):
+            calls.append((str(sql), tuple(params)))
+            return Result(None)
+
+    monkeypatch.setattr(snapshots, "_ensure_table", lambda: None)
+    monkeypatch.setattr(snapshots, "_conn", lambda: Connection())
+    monkeypatch.setattr(snapshots, "redis_delete", lambda key: deleted.append(key) or True)
+
+    queued = snapshots.request_refresh("overview")
+
+    assert queued is False
+    assert "WHERE console_page_snapshots.invalidated_at IS NULL" in calls[0][0]
+    assert deleted == []
+
+
 def test_snapshot_refresh_defaults_match_page_freshness_contract():
     assert snapshots._ttl("overview") == 180
     assert snapshots._ttl("decision") == 180

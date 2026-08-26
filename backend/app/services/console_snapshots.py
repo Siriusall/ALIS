@@ -768,6 +768,39 @@ def invalidate(page_keys: list[str] | tuple[str, ...] = PAGE_KEYS, *, reason: st
         redis_delete(_redis_key(page_key))
 
 
+def request_refresh(page_key: str) -> bool:
+    """Queue one browser-requested rebuild without starving its writer.
+
+    A manual refresh is advisory: once a page is already invalidated, further
+    clicks must not keep advancing its generation while the control worker is
+    assembling the replacement document.  Source mutations keep using
+    ``invalidate()`` and therefore retain the stricter compare-and-swap rule.
+    """
+    if page_key not in PAGE_KEYS:
+        raise ValueError(f"unsupported console page: {page_key}")
+    _ensure_table()
+    now = _now()
+    sentinel = _serialize(_warming_payload(page_key, 1))
+    with _conn() as conn:
+        row = conn.execute(
+            """INSERT INTO console_page_snapshots
+                (page_key,version,generated_at,as_of,status,invalidated_at,payload_json,updated_at,
+                 refresh_generation,last_attempt_generation,last_attempt_at,last_error_code)
+               VALUES (?, '', '', '', 'warming_up', ?, ?, ?, 1, -1, NULL, '')
+               ON CONFLICT (page_key) DO UPDATE SET
+                 invalidated_at=EXCLUDED.invalidated_at,
+                 refresh_generation=console_page_snapshots.refresh_generation + 1,
+                 updated_at=EXCLUDED.updated_at
+               WHERE console_page_snapshots.invalidated_at IS NULL
+               RETURNING refresh_generation""",
+            (page_key, now, sentinel, now),
+        ).fetchone()
+    if row is not None:
+        redis_delete(_redis_key(page_key))
+        return True
+    return False
+
+
 def _parse_timestamp(value: Any) -> datetime | None:
     try:
         parsed = datetime.fromisoformat(str(value or "").replace("Z", "+00:00"))
