@@ -673,9 +673,8 @@ def _node_views(
             status = "healthy" if database_healthy else "failed"
             status_reason = "数据库连接与只读检查正常" if database_healthy else "数据库健康检查失败"
         elif node_name == "alis-app":
-            service_failures = [item for item in services if item.get("status") == "failed"]
-            status = "failed" if service_failures else "running"
-            status_reason = "应用常驻服务心跳正常" if not service_failures else "应用常驻服务存在异常"
+            status = "running"
+            status_reason = "任务中心接口正常响应；常驻组件异常在下方单独展示"
         else:
             status = "running" if heartbeat_healthy else "degraded" if node_heartbeats else "unknown"
             status_reason = "Worker 心跳正常" if heartbeat_healthy else "Worker 心跳缺失或已超时"
