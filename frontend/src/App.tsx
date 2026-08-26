@@ -39,13 +39,37 @@ const pageNames: Record<string, string> = {
   "/data": "数据与日更", "/evidence": "证据与审计",
 };
 
+function formatCheckedAt(value: unknown) {
+  const text = String(value || "").trim();
+  if (!text) return "更新于当前会话";
+  return `快照 ${text.replace("T", " ").replace(/([+-]\d\d:\d\d|Z)$/, "").split(".")[0]}`;
+}
+
 function ConsoleApp() {
   const location = useLocation();
   const { user, logout } = useAuth();
-  const { data, errors, loading, loadingMessage, refreshing, progress, refresh } = useConsoleData(location.pathname);
+  const {
+    data,
+    errors,
+    loading,
+    bootstrapping,
+    hasVisibleData,
+    loadingMessage,
+    refreshing,
+    progress,
+    refresh,
+  } = useConsoleData(location.pathname);
   const [open, setOpen] = useState(false);
   const [expandedNav, setExpandedNav] = useState<string | null>(null);
   const currentPage = pageNames[location.pathname] || "控制台";
+  const syncLabel = bootstrapping
+    ? "正在载入"
+    : refreshing
+      ? "正在刷新"
+      : loading
+        ? "正在同步"
+        : "数据已同步";
+  const syncDetail = formatCheckedAt(data.__snapshot?.checkedAt);
   return <div className="app-shell">
     <aside className={open ? "sidebar open" : "sidebar"}>
       <div className="brand"><div><ChartNoAxesCombined size={21} strokeWidth={2.2}/></div><span><strong>ALIS</strong><small>量化研究与模拟交易</small></span><button onClick={() => setOpen(false)} aria-label="关闭导航"><X size={19}/></button></div>
@@ -54,15 +78,27 @@ function ConsoleApp() {
         const childrenVisible = Boolean(item.children && (groupActive || expandedNav === item.key));
         return <div className="nav-entry" key={item.key}><NavLink to={item.path} end className={({ isActive }) => isActive || groupActive ? "active" : undefined} onPointerEnter={()=>void preloadConsoleRoutes([item.path])} onFocus={()=>void preloadConsoleRoutes([item.path])} onClick={() => { setOpen(false); if (item.children) setExpandedNav(item.key); }}><item.Icon size={18}/><span>{item.label}</span></NavLink>{childrenVisible && <div className="nav-children">{item.children!.map(([path, label]) => <NavLink key={path} to={path} end onPointerEnter={()=>void preloadConsoleRoutes([path])} onFocus={()=>void preloadConsoleRoutes([path])} onClick={()=>setOpen(false)}>{label}</NavLink>)}</div>}</div>;
       })}</nav>
-      <div className="sidebar-foot"><span className={loading || refreshing ? "pulse" : ""}/><div><strong>{loading ? "正在载入" : refreshing ? "正在刷新" : "数据已同步"}</strong><small>更新于当前会话</small></div></div>
+      <div className="sidebar-foot"><span className={loading || refreshing ? "pulse" : ""}/><div><strong>{syncLabel}</strong><small>{syncDetail}</small></div></div>
     </aside>
     <div className="app-body">
-      <header className="topbar"><button className="mobile-menu" onClick={() => setOpen(true)} aria-label="打开导航"><Menu size={20}/></button><div className="topbar-context"><span>{user?.username || "模拟账户"}</span><strong>{currentPage}</strong></div><div className="topbar-actions"><button className="icon-button" onClick={refresh} disabled={loading || refreshing} title="刷新数据" aria-label="刷新数据"><RefreshCw size={18} className={loading || refreshing ? "spin" : ""}/></button><button className="icon-button" onClick={logout} title="退出登录" aria-label="退出登录"><LogOut size={17}/></button></div></header>
-      <main>{loading ? <ConsoleLoading page={currentPage} completed={progress.completed} total={progress.total} message={loadingMessage}/> : <><ErrorStrip errors={errors}/><Routes>
-        <Route path="/overview" element={<Overview data={data}/>}/><Route path="/system" element={<SystemObservatory data={data}/>}/><Route path="/system/versions" element={<SystemVersions data={data}/>}/><Route path="/decision" element={<TodayDecision data={data}/>}/><Route path="/portfolio" element={<Portfolio data={data}/>}/><Route path="/evolution" element={<Evolution data={data}/>}/><Route path="/evolution/factors" element={<FactorGuidance data={data}/>}/><Route path="/evolution/metrics" element={<ResearchEfficiency data={data}/>}/><Route path="/evolution/waves" element={<ResearchWaves data={data}/>}/><Route path="/research" element={<Research data={data}/>}/>
-        <Route path="/operations" element={<Operations data={data}/>}/><Route path="/data" element={<DataAssets data={data}/>}/><Route path="/models" element={<ModelGovernance data={data}/>}/><Route path="/evidence" element={<EvidenceChain data={data}/>}/>
-        <Route path="*" element={<Navigate to="/overview" replace/>}/>
-      </Routes></>}</main>
+      <header className="topbar"><button className="mobile-menu" onClick={() => setOpen(true)} aria-label="打开导航"><Menu size={20}/></button><div className="topbar-context"><span>{user?.username || "模拟账户"}</span><strong>{currentPage}</strong></div><div className="topbar-actions"><button className="icon-button" onClick={refresh} disabled={bootstrapping || refreshing} title="刷新数据" aria-label="刷新数据"><RefreshCw size={18} className={loading || refreshing ? "spin" : ""}/></button><button className="icon-button" onClick={logout} title="退出登录" aria-label="退出登录"><LogOut size={17}/></button></div></header>
+      <main>
+        {bootstrapping ? (
+          <ConsoleLoading page={currentPage} completed={progress.completed} total={progress.total} message={loadingMessage}/>
+        ) : (
+          <>
+            {refreshing && hasVisibleData && (
+              <div className="refresh-banner" role="status" aria-live="polite">正在后台刷新页面快照</div>
+            )}
+            <ErrorStrip errors={errors}/>
+            <Routes>
+              <Route path="/overview" element={<Overview data={data}/>}/><Route path="/system" element={<SystemObservatory data={data}/>}/><Route path="/system/versions" element={<SystemVersions data={data}/>}/><Route path="/decision" element={<TodayDecision data={data}/>}/><Route path="/portfolio" element={<Portfolio data={data}/>}/><Route path="/evolution" element={<Evolution data={data}/>}/><Route path="/evolution/factors" element={<FactorGuidance data={data}/>}/><Route path="/evolution/metrics" element={<ResearchEfficiency data={data}/>}/><Route path="/evolution/waves" element={<ResearchWaves data={data}/>}/><Route path="/research" element={<Research data={data}/>}/>
+              <Route path="/operations" element={<Operations data={data}/>}/><Route path="/data" element={<DataAssets data={data}/>}/><Route path="/models" element={<ModelGovernance data={data}/>}/><Route path="/evidence" element={<EvidenceChain data={data}/>}/>
+              <Route path="*" element={<Navigate to="/overview" replace/>}/>
+            </Routes>
+          </>
+        )}
+      </main>
     </div>{open && <button className="scrim" aria-label="关闭导航" onClick={() => setOpen(false)}/>}
   </div>;
 }

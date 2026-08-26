@@ -827,6 +827,18 @@ def _worker(parent_run_id: int) -> None:
         final_status = "completed"
         _set_state(running=False, phase="completed", message=f"数据已更新到 {trade_date}", progress=100,
                    finished_at=_now(), steps=steps, decision_contract=final_contract)
+        try:
+            from app.data_platform.services.asset_watermarks import request_data_assets_refresh
+
+            refresh = request_data_assets_refresh(invalidate=True)
+            steps.append({"step": "asset_watermarks_refresh", "result": refresh})
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("daily asset watermark refresh deferred: %s", str(exc)[:300])
+            steps.append({"step": "asset_watermarks_refresh", "result": {
+                "ok": False,
+                "deferred": True,
+                "error": str(exc)[:300],
+            }})
     except Exception as exc:  # noqa: BLE001
         final_status, error = "failed", str(exc)[:1000]
         failure_category = str(getattr(exc, "category", "internal_fault"))

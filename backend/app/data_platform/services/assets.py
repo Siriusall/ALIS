@@ -145,6 +145,11 @@ def _start_assets_refresh() -> bool:
     return True
 
 
+def request_assets_refresh() -> bool:
+    """Public entry for schedule/day-update paths that must refresh without blocking."""
+    return _start_assets_refresh()
+
+
 def get_data_assets(*, force: bool = False) -> dict[str, Any]:
     if force:
         return _store_assets(_compute_data_assets())

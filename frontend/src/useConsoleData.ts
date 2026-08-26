@@ -1,5 +1,17 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { endpoints, firstArray, Json, pick, readApi } from "./api";
+import {
+  consoleDataIsRenderable,
+  initialRequestLabel,
+  payloadIsComplete,
+  responseIsDegraded,
+  responseIsTerminal,
+  snapshotData,
+  snapshotIsHealthy,
+  snapshotRetryMessage,
+  snapshotSectionErrors,
+  snapshotStatus,
+} from "./snapshotUtils";
 
 export type ConsoleData = Partial<Record<keyof typeof endpoints, Json>> & {
   researchStockEvidence?: Json;
@@ -9,6 +21,8 @@ export type ConsoleData = Partial<Record<keyof typeof endpoints, Json>> & {
   __snapshot?: Json;
 };
 
+// Snapshot-backed console routes are the source of truth. Legacy /admin and
+// /factors aliases only redirect in App, so they do not keep a separate fan-out map.
 const routeKeys: Record<string, Array<keyof typeof endpoints>> = {
   "/overview": ["owner", "ledger", "portfolio", "tradingReady", "latestPlan", "health", "adminTasksLive", "dailyUpdateStatus", "watermarks", "ledgerAudit"],
   "/system": ["health", "tradingReady", "adminTasksLive"],
@@ -19,12 +33,6 @@ const routeKeys: Record<string, Array<keyof typeof endpoints>> = {
   "/evolution/factors": ["factors", "researchAnalytics", "researchFactorAnalytics"],
   "/evolution/metrics": ["researchAnalytics", "researchTimeseries", "evolutionTasks"],
   "/evolution/waves": ["researchAnalyticsConsole", "researchExpertHistory", "researchEnvironmentSimilarity", "researchArchive"],
-  "/admin": ["health", "tradingReady", "tasks", "adminTasksLive", "dailyUpdateStatus", "watermarks", "ledgerAudit"],
-  "/admin/operations": ["health", "owner", "tasks", "evolutionTasks", "evolutionSchedule", "quantTasks", "quantStatus", "quantRecent", "executionsPage", "operationsPage", "ledgerAudit"],
-  "/factors": ["owner", "strategy", "factors", "factorStatus", "factorResearch", "factorLineage", "evolutionTasks"],
-  "/admin/models": ["planModels", "modelOperations", "models", "modelMarketLive", "modelGovernance", "modelReports", "modelProduction", "modelController", "modelOutputContracts", "modelEvidenceBindings", "modelValidation", "modelMarketHistory", "factorResearchCompact", "evolutionTasks", "modelTasksLive"],
-  "/admin/data": ["watermarks", "failedRequests", "dataOperations", "runtimeLogs", "dataObservability", "dataStreams", "dailyUpdateStatus", "backfillStatus", "backfillPlan", "tasks"],
-  "/admin/evidence": ["decisionAudit", "decisions", "reviews", "reviewLearning", "llmBudget", "llmProposals", "performanceReports", "ledgerDetail", "reportCompact", "backtests", "ledgerAudit"],
   "/operations": ["health", "owner", "tasks", "evolutionTasks", "evolutionSchedule", "quantTasks", "quantStatus", "quantRecent", "executionsPage", "operationsPage", "ledgerAudit"],
   "/models": ["planModels", "modelOperations", "models", "modelMarketLive", "modelGovernance", "modelReports", "modelProduction", "modelController", "modelOutputContracts", "modelEvidenceBindings", "modelValidation", "modelMarketHistory", "factorResearchCompact", "evolutionTasks", "modelTasksLive"],
   "/data": ["watermarks", "failedRequests", "dataOperations", "runtimeLogs", "dataObservability", "dataStreams", "dailyUpdateStatus", "backfillStatus", "backfillPlan", "tasks"],
@@ -88,47 +96,6 @@ function snapshotPollInterval(pathname: string) {
   return SNAPSHOT_POLL_INTERVAL_MS[pathname] || 180_000;
 }
 
-const initialRequestLabels: Record<string, string> = {
-  owner: "系统摘要",
-  ledger: "账本摘要",
-  tradingReady: "交易就绪检查",
-  decision: "今日决策",
-  researchDataAssets: "研究数据资产",
-};
-
-function initialRequestLabel(key: string) {
-  return initialRequestLabels[key] || key;
-}
-
-function snapshotData(payload: unknown): ConsoleData | null {
-  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return null;
-  const data = (payload as Json).data;
-  return data && typeof data === "object" && !Array.isArray(data) ? data as ConsoleData : null;
-}
-
-function snapshotHasData(payload: unknown) {
-  const data = snapshotData(payload);
-  return Boolean(data && Object.keys(data).length > 0);
-}
-
-function snapshotStatus(payload: unknown) {
-  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return "unavailable";
-  return String((payload as Json).status || "unavailable").trim().toLowerCase();
-}
-
-function snapshotIsHealthy(payload: unknown): payload is Json {
-  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return false;
-  const snapshot = payload as Json;
-  const status = snapshotStatus(snapshot);
-  // A completed document may be degraded because one named section is
-  // unavailable. Its other sections are still authoritative and must render;
-  // only transient/no-document states keep the page behind loading.
-  return status !== "warming_up"
-    && !Boolean(snapshot.stale)
-    && !Boolean(snapshot.refreshing)
-    && snapshotHasData(snapshot);
-}
-
 function cachedHealthySnapshot(page: string): Json | null {
   const cacheKey = `snapshot:${page}`;
   const cached = cache.get(cacheKey);
@@ -138,57 +105,6 @@ function cachedHealthySnapshot(page: string): Json | null {
     return null;
   }
   return cached.value;
-}
-
-function snapshotErrorCode(section: Json) {
-  const error = section.error;
-  const value = error && typeof error === "object" && !Array.isArray(error)
-    ? error.code || error.kind || error.status
-    : section.error_code || section.code;
-  return String(value || "").trim().toLowerCase();
-}
-
-function snapshotSectionMessage(key: string, section: Json) {
-  const label = initialRequestLabel(key);
-  const status = String(section.status || "error").trim().toLowerCase();
-  const code = snapshotErrorCode(section);
-  if (/timeout|deadline/.test(code)) return `${label} 查询超时，不能据此判断为无数据`;
-  if (/connection|database|unavailable/.test(code)) return `${label} 暂不可读，正在等待下一个完整快照`;
-  if (status === "degraded") return `${label} 仅返回部分已验证证据`;
-  return `${label} 暂不可读，正在等待下一个完整快照`;
-}
-
-function snapshotSectionErrors(payload: Json) {
-  const sections = payload.sections;
-  if (!sections || typeof sections !== "object" || Array.isArray(sections)) return {};
-  const readableResearchSections = new Set(["researchGovernance", "theses", "industryAllocation", "modelMarketLive"]);
-  return Object.entries(sections).reduce<Record<string, string>>((result, [key, value]) => {
-    const section = value && typeof value === "object" && !Array.isArray(value) ? value as Json : {};
-    const status = String(section.status || "").trim().toLowerCase();
-    // These research routes return structured business conclusions even when
-    // one sub-check is blocked or historical evidence is partial.  Do not
-    // label the whole section as unavailable; the section body shows its
-    // exact governance/data state.
-    if (payload.page === "research" && readableResearchSections.has(key)) return result;
-    if (status === "error" || status === "degraded") result[key] = snapshotSectionMessage(key, section);
-    return result;
-  }, {});
-}
-
-function snapshotRetryMessage(payload: Json, hasVisibleData: boolean) {
-  if (snapshotStatus(payload) === "warming_up") {
-    return hasVisibleData
-      ? "服务端页面快照正在生成，继续展示最近一次可验证数据"
-      : "服务端页面快照正在生成，尚无可验证的页面数据";
-  }
-  if (payload.stale) {
-    return hasVisibleData
-      ? "服务端页面快照已失效，继续展示最近一次可验证数据"
-      : "服务端页面快照已失效，正在等待首个可验证版本";
-  }
-  if (payload.refreshing) return "服务端正在生成新的页面快照";
-  if (snapshotStatus(payload) === "degraded") return "新页面快照包含部分可用证据，正在等待完整版本";
-  return "页面快照尚未达到完整状态，正在等待新版本";
 }
 
 function terminalReadFailure(component: string, error: any): Json | null {
@@ -218,21 +134,6 @@ function terminalReadFailure(component: string, error: any): Json | null {
   };
 }
 
-function responseIsTerminal(value: unknown): value is Json {
-  if (Array.isArray(value)) return true;
-  if (!value || typeof value !== "object") return false;
-  const payload = value as Json;
-  return Object.keys(payload).length > 0;
-}
-
-function responseIsDegraded(value: unknown): boolean {
-  if (!responseIsTerminal(value) || Array.isArray(value)) return false;
-  const payload = value as Json;
-  return payload.data_available === false
-    || payload.available === false
-    || (payload.ok === false && payload.status === "degraded");
-}
-
 function diagnosticMessage(key: string, value: unknown) {
   if (!responseIsDegraded(value)) return "";
   const payload = value as Json;
@@ -240,29 +141,6 @@ function diagnosticMessage(key: string, value: unknown) {
   const code = String(payload.error?.code || payload.status || "data_unavailable");
   if (code === "request_timeout") return `${component}（查询超时）未完成，不能判断为无数据`;
   return `${component}（${code}）已返回终态，当前没有可用证据`;
-}
-
-function payloadIsComplete(key: string, value: unknown): value is Json {
-  if (!responseIsTerminal(value)) return false;
-  if (Array.isArray(value)) return true;
-  const payload = value as Json;
-  // A degraded/empty response is still a completed request. Render the
-  // page with an explicit warning instead of retrying forever behind a
-  // spinner while waiting for data that the backend has already ruled out.
-  if (responseIsDegraded(payload)) return true;
-  if (Object.keys(payload).length === 0) return false;
-  if (key === "owner") return Boolean(payload.summary || payload.questions || payload.account || payload.acceptance_progress);
-  if (key === "ledger") return ["total_equity", "cash_balance", "position_market_value"].every((field) => Object.prototype.hasOwnProperty.call(payload, field));
-  if (key === "tradingReady") return typeof payload.status === "string" && Boolean(payload.summary || payload.hard_blockers || payload.gates);
-  if (key === "decision") return Boolean(
-    payload.status || payload.summary || payload.actions || payload.rebalance || payload.items
-      || payload.gate_decision || payload.latest_data_contract || payload.data_health || payload.market_overview,
-  );
-  // Dynamic detail groups are complete once their child requests have settled.
-  // A child data domain may legitimately be unavailable/partial; that is an
-  // evidence warning, not a reason to keep the whole page behind a spinner.
-  if (key === "researchStockEvidence" || key === "researchIndustryEvidence" || key === "evidenceVerification" || key === "decisionDetail") return true;
-  return true;
 }
 
 function incompleteRouteData(pathname: string, data: ConsoleData): string[] {
@@ -671,7 +549,7 @@ export function useConsoleData(pathname: string) {
     // point-in-time diagnostics instead of reducing the page's total span.
     const requestConcurrency = pathname === "/models"
       ? 3
-      : (pathname.startsWith("/admin") || ["/operations", "/data", "/evidence"].includes(pathname)) ? 2 : 3;
+      : ["/operations", "/data", "/evidence"].includes(pathname) ? 2 : 3;
     const loadedData: ConsoleData = { ...cachedData };
     const loadWorker = async () => {
       while (cursor < entries.length) {
@@ -778,16 +656,39 @@ export function useConsoleData(pathname: string) {
   useEffect(() => {
     let stopped = false;
     let pollTimer: number | null = null;
-    const poll = async () => {
-      await refresh(false);
-      if (!stopped && snapshotPage) {
-        pollTimer = window.setTimeout(poll, snapshotPollInterval(pathname));
+    const clearPoll = () => {
+      if (pollTimer !== null) {
+        window.clearTimeout(pollTimer);
+        pollTimer = null;
       }
     };
-    void poll();
+    const scheduleNextPoll = () => {
+      clearPoll();
+      if (stopped || !snapshotPage || document.hidden) return;
+      pollTimer = window.setTimeout(async () => {
+        if (stopped || document.hidden) return;
+        await refresh(false);
+        if (!stopped && !document.hidden) scheduleNextPoll();
+      }, snapshotPollInterval(pathname));
+    };
+    const onVisibilityChange = () => {
+      if (document.hidden) {
+        clearPoll();
+        return;
+      }
+      // Resume immediately when the tab becomes visible again.
+      void refresh(false).then(() => {
+        if (!stopped && !document.hidden) scheduleNextPoll();
+      });
+    };
+    void refresh(false).then(() => {
+      if (!stopped && !document.hidden) scheduleNextPoll();
+    });
+    document.addEventListener("visibilitychange", onVisibilityChange);
     return () => {
       stopped = true;
-      if (pollTimer !== null) window.clearTimeout(pollTimer);
+      clearPoll();
+      document.removeEventListener("visibilitychange", onVisibilityChange);
       controller.current?.abort();
       if (retryTimer.current !== null) window.clearTimeout(retryTimer.current);
     };
@@ -810,10 +711,14 @@ export function useConsoleData(pathname: string) {
       : cachedSnapshotErrors
     : errors;
 
+  const hasVisibleData = consoleDataIsRenderable(visibleData);
+
   return {
     data: visibleData,
     errors: visibleErrors,
     loading: visibleLoading,
+    bootstrapping: visibleLoading && !hasVisibleData,
+    hasVisibleData,
     loadingMessage,
     refreshing,
     progress,

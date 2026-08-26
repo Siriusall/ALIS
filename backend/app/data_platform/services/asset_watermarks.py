@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from datetime import datetime
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from app.data_platform.db import _conn
 
@@ -15,6 +16,9 @@ CORE_ASSETS = {
     "financial_indicator", "financial_research_fields", "announcements",
 }
 OPTIONAL_ASSETS = {"web_fallback", "shareholder_return", "namechange", "pledge_detail"}
+_BUSINESS_TZ = ZoneInfo("Asia/Shanghai")
+# Watermark audits older than this, or lagging the live market day, must refresh.
+_WATERMARK_STALE_HOURS = 12
 
 
 def _tier(asset_key: str) -> str:
@@ -23,6 +27,54 @@ def _tier(asset_key: str) -> str:
     if asset_key in OPTIONAL_ASSETS:
         return "optional"
     return "enhanced"
+
+
+def _normalize_trade_date(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    digits = "".join(ch for ch in text if ch.isdigit())
+    return digits[:8] if len(digits) >= 8 else ""
+
+
+def _live_market_max_trade_date() -> str:
+    """Return the freshest durable market date without rebuilding the catalog."""
+    try:
+        with _conn() as conn:
+            probes = (
+                "SELECT MAX(trade_date) AS max_date FROM dc_available_trade_dates",
+                "SELECT MAX(trade_date) AS max_date FROM dc_stock_daily_snapshot",
+                """
+                SELECT MAX(trade_date) AS max_date
+                FROM dc_tushare_request_coverage
+                WHERE api_name='daily'
+                """,
+            )
+            for sql in probes:
+                try:
+                    row = conn.execute(sql).fetchone()
+                except Exception:  # noqa: BLE001 - optional probe tables may be absent
+                    continue
+                value = _normalize_trade_date(dict(row or {}).get("max_date"))
+                if value:
+                    return value
+    except Exception:  # noqa: BLE001 - freshness must degrade when DB is unreachable
+        return ""
+    return ""
+
+
+def _audit_trade_date(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    # Prefer explicit YYYYMMDD / ISO date prefixes over full timestamps.
+    normalized = _normalize_trade_date(text[:10])
+    if normalized:
+        return normalized
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).astimezone(_BUSINESS_TZ).strftime("%Y%m%d")
+    except ValueError:
+        return ""
 
 
 def persist_asset_watermarks(payload: dict[str, Any]) -> None:
@@ -36,12 +88,19 @@ def persist_asset_watermarks(payload: dict[str, Any]) -> None:
         expected = int(item.get("coverage_expected") or 0)
         available = int(item.get("coverage_basis") or 0)
         status = str(item.get("status") or "unknown")
+        metadata = {
+            "coverage": item.get("coverage"),
+            "window_start": item.get("window_start"),
+            "window_end": item.get("window_end"),
+            "measurement": item.get("measurement"),
+            "data_max_date": item.get("max_date"),
+            "min_date": item.get("min_date"),
+            "asset_snapshot": item,
+        }
         rows.append((key, "overall", _tier(key), expected, available, max(0, expected - available),
                      "complete" if status in {"complete", "available"} else "repairable",
                      "", 10 if key in CORE_ASSETS else 50 if _tier(key) == "enhanced" else 90,
-                     str(item.get("source") or ""), json.dumps({"coverage": item.get("coverage"), "window_start": item.get("window_start"),
-                     "window_end": item.get("window_end"), "measurement": item.get("measurement"),
-                     "asset_snapshot": item}, ensure_ascii=False, default=str), now, now))
+                     str(item.get("source") or ""), json.dumps(metadata, ensure_ascii=False, default=str), now, now))
         for detail in item.get("period_details") or []:
             period = str(detail.get("period") or "")
             checks = int(detail.get("checks") or 0)
@@ -94,7 +153,89 @@ def apply_terminal_states(payload: dict[str, Any]) -> dict[str, Any]:
     return payload
 
 
-def asset_watermark_status() -> dict[str, Any]:
+def _enrich_watermark_item(item: dict[str, Any]) -> dict[str, Any]:
+    metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+    snapshot = metadata.get("asset_snapshot") if isinstance(metadata.get("asset_snapshot"), dict) else {}
+    data_max_date = (
+        _normalize_trade_date(metadata.get("data_max_date"))
+        or _normalize_trade_date(snapshot.get("max_date"))
+        or _normalize_trade_date(item.get("latest_trade_date"))
+    )
+    window_end = (
+        _normalize_trade_date(metadata.get("window_end"))
+        or _normalize_trade_date(snapshot.get("window_end"))
+        or data_max_date
+    )
+    item["name"] = snapshot.get("name") or item.get("asset_key")
+    item["data_max_date"] = data_max_date or None
+    item["window_end"] = window_end or None
+    item["latest_trade_date"] = data_max_date or window_end or None
+    item["audit_updated_at"] = item.get("updated_at")
+    item["audit_checked_at"] = item.get("checked_at")
+    # Keep `watermark` as the data frontier, not the audit write time.
+    item["watermark"] = data_max_date or window_end or None
+    return item
+
+
+def _watermark_freshness(items: list[dict[str, Any]]) -> dict[str, Any]:
+    overall = [item for item in items if str(item.get("slice_key") or "") == "overall"]
+    audit_checked_at = max((str(item.get("checked_at") or "") for item in overall), default="")
+    audit_trade_date = _audit_trade_date(audit_checked_at)
+    live_max_trade_date = _live_market_max_trade_date()
+    age_hours = None
+    if audit_checked_at:
+        try:
+            checked = datetime.fromisoformat(audit_checked_at.replace("Z", "+00:00"))
+            if checked.tzinfo is None:
+                checked = checked.replace(tzinfo=_BUSINESS_TZ)
+            age_hours = round(
+                max(0.0, (datetime.now(_BUSINESS_TZ) - checked.astimezone(_BUSINESS_TZ)).total_seconds() / 3600.0),
+                2,
+            )
+        except ValueError:
+            age_hours = None
+    lagged_market = bool(
+        live_max_trade_date
+        and (not audit_trade_date or audit_trade_date < live_max_trade_date)
+    )
+    aged_out = age_hours is not None and age_hours >= _WATERMARK_STALE_HOURS
+    stale = lagged_market or aged_out or not overall
+    return {
+        "live_max_trade_date": live_max_trade_date or None,
+        "audit_checked_at": audit_checked_at or None,
+        "audit_trade_date": audit_trade_date or None,
+        "age_hours": age_hours,
+        "stale": stale,
+        "reason": (
+            "missing_watermark_rows"
+            if not overall
+            else "audit_behind_live_market"
+            if lagged_market
+            else "audit_aged_out"
+            if aged_out
+            else "fresh"
+        ),
+    }
+
+
+def request_data_assets_refresh(*, invalidate: bool = True) -> dict[str, Any]:
+    """Ask the expensive catalog rebuild to run without blocking the caller."""
+    from app.data_platform.services.assets import invalidate_data_assets_cache, request_assets_refresh
+
+    if invalidate:
+        invalidate_data_assets_cache()
+    started = request_assets_refresh()
+    if started:
+        try:
+            from app.services.console_snapshots import invalidate as invalidate_console_snapshots
+
+            invalidate_console_snapshots(["data", "overview"], reason="asset_watermarks_refresh")
+        except Exception:  # noqa: BLE001 - console invalidation must not block data refresh
+            pass
+    return {"started": started, "running": bool(started)}
+
+
+def asset_watermark_status(*, trigger_refresh_if_stale: bool = True) -> dict[str, Any]:
     with _conn() as conn:
         rows = conn.execute("""SELECT asset_key,slice_key,contract_tier,expected_count,available_count,
             missing_count,status,terminal_reason,repair_priority,source_code,metadata_json,checked_at,updated_at
@@ -103,17 +244,31 @@ def asset_watermark_status() -> dict[str, Any]:
     for row in rows:
         item = dict(row)
         item["metadata"] = json.loads(item.pop("metadata_json") or "{}")
-        items.append(item)
-    return {"ok": True, "items": items, "summary": {
-        "watermarks": len(items), "repairable": sum(x["status"] == "repairable" for x in items),
-        "terminal": sum(x["status"] in {"upstream_unavailable", "not_applicable", "permission_denied"} for x in items),
-        "missing_count": sum(int(x["missing_count"] or 0) for x in items if x["slice_key"] == "overall"),
-    }}
+        items.append(_enrich_watermark_item(item))
+    freshness = _watermark_freshness(items)
+    refresh = {"started": False, "running": False, "triggered": False}
+    if trigger_refresh_if_stale and freshness["stale"]:
+        refresh = {**request_data_assets_refresh(invalidate=True), "triggered": True}
+    return {
+        "ok": True,
+        "items": items,
+        "freshness": freshness,
+        "refresh": refresh,
+        "summary": {
+            "watermarks": len(items),
+            "repairable": sum(x["status"] == "repairable" for x in items),
+            "terminal": sum(x["status"] in {"upstream_unavailable", "not_applicable", "permission_denied"} for x in items),
+            "missing_count": sum(int(x["missing_count"] or 0) for x in items if x["slice_key"] == "overall"),
+            "stale": freshness["stale"],
+            "live_max_trade_date": freshness["live_max_trade_date"],
+            "audit_checked_at": freshness["audit_checked_at"],
+        },
+    }
 
 
 def load_asset_catalog_snapshot() -> dict[str, Any]:
     """Rebuild the last persisted catalog without scanning raw data tables."""
-    status = asset_watermark_status()
+    status = asset_watermark_status(trigger_refresh_if_stale=False)
     overall = [item for item in status["items"] if item["slice_key"] == "overall"]
     items = []
     for row in overall:
@@ -122,6 +277,8 @@ def load_asset_catalog_snapshot() -> dict[str, Any]:
         snapshot.setdefault("source", row["source_code"])
         snapshot.setdefault("actual", row["available_count"])
         snapshot.setdefault("expected", row["expected_count"])
+        snapshot.setdefault("max_date", row.get("data_max_date"))
+        snapshot.setdefault("window_end", row.get("window_end"))
         snapshot["status"] = (
             snapshot.get("status")
             or ("complete" if row["status"] == "complete" else row["status"])
@@ -129,14 +286,17 @@ def load_asset_catalog_snapshot() -> dict[str, Any]:
         snapshot["watermark_checked_at"] = row["checked_at"]
         items.append(snapshot)
     checked = max((str(item.get("checked_at") or "") for item in overall), default="")
+    freshness = status.get("freshness") or {}
     return {
         "ok": True,
         "items": items,
         "summary": status["summary"],
+        "freshness": freshness,
         "snapshot": {
             "source": "dc_asset_watermark",
             "checked_at": checked,
-            "stale": True,
+            "stale": bool(freshness.get("stale", True)),
+            "live_max_trade_date": freshness.get("live_max_trade_date"),
         },
     }
 

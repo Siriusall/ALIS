@@ -14,7 +14,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   return <AuthContext.Provider value={{user,loading,login:(u,p)=>authenticate("/api/auth/login",u,p),register:(u,p)=>authenticate("/api/auth/register",u,p),logout:()=>{setToken(null);setUser(null)}}}>{children}</AuthContext.Provider>;
 }
 export function useAuth(){const value=useContext(AuthContext);if(!value)throw new Error("AuthProvider missing");return value;}
-export function RequireAuth({children}:{children:ReactNode}){const {user,loading}=useAuth();if(loading)return <div className="auth-loading">正在验证会话</div>;return user?<>{children}</>:<Navigate to="/login" replace/>;}
+export function RequireAuth({children}:{children:ReactNode}){const {user,loading}=useAuth();if(loading)return <div className="auth-loading" role="status" aria-live="polite">正在验证会话</div>;return user?<>{children}</>:<Navigate to="/login" replace/>;}
 
 export function AuthPage({ mode }:{mode:"login"|"register"}){
   const auth=useAuth();const navigate=useNavigate();const [username,setUsername]=useState("");const [password,setPassword]=useState("");const [error,setError]=useState("");const [busy,setBusy]=useState(false);

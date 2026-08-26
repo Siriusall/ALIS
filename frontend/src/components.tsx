@@ -63,7 +63,7 @@ export function ErrorStrip({ errors }: { errors: Record<string, string> }) {
   const prefix = partialOnly
     ? `已展示可验证数据；${items.length} 个分区待刷新：`
     : `${items.length} 组数据暂不可用：`;
-  return <div className="error-strip"><ShieldAlert size={17} /><span>{prefix}{items.map(([key, message]) => `${key}（${message}）`).join("；")}</span></div>;
+  return <div className="error-strip" role="alert" aria-live="assertive"><ShieldAlert size={17} /><span>{prefix}{items.map(([key, message]) => `${key}（${message}）`).join("；")}</span></div>;
 }
 
 export function ConsoleLoading({ page, completed, total, message }: { page: string; completed: number; total: number; message?: string }) {
