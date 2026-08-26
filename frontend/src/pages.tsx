@@ -829,11 +829,47 @@ function ReadOnlyPager({label,offset,pageSize,total,hasMore,loading,onChange}:{l
   return <div className="read-only-pager"><span>{label} · 第 {currentPage} / {totalPages} 页 · 共 {total} 条</span><div><button className="icon-button" type="button" title="上一页" aria-label={`${label}上一页`} disabled={loading||offset===0} onClick={()=>onChange(Math.max(0,offset-pageSize))}><ChevronLeft size={16}/></button><button className="icon-button" type="button" title="下一页" aria-label={`${label}下一页`} disabled={loading||!hasMore} onClick={()=>onChange(offset+pageSize)}><ChevronRight size={16}/></button></div></div>;
 }
 
+const taskTextLabels: Record<string, string> = {
+  "data_platform.daily_update": "数据平台每日更新",
+  data_platform: "数据平台",
+  daily_update: "每日数据更新",
+  system: "系统调度",
+  control: "控制节点",
+  research: "研究任务",
+  execution: "执行任务",
+  factors: "因子研究",
+  models: "模型任务",
+  operations: "运行任务",
+  waiting_schedule: "等待收盘调度",
+  recovery_pending: "等待安全恢复",
+  retry_wait: "等待重试",
+};
+
+const taskTokenLabels: Record<string, string> = {
+  data: "数据", platform: "平台", daily: "每日", update: "更新", system: "系统",
+  task: "任务", job: "作业", model: "模型", strategy: "策略", research: "研究",
+  factor: "因子", execution: "执行", simulation: "模拟", evolution: "演化",
+  worker: "工作节点", scheduler: "调度器", control: "控制", operations: "运行",
+  backfill: "补全", snapshot: "快照", refresh: "刷新", sync: "同步", audit: "审计",
+};
+
+function taskTextLabel(value: unknown, fallback: string) {
+  const raw = String(value || "").trim();
+  if (!raw) return fallback;
+  if (taskTextLabels[raw]) return taskTextLabels[raw];
+  if (!/^[a-z][a-z0-9_.-]*$/i.test(raw)) return raw;
+  const tokens = raw.split(/[._-]+/);
+  const translated = tokens.map(token => taskTokenLabels[token.toLowerCase()] || token);
+  return translated.some((token, index) => token !== tokens[index]) ? translated.join("") : raw;
+}
+
 function TaskCategory({ rows, className = "" }: { rows: Json[]; className?: string }) {
   return rows.length ? <div className={`task-category ${className}`}>{rows.map((row, index) => {
     const raw = Number(pick(row, ["progress", "progress_pct"], 0));
     const progress = raw <= 1 ? raw * 100 : raw;
-    return <article key={String(pick(row, ["id"], index))}><div><strong>{pick(row, ["name", "task_name", "module"], "计划任务")}</strong><p>{pick(row, ["current_step", "message", "phase"], "等待下一次调度")}</p></div><div className="task-category-state"><Status>{runtimeStatusLabel(pick(row, ["status", "state"], "waiting"))}</Status><small>{Math.round(progress)}% · {formatSystemTime(pick(row, ["heartbeat_at", "updated_at", "next_run_at"], ""), "等待时间证据")}</small></div></article>;
+    const name = taskTextLabel(pick(row, ["name", "task_name", "module"], ""), "计划任务");
+    const detail = taskTextLabel(pick(row, ["current_step", "message", "phase"], ""), "等待下一次调度");
+    return <article key={String(pick(row, ["id"], index))}><div><strong>{name}</strong><p>{detail}</p></div><div className="task-category-state"><Status>{runtimeStatusLabel(pick(row, ["status", "state"], "waiting"))}</Status><small>{Math.round(progress)}% · {formatSystemTime(pick(row, ["heartbeat_at", "updated_at", "next_run_at"], ""), "等待时间证据")}</small></div></article>;
   })}</div> : <Empty title="当前没有此类任务" detail="调度器会在满足频率和数据门后自动创建。"/>;
 }
 
