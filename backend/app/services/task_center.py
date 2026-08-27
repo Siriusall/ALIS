@@ -639,6 +639,11 @@ def _persistent_worker_heartbeats() -> list[dict[str, Any]]:
         ).fetchall()]
 
 
+def _worker_heartbeat_timeout_seconds(component: str) -> int:
+    """Match health tolerance to each component's real heartbeat cadence."""
+    return 420 if str(component or "").strip().lower() == "scheduler" else 90
+
+
 def _node_views(
     tasks: list[dict[str, Any]],
     runtime_services: list[dict[str, Any]],
@@ -659,6 +664,11 @@ def _node_views(
         node_heartbeats = heartbeat_by_node.get(node_name, [])
         heartbeat_times = [_parse(item.get("heartbeat_at")) for item in node_heartbeats]
         heartbeat_times = [item for item in heartbeat_times if item is not None]
+        if node_name in {"alis-app", "alis-db"} and not heartbeat_times:
+            # These nodes are synchronously probed while this document is
+            # built rather than running the leased evolution heartbeat loop.
+            # Surface that real probe time instead of claiming no heartbeat.
+            heartbeat_times = [generated_at]
         latest_heartbeat = max(heartbeat_times).isoformat() if heartbeat_times else None
         heartbeat_age = min(
             [max(0.0, (generated_at - item.astimezone(generated_at.tzinfo)).total_seconds()) for item in heartbeat_times],
@@ -666,7 +676,8 @@ def _node_views(
         )
         heartbeat_healthy = bool(node_heartbeats) and all(
             bool(item.get("alive")) and (_parse(item.get("heartbeat_at")) is not None)
-            and max(0.0, (generated_at - _parse(item.get("heartbeat_at")).astimezone(generated_at.tzinfo)).total_seconds()) <= 90
+            and max(0.0, (generated_at - _parse(item.get("heartbeat_at")).astimezone(generated_at.tzinfo)).total_seconds())
+            <= _worker_heartbeat_timeout_seconds(str(item.get("component") or ""))
             for item in node_heartbeats
         )
         if node_name == "alis-db":
@@ -682,6 +693,11 @@ def _node_views(
             "node": node_name, "name": label, "responsibility": responsibility,
             "status": status, "status_reason": status_reason,
             "heartbeat_at": latest_heartbeat, "heartbeat_age_seconds": heartbeat_age,
+            "heartbeat_source": (
+                "api_response_probe" if node_name == "alis-app" and not node_heartbeats
+                else "database_read_probe" if node_name == "alis-db" and not node_heartbeats
+                else "worker_heartbeat"
+            ),
             "running_count": len(running), "queued_count": len(queued),
             "service_count": len(services),
             "current_tasks": running[:4], "queued_tasks": queued[:4], "services": services,

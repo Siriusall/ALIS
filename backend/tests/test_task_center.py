@@ -116,6 +116,41 @@ def test_compact_task_center_uses_bounded_data_status_and_health_reads(monkeypat
     assert calls == [("daily", {"compact": True}), ("health", {"compact": True})]
 
 
+def test_node_views_use_real_component_cadence_and_probe_times():
+    from datetime import datetime, timedelta, timezone
+
+    generated = datetime(2026, 8, 28, 0, 0, tzinfo=timezone.utc)
+    nodes = task_center._node_views(
+        [],
+        [],
+        [{
+            "worker_pool": "control",
+            "component": "scheduler",
+            "node_name": "alis-control-worker",
+            "heartbeat_at": (generated - timedelta(seconds=300)).isoformat(),
+            "alive": True,
+        }, {
+            "worker_pool": "control",
+            "component": "worker",
+            "node_name": "alis-control-worker",
+            "heartbeat_at": (generated - timedelta(seconds=20)).isoformat(),
+            "alive": True,
+        }],
+        database_healthy=True,
+        generated_at=generated,
+    )
+
+    app = next(item for item in nodes if item["node"] == "alis-app")
+    database = next(item for item in nodes if item["node"] == "alis-db")
+    control = next(item for item in nodes if item["node"] == "alis-control-worker")
+    assert app["heartbeat_at"] == generated.isoformat()
+    assert app["heartbeat_source"] == "api_response_probe"
+    assert database["heartbeat_at"] == generated.isoformat()
+    assert database["heartbeat_source"] == "database_read_probe"
+    assert control["status"] == "running"
+    assert control["heartbeat_age_seconds"] == 20
+
+
 def test_cycle_step_uses_recorded_precise_times():
     task = {
         "id": 3, "attempt": 1, "max_attempts": 3, "started_at": "2026-07-24T17:00:00+08:00",
