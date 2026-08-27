@@ -55,20 +55,20 @@ def test_delivery_failure_keeps_issue_pending_for_retry(monkeypatch, tmp_path: P
 
 def test_resend_delivery_reuses_reference_idempotency_contract(monkeypatch) -> None:
     response = MagicMock()
-    response.__enter__.return_value.read.return_value = b'{"id":"email-test-1"}'
+    response.json.return_value = {"id": "email-test-1"}
     captured = {}
 
-    def open_request(request, timeout):
-        captured["request"] = request
-        captured["timeout"] = timeout
+    def post(url, **kwargs):
+        captured["url"] = url
+        captured.update(kwargs)
         return response
 
     monkeypatch.setenv("ALIS_ALERT_RESEND_API_KEY", "test-key")
-    monkeypatch.setattr(system_alerts.urllib.request, "urlopen", open_request)
+    monkeypatch.setattr(system_alerts.httpx, "post", post)
     issue = AlertIssue("api_not_ready", "主服务未就绪", "数据库不可用")
 
     system_alerts.send_issue_email([issue])
 
-    assert captured["request"].full_url == "https://api.resend.com/emails"
-    assert captured["request"].headers["Idempotency-key"]
+    assert captured["url"] == "https://api.resend.com/emails"
+    assert captured["headers"]["Idempotency-Key"]
     assert captured["timeout"] == 20

@@ -20,6 +20,8 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
+import httpx
+
 from app.data_platform.db import _read_conn as data_read_conn
 from app.db.store import _read_conn as business_read_conn
 
@@ -215,24 +217,24 @@ def _email_content(issues: list[AlertIssue], *, recovered: bool) -> tuple[str, s
 
 def _send_with_resend(*, subject: str, text_body: str, html_body: str, idempotency_key: str) -> str:
     settings = _resend_settings()
-    request = urllib.request.Request(
+    response = httpx.post(
         "https://api.resend.com/emails",
-        data=json.dumps({
-            "from": settings["sender"],
-            "to": [ALERT_RECIPIENT],
-            "subject": subject,
-            "text": text_body,
-            "html": html_body,
-        }, ensure_ascii=False).encode(),
         headers={
             "Authorization": f"Bearer {settings['api_key']}",
             "Content-Type": "application/json",
             "Idempotency-Key": idempotency_key,
         },
-        method="POST",
+        json={
+            "from": settings["sender"],
+            "to": [ALERT_RECIPIENT],
+            "subject": subject,
+            "text": text_body,
+            "html": html_body,
+        },
+        timeout=20,
     )
-    with urllib.request.urlopen(request, timeout=20) as response:
-        payload = json.loads(response.read().decode("utf-8"))
+    response.raise_for_status()
+    payload = response.json()
     message_id = str(payload.get("id") or "")
     if not message_id:
         raise RuntimeError("Resend response did not contain an email id")
