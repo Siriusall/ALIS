@@ -1,0 +1,26 @@
+[Unit]
+Description=ALIS System Impact Email Alert Worker
+After=network-online.target wg-quick@wg0.service
+Wants=network-online.target wg-quick@wg0.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/alis-worker/backend
+EnvironmentFile=/etc/alis/worker.env
+Environment=PYTHONPATH=/opt/alis-worker/backend
+Environment=ALIS_BUSINESS_DB_MAX_CONNECTIONS=1
+Environment=ALIS_DATA_DB_MAX_CONNECTIONS=1
+Environment=DATABASE_CONNECT_TIMEOUT_SECONDS=5
+ExecStart=/opt/alis-worker/backend/.venv/bin/python -m app.alert_worker_main
+Restart=always
+RestartSec=15
+User=root
+NoNewPrivileges=true
+PrivateTmp=true
+Nice=10
+MemoryMax=256M
+TasksMax=32
+StateDirectory=alis-alert-worker
+
+[Install]
+WantedBy=multi-user.target
