@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from unittest.mock import MagicMock
 
 from app.services import system_alerts
 from app.services.system_alerts import AlertIssue
@@ -50,3 +51,24 @@ def test_delivery_failure_keeps_issue_pending_for_retry(monkeypatch, tmp_path: P
     assert system_alerts.run_alert_cycle(state)["ok"] is False
     assert system_alerts.run_alert_cycle(state)["new_count"] == 1
     assert attempts == [False, False]
+
+
+def test_resend_delivery_reuses_reference_idempotency_contract(monkeypatch) -> None:
+    response = MagicMock()
+    response.__enter__.return_value.read.return_value = b'{"id":"email-test-1"}'
+    captured = {}
+
+    def open_request(request, timeout):
+        captured["request"] = request
+        captured["timeout"] = timeout
+        return response
+
+    monkeypatch.setenv("ALIS_ALERT_RESEND_API_KEY", "test-key")
+    monkeypatch.setattr(system_alerts.urllib.request, "urlopen", open_request)
+    issue = AlertIssue("api_not_ready", "主服务未就绪", "数据库不可用")
+
+    system_alerts.send_issue_email([issue])
+
+    assert captured["request"].full_url == "https://api.resend.com/emails"
+    assert captured["request"].headers["Idempotency-key"]
+    assert captured["timeout"] == 20

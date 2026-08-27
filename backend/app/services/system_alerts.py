@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import html
 import json
 import logging
 import os
@@ -177,25 +178,91 @@ def _smtp_settings() -> dict[str, Any]:
     }
 
 
+def _resend_settings() -> dict[str, str]:
+    return {
+        "api_key": _env("ALIS_ALERT_RESEND_API_KEY"),
+        "sender": _env("ALIS_ALERT_RESEND_FROM", "ALIS 系统告警 <onboarding@resend.dev>"),
+    }
+
+
+def _email_content(issues: list[AlertIssue], *, recovered: bool) -> tuple[str, str, str]:
+    prefix = "[恢复]" if recovered else "[紧急]"
+    subject = f"{prefix} ALIS 系统告警（{len(issues)}项）"
+    heading = "ALIS 监控检测到以下已恢复问题：" if recovered else "ALIS 监控检测到以下可能影响主线运行的问题："
+    text_lines = [heading, ""]
+    html_rows = []
+    for index, issue in enumerate(issues, 1):
+        text_lines.extend([f"{index}. {issue.title}", f"   {issue.detail}", f"   代码：{issue.code}", ""])
+        html_rows.append(
+            "<tr>"
+            f"<td style='padding:8px;border:1px solid #ddd'>{index}</td>"
+            f"<td style='padding:8px;border:1px solid #ddd'><strong>{html.escape(issue.title)}</strong><br>"
+            f"{html.escape(issue.detail)}<br><small>{html.escape(issue.code)}</small></td>"
+            "</tr>"
+        )
+    checked_at = _now().isoformat(timespec="seconds")
+    text_lines.extend([f"检测时间：{checked_at}", f"收件人固定为 {ALERT_RECIPIENT}"])
+    html_body = (
+        "<html><body>"
+        f"<h2>{html.escape(heading)}</h2>"
+        "<table style='border-collapse:collapse'>"
+        f"{''.join(html_rows)}</table>"
+        f"<p>检测时间：{html.escape(checked_at)}<br>收件人：{ALERT_RECIPIENT}</p>"
+        "</body></html>"
+    )
+    return subject, "\n".join(text_lines), html_body
+
+
+def _send_with_resend(*, subject: str, text_body: str, html_body: str, idempotency_key: str) -> str:
+    settings = _resend_settings()
+    request = urllib.request.Request(
+        "https://api.resend.com/emails",
+        data=json.dumps({
+            "from": settings["sender"],
+            "to": [ALERT_RECIPIENT],
+            "subject": subject,
+            "text": text_body,
+            "html": html_body,
+        }, ensure_ascii=False).encode(),
+        headers={
+            "Authorization": f"Bearer {settings['api_key']}",
+            "Content-Type": "application/json",
+            "Idempotency-Key": idempotency_key,
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=20) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+    message_id = str(payload.get("id") or "")
+    if not message_id:
+        raise RuntimeError("Resend response did not contain an email id")
+    return message_id
+
+
 def send_issue_email(issues: list[AlertIssue], *, recovered: bool = False) -> None:
     if not issues:
+        return
+    subject, text_body, html_body = _email_content(issues, recovered=recovered)
+    resend = _resend_settings()
+    idempotency_source = "|".join(sorted(issue.fingerprint for issue in issues))
+    idempotency_key = hashlib.sha256(f"{recovered}|{idempotency_source}".encode()).hexdigest()
+    if resend["api_key"]:
+        _send_with_resend(
+            subject=subject,
+            text_body=text_body,
+            html_body=html_body,
+            idempotency_key=idempotency_key,
+        )
         return
     settings = _smtp_settings()
     if not settings["password"]:
         raise RuntimeError("ALIS_ALERT_SMTP_PASS is not configured")
     message = EmailMessage()
-    prefix = "[恢复]" if recovered else "[紧急]"
-    message["Subject"] = f"{prefix} ALIS 系统告警（{len(issues)}项）"
+    message["Subject"] = subject
     message["From"] = f"{settings['sender_name']} <{settings['sender']}>"
     message["To"] = ALERT_RECIPIENT
-    lines = [
-        "ALIS 监控检测到以下已恢复问题：" if recovered else "ALIS 监控检测到以下可能影响主线运行的问题：",
-        "",
-    ]
-    for index, issue in enumerate(issues, 1):
-        lines.extend([f"{index}. {issue.title}", f"   {issue.detail}", f"   代码：{issue.code}", ""])
-    lines.extend([f"检测时间：{_now().isoformat(timespec='seconds')}", "收件人固定为 siriusal@icloud.com"])
-    message.set_content("\n".join(lines))
+    message.set_content(text_body)
+    message.add_alternative(html_body, subtype="html")
     context = ssl.create_default_context()
     if settings["secure"]:
         client_context = smtplib.SMTP_SSL(
