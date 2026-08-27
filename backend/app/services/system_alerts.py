@@ -80,9 +80,10 @@ def _blocked_plan_issues(now: datetime) -> list[AlertIssue]:
         rows = conn.execute(
             """SELECT trade_date,planned_execute_date,status,validation_error_code
                  FROM daily_rebalance_plans
-                WHERE planned_execute_date<=? AND status IN (?,?,?,?)
+                WHERE (planned_execute_date=? OR trade_date=?)
+                  AND status IN (?,?,?,?)
                 ORDER BY planned_execute_date DESC,version DESC LIMIT 5""",
-            (today, *_BLOCKING_PLAN_STATUSES),
+            (today, today, *_BLOCKING_PLAN_STATUSES),
         ).fetchall()
     issues = []
     for row in rows:
