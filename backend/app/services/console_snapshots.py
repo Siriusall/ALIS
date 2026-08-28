@@ -8,6 +8,8 @@ both PostgreSQL and the expensive aggregation work.
 from __future__ import annotations
 
 import copy
+import gzip
+import hashlib
 import json
 import logging
 import os
@@ -27,7 +29,7 @@ from app.services.network_budget import optional_network_work_allowed
 
 
 PAGE_KEYS = (
-    "overview", "decision", "portfolio", "operations", "versions", "data",
+    "overview", "decision", "portfolio", "operations", "runtime", "versions", "data",
     "models", "research", "factors", "waves", "evidence",
 )
 _DEFAULT_TTLS = {
@@ -35,12 +37,13 @@ _DEFAULT_TTLS = {
     # safety net, not a second polling system: sub-minute TTLs kept the single
     # control worker permanently rebuilding pages and repeatedly ran formal
     # historical audits beside the close update and execution probes.
-    "overview": 180,
-    "decision": 180,
-    "portfolio": 300,
-    "operations": 180,
+    "overview": 600,
+    "decision": 600,
+    "portfolio": 600,
+    "operations": 600,
+    "runtime": 30,
     "versions": 600,
-    "data": 180,
+    "data": 600,
     "models": 600,
     "research": 600,
     "factors": 600,
@@ -48,6 +51,7 @@ _DEFAULT_TTLS = {
     "evidence": 600,
 }
 _FAILURE_RETRY_SECONDS = 15
+_APP_CACHE_TTL_SECONDS = 86400
 _DIAGNOSTIC_CACHE_SECONDS = 300
 _DIAGNOSTIC_PAGE_KEYS = frozenset({"overview", "operations", "data"})
 _DB_HEAVY_TASK_TYPES = frozenset({
@@ -67,6 +71,18 @@ _diagnostic_cache: dict[str, tuple[float, Callable[..., Any], Any]] = {}
 _diagnostic_cache_lock = Lock()
 _diagnostic_cache_generation = 0
 logger = logging.getLogger(__name__)
+
+_RUNTIME_OVERLAY_KEYS = frozenset({
+    "health",
+    "tradingReady",
+    "adminTasksLive",
+    "tasks",
+    "evolutionTasks",
+    "evolutionSchedule",
+    "quantTasks",
+    "quantStatus",
+    "quantRecent",
+})
 
 
 def _now() -> str:
@@ -207,6 +223,10 @@ def _ensure_table() -> None:
                         status VARCHAR(32) NOT NULL,
                         invalidated_at VARCHAR(64),
                         payload_json TEXT NOT NULL,
+                        payload_gzip BLOB,
+                        content_hash VARCHAR(64) NOT NULL DEFAULT '',
+                        payload_size_bytes BIGINT NOT NULL DEFAULT 0,
+                        compressed_size_bytes BIGINT NOT NULL DEFAULT 0,
                         updated_at VARCHAR(64) NOT NULL,
                         refresh_generation BIGINT NOT NULL DEFAULT 0,
                         last_attempt_generation BIGINT NOT NULL DEFAULT -1,
@@ -373,14 +393,12 @@ def _readers(page_key: str) -> dict[str, Callable[[], Any]]:
 
     pages: dict[str, dict[str, Callable[[], Any]]] = {
         "overview": {
-            **common,
             "oos": bounded_oos,
             "sealed": bounded_sealed,
             "owner": model_strategy.model_strategy_owner_summary,
             "ledger": quant_runs.quant_run_ledger_summary,
             "portfolio": lambda: research.research_portfolio_candles(limit=90),
             "latestPlan": lambda: decision_latest_plan(compact=True),
-            "adminTasksLive": lambda: model_strategy.model_strategy_task_center(limit=30, log_limit=20, compact=True),
             "dailyUpdateStatus": lambda: data_center.data_center_daily_update_status(compact=True),
             # A stale watermark can request its own catalog rebuild, which in
             # turn invalidates this page. Snapshot assembly must only read the
@@ -406,20 +424,23 @@ def _readers(page_key: str) -> dict[str, Callable[[], Any]]:
             "latestPlan": lambda: decision_latest_plan(compact=True),
         },
         "operations": {
-            **common,
             "oos": bounded_oos,
             "sealed": bounded_sealed,
             "owner": model_strategy.model_strategy_owner_summary,
-            "adminTasksLive": lambda: model_strategy.model_strategy_task_center(limit=30, log_limit=20, compact=True),
-            "tasks": lambda: model_strategy.model_strategy_task_center(limit=16, log_limit=40, compact=True),
-            "evolutionTasks": lambda: model_strategy.model_strategy_evolution_tasks(limit=30),
-            "evolutionSchedule": model_strategy.model_strategy_evolution_schedule,
-            "quantTasks": lambda: quant_runs.quant_run_tasks(limit=20),
-            "quantStatus": quant_runs.quant_run_status,
-            "quantRecent": lambda: quant_runs.quant_run_recent(limit=10),
             "operationsPage": lambda: __import__("app.api.routes.positions", fromlist=["get_operations_page"]).get_operations_page(execution_id=None, limit=20, offset=0),
             "executionsPage": lambda: __import__("app.api.routes.positions", fromlist=["get_executions_page"]).get_executions_page(limit=20, offset=0),
             "ledgerAudit": model_strategy.model_strategy_ledger_audit,
+        },
+        "runtime": {
+            "health": common["health"],
+            "tradingReady": common["tradingReady"],
+            "adminTasksLive": lambda: model_strategy.model_strategy_task_center(limit=16, log_limit=5, compact=True),
+            "tasks": lambda: model_strategy.model_strategy_task_center(limit=16, log_limit=5, compact=True),
+            "evolutionTasks": lambda: model_strategy.model_strategy_evolution_tasks(limit=20),
+            "evolutionSchedule": model_strategy.model_strategy_evolution_schedule,
+            "quantTasks": lambda: quant_runs.quant_run_tasks(limit=10),
+            "quantStatus": quant_runs.quant_run_status,
+            "quantRecent": lambda: quant_runs.quant_run_recent(limit=5),
         },
         "versions": {
             "systemVersionStatus": system_versions.system_version_status,
@@ -609,6 +630,48 @@ def _serialize(payload: dict[str, Any]) -> str:
     return json.dumps(jsonable_encoder(payload), ensure_ascii=False, separators=(",", ":"))
 
 
+def _semantic_payload_hash(payload: dict[str, Any]) -> str:
+    stable = {
+        "page": payload.get("page"),
+        "status": payload.get("status"),
+        "sections": payload.get("sections", {}),
+        "data": payload.get("data", {}),
+    }
+    return hashlib.sha256(_serialize(stable).encode("utf-8")).hexdigest()
+
+
+def _encode_payload(payload: dict[str, Any]) -> tuple[str, bytes, str, int, int]:
+    serialized = _serialize(payload)
+    raw = serialized.encode("utf-8")
+    compressed = gzip.compress(raw, compresslevel=6, mtime=0)
+    return serialized, compressed, _semantic_payload_hash(payload), len(raw), len(compressed)
+
+
+def _decode_payload(record: dict[str, Any]) -> dict[str, Any] | None:
+    compressed = record.get("payload_gzip")
+    if compressed:
+        try:
+            raw = bytes(compressed) if isinstance(compressed, memoryview) else compressed
+            payload = json.loads(gzip.decompress(raw).decode("utf-8"))
+        except (OSError, TypeError, UnicodeDecodeError, ValueError):
+            payload = None
+        if isinstance(payload, dict):
+            return payload
+    try:
+        payload = json.loads(record.get("payload_json") or "")
+    except (TypeError, ValueError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _app_cache_ttl() -> int:
+    raw = os.getenv("ALIS_CONSOLE_SNAPSHOT_APP_CACHE_TTL_SECONDS", "")
+    try:
+        return max(60, int(raw)) if raw else _APP_CACHE_TTL_SECONDS
+    except ValueError:
+        return _APP_CACHE_TTL_SECONDS
+
+
 def _generation(record: dict[str, Any] | None) -> int:
     try:
         return int((record or {}).get("refresh_generation") or 0)
@@ -665,7 +728,8 @@ def _snapshot_metadata(page_key: str) -> dict[str, Any] | None:
     with _conn() as conn:
         row = conn.execute(
             "SELECT page_key,version,generated_at,as_of,status,invalidated_at,updated_at,"
-            "refresh_generation,last_attempt_generation,last_attempt_at,last_error_code "
+            "refresh_generation,last_attempt_generation,last_attempt_at,last_error_code,"
+            "content_hash,payload_size_bytes,compressed_size_bytes "
             "FROM console_page_snapshots WHERE page_key=?",
             (page_key,),
         ).fetchone()
@@ -677,19 +741,20 @@ def _load_durable(page_key: str) -> dict[str, Any] | None:
     with _conn() as conn:
         row = conn.execute(
             "SELECT page_key,version,generated_at,as_of,status,invalidated_at,updated_at,"
-            "refresh_generation,last_attempt_generation,last_attempt_at,last_error_code,payload_json "
+            "refresh_generation,last_attempt_generation,last_attempt_at,last_error_code,payload_json,"
+            "payload_gzip,content_hash,payload_size_bytes,compressed_size_bytes "
             "FROM console_page_snapshots WHERE page_key=?",
             (page_key,),
         ).fetchone()
     if not row:
         return None
     record = dict(row)
-    try:
-        payload = json.loads(record.get("payload_json") or "")
-    except (TypeError, ValueError):
+    payload = _decode_payload(record)
+    if payload is None:
         return None
-    if not isinstance(payload, dict):
-        return None
+    payload["generated_at"] = str(record.get("generated_at") or payload.get("generated_at") or "")
+    payload["as_of"] = str(record.get("as_of") or payload.get("as_of") or "")
+    payload["status"] = str(record.get("status") or payload.get("status") or "")
     payload["refresh_generation"] = _generation(record)
     return payload
 
@@ -709,7 +774,7 @@ def _ensure_snapshot_record(page_key: str) -> dict[str, Any]:
             (page_key, now, payload, now),
         )
         row = conn.execute(
-            "SELECT page_key,version,status,invalidated_at,refresh_generation "
+            "SELECT page_key,version,status,invalidated_at,refresh_generation,content_hash "
             "FROM console_page_snapshots WHERE page_key=?",
             (page_key,),
         ).fetchone()
@@ -721,12 +786,33 @@ def _ensure_snapshot_record(page_key: str) -> dict[str, Any]:
 def _save_durable(page_key: str, payload: dict[str, Any], expected_generation: int) -> bool:
     """Commit only if no invalidation happened while the readers were running."""
     _ensure_table()
-    serialized = _serialize(payload)
+    _serialized, compressed, content_hash, payload_size, compressed_size = _encode_payload(payload)
     with _conn() as conn:
+        existing = conn.execute(
+            "SELECT version,status,content_hash FROM console_page_snapshots "
+            "WHERE page_key=? AND refresh_generation=?",
+            (page_key, expected_generation),
+        ).fetchone()
+        existing_record = dict(existing) if existing else None
+        if _has_committed_snapshot(existing_record) and str(existing_record.get("content_hash") or "") == content_hash:
+            row = conn.execute(
+                """UPDATE console_page_snapshots SET
+                        generated_at=?, as_of=?, status=?, invalidated_at=NULL, updated_at=?,
+                        last_attempt_generation=-1,
+                        last_attempt_at=NULL, last_error_code=''
+                    WHERE page_key=? AND refresh_generation=?
+                    RETURNING refresh_generation""",
+                (
+                    payload["generated_at"], payload["as_of"], payload["status"],
+                    payload["generated_at"], page_key, expected_generation,
+                ),
+            ).fetchone()
+            return row is not None
         row = conn.execute(
             """UPDATE console_page_snapshots SET
                     version=?, generated_at=?, as_of=?, status=?, invalidated_at=NULL,
-                    payload_json=?, updated_at=?, last_attempt_generation=-1,
+                    payload_json=?, payload_gzip=?, content_hash=?, payload_size_bytes=?,
+                    compressed_size_bytes=?, updated_at=?, last_attempt_generation=-1,
                     last_attempt_at=NULL, last_error_code=''
                 WHERE page_key=? AND refresh_generation=?
                 RETURNING refresh_generation""",
@@ -735,7 +821,11 @@ def _save_durable(page_key: str, payload: dict[str, Any], expected_generation: i
                 payload["generated_at"],
                 payload["as_of"],
                 payload["status"],
-                serialized,
+                "{}",
+                compressed,
+                content_hash,
+                payload_size,
+                compressed_size,
                 payload["generated_at"],
                 page_key,
                 expected_generation,
@@ -884,7 +974,10 @@ def _pages_due_for_refresh() -> list[str]:
     # on their latest known-good snapshot while the control worker is serial.
     ordered_page_keys = tuple(sorted(
         PAGE_KEYS,
-        key=lambda page_key: 0 if (by_page.get(page_key) or {}).get("invalidated_at") else 1,
+        key=lambda page_key: (
+            0 if page_key == "runtime" else 1,
+            0 if (by_page.get(page_key) or {}).get("invalidated_at") else 1,
+        ),
     ))
     for page_key in ordered_page_keys:
         record = by_page.get(page_key)
@@ -968,10 +1061,6 @@ def run_snapshot_worker_forever(stop_event: Any | None = None) -> None:
     stopper = stop_event
     while stopper is None or not stopper.is_set():
         try:
-            if _snapshot_build_should_yield():
-                if _wait_or_stop(stopper, 5.0):
-                    return
-                continue
             due = _pages_due_for_refresh()
         except Exception as exc:  # database failures must not involve the API host
             logger.warning("Console snapshot due scan unavailable error_type=%s", type(exc).__name__)
@@ -982,7 +1071,7 @@ def run_snapshot_worker_forever(stop_event: Any | None = None) -> None:
             if stopper is not None and stopper.is_set():
                 return
             try:
-                if _snapshot_build_should_yield():
+                if page_key != "runtime" and _snapshot_build_should_yield():
                     break
             except Exception as exc:
                 logger.warning(
@@ -1061,13 +1150,30 @@ def _cache_matches_metadata(cached: dict[str, Any], metadata: dict[str, Any]) ->
     )
 
 
+def _with_runtime_overlay(page_key: str, response: dict[str, Any]) -> dict[str, Any]:
+    if page_key not in {"overview", "operations"}:
+        return response
+    runtime = read("runtime")
+    runtime_data = runtime.get("data") if isinstance(runtime, dict) else None
+    if not isinstance(runtime_data, dict) or not runtime_data:
+        return response
+    combined = copy.deepcopy(response)
+    combined_data = combined.setdefault("data", {})
+    for key in _RUNTIME_OVERLAY_KEYS:
+        if key in runtime_data:
+            combined_data[key] = runtime_data[key]
+    combined["runtime_generated_at"] = runtime.get("generated_at", "")
+    combined["runtime_status"] = runtime.get("status", "warming_up")
+    return combined
+
+
 def read(page_key: str, *, force: bool = False) -> dict[str, Any]:
     if page_key not in PAGE_KEYS:
         raise ValueError(f"unsupported console page: {page_key}")
     metadata = _snapshot_metadata(page_key)
     cached = None if force else get_json(_redis_key(page_key))
     if isinstance(cached, dict) and metadata and _cache_matches_metadata(cached, metadata):
-        return cached
+        return _with_runtime_overlay(page_key, cached)
     if isinstance(cached, dict):
         redis_delete(_redis_key(page_key))
     generation = _generation(metadata)
@@ -1077,13 +1183,13 @@ def read(page_key: str, *, force: bool = False) -> dict[str, Any]:
         response["stale"] = bool(metadata.get("invalidated_at"))
         response["refreshing"] = response["stale"]
         if not response["stale"]:
-            set_json(_redis_key(page_key), response, ttl=min(15, _ttl(page_key)))
-        return response
+            set_json(_redis_key(page_key), response, ttl=_app_cache_ttl())
+        return _with_runtime_overlay(page_key, response)
     if durable and str(durable.get("status") or "") == "unavailable":
         durable["stale"] = False
         durable["refreshing"] = True
-        return durable
-    return _warming_payload(page_key, generation)
+        return _with_runtime_overlay(page_key, durable)
+    return _with_runtime_overlay(page_key, _warming_payload(page_key, generation))
 
 
 def status() -> dict[str, Any]:
@@ -1091,7 +1197,15 @@ def status() -> dict[str, Any]:
     with _conn() as conn:
         rows = conn.execute(
             "SELECT page_key,version,generated_at,as_of,status,invalidated_at,updated_at,"
-            "refresh_generation,last_attempt_generation,last_attempt_at,last_error_code "
+            "refresh_generation,last_attempt_generation,last_attempt_at,last_error_code,"
+            "content_hash,payload_size_bytes,compressed_size_bytes "
             "FROM console_page_snapshots ORDER BY page_key"
         ).fetchall()
-    return {"ok": True, "items": [dict(row) for row in rows], "pages": list(PAGE_KEYS)}
+    items = [dict(row) for row in rows]
+    return {
+        "ok": True,
+        "items": items,
+        "pages": list(PAGE_KEYS),
+        "payload_size_bytes": sum(int(item.get("payload_size_bytes") or 0) for item in items),
+        "compressed_size_bytes": sum(int(item.get("compressed_size_bytes") or 0) for item in items),
+    }

@@ -16,7 +16,7 @@ from app.db.store import _conn as business_conn
 
 RELEASE_SCHEMA_VERSION = "alis_software_release_manifest_v2"
 DECISION_MANIFEST_SCHEMA_VERSION = "alis_decision_version_manifest_v3"
-SIM_SCHEMA_HEAD = "sim_0013_factor_values_maint"
+SIM_SCHEMA_HEAD = "sim_0014_snapshot_compression"
 DATA_SCHEMA_HEAD = "data_0015_churn_maint"
 REPO_ROOT = Path(__file__).resolve().parents[3]
 

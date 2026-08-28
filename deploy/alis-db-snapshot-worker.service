@@ -1,0 +1,34 @@
+[Unit]
+Description=ALIS Database-local Console Snapshot Worker
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/alis-db-snapshot/backend
+EnvironmentFile=/etc/alis/db-snapshot-worker.env
+Environment=PYTHONPATH=/opt/alis-db-snapshot/backend
+Environment=ALIS_WORKER_POOL=control
+Environment=ALIS_BUSINESS_DB_MAX_CONNECTIONS=2
+Environment=ALIS_DATA_DB_MAX_CONNECTIONS=2
+Environment=DATABASE_CONNECT_TIMEOUT_SECONDS=5
+Environment=DATABASE_STATEMENT_TIMEOUT_MS=30000
+Environment=DATABASE_IDLE_IN_TRANSACTION_TIMEOUT_MS=15000
+Environment=ALIS_CONSOLE_SNAPSHOT_HISTORICAL_AUDIT_MODE=refresh
+Environment=ALIS_CONSOLE_SNAPSHOT_APP_CACHE_TTL_SECONDS=86400
+Environment=ALIS_NETWORK_BUDGET_ENABLED=0
+ExecStart=/opt/alis-db-snapshot/backend/.venv/bin/python -m app.console_snapshot_worker_main
+Restart=always
+RestartSec=10
+User=alis-snapshot
+NoNewPrivileges=true
+PrivateTmp=true
+Nice=15
+IOSchedulingClass=idle
+CPUQuota=80%
+MemoryHigh=600M
+MemoryMax=800M
+TasksMax=96
+
+[Install]
+WantedBy=multi-user.target

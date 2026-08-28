@@ -75,17 +75,17 @@ const inFlight = new Map<string, PendingRequest>();
 const snapshotRequestGeneration = new Map<string, number>();
 const CACHE_TTL_MS = 60_000;
 const SNAPSHOT_POLL_INTERVAL_MS: Record<string, number> = {
-  "/overview": 180_000,
-  "/decision": 180_000,
-  "/portfolio": 300_000,
-  "/operations": 5_000,
-  "/system": 5_000,
+  "/overview": 600_000,
+  "/decision": 600_000,
+  "/portfolio": 600_000,
+  "/operations": 30_000,
+  "/system": 30_000,
   "/system/versions": 600_000,
-  "/data": 180_000,
-  "/models": 15_000,
+  "/data": 600_000,
+  "/models": 600_000,
   "/research": 600_000,
   "/factors": 600_000,
-  "/evolution": 5_000,
+  "/evolution": 600_000,
   "/evolution/factors": 600_000,
   "/evolution/metrics": 600_000,
   "/evolution/waves": 600_000,
@@ -93,7 +93,7 @@ const SNAPSHOT_POLL_INTERVAL_MS: Record<string, number> = {
 };
 
 function snapshotPollInterval(pathname: string) {
-  return SNAPSHOT_POLL_INTERVAL_MS[pathname] || 180_000;
+  return SNAPSHOT_POLL_INTERVAL_MS[pathname] || 600_000;
 }
 
 function cachedHealthySnapshot(page: string): Json | null {

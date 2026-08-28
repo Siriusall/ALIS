@@ -181,15 +181,38 @@ def test_snapshot_watermarks_do_not_trigger_another_refresh(monkeypatch, page_ke
 
 
 def test_snapshot_refresh_defaults_match_page_freshness_contract():
-    assert snapshots._ttl("overview") == 180
-    assert snapshots._ttl("decision") == 180
-    assert snapshots._ttl("portfolio") == 300
-    assert snapshots._ttl("operations") == 180
-    assert snapshots._ttl("data") == 180
+    assert snapshots._ttl("overview") == 600
+    assert snapshots._ttl("decision") == 600
+    assert snapshots._ttl("portfolio") == 600
+    assert snapshots._ttl("operations") == 600
+    assert snapshots._ttl("runtime") == 30
+    assert snapshots._ttl("data") == 600
     assert snapshots._ttl("models") == 600
     assert snapshots._ttl("research") == 600
     assert snapshots._ttl("factors") == 600
     assert snapshots._ttl("evidence") == 600
+
+
+def test_runtime_snapshot_is_prioritized_ahead_of_business_pages(monkeypatch):
+    monkeypatch.setattr(snapshots, "_ensure_table", lambda: None)
+
+    class Rows:
+        def fetchall(self):
+            return []
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, *_args, **_kwargs):
+            return Rows()
+
+    monkeypatch.setattr(snapshots, "_conn", lambda: Connection())
+
+    assert snapshots._pages_due_for_refresh()[0] == "runtime"
 
 
 def test_degraded_envelope_metadata_is_not_readable_evidence():
@@ -455,6 +478,8 @@ def test_old_generation_save_cannot_overwrite_snapshot_after_invalidation(monkey
             return False
 
         def execute(self, sql, params=()):
+            if str(sql).startswith("SELECT version,status,content_hash"):
+                return Result({"version": "newer-snapshot", "status": "ready", "content_hash": "different"})
             assert "WHERE page_key=? AND refresh_generation=?" in sql
             assert params[-1] == 8
             if params[-1] != state["refresh_generation"]:
@@ -476,6 +501,71 @@ def test_old_generation_save_cannot_overwrite_snapshot_after_invalidation(monkey
 
     assert saved is False
     assert json.loads(state["payload_json"]) == {"version": "newer-snapshot"}
+
+
+def test_snapshot_payload_compression_round_trip():
+    payload = {
+        "page": "overview",
+        "version": "overview-v1",
+        "generated_at": "2026-08-29T00:00:00+00:00",
+        "status": "ready",
+        "sections": {"health": {"status": "ready"}},
+        "data": {"items": [{"name": "重复数据"}] * 100},
+    }
+
+    serialized, compressed, content_hash, raw_size, compressed_size = snapshots._encode_payload(payload)
+
+    assert snapshots._decode_payload({"payload_gzip": compressed, "payload_json": ""}) == payload
+    assert raw_size == len(serialized.encode("utf-8"))
+    assert compressed_size < raw_size
+    assert len(content_hash) == 64
+
+
+def test_new_snapshot_rows_store_only_compressed_body(monkeypatch):
+    calls: list[tuple[str, tuple[object, ...]]] = []
+
+    class Result:
+        def __init__(self, row):
+            self.row = row
+
+        def fetchone(self):
+            return self.row
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, sql, params=()):
+            calls.append((str(sql), tuple(params)))
+            if str(sql).startswith("SELECT version,status,content_hash"):
+                return Result({"version": "", "status": "warming_up", "content_hash": ""})
+            return Result({"refresh_generation": 2})
+
+    monkeypatch.setattr(snapshots, "_ensure_table", lambda: None)
+    monkeypatch.setattr(snapshots, "_conn", lambda: Connection())
+    payload = {
+        "page": "overview", "version": "v2", "generated_at": "now", "as_of": "now",
+        "status": "ready", "sections": {}, "data": {"items": ["large"] * 100},
+    }
+
+    assert snapshots._save_durable("overview", payload, expected_generation=2) is True
+    update_params = calls[1][1]
+    assert update_params[4] == "{}"
+    assert isinstance(update_params[5], bytes)
+    assert len(update_params[5]) < update_params[7]
+
+
+def test_semantic_hash_ignores_snapshot_wrapper_timestamps():
+    first = {
+        "page": "overview", "version": "v1", "generated_at": "one", "as_of": "one",
+        "status": "ready", "sections": {}, "data": {"value": 1},
+    }
+    second = {**first, "version": "v2", "generated_at": "two", "as_of": "two"}
+
+    assert snapshots._semantic_payload_hash(first) == snapshots._semantic_payload_hash(second)
 
 
 def test_failed_rebuild_retains_last_known_good_durable_payload(monkeypatch):
@@ -563,9 +653,9 @@ def test_read_discards_invalidated_redis_snapshot_without_recaching_lkg(monkeypa
     }
     deleted = []
     mirrored = []
-    monkeypatch.setattr(snapshots, "_snapshot_metadata", lambda _page: metadata)
-    monkeypatch.setattr(snapshots, "get_json", lambda _key: cached)
-    monkeypatch.setattr(snapshots, "_load_durable", lambda _page: durable)
+    monkeypatch.setattr(snapshots, "_snapshot_metadata", lambda page: metadata if page == "overview" else None)
+    monkeypatch.setattr(snapshots, "get_json", lambda key: cached if key == snapshots._redis_key("overview") else None)
+    monkeypatch.setattr(snapshots, "_load_durable", lambda page: durable if page == "overview" else None)
     monkeypatch.setattr(snapshots, "redis_delete", lambda key: deleted.append(key) or True)
     monkeypatch.setattr(snapshots, "set_json", lambda *args, **kwargs: mirrored.append((args, kwargs)) or True)
 
