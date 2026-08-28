@@ -435,10 +435,43 @@ def research_pools(pool_type:str="")->dict[str,Any]:
             # Pool membership remains usable when the optional name lookup is
             # unavailable; the UI will show the code instead of inventing a name.
             names = {}
+    scores_map: dict[str, dict[str, Any]] = {}
+    if codes:
+        placeholders = ",".join("?" for _ in codes)
+        try:
+            from app.db.store import _conn as business_conn
+            import json
+            with business_conn() as bconn:
+                srows = bconn.execute(
+                    f"""SELECT DISTINCT ON (ts_code) ts_code, dimensions_json, as_of_time, created_at
+                        FROM research_score_snapshots
+                        WHERE ts_code IN ({placeholders})
+                        ORDER BY ts_code, id DESC""",
+                    tuple(codes),
+                ).fetchall()
+                for srow in srows:
+                    sd = dict(srow)
+                    dims = json.loads(sd.get("dimensions_json") or "{}") if sd.get("dimensions_json") else {}
+                    val_scores = [v.get("score", 0) for v in dims.values() if isinstance(v, dict) and v.get("score") is not None]
+                    avg_score = round(sum(val_scores) / len(val_scores), 2) if val_scores else 0.0
+                    c_at = str(sd.get("created_at") or "")
+                    score_date = c_at[:10] if len(c_at) >= 10 else ""
+                    scores_map[str(sd.get("ts_code") or "").upper()] = {
+                        "score": avg_score,
+                        "as_of_time": sd.get("as_of_time"),
+                        "score_date": score_date,
+                    }
+        except Exception:
+            scores_map = {}
+
     for item in items:
         code = str(item.get("ts_code") or "").strip().upper()
         item["name"] = names.get(code, "")
         item["symbol_name"] = item["name"]
+        if code in scores_map:
+            item["current_research_score"] = scores_map[code]["score"]
+            item["score_as_of_date"] = scores_map[code]["score_date"]
+            item["score_as_of_time"] = scores_map[code]["as_of_time"]
     return {"ok": True, "items": items}
 
 

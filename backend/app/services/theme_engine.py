@@ -532,6 +532,7 @@ def materialize_theme_snapshots(*, as_of_time: str | None = None, lookback: int 
                 else "watch"
             )
             item["knowledge_graph"] = {"theme": item["theme"], "industry": raw["industry"], "company_count": len(raw["companies"]), "evidence_types": ["price_volume"] + (["company_financial_aggregate"] if raw["state"].get("status") == "ready" else [])}
+            item["point_in_time"] = point_in_time
             c.execute(
                 """INSERT INTO dc_theme_snapshot
                    (as_of_date,theme_code,theme_name,lifecycle,score,promotable,payload_json,model_version,available_time,created_at,updated_at)
@@ -927,9 +928,20 @@ def list_themes(
                     row["_decoded_payload"] = payload
                     visible_by_theme[theme_code] = row
                     break
+        for row in visible_by_theme.values():
+            decoded = row.get("_decoded_payload")
+            if not isinstance(decoded, dict):
+                try:
+                    decoded = json.loads(row.get("payload_json") or "{}")
+                except (TypeError, json.JSONDecodeError):
+                    decoded = {}
+            if not isinstance(decoded.get("point_in_time"), dict):
+                row["evidence_status"] = "legacy_unverified_pending_current_rematerialization"
+
         rows = sorted(
             visible_by_theme.values(),
             key=lambda item: (
+                1 if item.get("evidence_status") else 0,
                 -int(item.get("promotable") or 0),
                 -float(item.get("score") or 0),
                 str(item.get("as_of_date") or ""),
