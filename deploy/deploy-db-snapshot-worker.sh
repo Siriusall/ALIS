@@ -59,7 +59,7 @@ fi
 install -d -o alis-snapshot -g alis-snapshot -m 750 '$release'
 tar -xzf '$remote_archive' -C '$release'
 chown -R alis-snapshot:alis-snapshot '$release'
-ln -sfn /opt/alis-db-snapshot/shared/app-venv '$release/backend/.venv'
+rm -rf '$release/backend/.venv' && ln -sfn /opt/alis-db-snapshot/shared/app-venv '$release/backend/.venv'
 /opt/alis-db-snapshot/shared/app-venv/bin/pip install -q -r '$release/backend/requirements.txt'
 set -a
 . /etc/alis/db-snapshot-worker.env
