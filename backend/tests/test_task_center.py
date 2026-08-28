@@ -142,13 +142,20 @@ def test_node_views_use_real_component_cadence_and_probe_times():
 
     app = next(item for item in nodes if item["node"] == "alis-app")
     database = next(item for item in nodes if item["node"] == "alis-db")
-    control = next(item for item in nodes if item["node"] == "alis-control-worker")
-    assert app["heartbeat_at"] == generated.isoformat()
-    assert app["heartbeat_source"] == "api_response_probe"
+    compute = next(item for item in nodes if item["node"] == "alis-compute")
+    assert len(nodes) == 3
+    assert app["heartbeat_age_seconds"] == 300
+    assert app["heartbeat_source"] == "worker_heartbeat"
     assert database["heartbeat_at"] == generated.isoformat()
     assert database["heartbeat_source"] == "database_read_probe"
-    assert control["status"] == "running"
-    assert control["heartbeat_age_seconds"] == 20
+    assert compute["status"] == "running"
+    assert compute["heartbeat_age_seconds"] == 20
+    assert compute["logical_roles"] == ["控制 Worker", "研究 Worker"]
+
+
+def test_control_and_research_tasks_share_physical_compute_node():
+    assert task_center._task_execution_node({"worker_pool": "control"}) == "alis-compute"
+    assert task_center._task_execution_node({"worker_pool": "research"}) == "alis-compute"
 
 
 def test_cycle_step_uses_recorded_precise_times():

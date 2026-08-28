@@ -612,24 +612,21 @@ def _normalise_cycle_steps(task: dict[str, Any], schedule: dict[str, Any]) -> li
 _NODE_DEFINITIONS = (
     ("alis-app", "应用与数据流", "API、Redis Stream、日更调度与模拟执行"),
     ("alis-db", "数据库", "PostgreSQL 业务库与数据平台库"),
-    ("alis-control-worker", "控制工作节点", "自治编排、快照构建与控制类任务"),
-    ("alis-research-worker", "研究工作节点", "模型、因子、回测与长时研究任务"),
+    ("alis-compute", "计算工作服务器", "控制 Worker 与研究 Worker；负责自治编排、模型、因子和回测任务"),
 )
 
 
 def _task_execution_node(task: dict[str, Any]) -> str:
     pool = str(task.get("worker_pool") or "").lower()
-    if pool == "research":
-        return "alis-research-worker"
-    if pool == "control":
-        return "alis-control-worker"
+    if pool in {"research", "control"}:
+        return "alis-compute"
     if pool == "api_local":
         return "alis-app"
     source = str(task.get("source") or "")
     task_type = str(task.get("task_type") or "")
     if source in {"data_ingestion", "quant"} or "daily_update" in task_type or "stream" in task_type:
         return "alis-app"
-    return "alis-control-worker"
+    return "alis-compute"
 
 
 def _persistent_worker_heartbeats() -> list[dict[str, Any]]:
@@ -654,7 +651,9 @@ def _node_views(
 ) -> list[dict[str, Any]]:
     heartbeat_by_node: dict[str, list[dict[str, Any]]] = {}
     for item in heartbeats:
-        heartbeat_by_node.setdefault(str(item.get("node_name") or ""), []).append(item)
+        component = str(item.get("component") or "").strip().lower()
+        physical_node = "alis-app" if component == "scheduler" else "alis-compute"
+        heartbeat_by_node.setdefault(physical_node, []).append(item)
     nodes = []
     for node_name, label, responsibility in _NODE_DEFINITIONS:
         node_tasks = [item for item in tasks if item.get("execution_node") == node_name]
@@ -702,15 +701,22 @@ def _node_views(
             "service_count": len(services),
             "current_tasks": running[:4], "queued_tasks": queued[:4], "services": services,
             "worker_components": [str(item.get("component") or "") for item in node_heartbeats],
+            "logical_roles": (
+                ["API", "Redis", "快照 Worker", "告警 Worker", "调度器"]
+                if node_name == "alis-app"
+                else ["PostgreSQL"]
+                if node_name == "alis-db"
+                else ["控制 Worker", "研究 Worker"]
+            ),
         })
     return nodes
 
 
 def _upcoming_schedule(schedule: dict[str, Any]) -> list[dict[str, Any]]:
     definitions = (
-        ("factor_daily_cycle", "下次因子日循环", schedule.get("next_factor_cycle_at"), "alis-research-worker"),
-        ("system_autonomy_cycle", "下次系统自治周期", schedule.get("next_system_cycle_at"), "alis-control-worker"),
-        ("formal_oos_cycle", "下次正式 OOS 周期", schedule.get("next_formal_cycle_at"), "alis-research-worker"),
+        ("factor_daily_cycle", "下次因子日循环", schedule.get("next_factor_cycle_at"), "alis-compute"),
+        ("system_autonomy_cycle", "下次系统自治周期", schedule.get("next_system_cycle_at"), "alis-compute"),
+        ("formal_oos_cycle", "下次正式 OOS 周期", schedule.get("next_formal_cycle_at"), "alis-compute"),
     )
     return [
         {"task_type": task_type, "name": name, "scheduled_at": scheduled_at, "execution_node": node,
