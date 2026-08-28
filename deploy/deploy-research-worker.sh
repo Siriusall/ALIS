@@ -30,7 +30,7 @@ test "$(sed -n 's/^format=//p' <<<"$manifest")" = alis_release_bundle_v2
 test -n "$sim_head"
 test -n "$data_head"
 
-sha=$(shasum -a 256 "$bundle" | awk '{print $1}')
+sha=$(sha256sum "$bundle" 2>/dev/null | awk '{print $1}' || shasum -a 256 "$bundle" | awk '{print $1}')
 stamp=$(date +%Y%m%d-%H%M%S)
 short=${commit:0:7}
 remote_archive="/tmp/alis-research-${short}.tar.gz"

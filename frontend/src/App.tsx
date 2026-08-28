@@ -4,7 +4,21 @@ import { useState } from "react";
 import { NavLink, Navigate, Route, Routes, useLocation } from "react-router-dom";
 import { AuthPage, RequireAuth, useAuth } from "./auth";
 import { ConsoleLoading, ErrorStrip } from "./components";
-import { DataAssets, EvidenceChain, Evolution, FactorGuidance, ModelGovernance, Operations, Overview, Portfolio, Research, ResearchEfficiency, ResearchWaves, SystemObservatory, SystemVersions, TodayDecision } from "./pages";
+import React, { Suspense, lazy } from "react";
+const Overview = lazy(() => import("./pages").then(m => ({ default: m.Overview })));
+const TodayDecision = lazy(() => import("./pages").then(m => ({ default: m.TodayDecision })));
+const Portfolio = lazy(() => import("./pages").then(m => ({ default: m.Portfolio })));
+const Research = lazy(() => import("./pages").then(m => ({ default: m.Research })));
+const Evolution = lazy(() => import("./pages").then(m => ({ default: m.Evolution })));
+const FactorGuidance = lazy(() => import("./pages").then(m => ({ default: m.FactorGuidance })));
+const ResearchEfficiency = lazy(() => import("./pages").then(m => ({ default: m.ResearchEfficiency })));
+const ResearchWaves = lazy(() => import("./pages").then(m => ({ default: m.ResearchWaves })));
+const SystemObservatory = lazy(() => import("./pages").then(m => ({ default: m.SystemObservatory })));
+const SystemVersions = lazy(() => import("./pages").then(m => ({ default: m.SystemVersions })));
+const Operations = lazy(() => import("./pages").then(m => ({ default: m.Operations })));
+const DataAssets = lazy(() => import("./pages").then(m => ({ default: m.DataAssets })));
+const ModelGovernance = lazy(() => import("./pages").then(m => ({ default: m.ModelGovernance })));
+const EvidenceChain = lazy(() => import("./pages").then(m => ({ default: m.EvidenceChain })));
 import { preloadConsoleRoutes, useConsoleData } from "./useConsoleData";
 import type { ConsoleData } from "./useConsoleData";
 
@@ -165,11 +179,13 @@ function ConsoleApp() {
           <>
             {hasVisibleData && <SnapshotStatusBar snapshot={data.__snapshot} refreshing={refreshing} progress={progress}/>}
             <ErrorStrip errors={errors}/>
+            <Suspense fallback={<div className="panel loading-strip">????????...</div>}>
             <Routes>
               <Route path="/overview" element={<Overview data={data}/>}/><Route path="/system" element={<SystemObservatory data={data}/>}/><Route path="/system/versions" element={<SystemVersions data={data}/>}/><Route path="/decision" element={<TodayDecision data={data}/>}/><Route path="/portfolio" element={<Portfolio data={data}/>}/><Route path="/evolution" element={<Evolution data={data}/>}/><Route path="/evolution/factors" element={<FactorGuidance data={data}/>}/><Route path="/evolution/metrics" element={<ResearchEfficiency data={data}/>}/><Route path="/evolution/waves" element={<ResearchWaves data={data}/>}/><Route path="/research" element={<Research data={data}/>}/>
               <Route path="/operations" element={<Operations data={data}/>}/><Route path="/data" element={<DataAssets data={data}/>}/><Route path="/models" element={<ModelGovernance data={data}/>}/><Route path="/evidence" element={<EvidenceChain data={data}/>}/>
               <Route path="*" element={<Navigate to="/overview" replace/>}/>
             </Routes>
+            </Suspense>
           </>
         )}
       </main>

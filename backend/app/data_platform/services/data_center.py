@@ -7313,3 +7313,24 @@ def _upsert_industry_metric_values(rows: list[dict[str, Any]]) -> int:
                 pending[offset:offset + INDUSTRY_METRIC_UPSERT_BATCH_SIZE],
             )
     return len(pending)
+
+
+def purge_stale_runtime_logs(*, retention_days: int = 30, max_rows: int = 50000) -> dict[str, Any]:
+    """Bound PostgreSQL dc_runtime_logs growth by purging rows older than retention_days."""
+    from datetime import datetime, timedelta, timezone
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=max(7, retention_days))).isoformat()
+    try:
+        with _conn() as c:
+            deleted = c.execute(
+                """DELETE FROM dc_runtime_logs
+                   WHERE id IN (
+                       SELECT id FROM dc_runtime_logs
+                       WHERE created_at < ?
+                       ORDER BY id ASC
+                       LIMIT ?
+                   )""",
+                (cutoff, max(100, max_rows)),
+            ).rowcount
+            return {"ok": True, "deleted": deleted, "cutoff": cutoff}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc), "cutoff": cutoff}

@@ -876,6 +876,12 @@ def _worker(parent_run_id: int) -> None:
                  "retry_after_seconds": retry_after_seconds,
              }, ensure_ascii=False, default=str), parent_run_id),
         )
+    if final_status == "completed":
+        try:
+            from app.data_platform.services.data_center import purge_stale_runtime_logs
+            purge_stale_runtime_logs(retention_days=30)
+        except Exception:
+            pass
 
 
 def start_daily_update() -> dict[str, Any]:
