@@ -2074,29 +2074,77 @@ def _current_snapshot_prototypes(
     ]
 
 
-def _pending_candidate_count(*, snapshot_id: str | None = None) -> int:
+def _candidate_backlog_summary(*, snapshot_id: str | None = None) -> dict[str, Any]:
     ensure_strategy_research_tables()
     with _conn() as conn:
-        rows = conn.execute(
-            """SELECT payload_json
+        rows = [dict(row) for row in conn.execute(
+            """SELECT event_id,source_id,payload_json,status,created_at
                FROM strategy_research_events
                WHERE research_line='candidate_generation'
                  AND event_type='candidate_strategy_generated'
                  AND status IN ('queued','running')
                ORDER BY created_at ASC LIMIT 500"""
-        ).fetchall()
-    if not snapshot_id:
-        return len(rows)
-    return sum(
-        str(
-            json.loads(dict(row).get("payload_json") or "{}").get(
-                "snapshot_id"
-            )
-            or ""
-        )
-        == str(snapshot_id)
-        for row in rows
-    )
+        ).fetchall()]
+        completed_sources = {
+            str(dict(row).get("source_id") or "")
+            for row in conn.execute(
+                """SELECT DISTINCT source_id
+                   FROM strategy_research_events
+                   WHERE research_line='candidate_generation'
+                     AND event_type='candidate_strategy_generated'
+                     AND status='completed' AND source_id IS NOT NULL"""
+            ).fetchall()
+        }
+        waiting_tasks = [dict(row) for row in conn.execute(
+            """SELECT payload_json,phase,status,updated_at
+               FROM evolution_tasks
+               WHERE task_type='strategy_environment_backtest'
+                 AND status='retry_wait'
+                 AND phase IN ('waiting_for_historical_pit_evidence',
+                               'accumulating_new_strict_pit_baseline')
+               ORDER BY updated_at DESC LIMIT 500"""
+        ).fetchall()]
+    waiting_by_candidate: dict[str, dict[str, Any]] = {}
+    for task in waiting_tasks:
+        payload = json.loads(task.get("payload_json") or "{}")
+        candidate_id = str(payload.get("candidate_id") or "")
+        if candidate_id and candidate_id not in waiting_by_candidate:
+            waiting_by_candidate[candidate_id] = task
+    active: dict[str, dict[str, Any]] = {}
+    duplicate_completed: dict[str, dict[str, Any]] = {}
+    quarantined: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        payload = json.loads(row.get("payload_json") or "{}")
+        if snapshot_id and str(payload.get("snapshot_id") or "") != str(snapshot_id):
+            continue
+        candidate_id = str(payload.get("candidate_id") or row.get("source_id") or "")
+        item = {
+            "candidate_id": candidate_id,
+            "event_id": row.get("event_id"),
+            "created_at": row.get("created_at"),
+        }
+        if candidate_id in completed_sources:
+            duplicate_completed.setdefault(candidate_id, item)
+        elif candidate_id in waiting_by_candidate:
+            quarantined.setdefault(candidate_id, {
+                **item,
+                "reason": "historical_pit_evidence_unavailable",
+                "task_updated_at": waiting_by_candidate[candidate_id].get("updated_at"),
+            })
+        else:
+            active.setdefault(candidate_id, item)
+    return {
+        "active": list(active.values()),
+        "active_count": len(active),
+        "quarantined": list(quarantined.values()),
+        "quarantined_count": len(quarantined),
+        "duplicate_completed": list(duplicate_completed.values()),
+        "duplicate_completed_count": len(duplicate_completed),
+    }
+
+
+def _pending_candidate_count(*, snapshot_id: str | None = None) -> int:
+    return int(_candidate_backlog_summary(snapshot_id=snapshot_id)["active_count"])
 
 
 def _candidate_event_count() -> int:
@@ -2120,9 +2168,10 @@ def run_active_candidate_generation_line(
     from app.services.continuous_factor_research import _active_research_snapshot
 
     snapshot = _active_research_snapshot()
-    pending_count = _pending_candidate_count(
+    backlog = _candidate_backlog_summary(
         snapshot_id=str(snapshot.get("snapshot_id") or ""),
     )
+    pending_count = int(backlog["active_count"])
     available_slots = max(0, MAX_PENDING_CANDIDATES - pending_count)
     if available_slots == 0:
         return {
@@ -2134,6 +2183,10 @@ def run_active_candidate_generation_line(
             "events": [],
             "pending_candidate_count": pending_count,
             "maximum_pending_candidates": MAX_PENDING_CANDIDATES,
+            "pipeline_health": {
+                "status": "backpressured",
+                **backlog,
+            },
         }
 
     backfill_factor_learning()
@@ -2189,6 +2242,14 @@ def run_active_candidate_generation_line(
     result["status"] = "generated"
     result["pending_candidate_count_before_generation"] = pending_count
     result["maximum_pending_candidates"] = MAX_PENDING_CANDIDATES
+    result["pipeline_health"] = {
+        "status": (
+            "degraded_continuing"
+            if backlog["quarantined_count"] or backlog["duplicate_completed_count"]
+            else "healthy"
+        ),
+        **backlog,
+    }
     result["factor_analysis"] = {
         key: value for key, value in factor_analysis.items() if key != "eligible_factors"
     }

@@ -1255,10 +1255,24 @@ def build_task_center(
         age = max(0.0, (generated - heartbeat.astimezone(generated.tzinfo)).total_seconds()) if heartbeat else None
         if age is None or age > 180:
             stalled_tasks.append({**item, "heartbeat_age_seconds": age, "incident_reason": "任务心跳超过 180 秒"})
+    research_pipeline_blocks = [
+        {
+            **item,
+            "activity_scope": "pipeline_blocker",
+            "incident_reason": "策略候选环境回测等待历史点时证据；该候选已隔离，主研究流水线继续运行",
+        }
+        for item in tasks
+        if str(item.get("task_type") or "") == "strategy_environment_backtest"
+        and str(item.get("raw_status") or "") == "retry_wait"
+        and str(item.get("phase") or "") in {
+            "waiting_for_historical_pit_evidence",
+            "accumulating_new_strict_pit_baseline",
+        }
+    ]
     incidents = [
         {**item, "incident_reason": str(item.get("error") or item.get("message") or "任务阻断")}
         for item in current_tasks if item.get("status") in {"failed", "blocked"}
-    ] + stalled_tasks
+    ] + stalled_tasks + research_pipeline_blocks
     if include_slo:
         from app.services.system_autonomy import build_autonomy_slo
         try:
@@ -1306,6 +1320,8 @@ def build_task_center(
             "recent_failed_records": failed_records,
             "failed": unresolved_failures,
             "completed": sum(1 for item in current_tasks if item.get("status") == "completed"),
+            "research_pipeline_status": "degraded_continuing" if research_pipeline_blocks else "healthy",
+            "research_pipeline_blocked_candidates": len(research_pipeline_blocks),
         },
         "modules": module_items, "tasks": tasks[: max(20, min(limit * 3, 200))],
         # The two explicit projections prevent clients from presenting a

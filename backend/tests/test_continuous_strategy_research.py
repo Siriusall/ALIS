@@ -392,8 +392,15 @@ def test_active_candidate_generation_stops_at_pending_backlog_limit(monkeypatch)
     monkeypatch.setattr(research, "MAX_PENDING_CANDIDATES", 4)
     monkeypatch.setattr(
         research,
-        "_pending_candidate_count",
-        lambda **_kwargs: 4,
+        "_candidate_backlog_summary",
+        lambda **_kwargs: {
+            "active": [{"candidate_id": f"candidate-{index}"} for index in range(4)],
+            "active_count": 4,
+            "quarantined": [],
+            "quarantined_count": 0,
+            "duplicate_completed": [],
+            "duplicate_completed_count": 0,
+        },
     )
     from app.services import continuous_factor_research as factor_research
 
@@ -409,6 +416,56 @@ def test_active_candidate_generation_stops_at_pending_backlog_limit(monkeypatch)
     assert result["generated"] == []
     assert result["pending_candidate_count"] == 4
     assert result["maximum_pending_candidates"] == 4
+    assert result["pipeline_health"]["status"] == "backpressured"
+
+
+def test_active_candidate_generation_continues_when_blocked_candidates_are_quarantined(monkeypatch):
+    monkeypatch.setattr(research, "MAX_PENDING_CANDIDATES", 4)
+    monkeypatch.setattr(
+        research,
+        "_candidate_backlog_summary",
+        lambda **_kwargs: {
+            "active": [],
+            "active_count": 0,
+            "quarantined": [{"candidate_id": "blocked-candidate"}],
+            "quarantined_count": 1,
+            "duplicate_completed": [{"candidate_id": "completed-candidate"}],
+            "duplicate_completed_count": 1,
+        },
+    )
+    from app.services import continuous_factor_research as factor_research
+
+    monkeypatch.setattr(
+        factor_research,
+        "_active_research_snapshot",
+        lambda: {
+            "snapshot_id": "snapshot-current",
+            "contract": {"evidence_signature": "evidence"},
+            "research_windows": [],
+            "factors": [],
+            "data_as_of": "20260828",
+        },
+    )
+    monkeypatch.setattr(research, "backfill_factor_learning", lambda: None)
+    monkeypatch.setattr(research, "build_dynamic_market_environments", lambda **_kwargs: [])
+    monkeypatch.setattr(research, "persist_market_environments", lambda _items: None)
+    monkeypatch.setattr(research, "analyze_factor_pool", lambda _items: {"eligible_factors": []})
+    monkeypatch.setattr(research, "_current_snapshot_prototypes", lambda _snapshot: [])
+    monkeypatch.setattr(research, "_load_failure_memories", lambda **_kwargs: [])
+    monkeypatch.setattr(research, "_candidate_event_count", lambda: 0)
+    monkeypatch.setattr(
+        research,
+        "run_candidate_generation_line",
+        lambda **_kwargs: {"ok": True, "generated": [{"candidate_id": "new-candidate"}]},
+    )
+
+    result = research.run_active_candidate_generation_line(batch_size=4)
+
+    assert result["status"] == "generated"
+    assert result["generated"][0]["candidate_id"] == "new-candidate"
+    assert result["pipeline_health"]["status"] == "degraded_continuing"
+    assert result["pipeline_health"]["quarantined_count"] == 1
+    assert result["pipeline_health"]["duplicate_completed_count"] == 1
 
 
 def test_current_snapshot_prototypes_exclude_retired_model_contracts(monkeypatch):
