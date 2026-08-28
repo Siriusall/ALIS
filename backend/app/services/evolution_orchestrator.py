@@ -39,6 +39,7 @@ from app.services.strategy_config import get_replay_required_factor_names
 from app.services.backtest_data_source import BacktestDataSource
 from app.services.strategy_lifecycle import advance_formal_candidate_lifecycle
 from app.services.strategy_statistics import deflated_sharpe_ratio
+from app.services.network_budget import network_budget_status, optional_network_work_allowed
 
 
 logger = logging.getLogger("quant.evolution")
@@ -100,6 +101,20 @@ LONG_RESEARCH_TASK_TYPES = frozenset({
     "model_strategy_impact_validation", "hsmm_shadow_training",
     "controller_candidate_observation", "plan_model_autonomy",
     "research_maintenance", "factor_daily_cycle",
+})
+NETWORK_OPTIONAL_TASK_TYPES = frozenset({
+    "factor_research_cycle",
+    "hsmm_shadow_training",
+    "model_candidate_research",
+    "model_strategy_impact_validation",
+    "plan_model_autonomy",
+    "research_maintenance",
+    "strategy_candidate_generation",
+    "strategy_cluster_distillation",
+    "strategy_environment_backtest",
+    "strategy_evolution_cycle",
+    "strategy_failure_model_training",
+    "strategy_portfolio_research",
 })
 
 
@@ -250,7 +265,11 @@ def evolution_runtime_status() -> dict[str, Any]:
             age = None
         value["heartbeat_age_seconds"] = age
         value["healthy"] = bool(value.get("disabled")) or (bool(value.get("alive")) and age is not None and age <= 900)
-    return {"ok": all(item.get("healthy") for item in items.values()), "components": items}
+    return {
+        "ok": all(item.get("healthy") for item in items.values()),
+        "components": items,
+        "network_budget": network_budget_status(),
+    }
 
 
 def _is_scheduled_trade_day(value: datetime) -> bool:
@@ -1240,12 +1259,17 @@ def _claim_next_task() -> dict[str, Any] | None:
     now = _now()
     lease_until = (now + timedelta(minutes=LEASE_MINUTES)).isoformat()
     research_clause = ""
+    network_budget_clause = ""
     claim_params: list[Any] = [now.isoformat(), WORKER_POOL]
     worker_pool_clause = "AND worker_pool=?"
     if _defer_long_research_claims(now):
         placeholders = ",".join("?" for _ in LONG_RESEARCH_TASK_TYPES)
         research_clause = f"AND task_type NOT IN ({placeholders})"
         claim_params.extend(sorted(LONG_RESEARCH_TASK_TYPES))
+    if not optional_network_work_allowed():
+        placeholders = ",".join("?" for _ in NETWORK_OPTIONAL_TASK_TYPES)
+        network_budget_clause = f"AND task_type NOT IN ({placeholders})"
+        claim_params.extend(sorted(NETWORK_OPTIONAL_TASK_TYPES))
     with _conn() as conn:
         suffix = " FOR UPDATE SKIP LOCKED" if conn._is_postgres else ""
         row = conn.execute(
@@ -1254,6 +1278,7 @@ def _claim_next_task() -> dict[str, Any] | None:
                   AND (next_run_at IS NULL OR next_run_at<=?)
                   {worker_pool_clause}
                   {research_clause}
+                  {network_budget_clause}
                 ORDER BY priority ASC,created_at ASC LIMIT 1{suffix}""",
             tuple(claim_params),
         ).fetchone()

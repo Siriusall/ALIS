@@ -22,10 +22,16 @@ Environment=OPENBLAS_NUM_THREADS=1
 Environment=MKL_NUM_THREADS=1
 Environment=NUMEXPR_NUM_THREADS=1
 Environment=VECLIB_MAXIMUM_THREADS=1
+Environment=ALIS_NETWORK_BUDGET_ENABLED=1
+Environment=ALIS_NETWORK_DAILY_BUDGET_MB=1024
+Environment=ALIS_NETWORK_BUDGET_INTERFACE=eth0
+Environment=ALIS_NETWORK_BUDGET_DIRECTION=total
+Environment=ALIS_NETWORK_BUDGET_STATE_PATH=/var/lib/alis-research-worker/network-budget.json
 ExecStart=/opt/alis-research-worker/shared/app-venv/bin/python -m app.evolution_worker_main
 Restart=always
 RestartSec=10
 User=alis-research
+StateDirectory=alis-research-worker
 NoNewPrivileges=true
 PrivateTmp=true
 MemoryHigh=2600M

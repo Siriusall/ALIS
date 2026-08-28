@@ -23,6 +23,7 @@ from fastapi.responses import JSONResponse
 from app.data_platform.redis_store import delete as redis_delete
 from app.data_platform.redis_store import get_json, set_json
 from app.db.store import _conn, _read_conn
+from app.services.network_budget import optional_network_work_allowed
 
 
 PAGE_KEYS = (
@@ -122,6 +123,44 @@ def _cached_diagnostic(
         if generation == _diagnostic_cache_generation:
             _diagnostic_cache[key] = (time.monotonic(), reader, copy.deepcopy(value))
     return value
+
+
+def _persisted_diagnostic(name: str) -> dict[str, Any]:
+    """Reuse a compact durable audit instead of transferring raw PIT history."""
+
+    section_name = {
+        "progressive_oos": "oos",
+        "sealed_holdout": "sealed",
+    }.get(name, name)
+    for page_key in ("data", "operations", "overview"):
+        payload = _load_durable(page_key)
+        data = payload.get("data") if isinstance(payload, dict) else None
+        value = data.get(section_name) if isinstance(data, dict) else None
+        if isinstance(value, dict) and str(value.get("status") or "") not in {
+            "unavailable", "deferred",
+        }:
+            return copy.deepcopy(value)
+    return {
+        "ok": True,
+        "status": "deferred",
+        "deferred": True,
+        "reason": "traffic_budget_protection",
+        "summary": "历史审计沿用上一份持久化摘要，当前未跨网络重新扫描。",
+    }
+
+
+def _historical_diagnostic(
+    name: str,
+    reader: Callable[..., Any],
+    /,
+    **kwargs: Any,
+) -> Any:
+    mode = str(
+        os.getenv("ALIS_CONSOLE_SNAPSHOT_HISTORICAL_AUDIT_MODE", "refresh")
+    ).strip().lower()
+    if mode == "persisted":
+        return _persisted_diagnostic(name)
+    return _cached_diagnostic(name, reader, **kwargs)
 
 
 def _clear_diagnostic_cache() -> None:
@@ -319,14 +358,14 @@ def _readers(page_key: str) -> dict[str, Callable[[], Any]]:
     }
 
     def bounded_oos() -> dict[str, Any]:
-        return _cached_diagnostic(
+        return _historical_diagnostic(
             "progressive_oos",
             data_center.data_center_oos_hard_data,
             include_dates=False,
         )
 
     def bounded_sealed() -> dict[str, Any]:
-        return _cached_diagnostic(
+        return _historical_diagnostic(
             "sealed_holdout",
             data_center.data_center_sealed_strategy_holdout,
             include_dates=False,
@@ -917,7 +956,11 @@ def _data_ingestion_active() -> bool:
 
 
 def _snapshot_build_should_yield() -> bool:
-    return _control_work_active() or _data_ingestion_active()
+    return (
+        not optional_network_work_allowed()
+        or _control_work_active()
+        or _data_ingestion_active()
+    )
 
 
 def run_snapshot_worker_forever(stop_event: Any | None = None) -> None:

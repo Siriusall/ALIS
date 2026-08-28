@@ -59,6 +59,37 @@ def test_control_snapshot_readers_do_not_require_api_loopback_redis(monkeypatch)
     assert projection["status"] == "waiting"
 
 
+def test_snapshot_historical_audits_reuse_durable_summary(monkeypatch):
+    from app.data_platform.routes import data_center
+
+    monkeypatch.setenv("ALIS_CONSOLE_SNAPSHOT_HISTORICAL_AUDIT_MODE", "persisted")
+    monkeypatch.setattr(
+        snapshots,
+        "_load_durable",
+        lambda page_key: {
+            "data": {
+                "oos": {"ok": True, "status": "ready", "eligible_sessions": 126},
+                "sealed": {"ok": True, "status": "ready", "windows": 8},
+            }
+        } if page_key == "data" else None,
+    )
+    monkeypatch.setattr(
+        data_center,
+        "data_center_oos_hard_data",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("raw audit must not run")),
+    )
+    monkeypatch.setattr(
+        data_center,
+        "data_center_sealed_strategy_holdout",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("raw audit must not run")),
+    )
+
+    readers = snapshots._readers("overview")
+
+    assert readers["oos"]()["eligible_sessions"] == 126
+    assert readers["sealed"]()["windows"] == 8
+
+
 def test_durable_snapshot_is_returned_stale_while_queued(monkeypatch):
     metadata = {
         "page_key": "overview",

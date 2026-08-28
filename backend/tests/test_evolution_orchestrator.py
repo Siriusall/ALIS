@@ -225,6 +225,36 @@ def test_checkpoint_recovery_claim_does_not_consume_failure_attempt(monkeypatch)
     assert "CASE WHEN phase='recovered' THEN 0 ELSE 1 END" in claim_sql
 
 
+def test_network_budget_excludes_optional_research_claims(monkeypatch):
+    statements = []
+
+    class Result:
+        rowcount = 0
+
+        def fetchone(self):
+            return None
+
+    class Connection:
+        _is_postgres = True
+
+        def execute(self, sql, params=()):
+            statements.append((str(sql), params))
+            return Result()
+
+    @contextmanager
+    def connection():
+        yield Connection()
+
+    monkeypatch.setattr(evolution, "_conn", connection)
+    monkeypatch.setattr(evolution, "_defer_long_research_claims", lambda _now: False)
+    monkeypatch.setattr(evolution, "optional_network_work_allowed", lambda: False)
+
+    assert evolution._claim_next_task() is None
+    claim_sql, params = statements[0]
+    assert "task_type NOT IN" in claim_sql
+    assert set(evolution.NETWORK_OPTIONAL_TASK_TYPES).issubset(set(params))
+
+
 @pytest.fixture(autouse=True)
 def _bind_test_factor_contract(monkeypatch):
     """Replay is stubbed here; satisfy the production factor gate explicitly."""
