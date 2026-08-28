@@ -248,6 +248,22 @@ def mark_evolution_component_disabled(component: str, *, reason: str) -> None:
 def evolution_runtime_status() -> dict[str, Any]:
     with _runtime_lock:
         items = {key: dict(value) for key, value in _runtime_status.items()}
+    # Fallback to durable cluster heartbeats if local in-memory state is uninitialized
+    try:
+        with _conn() as conn:
+            rows = conn.execute("SELECT component, heartbeat_at, alive, last_error FROM runtime_worker_heartbeats").fetchall()
+            for r in rows:
+                row_dict = dict(r)
+                comp = str(row_dict.get("component") or "")
+                if comp in items and not items[comp].get("alive"):
+                    items[comp].update({
+                        "started": True,
+                        "alive": bool(row_dict.get("alive")),
+                        "heartbeat_at": row_dict.get("heartbeat_at"),
+                        "last_error": str(row_dict.get("last_error") or ""),
+                    })
+    except Exception:
+        pass
     now = _now()
     for value in items.values():
         heartbeat = value.get("heartbeat_at")
@@ -731,6 +747,40 @@ def reconcile_historical_data_gate_waiting_tasks(*, limit: int = 200) -> dict[st
         "count": len(reconciled),
     }
 
+
+def reconcile_stagnant_research_pipeline(*, wave_stagnation_seconds: int = 7200) -> dict[str, Any]:
+    """Watchdog to detect stagnant research waves and stalled tasks to auto-heal pipeline."""
+    now = _now()
+    distilled_waves: list[str] = []
+    try:
+        from app.services.continuous_strategy_research import (
+            refresh_research_wave,
+            mark_research_wave_distilled,
+            run_cluster_distillation_line,
+        )
+        with _read_conn() as conn:
+            stalled_waves = [dict(row) for row in conn.execute(
+                """SELECT wave_id, created_at, status, completed_count, expected_count
+                   FROM strategy_research_waves
+                   WHERE status IN ('running', 'queued')
+                   ORDER BY created_at ASC LIMIT 20"""
+            ).fetchall()]
+        for wave_row in stalled_waves:
+            wave_id = str(wave_row.get("wave_id") or "")
+            if not wave_id:
+                continue
+            refreshed = refresh_research_wave(wave_id)
+            if refreshed and bool(refreshed.get("ready_for_distillation")):
+                run_cluster_distillation_line(research_wave_id=wave_id)
+                distilled_waves.append(wave_id)
+    except Exception as exc:
+        logger.warning("reconcile_stagnant_research_pipeline encountered non-fatal error: %s", exc)
+
+    return {
+        "ok": True,
+        "distilled_waves": distilled_waves,
+        "count": len(distilled_waves),
+    }
 
 def reconcile_shadow_equity_evidence_gap_tasks(*, limit: int = 200) -> dict[str, Any]:
     """Relabel stale Shadow point gaps without replaying historical outcomes."""
@@ -3926,6 +3976,13 @@ def run_worker_once() -> dict[str, Any] | None:
             "relabelled %s Shadow equity-evidence gap task(s): %s",
             shadow_evidence_reconciliation["count"],
             shadow_evidence_reconciliation.get("reconciled") or [],
+        )
+    stagnation_reconciliation = reconcile_stagnant_research_pipeline()
+    if stagnation_reconciliation.get("count"):
+        logger.info(
+            "auto-healed %s stagnant research wave(s): %s",
+            stagnation_reconciliation["count"],
+            stagnation_reconciliation.get("distilled_waves"),
         )
     task = _claim_next_task()
     if not task:

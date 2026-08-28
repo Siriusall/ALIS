@@ -31,6 +31,8 @@ WAVE_MAX_RUNTIME_SECONDS = max(
     300, int(os.getenv("ALIS_V10_WAVE_MAX_RUNTIME_SECONDS", "14400"))
 )
 WAVE_MAX_RETRIES = max(0, int(os.getenv("ALIS_V10_WAVE_MAX_RETRIES", "2")))
+WAVE_QUORUM_RATIO = max(0.1, min(1.0, float(os.getenv("ALIS_V10_WAVE_QUORUM_RATIO", "0.6"))))
+WAVE_TIMEOUT_FORCE_DISTILL_SECONDS = max(300, int(os.getenv("ALIS_V10_WAVE_TIMEOUT_FORCE_DISTILL_SECONDS", "3600")))
 EXPERT_MAX_AGE_DAYS = max(1, int(os.getenv("ALIS_V10_EXPERT_MAX_AGE_DAYS", "30")))
 FACTOR_ANALYSIS_QUERY_BATCH_SIZE = max(
     1, min(int(os.getenv("ALIS_V10_FACTOR_ANALYSIS_QUERY_BATCH_SIZE", "10")), 20)
@@ -1080,14 +1082,25 @@ def refresh_research_wave(wave_id: str) -> dict[str, Any] | None:
     failed_count = sum(value in {"failed", "cancelled"} for value in statuses.values())
     expected_count = int(wave.get("expected_count") or len(candidate_ids))
     terminal_count = completed_count + failed_count
+    now = _now()
+    created_at_dt = None
+    try:
+        created_at_dt = datetime.fromisoformat(str(wave.get("created_at") or ""))
+    except Exception:
+        pass
+    wave_age_seconds = (now - created_at_dt).total_seconds() if created_at_dt else 0.0
+    quorum_satisfied = (
+        completed_count >= max(1, int(expected_count * WAVE_QUORUM_RATIO))
+        and wave_age_seconds >= WAVE_TIMEOUT_FORCE_DISTILL_SECONDS
+    )
     status = (
         "completed" if expected_count > 0 and terminal_count >= expected_count
+        else "completed" if quorum_satisfied
         else "running" if any(value == "running" for value in statuses.values()) or completed_count > 0
         else "queued"
     )
     if str(wave.get("status") or "") == "distilled":
         status = "distilled"
-    now = _now()
     with _conn() as conn:
         conn.execute(
             """UPDATE strategy_research_waves
@@ -2517,6 +2530,26 @@ def refresh_environment_expert_pool(
             })
     now = _now()
     output: list[dict[str, Any]] = []
+    if not ranked:
+        with _conn() as conn:
+            existing_rows = [dict(row) for row in conn.execute(
+                """SELECT e.*, m.name AS environment_name, m.environment_type
+                   FROM strategy_environment_experts e
+                   LEFT JOIN dynamic_market_environments m ON m.environment_id=e.environment_id
+                   ORDER BY e.environment_id, e.environment_version DESC, e.rank_no"""
+            ).fetchall()]
+        if existing_rows:
+            for item in existing_rows:
+                evidence = json.loads(item.get("evidence_json") or "{}")
+                fitness_detail = json.loads(item.get("fitness_json") or "{}")
+                output.append({
+                    **item,
+                    "factor_weights": evidence.get("factor_weights") or {},
+                    "factor_count": evidence.get("factor_count") or 0,
+                    "fitness_detail": fitness_detail,
+                })
+            return output
+
     with _conn() as conn:
         conn.execute("DELETE FROM strategy_environment_experts")
         for key, candidates in sorted(ranked.items()):

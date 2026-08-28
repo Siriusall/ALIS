@@ -1903,3 +1903,9 @@ ALIS 的目标运行方式调整为“系统自治、结果可见、异常才打
 - [x] 对全部 Git 跟踪 Python、Shell、迁移和前端源码完成语法、构建、事务/连接、时区、快照、路由副作用和宽 SQL 静态扫描；历史研究、绩效、人工复核、因子组合、LLM 路由、候选生命周期、主题快照、OCR、股票池和持仓状态读取均按调用语义增加明确上限或日期窗口。单行主键读取、聚合计数和固定小注册表保留原投影，不把 `SELECT *` 文本扫描误判为大表问题。
 - [x] `datetime.now()`、`date.today()` 影响业务新鲜度、主题日期、公告审计或候选/决策时间的路径统一使用 `Asia/Shanghai`；公告新鲜度计算同时兼容历史 naive 和当前带时区时间，避免跨日误报或 aware/naive 异常。版本号等纯标识时间不改变业务语义。
 - [x] 新增查询边界回归；全量后端 `1446 passed、1 skipped、4 warnings、6 subtests passed`，全量 Python 编译、Shell 语法检查和前端 Vite 构建通过。提交 `e23678b` 及之前审计修复已推送 GitHub `main`；线上仍需受控发布后才会加载这些提交，不能把 GitHub 状态等同于生产运行状态。
+
+# 2026-08-29：演化流水线防死锁、专家池非破坏性刷新与流水线看门狗机制
+
+- [x] **Wave 仲裁与超时防死锁机制（Quorum & Timeout Distillation）**：修复此前由于个别候选策略卡在 retry_wait 导致整个 Wave 无法闭环并无限阻塞下游策略簇蒸馏（strategy_cluster_distillation）的问题。引入 ALIS_V10_WAVE_QUORUM_RATIO（默认 60%）与 ALIS_V10_WAVE_TIMEOUT_FORCE_DISTILL_SECONDS（默认 3600 秒超时强制进入完成态），实现部分候选就绪即可推进蒸馏。
+- [x] **环境专家池非破坏性刷新（Non-Destructive Expert Pool Refresh）**：修复当某次蒸馏无新合格候选时直接执行 DELETE 导致专家池清空为 0 的问题。当最新批次无可用排名专家时，平滑保留上一代专家及其特征权重，确保生产与回测路由始终有专家可用。
+- [x] **演化流水线停滞看门狗（Pipeline Stagnation Watchdog）**：在 evolution_orchestrator 的 Worker 循环与调度器中增加自动巡检看门狗 reconcile_stagnant_research_pipeline()，定时扫描处于等待/积压状态的 Wave，自动触发蒸馏与后继任务派发，防止流水线静默停滞。
