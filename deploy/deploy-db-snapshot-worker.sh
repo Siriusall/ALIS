@@ -33,7 +33,7 @@ test "$(sed -n 's/^format=//p' <<<"$manifest")" = alis_release_bundle_v2
 [[ "$commit" =~ ^[0-9a-f]{40}$ ]]
 test -n "$sim_head"
 
-sha=$(shasum -a 256 "$bundle" | awk '{print $1}')
+sha=$(sha256sum "$bundle" 2>/dev/null | awk '{print $1}' || shasum -a 256 "$bundle" | awk '{print $1}')
 stamp=$(date +%Y%m%d-%H%M%S)
 short=${commit:0:7}
 release_root=${ALIS_DB_SNAPSHOT_RELEASE_ROOT:-/opt/alis-db-snapshot/releases}
@@ -65,8 +65,8 @@ set -a
 . /etc/alis/db-snapshot-worker.env
 set +a
 PYTHONPATH='$release/backend' /opt/alis-db-snapshot/shared/app-venv/bin/python - <<'PY'
-from app.services.system_release_center import SIM_SCHEMA_HEAD, current_database_revisions
-current = current_database_revisions()
+from app.services.system_release_center import SIM_SCHEMA_HEAD, database_revisions
+current = database_revisions()
 if current.get("sim") != SIM_SCHEMA_HEAD:
     raise SystemExit(f"sim migration mismatch: {current.get('sim')} != {SIM_SCHEMA_HEAD}")
 PY
