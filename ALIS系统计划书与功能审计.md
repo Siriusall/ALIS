@@ -5,6 +5,8 @@
 > 范围：投资研究、策略、组合、模拟交易和复盘；不包含实盘接入、自动备份与服务器运维。  
 > 本文正文给出当前真实状态；附录保留 2026-07-19 详细设计，所有变更均标注而不直接抹除。
 
+> 最新完成记录（2026-08-30）：生产应用、前端、control Worker 与独立 research Worker 已统一切换到 `a8b510f`；API `live/health/ready` 均为 200，发布治理无漂移，账本现金漂移与持仓差异均为 0。受控版本更新的运行优先级现高于可恢复研究任务：research Worker 发布器发现 research 池任务正在运行时，先停止唯一 claimant，再将任务保留 checkpoint、attempt、result 与治理证据原子退回 `queued/paused_for_release`，完成切换后恢复 Worker；发布失败时至少恢复原 Worker 服务，禁止把研究任务标为成功、失败或取消，也不得触碰交易、账本、计划、Champion 或模型权限。发布上传显式使用传统 SCP 兼容模式，适配当前服务器未启用 SFTP 子系统的边界。
+
 > 最新审计记录（2026-08-18）：严格 PIT OOS 审计仍为 `0/1537 blocked_by_oos_hard_data`，原因不是数据底表被删除，也不是 research Worker 故障，而是 `data_0011_pit_observation_clock` 启用后要求不可变历史观测证据。生产两张版本表均为 0 行；本机版本表仅覆盖 `20260814` 一天（原始 22,121 行、快照 16,572 行），另有一条 `20990102` 异常日期，均不足以恢复历史窗口。旧原始/快照数据的观测字段仍为空或 `legacy_unknown`，不能把当前重抓时间回写为历史 T15 证据。数据库机只读检查确认无 ALIS 导出、快照或 WAL 归档（`archive_mode=off`）。因此不执行伪造回填、不放宽正式 PIT 门；保留 OOS 明确阻断，下一步先将旧结果标识为 legacy economic-time 参考，再从观察时钟切换后的新数据自然积累正式证据，或在发现外部可信快照后做只追加导入和重新审计。
 
 > 2026-08-18：完成 OOS 证据迁移状态收口。严格 `0/1537` 仍是正式五窗口 OOS 的不可替代硬门，但当所有缺口均为历史点时不可证明且没有可修复日期时，审计新增 `legacy_reference=legacy_economic_time_reference` 和 `strict_pit_recovery=external_immutable_evidence_only`，禁止自治补数循环把历史重抓当成修复。同步新增连续新 PIT 证据进度 `new_strict_baseline`（初始冻结研究目标 126 个连续合格交易日），明确 `promotion_authorized=false`，不降低正式晋升门。正式任务改为 `blocked_by_legacy_oos_reference / accumulating_new_strict_pit_baseline`，按日复核新证据而非重试旧历史；日更、计划、隔离模拟、账本和未来 Shadow 不受影响。管理后台将该状态显示为“旧证据归档 · 新 PIT 累积”，不再显示为普通故障。新增回归并通过定向 OOS/演化测试 `76 passed`、Python 编译、前端构建（1,596 modules）和 `git diff --check`。

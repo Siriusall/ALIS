@@ -41,8 +41,18 @@ if [[ -n ${ALIS_RESEARCH_WORKER_SSH_PROXY_COMMAND:-} ]]; then
 fi
 worker_ssh() { ssh "${ssh_opts[@]}" -i "$ALIS_RESEARCH_WORKER_SSH_KEY" "$ALIS_RESEARCH_WORKER_SSH_TARGET" "$@"; }
 
-scp -q "${ssh_opts[@]}" -i "$ALIS_RESEARCH_WORKER_SSH_KEY" "$bundle" "$ALIS_RESEARCH_WORKER_SSH_TARGET:$remote_archive"
+scp -O -q "${ssh_opts[@]}" -i "$ALIS_RESEARCH_WORKER_SSH_KEY" "$bundle" "$ALIS_RESEARCH_WORKER_SSH_TARGET:$remote_archive"
 old_release=$(worker_ssh 'readlink -f /opt/alis-research-worker/backend 2>/dev/null || true')
+worker_was_active=$(worker_ssh 'systemctl is-active alis-research-worker 2>/dev/null || true')
+release_finished=0
+restore_worker_on_error() {
+  local exit_code=$?
+  if (( ! release_finished )) && [[ $worker_was_active == active ]]; then
+    worker_ssh 'sudo systemctl start alis-research-worker' || true
+  fi
+  exit "$exit_code"
+}
+trap restore_worker_on_error ERR
 protection_code=$(printf '%s' \
   'from app.db.store import _conn; scope=_conn(); conn=scope.__enter__(); row=conn.execute("SELECT COUNT(*) AS count FROM evolution_tasks WHERE status=\x27running\x27 AND COALESCE(worker_pool,\x27control\x27)=\x27research\x27").fetchone(); print(int(dict(row).get("count") or 0)); scope.__exit__(None,None,None)' \
   | base64 | tr -d '\n')
@@ -52,8 +62,17 @@ if [[ ! $research_running =~ ^[0-9]+$ ]]; then
   exit 1
 fi
 if (( research_running > 0 )); then
-  echo "research_worker_protected=$research_running; refusing release switch while research task is running" >&2
-  exit 1
+  # A controlled software release has priority over resumable research work.
+  # Stop the only research claimant first, then atomically return its tasks to
+  # the queue without changing attempts, checkpoints, results, or governance.
+  worker_ssh 'sudo systemctl stop alis-research-worker'
+  worker_ssh 'test "$(systemctl is-active alis-research-worker 2>/dev/null || true)" != active'
+  pause_code=$(printf '%s' \
+    'from datetime import datetime; from zoneinfo import ZoneInfo; from app.db.store import _conn; now=datetime.now(ZoneInfo("Asia/Shanghai")).isoformat(); scope=_conn(); conn=scope.__enter__(); rows=conn.execute("SELECT id FROM evolution_tasks WHERE status=\x27running\x27 AND COALESCE(worker_pool,\x27control\x27)=\x27research\x27 FOR UPDATE").fetchall(); ids=[int(dict(row)["id"]) for row in rows]; [conn.execute("UPDATE evolution_tasks SET status=\x27queued\x27,phase=\x27paused_for_release\x27,message=\x27版本更新优先：研究任务已保留检查点并暂停，Worker 更新后自动恢复\x27,lease_owner=NULL,lease_expires_at=NULL,heartbeat_at=?,next_run_at=?,updated_at=? WHERE id=? AND status=\x27running\x27 AND COALESCE(worker_pool,\x27control\x27)=\x27research\x27",(now,now,now,task_id)) for task_id in ids]; scope.__exit__(None,None,None); print(len(ids))' \
+    | base64 | tr -d '\n')
+  paused_count=$(worker_ssh "sudo bash -lc 'set -a; . /etc/alis/research-worker.env; set +a; cd /opt/alis-research-worker/backend; echo $pause_code | base64 -d | /opt/alis-research-worker/shared/app-venv/bin/python -'")
+  [[ $paused_count =~ ^[0-9]+$ ]]
+  echo "research_tasks_paused_for_release=$paused_count"
 fi
 
 worker_ssh "sudo bash -s" <<REMOTE
@@ -85,6 +104,8 @@ worker_ssh "sudo systemctl restart alis-research-worker"
 worker_ssh 'test "$(systemctl is-active alis-research-worker)" = active'
 worker_ssh 'test "$(readlink -f /opt/alis-research-worker/backend)" != ""'
 
+release_finished=1
+trap - ERR
 echo "release_commit=$commit"
 echo "research_worker_release=$release"
 echo "status=healthy"
