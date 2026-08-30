@@ -2,7 +2,6 @@
 Description=ALIS Research Compute Worker
 After=network-online.target wg-quick@wg0.service
 Wants=network-online.target wg-quick@wg0.service
-Conflicts=alis-control-worker.service
 
 [Service]
 Type=simple

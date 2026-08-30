@@ -93,7 +93,6 @@ sudo ln -sfn /opt/alis-research-worker/shared/runtime-cache '$release/backend/.c
 sudo /opt/alis-research-worker/shared/app-venv/bin/pip install -q -r '$release/backend/requirements.txt'
 sudo /opt/alis-research-worker/shared/app-venv/bin/python -m compileall -q '$release/backend/app' '$release/backend/migrations'
 sudo install -o root -g root -m 644 '$release/deploy/alis-research-worker.service' /etc/systemd/system/alis-research-worker.service
-sudo systemctl disable --now alis-control-worker.service 2>/dev/null || true
 sudo sed -i 's/^ALIS_BUILD_GIT_SHA=.*/ALIS_BUILD_GIT_SHA=$commit/' /etc/alis/research-worker.env
 grep -q '^ALIS_BUILD_GIT_SHA=$commit$' /etc/alis/research-worker.env
 sudo ln -sfn '$release/backend' /opt/alis-research-worker/backend
