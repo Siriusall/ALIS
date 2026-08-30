@@ -73,10 +73,14 @@ PY
 install -o root -g root -m 644 '$release/deploy/alis-db-snapshot-worker.service' /etc/systemd/system/alis-db-snapshot-worker.service
 install -o root -g root -m 755 '$release/deploy/alis-db-egress-guard.sh' /usr/local/sbin/alis-db-egress-guard
 install -o root -g root -m 644 '$release/deploy/alis-db-egress-guard.service' /etc/systemd/system/alis-db-egress-guard.service
+install -o root -g root -m 644 '$release/deploy/alis-db-egress-guard-account.service' /etc/systemd/system/alis-db-egress-guard-account.service
+install -o root -g root -m 644 '$release/deploy/alis-db-egress-guard-account.timer' /etc/systemd/system/alis-db-egress-guard-account.timer
 ln -sfn '$release/backend' /opt/alis-db-snapshot/backend
 chown -h alis-snapshot:alis-snapshot /opt/alis-db-snapshot/backend
 systemctl daemon-reload
-systemctl enable --now alis-db-egress-guard
+systemctl enable alis-db-egress-guard
+systemctl restart alis-db-egress-guard
+systemctl enable --now alis-db-egress-guard-account.timer
 systemctl enable --now alis-db-snapshot-worker
 test "\$(systemctl is-active alis-db-snapshot-worker)" = active
 REMOTE

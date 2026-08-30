@@ -241,10 +241,28 @@ def _send_with_resend(*, subject: str, text_body: str, html_body: str, idempoten
     return message_id
 
 
+def _send_webhook_alert(*, subject: str, text_body: str, issues: list[AlertIssue]) -> None:
+    webhook_url = _env("ALIS_ALERT_WEBHOOK_URL", "")
+    if not webhook_url:
+        return
+    try:
+        payload = {
+            "msg_type": "text",
+            "title": subject,
+            "text": text_body,
+            "issues_count": len(issues),
+            "created_at": _now().isoformat(),
+        }
+        httpx.post(webhook_url, json=payload, timeout=10)
+    except Exception as exc:  # noqa: BLE001 - non-blocking backup channel
+        logger.warning("Webhook alert broadcast failed: %s", exc)
+
+
 def send_issue_email(issues: list[AlertIssue], *, recovered: bool = False) -> None:
     if not issues:
         return
     subject, text_body, html_body = _email_content(issues, recovered=recovered)
+    _send_webhook_alert(subject=subject, text_body=text_body, issues=issues)
     resend = _resend_settings()
     idempotency_source = "|".join(sorted(issue.fingerprint for issue in issues))
     idempotency_key = hashlib.sha256(f"{recovered}|{idempotency_source}".encode()).hexdigest()

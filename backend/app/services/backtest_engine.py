@@ -162,22 +162,62 @@ def _score_rows(
     *,
     normalization: str = "minmax",
 ) -> List[Tuple[SnapshotRow, float]]:
+    if not rows:
+        return []
     factors = [f for f in weights.keys()]
-    values_per_factor: Dict[str, List[float]] = {f: [] for f in factors}
-    for r in rows:
-        vals = factor_values.get(r.symbol) or {}
-        for f in factors:
-            values_per_factor[f].append(float(vals.get(f, 0) or 0))
-    normalize = _rank_percentiles if str(normalization or "").lower() == "rank_percentile" else _norm
-    norm_per_factor: Dict[str, List[float]] = {f: normalize(values_per_factor[f]) for f in factors}
-    out: List[Tuple[SnapshotRow, float]] = []
-    for i, r in enumerate(rows):
-        s = 0.0
-        for f in factors:
-            s += float(weights.get(f, 0) or 0) * norm_per_factor[f][i]
-        out.append((r, s))
-    out.sort(key=lambda x: x[1], reverse=True)
-    return out
+    if not factors:
+        return [(r, 0.0) for r in rows]
+
+    try:
+        import numpy as np
+        n_rows = len(rows)
+        n_factors = len(factors)
+        mat = np.empty((n_rows, n_factors), dtype=np.float64)
+        for i, r in enumerate(rows):
+            vals = factor_values.get(r.symbol) or {}
+            for j, f in enumerate(factors):
+                mat[i, j] = float(vals.get(f, 0) or 0)
+
+        weight_vec = np.array([float(weights.get(f, 0) or 0) for f in factors], dtype=np.float64)
+
+        if str(normalization or "").lower() == "rank_percentile":
+            if n_rows > 1:
+                # Rank percentiles along columns in [0, 1]
+                # Tie-aware ranking matching _rank_percentiles
+                norm_mat = np.empty_like(mat)
+                for j in range(n_factors):
+                    norm_mat[:, j] = _rank_percentiles(mat[:, j].tolist())
+            else:
+                norm_mat = np.full((n_rows, n_factors), 0.5, dtype=np.float64)
+        else:
+            # MinMax normalization along columns
+            vmin = mat.min(axis=0)
+            vmax = mat.max(axis=0)
+            diff = vmax - vmin
+            diff[diff == 0] = 1.0
+            norm_mat = (mat - vmin) / diff
+
+        scores = norm_mat @ weight_vec
+        out = [(rows[i], float(scores[i])) for i in range(n_rows)]
+        out.sort(key=lambda x: x[1], reverse=True)
+        return out
+    except Exception:
+        # Fallback to deterministic scalar implementation if numpy fails
+        values_per_factor: Dict[str, List[float]] = {f: [] for f in factors}
+        for r in rows:
+            vals = factor_values.get(r.symbol) or {}
+            for f in factors:
+                values_per_factor[f].append(float(vals.get(f, 0) or 0))
+        normalize = _rank_percentiles if str(normalization or "").lower() == "rank_percentile" else _norm
+        norm_per_factor: Dict[str, List[float]] = {f: normalize(values_per_factor[f]) for f in factors}
+        out: List[Tuple[SnapshotRow, float]] = []
+        for i, r in enumerate(rows):
+            s = 0.0
+            for f in factors:
+                s += float(weights.get(f, 0) or 0) * norm_per_factor[f][i]
+            out.append((r, s))
+        out.sort(key=lambda x: x[1], reverse=True)
+        return out
 
 
 def run_backtest(

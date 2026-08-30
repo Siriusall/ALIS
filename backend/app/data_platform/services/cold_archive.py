@@ -138,3 +138,50 @@ def archive_raw_records(
         "file_sha256": checksum, "storage": "local_filesystem", "compression": "zstd",
         "delete_online_rows": False,
     }
+
+
+def vacuum_table_dead_tuples(*, table_name: str, full: bool = False, analyze: bool = True) -> dict[str, Any]:
+    """Execute VACUUM / ANALYZE on high-churn tables to reclaim dead tuple storage."""
+    allowed_tables = {
+        "dc_tushare_raw_records",
+        "dc_stock_daily_snapshot",
+        "dc_theme_company_mapping",
+        "dc_theme_snapshot",
+        "dc_tushare_request_coverage",
+        "data_ingestion_runs",
+        "console_page_snapshots",
+    }
+    cleaned_table = str(table_name).strip().lower()
+    if cleaned_table not in allowed_tables:
+        raise ValueError(f"Table {cleaned_table} is not authorized for maintenance vacuum")
+
+    verb = "VACUUM FULL" if full else "VACUUM"
+    if analyze and not full:
+        verb = "VACUUM ANALYZE"
+    elif analyze and full:
+        verb = "VACUUM FULL ANALYZE"
+
+    started_at = datetime.now(timezone.utc).isoformat()
+    try:
+        from app.data_platform.db import _conn
+
+        with _conn() as conn:
+            # Table-level vacuum execution
+            conn.execute(f"{verb} public.{cleaned_table}")
+        return {
+            "ok": True,
+            "table": cleaned_table,
+            "operation": verb,
+            "started_at": started_at,
+            "finished_at": datetime.now(timezone.utc).isoformat(),
+            "status": "completed",
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "ok": False,
+            "table": cleaned_table,
+            "operation": verb,
+            "started_at": started_at,
+            "error": str(exc)[:300],
+            "status": "failed",
+        }

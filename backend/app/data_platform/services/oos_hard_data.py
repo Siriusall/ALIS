@@ -1184,7 +1184,21 @@ def progressive_oos_consumer_eligibility(
     baseline = audit.get("new_strict_baseline") if isinstance(
         audit.get("new_strict_baseline"), dict
     ) else audit.get("qualification") if isinstance(audit.get("qualification"), dict) else {}
-    observed = int((baseline or {}).get("eligible_sessions") or 0)
+    qualification_mode = str(
+        ((audit.get("observation_evidence") or {}).get("qualification_mode"))
+        if isinstance(audit.get("observation_evidence"), dict)
+        else ""
+    )
+    frozen_replay = bool(
+        frozen_replay_oos_fallback_enabled()
+        and qualification_mode == "frozen_replay_before_candidate"
+    )
+    observed = int(
+        audit.get("eligible_sessions")
+        if frozen_replay
+        else (baseline or {}).get("eligible_sessions")
+        or 0
+    )
     audit_status = str(audit.get("status") or "")
     eligible = (
         bool(audit.get("audit_completed", True))
@@ -1198,6 +1212,7 @@ def progressive_oos_consumer_eligibility(
         "eligible": eligible,
         "eligible_sessions": observed,
         "required_sessions": required,
+        "qualification_mode": qualification_mode or "strict_pit",
         "production_change_authorized": False,
         "formal_oos_required_sessions": REQUIRED_SESSIONS,
     }

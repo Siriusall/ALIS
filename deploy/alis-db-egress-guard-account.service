@@ -1,0 +1,8 @@
+[Unit]
+Description=ALIS Database Egress Budget Accounting
+After=network-online.target alis-db-egress-guard.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/alis/db-egress-guard.env
+ExecStart=/usr/local/sbin/alis-db-egress-guard account

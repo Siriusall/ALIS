@@ -5,6 +5,7 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
+EnvironmentFile=-/etc/alis/db-egress-guard.env
 ExecStart=/usr/local/sbin/alis-db-egress-guard
 RemainAfterExit=yes
 

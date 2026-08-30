@@ -17,6 +17,7 @@ from app.data_platform.services.observation_clock import (
     _timestamp_value_sql,
 )
 from app.services.point_in_time import is_available_at, normalize_explicit_timestamp, normalize_timestamp
+from app.services.compact_feature_store import load_snapshot_bundle_from_local_cache, save_snapshot_bundle_to_local_cache
 
 logger = logging.getLogger("quant.backtest_data_source")
 
@@ -600,6 +601,10 @@ class BacktestDataSource:
             return []
 
     def _postgres_snapshot_rows(self, ymd: str) -> List[dict]:
+        cached_rows = load_snapshot_bundle_from_local_cache(ymd, as_of_time=self._as_of_time)
+        if cached_rows is not None:
+            self._record_pit_read("snapshot.daily_structured.local_cache", cached_rows)
+            return cached_rows
         try:
             versioned = self._versioned_snapshot_rows(ymd)
             if versioned is not None:

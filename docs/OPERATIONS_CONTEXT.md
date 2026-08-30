@@ -199,21 +199,25 @@ alis-db-egress-normalize-sep11.timer
 
 - `deploy/alis-db-egress-guard.sh`
 - `deploy/alis-db-egress-guard.service`
+- `deploy/alis-db-egress-guard-account.service`
+- `deploy/alis-db-egress-guard-account.timer`
 
-默认最大速率：
+统一保护器同时执行三层保护：
 
-| 类别 | 最大速率 |
-| --- | --- |
-| 数据库机 -> 计算机 | `96Kbit/s` |
-| 数据库机 -> 应用机 | `96Kbit/s` |
-| 数据库机 -> 其他所有目标 | `128Kbit/s` |
+1. `eth0` 总出口始终不超过 `448Kbit/s`。即使计量 timer 完全失效并连续跑满 31 天，理论上也约为 150GB。
+2. 每分钟读取网卡累计发送字节并持久化到 `/var/lib/alis-egress-guard/state`，重启和规则重载不会清零月度账本。
+3. 每月 11 日切换账期；达到 120GB 后将总出口降到 `128Kbit/s`，达到 150GB 后熔断到 `1Kbit/s`。
 
-三类同时持续跑满 30 天约 104GB，低于每月 200GB，预留约 96GB。该上限覆盖云 Agent、系统更新和其他未分类目标。
+正常模式下计算机、应用机和其他目标的保底速率分别为 `192Kbit/s`、`192Kbit/s` 和 `64Kbit/s`，三类可在 `448Kbit/s` 总上限内借用空闲带宽。150GB 熔断线为云厂商 200GB 套餐预留至少 50GB，用于统计口径差异和保护器之外的云平台流量。
+
+首次在账期中途安装时，可在 `/etc/alis/db-egress-guard.env` 设置 `ALIS_EGRESS_INITIAL_USED_GB` 注入云平台已经统计的用量。紧急冻结使用 `ALIS_EGRESS_FORCE_FREEZE=1`，不要通过停止保护器实现冻结。
 
 验证：
 
 ```powershell
 ssh alis-db "systemctl is-active alis-db-egress-guard"
+ssh alis-db "systemctl is-active alis-db-egress-guard-account.timer"
+ssh alis-db "sudo /usr/local/sbin/alis-db-egress-guard status"
 ssh alis-db "sudo tc class show dev eth0"
 ssh alis-db "sudo tc filter show dev eth0 parent 1:"
 ```

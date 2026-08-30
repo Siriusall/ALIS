@@ -1,4 +1,5 @@
 from __future__ import annotations
+from app.services.compact_feature_store import load_text_event_features_from_local_cache, save_text_event_features_to_local_cache
 
 import hashlib
 import json
@@ -168,6 +169,15 @@ def _point_in_time_event_features(
     cached = _EVENT_FEATURE_CACHE.get(cache_key)
     if cached is not None:
         return cached
+
+    local_features = load_text_event_features_from_local_cache(compact_date, as_of_time=cutoff)
+    if local_features is not None and isinstance(local_features, list):
+        # Decode and filter for symbols
+        local_symbol_map = {str(item.get("ts_code") or ""): item for item in local_features}
+        features_from_local = {sym: local_symbol_map[sym] for sym in unique_symbols if sym in local_symbol_map}
+        if features_from_local:
+            _EVENT_FEATURE_CACHE[cache_key] = features_from_local
+            return features_from_local
     start_date = (
         datetime.strptime(compact_date, "%Y%m%d") - timedelta(days=14)
     ).strftime("%Y%m%d")

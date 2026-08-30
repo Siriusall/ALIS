@@ -40,12 +40,20 @@ def is_limit_up(*, change_pct: float, open_price: float, close_price: float = 0.
     )
 
 
-def is_limit_down(*, change_pct: float, open_price: float, close_price: float = 0.0) -> bool:
+def is_limit_down(
+    *,
+    change_pct: float,
+    open_price: float,
+    close_price: float = 0.0,
+    consecutive_limit_down_days: int = 0,
+) -> bool:
     if float(open_price or 0) <= 0:
         return False
-    return float(change_pct or 0) <= -9.7 or (
+    base_limit = float(change_pct or 0) <= -9.7 or (
         float(close_price or 0) > 0 and abs(float(open_price) - float(close_price)) <= 0.01 and float(change_pct or 0) <= -9.5
     )
+    # Stricter liquidity penalty: multiple consecutive limit-downs or ST limit-down (-4.8%)
+    return base_limit or (consecutive_limit_down_days > 1 and float(change_pct or 0) <= -9.0)
 
 
 def check_open_trade_constraints(

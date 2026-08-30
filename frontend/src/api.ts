@@ -1,3 +1,27 @@
+const MOCK_ENABLED = Boolean(import.meta.env.VITE_ENABLE_MOCK === "true");
+
+function mockFallbackForPath(path: string): Json | null {
+  const clean = path.split("?", 1)[0];
+  if (clean.includes("/api/auth/me")) return { id: 1, username: "admin", is_authenticated: true, is_superuser: true };
+  if (clean.includes("/api/health") || clean.includes("/api/trading-ready")) return { ok: true, status: "healthy", ready: true };
+  if (clean.includes("/api/console-snapshots/")) {
+    return {
+      status: "ready",
+      refreshing: false,
+      stale: false,
+      sections: { health: { status: "ready" } },
+      data: {
+        theses: { items: [{ thesis_id: "t1", title: "??????????", status: "active", confidence: 0.85 }] },
+        industries: { items: [{ industry_code: "semi", industry_name: "???", score: 0.88 }] },
+        themes: { items: [{ theme_code: "drone", name: "????", score: 0.92 }] },
+        pools: { items: [{ ts_code: "000001.SZ", name: "????", current_research_score: 0.85 }] },
+        events: { items: [{ id: 1, title: "???????", impact: { score: 0.8 } }] },
+      },
+    };
+  }
+  return null;
+}
+
 export type Json = Record<string, any>;
 
 const API_BASE = String(import.meta.env.VITE_API_BASE || "").replace(/\/$/, "");
@@ -35,6 +59,10 @@ export async function readApi(path: string, signal?: AbortSignal, timeoutMs = AP
   else signal?.addEventListener("abort", abort, { once: true });
   try {
     const token = getToken();
+    if (MOCK_ENABLED) {
+      const mock = mockFallbackForPath(path);
+      if (mock) return mock;
+    }
     const response = await fetch(`${API_BASE}${path}`, {
       signal: timeout.signal,
       cache: "no-store",
@@ -69,7 +97,11 @@ export async function authWriteApi(path: string, body?: unknown): Promise<Json> 
     throw new Error("前端只允许认证写入，业务写接口已被拒绝");
   }
   const token = getToken();
-  const response = await fetch(`${API_BASE}${path}`, {
+  if (MOCK_ENABLED) {
+      const mock = mockFallbackForPath(path);
+      if (mock) return mock;
+    }
+    const response = await fetch(`${API_BASE}${path}`, {
     method: "POST", headers: { Accept: "application/json", "Content-Type": "application/json", ...(token ? { Authorization: `Bearer ${token}` } : {}) },
     body: body === undefined ? undefined : JSON.stringify(body),
   });
