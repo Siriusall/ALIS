@@ -111,8 +111,6 @@ NETWORK_OPTIONAL_TASK_TYPES = frozenset({
     "research_maintenance",
     "strategy_candidate_generation",
     "strategy_cluster_distillation",
-    "strategy_environment_backtest",
-    "strategy_evolution_cycle",
     "strategy_failure_model_training",
     "strategy_portfolio_research",
 })
@@ -2720,6 +2718,8 @@ def execute_evolution_task(
     validation_runner: Callable[..., dict[str, Any]] = run_purged_walk_forward_validation,
 ) -> dict[str, Any]:
     task_type = str(task.get("task_type") or "")
+    if task_type in NETWORK_OPTIONAL_TASK_TYPES and not optional_network_work_allowed():
+        raise EvolutionTaskBudgetExceeded("daily public network budget exhausted")
     if task_type == "system_release_governance":
         from app.services.system_release_center import run_release_governance_cycle
 

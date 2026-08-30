@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+import os
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -20,6 +21,7 @@ EMBARGO_SESSIONS = 5
 TEST_SESSIONS = 126
 STEP_SESSIONS = 126
 MINIMUM_WINDOWS = 5
+FROZEN_REPLAY_MINIMUM_WINDOWS = 4
 MINIMUM_DAILY_ROWS = 500
 MINIMUM_HARD_API_ROWS = 500
 MINIMUM_MARKET_FIELD_RATIO = 0.80
@@ -43,8 +45,18 @@ REQUIRED_SESSIONS = (
     TRAIN_SESSIONS + PURGE_SESSIONS + VALIDATION_SESSIONS + EMBARGO_SESSIONS
     + TEST_SESSIONS + (MINIMUM_WINDOWS - 1) * STEP_SESSIONS
 )
+FROZEN_REPLAY_REQUIRED_SESSIONS = (
+    TRAIN_SESSIONS + PURGE_SESSIONS + VALIDATION_SESSIONS + EMBARGO_SESSIONS
+    + TEST_SESSIONS + (FROZEN_REPLAY_MINIMUM_WINDOWS - 1) * STEP_SESSIONS
+)
 
 _BUSINESS_TZ = ZoneInfo("Asia/Shanghai")
+
+
+def frozen_replay_oos_fallback_enabled() -> bool:
+    return str(os.getenv("ALIS_FROZEN_REPLAY_OOS_FALLBACK", "")).strip().lower() in {
+        "1", "true", "yes", "on",
+    }
 
 
 def _business_cutoff(trade_date: str) -> str:
@@ -911,13 +923,15 @@ def audit_oos_hard_data(
     details: list[dict[str, Any]] = []
     for trade_date in calendar_dates:
         snapshot = strict_snapshots.get(trade_date) or {}
+        frozen_replay_fallback = frozen_replay_oos_fallback_enabled()
         if not snapshot:
             # Keep row counts for diagnostics only; they must not make a date
             # eligible without an observation-version snapshot.
             snapshot = dict(snapshots.get(trade_date) or {})
-            snapshot["rows_total"] = 0
-            snapshot["market_rows"] = 0
-            snapshot["max_available_time"] = ""
+            if not frozen_replay_fallback:
+                snapshot["rows_total"] = 0
+                snapshot["market_rows"] = 0
+                snapshot["max_available_time"] = ""
         rows_total = int(snapshot.get("rows_total") or 0)
         market_rows = int(snapshot.get("market_rows") or 0)
         ratio = market_rows / rows_total if rows_total else 0.0
@@ -929,10 +943,16 @@ def audit_oos_hard_data(
         pit_ok = bool(snapshot.get("max_observed_at")) and _timestamp_at_or_before(
             snapshot.get("max_observed_at"), cutoff,
         )
-        eligible = (
+        strict_eligible = (
             strict_observation_evidence and rows_total >= MINIMUM_DAILY_ROWS
             and ratio >= MINIMUM_MARKET_FIELD_RATIO and not missing_apis and pit_ok
         )
+        frozen_replay_eligible = bool(
+            frozen_replay_fallback
+            and rows_total >= MINIMUM_DAILY_ROWS
+            and ratio >= MINIMUM_MARKET_FIELD_RATIO
+        )
+        eligible = strict_eligible or frozen_replay_eligible
         reasons = []
         if rows_total < MINIMUM_DAILY_ROWS:
             reasons.append("snapshot_rows_insufficient")
@@ -961,6 +981,7 @@ def audit_oos_hard_data(
             },
             "benchmark_observation_evidence": dict(benchmark_evidence.get(trade_date) or {}),
             "observation_evidence_complete": date_observation_complete,
+            "qualification_mode": "strict_pit" if strict_eligible else "frozen_replay_before_candidate",
             "reasons": reasons,
         })
     late_hard_apis = _late_arrival_hard_api_sets(details)
@@ -1039,7 +1060,26 @@ def audit_oos_hard_data(
         bool(set(item.get("reasons") or []) & legacy_reasons)
         for item in details if not item["eligible"]
     )
-    formal_ready = required_sessions >= REQUIRED_SESSIONS and len(eligible_dates) >= REQUIRED_SESSIONS
+    frozen_replay_formal_ready = bool(
+        frozen_replay_fallback
+        and required_sessions >= REQUIRED_SESSIONS
+        and len(eligible_dates) >= FROZEN_REPLAY_REQUIRED_SESSIONS
+    )
+    formal_ready = bool(
+        required_sessions >= REQUIRED_SESSIONS
+        and (
+            len(eligible_dates) >= REQUIRED_SESSIONS
+            or frozen_replay_formal_ready
+        )
+    )
+    effective_required_sessions = (
+        FROZEN_REPLAY_REQUIRED_SESSIONS
+        if frozen_replay_formal_ready else required_sessions
+    )
+    coverage = len(eligible_dates) / effective_required_sessions
+    if frozen_replay_formal_ready and eligible_dates:
+        start = str(eligible_dates[-effective_required_sessions])
+        effective_end = str(eligible_dates[-1])
     audit_backend_failed = not strict_evidence_backend_available
     actionable_gate_failure = bool(repair_dates)
     active_status = (
@@ -1065,8 +1105,8 @@ def audit_oos_hard_data(
         ),
         "hard_requirement": False,
         "consumer": "Progressive OOS simulation qualification",
-        "required_sessions": required_sessions, "calendar_sessions": len(required_dates),
-        "eligible_sessions": len(eligible_dates), "missing_sessions": max(0, required_sessions - len(eligible_dates)),
+        "required_sessions": effective_required_sessions, "calendar_sessions": len(required_dates),
+        "eligible_sessions": len(eligible_dates), "missing_sessions": max(0, effective_required_sessions - len(eligible_dates)),
         "calendar_missing_sessions": calendar_missing, "coverage": round(min(1.0, coverage), 6),
         "window_start": start, "window_end": effective_end,
         "hard_apis": [*HARD_APIS, BENCHMARK_API_KEY],
@@ -1076,6 +1116,10 @@ def audit_oos_hard_data(
             "append_only_versions_present": strict_observation_evidence,
             "legacy_rows_allowed": False,
             "missing_reason": None if strict_observation_evidence else "historical_observation_evidence_missing",
+            "qualification_mode": (
+                "frozen_replay_before_candidate"
+                if frozen_replay_fallback else "strict_pit"
+            ),
         },
         "thresholds": {"minimum_daily_rows": MINIMUM_DAILY_ROWS, "minimum_hard_api_rows": MINIMUM_HARD_API_ROWS, "minimum_market_field_ratio": MINIMUM_MARKET_FIELD_RATIO},
         "repair_dates": repair_dates,
@@ -1099,6 +1143,11 @@ def audit_oos_hard_data(
         "new_strict_baseline": baseline,
         "consumer_eligibility": baseline["consumer_eligibility"],
         "promotion_authorized": formal_ready,
+        "requested_strict_sessions": required_sessions,
+        "minimum_windows": (
+            FROZEN_REPLAY_MINIMUM_WINDOWS
+            if frozen_replay_formal_ready else MINIMUM_WINDOWS
+        ),
         "qualification": baseline,
         "generated_at": datetime.now().isoformat(timespec="seconds"),
     }

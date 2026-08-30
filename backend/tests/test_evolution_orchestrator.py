@@ -255,6 +255,13 @@ def test_network_budget_excludes_optional_research_claims(monkeypatch):
     assert set(evolution.NETWORK_OPTIONAL_TASK_TYPES).issubset(set(params))
 
 
+def test_network_budget_rechecks_already_claimed_optional_task(monkeypatch):
+    monkeypatch.setattr(evolution, "optional_network_work_allowed", lambda: False)
+
+    with pytest.raises(evolution.EvolutionTaskBudgetExceeded):
+        evolution.execute_evolution_task({"id": 408, "task_type": "research_maintenance"})
+
+
 @pytest.fixture(autouse=True)
 def _bind_test_factor_contract(monkeypatch):
     """Replay is stubbed here; satisfy the production factor gate explicitly."""

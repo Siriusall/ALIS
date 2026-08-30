@@ -35,7 +35,11 @@ export async function readApi(path: string, signal?: AbortSignal, timeoutMs = AP
   else signal?.addEventListener("abort", abort, { once: true });
   try {
     const token = getToken();
-    const response = await fetch(`${API_BASE}${path}`, { signal: timeout.signal, headers: { Accept: "application/json", ...(token ? { Authorization: `Bearer ${token}` } : {}) } });
+    const response = await fetch(`${API_BASE}${path}`, {
+      signal: timeout.signal,
+      cache: "no-store",
+      headers: { Accept: "application/json", ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+    });
     if (response.status === 401) {
       if (path === "/api/auth/me") window.dispatchEvent(new CustomEvent("alis:session-expired"));
       else void confirmSessionExpired(token);

@@ -19,6 +19,7 @@ export function Status({ children, tone }: { children: ReactNode; tone?: Tone })
     ? String(objectValue.label ?? objectValue.state ?? objectValue.status ?? "证据已记录")
     : children;
   const labels: Record<string, string> = {
+    waiting_data: "等待数据", safety_isolation: "安全隔离", runtime_failure: "故障",
     ok: "正常", ready: "就绪", healthy: "健康", normal: "正常", running: "运行中",
     waiting: "等待", queued: "排队", pending: "等待", observing: "观察中", idle: "空闲",
     waiting_schedule: "等待收盘调度", recovery_pending: "等待安全恢复",
@@ -35,7 +36,11 @@ export function Status({ children, tone }: { children: ReactNode; tone?: Tone })
     waiting_condition: "等待条件", stopping: "正在停止", alive: "存活", error: "错误",
   };
   const label = typeof value === "string" ? labels[value.toLowerCase()] || value : value;
-  return <span className={`status status-${tone || toneOf(value)}`}><i />{label}</span>;
+  const semanticTone = String(value).toLowerCase() === "waiting_data" ? "watch"
+    : String(value).toLowerCase() === "safety_isolation" ? "info"
+    : String(value).toLowerCase() === "runtime_failure" ? "danger"
+    : tone || toneOf(value);
+  return <span className={`status status-${semanticTone}`}><i />{label}</span>;
 }
 
 export function PageHeader({ eyebrow, title, summary, actions }: { eyebrow?: string; title: string; summary: string; actions?: ReactNode }) {

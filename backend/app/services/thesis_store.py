@@ -145,6 +145,18 @@ def list_theses(
     return values
 
 
+def count_theses(ts_code: str = "") -> int:
+    with _read_conn() as conn:
+        if ts_code:
+            row = conn.execute(
+                "SELECT COUNT(*) AS count FROM investment_theses WHERE ts_code=?",
+                (ts_code,),
+            ).fetchone()
+        else:
+            row = conn.execute("SELECT COUNT(*) AS count FROM investment_theses").fetchone()
+    return int(dict(row).get("count") or 0) if row else 0
+
+
 def list_theses_for_symbols(symbols: list[str]) -> list[dict[str, Any]]:
     """Read only thesis evidence that can match the current holdings."""
     candidates: set[str] = set()

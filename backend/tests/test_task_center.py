@@ -543,3 +543,42 @@ def test_task_center_route_degrades_when_aggregate_read_fails(monkeypatch):
     assert result["data_available"] is False
     assert result["component"] == "task_center"
     assert result["error"]["code"] == "database_query_timeout"
+
+
+def test_incident_classification_separates_wait_isolation_and_failure():
+    waiting = task_center._incident_classification({
+        "task_type": "factor_daily_cycle",
+        "phase": "waiting_for_decision_data",
+    })
+    isolated = task_center._incident_classification({
+        "task_type": "strategy_environment_backtest",
+        "phase": "waiting_for_historical_pit_evidence",
+    })
+    failed = task_center._incident_classification({
+        "task_type": "system_autonomy_cycle",
+        "phase": "runtime_health",
+        "error": "worker heartbeat timeout",
+    })
+
+    assert waiting["incident_kind"] == "waiting_data"
+    assert waiting["incident_label"] == "等待数据"
+    assert isolated["incident_kind"] == "safety_isolation"
+    assert isolated["incident_label"] == "安全隔离"
+    assert failed["incident_kind"] == "runtime_failure"
+    assert failed["incident_label"] == "故障"
+
+
+def test_idle_daily_scheduler_is_not_an_incident():
+    assert task_center._is_benign_idle_incident({
+        "source": "daily_update",
+        "raw_status": "idle",
+        "phase": "idle",
+        "message": "等待更新",
+        "error": None,
+    }) is True
+    assert task_center._is_benign_idle_incident({
+        "source": "daily_update",
+        "raw_status": "failed",
+        "phase": "failed",
+        "error": "upstream unavailable",
+    }) is False

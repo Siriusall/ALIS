@@ -20,9 +20,9 @@ Environment=DATABASE_STATEMENT_TIMEOUT_MS=30000
 Environment=DATABASE_IDLE_IN_TRANSACTION_TIMEOUT_MS=15000
 Environment=ALIS_CONSOLE_SNAPSHOT_HISTORICAL_AUDIT_MODE=persisted
 Environment=ALIS_NETWORK_BUDGET_ENABLED=1
-Environment=ALIS_NETWORK_DAILY_BUDGET_MB=1024
+Environment=ALIS_NETWORK_DAILY_BUDGET_MB=128
 Environment=ALIS_NETWORK_BUDGET_INTERFACE=eth0
-Environment=ALIS_NETWORK_BUDGET_DIRECTION=total
+Environment=ALIS_NETWORK_BUDGET_DIRECTION=tx
 Environment=ALIS_NETWORK_BUDGET_STATE_PATH=/var/lib/alis-worker/network-budget.json
 ExecStart=/opt/alis-worker/backend/.venv/bin/python -m app.console_snapshot_worker_main
 Restart=always

@@ -64,3 +64,23 @@ def test_network_budget_fails_closed_when_counter_is_unavailable(monkeypatch, tm
     assert result["available"] is False
     assert result["exhausted"] is True
     assert result["error_code"] == "network_counter_unavailable"
+
+
+def test_network_budget_resets_baseline_when_direction_changes(monkeypatch, tmp_path):
+    monkeypatch.setenv("ALIS_NETWORK_BUDGET_ENABLED", "1")
+    monkeypatch.setenv("ALIS_NETWORK_DAILY_BUDGET_MB", "128")
+    monkeypatch.setenv("ALIS_NETWORK_BUDGET_STATE_PATH", str(tmp_path / "budget.json"))
+    monkeypatch.setenv("ALIS_NETWORK_BUDGET_DIRECTION", "total")
+    network_budget.network_budget_status(
+        now=datetime.fromisoformat("2026-08-30T10:00:00+08:00"),
+        counter_reader=lambda _interface, _direction: 5_000,
+    )
+
+    monkeypatch.setenv("ALIS_NETWORK_BUDGET_DIRECTION", "tx")
+    result = network_budget.network_budget_status(
+        now=datetime.fromisoformat("2026-08-30T10:01:00+08:00"),
+        counter_reader=lambda _interface, _direction: 2_000,
+    )
+
+    assert result["direction"] == "tx"
+    assert result["used_bytes"] == 0

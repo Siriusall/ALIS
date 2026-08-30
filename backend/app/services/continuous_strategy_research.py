@@ -77,6 +77,33 @@ def _age_days_from_timestamp(value: Any, *, now: datetime | None = None) -> floa
         return float(EXPERT_MAX_AGE_DAYS + 1)
 
 
+def _wave_should_distill(
+    *, completed_count: int, expected_count: int, created_at: Any,
+    now: datetime | None = None,
+) -> bool:
+    if expected_count <= 0 or completed_count <= 0:
+        return False
+    current = now or datetime.now(_BUSINESS_TZ)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=_BUSINESS_TZ)
+    else:
+        current = current.astimezone(_BUSINESS_TZ)
+    try:
+        created = datetime.fromisoformat(str(created_at or "").replace("Z", "+00:00"))
+        if created.tzinfo is None:
+            created = created.replace(tzinfo=_BUSINESS_TZ)
+        else:
+            created = created.astimezone(_BUSINESS_TZ)
+        wave_age_seconds = max(0.0, (current - created).total_seconds())
+    except (TypeError, ValueError):
+        wave_age_seconds = 0.0
+    quorum_count = max(1, math.ceil(expected_count * WAVE_QUORUM_RATIO))
+    return (
+        completed_count >= quorum_count
+        or wave_age_seconds >= WAVE_TIMEOUT_FORCE_DISTILL_SECONDS
+    )
+
+
 def _json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
 
@@ -1083,15 +1110,10 @@ def refresh_research_wave(wave_id: str) -> dict[str, Any] | None:
     expected_count = int(wave.get("expected_count") or len(candidate_ids))
     terminal_count = completed_count + failed_count
     now = _now()
-    created_at_dt = None
-    try:
-        created_at_dt = datetime.fromisoformat(str(wave.get("created_at") or ""))
-    except Exception:
-        pass
-    wave_age_seconds = (now - created_at_dt).total_seconds() if created_at_dt else 0.0
-    quorum_satisfied = (
-        completed_count >= max(1, int(expected_count * WAVE_QUORUM_RATIO))
-        and wave_age_seconds >= WAVE_TIMEOUT_FORCE_DISTILL_SECONDS
+    quorum_satisfied = _wave_should_distill(
+        completed_count=completed_count,
+        expected_count=expected_count,
+        created_at=wave.get("created_at"),
     )
     status = (
         "completed" if expected_count > 0 and terminal_count >= expected_count

@@ -139,7 +139,11 @@ def network_budget_status(
         path = _state_path()
         with _lock, _file_lock(path):
             state = _load_state(path)
-            if str(state.get("day") or "") != day:
+            if (
+                str(state.get("day") or "") != day
+                or str(state.get("interface") or "") != interface
+                or str(state.get("direction") or "") != direction
+            ):
                 used_bytes = 0
                 previous_counter = counter
             else:

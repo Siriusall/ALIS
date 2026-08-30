@@ -89,6 +89,8 @@ def test_list_themes_filters_late_rows_before_applying_limit(monkeypatch):
     )
 
     assert result["count"] == 1
+    assert result["total_count"] == 1
+    assert result["promotable_count"] == 1
     assert result["items"][0]["theme_code"] == "industry:visible"
 
 

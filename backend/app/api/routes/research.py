@@ -25,7 +25,7 @@ from app.services.research_engine import (
     research_state,
     score_dimension,
 )
-from app.services.thesis_store import create_thesis, generate_thesis_for_stock, generate_watch_pool_theses, get_thesis, list_theses, review_due_theses, review_thesis, update_hypothesis
+from app.services.thesis_store import count_theses, create_thesis, generate_thesis_for_stock, generate_watch_pool_theses, get_thesis, list_theses, review_due_theses, review_thesis, update_hypothesis
 from app.services.industry_event_engine import industry_detail, list_event_followups, list_events, list_industries, materialize_event_followups, materialize_industry_state_history, materialize_industry_state_snapshots, review_linked_event_theses, score_event, score_industry, update_event_followup
 from app.services.industry_allocator import build_industry_allocation
 from app.services.market_context import live_market_context
@@ -252,13 +252,15 @@ def research_thesis_list(ts_code: str = "", limit: int = Query(default=100, ge=1
     try:
         # The research page only renders thesis identity/status fields. Full
         # hypothesis evidence remains available from the per-thesis endpoint.
+        normalized_code = ts_code.strip().upper()
         return {
             "ok": True,
             "items": list_theses(
-                ts_code=ts_code.strip().upper(),
+                ts_code=normalized_code,
                 limit=limit,
                 include_hypotheses=False,
             ),
+            "total_count": count_theses(normalized_code),
         }
     except Exception as exc:  # noqa: BLE001 - read-only evidence must terminate safely
         return degraded_read("research_theses", exc, items=[])

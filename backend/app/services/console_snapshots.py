@@ -492,7 +492,9 @@ def _readers(page_key: str) -> dict[str, Callable[[], Any]]:
             "analystConsensus": lambda: model_strategy.model_strategy_analyst_consensus_batch(limit=100),
             "theses": lambda: research.research_thesis_list(limit=100),
             "industries": research_industries,
-            "industryAllocation": lambda: research.research_industry_allocation(compact=True),
+            "industryAllocation": lambda: research.research_industry_allocation(
+                as_of_time="", market_state="", equity_budget=-1.0, compact=True,
+            ),
             # Route handlers use FastAPI Query defaults.  The control worker
             # calls them directly, so provide concrete bounded values rather
             # than passing Query instances into service logic.

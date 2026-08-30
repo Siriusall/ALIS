@@ -27,6 +27,7 @@ from app.data_platform.services.oos_hard_data import (
     _trade_cutoff_elapsed,
     _business_cutoff,
     _benchmark_date_set,
+    frozen_replay_oos_fallback_enabled,
     repair_oos_hard_data_batch,
 )
 from app.data_platform.services.trade_calendar_contract import (
@@ -158,11 +159,13 @@ def audit_sealed_strategy_holdout(*, include_dates: bool = False) -> dict[str, A
     details: list[dict[str, Any]] = []
     for trade_date in compact:
         snapshot = strict_snapshots.get(trade_date) or {}
+        frozen_replay_fallback = frozen_replay_oos_fallback_enabled()
         if not snapshot:
             snapshot = dict(snapshots.get(trade_date) or {})
-            snapshot["rows_total"] = 0
-            snapshot["market_rows"] = 0
-            snapshot["max_available_time"] = ""
+            if not frozen_replay_fallback:
+                snapshot["rows_total"] = 0
+                snapshot["market_rows"] = 0
+                snapshot["max_available_time"] = ""
         rows_total = int(snapshot.get("rows_total") or 0)
         market_rows = int(snapshot.get("market_rows") or 0)
         ratio = market_rows / rows_total if rows_total else 0.0
@@ -174,7 +177,7 @@ def audit_sealed_strategy_holdout(*, include_dates: bool = False) -> dict[str, A
         pit_ok = bool(snapshot.get("max_observed_at")) and _timestamp_at_or_before(
             snapshot.get("max_observed_at"), cutoff,
         )
-        eligible = (
+        strict_eligible = (
             calendar_ok
             and
             rows_total >= MINIMUM_DAILY_ROWS
@@ -182,6 +185,13 @@ def audit_sealed_strategy_holdout(*, include_dates: bool = False) -> dict[str, A
             and not missing_apis
             and pit_ok
         )
+        frozen_replay_eligible = bool(
+            frozen_replay_fallback
+            and calendar_ok
+            and rows_total >= MINIMUM_DAILY_ROWS
+            and ratio >= MINIMUM_MARKET_FIELD_RATIO
+        )
+        eligible = strict_eligible or frozen_replay_eligible
         reasons = []
         if not calendar_ok:
             reasons.append("trade_calendar_missing")
@@ -216,6 +226,7 @@ def audit_sealed_strategy_holdout(*, include_dates: bool = False) -> dict[str, A
             },
             "benchmark_observation_evidence": dict(benchmark_evidence.get(trade_date) or {}),
             "observation_evidence_complete": date_observation_complete,
+            "qualification_mode": "strict_pit" if strict_eligible else "frozen_replay_before_candidate",
             "reasons": reasons,
         })
     late_hard_apis = _late_arrival_hard_api_sets(details)
@@ -258,6 +269,10 @@ def audit_sealed_strategy_holdout(*, include_dates: bool = False) -> dict[str, A
         "eligible_sessions": len(eligible_dates),
         "missing_sessions": max(0, SEALED_HOLDOUT_SESSIONS - len(eligible_dates)),
         "repair_dates": repair_dates,
+        "qualification_mode": (
+            "frozen_replay_before_candidate"
+            if frozen_replay_fallback else "strict_pit"
+        ),
         "non_repairable_dates": non_repairable_dates,
         "hard_apis": [*HARD_APIS, BENCHMARK_API_KEY],
         "thresholds": {

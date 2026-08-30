@@ -4,9 +4,43 @@ from app.services.strategy_config import (
     get_strategy_factor_names,
     get_strategy_score_for_market_state,
 )
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 import json
 import pytest
 import uuid
+
+
+def test_research_wave_distills_on_quorum_without_waiting_for_timeout(monkeypatch):
+    monkeypatch.setattr(research, "WAVE_QUORUM_RATIO", 0.6)
+    monkeypatch.setattr(research, "WAVE_TIMEOUT_FORCE_DISTILL_SECONDS", 3600)
+    now = datetime(2026, 8, 29, 4, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+
+    assert research._wave_should_distill(
+        completed_count=3,
+        expected_count=5,
+        created_at=(now - timedelta(minutes=5)).isoformat(),
+        now=now,
+    )
+
+
+def test_research_wave_distills_after_timeout_with_partial_result(monkeypatch):
+    monkeypatch.setattr(research, "WAVE_QUORUM_RATIO", 0.6)
+    monkeypatch.setattr(research, "WAVE_TIMEOUT_FORCE_DISTILL_SECONDS", 3600)
+    now = datetime(2026, 8, 29, 4, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+
+    assert research._wave_should_distill(
+        completed_count=1,
+        expected_count=5,
+        created_at=(now - timedelta(hours=2)).isoformat(),
+        now=now,
+    )
+    assert not research._wave_should_distill(
+        completed_count=0,
+        expected_count=5,
+        created_at=(now - timedelta(hours=2)).isoformat(),
+        now=now,
+    )
 
 
 def test_dynamic_factor_complexity_is_not_a_fixed_range():

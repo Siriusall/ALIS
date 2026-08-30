@@ -213,6 +213,50 @@ def _mapping(value: Any) -> dict[str, Any]:
     return parsed if isinstance(parsed, dict) else {}
 
 
+def _incident_classification(item: dict[str, Any]) -> dict[str, str]:
+    evidence = " ".join(str(item.get(key) or "") for key in (
+        "task_type", "phase", "message", "error", "failure_category", "history_reason",
+    )).lower()
+    if any(marker in evidence for marker in (
+        "waiting_for_historical_pit_evidence",
+        "accumulating_new_strict_pit_baseline",
+        "progressive_oos_evidence_accumulating",
+        "formal_oos_or_historical_contract_wait",
+    )):
+        return {"incident_kind": "safety_isolation", "incident_label": "安全隔离", "incident_severity": "info"}
+    if any(marker in evidence for marker in (
+        "waiting_for_decision_data",
+        "blocked_by_decision_data",
+        "upstream_not_ready",
+        "upstream_not_published",
+        "waiting_stk_limit_gap_repair",
+        "execution_slice_blocked",
+        "daily_update",
+    )):
+        return {"incident_kind": "waiting_data", "incident_label": "等待数据", "incident_severity": "warning"}
+    return {"incident_kind": "runtime_failure", "incident_label": "故障", "incident_severity": "critical"}
+
+
+def _incident_item(item: dict[str, Any], *, reason: str) -> dict[str, Any]:
+    classification = _incident_classification(item)
+    return {
+        **item,
+        "incident_source_status": str(item.get("status") or ""),
+        "status": classification["incident_kind"],
+        "incident_reason": reason,
+        **classification,
+    }
+
+
+def _is_benign_idle_incident(item: dict[str, Any]) -> bool:
+    return (
+        str(item.get("source") or "") == "daily_update"
+        and str(item.get("raw_status") or "") == "idle"
+        and str(item.get("phase") or "") == "idle"
+        and not str(item.get("error") or "").strip()
+    )
+
+
 def _non_negative_int(value: Any) -> int | None:
     if value is None or value == "":
         return None
@@ -1279,6 +1323,13 @@ def build_task_center(
         {**item, "incident_reason": str(item.get("error") or item.get("message") or "任务阻断")}
         for item in current_tasks if item.get("status") in {"failed", "blocked"}
     ] + stalled_tasks + research_pipeline_blocks
+    incidents = [
+        _incident_item(
+            item,
+            reason=str(item.get("incident_reason") or item.get("error") or item.get("message") or "任务状态异常"),
+        )
+        for item in incidents if not _is_benign_idle_incident(item)
+    ]
     if include_slo:
         from app.services.system_autonomy import build_autonomy_slo
         try:

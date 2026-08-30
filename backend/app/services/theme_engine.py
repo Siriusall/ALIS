@@ -938,7 +938,7 @@ def list_themes(
             if not isinstance(decoded.get("point_in_time"), dict):
                 row["evidence_status"] = "legacy_unverified_pending_current_rematerialization"
 
-        rows = sorted(
+        visible_rows = sorted(
             visible_by_theme.values(),
             key=lambda item: (
                 1 if item.get("evidence_status") else 0,
@@ -946,7 +946,10 @@ def list_themes(
                 -float(item.get("score") or 0),
                 str(item.get("as_of_date") or ""),
             ),
-        )[:max(1, min(int(limit), 500))]
+        )
+        total_count = len(visible_rows)
+        promotable_count = sum(bool(row.get("promotable")) for row in visible_rows)
+        rows = visible_rows[:max(1, min(int(limit), 500))]
         if as_of_time and not rows:
             return {
                 "ok": False,
@@ -1003,7 +1006,14 @@ def list_themes(
                     mapping["evidence"] = json.loads(mapping.pop("evidence_json") or "{}")
             if include_companies:
                 row["companies"] = mappings
-    return {"ok": True, "items": rows, "count": len(rows), "as_of_time": as_of_time}
+    return {
+        "ok": True,
+        "items": rows,
+        "count": len(rows),
+        "total_count": total_count,
+        "promotable_count": promotable_count,
+        "as_of_time": as_of_time,
+    }
 
 
 def get_theme(theme_code: str, *, as_of_date: str = "") -> dict[str, Any] | None:
