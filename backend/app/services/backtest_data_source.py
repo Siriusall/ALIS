@@ -17,7 +17,8 @@ from app.data_platform.services.observation_clock import (
     _timestamp_value_sql,
 )
 from app.services.point_in_time import is_available_at, normalize_explicit_timestamp, normalize_timestamp
-from app.services.compact_feature_store import load_snapshot_bundle_from_local_cache, save_snapshot_bundle_to_local_cache
+from app.services.compact_feature_store import load_snapshot_bundle_from_local_cache
+from app.services.market_dataset import configured_dataset
 
 logger = logging.getLogger("quant.backtest_data_source")
 
@@ -70,6 +71,7 @@ class HistBar:
 
 class BacktestDataSource:
     def __init__(self) -> None:
+        self.market_dataset = configured_dataset()
         self._hist_cache: Dict[str, List[HistBar]] = {}
         self._hist_cache_through: Dict[str, str] = {}
         self._history_load_failed: set[str] = set()
@@ -271,6 +273,9 @@ class BacktestDataSource:
         those states distinct prevents a later current-table row from leaking
         into a historical replay.
         """
+        if self.market_dataset is not None:
+            return self.market_dataset.rows(api_name, cutoff=self._as_of_time, ymd=ymd,
+                                            ts_codes=ts_codes, date_clause=date_clause, date_params=date_params)
         try:
             postgres = _is_postgres()
             # The mutable projection records the provider selected by the
@@ -358,6 +363,10 @@ class BacktestDataSource:
 
     def _versioned_snapshot_rows(self, ymd: str, *, ts_codes: list[str] | None = None,
                                  date_clause: str = "", date_params: tuple = ()) -> list[dict] | None:
+        if self.market_dataset is not None:
+            rows = self.market_dataset.rows("snapshot", cutoff=self._as_of_time, ymd=ymd,
+                                            ts_codes=ts_codes, date_clause=date_clause, date_params=date_params)
+            return [self._decode_versioned_snapshot_row(row) for row in rows]
         cache_key = (
             str(self._as_of_time or ""), str(ymd or ""),
             tuple(sorted(ts_codes or [])), str(date_clause or ""), tuple(date_params),
@@ -483,6 +492,9 @@ class BacktestDataSource:
         """
         if not ts_codes:
             return []
+        if self.market_dataset is not None:
+            return self._versioned_snapshot_rows("", ts_codes=ts_codes,
+                                                 date_clause=date_clause, date_params=date_params)
         try:
             placeholders = ",".join("?" for _ in ts_codes)
             postgres = _is_postgres()
@@ -555,6 +567,8 @@ class BacktestDataSource:
             return None
 
     def _postgres_trade_dates(self, start: str, end: str) -> List[str]:
+        if self.market_dataset is not None:
+            return [self._fmt_date(d) for d in self.market_dataset.dates(start, end)]
         try:
             with _read_data_conn() as conn:
                 rows = conn.execute(
@@ -601,6 +615,10 @@ class BacktestDataSource:
             return []
 
     def _postgres_snapshot_rows(self, ymd: str) -> List[dict]:
+        if self.market_dataset is not None:
+            rows = self._versioned_snapshot_rows(ymd)
+            self._record_pit_read("snapshot.daily_structured", rows)
+            return rows
         cached_rows = load_snapshot_bundle_from_local_cache(ymd, as_of_time=self._as_of_time)
         if cached_rows is not None:
             self._record_pit_read("snapshot.daily_structured.local_cache", cached_rows)
@@ -833,7 +851,10 @@ class BacktestDataSource:
             if fresh:
                 limit_days = max(1, int(lookback or 0) + 5) if lookback else 0
                 start_ymd = ""
-                if limit_days:
+                if limit_days and self.market_dataset is not None:
+                    days = self.market_dataset.dates(self.market_dataset.manifest["start"], end_ymd)
+                    start_ymd = days[-limit_days] if len(days) >= limit_days else (days[0] if days else "")
+                elif limit_days:
                     with _read_data_conn() as conn:
                         row = conn.execute(
                             """SELECT MIN(trade_date) AS start_date FROM (

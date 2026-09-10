@@ -316,6 +316,7 @@ def _sell_position_for_rebalance(
         close_price=float(getattr(price_row, "prev_close", 0) or 0) if price_row else 0.0,
         change_pct=_open_change_pct(price_row),
         volume=_execution_volume(price_row),
+        consecutive_limit_down_days=int(getattr(price_row, "consecutive_limit_down_days", 0) or 0),
     )
     if not tradable.ok:
         blocked_events.append({"date": execute_date, "symbol": sym, "side": "SELL", "code": tradable.code, "message": tradable.message})
@@ -1371,7 +1372,7 @@ def run_for_trade_date(
         # execution row before the frozen plan can mutate the ledger.
         missing_position_rows = []
         target_execute_date = str(execute_date or "").replace("-", "")[:8]
-        for position in pretrade_portfolio["positions"]:
+        for position in (pretrade_portfolio.get("positions") or []):
             symbol = str(position.get("symbol") or "").strip()
             if int(position.get("quantity") or 0) <= 0 or not symbol:
                 continue
@@ -1415,7 +1416,7 @@ def run_for_trade_date(
     sold_count = 0
     sold_ops_payload: List[Dict[str, Any]] = []
     blocked_count = 0
-    rows = list(pretrade_portfolio["positions"])
+    rows = list(pretrade_portfolio.get("positions") or [])
     positions_before_execution = {
         str(position.get("symbol") or "").strip(): dict(position)
         for position in rows
@@ -1648,6 +1649,7 @@ def run_for_trade_date(
                 name=str(getattr(px_row, "name", "") or narrative_name_by_symbol.get(sym) or ""),
                 change_pct=_open_change_pct(px_row),
                 volume=_execution_volume(px_row),
+                consecutive_limit_down_days=int(getattr(px_row, "consecutive_limit_down_days", 0) or 0),
                 close=float(getattr(px_row, "prev_close", 0) or 0),
             )
         )
@@ -1951,7 +1953,7 @@ def run_for_trade_date(
         orders_payload=orders_payload,
         sold_ops_payload=sold_ops_payload,
         positions_before_execution=positions_before_execution,
-        pretrade_positions=pretrade_portfolio["positions"],
+        pretrade_positions=pretrade_portfolio.get("positions") or [],
         pretrade_cash_balance=float(pretrade_portfolio["cash_balance"]),
         frozen_exact_quantity_orders=frozen_exact_quantity_orders,
         release_id=int((authoritative_plan or {}).get("release_id") or 0) or None,

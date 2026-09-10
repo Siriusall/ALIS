@@ -514,18 +514,23 @@ def run_sealed_strategy_holdout(
                 "contract_hash": str(item["contract_hash"]),
                 "reused": True,
             }
-    candidate = replay_runner(
-        strategy_id=strategy_id,
-        model_version_id=int(model_version_id),
-        start_date=SEALED_HOLDOUT_START,
-        end_date=SEALED_HOLDOUT_END,
-    )
-    reference = replay_runner(
-        strategy_id=int(champion["strategy_id"]),
-        model_version_id=None,
-        start_date=SEALED_HOLDOUT_START,
-        end_date=SEALED_HOLDOUT_END,
-    )
+    # The public market dataset deliberately excludes this range. Remove its
+    # process binding while the one-shot, redacted holdout replay runs so a
+    # formal OOS task cannot accidentally make the holdout appear missing.
+    from app.services.market_dataset import without_dataset
+    with without_dataset():
+        candidate = replay_runner(
+            strategy_id=strategy_id,
+            model_version_id=int(model_version_id),
+            start_date=SEALED_HOLDOUT_START,
+            end_date=SEALED_HOLDOUT_END,
+        )
+        reference = replay_runner(
+            strategy_id=int(champion["strategy_id"]),
+            model_version_id=None,
+            start_date=SEALED_HOLDOUT_START,
+            end_date=SEALED_HOLDOUT_END,
+        )
     candidate_metrics = candidate.get("metrics") or {}
     reference_metrics = reference.get("metrics") or {}
     candidate_return = float(candidate_metrics.get("total_return") or 0.0)

@@ -195,6 +195,26 @@ alis-db-egress-normalize-sep11.timer
 
 ## 7. 长期数据库机月度出网保护
 
+### 7.0 研究数据源硬门
+
+研究 Worker 的 `/etc/alis/research-worker.env` 必须配置：
+
+```text
+ALIS_MARKET_DATASET_REQUIRED=1
+ALIS_MARKET_DATASET_SOURCE=ssh://alis-snapshot@<database-host>/opt/alis/shared/market-datasets
+ALIS_MARKET_DATASET_ROOT=/var/lib/alis-research-worker/market-datasets
+```
+
+数据库机先在本机发布公开研究数据集：
+
+```bash
+PYTHONPATH=/opt/alis-db-snapshot/backend /opt/alis-db-snapshot/shared/app-venv/bin/python \
+  /opt/alis-db-snapshot/backend/scripts/market_dataset.py publish \
+  --start 20200101 --end 20260831 --root /opt/alis/shared/market-datasets
+```
+
+研究 Worker 首次同步后，所有研究任务复用本地内容寻址分区；相同哈希不会再次传输。若数据集没有准备好，研究任务会等待/失败并留证，不得回源 PostgreSQL 形成重复出网。`ALIS_MARKET_DATASET_SOURCE` 的 SSH 用户、地址和目录必须按实际服务器配置，本文不提供凭据。
+
 规则来自：
 
 - `deploy/alis-db-egress-guard.sh`

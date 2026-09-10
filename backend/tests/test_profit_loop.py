@@ -167,6 +167,23 @@ def test_missing_live_metrics_do_not_degrade_production_model(monkeypatch):
     assert result["items"][0]["evidence_maturity"]["status"] == "insufficient"
 
 
+def test_current_production_status_enters_live_degradation(monkeypatch):
+    monkeypatch.setattr(profit_loop, "_ensure_tables", lambda: None)
+    monkeypatch.setattr(profit_loop, "model_family_status", lambda: {"items": [{
+        "model_key": "m1", "name": "M1", "status": "production_current_standard",
+        "active_version": {"version": "v1", "metrics": {"live_ic": -0.05}},
+    }]})
+    monkeypatch.setattr(profit_loop, "model_feedback_gate", lambda *_: {
+        "weighted_accuracy": 0.3, "mature_20d_outcomes": 5, "should_degrade": True,
+    })
+
+    result = profit_loop.build_model_live_monitor(persist=False)
+
+    assert result["items"][0]["status"] == "degraded"
+    assert result["items"][0]["weight_multiplier"] == 0.55
+    assert result["items"][0]["degraded_streak"] == 1
+
+
 def test_model_contribution_refuses_to_invent_portfolio_pnl(monkeypatch):
     monkeypatch.setattr(profit_loop, "_ensure_tables", lambda: None)
     monkeypatch.setattr(profit_loop, "model_family_status", lambda: {"items": [{

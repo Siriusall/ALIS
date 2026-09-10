@@ -89,6 +89,17 @@ HEARTBEAT_DB_RETRY_ATTEMPTS = max(
 HEARTBEAT_DB_RETRY_BACKOFF_SECONDS = max(
     0.1, min(float(os.getenv("EVOLUTION_HEARTBEAT_DB_RETRY_BACKOFF_SECONDS", "0.5")), 5.0)
 )
+MODEL_TRAIN_STALE_SECONDS = max(
+    300, min(int(os.getenv("ALIS_MODEL_TRAIN_STALE_SECONDS", "1200")), 7200)
+)
+MODEL_TRAIN_MAX_SECONDS = max(
+    MODEL_TRAIN_STALE_SECONDS,
+    min(int(os.getenv("ALIS_MODEL_TRAIN_MAX_SECONDS", "21600")), 86400),
+)
+MODEL_WATCHDOG_INTERVAL_SECONDS = max(
+    30, min(int(os.getenv("ALIS_MODEL_WATCHDOG_INTERVAL_SECONDS", "60")), 600)
+)
+_model_watchdog_last_at = 0.0
 LEGACY_TASK_RECONCILIATION_VERSION = "alis_evolution_task_reconciliation_v1"
 WORKER_ID = f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
 SYSTEM_AUTONOMY_RECOVERY_POLICY_VERSION = "v3"
@@ -780,6 +791,33 @@ def reconcile_stagnant_research_pipeline(*, wave_stagnation_seconds: int = 7200)
         "count": len(distilled_waves),
     }
 
+
+def reconcile_stagnant_model_research() -> dict[str, Any]:
+    """Bounded model watchdog: close orphan runs and restore missing shadow work."""
+    global _model_watchdog_last_at
+    now_monotonic = time.monotonic()
+    if now_monotonic - _model_watchdog_last_at < MODEL_WATCHDOG_INTERVAL_SECONDS:
+        return {"ok": True, "skipped": "interval_not_elapsed", "count": 0}
+    _model_watchdog_last_at = now_monotonic
+    try:
+        from app.services.model_shadow_observation import ensure_model_shadow_tasks
+        from app.services.plan_model_control import reconcile_stale_plan_model_runs
+
+        stale = reconcile_stale_plan_model_runs(
+            stale_minutes=max(5, MODEL_TRAIN_STALE_SECONDS // 60)
+        )
+        shadows = ensure_model_shadow_tasks()
+        return {
+            "ok": True,
+            "schema_version": "alis_model_research_watchdog_v1",
+            "stale_training_runs": list(stale.get("reconciled_run_ids") or []),
+            "shadow_tasks": shadows,
+            "count": int(stale.get("count") or 0),
+        }
+    except Exception as exc:  # watchdog must never take down the worker
+        logger.warning("model research watchdog encountered non-fatal error: %s", exc)
+        return {"ok": False, "error": str(exc)[:300], "count": 0}
+
 def reconcile_shadow_equity_evidence_gap_tasks(*, limit: int = 200) -> dict[str, Any]:
     """Relabel stale Shadow point gaps without replaying historical outcomes."""
     from app.services.plan_model_control import classify_plan_model_training_failure
@@ -1308,16 +1346,30 @@ def _claim_next_task() -> dict[str, Any] | None:
     lease_until = (now + timedelta(minutes=LEASE_MINUTES)).isoformat()
     research_clause = ""
     network_budget_clause = ""
+    claim_exclusions: list[str] = []
     claim_params: list[Any] = [now.isoformat(), WORKER_POOL]
     worker_pool_clause = "AND worker_pool=?"
+    dataset_tasks = {
+        "strategy_evolution_cycle", "strategy_controller_oos", "strategy_environment_backtest",
+        "model_strategy_impact_validation", "factor_research_cycle", "strategy_portfolio_research",
+    }
+    dataset_status = None
+    if str(os.getenv("ALIS_MARKET_DATASET_REQUIRED", "0")).strip().lower() in {"1", "true", "yes", "on"}:
+        from app.services.market_dataset import dataset_configuration_status
+        dataset_status = dataset_configuration_status()
+        if not dataset_status["ready"]:
+            placeholders = ",".join("?" for _ in dataset_tasks)
+            claim_exclusions.append(f"AND task_type NOT IN ({placeholders})")
+            claim_params.extend(sorted(dataset_tasks))
     if _defer_long_research_claims(now):
         placeholders = ",".join("?" for _ in LONG_RESEARCH_TASK_TYPES)
         research_clause = f"AND task_type NOT IN ({placeholders})"
         claim_params.extend(sorted(LONG_RESEARCH_TASK_TYPES))
     if not optional_network_work_allowed():
         placeholders = ",".join("?" for _ in NETWORK_OPTIONAL_TASK_TYPES)
-        network_budget_clause = f"AND task_type NOT IN ({placeholders})"
+        claim_exclusions.append(f"AND task_type NOT IN ({placeholders})")
         claim_params.extend(sorted(NETWORK_OPTIONAL_TASK_TYPES))
+    network_budget_clause = " ".join(claim_exclusions)
     with _conn() as conn:
         suffix = " FOR UPDATE SKIP LOCKED" if conn._is_postgres else ""
         row = conn.execute(
@@ -1498,10 +1550,17 @@ def _wait_for_model_train_runs(
     phase_prefix: str,
 ) -> list[dict[str, Any]]:
     from app.db.store import get_model_train_run
+    from app.services.plan_model_control import interrupt_plan_model_train_run
 
     completed_runs: list[dict[str, Any]] = []
     for run_id in run_ids:
+        wait_started = time.monotonic()
         while True:
+            # Direct executor tests and administrative replays may not persist a
+            # parent task; live workers always do and therefore enforce lease,
+            # cancellation and deadline ownership on every poll.
+            if get_evolution_task(int(task_id)):
+                _ensure_task_active(int(task_id))
             run = get_model_train_run(int(run_id))
             if not run:
                 raise RuntimeError(f"模型训练运行不存在：{run_id}")
@@ -1527,6 +1586,33 @@ def _wait_for_model_train_runs(
                     "status": status,
                     "model_version_id": run.get("model_version_id"),
                     "error": run.get("error"),
+                })
+                break
+            updated_at = run.get("updated_at") or run.get("created_at")
+            try:
+                heartbeat_age = max(
+                    0.0,
+                    (_now() - datetime.fromisoformat(str(updated_at).replace("Z", "+00:00"))).total_seconds(),
+                )
+            except (TypeError, ValueError):
+                heartbeat_age = 0.0
+            error_code = ""
+            message = ""
+            if heartbeat_age >= MODEL_TRAIN_STALE_SECONDS:
+                error_code = "stale_plan_model_training_run"
+                message = "模型训练心跳停滞，已终止本次运行并进入受限恢复"
+            elif time.monotonic() - wait_started >= MODEL_TRAIN_MAX_SECONDS:
+                error_code = "plan_model_training_runtime_budget_exceeded"
+                message = "模型训练超过单次总时限，已终止本次运行并进入受限恢复"
+            if error_code:
+                interrupted = interrupt_plan_model_train_run(
+                    int(run_id), error_code=error_code, message=message
+                ) or run
+                completed_runs.append({
+                    "run_id": int(run_id),
+                    "status": str(interrupted.get("status") or "failed"),
+                    "model_version_id": interrupted.get("model_version_id"),
+                    "error": str(interrupted.get("error") or error_code),
                 })
                 break
             time.sleep(2)
@@ -2713,6 +2799,45 @@ def diagnose_strategy_results(items: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def execute_evolution_task(
+    task: dict[str, Any],
+    *,
+    validation_runner: Callable[..., dict[str, Any]] = run_purged_walk_forward_validation,
+) -> dict[str, Any]:
+    from app.services.market_dataset import bind_dataset, sync_market_dataset
+
+    dataset_tasks = {
+        "strategy_evolution_cycle", "strategy_controller_oos", "strategy_environment_backtest",
+        "model_strategy_impact_validation", "factor_research_cycle", "strategy_portfolio_research",
+    }
+    source = os.getenv("ALIS_MARKET_DATASET_SOURCE", "")
+    dataset_required = str(os.getenv("ALIS_MARKET_DATASET_REQUIRED", "0")).strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+    if dataset_required and str(task.get("task_type")) in dataset_tasks and not source:
+        raise EvolutionTaskBudgetExceeded("market dataset source is required for research task")
+    if source and str(task.get("task_type")) in dataset_tasks:
+        task_id = int(task["id"])
+        payload = dict(task.get("payload") or {})
+        prepared = _run_with_heartbeat_pulse(
+            task_id, phase="market_dataset_prepare", message="准备冻结市场数据集并复用已校验分区",
+            runner=lambda: sync_market_dataset(
+                source=source, version=payload.get("market_dataset_version"),
+                progress=lambda: _ensure_task_active(task_id),
+            ),
+        )
+        payload["market_dataset_version"] = prepared["version"]
+        if not _update_active_task(task_id, statuses=("running",), require_not_stopped=True,
+                                   expected_lease_owner=WORKER_ID, payload=payload):
+            raise RuntimeError("task no longer owns dataset binding")
+        task = {**task, "payload": payload}
+        with bind_dataset(prepared["version"]):
+            result = _execute_evolution_task(task, validation_runner=validation_runner)
+        result["market_dataset"] = prepared
+        return result
+    return _execute_evolution_task(task, validation_runner=validation_runner)
+
+
+def _execute_evolution_task(
     task: dict[str, Any],
     *,
     validation_runner: Callable[..., dict[str, Any]] = run_purged_walk_forward_validation,
@@ -3983,6 +4108,13 @@ def run_worker_once() -> dict[str, Any] | None:
             "auto-healed %s stagnant research wave(s): %s",
             stagnation_reconciliation["count"],
             stagnation_reconciliation.get("distilled_waves"),
+        )
+    model_stagnation_reconciliation = reconcile_stagnant_model_research()
+    if model_stagnation_reconciliation.get("count"):
+        logger.info(
+            "auto-healed %s stagnant model training run(s): %s",
+            model_stagnation_reconciliation["count"],
+            model_stagnation_reconciliation.get("stale_training_runs"),
         )
     task = _claim_next_task()
     if not task:

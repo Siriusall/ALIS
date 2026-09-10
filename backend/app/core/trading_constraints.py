@@ -46,14 +46,16 @@ def is_limit_down(
     open_price: float,
     close_price: float = 0.0,
     consecutive_limit_down_days: int = 0,
+    is_st: bool = False,
 ) -> bool:
     if float(open_price or 0) <= 0:
         return False
     base_limit = float(change_pct or 0) <= -9.7 or (
         float(close_price or 0) > 0 and abs(float(open_price) - float(close_price)) <= 0.01 and float(change_pct or 0) <= -9.5
     )
-    # Stricter liquidity penalty: multiple consecutive limit-downs or ST limit-down (-4.8%)
-    return base_limit or (consecutive_limit_down_days > 1 and float(change_pct or 0) <= -9.0)
+    st_limit = bool(is_st) and float(change_pct or 0) <= -4.8
+    consecutive_lock = int(consecutive_limit_down_days or 0) >= 2 and float(change_pct or 0) <= -9.0
+    return base_limit or st_limit or consecutive_lock
 
 
 def check_open_trade_constraints(
@@ -66,6 +68,7 @@ def check_open_trade_constraints(
     change_pct: float = 0.0,
     volume: float = 0.0,
     allow_st_buy: bool = False,
+    consecutive_limit_down_days: int = 0,
 ) -> TradeConstraintResult:
     """Conservative daily-bar tradability check for T+1 open execution."""
 
@@ -76,6 +79,12 @@ def check_open_trade_constraints(
         return TradeConstraintResult(False, "st_buy_blocked", f"{symbol} 为 ST/*ST，默认禁止新开仓")
     if side == "BUY" and is_limit_up(change_pct=change_pct, open_price=open_price, close_price=close_price):
         return TradeConstraintResult(False, "limit_up_buy_blocked", f"{symbol} 近似涨停，按买不进处理")
-    if side == "SELL" and is_limit_down(change_pct=change_pct, open_price=open_price, close_price=close_price):
+    if side == "SELL" and is_limit_down(
+        change_pct=change_pct,
+        open_price=open_price,
+        close_price=close_price,
+        consecutive_limit_down_days=consecutive_limit_down_days,
+        is_st=is_st_name(name),
+    ):
         return TradeConstraintResult(False, "limit_down_sell_blocked", f"{symbol} 近似跌停，按卖不出处理")
     return TradeConstraintResult(True, "tradable", f"{symbol} 可按开盘价模拟{side}")

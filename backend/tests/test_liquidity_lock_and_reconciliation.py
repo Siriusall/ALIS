@@ -34,6 +34,21 @@ def test_suspended_liquidity_lock():
     assert res_suspended.code == "suspended_or_no_open_price"
 
 
+def test_st_and_consecutive_limit_down_sell_are_blocked():
+    st_result = check_open_trade_constraints(
+        side="SELL", symbol="000001", name="*ST示例",
+        open_price=5.0, close_price=5.0, change_pct=-4.9, volume=1000.0,
+    )
+    assert st_result.code == "limit_down_sell_blocked"
+
+    consecutive_result = check_open_trade_constraints(
+        side="SELL", symbol="000002", name="普通股票",
+        open_price=9.1, close_price=9.1, change_pct=-9.1, volume=1000.0,
+        consecutive_limit_down_days=2,
+    )
+    assert consecutive_result.code == "limit_down_sell_blocked"
+
+
 def test_cash_reconciliation_consistent_state(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr("app.services.simulation_ledger_audit.audit_simulation_ledger", lambda **kwargs: {
         "ok": True,

@@ -24,7 +24,7 @@ from app.services.position_valuation import (
     missing_exact_position_valuations,
 )
 from app.services.point_in_time import normalize_explicit_timestamp
-from app.services.plan_model_control import model_family_status
+from app.services.plan_model_control import model_family_status, reconcile_plan_model_live_health
 from app.services.review_learning import materialize_decision_outcomes, model_feedback_gate, review_learning_overview
 from app.services.risk_limit_contract import (
     DEFAULT_CORRELATED_INDUSTRY_LIMIT,
@@ -1017,6 +1017,10 @@ def build_model_live_monitor(*, persist: bool = True) -> dict[str, Any]:
     _ensure_tables()
     family = model_family_status()
     rows = []
+    evaluation_date = datetime.now(_BUSINESS_TZ).date().isoformat()
+    quarantine_streak = max(
+        2, min(int(os.getenv("ALIS_MODEL_DEGRADED_STREAK_TO_QUARANTINE", "3")), 20)
+    )
     for item in family.get("items") or []:
         active = item.get("active_version") or {}
         latest = item.get("latest_version") or {}
@@ -1035,12 +1039,35 @@ def build_model_live_monitor(*, persist: bool = True) -> dict[str, Any]:
         # Until forward outcomes mature, keep the model neutral and call it
         # observation rather than incorrectly declaring production health.
         has_live_signal = evidence_mature and (has_live_ic or has_hit_rate)
-        production = str(item.get("status") or "") == "production"
+        family_status = str(item.get("status") or "")
+        production = bool(active) and family_status in {
+            "production", "production_current_standard"
+        }
         decay = max(0.0, min(1.0, 0.05 - live_ic)) if has_live_ic and live_ic < 0.05 else max(0.0, 0.45 - hit_rate) if has_hit_rate else 0.0
         should_degrade = production and has_live_signal and (bool(feedback.get("should_degrade")) or (has_live_ic and live_ic < -0.02) or (has_hit_rate and hit_rate < 0.38))
-        multiplier = 0.55 if should_degrade else 0.8 if production and decay > 0.25 else 1.0
-        status = "degraded" if should_degrade else "observing" if production and not has_live_signal else "watch" if multiplier < 1 else str(item.get("status") or "unknown")
-        reason = "上线后指标失效，自动降权" if should_degrade else "未来20日样本不足，观察中且不调整权重" if production and not has_live_signal else "指标衰减，降低影响权重" if multiplier < 1 else "非生产模型不参与降权" if not production else "生产健康"
+        previous_payload: dict[str, Any] = {}
+        if persist:
+            with business_conn() as c:
+                previous = c.execute(
+                    "SELECT active_version,metrics_json FROM model_live_health WHERE model_key=?",
+                    (str(item.get("model_key") or ""),),
+                ).fetchone()
+            if previous and str(previous.get("active_version") or "") == version:
+                raw_previous = previous.get("metrics_json")
+                try:
+                    previous_payload = (
+                        raw_previous if isinstance(raw_previous, dict)
+                        else json.loads(raw_previous or "{}")
+                    )
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    previous_payload = {}
+        prior_streak = int(previous_payload.get("degraded_streak") or 0)
+        already_evaluated = str(previous_payload.get("last_evaluated_date") or "") == evaluation_date
+        degraded_streak = prior_streak if already_evaluated else prior_streak + 1 if should_degrade else 0
+        quarantined = should_degrade and degraded_streak >= quarantine_streak
+        multiplier = 0.0 if quarantined else 0.55 if should_degrade else 0.8 if production and decay > 0.25 else 1.0
+        status = "quarantined" if quarantined else "degraded" if should_degrade else "observing" if production and not has_live_signal else "watch" if multiplier < 1 else family_status or "unknown"
+        reason = "连续线上失效，已隔离并进入安全回退" if quarantined else "上线后指标失效，自动降权" if should_degrade else "未来20日样本不足，观察中且不调整权重" if production and not has_live_signal else "指标衰减，降低影响权重" if multiplier < 1 else "非生产模型不参与降权" if not production else "生产健康"
         payload = {
             "model_key": item.get("model_key"),
             "name": item.get("name"),
@@ -1053,6 +1080,9 @@ def build_model_live_monitor(*, persist: bool = True) -> dict[str, Any]:
             "decay": round(decay, 6),
             "weight_multiplier": round(multiplier, 4),
             "reason": reason,
+            "degraded_streak": degraded_streak,
+            "quarantine_streak_required": quarantine_streak,
+            "last_evaluated_date": evaluation_date,
             "evidence_maturity": {
                 "status": "mature" if evidence_mature else "insufficient",
                 "mature_20d_outcomes": mature_outcomes,
@@ -1072,7 +1102,15 @@ def build_model_live_monitor(*, persist: bool = True) -> dict[str, Any]:
                     (str(item.get("model_key") or ""), version, status, live_ic, hit_rate, turnover, drawdown_contribution,
                  decay, multiplier, reason, json.dumps(payload, ensure_ascii=False), _now()))
         rows.append(payload)
-    return {"ok": True, "schema_version": "model_live_monitor_v1", "items": rows, "degraded_count": sum(1 for x in rows if x["status"] == "degraded")}
+    health_actions = reconcile_plan_model_live_health(rows) if persist else {"items": []}
+    return {
+        "ok": True,
+        "schema_version": "model_live_monitor_v2",
+        "items": rows,
+        "degraded_count": sum(1 for x in rows if x["status"] == "degraded"),
+        "quarantined_count": sum(1 for x in rows if x["status"] == "quarantined"),
+        "health_actions": health_actions,
+    }
 
 
 def build_portfolio_reoptimization(*, signal_date: str = "") -> dict[str, Any]:

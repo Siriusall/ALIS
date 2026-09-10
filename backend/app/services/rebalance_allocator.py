@@ -86,6 +86,7 @@ def _build_tradable_orders(
             close_price=float(order.close or 0),
             change_pct=float(order.change_pct or 0),
             volume=float(order.volume or 0),
+            consecutive_limit_down_days=int(order.consecutive_limit_down_days or 0),
         )
         if not tradable_check.ok:
             blocked.append(

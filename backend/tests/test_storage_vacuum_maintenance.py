@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock
 import pytest
 
 from app.data_platform.services.cold_archive import (
@@ -27,7 +26,6 @@ def test_vacuum_table_unauthorized():
 
 
 def test_vacuum_table_execution(monkeypatch: pytest.MonkeyPatch):
-    mock_conn = MagicMock()
     executed_queries = []
 
     class MockContext:
@@ -40,9 +38,14 @@ def test_vacuum_table_execution(monkeypatch: pytest.MonkeyPatch):
         def execute(self, sql):
             executed_queries.append(sql)
 
-    monkeypatch.setattr("app.data_platform.db._conn", lambda: MockContext())
+    monkeypatch.setattr("app.data_platform.db._maintenance_conn", lambda: MockContext())
 
     result = vacuum_table_dead_tuples(table_name="dc_tushare_raw_records", full=False, analyze=True)
     assert result["ok"] is True
     assert result["table"] == "dc_tushare_raw_records"
     assert "VACUUM ANALYZE public.dc_tushare_raw_records" in executed_queries
+
+
+def test_vacuum_full_requires_explicit_maintenance_window():
+    with pytest.raises(ValueError, match="maintenance window"):
+        vacuum_table_dead_tuples(table_name="dc_tushare_raw_records", full=True)

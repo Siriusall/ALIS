@@ -61,7 +61,7 @@ def test_current_news_snapshot_uses_latest_market_session(monkeypatch):
     result = news_theme_cluster.cluster_news_themes()
 
     assert result["reason"] == "no_news_data"
-    assert connection.calls[1][1] == ("20260831",)
+    assert connection.calls[1][1] == ("20260911",)
 
 
 def test_theme_history_accepts_full_walk_forward_session_target(monkeypatch):

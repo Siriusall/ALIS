@@ -2,11 +2,8 @@
 
 from __future__ import annotations
 
-import gzip
 import json
-import tempfile
 from pathlib import Path
-from unittest.mock import patch
 
 import pytest
 
@@ -49,7 +46,8 @@ def test_save_and_load_snapshot_bundle(tmp_path: Path, monkeypatch: pytest.Monke
 
     saved_path = save_snapshot_bundle_to_local_cache("20260828", sample_records)
     assert saved_path.exists()
-    assert saved_path.suffix == ".gz"
+    assert saved_path.suffix == ".parquet"
+    assert saved_path.with_name(saved_path.name + ".manifest.json").exists()
 
     loaded = load_snapshot_bundle_from_local_cache("20260828")
     assert loaded is not None
@@ -70,7 +68,12 @@ def test_disabled_cache_returns_none(tmp_path: Path, monkeypatch: pytest.MonkeyP
     monkeypatch.setenv("ALIS_FEATURE_CACHE_ROOT", str(tmp_path))
     monkeypatch.setenv("ALIS_LOCAL_FEATURE_CACHE_ENABLED", "0")
 
-    sample_records = [{"ts_code": "000001.SZ", "trade_date": "20260828", "close": 10.5}]
+    sample_records = [{
+        "ts_code": "000001.SZ",
+        "trade_date": "20260828",
+        "close": 10.5,
+        "observed_at": "2026-08-28T15:30:00+08:00",
+    }]
     save_snapshot_bundle_to_local_cache("20260828", sample_records)
 
     loaded = load_snapshot_bundle_from_local_cache("20260828")
@@ -103,3 +106,26 @@ def test_save_and_load_text_event_bundle(tmp_path: Path, monkeypatch: pytest.Mon
     assert loaded is not None
     assert len(loaded) == 1
     assert loaded[0]["event_type"] == "earnings_forecast"
+
+
+def test_cache_rejects_missing_or_naive_availability_time(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("ALIS_FEATURE_CACHE_ROOT", str(tmp_path))
+    with pytest.raises(ValueError, match="missing available_time"):
+        save_snapshot_bundle_to_local_cache(
+            "20260828", [{"ts_code": "000001.SZ", "trade_date": "20260828"}]
+        )
+    with pytest.raises(ValueError, match="include timezone"):
+        save_snapshot_bundle_to_local_cache(
+            "20260828",
+            [{"ts_code": "000001.SZ", "trade_date": "20260828", "observed_at": "2026-08-28T15:30:00"}],
+        )
+
+
+def test_cache_rejects_tampered_parquet(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("ALIS_FEATURE_CACHE_ROOT", str(tmp_path))
+    saved = save_snapshot_bundle_to_local_cache(
+        "20260828",
+        [{"ts_code": "000001.SZ", "trade_date": "20260828", "observed_at": "2026-08-28T15:30:00+08:00"}],
+    )
+    saved.write_bytes(saved.read_bytes() + b"tampered")
+    assert load_snapshot_bundle_from_local_cache("20260828") is None

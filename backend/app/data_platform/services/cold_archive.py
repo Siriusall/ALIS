@@ -140,7 +140,13 @@ def archive_raw_records(
     }
 
 
-def vacuum_table_dead_tuples(*, table_name: str, full: bool = False, analyze: bool = True) -> dict[str, Any]:
+def vacuum_table_dead_tuples(
+    *,
+    table_name: str,
+    full: bool = False,
+    analyze: bool = True,
+    allow_blocking_full: bool = False,
+) -> dict[str, Any]:
     """Execute VACUUM / ANALYZE on high-churn tables to reclaim dead tuple storage."""
     allowed_tables = {
         "dc_tushare_raw_records",
@@ -154,6 +160,8 @@ def vacuum_table_dead_tuples(*, table_name: str, full: bool = False, analyze: bo
     cleaned_table = str(table_name).strip().lower()
     if cleaned_table not in allowed_tables:
         raise ValueError(f"Table {cleaned_table} is not authorized for maintenance vacuum")
+    if full and not allow_blocking_full:
+        raise ValueError("VACUUM FULL requires allow_blocking_full=True and a maintenance window")
 
     verb = "VACUUM FULL" if full else "VACUUM"
     if analyze and not full:
@@ -163,10 +171,9 @@ def vacuum_table_dead_tuples(*, table_name: str, full: bool = False, analyze: bo
 
     started_at = datetime.now(timezone.utc).isoformat()
     try:
-        from app.data_platform.db import _conn
+        from app.data_platform.db import _maintenance_conn
 
-        with _conn() as conn:
-            # Table-level vacuum execution
+        with _maintenance_conn() as conn:
             conn.execute(f"{verb} public.{cleaned_table}")
         return {
             "ok": True,

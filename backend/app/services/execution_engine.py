@@ -91,6 +91,7 @@ def simulate_open_execution_legacy(
             close_price=order.close,
             change_pct=order.change_pct,
             volume=order.volume,
+            consecutive_limit_down_days=order.consecutive_limit_down_days,
         )
         if not tradable.ok:
             orders.append(

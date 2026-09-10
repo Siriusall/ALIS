@@ -457,6 +457,33 @@ def test_plan_model_autonomy_holds_worker_until_training_is_terminal(monkeypatch
     assert any("单模型资源锁定中" in values["message"] for _, values in heartbeats)
 
 
+def test_model_training_wait_interrupts_stale_run(monkeypatch):
+    from app.db import store
+    from app.services import plan_model_control
+
+    interrupted = []
+    monkeypatch.setattr(evolution, "MODEL_TRAIN_STALE_SECONDS", 300)
+    monkeypatch.setattr(evolution, "get_evolution_task", lambda _task_id: None)
+    monkeypatch.setattr(evolution, "_heartbeat", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(store, "get_model_train_run", lambda _run_id: {
+        "id": 66, "status": "running", "phase": "training", "progress": 0.5,
+        "updated_at": "2020-01-01T00:00:00+08:00",
+        "metrics": {"model_key": "medium_horizon_lambdarank_v1"},
+    })
+    monkeypatch.setattr(
+        plan_model_control,
+        "interrupt_plan_model_train_run",
+        lambda run_id, **kwargs: interrupted.append((run_id, kwargs)) or {
+            "id": run_id, "status": "failed", "error": kwargs["error_code"],
+        },
+    )
+
+    result = evolution._wait_for_model_train_runs(947, [66], phase_prefix="model")
+
+    assert result[0]["error"] == "stale_plan_model_training_run"
+    assert interrupted[0][0] == 66
+
+
 def test_plan_model_autonomy_dispatches_frozen_targeted_candidate(monkeypatch):
     from app.db import store
     from app.services import plan_model_control
