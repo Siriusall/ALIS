@@ -409,6 +409,7 @@ export function useConsoleData(pathname: string) {
   const controller = useRef<AbortController | null>(null);
   const retryTimer = useRef<number | null>(null);
   const retryAttempt = useRef(0);
+  const snapshotNextPollDelay = useRef<number | null>(null);
   const lastGoodSnapshot = useRef<{ page: string; payload: Json } | null>(
     snapshotPage && initialSnapshot ? { page: snapshotPage, payload: initialSnapshot } : null,
   );
@@ -477,6 +478,7 @@ export function useConsoleData(pathname: string) {
         retryInMs = snapshotPollInterval(pathname),
       ) => {
         retryAttempt.current += 1;
+        snapshotNextPollDelay.current = retryInMs;
         if (controller.current !== activeController) return;
         setProgress({ completed: 0, total: 1 });
         setLoading(!hasVisibleData);
@@ -508,6 +510,7 @@ export function useConsoleData(pathname: string) {
           lastGoodSnapshot.current = { page: snapshotPage, payload };
           showSnapshotData(nextSnapshot, payload);
           retryAttempt.current = 0;
+          snapshotNextPollDelay.current = null;
           setProgress({ completed: 1, total: 1 });
           setLoading(false);
           setRefreshing(false);
@@ -516,10 +519,10 @@ export function useConsoleData(pathname: string) {
           return;
         }
 
-        // A stale durable document is useful only when this tab has no newer
-        // visible data. It remains in component state, never in browser cache.
-        const fallbackData = priorGood || priorVisible
-          || (snapshotStatus(payload) === "warming_up" ? null : nextSnapshot);
+        // Keep content and metadata from the same server document. Reusing
+        // priorGood here displayed old evidence under a new generation time.
+        const fallbackData = (snapshotStatus(payload) === "warming_up" ? null : nextSnapshot)
+          || priorGood || priorVisible;
         if (fallbackData) showSnapshotData(fallbackData, payload, "degraded");
         const sectionErrors = snapshotSectionErrors(payload);
         sectionErrors.snapshot = snapshotRetryMessage(payload, Boolean(fallbackData));
@@ -676,7 +679,7 @@ export function useConsoleData(pathname: string) {
         if (stopped || document.hidden) return;
         await refresh(false);
         if (!stopped && !document.hidden) scheduleNextPoll();
-      }, snapshotPollInterval(pathname));
+      }, snapshotNextPollDelay.current ?? snapshotPollInterval(pathname));
     };
     const onVisibilityChange = () => {
       if (document.hidden) {

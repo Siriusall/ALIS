@@ -113,16 +113,16 @@ function SnapshotStatusBar({
   const stateLabel = failed
     ? "快照刷新异常"
     : latest
-      ? sourceStatus === "degraded" ? "最新快照 · 部分可用" : "已是最新快照"
+      ? sourceStatus === "degraded" ? "快照已同步 · 部分可用" : "页面快照已同步"
       : serverRefreshing || stale
-        ? "正在生成新快照"
+        ? "快照待更新"
         : "正在检查最新快照";
   const progressLabel = failed
     ? "等待后台重试"
     : latest
       ? "刷新已完成"
       : serverRefreshing || stale
-        ? "后台生成中，完成后自动切换"
+        ? "等待后台更新，完成后自动切换"
         : progress.total > 0 && progress.completed >= progress.total
           ? "正在确认服务端版本"
           : "正在读取快照状态";

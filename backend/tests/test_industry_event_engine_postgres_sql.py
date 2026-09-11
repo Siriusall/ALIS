@@ -1,6 +1,19 @@
 from app.services import industry_event_engine as engine
 
 
+def test_current_industries_observe_updates_from_another_worker(monkeypatch):
+    current = {"date": "20260828"}
+    monkeypatch.setattr(engine, "_latest_industry_snapshot", lambda *a, **k: {
+        "ok": True, "items": [{"state_as_of_date": current["date"]}],
+    })
+    engine.clear_industry_cache()
+    for compact in (False, True):
+        current["date"] = "20260828"
+        assert engine.list_industries(compact=compact)["items"][0]["state_as_of_date"] == "20260828"
+        current["date"] = "20260911"
+        assert engine.list_industries(compact=compact)["items"][0]["state_as_of_date"] == "20260911"
+
+
 class _Rows(list):
     def fetchall(self):
         return self

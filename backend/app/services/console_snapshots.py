@@ -1173,8 +1173,12 @@ def read(page_key: str, *, force: bool = False) -> dict[str, Any]:
     if page_key not in PAGE_KEYS:
         raise ValueError(f"unsupported console page: {page_key}")
     metadata = _snapshot_metadata(page_key)
+    generated_at = _parse_timestamp((metadata or {}).get("generated_at"))
+    expired = generated_at is None or (
+        datetime.now(timezone.utc) - generated_at
+    ).total_seconds() >= _ttl(page_key)
     cached = None if force else get_json(_redis_key(page_key))
-    if isinstance(cached, dict) and metadata and _cache_matches_metadata(cached, metadata):
+    if not expired and isinstance(cached, dict) and metadata and _cache_matches_metadata(cached, metadata):
         return _with_runtime_overlay(page_key, cached)
     if isinstance(cached, dict):
         redis_delete(_redis_key(page_key))
@@ -1182,7 +1186,7 @@ def read(page_key: str, *, force: bool = False) -> dict[str, Any]:
     durable = _load_durable(page_key) if metadata else None
     if metadata and _has_committed_snapshot(metadata) and durable:
         response = copy.deepcopy(durable)
-        response["stale"] = bool(metadata.get("invalidated_at"))
+        response["stale"] = expired or bool(metadata.get("invalidated_at"))
         response["refreshing"] = response["stale"]
         if not response["stale"]:
             set_json(_redis_key(page_key), response, ttl=_app_cache_ttl())

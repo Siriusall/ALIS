@@ -1922,3 +1922,10 @@ ALIS 的目标运行方式调整为“系统自治、结果可见、异常才打
 - [x] T+1 流动性硬门补齐 ST 约 5% 跌停与连续两日跌停状态，并把冻结执行行情中的连续跌停日数传入正式卖出检查；买入候选请求合同保留同一字段。研究 worker 在 4GB 档收敛为最多2路环境并行、每任务1个 BLAS/OpenMP线程，避免原4路×2线程在3.2GB内存上限下过度订阅。
 - [x] 删除前端 `VITE_ENABLE_MOCK`、伪管理员会话、伪健康和伪控制台快照，所有前端状态只读取真实 API。定向缓存、维护、流动性、OOS、主题和向量回归 `43 passed`；扩展执行链 `108 passed`，另1项失败已在未修改远端基线复现，原因为旧测试夹具缺少生产合同要求的 `positions` 字段，与本轮改动无关；Python 编译、Shell 语法、`git diff --check` 和前端生产构建（1,599 modules）通过。
 - [x] 2026-09-11 补齐跨节点研究数据复用闭环：新增 `market_dataset` 不可变市场数据集合同，数据库机在本地 PostgreSQL 的可重复读事务中按月生成 Parquet 分区，按内容哈希去重并写入版本清单；计算机通过本地目录或受控 SSH 仅同步缺失/哈希变化的对象，重复同步零传输。`BacktestDataSource` 在任务绑定 `market_dataset_version` 后优先读取本地分区，策略重放写入使用的数据集版本；缺失、篡改、点时四时钟不完整或覆盖密封集均拒绝。新增 `backend/scripts/market_dataset.py publish/sync` 和同步复用回归，定向测试 `12 passed`。
+
+# 2026-09-12：前端与页面快照陈旧治理
+
+- [x] 当前行业列表不再把空截止时间永久缓存到进程 LRU；其他研究进程更新行业物化后，下一次页面构建会读取新数据。显式历史截止读取保持原点时合同。文件：`backend/app/services/industry_event_engine.py`。
+- [x] 快照读取按页面 TTL 判定过期，Redis 版本相同也不能把超时文档称为最新；保留最后成功内容供查看。前端同步修正“已是最新”措辞、旧内容配新时间戳的问题，以及提示5秒重试但实际等待10分钟的定时器。文件：`backend/app/services/console_snapshots.py`、`frontend/src/App.tsx`、`frontend/src/useConsoleData.ts`。
+- [x] 数据库快照 worker 发布在切换路径后显式重启；`enable --now` 对已有进程不加载新代码的问题已修正。文件：`deploy/deploy-db-snapshot-worker.sh`。
+- [x] 定向后端回归48项通过，前端测试11项通过，TypeScript/Vite构建和发布脚本语法检查通过。线上只读确认行业快照及新进程读取均为`20260911`；正在运行的因子研究任务仍会使重型页面构建让路，页面须显示待更新，不能伪称后台已完成。

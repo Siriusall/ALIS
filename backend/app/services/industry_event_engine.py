@@ -996,7 +996,10 @@ def _list_industries_cached(as_of_time: str, compact: bool = False) -> dict[str,
 
 
 def list_industries(*, as_of_time: str | None = None, compact: bool = False) -> dict[str, Any]:
-    result = _list_industries_cached(str(as_of_time or ""), compact)
+    # Current projections can be updated by another worker/process. An empty
+    # cutoff must never become a permanent LRU entry on the console worker.
+    reader = _list_industries_cached if as_of_time else _list_industries_cached.__wrapped__
+    result = reader(str(as_of_time or ""), compact)
     if not compact:
         return result
     fields = {

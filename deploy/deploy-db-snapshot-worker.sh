@@ -82,7 +82,10 @@ systemctl daemon-reload
 systemctl enable alis-db-egress-guard
 systemctl restart alis-db-egress-guard
 systemctl enable --now alis-db-egress-guard-account.timer
-systemctl enable --now alis-db-snapshot-worker
+systemctl enable alis-db-snapshot-worker
+# enable --now does not restart an already running Python process after the
+# release symlink changes; it would keep old readers and their caches alive.
+systemctl restart alis-db-snapshot-worker
 test "\$(systemctl is-active alis-db-snapshot-worker)" = active
 REMOTE
 

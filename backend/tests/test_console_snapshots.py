@@ -635,6 +635,21 @@ def test_redis_cache_requires_matching_version_generation_and_valid_authority():
     assert snapshots._cache_matches_metadata(cached, {**metadata, "invalidated_at": "2026-08-21T00:00:00+00:00"}) is False
 
 
+def test_expired_snapshot_is_stale_even_with_matching_redis_and_no_invalidation(monkeypatch):
+    payload = {"page": "research", "version": "old", "status": "ready",
+               "generated_at": "2020-01-01T00:00:00+00:00", "data": {"evidence": "retained"}}
+    metadata = {**payload, "page_key": "research", "invalidated_at": None}
+    monkeypatch.setattr(snapshots, "_snapshot_metadata", lambda _: metadata)
+    monkeypatch.setattr(snapshots, "_load_durable", lambda _: payload)
+    monkeypatch.setattr(snapshots, "get_json", lambda _: payload)
+    monkeypatch.setattr(snapshots, "redis_delete", lambda _: None)
+    monkeypatch.setattr(snapshots, "set_json", lambda *a, **k: (_ for _ in ()).throw(AssertionError("expired cache")))
+    result = snapshots.read("research")
+    assert result["stale"] is True
+    assert result["refreshing"] is True
+    assert result["data"] == payload["data"]
+
+
 def test_read_discards_invalidated_redis_snapshot_without_recaching_lkg(monkeypatch):
     metadata = {
         "page_key": "overview",
