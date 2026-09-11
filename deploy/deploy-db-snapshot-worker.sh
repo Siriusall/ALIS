@@ -75,6 +75,7 @@ install -o root -g root -m 755 '$release/deploy/alis-db-egress-guard.sh' /usr/lo
 install -o root -g root -m 644 '$release/deploy/alis-db-egress-guard.service' /etc/systemd/system/alis-db-egress-guard.service
 install -o root -g root -m 644 '$release/deploy/alis-db-egress-guard-account.service' /etc/systemd/system/alis-db-egress-guard-account.service
 install -o root -g root -m 644 '$release/deploy/alis-db-egress-guard-account.timer' /etc/systemd/system/alis-db-egress-guard-account.timer
+install -o root -g root -m 755 '$release/deploy/alis-market-dataset-read' /usr/local/sbin/alis-market-dataset-read
 ln -sfn '$release/backend' /opt/alis-db-snapshot/backend
 chown -h alis-snapshot:alis-snapshot /opt/alis-db-snapshot/backend
 systemctl daemon-reload

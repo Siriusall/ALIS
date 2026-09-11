@@ -1,0 +1,3 @@
+deploy/deploy-db-snapshot-worker.sh text eol=lf
+deploy/deploy-research-worker.sh text eol=lf
+deploy/alis-market-dataset-read text eol=lf

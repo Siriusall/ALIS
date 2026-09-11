@@ -113,6 +113,10 @@ LONG_RESEARCH_TASK_TYPES = frozenset({
     "controller_candidate_observation", "plan_model_autonomy",
     "research_maintenance", "factor_daily_cycle",
 })
+# Every task claimable by the research worker binds the same derived dataset.
+# A smaller hand-maintained subset allowed newly added research paths to query
+# PostgreSQL directly from the compute node.
+MARKET_DATASET_TASK_TYPES = LONG_RESEARCH_TASK_TYPES
 NETWORK_OPTIONAL_TASK_TYPES = frozenset({
     "factor_research_cycle",
     "hsmm_shadow_training",
@@ -1349,10 +1353,7 @@ def _claim_next_task() -> dict[str, Any] | None:
     claim_exclusions: list[str] = []
     claim_params: list[Any] = [now.isoformat(), WORKER_POOL]
     worker_pool_clause = "AND worker_pool=?"
-    dataset_tasks = {
-        "strategy_evolution_cycle", "strategy_controller_oos", "strategy_environment_backtest",
-        "model_strategy_impact_validation", "factor_research_cycle", "strategy_portfolio_research",
-    }
+    dataset_tasks = MARKET_DATASET_TASK_TYPES
     dataset_status = None
     if str(os.getenv("ALIS_MARKET_DATASET_REQUIRED", "0")).strip().lower() in {"1", "true", "yes", "on"}:
         from app.services.market_dataset import dataset_configuration_status
@@ -2805,10 +2806,7 @@ def execute_evolution_task(
 ) -> dict[str, Any]:
     from app.services.market_dataset import bind_dataset, sync_market_dataset
 
-    dataset_tasks = {
-        "strategy_evolution_cycle", "strategy_controller_oos", "strategy_environment_backtest",
-        "model_strategy_impact_validation", "factor_research_cycle", "strategy_portfolio_research",
-    }
+    dataset_tasks = MARKET_DATASET_TASK_TYPES
     source = os.getenv("ALIS_MARKET_DATASET_SOURCE", "")
     dataset_required = str(os.getenv("ALIS_MARKET_DATASET_REQUIRED", "0")).strip().lower() in {
         "1", "true", "yes", "on",

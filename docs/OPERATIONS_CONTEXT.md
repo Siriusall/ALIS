@@ -201,8 +201,9 @@ alis-db-egress-normalize-sep11.timer
 
 ```text
 ALIS_MARKET_DATASET_REQUIRED=1
-ALIS_MARKET_DATASET_SOURCE=ssh://alis-snapshot@<database-host>/opt/alis/shared/market-datasets
+ALIS_MARKET_DATASET_SOURCE=ssh://alis-snapshot@<database-host>/opt/alis-db-snapshot/shared/market-datasets
 ALIS_MARKET_DATASET_ROOT=/var/lib/alis-research-worker/market-datasets
+ALIS_MARKET_DATASET_SSH_KEY=/opt/alis-research-worker/.ssh/market-dataset
 ```
 
 数据库机先在本机发布公开研究数据集：
@@ -210,10 +211,14 @@ ALIS_MARKET_DATASET_ROOT=/var/lib/alis-research-worker/market-datasets
 ```bash
 PYTHONPATH=/opt/alis-db-snapshot/backend /opt/alis-db-snapshot/shared/app-venv/bin/python \
   /opt/alis-db-snapshot/backend/scripts/market_dataset.py publish \
-  --start 20200101 --end 20260831 --root /opt/alis/shared/market-datasets
+  --start 20200321 --end 20260831 --root /opt/alis-db-snapshot/shared/market-datasets
 ```
 
-研究 Worker 首次同步后，所有研究任务复用本地内容寻址分区；相同哈希不会再次传输。若数据集没有准备好，研究任务会等待/失败并留证，不得回源 PostgreSQL 形成重复出网。`ALIS_MARKET_DATASET_SOURCE` 的 SSH 用户、地址和目录必须按实际服务器配置，本文不提供凭据。
+发布器必须在数据库机本地解析 `payload_json`，仅把规范化股票快照、ETF 行情和指数行情的显式白名单字段写入 `alis_market_dataset_v2_derived_fields_four_clocks` Parquet。对象 schema 出现 `payload_json`、其他原始载荷列或合同外列时，研究机必须拒绝同步。数据库机上的原始 JSON 不得复制到研究机。
+
+研究 Worker 首次同步后，所有研究任务复用本地内容寻址分区；相同哈希不会再次传输。`ALIS_MARKET_DATASET_REQUIRED=1` 时，缺少数据集绑定必须直接失败，不得回源 PostgreSQL。`ALIS_MARKET_DATASET_SOURCE` 的 SSH 用户、地址和目录必须按实际服务器配置，本文不提供凭据。
+
+数据集 SSH key 必须使用 `restrict,command="/usr/local/sbin/alis-market-dataset-read"` 写入数据库机 `alis-snapshot` 用户的 `authorized_keys`。该入口只允许读取当前指针、内容寻址 manifest 和 Parquet 对象；禁止 shell、端口转发及合同外路径。
 
 规则来自：
 

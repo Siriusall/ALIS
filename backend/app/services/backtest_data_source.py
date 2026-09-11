@@ -7,8 +7,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Dict, List, Optional
 
-from app.data_platform import db as _data_platform_db
 from app.core.a_share_fees import is_exchange_etf
+from app.data_platform import db as _data_platform_db
 from app.data_platform.db import _conn, _is_postgres, _read_conn
 from app.data_platform.services.observation_clock import (
     _explicit_timestamp_sql,
@@ -16,9 +16,12 @@ from app.data_platform.services.observation_clock import (
     _timestamp_parameter_sql,
     _timestamp_value_sql,
 )
-from app.services.point_in_time import is_available_at, normalize_explicit_timestamp, normalize_timestamp
 from app.services.compact_feature_store import load_snapshot_bundle_from_local_cache
 from app.services.market_dataset import configured_dataset
+from app.services.point_in_time import (
+    is_available_at,
+    normalize_explicit_timestamp,
+)
 
 logger = logging.getLogger("quant.backtest_data_source")
 
@@ -193,6 +196,17 @@ class BacktestDataSource:
         }
 
     @staticmethod
+    def _payload_fields(raw: dict) -> dict:
+        """Read legacy DB JSON or an explicit derived-dataset row."""
+        if "payload_json" not in raw:
+            return dict(raw)
+        try:
+            payload = json.loads(raw.get("payload_json") or "{}")
+        except (TypeError, json.JSONDecodeError):
+            payload = {}
+        return payload if isinstance(payload, dict) else {}
+
+    @staticmethod
     def _decode_versioned_snapshot_row(raw: dict) -> dict:
         """Expand one immutable snapshot payload into the legacy read shape.
 
@@ -201,12 +215,7 @@ class BacktestDataSource:
         projection aliases such as daily_open and volume. Return both without
         consulting the mutable projection table.
         """
-        try:
-            payload = json.loads(raw.get("payload_json") or "{}")
-        except (TypeError, json.JSONDecodeError):
-            payload = {}
-        if not isinstance(payload, dict):
-            payload = {}
+        payload = BacktestDataSource._payload_fields(raw)
         result = {
             **payload,
             "ts_code": raw.get("ts_code"),
@@ -676,10 +685,7 @@ class BacktestDataSource:
         self._record_pit_read("tushare.fund_daily", raw_rows)
         result: List[SnapshotRow] = []
         for raw in raw_rows:
-            try:
-                payload = json.loads(raw.get("payload_json") or "{}")
-            except (TypeError, json.JSONDecodeError):
-                payload = {}
+            payload = self._payload_fields(raw)
             close = float(payload.get("close") or 0)
             if close <= 0:
                 continue
@@ -771,10 +777,7 @@ class BacktestDataSource:
                 rows = versioned
                 self._record_pit_read("tushare.fund_daily_execution_close", rows)
                 for row in rows:
-                    try:
-                        payload = json.loads(row.get("payload_json") or "{}")
-                    except (TypeError, json.JSONDecodeError):
-                        payload = {}
+                    payload = self._payload_fields(row)
                     code = str(row.get("ts_code") or "").split(".", 1)[0].zfill(6)
                     close = float(payload.get("close") or 0)
                     if code and close > 0:
@@ -1077,7 +1080,7 @@ class BacktestDataSource:
                 if versioned:
                     item = dict(versioned[-1])
                     self._record_pit_read("canonical_market.index_daily", [item])
-                    payload = json.loads(str(item.get("payload_json") or "{}"))
+                    payload = self._payload_fields(item)
                     value = float(payload.get(field) or 0)
                     return value if value > 0 else None
             except Exception as exc:  # noqa: BLE001
@@ -1128,7 +1131,7 @@ class BacktestDataSource:
                 raw_rows = sorted(versioned, key=lambda row: str(row.get("trade_date") or ""), reverse=True)[:max(2, min(int(lookback) + 1, 251))]
             self._record_pit_read("canonical_market.index_daily_trend", raw_rows)
             closes = [
-                float(json.loads(str(row.get("payload_json") or "{}")).get("close") or 0)
+                float(self._payload_fields(row).get("close") or 0)
                 for row in reversed(raw_rows)
             ]
             closes = [value for value in closes if value > 0]

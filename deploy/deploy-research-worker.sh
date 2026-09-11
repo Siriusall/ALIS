@@ -95,6 +95,11 @@ sudo /opt/alis-research-worker/shared/app-venv/bin/python -m compileall -q '$rel
 sudo install -o root -g root -m 644 '$release/deploy/alis-research-worker.service' /etc/systemd/system/alis-research-worker.service
 sudo sed -i 's/^ALIS_BUILD_GIT_SHA=.*/ALIS_BUILD_GIT_SHA=$commit/' /etc/alis/research-worker.env
 grep -q '^ALIS_BUILD_GIT_SHA=$commit$' /etc/alis/research-worker.env
+grep -Eq '^ALIS_MARKET_DATASET_SOURCE=ssh://[^/]+/opt/alis-db-snapshot/shared/market-datasets$' /etc/alis/research-worker.env
+grep -Eq '^ALIS_MARKET_DATASET_ROOT=/var/lib/alis-research-worker/market-datasets$' /etc/alis/research-worker.env
+dataset_key=$(sed -n 's/^ALIS_MARKET_DATASET_SSH_KEY=//p' /etc/alis/research-worker.env)
+test -n "$dataset_key"
+sudo -u alis-research test -r "$dataset_key"
 sudo ln -sfn '$release/backend' /opt/alis-research-worker/backend
 sudo chown -h alis-research:alis-research /opt/alis-research-worker/backend
 sudo systemctl daemon-reload
