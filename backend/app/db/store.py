@@ -3899,6 +3899,34 @@ def list_model_train_runs(limit: int = 20) -> List[Dict[str, Any]]:
         rows = cur.fetchall()
     return [_train_run_from_row(r) for r in rows]
 
+def list_active_model_train_runs(limit: int = 100) -> List[Dict[str, Any]]:
+    """Query pending/running model training runs without heavy metrics blobs."""
+    n = max(1, min(int(limit or 100), 1000))
+    with _conn() as c:
+        cur = c.execute(
+            "SELECT id, status, phase, progress, message, model_version_id, error, "
+            "started_at, finished_at, created_at, updated_at "
+            "FROM model_train_runs WHERE status IN ('running', 'queued') ORDER BY id DESC LIMIT ?",
+            (n,),
+        )
+        rows = cur.fetchall()
+    return [
+        {
+            "id": int(r["id"]),
+            "status": str(r["status"] or ""),
+            "phase": str(r["phase"] or ""),
+            "progress": float(r["progress"] or 0),
+            "message": str(r["message"] or ""),
+            "model_version_id": int(r["model_version_id"]) if r["model_version_id"] is not None else None,
+            "error": str(r["error"] or ""),
+            "started_at": str(r["started_at"] or ""),
+            "finished_at": str(r["finished_at"] or ""),
+            "created_at": str(r["created_at"] or ""),
+            "updated_at": str(r["updated_at"] or ""),
+        }
+        for r in rows
+    ]
+
 
 def save_performance_reports(task_id: int | None, reports: dict[str, list[dict[str, Any]]]) -> int:
     from app.services.production_strategy import resolve_production_strategy_champion

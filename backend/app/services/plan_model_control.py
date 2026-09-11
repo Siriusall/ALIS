@@ -24,6 +24,7 @@ from app.db.store import (
     get_model_train_run,
     get_model_version,
     list_model_train_runs,
+    list_active_model_train_runs,
     list_model_versions,
     set_active_model_version,
     update_model_train_run,
@@ -7523,9 +7524,7 @@ def _mark_stale_train_run(run: dict[str, Any] | None, *, stale_minutes: int = 20
 def reconcile_stale_plan_model_runs(*, stale_minutes: int = 20) -> dict[str, Any]:
     """Close every orphaned run, not only the latest run of each model family."""
     reconciled: list[int] = []
-    for run in list_model_train_runs(limit=1000):
-        if str(run.get("status") or "") not in {"running", "queued"}:
-            continue
+    for run in list_active_model_train_runs(limit=1000):
         refreshed = _mark_stale_train_run(run, stale_minutes=stale_minutes)
         if refreshed and str(refreshed.get("error") or "") == "stale_plan_model_training_run":
             reconciled.append(int(refreshed["id"]))

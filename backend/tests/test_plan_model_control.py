@@ -1606,7 +1606,7 @@ def test_reconcile_stale_plan_model_runs_sweeps_all_runs(monkeypatch):
         {"id": 2, "status": "completed"},
         {"id": 3, "status": "queued"},
     ]
-    monkeypatch.setattr(plan_model_control, "list_model_train_runs", lambda limit=1000: runs)
+    monkeypatch.setattr(plan_model_control, "list_active_model_train_runs", lambda limit=1000: [r for r in runs if r.get("status") in {"running", "queued"}])
     monkeypatch.setattr(
         plan_model_control,
         "_mark_stale_train_run",
