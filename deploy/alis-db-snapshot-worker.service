@@ -16,6 +16,7 @@ Environment=DATABASE_STATEMENT_TIMEOUT_MS=30000
 Environment=DATABASE_IDLE_IN_TRANSACTION_TIMEOUT_MS=15000
 Environment=ALIS_CONSOLE_SNAPSHOT_HISTORICAL_AUDIT_MODE=refresh
 Environment=ALIS_CONSOLE_SNAPSHOT_APP_CACHE_TTL_SECONDS=86400
+Environment=ALIS_CONSOLE_SNAPSHOT_BOUNDED_RESEARCH_YIELD=1
 Environment=ALIS_NETWORK_BUDGET_ENABLED=0
 ExecStart=/opt/alis-db-snapshot/backend/.venv/bin/python -m app.console_snapshot_worker_main
 Restart=always

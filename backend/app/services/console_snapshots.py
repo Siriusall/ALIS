@@ -1004,7 +1004,7 @@ def _wait_or_stop(stopper: Any | None, seconds: float) -> bool:
     return bool(stopper.wait(seconds))
 
 
-def _control_work_active() -> bool:
+def _control_work_active(*, include_research: bool = True) -> bool:
     """Do not make page aggregation compete with database-heavy autonomy."""
 
     with _read_conn() as conn:
@@ -1015,10 +1015,10 @@ def _control_work_active() -> bool:
                 WHERE status='running'
                   AND (
                     COALESCE(worker_pool,'control')='control'
-                    OR task_type IN ({placeholders})
+                    OR (? AND task_type IN ({placeholders}))
                   )
                 LIMIT 1""",
-            tuple(sorted(_DB_HEAVY_TASK_TYPES)),
+            (include_research, *sorted(_DB_HEAVY_TASK_TYPES)),
         ).fetchone()
     return bool(row)
 
@@ -1050,12 +1050,24 @@ def _data_ingestion_active() -> bool:
         return True
 
 
-def _snapshot_build_should_yield() -> bool:
-    return (
-        not optional_network_work_allowed()
-        or _control_work_active()
-        or _data_ingestion_active()
-    )
+def _snapshot_build_should_yield(page_key: str = "") -> bool:
+    if not optional_network_work_allowed() or _data_ingestion_active():
+        return True
+    if not _control_work_active():
+        return False
+    # On the DB-local, resource-limited snapshot worker, a continuous research
+    # backlog must not starve the console forever. Allow one serial build once
+    # its last successful document is 30 minutes old. Control/ingestion work
+    # retains absolute priority; other deployment topologies keep yielding.
+    if os.getenv("ALIS_CONSOLE_SNAPSHOT_BOUNDED_RESEARCH_YIELD", "0") != "1" or not page_key:
+        return True
+    if _control_work_active(include_research=False):
+        return True
+    metadata = _snapshot_metadata(page_key) or {}
+    generated_at = _parse_timestamp(metadata.get("generated_at"))
+    return generated_at is not None and (
+        datetime.now(timezone.utc) - generated_at
+    ).total_seconds() < 1800
 
 
 def run_snapshot_worker_forever(stop_event: Any | None = None) -> None:
@@ -1073,8 +1085,8 @@ def run_snapshot_worker_forever(stop_event: Any | None = None) -> None:
             if stopper is not None and stopper.is_set():
                 return
             try:
-                if page_key != "runtime" and _snapshot_build_should_yield():
-                    break
+                if page_key != "runtime" and _snapshot_build_should_yield(page_key):
+                    continue
             except Exception as exc:
                 logger.warning(
                     "Console snapshot workload gate unavailable error_type=%s",

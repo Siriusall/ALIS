@@ -653,7 +653,7 @@ def test_expired_snapshot_is_stale_even_with_matching_redis_and_no_invalidation(
 def test_workload_yield_waits_before_scanning_again(monkeypatch):
     scans = []
     monkeypatch.setattr(snapshots, "_pages_due_for_refresh", lambda: scans.append(1) or ["research"])
-    monkeypatch.setattr(snapshots, "_snapshot_build_should_yield", lambda: True)
+    monkeypatch.setattr(snapshots, "_snapshot_build_should_yield", lambda _: True)
     monkeypatch.setattr(snapshots, "build", lambda _: pytest.fail("must yield"))
     class StopAfterWait:
         def is_set(self):
@@ -664,6 +664,23 @@ def test_workload_yield_waits_before_scanning_again(monkeypatch):
             return True
     snapshots.run_snapshot_worker_forever(StopAfterWait())
     assert len(scans) == 1
+
+
+def test_db_local_snapshot_cannot_be_starved_by_research(monkeypatch):
+    monkeypatch.setenv("ALIS_CONSOLE_SNAPSHOT_BOUNDED_RESEARCH_YIELD", "1")
+    monkeypatch.setattr(snapshots, "optional_network_work_allowed", lambda: True)
+    monkeypatch.setattr(snapshots, "_data_ingestion_active", lambda: False)
+    monkeypatch.setattr(snapshots, "_control_work_active", lambda include_research=True: include_research)
+    monkeypatch.setattr(snapshots, "_snapshot_metadata", lambda _: {"generated_at": "2020-01-01T00:00:00Z"})
+    assert snapshots._snapshot_build_should_yield("research") is False
+    monkeypatch.setattr(snapshots, "_snapshot_metadata", lambda _: {"generated_at": snapshots._now()})
+    assert snapshots._snapshot_build_should_yield("research") is True
+    monkeypatch.setattr(snapshots, "_snapshot_metadata", lambda _: {"generated_at": "2020-01-01T00:00:00Z"})
+    monkeypatch.setattr(snapshots, "_control_work_active", lambda **_: True)
+    assert snapshots._snapshot_build_should_yield("research") is True
+    monkeypatch.setattr(snapshots, "_control_work_active", lambda **_: False)
+    monkeypatch.setattr(snapshots, "_data_ingestion_active", lambda: True)
+    assert snapshots._snapshot_build_should_yield("research") is True
 
 
 def test_read_discards_invalidated_redis_snapshot_without_recaching_lkg(monkeypatch):
