@@ -727,7 +727,7 @@ def _unavailable_payload(page_key: str, generation: int, sections: dict[str, dic
 
 def _snapshot_metadata(page_key: str) -> dict[str, Any] | None:
     _ensure_table()
-    with _conn() as conn:
+    with _read_conn() as conn:
         row = conn.execute(
             "SELECT page_key,version,generated_at,as_of,status,invalidated_at,updated_at,"
             "refresh_generation,last_attempt_generation,last_attempt_at,last_error_code,"
@@ -740,7 +740,7 @@ def _snapshot_metadata(page_key: str) -> dict[str, Any] | None:
 
 def _load_durable(page_key: str) -> dict[str, Any] | None:
     _ensure_table()
-    with _conn() as conn:
+    with _read_conn() as conn:
         row = conn.execute(
             "SELECT page_key,version,generated_at,as_of,status,invalidated_at,updated_at,"
             "refresh_generation,last_attempt_generation,last_attempt_at,last_error_code,payload_json,"
