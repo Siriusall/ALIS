@@ -123,7 +123,6 @@ NETWORK_OPTIONAL_TASK_TYPES = frozenset({
     "model_candidate_research",
     "model_strategy_impact_validation",
     "plan_model_autonomy",
-    "research_maintenance",
     "strategy_candidate_generation",
     "strategy_cluster_distillation",
     "strategy_failure_model_training",
