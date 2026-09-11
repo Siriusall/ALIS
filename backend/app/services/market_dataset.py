@@ -90,6 +90,10 @@ FORBIDDEN_DATASET_FIELDS = frozenset(
 )
 _HEX = re.compile(r"[0-9a-f]{64}\Z")
 _binding_lock = threading.RLock()
+FETCH_TIMEOUT_SECONDS = max(
+    60,
+    min(int(os.getenv("ALIS_MARKET_DATASET_FETCH_TIMEOUT_SECONDS", "1800")), 3600),
+)
 
 
 class DatasetUnavailable(RuntimeError):
@@ -441,7 +445,7 @@ def _fetch(source: str, relative: str, target: Path) -> None:
                 command,
                 stdout=handle,
                 stderr=subprocess.DEVNULL,
-                timeout=300,
+                timeout=FETCH_TIMEOUT_SECONDS,
                 check=True,
             )
     else:
