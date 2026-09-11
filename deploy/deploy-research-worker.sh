@@ -2,7 +2,7 @@
 set -euo pipefail
 
 usage() {
-  cat <<'EOF'
+  cat <<'HELP'
 Usage: deploy-research-worker.sh BUNDLE
 
 Required environment:
@@ -11,7 +11,7 @@ Required environment:
 Optional environment:
   ALIS_RESEARCH_WORKER_RELEASE_ROOT  Default: /opt/alis-research-worker/releases
   ALIS_RESEARCH_WORKER_SSH_PROXY_COMMAND  Optional SSH ProxyCommand for WireGuard-only nodes
-EOF
+HELP
 }
 
 [[ ${1:-} != "--help" ]] || { usage; exit 0; }
@@ -78,31 +78,31 @@ fi
 worker_ssh "sudo bash -s" <<REMOTE
 set -euo pipefail
 sha256sum '$remote_archive' | awk '{print \$1}' | grep -Fx '$sha'
-id -u alis-research >/dev/null 2>&1 || sudo useradd --system --home-dir /opt/alis-research-worker --shell /usr/sbin/nologin alis-research
-sudo install -d -o alis-research -g alis-research -m 750 '$release_root' /opt/alis-research-worker/shared /opt/alis-research-worker/shared/runtime-cache /etc/alis
+id -u alis-research >/dev/null 2>&1 || useradd --system --home-dir /opt/alis-research-worker --shell /usr/sbin/nologin alis-research
+install -d -o alis-research -g alis-research -m 750 '$release_root' /opt/alis-research-worker/shared /opt/alis-research-worker/shared/runtime-cache /etc/alis
 if [ ! -x /opt/alis-research-worker/shared/app-venv/bin/python ] || [ ! -x /opt/alis-research-worker/shared/app-venv/bin/pip ]; then
-  sudo python3 -m venv --clear /opt/alis-research-worker/shared/app-venv
+  python3 -m venv --clear /opt/alis-research-worker/shared/app-venv
 fi
-sudo mkdir -p '$release_root'
-sudo test ! -e '$release'
-sudo install -d -o alis-research -g alis-research -m 750 '$release'
-sudo tar -xzf '$remote_archive' -C '$release'
-sudo chown -R alis-research:alis-research '$release'
-sudo ln -sfn /opt/alis-research-worker/shared/app-venv '$release/backend/.venv'
-sudo ln -sfn /opt/alis-research-worker/shared/runtime-cache '$release/backend/.cache'
-sudo /opt/alis-research-worker/shared/app-venv/bin/pip install -q -r '$release/backend/requirements.txt'
-sudo /opt/alis-research-worker/shared/app-venv/bin/python -m compileall -q '$release/backend/app' '$release/backend/migrations'
-sudo install -o root -g root -m 644 '$release/deploy/alis-research-worker.service' /etc/systemd/system/alis-research-worker.service
-sudo sed -i 's/^ALIS_BUILD_GIT_SHA=.*/ALIS_BUILD_GIT_SHA=$commit/' /etc/alis/research-worker.env
-grep -q '^ALIS_BUILD_GIT_SHA=$commit$' /etc/alis/research-worker.env
+mkdir -p '$release_root'
+test ! -e '$release'
+install -d -o alis-research -g alis-research -m 750 '$release'
+tar -xzf '$remote_archive' -C '$release'
+chown -R alis-research:alis-research '$release'
+ln -sfn /opt/alis-research-worker/shared/app-venv '$release/backend/.venv'
+ln -sfn /opt/alis-research-worker/shared/runtime-cache '$release/backend/.cache'
+/opt/alis-research-worker/shared/app-venv/bin/pip install -q -r '$release/backend/requirements.txt'
+/opt/alis-research-worker/shared/app-venv/bin/python -m compileall -q '$release/backend/app' '$release/backend/migrations'
+install -o root -g root -m 644 '$release/deploy/alis-research-worker.service' /etc/systemd/system/alis-research-worker.service
+sed -i 's/^ALIS_BUILD_GIT_SHA=.*/ALIS_BUILD_GIT_SHA=$commit/' /etc/alis/research-worker.env
+grep -q '^ALIS_BUILD_GIT_SHA=$commit\$' /etc/alis/research-worker.env
 grep -Eq '^ALIS_MARKET_DATASET_SOURCE=ssh://[^/]+/opt/alis-db-snapshot/shared/market-datasets$' /etc/alis/research-worker.env
 grep -Eq '^ALIS_MARKET_DATASET_ROOT=/var/lib/alis-research-worker/market-datasets$' /etc/alis/research-worker.env
-dataset_key=$(sed -n 's/^ALIS_MARKET_DATASET_SSH_KEY=//p' /etc/alis/research-worker.env)
-test -n "$dataset_key"
-sudo -u alis-research test -r "$dataset_key"
-sudo ln -sfn '$release/backend' /opt/alis-research-worker/backend
-sudo chown -h alis-research:alis-research /opt/alis-research-worker/backend
-sudo systemctl daemon-reload
+dataset_key=\$(sed -n 's/^ALIS_MARKET_DATASET_SSH_KEY=//p' /etc/alis/research-worker.env)
+test -n "\$dataset_key"
+sudo -u alis-research test -r "\$dataset_key"
+ln -sfn '$release/backend' /opt/alis-research-worker/backend
+chown -h alis-research:alis-research /opt/alis-research-worker/backend
+systemctl daemon-reload
 REMOTE
 
 worker_ssh "sudo systemctl restart alis-research-worker"
