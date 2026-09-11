@@ -2161,12 +2161,12 @@ def enqueue_research_maintenance_task(
             "trade_date": normalized_date or None,
             "max_candidates": max(1, min(int(max_candidates), 200)),
             "delegated_from": "system_autonomy_cycle",
-            "execution_contract": "alis_research_maintenance_worker_task_v1",
+            "execution_contract": "alis_research_maintenance_worker_task_v2",
             "production_change_forbidden": True,
         },
         dedupe_key=f"research_maintenance:daily:v1:{date_key}",
         max_attempts=3,
-        priority=78,
+        priority=18,
         worker_pool="research",
     )
     task_status = str(task.get("status") or "queued")
@@ -2881,11 +2881,14 @@ def _execute_evolution_task(
 
         payload = task.get("payload") if isinstance(task.get("payload"), dict) else {}
         max_candidates = max(1, min(int(payload.get("max_candidates") or 50), 200))
+        trade_date = str(payload.get("trade_date") or "").replace("-", "")[:8]
         return _run_with_heartbeat_pulse(
             int(task["id"]),
             phase="research_maintenance",
             message="正在维护公司研究、论点与研究池",
-            runner=lambda: run_daily_maintenance(max_candidates=max_candidates),
+            runner=lambda: run_daily_maintenance(
+                max_candidates=max_candidates, trade_date=trade_date,
+            ),
         )
     progressive_consumer = PROGRESSIVE_OOS_TASK_CONSUMERS.get(task_type)
     if progressive_consumer:

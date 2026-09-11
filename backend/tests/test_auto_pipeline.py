@@ -1,6 +1,22 @@
 from app.services import auto_pipeline
 
 
+def test_daily_maintenance_runs_complete_market_research_contract(monkeypatch):
+    monkeypatch.setattr(auto_pipeline, "get_positions", lambda: [])
+    monkeypatch.setattr(auto_pipeline, "generate_watch_pool_theses", lambda **_: {"ok": True})
+    monkeypatch.setattr(auto_pipeline, "reconcile_missing_position_states_from_confirmed_operations", lambda: {})
+    calls = []
+    monkeypatch.setattr(
+        "app.data_platform.services.daily_update._run_research_maintenance",
+        lambda date: calls.append(date) or {"themes": {"ok": True}},
+    )
+
+    result = auto_pipeline.run_daily_maintenance(trade_date="20260911")
+
+    assert calls == ["20260911"]
+    assert result["results"]["market_research"]["themes"]["ok"] is True
+
+
 def test_daily_maintenance_surfaces_internal_position_failures(monkeypatch):
     monkeypatch.setattr(auto_pipeline, "get_positions", lambda: [{"symbol": "000001.SZ"}])
     monkeypatch.setattr(auto_pipeline, "build_stock_research", lambda *args, **kwargs: {"ok": True})

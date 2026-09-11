@@ -123,12 +123,20 @@ def _pit_theme_inputs(
 ) -> dict[str, Any]:
     """Load bounded immutable market inputs for a historical theme materialization."""
 
-    calendar_rows = c.execute(
-        """SELECT cal_date FROM dc_trade_calendar
-           WHERE is_open=1 AND cal_date<=?
-           ORDER BY cal_date DESC LIMIT ?""",
-        (cutoff_date, max(5, min(int(lookback), 60))),
-    ).fetchall()
+    if current_projection:
+        calendar_rows = c.execute(
+            """SELECT trade_date AS cal_date FROM dc_available_trade_dates
+               WHERE trade_date<=?
+               ORDER BY trade_date DESC LIMIT ?""",
+            (cutoff_date, max(5, min(int(lookback), 60))),
+        ).fetchall()
+    else:
+        calendar_rows = c.execute(
+            """SELECT cal_date FROM dc_trade_calendar
+               WHERE is_open=1 AND cal_date<=?
+               ORDER BY cal_date DESC LIMIT ?""",
+            (cutoff_date, max(5, min(int(lookback), 60))),
+        ).fetchall()
     calendar_dates = sorted({
         str(dict(row).get("cal_date") or "").replace("-", "")[:8]
         for row in calendar_rows

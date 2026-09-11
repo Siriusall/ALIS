@@ -66,7 +66,9 @@ def test_research_maintenance_is_persisted_for_research_pool(monkeypatch):
     assert result["worker_pool"] == "research"
     assert captured["task_type"] == "research_maintenance"
     assert captured["worker_pool"] == "research"
+    assert captured["priority"] == 18
     assert captured["dedupe_key"] == "research_maintenance:daily:v1:20260825"
+    assert captured["payload"]["execution_contract"] == "alis_research_maintenance_worker_task_v2"
     assert captured["payload"]["max_candidates"] == 50
 
 
@@ -85,11 +87,11 @@ def test_research_worker_executes_maintenance_task(monkeypatch):
     result = evolution.execute_evolution_task({
         "id": 812,
         "task_type": "research_maintenance",
-        "payload": {"max_candidates": 37},
+        "payload": {"max_candidates": 37, "trade_date": "20260911"},
     })
 
     assert result["ok"] is True
-    assert calls == [{"max_candidates": 37}]
+    assert calls == [{"max_candidates": 37, "trade_date": "20260911"}]
 
 
 def test_system_autonomy_factor_entry_reuses_research_daily_task(monkeypatch):

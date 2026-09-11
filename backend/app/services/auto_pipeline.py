@@ -15,11 +15,25 @@ from app.db.store import get_positions
 from app.core.a_share_fees import is_exchange_etf
 
 
-def run_daily_maintenance(*, max_candidates: int = 50) -> dict[str, Any]:
+def run_daily_maintenance(
+    *, max_candidates: int = 50, trade_date: str = "",
+) -> dict[str, Any]:
     """Run full daily pipeline: research → pool → theses → position states."""
     now = datetime.now().isoformat(timespec="seconds")
     errors = []
     skipped_etf_research = 0
+    market_research: dict[str, Any] = {}
+    if trade_date:
+        # Materialize the page-wide read models before per-company work. A
+        # large company pool must not postpone themes and screening for hours.
+        from app.data_platform.services.daily_update import _run_research_maintenance
+
+        try:
+            market_research = _run_research_maintenance(trade_date)
+        except Exception as exc:  # noqa: BLE001
+            market_research = {
+                "ok": False, "status": "deferred", "error": str(exc)[:300],
+            }
 
     # Step 1: Research on current positions
     positions = get_positions()
@@ -118,6 +132,7 @@ def run_daily_maintenance(*, max_candidates: int = 50) -> dict[str, Any]:
             "missing_position_states": missing_position_states,
             "position_state_reconciliation": state_reconciliation,
             "skipped_etf_research": skipped_etf_research,
+            "market_research": market_research,
         },
         "errors": errors[:10],
         "error_count": len(errors),
