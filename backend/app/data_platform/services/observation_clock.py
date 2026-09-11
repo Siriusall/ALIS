@@ -858,9 +858,10 @@ def load_snapshot_market_aggregates(
         # clock predicates made the six-date slice look like a single row.
         # It then performed tens of thousands of random lookups against the
         # 7 GB accepted projection and regularly hit the 30-second budget.
-        # Materializing the explicitly bounded accepted-date slice fixes the
-        # join direction without disabling planner choices for other readers.
-        version_predicates = predicates[:-1]
+        # Materializing the explicitly bounded accepted-date slice and retaining
+        # the explicit date predicate on the version table lets PostgreSQL use
+        # the date index to filter versions before joining accepted rows.
+        version_predicates = predicates
         visible_sql = f"""accepted_rows AS MATERIALIZED (
                          SELECT ts_code,trade_date,content_hash
                            FROM dc_stock_daily_snapshot
@@ -951,8 +952,7 @@ def load_snapshot_market_aggregates(
         params.extend(compact_dates)
     if observed_cutoff:
         params.extend([observed_cutoff] * 3)
-    if not materialized_accepted_slice:
-        params.extend(compact_dates)
+    params.extend(compact_dates)
     rows = c.execute(sql, tuple(params)).fetchall()
     return {
         str(dict(row).get("trade_date") or ""): dict(row)
