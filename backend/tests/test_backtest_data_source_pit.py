@@ -5,6 +5,26 @@ from app.services import backtest_data_source as data_source_module
 from app.services.backtest_data_source import BacktestDataSource, HistBar
 
 
+def test_derived_dataset_fields_are_consumed_without_rebuilding_raw_json():
+    row = {
+        "ts_code": "510300.SH",
+        "trade_date": "20260831",
+        "open": 4.0,
+        "high": 4.2,
+        "low": 3.9,
+        "close": 4.1,
+        "pre_close": 4.0,
+        "vol": 100.0,
+        "amount": 410.0,
+    }
+
+    assert BacktestDataSource._payload_fields(row) == row  # noqa: SLF001
+    decoded = BacktestDataSource._decode_versioned_snapshot_row(row)  # noqa: SLF001
+    assert decoded["close"] == 4.1
+    assert decoded["daily_open"] == 4.0
+    assert "payload_json" not in decoded
+
+
 def test_point_in_time_audit_accumulates_repeated_source_batches():
     source = BacktestDataSource()
     source.set_as_of_time("2026-07-22T15:00:00+08:00")

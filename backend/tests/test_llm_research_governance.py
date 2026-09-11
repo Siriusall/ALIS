@@ -19,6 +19,7 @@ def test_semantic_signature_collapses_same_route_issue_family() -> None:
 def test_research_governance_rejects_hypothesis_with_formal_failure_memory(monkeypatch):
     monkeypatch.setattr(governance, "_ensure_tables", lambda: None)
     monkeypatch.setattr(governance, "find_rejected_hypothesis", lambda *_args, **_kwargs: {"outcome_stage": "formal_oos"})
+    monkeypatch.setattr(governance, "llm_research_proposal_quality_report", lambda: {"status": "observing"})
 
     class Conn:
         def __enter__(self): return self

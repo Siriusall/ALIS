@@ -14,6 +14,7 @@ class OrderRequest:
     change_pct: float = 0.0
     volume: float = -1.0
     close: float = 0.0
+    consecutive_limit_down_days: int = 0
 
 
 @dataclass

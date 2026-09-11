@@ -7,8 +7,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Dict, List, Optional
 
-from app.data_platform import db as _data_platform_db
 from app.core.a_share_fees import is_exchange_etf
+from app.data_platform import db as _data_platform_db
 from app.data_platform.db import _conn, _is_postgres, _read_conn
 from app.data_platform.services.observation_clock import (
     _explicit_timestamp_sql,
@@ -16,7 +16,12 @@ from app.data_platform.services.observation_clock import (
     _timestamp_parameter_sql,
     _timestamp_value_sql,
 )
-from app.services.point_in_time import is_available_at, normalize_explicit_timestamp, normalize_timestamp
+from app.services.compact_feature_store import load_snapshot_bundle_from_local_cache
+from app.services.market_dataset import configured_dataset
+from app.services.point_in_time import (
+    is_available_at,
+    normalize_explicit_timestamp,
+)
 
 logger = logging.getLogger("quant.backtest_data_source")
 
@@ -69,6 +74,7 @@ class HistBar:
 
 class BacktestDataSource:
     def __init__(self) -> None:
+        self.market_dataset = configured_dataset()
         self._hist_cache: Dict[str, List[HistBar]] = {}
         self._hist_cache_through: Dict[str, str] = {}
         self._history_load_failed: set[str] = set()
@@ -190,6 +196,17 @@ class BacktestDataSource:
         }
 
     @staticmethod
+    def _payload_fields(raw: dict) -> dict:
+        """Read legacy DB JSON or an explicit derived-dataset row."""
+        if "payload_json" not in raw:
+            return dict(raw)
+        try:
+            payload = json.loads(raw.get("payload_json") or "{}")
+        except (TypeError, json.JSONDecodeError):
+            payload = {}
+        return payload if isinstance(payload, dict) else {}
+
+    @staticmethod
     def _decode_versioned_snapshot_row(raw: dict) -> dict:
         """Expand one immutable snapshot payload into the legacy read shape.
 
@@ -198,12 +215,7 @@ class BacktestDataSource:
         projection aliases such as daily_open and volume. Return both without
         consulting the mutable projection table.
         """
-        try:
-            payload = json.loads(raw.get("payload_json") or "{}")
-        except (TypeError, json.JSONDecodeError):
-            payload = {}
-        if not isinstance(payload, dict):
-            payload = {}
+        payload = BacktestDataSource._payload_fields(raw)
         result = {
             **payload,
             "ts_code": raw.get("ts_code"),
@@ -270,6 +282,9 @@ class BacktestDataSource:
         those states distinct prevents a later current-table row from leaking
         into a historical replay.
         """
+        if self.market_dataset is not None:
+            return self.market_dataset.rows(api_name, cutoff=self._as_of_time, ymd=ymd,
+                                            ts_codes=ts_codes, date_clause=date_clause, date_params=date_params)
         try:
             postgres = _is_postgres()
             # The mutable projection records the provider selected by the
@@ -357,6 +372,10 @@ class BacktestDataSource:
 
     def _versioned_snapshot_rows(self, ymd: str, *, ts_codes: list[str] | None = None,
                                  date_clause: str = "", date_params: tuple = ()) -> list[dict] | None:
+        if self.market_dataset is not None:
+            rows = self.market_dataset.rows("snapshot", cutoff=self._as_of_time, ymd=ymd,
+                                            ts_codes=ts_codes, date_clause=date_clause, date_params=date_params)
+            return [self._decode_versioned_snapshot_row(row) for row in rows]
         cache_key = (
             str(self._as_of_time or ""), str(ymd or ""),
             tuple(sorted(ts_codes or [])), str(date_clause or ""), tuple(date_params),
@@ -482,6 +501,9 @@ class BacktestDataSource:
         """
         if not ts_codes:
             return []
+        if self.market_dataset is not None:
+            return self._versioned_snapshot_rows("", ts_codes=ts_codes,
+                                                 date_clause=date_clause, date_params=date_params)
         try:
             placeholders = ",".join("?" for _ in ts_codes)
             postgres = _is_postgres()
@@ -554,6 +576,8 @@ class BacktestDataSource:
             return None
 
     def _postgres_trade_dates(self, start: str, end: str) -> List[str]:
+        if self.market_dataset is not None:
+            return [self._fmt_date(d) for d in self.market_dataset.dates(start, end)]
         try:
             with _read_data_conn() as conn:
                 rows = conn.execute(
@@ -600,6 +624,14 @@ class BacktestDataSource:
             return []
 
     def _postgres_snapshot_rows(self, ymd: str) -> List[dict]:
+        if self.market_dataset is not None:
+            rows = self._versioned_snapshot_rows(ymd)
+            self._record_pit_read("snapshot.daily_structured", rows)
+            return rows
+        cached_rows = load_snapshot_bundle_from_local_cache(ymd, as_of_time=self._as_of_time)
+        if cached_rows is not None:
+            self._record_pit_read("snapshot.daily_structured.local_cache", cached_rows)
+            return cached_rows
         try:
             versioned = self._versioned_snapshot_rows(ymd)
             if versioned is not None:
@@ -653,10 +685,7 @@ class BacktestDataSource:
         self._record_pit_read("tushare.fund_daily", raw_rows)
         result: List[SnapshotRow] = []
         for raw in raw_rows:
-            try:
-                payload = json.loads(raw.get("payload_json") or "{}")
-            except (TypeError, json.JSONDecodeError):
-                payload = {}
+            payload = self._payload_fields(raw)
             close = float(payload.get("close") or 0)
             if close <= 0:
                 continue
@@ -748,10 +777,7 @@ class BacktestDataSource:
                 rows = versioned
                 self._record_pit_read("tushare.fund_daily_execution_close", rows)
                 for row in rows:
-                    try:
-                        payload = json.loads(row.get("payload_json") or "{}")
-                    except (TypeError, json.JSONDecodeError):
-                        payload = {}
+                    payload = self._payload_fields(row)
                     code = str(row.get("ts_code") or "").split(".", 1)[0].zfill(6)
                     close = float(payload.get("close") or 0)
                     if code and close > 0:
@@ -828,7 +854,10 @@ class BacktestDataSource:
             if fresh:
                 limit_days = max(1, int(lookback or 0) + 5) if lookback else 0
                 start_ymd = ""
-                if limit_days:
+                if limit_days and self.market_dataset is not None:
+                    days = self.market_dataset.dates(self.market_dataset.manifest["start"], end_ymd)
+                    start_ymd = days[-limit_days] if len(days) >= limit_days else (days[0] if days else "")
+                elif limit_days:
                     with _read_data_conn() as conn:
                         row = conn.execute(
                             """SELECT MIN(trade_date) AS start_date FROM (
@@ -1051,7 +1080,7 @@ class BacktestDataSource:
                 if versioned:
                     item = dict(versioned[-1])
                     self._record_pit_read("canonical_market.index_daily", [item])
-                    payload = json.loads(str(item.get("payload_json") or "{}"))
+                    payload = self._payload_fields(item)
                     value = float(payload.get(field) or 0)
                     return value if value > 0 else None
             except Exception as exc:  # noqa: BLE001
@@ -1102,7 +1131,7 @@ class BacktestDataSource:
                 raw_rows = sorted(versioned, key=lambda row: str(row.get("trade_date") or ""), reverse=True)[:max(2, min(int(lookback) + 1, 251))]
             self._record_pit_read("canonical_market.index_daily_trend", raw_rows)
             closes = [
-                float(json.loads(str(row.get("payload_json") or "{}")).get("close") or 0)
+                float(self._payload_fields(row).get("close") or 0)
                 for row in reversed(raw_rows)
             ]
             closes = [value for value in closes if value > 0]

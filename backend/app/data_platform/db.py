@@ -848,6 +848,47 @@ def _conn():
 
 
 @contextmanager
+def _maintenance_conn():
+    """Dedicated autocommit connection for PostgreSQL maintenance commands.
+
+    Commands such as VACUUM are rejected inside a transaction block, so they
+    must never reuse the normal mutable connection path.
+    """
+
+    if not _is_postgres():
+        raise RuntimeError("database maintenance requires PostgreSQL")
+    import psycopg
+    from psycopg.rows import dict_row
+
+    url = os.getenv(
+        "DATA_PLATFORM_DATABASE_URL",
+        "postgresql://alis_app@127.0.0.1:5432/alis_data",
+    )
+    assert_database_boundary(url, role="data-platform")
+    if url.startswith("postgresql+psycopg://"):
+        url = url.replace("postgresql+psycopg://", "postgresql://", 1)
+    connect_timeout = int(os.getenv("DATABASE_CONNECT_TIMEOUT_SECONDS", "5"))
+    with _DATA_PLATFORM_DB_CONNECTION_GATE.slot(connect_timeout):
+        raw = connect_postgres(
+            psycopg.connect,
+            url,
+            row_factory=dict_row,
+            timeout=connect_timeout,
+            role="data-platform",
+            autocommit=True,
+        )
+        from app.core.autonomy_step_control import register_postgres_connection, unregister_postgres_connection
+
+        registration = register_postgres_connection(raw)
+        try:
+            _configure_postgres_session(raw, read_only=False)
+            yield Connection(raw, is_postgres=True)
+        finally:
+            unregister_postgres_connection(registration)
+            raw.close()
+
+
+@contextmanager
 def _read_conn():
     """Open a short-lived, server-enforced read-only autocommit connection.
 

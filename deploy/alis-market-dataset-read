@@ -1,0 +1,31 @@
+#!/bin/sh
+set -eu
+
+# ForcedCommand for the research worker's dedicated SSH key.  Never evaluate
+# SSH_ORIGINAL_COMMAND: accept only the exact cat command emitted by
+# app.services.market_dataset._fetch and constrain it to immutable objects.
+base=/opt/alis-db-snapshot/shared/market-datasets
+prefix="cat -- $base/"
+command=${SSH_ORIGINAL_COMMAND:-}
+
+case "$command" in
+  "$prefix"latest.json)
+    relative=latest.json
+    ;;
+  "$prefix"manifests/*.json)
+    relative=${command#"$prefix"}
+    echo "$relative" | grep -Eq '^manifests/[0-9a-f]{64}\.json$' || exit 126
+    ;;
+  "$prefix"objects/*.parquet)
+    relative=${command#"$prefix"}
+    echo "$relative" | grep -Eq '^objects/[0-9a-f]{64}\.parquet$' || exit 126
+    ;;
+  *)
+    echo "dataset object access denied" >&2
+    exit 126
+    ;;
+esac
+
+target="$base/$relative"
+test -f "$target"
+exec /bin/cat -- "$target"

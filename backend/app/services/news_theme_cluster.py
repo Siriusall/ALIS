@@ -160,6 +160,12 @@ def cluster_news_themes(*, as_of_time: str | None = None) -> dict[str, Any]:
                 ORDER BY available_time DESC,id DESC
                 LIMIT 2000""", params
         ).fetchall()]
+        market_row = c.execute(
+            """SELECT MAX(trade_date) value FROM dc_stock_daily_snapshot
+               WHERE trade_date<=?""",
+            (cutoff or datetime.now(_BUSINESS_TZ).strftime("%Y%m%d"),),
+        ).fetchone()
+        market_as_of_date = str(dict(market_row).get("value") or "") if market_row else ""
 
     # A delayed provider can publish an article with a publication timestamp
     # older than its observation time.  Preserve the former publication-time
@@ -207,7 +213,7 @@ def cluster_news_themes(*, as_of_time: str | None = None) -> dict[str, Any]:
     now = datetime.now(_BUSINESS_TZ).isoformat(timespec="seconds")
     themes_written = 0
     company_mappings = 0
-    as_of_date = cutoff or datetime.now(_BUSINESS_TZ).strftime("%Y%m%d")
+    as_of_date = market_as_of_date or cutoff or datetime.now(_BUSINESS_TZ).strftime("%Y%m%d")
 
     with _conn() as c:
         for theme_name, articles_list in sorted(theme_articles.items(), key=lambda x: len(x[1]), reverse=True):

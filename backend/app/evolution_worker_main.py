@@ -13,6 +13,7 @@ from app.services.evolution_orchestrator import (
     recover_evolution_tasks,
     start_evolution_worker,
 )
+from app.services.market_dataset import dataset_configuration_status
 
 
 logger = logging.getLogger("quant.evolution_worker")
@@ -32,6 +33,10 @@ def run_forever(stop_event: threading.Event | None = None) -> None:
 
     stopper = stop_event or threading.Event()
     _verify_database_connections()
+    dataset_status = dataset_configuration_status()
+    if not dataset_status["ready"]:
+        raise RuntimeError(f"market dataset preflight failed: {dataset_status['errors']}")
+    logger.info("Market dataset preflight: %s", dataset_status)
     recovered = recover_evolution_tasks()
     started = start_evolution_worker()
     logger.info(

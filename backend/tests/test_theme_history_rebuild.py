@@ -48,6 +48,22 @@ def test_news_history_uses_publish_and_available_time_instead_of_empty_trade_dat
     assert result["reason"] == "no_news_data"
 
 
+def test_current_news_snapshot_uses_latest_market_session(monkeypatch):
+    def handler(sql, _params):
+        if "MAX(trade_date)" in sql:
+            return [{"value": "20260828"}]
+        return []
+
+    connection = _Connection(handler)
+    monkeypatch.setattr(news_theme_cluster, "_conn", lambda: connection)
+    monkeypatch.setattr(news_theme_cluster, "_load_stock_names", lambda: {})
+
+    result = news_theme_cluster.cluster_news_themes()
+
+    assert result["reason"] == "no_news_data"
+    assert connection.calls[1][1] == ("20260911",)
+
+
 def test_theme_history_accepts_full_walk_forward_session_target(monkeypatch):
     def handler(sql, _params):
         if "MAX(trade_date)" in sql:

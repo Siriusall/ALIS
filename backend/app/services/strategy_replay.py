@@ -1000,6 +1000,7 @@ def run_strategy_replay(
     total_fees = round(sum(float(item.get("fees") or 0.0) for item in trades), 2)
     return {
         "schema_version": "strategy_replay_v1",
+        "market_dataset_version": getattr(getattr(ds, "market_dataset", None), "version", None),
         "status": "completed",
         "strategy_id": strategy_id,
         "strategy_name": strategy.get("name") or "",

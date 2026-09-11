@@ -6973,7 +6973,12 @@ def classify_plan_model_training_failure(error: Any) -> dict[str, Any]:
         category = "code_contract_error"
         retryable = False
         action = "escalate_owner_review"
-    elif "stale_plan_model_training_run" in message or "训练心跳超时" in message:
+    elif any(value in message for value in (
+        "stale_plan_model_training_run",
+        "plan_model_training_runtime_budget_exceeded",
+        "训练心跳超时",
+        "训练超过单次总时限",
+    )):
         category = "interrupted_runtime"
         retryable = True
         action = "bounded_retry"
@@ -7457,30 +7462,25 @@ def _parse_dt(value: Any) -> datetime | None:
         return None
 
 
-def _mark_stale_train_run(run: dict[str, Any] | None, *, stale_minutes: int = 20) -> dict[str, Any] | None:
+def interrupt_plan_model_train_run(
+    run_id: int,
+    *,
+    error_code: str,
+    message: str,
+    run_snapshot: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """Terminate one asynchronous run and prevent later candidate publication."""
+    run = run_snapshot or get_model_train_run(int(run_id))
     if not run or str(run.get("status") or "") not in {"running", "queued"}:
-        return run
-    updated_at = _parse_dt(run.get("updated_at") or run.get("created_at"))
-    if not updated_at or datetime.now(_BUSINESS_TZ) - updated_at < timedelta(minutes=max(5, stale_minutes)):
         return run
     metrics = dict(run.get("metrics") or {})
     timeline = list(metrics.get("timeline") or [])
-    timeline.append({
-        "at": datetime.now(_BUSINESS_TZ).isoformat(),
-        "phase": "failed",
-        "progress": 1.0,
-        "message": "训练心跳超时：后端进程重启或训练线程中断，已标记为可重训",
-    })
+    now = datetime.now(_BUSINESS_TZ).isoformat()
+    timeline.append({"at": now, "phase": "failed", "progress": 1.0, "message": message})
     metrics["timeline"] = timeline[-20:]
     update_model_train_run(
-        int(run["id"]),
-        status="failed",
-        phase="failed",
-        progress=1.0,
-        message="训练心跳超时，已标记为可重训",
-        metrics=metrics,
-        error="stale_plan_model_training_run",
-        finished_at=datetime.now(_BUSINESS_TZ).isoformat(),
+        int(run_id), status="failed", phase="failed", progress=1.0,
+        message=message, metrics=metrics, error=error_code, finished_at=now,
     )
     model_key = str(metrics.get("model_key") or "")
     context = metrics.get("targeted_training_context") if isinstance(
@@ -7492,24 +7492,32 @@ def _mark_stale_train_run(run: dict[str, Any] | None, *, stale_minutes: int = 20
     if model_key in PLAN_MODELS:
         _enqueue_plan_model_training_recovery(
             model_key=model_key,
-            failed_run_id=int(run["id"]),
-            root_run_id=int(prior_recovery.get("root_run_id") or run["id"]),
+            failed_run_id=int(run_id),
+            root_run_id=int(prior_recovery.get("root_run_id") or run_id),
             retry_count=int(prior_recovery.get("retry_count") or 0),
-            classification=classify_plan_model_training_failure(
-                "stale_plan_model_training_run"
-            ),
+            classification=classify_plan_model_training_failure(error_code),
         )
     refreshed = dict(run)
     refreshed.update({
-        "status": "failed",
-        "phase": "failed",
-        "progress": 1.0,
-        "message": "训练心跳超时，已标记为可重训",
-        "metrics": metrics,
-        "error": "stale_plan_model_training_run",
-        "finished_at": datetime.now().isoformat(),
+        "status": "failed", "phase": "failed", "progress": 1.0,
+        "message": message, "metrics": metrics, "error": error_code,
+        "finished_at": now,
     })
     return refreshed
+
+
+def _mark_stale_train_run(run: dict[str, Any] | None, *, stale_minutes: int = 20) -> dict[str, Any] | None:
+    if not run or str(run.get("status") or "") not in {"running", "queued"}:
+        return run
+    updated_at = _parse_dt(run.get("updated_at") or run.get("created_at"))
+    if not updated_at or datetime.now(_BUSINESS_TZ) - updated_at < timedelta(minutes=max(5, stale_minutes)):
+        return run
+    return interrupt_plan_model_train_run(
+        int(run["id"]),
+        error_code="stale_plan_model_training_run",
+        message="训练心跳超时，已标记为可重训",
+        run_snapshot=run,
+    )
 
 
 def reconcile_stale_plan_model_runs(*, stale_minutes: int = 20) -> dict[str, Any]:
@@ -7757,6 +7765,74 @@ def reconcile_plan_model_production_gates() -> dict[str, Any]:
         ),
         "active_count": sum(bool(item.get("active")) for item in items),
         "items": items,
+    }
+
+
+def reconcile_plan_model_live_health(
+    health_rows: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Quarantine repeatedly failing production models and rebind safely.
+
+    Rollback is allowed only to an older artifact that still passes the current
+    production gate.  If none exists, the model family is disabled and the
+    Champion continues with deterministic factors.
+    """
+    from app.services.production_strategy import ensure_production_strategy_champion
+
+    actions: list[dict[str, Any]] = []
+    for health in health_rows:
+        if str(health.get("status") or "") != "quarantined":
+            continue
+        model_key = str(health.get("model_key") or "")
+        current = get_active_model_version(model_key) if model_key in PLAN_MODELS else None
+        if not current or str(current.get("version") or "") != str(health.get("active_version") or ""):
+            continue
+        rollback = None
+        for candidate in list_model_versions(model_key, limit=200):
+            if int(candidate.get("id") or 0) >= int(current.get("id") or 0):
+                continue
+            if audit_plan_model_production_eligibility(candidate).get("passed"):
+                rollback = candidate
+                break
+
+        validation = dict(current.get("validation") or {})
+        validation["production_eligible"] = False
+        validation["live_health_quarantine"] = {
+            "schema_version": "plan_model_live_health_quarantine_v1",
+            "quarantined_at": datetime.now(_BUSINESS_TZ).isoformat(),
+            "reason": str(health.get("reason") or "continuous_live_health_failure"),
+            "degraded_streak": int(health.get("degraded_streak") or 0),
+            "rollback_model_version_id": int(rollback["id"]) if rollback else None,
+        }
+        update_model_version_validation(int(current["id"]), validation=validation)
+        update_model_version_status(
+            int(current["id"]),
+            status="rolled_back_live_health" if rollback else "quarantined_live_health",
+            is_active=False,
+        )
+        if rollback:
+            set_active_model_version(int(rollback["id"]))
+            action = {
+                "model_key": model_key,
+                "action": "rolled_back",
+                "from_model_version_id": int(current["id"]),
+                "to_model_version_id": int(rollback["id"]),
+            }
+        else:
+            action = {
+                "model_key": model_key,
+                "action": "disabled_to_deterministic_fallback",
+                "from_model_version_id": int(current["id"]),
+                "to_model_version_id": None,
+            }
+        champion = ensure_production_strategy_champion(force_rebind=True)
+        action["champion_id"] = int(champion.get("id") or 0)
+        actions.append(action)
+    return {
+        "ok": True,
+        "schema_version": "plan_model_live_health_reconciliation_v1",
+        "items": actions,
+        "count": len(actions),
     }
 
 
@@ -8957,6 +9033,9 @@ def _run_training_sync(
         }
         artifact_path = root / "artifact.json"
         artifact_path.write_text(json.dumps(artifact, ensure_ascii=False, indent=2), encoding="utf-8")
+        terminal_guard = get_model_train_run(run_id) or {}
+        if str(terminal_guard.get("status") or "") not in {"running", "queued"}:
+            raise RuntimeError(str(terminal_guard.get("error") or "plan_model_training_run_interrupted"))
         model_version_id = create_model_version(
             model_key=model_key,
             version=version,
@@ -9044,7 +9123,21 @@ def _run_training_sync(
             "plan_model_autonomy_continuation": autonomy_continuation,
         }
     except Exception as exc:
-        previous = (get_model_train_run(run_id) or {}).get("metrics") or {}
+        current_run = get_model_train_run(run_id) or {}
+        if (
+            str(current_run.get("status") or "") == "failed"
+            and str(current_run.get("error") or "") in {
+                "stale_plan_model_training_run",
+                "plan_model_training_runtime_budget_exceeded",
+            }
+        ):
+            return {
+                "ok": False,
+                "run_id": run_id,
+                "error": str(current_run.get("error") or exc),
+                "automatic_recovery": {"status": "already_enqueued_by_watchdog"},
+            }
+        previous = current_run.get("metrics") or {}
         context = dict(training_context or {})
         prior_recovery = context.get("failure_recovery") if isinstance(
             context.get("failure_recovery"), dict

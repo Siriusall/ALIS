@@ -673,6 +673,26 @@ def test_progressive_consumer_gate_preserves_real_audit_failure():
     assert result["production_change_authorized"] is False
 
 
+def test_progressive_consumer_gate_accepts_enabled_frozen_replay(monkeypatch):
+    monkeypatch.setattr(oos_hard_data, "frozen_replay_oos_fallback_enabled", lambda: True)
+    audit = {
+        "audit_completed": True,
+        "status": "accumulating",
+        "eligible_sessions": 227,
+        "new_strict_baseline": {"eligible_sessions": 0},
+        "observation_evidence": {"qualification_mode": "frozen_replay_before_candidate"},
+    }
+
+    result = oos_hard_data.progressive_oos_consumer_eligibility(
+        audit, "simulation_evaluation",
+    )
+
+    assert result["status"] == "eligible"
+    assert result["eligible"] is True
+    assert result["eligible_sessions"] == 227
+    assert result["production_change_authorized"] is False
+
+
 def test_calendar_unavailable_uses_progressive_consumer_semantics():
     result = oos_hard_data._calendar_not_ready_audit(
         oos_hard_data.TradeCalendarNotReady(

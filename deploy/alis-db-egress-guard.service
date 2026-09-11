@@ -1,10 +1,11 @@
 [Unit]
 Description=ALIS Database Public Egress Guard
-After=network-online.target wg-quick@wg0.service
-Wants=network-online.target wg-quick@wg0.service
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=oneshot
+EnvironmentFile=-/etc/alis/db-egress-guard.env
 ExecStart=/usr/local/sbin/alis-db-egress-guard
 RemainAfterExit=yes
 

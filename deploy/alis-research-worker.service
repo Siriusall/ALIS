@@ -2,7 +2,6 @@
 Description=ALIS Research Compute Worker
 After=network-online.target wg-quick@wg0.service
 Wants=network-online.target wg-quick@wg0.service
-Conflicts=alis-control-worker.service
 
 [Service]
 Type=simple
@@ -16,7 +15,7 @@ Environment=DATABASE_CONNECT_TIMEOUT_SECONDS=5
 Environment=DATABASE_STATEMENT_TIMEOUT_MS=30000
 Environment=DATABASE_IDLE_IN_TRANSACTION_TIMEOUT_MS=15000
 Environment=ALIS_WORKER_PROFILE=4gb
-Environment=ALIS_V10_ENV_PARALLELISM=1
+Environment=ALIS_V10_ENV_PARALLELISM=2
 Environment=ALIS_RESEARCH_MAX_REPLAY_SECONDS=300
 Environment=OMP_NUM_THREADS=1
 Environment=OPENBLAS_NUM_THREADS=1
@@ -24,6 +23,7 @@ Environment=MKL_NUM_THREADS=1
 Environment=NUMEXPR_NUM_THREADS=1
 Environment=VECLIB_MAXIMUM_THREADS=1
 Environment=ALIS_NETWORK_BUDGET_ENABLED=1
+Environment=ALIS_MARKET_DATASET_REQUIRED=1
 Environment=ALIS_NETWORK_DAILY_BUDGET_MB=128
 Environment=ALIS_NETWORK_BUDGET_INTERFACE=eth0
 Environment=ALIS_NETWORK_BUDGET_DIRECTION=tx

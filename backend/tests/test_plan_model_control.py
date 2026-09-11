@@ -2087,3 +2087,42 @@ def test_running_current_event_protocol_is_not_mislabeled_as_legacy():
     })
 
     assert result["training_protocol_status"] == "current_running"
+
+
+def test_live_health_quarantine_rolls_back_only_to_currently_eligible_version(monkeypatch):
+    current = {"id": 20, "model_key": "medium_horizon_lambdarank_v1", "version": "v20", "validation": {}}
+    older = {"id": 19, "model_key": current["model_key"], "version": "v19", "validation": {}}
+    calls = []
+    monkeypatch.setattr(plan_model_control, "get_active_model_version", lambda _key: current)
+    monkeypatch.setattr(plan_model_control, "list_model_versions", lambda *_args, **_kwargs: [current, older])
+    monkeypatch.setattr(plan_model_control, "audit_plan_model_production_eligibility", lambda version: {"passed": version["id"] == 19})
+    monkeypatch.setattr(plan_model_control, "update_model_version_validation", lambda *args, **kwargs: calls.append(("validation", args, kwargs)))
+    monkeypatch.setattr(plan_model_control, "update_model_version_status", lambda *args, **kwargs: calls.append(("status", args, kwargs)))
+    monkeypatch.setattr(plan_model_control, "set_active_model_version", lambda version_id: calls.append(("activate", version_id)))
+    from app.services import production_strategy
+    monkeypatch.setattr(production_strategy, "ensure_production_strategy_champion", lambda **_kwargs: {"id": 88})
+
+    result = plan_model_control.reconcile_plan_model_live_health([{
+        "model_key": current["model_key"], "active_version": "v20",
+        "status": "quarantined", "degraded_streak": 3, "reason": "failed",
+    }])
+
+    assert result["items"][0]["action"] == "rolled_back"
+    assert ("activate", 19) in calls
+
+
+def test_live_health_quarantine_disables_family_without_safe_rollback(monkeypatch):
+    current = {"id": 20, "model_key": "medium_horizon_lambdarank_v1", "version": "v20", "validation": {}}
+    monkeypatch.setattr(plan_model_control, "get_active_model_version", lambda _key: current)
+    monkeypatch.setattr(plan_model_control, "list_model_versions", lambda *_args, **_kwargs: [current])
+    monkeypatch.setattr(plan_model_control, "update_model_version_validation", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(plan_model_control, "update_model_version_status", lambda *_args, **_kwargs: None)
+    from app.services import production_strategy
+    monkeypatch.setattr(production_strategy, "ensure_production_strategy_champion", lambda **_kwargs: {"id": 89})
+
+    result = plan_model_control.reconcile_plan_model_live_health([{
+        "model_key": current["model_key"], "active_version": "v20",
+        "status": "quarantined", "degraded_streak": 3,
+    }])
+
+    assert result["items"][0]["action"] == "disabled_to_deterministic_fallback"

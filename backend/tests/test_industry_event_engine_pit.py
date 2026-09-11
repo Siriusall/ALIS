@@ -183,10 +183,17 @@ def test_industry_valuation_uses_accepted_snapshot_hash_without_version_ranking(
     connection = _version_connection()
     connection.executescript(
         """
-        CREATE TABLE dc_stock_master(
-            ts_code TEXT PRIMARY KEY, industry TEXT, list_date TEXT,
-            available_time TEXT, updated_at TEXT, source_code TEXT
-        );
+            CREATE TABLE dc_stock_master(
+                ts_code TEXT PRIMARY KEY, industry TEXT, list_date TEXT,
+                available_time TEXT, updated_at TEXT, source_code TEXT
+            );
+            CREATE TABLE dc_stock_master_version(
+                id INTEGER PRIMARY KEY, ts_code TEXT NOT NULL, symbol TEXT NOT NULL DEFAULT '',
+                name TEXT NOT NULL DEFAULT '', area TEXT NOT NULL DEFAULT '',
+                industry TEXT NOT NULL DEFAULT '', market TEXT NOT NULL DEFAULT '',
+                list_date TEXT NOT NULL DEFAULT '', source_code TEXT NOT NULL,
+                observed_at TEXT NOT NULL, content_hash TEXT NOT NULL, created_at TEXT NOT NULL
+            );
         CREATE TABLE dc_stock_daily_snapshot(
             ts_code TEXT NOT NULL, trade_date TEXT NOT NULL,
             content_hash TEXT NOT NULL,
@@ -208,6 +215,11 @@ def test_industry_valuation_uses_accepted_snapshot_hash_without_version_ranking(
         connection.execute(
             "INSERT INTO dc_stock_master VALUES(?,?,?,?,?,?)",
             (code, "测试行业", "20100101", observed, observed, "tushare"),
+        )
+        connection.execute(
+            "INSERT INTO dc_stock_master_version VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            (number, code, f"00000{number}", "测试", "", "测试行业", "", "20100101",
+             "tushare", observed, f"master-{number}", observed),
         )
         connection.execute(
             "INSERT INTO dc_stock_daily_snapshot VALUES(?,?,?)",
