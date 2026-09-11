@@ -1092,7 +1092,9 @@ def run_snapshot_worker_forever(stop_event: Any | None = None) -> None:
             # Never fan out expensive aggregations across the small DB.
             if _wait_or_stop(stopper, 1.0):
                 return
-        if not due and _wait_or_stop(stopper, 1.0):
+        # A workload-gate break leaves due pages in the queue. Without a wait
+        # this spins on PostgreSQL continuously while research owns the DB.
+        if _wait_or_stop(stopper, 5.0 if due else 1.0):
             return
 
 
@@ -1178,8 +1180,11 @@ def read(page_key: str, *, force: bool = False) -> dict[str, Any]:
         datetime.now(timezone.utc) - generated_at
     ).total_seconds() >= _ttl(page_key)
     cached = None if force else get_json(_redis_key(page_key))
-    if not expired and isinstance(cached, dict) and metadata and _cache_matches_metadata(cached, metadata):
-        return _with_runtime_overlay(page_key, cached)
+    if isinstance(cached, dict) and metadata and _cache_matches_metadata(cached, metadata):
+        response = copy.deepcopy(cached)
+        response["stale"] = expired
+        response["refreshing"] = expired
+        return _with_runtime_overlay(page_key, response)
     if isinstance(cached, dict):
         redis_delete(_redis_key(page_key))
     generation = _generation(metadata)
@@ -1188,7 +1193,9 @@ def read(page_key: str, *, force: bool = False) -> dict[str, Any]:
         response = copy.deepcopy(durable)
         response["stale"] = expired or bool(metadata.get("invalidated_at"))
         response["refreshing"] = response["stale"]
-        if not response["stale"]:
+        # Expiry affects freshness, not content identity. Mirror the committed
+        # version while waiting, avoiding repeated cross-node payload transfers.
+        if not metadata.get("invalidated_at"):
             set_json(_redis_key(page_key), response, ttl=_app_cache_ttl())
         return _with_runtime_overlay(page_key, response)
     if durable and str(durable.get("status") or "") == "unavailable":

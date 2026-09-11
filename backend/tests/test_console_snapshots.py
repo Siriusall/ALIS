@@ -650,6 +650,22 @@ def test_expired_snapshot_is_stale_even_with_matching_redis_and_no_invalidation(
     assert result["data"] == payload["data"]
 
 
+def test_workload_yield_waits_before_scanning_again(monkeypatch):
+    scans = []
+    monkeypatch.setattr(snapshots, "_pages_due_for_refresh", lambda: scans.append(1) or ["research"])
+    monkeypatch.setattr(snapshots, "_snapshot_build_should_yield", lambda: True)
+    monkeypatch.setattr(snapshots, "build", lambda _: pytest.fail("must yield"))
+    class StopAfterWait:
+        def is_set(self):
+            assert len(scans) <= 1, "busy loop while database is occupied"
+            return False
+        def wait(self, seconds):
+            assert seconds >= 1
+            return True
+    snapshots.run_snapshot_worker_forever(StopAfterWait())
+    assert len(scans) == 1
+
+
 def test_read_discards_invalidated_redis_snapshot_without_recaching_lkg(monkeypatch):
     metadata = {
         "page_key": "overview",

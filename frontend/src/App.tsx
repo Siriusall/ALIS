@@ -57,7 +57,7 @@ const pageNames: Record<string, string> = {
 function formatCheckedAt(value: unknown) {
   const text = String(value || "").trim();
   if (!text) return "更新于当前会话";
-  return `快照 ${text.replace("T", " ").replace(/([+-]\d\d:\d\d|Z)$/, "").split(".")[0]}`;
+  return `检查于 ${formatSnapshotTime(text)}`;
 }
 
 function formatSnapshotTime(value: unknown) {
