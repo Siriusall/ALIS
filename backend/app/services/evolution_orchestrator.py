@@ -3526,10 +3526,16 @@ def _finish_success(task_id: int, result: dict[str, Any]) -> None:
         "strategy_controller_oos": "策略控制器 OOS 完成",
         "system_autonomy_cycle": "系统自治周期完成",
     }.get(task_type, "自治任务完成")
+    research_incomplete = task_type == "research_maintenance" and (
+        result.get("ok") is False or result.get("status") == "partial"
+    )
+    if research_incomplete:
+        message = "研究维护未完成：部分步骤失败，请查看结果中的阻断原因"
     _update_active_task(
         int(task_id), statuses=("running",), require_not_stopped=True,
         expected_lease_owner=WORKER_ID,
-        status="completed", phase="completed", progress=1.0,
+        status="failed" if research_incomplete else "completed",
+        phase="research_incomplete" if research_incomplete else "completed", progress=1.0,
         message=message, result=result, error=None,
         lease_owner=None, lease_expires_at=None, heartbeat_at=now,
         finished_at=now,

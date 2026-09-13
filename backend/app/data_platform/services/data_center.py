@@ -5936,8 +5936,15 @@ def _snapshot_raw_dependencies(c: Any, trade_date: str) -> dict[str, Any]:
     api_names = ("daily", "daily_basic", "adj_factor", "stk_limit", "suspend_d")
     payloads: dict[str, dict[str, dict[str, Any]]] = {api_name: {} for api_name in api_names}
     source_metadata: dict[str, list[dict[str, Any]]] = {}
+    fields = {
+        "daily": ("ts_code", "open", "high", "low", "close", "pre_close", "pct_chg", "vol", "amount"),
+        "daily_basic": ("ts_code", "close", "total_mv", "circ_mv", "pe_ttm", "pb", "turnover_rate"),
+        "adj_factor": ("ts_code", "adj_factor"),
+        "stk_limit": ("ts_code", "up_limit", "down_limit"),
+        "suspend_d": ("ts_code",),
+    }
     for api_name in api_names:
-        versioned = load_current_raw_record_versions(c, api_name, target)
+        versioned = load_current_raw_record_versions(c, api_name, target, payload_fields=fields[api_name])
         if versioned is None:
             versioned = load_raw_record_versions(
                 c, api_name, trade_date_start=target, trade_date_end=target,

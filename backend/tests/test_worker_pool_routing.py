@@ -3,6 +3,18 @@ from contextlib import contextmanager
 from app.services import evolution_orchestrator as evolution
 
 
+def test_partial_research_is_not_persisted_as_completed(monkeypatch):
+    captured = {}
+    result = {"ok": False, "status": "partial", "errors": ["themes: timeout"]}
+    monkeypatch.setattr(evolution, "get_evolution_task", lambda _: {"task_type": "research_maintenance"})
+    monkeypatch.setattr(evolution, "_update_active_task", lambda _, **kwargs: captured.update(kwargs))
+    evolution._finish_success(2424, result)
+    assert captured["status"] == "failed"
+    assert captured["phase"] == "research_incomplete"
+    assert captured["result"] == result
+    assert captured["expected_lease_owner"] == evolution.WORKER_ID
+
+
 def test_default_worker_pool_routes_only_long_research_to_research_pool():
     assert evolution._default_worker_pool("strategy_environment_backtest") == "research"
     assert evolution._default_worker_pool("strategy_controller_oos") == "research"

@@ -34,6 +34,12 @@ def run_daily_maintenance(
             market_research = {
                 "ok": False, "status": "deferred", "error": str(exc)[:300],
             }
+        if market_research.get("ok") is False:
+            errors.append(f"market_research: {market_research.get('error') or market_research.get('status') or 'not_ok'}")
+        for step in ("industry_states", "themes", "screen", "stage", "promote"):
+            outcome = market_research.get(step)
+            if isinstance(outcome, dict) and outcome.get("ok") is False:
+                errors.append(f"{step}: {outcome.get('error') or outcome.get('reason') or outcome.get('status') or 'not_ok'}")
 
     # Step 1: Research on current positions
     positions = get_positions()

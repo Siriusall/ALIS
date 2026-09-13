@@ -456,6 +456,12 @@ def test_postgres_current_projection_materializes_both_exact_date_sides(monkeypa
     assert load_current_raw_record_versions(Connection(), "adj_factor", "20260825") == []
     assert "versions AS MATERIALIZED" in captured["sql"]
     assert captured["params"] == ("adj_factor", "20260825", "adj_factor", "20260825")
+    load_current_raw_record_versions(
+        Connection(), "adj_factor", "20260825", payload_fields=("ts_code", "adj_factor"),
+    )
+    assert "jsonb_object_agg(key,value)" in captured["sql"]
+    assert "WHERE key IN ('ts_code','adj_factor')" in captured["sql"]
+    assert "v.content_hash=p.content_hash" in captured["sql"]
 
 
 def test_raw_loader_does_not_move_an_accepted_hash_between_trade_dates():

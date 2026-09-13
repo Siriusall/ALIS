@@ -1,6 +1,20 @@
 from app.services import auto_pipeline
 
 
+def test_market_failure_cannot_be_hidden_by_successful_company_steps(monkeypatch):
+    monkeypatch.setattr(auto_pipeline, "get_positions", lambda: [])
+    monkeypatch.setattr(auto_pipeline, "generate_watch_pool_theses", lambda **_: {"ok": True})
+    monkeypatch.setattr(auto_pipeline, "reconcile_missing_position_states_from_confirmed_operations", lambda: {})
+    monkeypatch.setattr(
+        "app.data_platform.services.daily_update._run_research_maintenance",
+        lambda _: {"themes": {"ok": False, "error": "statement timeout"}, "screen": {"ok": True}},
+    )
+    result = auto_pipeline.run_daily_maintenance(trade_date="20260911")
+    assert result["ok"] is False
+    assert result["status"] == "partial"
+    assert "themes: statement timeout" in result["errors"]
+
+
 def test_daily_maintenance_runs_complete_market_research_contract(monkeypatch):
     monkeypatch.setattr(auto_pipeline, "get_positions", lambda: [])
     monkeypatch.setattr(auto_pipeline, "generate_watch_pool_theses", lambda **_: {"ok": True})

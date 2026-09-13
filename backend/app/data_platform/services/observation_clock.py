@@ -504,6 +504,7 @@ def load_current_raw_record_versions(
     c: Any,
     api_name: str,
     trade_date: str,
+    *, payload_fields: tuple[str, ...] = (),
 ) -> list[dict[str, Any]] | None:
     """Load an accepted current projection joined to its immutable version.
 
@@ -541,6 +542,19 @@ def load_current_raw_record_versions(
         # date on the append-only table and start from tens of millions of
         # versions.  Freeze the exact accepted session first; this is the same
         # authoritative hash join with a bounded and deterministic join side.
+        payload_expression = "v.payload_json"
+        if payload_fields:
+            if any(not field.replace('_', '').isalnum() for field in payload_fields):
+                raise ValueError("invalid payload field")
+            field_literals = ",".join("'" + field + "'" for field in payload_fields)
+            # Project on the database host before crossing the bounded link.
+            # Preserve missing keys versus explicit nulls and keep the full
+            # immutable source hash/clocks alongside the derived payload.
+            payload_expression = (
+                "(SELECT COALESCE(jsonb_object_agg(key,value),'{}'::jsonb)::text "
+                "FROM jsonb_each(v.payload_json::jsonb) "
+                f"WHERE key IN ({field_literals})) AS payload_json"
+            )
         sql = f"""
             WITH accepted AS MATERIALIZED (
                 SELECT api_name,record_key,trade_date,content_hash
@@ -556,7 +570,7 @@ def load_current_raw_record_versions(
                    AND {' AND '.join(version_predicates)}
             )
             SELECT v.id,v.api_name,v.record_key,v.ts_code,v.trade_date,
-                   v.period,v.ann_date,v.payload_json,v.source_code,
+                   v.period,v.ann_date,{payload_expression},v.source_code,
                    v.economic_available_time,v.observed_at,v.first_observed_at,
                    v.observation_provenance,v.content_hash,v.created_at
               FROM accepted p
