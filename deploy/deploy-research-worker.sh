@@ -42,7 +42,7 @@ fi
 worker_ssh() { ssh "${ssh_opts[@]}" -i "$ALIS_RESEARCH_WORKER_SSH_KEY" "$ALIS_RESEARCH_WORKER_SSH_TARGET" "$@"; }
 
 scp -O -q "${ssh_opts[@]}" -i "$ALIS_RESEARCH_WORKER_SSH_KEY" "$bundle" "$ALIS_RESEARCH_WORKER_SSH_TARGET:$remote_archive"
-old_release=$(worker_ssh 'readlink -f /opt/alis-research-worker/backend 2>/dev/null || true')
+old_release=$(worker_ssh 'sudo readlink -f /opt/alis-research-worker/backend')
 worker_was_active=$(worker_ssh 'systemctl is-active alis-research-worker 2>/dev/null || true')
 release_finished=0
 restore_worker_on_error() {
@@ -107,7 +107,7 @@ REMOTE
 
 worker_ssh "sudo systemctl restart alis-research-worker"
 worker_ssh 'test "$(systemctl is-active alis-research-worker)" = active'
-worker_ssh 'test "$(readlink -f /opt/alis-research-worker/backend)" != ""'
+worker_ssh "test \"\$(sudo readlink -f /opt/alis-research-worker/backend)\" = '$release/backend'"
 
 release_finished=1
 trap - ERR

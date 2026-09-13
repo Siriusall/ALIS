@@ -302,7 +302,7 @@ def _validate_derived_columns(
             )
 
 
-def publish_market_dataset(start: str, end: str, *, root: Path | None = None) -> dict:
+def publish_market_dataset(start: str, end: str, *, root: Path | None = None, refresh_from: str = "") -> dict:
     """Run on the DB host only; repeatable-read freezes every accepted join."""
     import pyarrow as pa
     import pyarrow.parquet as pq
@@ -317,6 +317,20 @@ def publish_market_dataset(start: str, end: str, *, root: Path | None = None) ->
         raise ValueError("publish requires database-local DATA_PLATFORM_DATABASE_URL")
     root = root or dataset_root()
     with _lock(root), _read_conn() as conn:
+        reusable = {}
+        if refresh_from:
+            refresh_from = _ymd(refresh_from)
+            pointer = json.loads((root / "latest.json").read_text())
+            previous = json.loads((root / "manifests" / f"{pointer['version']}.json").read_text())
+            _validate_manifest(previous, pointer["version"])
+            if previous["start"] != start or end < previous["end"]:
+                raise ValueError("incremental publication cannot truncate existing history")
+            for part in previous["partitions"]:
+                if part["end"] < refresh_from:
+                    path = root / "objects" / f"{part['sha256']}.parquet"
+                    if _sha256_file(path) != part["sha256"]:
+                        raise DatasetUnavailable("cannot reuse corrupt dataset partition")
+                    reusable[(part["category"], part["start"], part["end"])] = part
         conn.execute("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
         try:
             dates = [
@@ -329,6 +343,9 @@ def publish_market_dataset(start: str, end: str, *, root: Path | None = None) ->
             partitions = []
             for lo, hi in _month_ranges(start, end):
                 for category in ("snapshot", *RAW_APIS):
+                    if (category, lo, hi) in reusable:
+                        partitions.append(reusable[(category, lo, hi)])
+                        continue
                     if category == "snapshot":
                         sql = """SELECT v.ts_code,v.trade_date,v.payload_json,v.source_code,
                             v.economic_available_time,v.observed_at,v.first_observed_at,

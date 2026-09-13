@@ -15,13 +15,14 @@ def main() -> None:
     publish.add_argument("--start", required=True, help="YYYYMMDD")
     publish.add_argument("--end", required=True, help="YYYYMMDD")
     publish.add_argument("--root", type=Path)
+    publish.add_argument("--refresh-from", default="", help="reuse verified full partitions before YYYYMMDD; omit for full rebuild")
     sync = sub.add_parser("sync", help="run on the research worker")
     sync.add_argument("--source", help="local path or ssh://user@host/absolute/path")
     sync.add_argument("--version")
     sync.add_argument("--root", type=Path)
     args = parser.parse_args()
     if args.command == "publish":
-        result = publish_market_dataset(args.start, args.end, root=args.root)
+        result = publish_market_dataset(args.start, args.end, root=args.root, refresh_from=args.refresh_from)
     else:
         result = sync_market_dataset(source=args.source, version=args.version, root=args.root)
     print(json.dumps(result, ensure_ascii=False, sort_keys=True))
