@@ -1158,6 +1158,26 @@ def build(page_key: str) -> dict[str, Any]:
 
 
 def _cache_matches_metadata(cached: dict[str, Any], metadata: dict[str, Any]) -> bool:
+    cached_generated_at = str(cached.get("generated_at") or "")
+    metadata_generated_at = str(metadata.get("generated_at") or "")
+    # Version/generation alone is not sufficient across application hosts:
+    # an old Redis value can retain both after a partial cache write or a
+    # restored Redis snapshot.  When timestamps are present, the durable
+    # PostgreSQL record is authoritative and the payload must be from that
+    # exact build.  Keep compatibility with compact test/legacy cache values
+    # that do not carry the optional fields.
+    if cached_generated_at and metadata_generated_at and cached_generated_at != metadata_generated_at:
+        return False
+    cached_hash = str(cached.get("content_hash") or "")
+    metadata_hash = str(metadata.get("content_hash") or "")
+    if metadata_hash and (cached_hash or "data" in cached or "sections" in cached):
+        # Most payloads predate the explicit content_hash wrapper field, so
+        # derive the same semantic hash used at durable commit time.
+        observed_hash = cached_hash or _semantic_payload_hash(cached)
+        if observed_hash != metadata_hash:
+            return False
+    elif cached_hash and metadata_hash and cached_hash != metadata_hash:
+        return False
     return (
         _has_committed_snapshot(metadata)
         and not metadata.get("invalidated_at")

@@ -1,0 +1,18 @@
+[Unit]
+Description=ALIS database-local incremental research dataset publication
+After=postgresql.service
+
+[Service]
+Type=oneshot
+User=alis-snapshot
+WorkingDirectory=/opt/alis-db-snapshot/backend
+EnvironmentFile=/etc/alis/db-snapshot-worker.env
+Environment=PYTHONPATH=/opt/alis-db-snapshot/backend
+Environment=DATABASE_STATEMENT_TIMEOUT_MS=180000
+ExecStart=/opt/alis-db-snapshot/shared/app-venv/bin/python scripts/market_dataset.py refresh --root /opt/alis-db-snapshot/shared/market-datasets
+TimeoutStartSec=1800
+MemoryMax=900M
+CPUQuota=70%
+Nice=15
+NoNewPrivileges=true
+

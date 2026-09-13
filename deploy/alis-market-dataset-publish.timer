@@ -1,0 +1,11 @@
+[Unit]
+Description=Refresh ALIS research dataset hourly
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+RandomizedDelaySec=120
+Unit=alis-market-dataset-publish.service
+
+[Install]
+WantedBy=timers.target

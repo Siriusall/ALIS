@@ -555,6 +555,24 @@ def _read_partition(path: Path, part: dict) -> list[dict]:
     return rows
 
 
+def refresh_market_dataset(*, root: Path | None = None) -> dict:
+    """DB-local scheduled refresh; preserve the established public history."""
+    from app.data_platform.db import _read_conn
+
+    root = root or dataset_root()
+    pointer = json.loads((root / "latest.json").read_text())
+    previous = json.loads((root / "manifests" / f"{pointer['version']}.json").read_text())
+    _validate_manifest(previous, pointer["version"])
+    with _read_conn() as conn:
+        row = conn.execute("SELECT MAX(trade_date) AS latest FROM dc_available_trade_dates").fetchone()
+    latest = str(dict(row).get("latest") or "")
+    end = max(previous["end"], _ymd(latest))
+    # Refresh the prior tail month too: its partial partition may expand and
+    # late corrections within that month must become visible to new tasks.
+    refresh_from = previous["end"][:6] + "01"
+    return publish_market_dataset(previous["start"], end, root=root, refresh_from=refresh_from)
+
+
 class MarketDataset:
     def __init__(self, version: str, *, root: Path | None = None):
         if not _HEX.fullmatch(version):

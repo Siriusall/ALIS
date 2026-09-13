@@ -79,6 +79,10 @@ install -o root -g root -m 755 '$release/deploy/alis-market-dataset-read' /usr/l
 ln -sfn '$release/backend' /opt/alis-db-snapshot/backend
 chown -h alis-snapshot:alis-snapshot /opt/alis-db-snapshot/backend
 systemctl daemon-reload
+install -o root -g root -m 644 '$release/deploy/alis-market-dataset-publish.service' /etc/systemd/system/alis-market-dataset-publish.service
+install -o root -g root -m 644 '$release/deploy/alis-market-dataset-publish.timer' /etc/systemd/system/alis-market-dataset-publish.timer
+systemctl daemon-reload
+systemctl enable --now alis-market-dataset-publish.timer
 systemctl enable alis-db-egress-guard
 systemctl restart alis-db-egress-guard
 systemctl enable --now alis-db-egress-guard-account.timer
