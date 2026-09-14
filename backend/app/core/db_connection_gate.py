@@ -23,6 +23,7 @@ from typing import Iterator
 
 DEFAULT_BUSINESS_DB_CONNECTIONS = 4
 DEFAULT_DATA_PLATFORM_DB_CONNECTIONS = 3
+DEFAULT_AUTH_DB_CONNECTIONS = 2
 
 
 class DatabaseConnectionCapacity(RuntimeError):

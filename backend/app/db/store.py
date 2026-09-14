@@ -33,6 +33,7 @@ from app.core.config import settings
 from app.core.trade_calendar import get_last_trade_date
 from app.core.runtime_guard import assert_database_boundary
 from app.core.db_connection_gate import (
+    DEFAULT_AUTH_DB_CONNECTIONS,
     DEFAULT_BUSINESS_DB_CONNECTIONS,
     DatabaseConnectionGate,
 )
@@ -71,6 +72,9 @@ _DEFAULT_STRATEGY_CONTENT = {
 
 _BUSINESS_DB_CONNECTION_GATE = DatabaseConnectionGate(
     "ALIS_BUSINESS_DB_MAX_CONNECTIONS", default=DEFAULT_BUSINESS_DB_CONNECTIONS
+)
+_AUTH_DB_CONNECTION_GATE = DatabaseConnectionGate(
+    "ALIS_AUTH_DB_MAX_CONNECTIONS", default=DEFAULT_AUTH_DB_CONNECTIONS
 )
 _ACTIVE_BUSINESS_TRANSACTION: ContextVar[Optional["_ConnWrapper"]] = ContextVar(
     "alis_active_business_transaction", default=None,
@@ -235,12 +239,22 @@ def _idle_in_transaction_timeout_ms() -> str:
     )
 
 
-def _configure_postgres_session(raw: Any, *, read_only: bool = False) -> None:
+def _configure_postgres_session(
+    raw: Any,
+    *,
+    read_only: bool = False,
+    statement_timeout_ms: int | None = None,
+) -> None:
     """Apply the bounded session contract to a newly opened connection."""
 
+    effective_timeout = (
+        statement_timeout_ms
+        if statement_timeout_ms is not None
+        else settings.database_statement_timeout_ms
+    )
     raw.execute(
         "SELECT set_config('statement_timeout', %s, false)",
-        (str(settings.database_statement_timeout_ms),),
+        (str(effective_timeout),),
     )
     raw.execute(
         "SELECT set_config('idle_in_transaction_session_timeout', %s, false)",
@@ -253,7 +267,12 @@ def _configure_postgres_session(raw: Any, *, read_only: bool = False) -> None:
 
 
 @contextmanager
-def _postgres_conn(*, read_only: bool):
+def _postgres_conn(
+    *,
+    read_only: bool,
+    gate: DatabaseConnectionGate | None = None,
+    statement_timeout_ms: int | None = None,
+):
     """Open one business PostgreSQL connection with explicit semantics."""
 
     import psycopg
@@ -264,7 +283,8 @@ def _postgres_conn(*, read_only: bool):
     if url.startswith("postgresql+psycopg://"):
         url = url.replace("postgresql+psycopg://", "postgresql://", 1)
     logger.debug("PostgreSQL 连接: %s", url.split("@")[-1])
-    with _BUSINESS_DB_CONNECTION_GATE.slot(settings.database_connect_timeout_seconds):
+    active_gate = gate or _BUSINESS_DB_CONNECTION_GATE
+    with active_gate.slot(settings.database_connect_timeout_seconds):
         raw = connect_postgres(
             psycopg.connect,
             url,
@@ -283,7 +303,11 @@ def _postgres_conn(*, read_only: bool):
             autocommit_read_only=read_only,
         )
         try:
-            _configure_postgres_session(raw, read_only=read_only)
+            _configure_postgres_session(
+                raw,
+                read_only=read_only,
+                statement_timeout_ms=statement_timeout_ms,
+            )
             yield wrapper
             if not read_only:
                 wrapper.commit()
@@ -356,6 +380,40 @@ def _read_conn():
         raise RuntimeError("只读自动提交连接不能加入活动的模拟账本事务")
     if _is_postgres():
         with _postgres_conn(read_only=True) as connection:
+            yield connection
+        return
+    if _is_mysql():
+        import pymysql
+
+        raw = pymysql.connect(**_mysql_connect_kwargs(), autocommit=True)
+        try:
+            with raw.cursor() as cursor:
+                cursor.execute("SET SESSION TRANSACTION READ ONLY")
+            yield _ConnWrapper(raw, is_mysql=True, autocommit_read_only=True)
+        finally:
+            raw.close()
+        return
+    raise RuntimeError(
+        "DATABASE_URL 未配置为 PostgreSQL；SQLite 已禁用，请设置 DATABASE_URL。"
+    )
+
+
+@contextmanager
+def _auth_read_conn():
+    """Open a dedicated, read-only autocommit connection for user authentication.
+
+    Authentication uses a dedicated connection gate with its own quota so that
+    login and /auth/me checks never get starved by background snapshot builds,
+    research maintenance, or batch analytical queries.
+    """
+    if _ACTIVE_BUSINESS_TRANSACTION.get() is not None:
+        raise RuntimeError("只读自动提交认证连接不能加入活动的模拟账本事务")
+    if _is_postgres():
+        with _postgres_conn(
+            read_only=True,
+            gate=_AUTH_DB_CONNECTION_GATE,
+            statement_timeout_ms=5000,
+        ) as connection:
             yield connection
         return
     if _is_mysql():
@@ -2732,7 +2790,7 @@ def create_user(username: str, password_hash: str) -> Dict[str, Any]:
 
 def get_user_by_username(username: str) -> Optional[Dict[str, Any]]:
     """按用户名查询用户，返回 { id, username, password_hash, created_at } 或 None。"""
-    with _conn() as c:
+    with _auth_read_conn() as c:
         cur = c.execute(
             "SELECT id, username, password_hash, created_at FROM users WHERE username = ?",
             (username.strip(),),
@@ -2750,7 +2808,7 @@ def get_user_by_username(username: str) -> Optional[Dict[str, Any]]:
 
 def get_user_by_id(user_id: int) -> Optional[Dict[str, Any]]:
     """按 id 查询用户（不含密码），返回 { id, username, created_at } 或 None。"""
-    with _conn() as c:
+    with _auth_read_conn() as c:
         cur = c.execute(
             "SELECT id, username, created_at FROM users WHERE id = ?",
             (user_id,),

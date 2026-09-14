@@ -1935,7 +1935,16 @@ def run_for_trade_date(
         if isinstance(item, dict)
         )
     ) if frozen_unified_plan else False
-    if sold_count == 0 and not filled and (not frozen_unified_plan or frozen_plan_actionable):
+    defensive_or_hold_sleeve = (
+        defensive_only_target
+        or bool(defensive_weights)
+        or all(
+            str(item.get("action") or "") in {"", "hold", "defensive_switch", "observe"}
+            for item in ((authoritative_plan or {}).get("proposal") or [])
+            if isinstance(item, dict)
+        )
+    )
+    if sold_count == 0 and not filled and (not frozen_unified_plan or frozen_plan_actionable) and not defensive_or_hold_sleeve:
         raise ReplayRiskGateError(
             "正常交易日未形成任何可执行订单；全仓策略禁止将 no_trade 标记为成功",
             code="blocked_zero_order_full_investment",

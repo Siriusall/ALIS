@@ -1,0 +1,13 @@
+[Unit]
+Description=ALIS three-node chain monitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/alis-chain-monitor.py
+User=root
+StateDirectory=alis-chain-monitor
+NoNewPrivileges=true
+PrivateTmp=true
+TimeoutStartSec=60

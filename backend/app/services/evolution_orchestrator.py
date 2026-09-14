@@ -104,7 +104,7 @@ LEGACY_TASK_RECONCILIATION_VERSION = "alis_evolution_task_reconciliation_v1"
 WORKER_ID = f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
 SYSTEM_AUTONOMY_RECOVERY_POLICY_VERSION = "v3"
 SYSTEM_AUTONOMY_MAX_RECOVERY_CONTINUATIONS = 2
-LONG_RESEARCH_TASK_TYPES = frozenset({
+ALL_RESEARCH_TASK_TYPES = frozenset({
     "strategy_evolution_cycle", "strategy_controller_oos", "factor_research_cycle",
     "strategy_candidate_generation", "strategy_environment_backtest",
     "strategy_cluster_distillation", "strategy_portfolio_research",
@@ -113,10 +113,17 @@ LONG_RESEARCH_TASK_TYPES = frozenset({
     "controller_candidate_observation", "plan_model_autonomy",
     "research_maintenance", "factor_daily_cycle",
 })
-# Every task claimable by the research worker binds the same derived dataset.
-# A smaller hand-maintained subset allowed newly added research paths to query
-# PostgreSQL directly from the compute node.
-MARKET_DATASET_TASK_TYPES = LONG_RESEARCH_TASK_TYPES
+# Only heavy OOS and compute-intensive backtests defer during trading hours (10:30-16:30).
+# Lightweight daily maintenance, candidate observation, factor cycles and plan autonomy run continuously.
+TRADING_HOURS_DEFERRED_RESEARCH_TASK_TYPES = frozenset({
+    "strategy_evolution_cycle", "strategy_controller_oos", "factor_research_cycle",
+    "strategy_candidate_generation", "strategy_environment_backtest",
+    "strategy_cluster_distillation", "strategy_portfolio_research",
+    "strategy_failure_model_training", "model_candidate_research",
+    "model_strategy_impact_validation", "hsmm_shadow_training",
+})
+LONG_RESEARCH_TASK_TYPES = TRADING_HOURS_DEFERRED_RESEARCH_TASK_TYPES
+MARKET_DATASET_TASK_TYPES = ALL_RESEARCH_TASK_TYPES
 NETWORK_OPTIONAL_TASK_TYPES = frozenset({
     "factor_research_cycle",
     "hsmm_shadow_training",
@@ -140,7 +147,7 @@ def _default_worker_pool(task_type: str) -> str:
     # its own stale release and block otherwise healthy trading.
     if str(task_type or "") == "system_release_governance":
         return "api_local"
-    return "research" if str(task_type or "") in LONG_RESEARCH_TASK_TYPES else "control"
+    return "research" if str(task_type or "") in ALL_RESEARCH_TASK_TYPES else "control"
 
 
 def _normalise_worker_pool(value: Any, *, task_type: str = "") -> str:
