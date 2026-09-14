@@ -898,11 +898,17 @@ def live_market_context(*, persist: bool = False) -> dict[str, Any]:
         # the actual captured observation clock; historical PIT readers keep
         # the strict T15 default in ``load_snapshot_market_aggregates``.
         live_observation_cutoff = now_observed_at()
-        aggregates = load_snapshot_market_aggregates(
-            c,
-            trade_dates=dates,
-            observation_cutoff=live_observation_cutoff,
-        )
+        aggregates = {}
+        for dt in dates:
+            single_agg = load_snapshot_market_aggregates(
+                c,
+                trade_dates=[dt],
+                observation_cutoff=live_observation_cutoff,
+            )
+            if single_agg is None:
+                aggregates = None
+                break
+            aggregates.update(single_agg)
         if aggregates is None:
             return {
                 "ok": False,
