@@ -91,6 +91,8 @@ systemctl enable alis-db-snapshot-worker
 # release symlink changes; it would keep old readers and their caches alive.
 systemctl restart alis-db-snapshot-worker
 test "\$(systemctl is-active alis-db-snapshot-worker)" = active
+pid=\$(systemctl show alis-db-snapshot-worker -p MainPID --value)
+test "\$(readlink -f /proc/\$pid/cwd)" = '$release/backend'
 REMOTE
 
 echo "release_commit=$commit"

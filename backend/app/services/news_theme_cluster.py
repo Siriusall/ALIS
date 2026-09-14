@@ -14,6 +14,7 @@ from typing import Any
 from collections import Counter
 
 from app.data_platform.db import _conn
+from app.core.trade_calendar import get_last_trade_date_str
 
 _BUSINESS_TZ = ZoneInfo("Asia/Shanghai")
 
@@ -129,6 +130,7 @@ def _match_companies(text: str) -> list[dict[str, str]]:
 def cluster_news_themes(*, as_of_time: str | None = None) -> dict[str, Any]:
     """Cluster news articles into themes and map to companies."""
     cutoff = str(as_of_time or "")[:10].replace("-", "")
+    market_cutoff = cutoff or get_last_trade_date_str()
     cutoff_iso = (
         f"{cutoff[:4]}-{cutoff[4:6]}-{cutoff[6:8]}T23:59:59"
         if len(cutoff) == 8 else ""
@@ -163,7 +165,7 @@ def cluster_news_themes(*, as_of_time: str | None = None) -> dict[str, Any]:
         market_row = c.execute(
             """SELECT MAX(trade_date) value FROM dc_stock_daily_snapshot
                WHERE trade_date<=?""",
-            (cutoff or datetime.now(_BUSINESS_TZ).strftime("%Y%m%d"),),
+            (market_cutoff,),
         ).fetchone()
         market_as_of_date = str(dict(market_row).get("value") or "") if market_row else ""
 

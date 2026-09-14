@@ -57,6 +57,7 @@ def test_current_news_snapshot_uses_latest_market_session(monkeypatch):
     connection = _Connection(handler)
     monkeypatch.setattr(news_theme_cluster, "_conn", lambda: connection)
     monkeypatch.setattr(news_theme_cluster, "_load_stock_names", lambda: {})
+    monkeypatch.setattr(news_theme_cluster, "get_last_trade_date_str", lambda: "20260911")
 
     result = news_theme_cluster.cluster_news_themes()
 

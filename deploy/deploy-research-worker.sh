@@ -108,6 +108,7 @@ REMOTE
 worker_ssh "sudo systemctl restart alis-research-worker"
 worker_ssh 'test "$(systemctl is-active alis-research-worker)" = active'
 worker_ssh "test \"\$(sudo readlink -f /opt/alis-research-worker/backend)\" = '$release/backend'"
+worker_ssh "pid=\$(systemctl show alis-research-worker -p MainPID --value); test \"\$(sudo readlink -f /proc/\$pid/cwd)\" = '$release/backend'"
 
 release_finished=1
 trap - ERR

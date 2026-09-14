@@ -300,7 +300,7 @@ def _readers(page_key: str) -> dict[str, Callable[[], Any]]:
     from app.api.routes.decision import decision_latest_plan, decision_summary
     from app.api.routes.positions import get_positions
     from app.data_platform.routes import data_center
-    from app.main import _health_payload
+    from app.services.application_runtime_projection import read_health
 
     def control_trading_ready() -> dict[str, Any]:
         # Full trading readiness performs strict immutable raw evidence scans
@@ -315,6 +315,21 @@ def _readers(page_key: str) -> dict[str, Callable[[], Any]]:
             "hard_blockers": [],
             "gates": [],
             "policy": {"read_only": True, "source": "control_snapshot_projection"},
+        }
+
+    def application_data_streams() -> dict[str, Any]:
+        health = read_health()
+        redis = (health.get("dependencies") or {}).get("redis") or {}
+        current = health.get("projection_status") == "current"
+        available = current and bool(redis.get("available"))
+        return {
+            "ok": available,
+            "available": available,
+            "status": "ready" if available else "unknown" if not current else "unavailable",
+            "source_role": "application",
+            "observed_at": health.get("observed_at"),
+            "expires_at": health.get("expires_at"),
+            "reason": "" if available else (health.get("issues") or ["application_redis_unavailable"])[0],
         }
 
     latest_decision_bundle: dict[str, Any] = {}
@@ -373,7 +388,7 @@ def _readers(page_key: str) -> dict[str, Callable[[], Any]]:
         # The control worker builds durable PostgreSQL snapshots. It must not
         # inherit the API host's loopback Redis requirement: browser reads and
         # stream consumption remain checked by the API's normal health route.
-        "health": lambda: _health_payload(require_redis=False),
+        "health": read_health,
         "tradingReady": control_trading_ready,
     }
 
@@ -457,7 +472,7 @@ def _readers(page_key: str) -> dict[str, Callable[[], Any]]:
             "dataOperations": lambda: data_center.data_center_llm_data_operations(limit=20),
             "runtimeLogs": lambda: data_center.data_center_runtime_logs(after_id=0, limit=100, wait_seconds=0.0),
             "dataObservability": lambda: data_center.data_center_observability(limit_logs=50, compact=True),
-            "dataStreams": lambda: data_center.data_center_streams(limit=50, pending_limit=50),
+            "dataStreams": application_data_streams,
             "dailyUpdateStatus": lambda: data_center.data_center_daily_update_status(compact=True),
             "backfillStatus": data_center.data_center_backfill_status,
             "backfillPlan": lambda: data_center.data_center_backfill_plan(
@@ -640,6 +655,35 @@ def _semantic_payload_hash(payload: dict[str, Any]) -> str:
         "data": payload.get("data", {}),
     }
     return hashlib.sha256(_serialize(stable).encode("utf-8")).hexdigest()
+
+
+def _business_metadata(data: dict[str, Any], sections: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    dates: list[str] = []
+    business_failures: list[str] = []
+
+    def visit(value: Any, path: str = "") -> None:
+        if isinstance(value, dict):
+            for key, item in value.items():
+                child = f"{path}.{key}" if path else key
+                if key in {"trade_date", "latest_trade_date", "data_date", "data_as_of"}:
+                    candidate = str(item or "").replace("-", "")[:8]
+                    if len(candidate) == 8 and candidate.isdigit():
+                        dates.append(candidate)
+                if key == "status" and str(item or "") in {"failed", "partial", "blocked", "unavailable", "error"}:
+                    business_failures.append(child)
+                visit(item, child)
+        elif isinstance(value, list):
+            for index, item in enumerate(value[:200]):
+                visit(item, f"{path}[{index}]")
+
+    visit(data)
+    document_errors = any(item.get("status") == "error" for item in sections.values())
+    return {
+        "document_status": "error" if document_errors else "ready",
+        "business_status": "partial" if business_failures else "ready",
+        "data_as_of": max(dates) if dates else None,
+        "business_issues": business_failures[:20],
+    }
 
 
 def _encode_payload(payload: dict[str, Any]) -> tuple[str, bytes, str, int, int]:
@@ -1147,6 +1191,7 @@ def build(page_key: str) -> dict[str, Any]:
         "refresh_generation": expected_generation,
         "sections": sections,
         "data": data,
+        **_business_metadata(data, sections),
     }
     if errors:
         _record_failed_build(page_key, expected_generation, payload)
@@ -1216,6 +1261,7 @@ def read(page_key: str, *, force: bool = False) -> dict[str, Any]:
         response = copy.deepcopy(cached)
         response["stale"] = expired
         response["refreshing"] = expired
+        response["stale_reason"] = "snapshot_ttl_expired" if expired else ""
         return _with_runtime_overlay(page_key, response)
     if isinstance(cached, dict):
         redis_delete(_redis_key(page_key))
@@ -1225,6 +1271,10 @@ def read(page_key: str, *, force: bool = False) -> dict[str, Any]:
         response = copy.deepcopy(durable)
         response["stale"] = expired or bool(metadata.get("invalidated_at"))
         response["refreshing"] = response["stale"]
+        response["stale_reason"] = (
+            "source_invalidated" if metadata.get("invalidated_at")
+            else "snapshot_ttl_expired" if expired else ""
+        )
         # Expiry affects freshness, not content identity. Mirror the committed
         # version while waiting, avoiding repeated cross-node payload transfers.
         if not metadata.get("invalidated_at"):

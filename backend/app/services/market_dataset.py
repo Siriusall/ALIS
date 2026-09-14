@@ -481,12 +481,13 @@ def sync_market_dataset(
     if not source:
         raise DatasetUnavailable("dataset source not configured")
     downloaded = reused = transferred = 0
+    follows_latest = version is None
     with (
         _lock(root),
         tempfile.TemporaryDirectory(dir=root, prefix=".prepare-") as stage_name,
     ):
         stage = Path(stage_name)
-        if not version:
+        if follows_latest:
             _fetch(source, "latest.json", stage / "latest.json")
             version = json.loads((stage / "latest.json").read_text())["version"]
         if not isinstance(version, str) or not _HEX.fullmatch(version):
@@ -523,12 +524,28 @@ def sync_market_dataset(
             downloaded += 1
             transferred += part["bytes"]
         _atomic(manifest_path, _json_bytes(manifest))
-        _atomic(root / "latest.json", _json_bytes({"version": version}))
+        # Explicit versions replay immutable evidence and must not move the
+        # shared pointer used by future tasks.
+        if follows_latest:
+            pointer_path = root / "latest.json"
+            if pointer_path.is_file():
+                try:
+                    current_version = json.loads(pointer_path.read_text())["version"]
+                    current = json.loads(
+                        (root / "manifests" / f"{current_version}.json").read_text()
+                    )
+                    _validate_manifest(current, current_version)
+                    if str(manifest.get("end") or "") < str(current.get("end") or ""):
+                        raise DatasetUnavailable("refusing to move latest dataset backwards")
+                except (KeyError, TypeError, ValueError, OSError) as exc:
+                    raise DatasetUnavailable("current dataset pointer is invalid") from exc
+            _atomic(pointer_path, _json_bytes({"version": version}))
     return dict(
         version=version,
         downloaded_partitions=downloaded,
         reused_partitions=reused,
         downloaded_bytes=transferred,
+        latest_pointer_updated=follows_latest,
     )
 
 

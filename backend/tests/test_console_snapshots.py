@@ -45,15 +45,15 @@ def test_build_preserves_section_failure(monkeypatch):
 
 
 def test_control_snapshot_readers_do_not_require_api_loopback_redis(monkeypatch):
-    from app import main
+    from app.services import application_runtime_projection
 
-    seen: dict[str, object] = {}
-    monkeypatch.setattr(main, "_health_payload", lambda *, require_redis=True: seen.setdefault("health", require_redis) or {})
+    projected = {"status": "ok", "ready": True, "projection_status": "current"}
+    monkeypatch.setattr(application_runtime_projection, "read_health", lambda: projected)
 
     readers = snapshots._readers("decision")
-    readers["health"]()
+    health = readers["health"]()
 
-    assert seen == {"health": False}
+    assert health == projected
     projection = readers["tradingReady"]()
     assert projection["schema_version"] == "alis_trading_readiness_projection_v1"
     assert projection["status"] == "waiting"
@@ -230,6 +230,21 @@ def test_degraded_envelope_metadata_is_not_readable_evidence():
     assert snapshots._has_readable_evidence(value) is False
     _, section = snapshots._section("evidence", "decisionAudit", lambda: value)
     assert section["status"] == "degraded"
+
+
+def test_snapshot_separates_document_and_business_freshness():
+    metadata = snapshots._business_metadata(
+        {
+            "daily": {"status": "ready", "latest_trade_date": "20260911"},
+            "research": {"ok": False, "status": "partial", "data_as_of": "20260829"},
+        },
+        {"daily": {"status": "ready"}, "research": {"status": "ready"}},
+    )
+
+    assert metadata["document_status"] == "ready"
+    assert metadata["business_status"] == "partial"
+    assert metadata["data_as_of"] == "20260911"
+    assert "research.status" in metadata["business_issues"]
 
 
 def test_evidence_snapshot_freezes_first_decision_detail_and_verification(monkeypatch):

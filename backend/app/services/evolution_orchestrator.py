@@ -127,6 +127,7 @@ NETWORK_OPTIONAL_TASK_TYPES = frozenset({
     "strategy_cluster_distillation",
     "strategy_failure_model_training",
     "strategy_portfolio_research",
+    "research_maintenance",
 })
 
 

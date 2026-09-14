@@ -1058,7 +1058,13 @@ def start_daily_update_scheduler() -> bool:
                                     ready,
                                     discovery.get("winners") or discovery.get("winner"),
                                 )
-                            elif result.get("reason") != "already_running":
+                            elif result.get("reason") in {"already_running", "already_completed"}:
+                                logger.info(
+                                    "自动收盘日更无需重复启动 target=%s reason=%s",
+                                    target,
+                                    result.get("reason"),
+                                )
+                            else:
                                 logger.warning("自动收盘日更启动失败 target=%s result=%s", target, result)
                         else:
                             _set_state(

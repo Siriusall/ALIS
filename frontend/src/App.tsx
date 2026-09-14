@@ -110,10 +110,12 @@ function SnapshotStatusBar({
     && !active
     && !["warming_up", "unavailable", "error"].includes(sourceStatus);
   const failed = sourceStatus === "error" || sourceStatus === "unavailable";
+  const businessStatus = String(snapshot.businessStatus || "unknown").toLowerCase();
+  const businessPartial = businessStatus === "partial" || businessStatus === "blocked";
   const stateLabel = failed
     ? "快照刷新异常"
     : latest
-      ? sourceStatus === "degraded" ? "快照已同步 · 部分可用" : "页面快照已同步"
+      ? sourceStatus === "degraded" || businessPartial ? "快照已同步 · 业务部分可用" : "页面快照已同步"
       : serverRefreshing || stale
         ? "快照待更新"
         : "正在检查最新快照";
@@ -130,7 +132,7 @@ function SnapshotStatusBar({
 
   return <div className={`snapshot-status-bar is-${tone}`} role="status" aria-live="polite">
     <div className="snapshot-status-main"><span className="snapshot-state-dot"/><strong>{stateLabel}</strong><small>页面快照：{snapshotPageLabels[String(snapshot.page)] || "当前页面"}</small></div>
-    <div className="snapshot-status-time"><span>快照刷新时间</span><strong>{formatSnapshotTime(snapshot.generatedAt)}</strong></div>
+    <div className="snapshot-status-time"><span>快照刷新时间</span><strong>{formatSnapshotTime(snapshot.generatedAt)}</strong><small>业务数据截止 {String(snapshot.dataAsOf || "未记录")}</small></div>
     <div className="snapshot-status-progress"><div><span>后台刷新进度</span><strong>{progressLabel}</strong></div><span className={`snapshot-progress-track ${latest ? "is-complete" : "is-active"}`}><i/></span></div>
   </div>;
 }

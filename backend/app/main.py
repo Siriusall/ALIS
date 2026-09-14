@@ -413,7 +413,7 @@ def _health_payload(*, require_redis: bool = True) -> dict:
         and (not require_redis or bool(redis.get("available", False)))
         and runtime_ready
     )
-    return {
+    payload = {
         "status": "ok" if ready else "error",
         "ready": ready,
         "degraded": databases_ready and bool(issues),
@@ -441,6 +441,17 @@ def _health_payload(*, require_redis: bool = True) -> dict:
             "runtime_heartbeats": runtime_heartbeats,
         },
     }
+    if require_redis:
+        # Only the API process can assert the state of its loopback Redis and
+        # loaded release. DB-local console builders consume this projection
+        # instead of manufacturing application health from their own process.
+        try:
+            from app.services.application_runtime_projection import publish_health
+
+            publish_health(payload)
+        except Exception as exc:  # telemetry must not make the live gate fail
+            logger.warning("Application runtime projection unavailable error_type=%s", type(exc).__name__)
+    return payload
 
 
 @app.get("/api/health")

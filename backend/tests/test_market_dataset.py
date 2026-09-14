@@ -106,6 +106,57 @@ def test_sync_reuses_content_addressed_partitions(tmp_path: Path):
     )
 
 
+def test_explicit_historical_sync_does_not_roll_back_latest_pointer(tmp_path: Path):
+    source, old_version = _make_source(tmp_path)
+    target = tmp_path / "target"
+    sync_market_dataset(source=str(source), root=target)
+    old_manifest = json.loads((source / "manifests" / f"{old_version}.json").read_text())
+    september = [
+        {**part, "start": "20260901", "end": "20260930"}
+        for part in old_manifest["partitions"]
+    ]
+    new_manifest = {
+        **old_manifest,
+        "end": "20260930",
+        "trade_dates": [*old_manifest["trade_dates"], "20260901"],
+        "partitions": [*old_manifest["partitions"], *september],
+    }
+    new_version = _identity(new_manifest)
+    (source / "manifests" / f"{new_version}.json").write_text(json.dumps(new_manifest))
+    (source / "latest.json").write_text(json.dumps({"version": new_version}))
+
+    followed = sync_market_dataset(source=str(source), root=target)
+    replayed = sync_market_dataset(source=str(source), version=old_version, root=target)
+
+    assert followed["latest_pointer_updated"] is True
+    assert replayed["latest_pointer_updated"] is False
+    assert json.loads((target / "latest.json").read_text())["version"] == new_version
+
+
+def test_follow_latest_rejects_pointer_rollback(tmp_path: Path):
+    source, old_version = _make_source(tmp_path)
+    target = tmp_path / "target"
+    old_manifest = json.loads((source / "manifests" / f"{old_version}.json").read_text())
+    september = [
+        {**part, "start": "20260901", "end": "20260930"}
+        for part in old_manifest["partitions"]
+    ]
+    new_manifest = {
+        **old_manifest,
+        "end": "20260930",
+        "trade_dates": [*old_manifest["trade_dates"], "20260901"],
+        "partitions": [*old_manifest["partitions"], *september],
+    }
+    new_version = _identity(new_manifest)
+    (source / "manifests" / f"{new_version}.json").write_text(json.dumps(new_manifest))
+    (source / "latest.json").write_text(json.dumps({"version": new_version}))
+    sync_market_dataset(source=str(source), root=target)
+    (source / "latest.json").write_text(json.dumps({"version": old_version}))
+
+    with pytest.raises(DatasetUnavailable, match="backwards"):
+        sync_market_dataset(source=str(source), root=target)
+
+
 def test_derived_row_whitelists_research_fields_and_drops_raw_payload():
     import json
 

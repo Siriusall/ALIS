@@ -383,13 +383,22 @@ def _owner_summary(steps: list[dict[str, Any]]) -> dict[str, Any]:
         )
     )
     research_readiness = "accumulating" if historical_gate_waits else "ready"
+    rebalance_date = rebalance.get("plan_date") or rebalance.get("trade_date")
+    rebalance_status = str(rebalance.get("status") or "").strip()
+    if not rebalance_status:
+        if rebalance.get("blocked_reason"):
+            rebalance_status = "blocked"
+        elif rebalance_date or rebalance_items:
+            rebalance_status = "generated"
+        else:
+            rebalance_status = "waiting"
     return {
         "schema_version": "alis_owner_daily_summary_v4_split_health",
         "generated_at": datetime.now().astimezone().isoformat(),
         "questions": {
             "today_rebalance": {
-                "status": str(rebalance.get("status") or "generated"),
-                "plan_date": rebalance.get("plan_date") or rebalance.get("trade_date"),
+                "status": rebalance_status,
+                "plan_date": rebalance_date,
                 "summary": rebalance.get("summary") or {},
                 "proposal_count": len(rebalance_actions),
                 "execution_authorized": bool(rebalance.get("execution_authorized")),

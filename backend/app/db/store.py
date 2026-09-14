@@ -1015,6 +1015,14 @@ CREATE TABLE IF NOT EXISTS runtime_worker_heartbeats (
     updated_at TEXT NOT NULL,
     PRIMARY KEY (worker_pool, component)
 );
+CREATE TABLE IF NOT EXISTS application_runtime_projections (
+    projection_kind TEXT PRIMARY KEY,
+    source_role TEXT NOT NULL,
+    source_instance TEXT NOT NULL,
+    observed_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    payload_json TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS strategy_shadow_observations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     model_version_id INTEGER NOT NULL,
