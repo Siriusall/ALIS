@@ -18,7 +18,7 @@ from app.data_platform.services.observation_clock import (
     _valid_provenance_sql,
     load_raw_record_versions,
 )
-from app.services.point_in_time import normalize_explicit_timestamp
+from app.services.point_in_time import normalize_explicit_timestamp, normalize_timestamp
 
 _BUSINESS_TZ = ZoneInfo("Asia/Shanghai")
 
@@ -788,10 +788,17 @@ def _latest_industry_snapshot(
             # Filter every observation clock before selecting the latest row
             # for an industry.  Ranking first would let a late repair hide an
             # older version that was genuinely visible at the replay cutoff.
+            # Use a bounded subquery or compact columns to prevent transfer timeouts over egress limit.
             candidates = [dict(row) for row in c.execute(
                 f"""SELECT {snapshot_columns}
-                      FROM dc_industry_state_snapshot s
-                     {snapshot_where}
+                      FROM (
+                          SELECT s.*, ROW_NUMBER() OVER(
+                              PARTITION BY industry_name ORDER BY as_of_date DESC, available_time DESC
+                          ) rn
+                          FROM dc_industry_state_snapshot s
+                          {snapshot_where}
+                      ) s
+                     WHERE rn <= 5
                      ORDER BY industry_name,as_of_date DESC,available_time DESC""",
                 snapshot_params,
             ).fetchall()]
