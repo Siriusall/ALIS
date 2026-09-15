@@ -12,7 +12,7 @@ from app.data_platform.services.observation_clock import (
     load_snapshot_versions,
 )
 from app.db.store import _conn as _business_conn
-from app.services.point_in_time import normalize_explicit_timestamp
+from app.services.point_in_time import normalize_explicit_timestamp, normalize_timestamp
 
 
 def _clip(value: Any, low: float = 0.0, high: float = 100.0) -> float:
@@ -316,7 +316,7 @@ def _decode_observation_payload(row: dict[str, Any]) -> dict[str, Any]:
         payload = {}
     item = dict(row)
     item["payload"] = payload
-    item["available_time"] = str(item.get("observed_at") or "")
+    item["available_time"] = str(item.get("available_time") or item.get("observed_at") or "")
     # Provider payload fields are useful to the research templates, but may not
     # overwrite the immutable envelope (including its observation clocks).
     for key, value in payload.items():
@@ -347,9 +347,15 @@ def _strict_raw_payloads(
         cutoff=cutoff,
         ts_codes=[ts_code],
     )
-    if rows is None:
-        return []
-    return [_decode_observation_payload(dict(row)) for row in rows]
+    if rows:
+        return [_decode_observation_payload(dict(row)) for row in rows]
+    cutoff_iso = cutoff[:19]
+    query = """SELECT period, ann_date, available_time, updated_at, payload_json, observed_at, first_observed_at, economic_available_time, created_at
+        FROM dc_tushare_raw_records
+        WHERE api_name=? AND ts_code=? AND (available_time='' OR available_time<=?)
+        ORDER BY period DESC, available_time DESC, id DESC LIMIT ?"""
+    raw_rows = [dict(row) for row in c.execute(query, (api, ts_code, cutoff_iso, max(1, int(limit * 2)))).fetchall()]
+    return [_decode_observation_payload(r) for r in raw_rows]
 
 
 def _strict_master_row(
@@ -395,8 +401,8 @@ def _strict_master_row(
     if not row:
         return None, "stock_master_not_found"
     item = dict(row)
-    available = normalize_explicit_timestamp(item.get("available_time"))
-    updated = normalize_explicit_timestamp(item.get("updated_at"))
+    available = normalize_timestamp(item.get("available_time"))
+    updated = normalize_timestamp(item.get("updated_at"))
     if not available or not updated or available > cutoff or updated > cutoff:
         return None, "stock_master_not_visible_at_cutoff"
     return item, "ready"
@@ -1339,8 +1345,8 @@ def build_valuation_state(ts_code: str, *, persist: bool = True, as_of_time: str
             peer_codes = []
             for row in peer_master_rows:
                 peer = dict(row)
-                available = normalize_explicit_timestamp(peer.get("available_time"))
-                updated = normalize_explicit_timestamp(peer.get("updated_at"))
+                available = normalize_timestamp(peer.get("available_time"))
+                updated = normalize_timestamp(peer.get("updated_at"))
                 if available and updated and available <= cutoff and updated <= cutoff:
                     peer_codes.append(str(peer.get("ts_code") or ""))
             peer_versions = load_snapshot_versions(

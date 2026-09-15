@@ -290,7 +290,8 @@ def materialize_training_feedback() -> dict[str, Any]:
     with _conn() as c:
         outcomes = [dict(row) for row in c.execute("""SELECT a.*,d.model_version,d.market_state_json,d.research_state_json,
             d.valuation_json,d.portfolio_context_json,d.decision_type,d.ts_code
-            FROM decision_outcome_attributions a JOIN decision_snapshots d ON d.id=a.decision_snapshot_id""").fetchall()]
+            FROM decision_outcome_attributions a JOIN decision_snapshots d ON d.id=a.decision_snapshot_id
+            ORDER BY a.id DESC LIMIT 500""").fetchall()]
     auto_written = 0
     for row in outcomes:
         source = f"outcome_{int(row['horizon_sessions'])}d"

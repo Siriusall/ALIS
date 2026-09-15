@@ -4307,6 +4307,7 @@ def financial_research_completeness(
             if any(label in industry for label in ("银行", "保险", "证券", "多元金融"))
             else FINANCIAL_RESEARCH_REQUIRED_FIELDS
         )
+        cutoff_iso = str(as_of_time or "")[:19]
         if periods:
             target_periods = list(dict.fromkeys(str(value) for value in periods if str(value)))
         else:
@@ -4315,17 +4316,31 @@ def financial_research_completeness(
                 period_limit=max(1, min(int(period_limit), 12)),
             )
             target_periods = sorted({str(row.get("period") or "") for row in (income_rows or []) if str(row.get("period") or "")}, reverse=True)
+            if not target_periods:
+                raw_income = c.execute(
+                    "SELECT DISTINCT period FROM dc_tushare_raw_records WHERE api_name=? AND ts_code=? AND (available_time='' OR available_time<=?) ORDER BY period DESC LIMIT ?",
+                    ("income", code, cutoff_iso, max(1, min(int(period_limit), 12))),
+                ).fetchall()
+                target_periods = [str(dict(r).get("period") or "") for r in raw_income if str(dict(r).get("period") or "")]
         payloads: dict[tuple[str, str], list[str]] = {}
         for api_name in required_contract:
             rows = load_raw_record_versions(
                 c, api_name, cutoff=str(as_of_time or ""), ts_codes=[code], periods=target_periods,
             )
-            if rows is None:
-                continue
-            for row in rows:
-                period = str(row.get("period") or "")
-                if period in target_periods:
-                    payloads.setdefault((period, api_name), []).append(str(row.get("payload_json") or "{}"))
+            if rows:
+                for row in rows:
+                    period = str(row.get("period") or "")
+                    if period in target_periods:
+                        payloads.setdefault((period, api_name), []).append(str(row.get("payload_json") or "{}"))
+            elif target_periods:
+                placeholders = ",".join("?" for _ in target_periods)
+                query = f"SELECT period, payload_json FROM dc_tushare_raw_records WHERE api_name=? AND ts_code=? AND period IN ({placeholders}) AND (available_time='' OR available_time<=?)"
+                raw_rows = c.execute(query, tuple([api_name, code] + target_periods + [cutoff_iso])).fetchall()
+                for r in raw_rows:
+                    item = dict(r)
+                    period = str(item.get("period") or "")
+                    if period in target_periods:
+                        payloads.setdefault((period, api_name), []).append(str(item.get("payload_json") or "{}"))
     # The database connection is deliberately closed before JSON decoding and
     # contract evaluation.  This keeps the read session in autocommit mode and
     # prevents CPU-side payload work from pinning a PostgreSQL transaction.
