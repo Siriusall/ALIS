@@ -802,7 +802,7 @@ def _latest_industry_snapshot(
                 if industry in seen_industries:
                     continue
                 if not all(
-                    (value := normalize_explicit_timestamp(row.get(column)))
+                    (value := normalize_timestamp(row.get(column)))
                     and value <= cutoff
                     for column in ("available_time", "created_at", "updated_at")
                 ):
