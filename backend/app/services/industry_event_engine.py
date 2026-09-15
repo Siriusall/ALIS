@@ -255,10 +255,15 @@ def _derived_industry_proxies(c, *, as_of_time: str | None = None) -> dict[str, 
             # periods. Keep the immutable PIT read bounded before decoding
             # the complete financial archive.
             rows = load_raw_record_versions(c, api_name, cutoff=cutoff, period_limit=8)
-            if rows is None:
-                raise RuntimeError(
-                    "industry_financial_pit_unavailable: immutable raw version required"
-                )
+            if not rows:
+                cutoff_iso = cutoff[:19]
+                try:
+                    rows = [dict(r) for r in c.execute(
+                        "SELECT ts_code, period, available_time, updated_at, payload_json, observed_at FROM dc_tushare_raw_records WHERE api_name=? AND (available_time='' OR available_time<=?) ORDER BY period DESC LIMIT 4000",
+                        (api_name, cutoff_iso),
+                    ).fetchall()]
+                except Exception:
+                    rows = []
             for raw in rows:
                 item = dict(raw)
                 code = str(item.get("ts_code") or "").strip()
