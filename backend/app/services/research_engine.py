@@ -350,7 +350,7 @@ def _strict_raw_payloads(
     if rows:
         return [_decode_observation_payload(dict(row)) for row in rows]
     cutoff_iso = cutoff[:19]
-    query = """SELECT period, ann_date, available_time, updated_at, payload_json, observed_at, first_observed_at, economic_available_time, created_at
+    query = """SELECT period, ann_date, available_time, updated_at, payload_json, observed_at, first_observed_at, economic_available_time
         FROM dc_tushare_raw_records
         WHERE api_name=? AND ts_code=? AND (available_time='' OR available_time<=?)
         ORDER BY period DESC, available_time DESC, id DESC LIMIT ?"""
