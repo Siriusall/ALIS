@@ -46,6 +46,7 @@ class _Connection:
 def test_materialized_industry_snapshot_parameterizes_percent_like_pattern(monkeypatch):
     conn = _Connection()
     monkeypatch.setattr(engine, "_conn", lambda: conn)
+    monkeypatch.setattr(engine, "_read_conn", lambda: conn)
 
     result = engine._latest_industry_snapshot("20260811")
 
@@ -71,6 +72,7 @@ def test_materialized_industry_snapshot_blocks_late_observation_for_formal_cutof
         )
     )
     monkeypatch.setattr(engine, "_conn", lambda: conn)
+    monkeypatch.setattr(engine, "_read_conn", lambda: conn)
 
     result = engine._latest_industry_snapshot(
         "20260811", as_of_time="2026-08-11T15:00:00+08:00",

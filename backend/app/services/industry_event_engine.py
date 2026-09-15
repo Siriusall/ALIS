@@ -778,7 +778,7 @@ def _latest_industry_snapshot(
     cutoff = normalize_explicit_timestamp(as_of_time) if as_of_time else ""
     if as_of_time and not cutoff:
         return None
-    with _conn() as c:
+    with _read_conn() as c:
         snapshot_columns = (
             "industry_name,as_of_date,model_version,state_json,available_time,created_at,updated_at"
             if compact
@@ -798,7 +798,7 @@ def _latest_industry_snapshot(
                           FROM dc_industry_state_snapshot s
                           {snapshot_where}
                       ) s
-                     WHERE rn <= 5
+                     WHERE rn <= 1
                      ORDER BY industry_name,as_of_date DESC,available_time DESC""",
                 snapshot_params,
             ).fetchall()]
