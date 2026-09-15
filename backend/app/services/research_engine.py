@@ -6,7 +6,7 @@ from statistics import median, pstdev
 from datetime import datetime
 from typing import Any
 
-from app.data_platform.db import _conn
+from app.data_platform.db import _conn, _read_conn
 from app.data_platform.services.observation_clock import (
     load_raw_record_versions,
     load_snapshot_versions,
