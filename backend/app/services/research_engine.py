@@ -722,7 +722,7 @@ def _specialized_research_inputs(code: str, industry_name: str, *, as_of_time: s
 
     expectation = build_expectation_state(code, persist_baseline=False, as_of_time=as_of_time)
     valuation = build_valuation_state(code, persist=False, as_of_time=as_of_time)
-    industry_result = list_industries(as_of_time=as_of_time)
+    industry_result = list_industries(as_of_time=as_of_time, compact=True)
     events_result = list_events(ts_code=code, limit=100, as_of_time=as_of_time)
     if as_of_time:
         dependency_failures = []
