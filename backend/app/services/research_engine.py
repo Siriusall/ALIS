@@ -456,7 +456,7 @@ def _strict_snapshot_for_code(
 
 def _payloads(ts_code: str, api: str, limit: int = 12, *, as_of_time: str | None = None) -> list[dict[str, Any]]:
     if as_of_time:
-        with _conn() as c:
+        with _read_conn() as c:
             rows = _strict_raw_payloads(
                 c, ts_code, api, limit=limit, as_of_time=as_of_time,
             )
@@ -471,7 +471,7 @@ def _payloads(ts_code: str, api: str, limit: int = 12, *, as_of_time: str | None
             reverse=True,
         )
     else:
-        with _conn() as c:
+        with _read_conn() as c:
             query = """WITH ranked AS (
                 SELECT period,available_time,payload_json,
                        ROW_NUMBER() OVER(
@@ -519,7 +519,7 @@ def _forecast_history(ts_code: str, limit: int = 16, *, as_of_time: str | None =
     a management notice as a sell-side estimate.
     """
     if as_of_time:
-        with _conn() as c:
+        with _read_conn() as c:
             rows = _strict_raw_payloads(
                 c, ts_code, "forecast", limit=limit, as_of_time=as_of_time,
             )
@@ -531,7 +531,7 @@ def _forecast_history(ts_code: str, limit: int = 16, *, as_of_time: str | None =
             reverse=True,
         )
     else:
-        with _conn() as c:
+        with _read_conn() as c:
             rows = [dict(row) for row in c.execute(
                 """SELECT period,ann_date,available_time,payload_json FROM dc_tushare_raw_records
                    WHERE api_name='forecast' AND ts_code=?
@@ -782,7 +782,7 @@ def _specialized_research_inputs(code: str, industry_name: str, *, as_of_time: s
 def build_stock_research(ts_code: str, *, persist: bool = True, as_of_time: str | None = None) -> dict[str, Any]:
     code = str(ts_code).strip().upper()
     as_of_date = str(as_of_time or "")[:10].replace("-", "")
-    with _conn() as c:
+    with _read_conn() as c:
         if as_of_date:
             master_row, master_status = _strict_master_row(
                 c, code, as_of_time=str(as_of_time),
@@ -1274,7 +1274,7 @@ def _dcf_per_share(
 def build_valuation_state(ts_code: str, *, persist: bool = True, as_of_time: str | None = None) -> dict[str, Any]:
     code = str(ts_code).strip().upper()
     as_of_date = str(as_of_time or "")[:10].replace("-", "")
-    with _conn() as c:
+    with _read_conn() as c:
         if as_of_date:
             cutoff = normalize_explicit_timestamp(str(as_of_time))
             if not cutoff:
