@@ -887,10 +887,18 @@ def build_stock_research(ts_code: str, *, persist: bool = True, as_of_time: str 
         }
     receivable_to_revenue = _safe_ratio(latest_balance.get("accounts_receiv"), latest_income.get("total_revenue"))
     cash_debt_coverage = _safe_ratio(cash_balance, interest_debt) if interest_debt > 0 else None
+    netprofit_margin_val = latest_indicator.get("netprofit_margin")
+    if netprofit_margin_val is None and latest_income.get("total_revenue") and latest_income.get("n_income") is not None:
+        netprofit_margin_val = _safe_ratio(latest_income.get("n_income"), latest_income.get("total_revenue")) * 100.0
+    roe_val = latest_indicator.get("roe")
+    if roe_val is None:
+        roe_val = latest_indicator.get("roe_waa") if latest_indicator.get("roe_waa") is not None else latest_indicator.get("roe_dt")
+    if roe_val is None and latest_income.get("n_income") is not None and latest_balance.get("total_hldr_eqy_exc_min_int"):
+        roe_val = _safe_ratio(latest_income.get("n_income"), latest_balance.get("total_hldr_eqy_exc_min_int")) * 100.0
     dimensions_input = {
         "quality": {
-            "profitability": _linear(latest_indicator.get("netprofit_margin"), -15, 20),
-            "capital_efficiency": _linear(latest_indicator.get("roe"), -10, 25),
+            "profitability": _linear(netprofit_margin_val, -15, 20),
+            "capital_efficiency": _linear(roe_val, -10, 25),
             "cash_conversion": _linear(cash_conversion, 0, 1.2),
             "balance_sheet_safety": _linear(debt_ratio, 90, 25),
             "stability": stability,
@@ -936,8 +944,8 @@ def build_stock_research(ts_code: str, *, persist: bool = True, as_of_time: str 
     else:
         nonfinancial_inputs = _nonfinancial_template_inputs(
             template_kind,
-            netprofit_margin=latest_indicator.get("netprofit_margin"),
-            roe=latest_indicator.get("roe"),
+            netprofit_margin=netprofit_margin_val,
+            roe=roe_val,
             debt_ratio=debt_ratio,
             cash_conversion=cash_conversion,
             revenue_growth=revenue_growth,

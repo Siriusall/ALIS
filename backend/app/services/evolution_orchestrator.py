@@ -1326,6 +1326,7 @@ def ensure_latest_ready_system_cycle() -> dict[str, Any]:
     from app.services.data_health import assess_latest_decision_data_health
     from app.services.profit_loop import (
         LEGACY_UNIFIED_DAILY_DECISION_SCHEMA_VERSION,
+        PREVIOUS_UNIFIED_DAILY_DECISION_SCHEMA_VERSION,
         UNIFIED_DAILY_DECISION_SCHEMA_VERSION,
     )
 
@@ -1395,6 +1396,7 @@ def ensure_latest_ready_system_cycle() -> dict[str, Any]:
                         and str(plan.get("decision_contract_schema_version") or "")
                         in {
                             LEGACY_UNIFIED_DAILY_DECISION_SCHEMA_VERSION,
+                            PREVIOUS_UNIFIED_DAILY_DECISION_SCHEMA_VERSION,
                             UNIFIED_DAILY_DECISION_SCHEMA_VERSION,
                         }
                     )

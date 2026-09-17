@@ -83,7 +83,7 @@ def build_decision_version_manifest(
     # cutoff is deliberately rejected when a V2 contract is validated.
     selection_cutoff = normalize_explicit_timestamp(selection.get("data_as_of_time"))
     manifest = {
-        "schema_version": "alis_decision_version_manifest_v2",
+        "schema_version": "alis_decision_version_manifest_v3",
         "release": {
             "id": int(release.get("id") or 0) if release else None,
             "release_key": str(release.get("release_key") or "") if release else "",
@@ -107,6 +107,8 @@ def build_decision_version_manifest(
         "selection": {
             "schema_version": selection.get("schema_version"),
             "selection_hash": selection.get("selection_hash"),
+            "research_tier_schema": ((selection.get("research_tier_contract") or {}).get("schema_version")),
+            "research_tier_contract_hash": ((selection.get("research_tier_contract") or {}).get("contract_hash")),
             "environment_snapshot": selection.get("environment_snapshot") or {},
             "factor_expert_snapshot": selection.get("factor_expert_snapshot") or {},
         },
@@ -130,6 +132,7 @@ def build_decision_version_manifest(
             "competition_schema": ((optimizer.get("method_competition") or {}).get("schema_version")),
             "risk_budget": (portfolio or {}).get("risk_budget") or {},
             "risk_limit_contract": (portfolio or {}).get("risk_limit_contract") or {},
+            "tiered_equity_budget": (portfolio or {}).get("tiered_equity_budget") or {},
         },
         "execution_cost": (
             (portfolio or {}).get("execution_cost_contract")
@@ -138,7 +141,7 @@ def build_decision_version_manifest(
             else active_execution_cost_contract()
         ),
         "execution_contract": {
-            "decision_schema": "alis_unified_daily_decision_v2",
+            "decision_schema": "alis_unified_daily_decision_v3",
             "t1_safety_schema": "alis_t1_execution_safety_v2",
             "quantity_policy": "t_day_frozen_exact_quantity_or_t1_safety_veto",
         },

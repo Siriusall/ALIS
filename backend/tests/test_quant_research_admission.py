@@ -64,6 +64,9 @@ def test_dynamic_gate_is_applied_to_research_admitted_candidate(monkeypatch):
     assert admitted == []
     assert blocked[0]["code"] == "dynamic_strategy_gate_failed"
     assert summary["risk_budget_multiplier"] == 0
+    gate = summary["items"][0]["gate"]
+    assert gate["hard_blockers"] == []
+    assert gate["research_blockers"]
 
 
 def test_champion_hsmm_state_replaces_transparent_state_at_same_cutoff(monkeypatch):

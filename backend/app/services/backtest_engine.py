@@ -383,7 +383,7 @@ def run_backtest(
                 if not tradable.ok:
                     constraint_events.append({"date": d, "symbol": sym, "side": "SELL", "code": tradable.code, "message": tradable.message})
                     continue
-                px = apply_slippage_sell(row.open, symbol)
+                px = apply_slippage_sell(row.open, sym)
                 gross = px * pos.quantity
                 fee_comm = round(commission(gross), 2)
                 fee_trans = round(transfer_fee(gross), 2)
@@ -426,7 +426,7 @@ def run_backtest(
                     if not tradable.ok:
                         constraint_events.append({"date": d, "symbol": sym, "side": "BUY", "code": tradable.code, "message": tradable.message})
                         continue
-                    px = apply_slippage_buy(row.open, symbol)
+                    px = apply_slippage_buy(row.open, sym)
                     qty = int(per_budget / px)
                     qty = normalize_lot_quantity(qty)
                     if qty <= 0:

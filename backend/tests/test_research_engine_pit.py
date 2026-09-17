@@ -73,6 +73,7 @@ def _patch_connection(monkeypatch, connection: sqlite3.Connection) -> None:
         yield connection
 
     monkeypatch.setattr(research_engine, "_conn", fake_conn)
+    monkeypatch.setattr(research_engine, "_read_conn", fake_conn)
 
 
 def test_research_raw_reader_excludes_late_economic_clock_even_when_observed_early(monkeypatch):

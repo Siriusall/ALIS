@@ -41,7 +41,8 @@ from app.services.risk_limit_contract import (
 )
 from app.services.two_group_optimizer import two_group_cvar_optimizer
 
-UNIFIED_DAILY_DECISION_SCHEMA_VERSION = "alis_unified_daily_decision_v2"
+UNIFIED_DAILY_DECISION_SCHEMA_VERSION = "alis_unified_daily_decision_v3"
+PREVIOUS_UNIFIED_DAILY_DECISION_SCHEMA_VERSION = "alis_unified_daily_decision_v2"
 LEGACY_UNIFIED_DAILY_DECISION_SCHEMA_VERSION = "alis_unified_daily_decision_v1"
 UNIFIED_EXECUTION_SAFETY_SCHEMA_VERSION = "alis_t1_execution_safety_v2"
 FROZEN_ORDER_DATA_GATE_SCHEMA_VERSION = "alis_frozen_order_execution_data_gate_v1"
@@ -975,7 +976,7 @@ def _build_formal_unified_selection(
         return {
             "ok": False,
             "status": "blocked",
-            "schema_version": "alis_unified_stock_selection_v1",
+            "schema_version": "alis_unified_stock_selection_v2",
             "error": "latest_decision_trade_date_missing",
         }
     try:
@@ -992,7 +993,7 @@ def _build_formal_unified_selection(
         return {
             "ok": False,
             "status": "blocked",
-            "schema_version": "alis_unified_stock_selection_v1",
+            "schema_version": "alis_unified_stock_selection_v2",
             "error": str(exc)[:500],
         }
 
@@ -1240,7 +1241,7 @@ def build_portfolio_reoptimization(*, signal_date: str = "") -> dict[str, Any]:
         else {
             "ok": False,
             "status": "blocked",
-            "schema_version": "alis_unified_stock_selection_v1",
+            "schema_version": "alis_unified_stock_selection_v2",
             "error": (
                 "decision_observation_cutoff_missing_or_invalid"
                 if decision_gate_ready and not decision_clock_ready
@@ -1265,7 +1266,11 @@ def build_portfolio_reoptimization(*, signal_date: str = "") -> dict[str, Any]:
     selection_contract = dict(unified_selection.get("selection_contract") or {}) if unified_available else {}
     unified_symbols = [
         str(value or "").split(".")[0]
-        for value in (selection_contract.get("admitted_symbols") or [])
+        for value in (
+            selection_contract.get("tradable_symbols")
+            or selection_contract.get("admitted_symbols")
+            or []
+        )
         if str(value or "")
     ]
     legacy_symbols = list(dict.fromkeys(core_symbols + candidate_symbols))
@@ -1361,7 +1366,25 @@ def build_portfolio_reoptimization(*, signal_date: str = "") -> dict[str, Any]:
         else 1.0 if risk_status in {"ready", "blocked"}
         else 0.5
     )
-    equity_budget = round(market_budget * profile_budget * portfolio_budget, 6)
+    base_equity_budget = round(market_budget * profile_budget * portfolio_budget, 6)
+    from app.services.research_tier_contract import build_tiered_equity_budget
+    core_equity_symbols = [
+        str(value or "").split(".")[0]
+        for value in (selection_contract.get("core_symbols") or [])
+        if str(value or "")
+    ] if unified_available else list(selection_candidate_symbols)
+    restricted_equity_symbols = [
+        str(value or "").split(".")[0]
+        for value in (selection_contract.get("restricted_symbols") or [])
+        if str(value or "")
+    ] if unified_available else []
+    tiered_equity_budget = build_tiered_equity_budget(
+        market_state=state,
+        base_equity_budget=base_equity_budget,
+        core_symbols=core_equity_symbols,
+        restricted_symbols=restricted_equity_symbols,
+    )
+    equity_budget = float(tiered_equity_budget.get("effective_equity_budget") or 0.0)
     frozen_signal_symbols = (
         ((selection_contract.get("model_signal_snapshot") or {}).get("symbols") or {})
         if unified_available else {}
@@ -1395,6 +1418,23 @@ def build_portfolio_reoptimization(*, signal_date: str = "") -> dict[str, Any]:
         if unified_available
         else {symbol: (mean(values[-20:]) * 20 if values else 0.0) for symbol, values in returns.items()}
     )
+    if unified_available and restricted_equity_symbols:
+        restricted_set = set(restricted_equity_symbols)
+        for symbol in restricted_set:
+            expected[symbol] = round(_safe_float(expected.get(symbol)) * 0.35, 8)
+        for item in expected_return_contract.get("items") or []:
+            if not isinstance(item, dict) or str(item.get("symbol") or "") not in restricted_set:
+                continue
+            raw_expected = _safe_float(item.get("expected_20d_return_before_trade_cost"))
+            item["research_tier"] = "restricted"
+            item["research_quality_discount"] = 0.35
+            item["undiscounted_expected_20d_return"] = round(raw_expected, 8)
+            item["expected_20d_return_before_trade_cost"] = round(raw_expected * 0.35, 8)
+            item["estimated_entry_net_20d_return"] = round(
+                raw_expected * 0.35 - one_way_cost,
+                8,
+            )
+        expected_return_contract["optimizer_expected_returns"] = dict(expected)
     from app.services.defensive_assets import DEFENSIVE_ASSETS, defensive_allocation_for_state
     from app.services.production_strategy import champion_execution_gate
     execution_guard = champion_execution_gate()
@@ -1511,6 +1551,12 @@ def build_portfolio_reoptimization(*, signal_date: str = "") -> dict[str, Any]:
         for item in (risk.get("exposures") or [])
         if str(item.get("symbol") or "")
     }
+    restricted_symbol_cap = _safe_float(tiered_equity_budget.get("restricted_symbol_cap"))
+    for symbol in restricted_equity_symbols:
+        position_weight_caps[symbol] = min(
+            position_weight_caps.get(symbol, DEFAULT_GLOBAL_SINGLE_ASSET_LIMIT),
+            restricted_symbol_cap,
+        )
     symbol_limit_overrides = dict(position_weight_caps)
     controller_risk_breaches = [dict(item) for item in error_breaches if item.get("symbol")]
     exposure_rows = [item for item in (risk.get("exposures") or []) if isinstance(item, dict)]
@@ -1582,6 +1628,8 @@ def build_portfolio_reoptimization(*, signal_date: str = "") -> dict[str, Any]:
         holding_symbols=holding_symbols,
         selections=unified_selection_by_symbol,
         research_evidence=research_evidence,
+        research_tiers=(selection_contract.get("research_tier_contract") or {}).get("items") or {},
+        tiered_equity_budget=tiered_equity_budget,
         expected_returns=expected,
         current_weights=current_weights,
         thesis_status_by_symbol=thesis_status_by_symbol,
@@ -1597,6 +1645,7 @@ def build_portfolio_reoptimization(*, signal_date: str = "") -> dict[str, Any]:
             "data_as_of_time": str(selection_contract.get("data_as_of_time") or ""),
             "data_status": "frozen",
             "risk_budget": {"equity_budget": equity_budget, "max_single_position_pct": DEFAULT_GLOBAL_SINGLE_ASSET_LIMIT},
+            "tiered_equity_budget": tiered_equity_budget,
             "market_state": state,
         },
     )
@@ -1755,6 +1804,8 @@ def build_portfolio_reoptimization(*, signal_date: str = "") -> dict[str, Any]:
                 "min_weight": _safe_float(controller_evidence.get("min_weight")),
                 "max_weight": _safe_float(controller_evidence.get("max_weight")),
             },
+            "research_tier": str(controller_evidence.get("research_tier") or ""),
+            "research_quality_discount": _safe_float(controller_evidence.get("research_quality_discount")),
             "expected_return_contribution_before": round(current_weight * expected_return, 8),
             "expected_return_contribution_after": round(target_weight * expected_return, 8),
             "estimated_one_way_cost": round(_safe_float(planned_cost.get("total_cost")) / max(account_equity, 1.0), 8),
@@ -1773,7 +1824,13 @@ def build_portfolio_reoptimization(*, signal_date: str = "") -> dict[str, Any]:
                 delta=delta,
                 block_reason=str((block_by_symbol.get(symbol) or {}).get("reason") or ""),
             ),
-            "candidate_source": "unified_full_market_selection" if unified_available and symbol in unified_symbols and symbol not in holding_symbols
+            "candidate_source": (
+                "unified_restricted_opportunity_pool"
+                if unified_available and symbol in restricted_equity_symbols and symbol not in holding_symbols
+                else "unified_core_research_pool"
+                if unified_available and symbol in core_equity_symbols and symbol not in holding_symbols
+                else "unified_full_market_selection"
+            ) if unified_available and symbol in unified_symbols and symbol not in holding_symbols
                 else "core_pool_compatibility_preview" if symbol in core_symbols and symbol not in holding_symbols
                 else "candidate_pool_compatibility_preview" if symbol in candidate_symbols and symbol not in holding_symbols
                 else "holding",
@@ -1782,7 +1839,8 @@ def build_portfolio_reoptimization(*, signal_date: str = "") -> dict[str, Any]:
                 "rank_score": unified_evidence.get("score"),
                 "factor_contributions": unified_evidence.get("factor_contributions") or [],
                 "model_signals": unified_evidence.get("model_signals") or {},
-                "path": ["全市场点时截面", "冻结因子公式", "生产模型融合", "研究硬门", "动态策略门", "行业预算", "组合优化"],
+                "research_tier": str(controller_evidence.get("research_tier") or ""),
+                "path": ["全市场点时截面", "交易硬门", "研究证据分层", "StrategyController层级折扣", "行业预算", "组合优化"],
             } if unified_available and symbol in unified_symbols and symbol not in holding_symbols else {
                 "entry_pool": "core",
                 "entered_at": str((core_member_by_symbol.get(symbol) or {}).get("entered_at") or ""),
@@ -1869,7 +1927,7 @@ def build_portfolio_reoptimization(*, signal_date: str = "") -> dict[str, Any]:
             else f"全部持仓均使用 {valuation_as_of} 截止、{observation_cutoff or '无'} 可见的行情估值"
         ), "fallbacks": valuation_fallbacks},
         {"key": "unified_selection", "label": "统一正式选股链路", "status": "pass" if unified_available else "block", "detail": (
-            f"全市场因子模型、研究硬门和动态门已冻结，入选 {len(unified_symbols)} 只"
+            f"全市场因子模型、交易硬门与研究分层已冻结：核心 {len(core_equity_symbols)} 只，受限 {len(restricted_equity_symbols)} 只"
             if unified_available
             else f"统一选股不可用，旧研究池结果仅保留预览：{unified_selection.get('error') or unified_selection.get('status') or 'unknown'}"
         )},
@@ -1937,6 +1995,8 @@ def build_portfolio_reoptimization(*, signal_date: str = "") -> dict[str, Any]:
         "selection_source": selection_source,
         "unified_selection": unified_selection,
         "selection_snapshot": selection_contract,
+        "research_tier_contract": selection_contract.get("research_tier_contract") or {},
+        "tiered_equity_budget": tiered_equity_budget,
         "expected_return_contract": expected_return_contract,
         "pretrade_controller": pretrade_controller,
         "risk_limit_contract": risk_limit_contract,
@@ -1979,6 +2039,8 @@ def build_portfolio_reoptimization(*, signal_date: str = "") -> dict[str, Any]:
             "cash_target": round(1.0 - actual_equity_budget, 6),
             "target_weights": risk.get("target_weights") or {},
             "breaches": risk.get("breaches") or [],
+            "tiered_equity_budget": tiered_equity_budget,
+            "opportunity_status": tiered_equity_budget.get("opportunity_status"),
         },
         "interpretation": "组合层统一预期收益、波动、相关性、换手成本和风险预算；这里只生成模拟目标权重，不连接券商。",
     }
@@ -2394,6 +2456,8 @@ def build_daily_decision_contract(
         "execution_checks": execution_checks,
         "decision_data_gate": decision_gate,
         "selection_snapshot": portfolio.get("selection_snapshot") or {},
+        "research_tier_contract": portfolio.get("research_tier_contract") or {},
+        "tiered_equity_budget": portfolio.get("tiered_equity_budget") or {},
         "pretrade_controller": portfolio.get("pretrade_controller") or {},
         "industry_allocation": portfolio.get("industry_allocation") or {},
         "expected_return_contract": portfolio.get("expected_return_contract") or {},
@@ -2874,7 +2938,10 @@ def claim_daily_rebalance_execution_input(
         except (TypeError, json.JSONDecodeError):
             reject_contract("正式调仓计划 JSON 合同无法解析", "invalid_authoritative_plan")
         schema_version = str(contract.get("schema_version") or "")
-        if schema_version != UNIFIED_DAILY_DECISION_SCHEMA_VERSION:
+        if schema_version not in {
+            UNIFIED_DAILY_DECISION_SCHEMA_VERSION,
+            PREVIOUS_UNIFIED_DAILY_DECISION_SCHEMA_VERSION,
+        }:
             # Autonomous execution may consume only the current frozen
             # contract. Preserve older evidence, but quarantine it before any
             # execution claim can be written.
@@ -2899,6 +2966,7 @@ def claim_daily_rebalance_execution_input(
             )
         if str(contract.get("schema_version") or "") in {
             UNIFIED_DAILY_DECISION_SCHEMA_VERSION,
+            PREVIOUS_UNIFIED_DAILY_DECISION_SCHEMA_VERSION,
             LEGACY_UNIFIED_DAILY_DECISION_SCHEMA_VERSION,
         }:
             from app.services.quant_run_plan_input import validate_unified_decision_contract
@@ -2957,6 +3025,7 @@ def claim_daily_rebalance_execution_input(
         raise order_audit_error
     if str(contract.get("schema_version") or "") in {
         UNIFIED_DAILY_DECISION_SCHEMA_VERSION,
+        PREVIOUS_UNIFIED_DAILY_DECISION_SCHEMA_VERSION,
         LEGACY_UNIFIED_DAILY_DECISION_SCHEMA_VERSION,
     }:
         target_weights = dict(contract.get("target_weights") or {})
@@ -3322,9 +3391,11 @@ def _compact_frozen_plan_contract(contract: dict[str, Any]) -> dict[str, Any]:
         "proposal": compact_proposal,
         "risk_budget": {
             field: risk_budget[field]
-            for field in ("status", "equity_budget", "cash_target")
+            for field in ("status", "equity_budget", "cash_target", "opportunity_status", "tiered_equity_budget")
             if isinstance(risk_budget, dict) and field in risk_budget
         },
+        "research_tier_contract": contract.get("research_tier_contract") or {},
+        "tiered_equity_budget": contract.get("tiered_equity_budget") or {},
         "decision_data_gate": contract.get("decision_data_gate") or {},
         "pretrade_controller": {
             "actions": [
@@ -3374,6 +3445,8 @@ def get_latest_daily_rebalance_plan(trade_date: str = "", *, compact: bool = Fal
                 'proposal',COALESCE(proposal_json::jsonb->'proposal','[]'::jsonb),
                 'execution_orders',COALESCE(proposal_json::jsonb->'execution_orders','[]'::jsonb),
                 'risk_budget',COALESCE(proposal_json::jsonb->'risk_budget','{}'::jsonb),
+                'research_tier_contract',COALESCE(proposal_json::jsonb->'research_tier_contract','{}'::jsonb),
+                'tiered_equity_budget',COALESCE(proposal_json::jsonb->'tiered_equity_budget','{}'::jsonb),
                 'decision_data_gate',COALESCE(proposal_json::jsonb->'decision_data_gate','{}'::jsonb),
                 'pretrade_controller',COALESCE(proposal_json::jsonb->'pretrade_controller','{}'::jsonb),
                 'expected_return_contract',COALESCE(proposal_json::jsonb->'expected_return_contract','{}'::jsonb),
@@ -3402,6 +3475,8 @@ def get_latest_daily_rebalance_plan(trade_date: str = "", *, compact: bool = Fal
     projection = _compact_frozen_plan_contract(contract) if compact else {
         "proposal": contract.get("proposal") or [],
         "risk_budget": contract.get("risk_budget") or {},
+        "research_tier_contract": contract.get("research_tier_contract") or {},
+        "tiered_equity_budget": contract.get("tiered_equity_budget") or {},
         "decision_data_gate": contract.get("decision_data_gate") or {},
         "selection_snapshot": contract.get("selection_snapshot") or {},
         "pretrade_controller": contract.get("pretrade_controller") or {},
@@ -3531,7 +3606,10 @@ def _frozen_execution_order_limits(plan: dict[str, Any]) -> dict[tuple[str, str]
             contract = json.loads(plan.get("proposal_json") or "{}")
         except (TypeError, json.JSONDecodeError):
             return None
-        if str(contract.get("schema_version") or "") != UNIFIED_DAILY_DECISION_SCHEMA_VERSION:
+        if str(contract.get("schema_version") or "") not in {
+            UNIFIED_DAILY_DECISION_SCHEMA_VERSION,
+            PREVIOUS_UNIFIED_DAILY_DECISION_SCHEMA_VERSION,
+        }:
             return None
         frozen_orders = contract.get("execution_orders")
     if isinstance(frozen_orders, str):

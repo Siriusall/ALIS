@@ -105,6 +105,7 @@ export const endpoints = {
   evolutionTasks: "/api/model-strategy/evolution/tasks?limit=30",
   evolutionSchedule: "/api/model-strategy/evolution/schedule",
   ledgerAudit: "/api/model-strategy/evolution/ledger-audit",
+  nodeActivities: "/api/model-strategy/evolution/node-activities",
   quantTasks: "/api/quant-runs/tasks?limit=20",
   quantStatus: "/api/quant-runs/status",
   quantRecent: "/api/quant-runs/recent?limit=10",

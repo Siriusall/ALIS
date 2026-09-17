@@ -28,7 +28,7 @@ export type ConsoleData = Partial<Record<keyof typeof endpoints, Json>> & {
 // Snapshot-backed console routes are the source of truth. Legacy /admin and
 // /factors aliases only redirect in App, so they do not keep a separate fan-out map.
 const routeKeys: Record<string, Array<keyof typeof endpoints>> = {
-  "/overview": ["owner", "ledger", "portfolio", "tradingReady", "latestPlan", "health", "adminTasksLive", "dailyUpdateStatus", "watermarks", "ledgerAudit"],
+  "/overview": ["owner", "ledger", "portfolio", "tradingReady", "latestPlan", "health", "adminTasksLive", "dailyUpdateStatus", "watermarks", "ledgerAudit", "nodeActivities"],
   "/system": ["health", "tradingReady", "adminTasksLive"],
   "/system/versions": ["systemVersionStatus", "systemReleases", "systemContracts"],
   "/decision": ["owner", "decision", "tradingReady", "latestPlan"],

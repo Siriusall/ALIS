@@ -298,7 +298,101 @@ export function Overview({ data }: { data: ConsoleData }) {
     {state.isolated&&<div className="overview-risk-note"><TriangleAlert size={18}/><div><strong>当前策略处于研究隔离</strong><span>{state.defensiveContinuity?`仅允许减仓、卖出及最多 ${fmtPct(state.defensiveMaximum)} 的登记防御 ETF。`:"仅允许减仓、卖出、账本审计和候选研究。"}</span></div></div>}
     <HomeRuntimeSummary data={data}/>
     <Section title="历史周期异常与系统自行处理事项" detail="周期证据与当前实时 readiness 分开显示；只有需要所有者授权的事项会提升为强通知。">{incidents.length ? <div className="incident-list">{incidents.slice(0, 6).map((item, i) => {const historical=String(pick(item,["evidence_scope"],""))==="completed_cycle";return <div key={i}><Status>{pick(item, ["disposition", "status"], "观察")}</Status><div><strong>{historical ? "历史周期证据 · " : ""}{pick(item, ["title", "summary", "name"], "运行事项")}</strong><p>{pick(item, ["next_review", "reason", "detail"], "等待下一周期复核")}{historical && pick(item,["observed_at"],"") ? ` · 观测于 ${String(pick(item,["observed_at"],""))}` : ""}</p></div></div>})}</div> : <Empty title="没有需要所有者处理的事项" detail="等待未来样本和冷却期不计为故障。" />}<a className="text-link" href="/operations">查看系统运行证据 →</a></Section>
+
+    <Section title="节点每日活动与排障日志" detail="展示三台服务器（数据库中台、计算研究集群、应用调度网关）每日运行任务、执行状态与最新异常，便于定位问题。">
+      <NodeDailyActivities data={data.nodeActivities} />
+    </Section>
   </>;
+}
+
+function NodeDailyActivities({ data }: { data?: Json }) {
+  const [selectedDayIndex, setSelectedDayIndex] = useState(0);
+  const days = firstArray(data, ["days"]);
+  if (!days.length) {
+    return <Empty title="暂无节点活动记录" detail="后台任务产生后将在此汇总展示各节点每日工作情况。" />;
+  }
+  const currentDay = days[Math.min(selectedDayIndex, days.length - 1)] || {};
+  const nodes = [
+    { key: "db_node", defaultName: "数据库与数据中台 (122.51.159.195)", icon: Database },
+    { key: "compute_node", defaultName: "计算/研究集群 (124.223.225.117)", icon: ServerCog },
+    { key: "app_node", defaultName: "应用/调度网关 (124.221.86.123)", icon: Workflow },
+  ];
+
+  return <div className="node-activities-container">
+    <div className="node-day-selector">
+      <span className="selector-label"><Clock3 size={15}/> 观测日期：</span>
+      <div className="day-chips">
+        {days.map((d, idx) => {
+          const isSelected = idx === selectedDayIndex;
+          const label = String(pick(d, ["date"], ""));
+          const totalFailed = Number(pick(d, ["db_node.failed"], 0)) + Number(pick(d, ["compute_node.failed"], 0)) + Number(pick(d, ["app_node.failed"], 0));
+          return <button
+            key={label || idx}
+            className={'day-chip' + (isSelected ? ' is-active' : '') + (totalFailed > 0 ? ' has-failed' : '')}
+            onClick={() => setSelectedDayIndex(idx)}
+          >
+            <strong>{label}</strong>
+            {totalFailed > 0 && <span className="badge-fail">{totalFailed} 异常</span>}
+          </button>;
+        })}
+      </div>
+    </div>
+
+    <div className="node-cards-grid">
+      {nodes.map(({ key, defaultName, icon: Icon }) => {
+        const node = pick(currentDay, [key], {}) as Json;
+        const name = String(pick(node, ["name"], defaultName));
+        const role = String(pick(node, ["role"], ""));
+        const completed = Number(pick(node, ["completed"], 0));
+        const failed = Number(pick(node, ["failed"], 0));
+        const queued = Number(pick(node, ["queued"], 0));
+        const running = Number(pick(node, ["running"], 0));
+        const tasks = firstArray(node, ["tasks"]);
+
+        return <article className={'node-activity-card' + (failed > 0 ? ' has-error' : '')} key={key}>
+          <header className="node-card-head">
+            <div className="node-title-group">
+              <Icon size={18} className="node-icon" />
+              <div>
+                <h4>{name}</h4>
+                {role && <small>{role}</small>}
+              </div>
+            </div>
+            <div className="node-status-badges">
+              {running > 0 && <Status tone="info">{running} 运行中</Status>}
+              {completed > 0 && <Status tone="good">{completed} 完成</Status>}
+              {queued > 0 && <Status tone="watch">{queued} 排队</Status>}
+              {failed > 0 && <Status tone="danger">{failed} 失败</Status>}
+              {completed === 0 && failed === 0 && queued === 0 && running === 0 && <Status tone="neutral">无任务</Status>}
+            </div>
+          </header>
+
+          <div className="node-task-list">
+            {tasks.length ? tasks.map((t, tIdx) => {
+              const taskType = String(pick(t, ["task_type"], "未命名任务"));
+              const taskStatus = String(pick(t, ["status"], ""));
+              const count = Number(pick(t, ["count"], 1));
+              const error = String(pick(t, ["error"], ""));
+              const firstStart = String(pick(t, ["first_start"], ""));
+              const lastFinish = String(pick(t, ["last_finish"], ""));
+              const rowsWritten = Number(pick(t, ["rows_written"], 0));
+
+              return <div className={'node-task-item status-' + taskStatus} key={tIdx}>
+                <div className="task-item-main">
+                  <Status tone={toneOf(taskStatus)}>{taskStatus}</Status>
+                  <strong className="task-name">{taskType}</strong>
+                  <span className="task-count">× {count}</span>
+                  {rowsWritten > 0 && <small className="rows-info">写入 {rowsWritten.toLocaleString()} 行</small>}
+                </div>
+                {error && <div className="task-error-msg"><TriangleAlert size={14}/><span>{error}</span></div>}
+                {(firstStart || lastFinish) && <div className="task-time-range"><small>{firstStart ? ('首次 ' + firstStart.slice(11, 19)) : ''}{lastFinish ? (' · 最终 ' + lastFinish.slice(11, 19)) : ''}</small></div>}
+              </div>;
+            }) : <div className="node-task-empty"><small>当日暂无调度任务</small></div>}
+          </div>
+        </article>;
+      })}
+    </div>
+  </div>;
 }
 
 export function TodayDecision({ data }: { data: ConsoleData }) {
@@ -317,7 +411,7 @@ export function TodayDecision({ data }: { data: ConsoleData }) {
 }
 
 function DecisionTable({ items }: { items: Json[] }) {
-  const decisionLabel=(row:Json)=>{const quantity=Number(row.planned_quantity||0);const intent=String(row.controller_intent||"");const required=Boolean(pick(row,["controller_obligation.required"],false));if(quantity>0)return `${required?"强制":"建议"} · ${String(row.planned_side||"")==="SELL"?"卖出":"买入"}`;if(intent==="research_only")return "研究观察 · 禁止买入";if(["advisory_entry","advisory_add"].includes(intent))return "允许，但组合未选择";return "保持 · 无执行单";};
+  const decisionLabel=(row:Json)=>{const quantity=Number(row.planned_quantity||0);const intent=String(row.controller_intent||"");const tier=String(row.research_tier||"");const prefix=tier==="restricted"?"受限机会池 · ":tier==="core"?"核心研究池 · ":"";const required=Boolean(pick(row,["controller_obligation.required"],false));if(quantity>0)return `${prefix}${required?"强制":"建议"} · ${String(row.planned_side||"")==="SELL"?"卖出":"买入"}`;if(intent==="research_only")return "研究未通过 · 禁止买入";if(intent.startsWith("restricted_"))return `${prefix}风险降权`;if(["advisory_entry","advisory_add"].includes(intent))return `${prefix}允许，但组合未选择`;return `${prefix}保持 · 无执行单`;};
   return items.length ? <div className="table-wrap decision-orders"><table><thead><tr><th>资产</th><th>授权与动作</th><th>冻结数量</th><th>当前 / 目标</th><th>金额与成本</th></tr></thead><tbody>{items.map((row, i) => {const cost=pick(row,["planned_cost"],{}) as Json;const quantity=Number(row.planned_quantity||0);return <tr key={i}><td data-label="资产"><strong>{pick(row,["name","symbol_name","symbol","ts_code"],"未命名资产")}</strong><small>{pick(row,["symbol","ts_code"],"")}</small></td><td data-label="授权与动作"><strong>{decisionLabel(row)}</strong><small>{frozenOrderReason(row)}</small></td><td data-label="冻结数量">{quantity>0?<><strong>{quantity} 股</strong><small>{pick(row,["planned_lots"],0)} 手 · 参考价 {fmtMoney(pick(row,["reference_close"]))}</small></>:"0 股"}</td><td data-label="当前 / 目标">{fmtPct(pick(row,["current_weight"]),false)} / {fmtPct(pick(row,["target_weight","weight"]),false)}</td><td data-label="金额与成本">{quantity>0?<><strong>{fmtMoney(pick(row,["estimated_execution_amount"]))}</strong><small>费用 {fmtMoney(Number(cost.commission||0)+Number(cost.transfer_fee||0)+Number(cost.stamp_tax||0))} · 滑点 {fmtMoney(cost.slippage_cost)} · 缓冲 {fmtMoney(cost.calibration_buffer)}</small></>:"无交易成本"}</td></tr>})}</tbody></table></div> : <Empty title="暂无正式执行单" detail="当前没有冻结执行单，可能是保持、数据门阻断或计划尚未生成。" />;
 }
 

@@ -819,6 +819,16 @@ def model_strategy_owner_summary() -> dict:
         return degraded_read("owner_summary", exc, summary={}, components=[])
 
 
+@router.get("/model-strategy/evolution/node-activities")
+def model_strategy_node_activities(limit_days: int = 7) -> dict:
+    from app.services.node_activity import get_node_daily_activities
+    try:
+        return get_node_daily_activities(limit_days=limit_days)
+    except Exception as exc:  # noqa: BLE001 - optional node activities must degrade safely
+        from app.core.read_only_diagnostics import degraded_read
+        return degraded_read("node_activities", exc, days=[])
+
+
 @router.get("/model-strategy/evolution/ledger-audit")
 def model_strategy_ledger_audit() -> dict:
     from app.services.simulation_ledger_audit import audit_simulation_ledger

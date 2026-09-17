@@ -11,18 +11,22 @@ from app.services.quant_run_contracts import ReplayRiskGateError
 from app.services.risk_limit_contract import RISK_LIMIT_CONTRACT_SCHEMA_VERSION
 from app.services.point_in_time import normalize_explicit_timestamp
 
-UNIFIED_DAILY_DECISION_SCHEMA_VERSION = "alis_unified_daily_decision_v2"
+UNIFIED_DAILY_DECISION_SCHEMA_VERSION = "alis_unified_daily_decision_v3"
+PREVIOUS_UNIFIED_DAILY_DECISION_SCHEMA_VERSION = "alis_unified_daily_decision_v2"
 LEGACY_UNIFIED_DAILY_DECISION_SCHEMA_VERSION = "alis_unified_daily_decision_v1"
-UNIFIED_SELECTION_SCHEMA_VERSION = "alis_unified_stock_selection_v1"
+UNIFIED_SELECTION_SCHEMA_VERSION = "alis_unified_stock_selection_v2"
+PREVIOUS_UNIFIED_SELECTION_SCHEMA_VERSION = "alis_unified_stock_selection_v1"
 UNIFIED_EXECUTION_SAFETY_SCHEMA_VERSION = "alis_t1_execution_safety_v2"
 LEGACY_UNIFIED_EXECUTION_SAFETY_SCHEMA_VERSION = "alis_t1_execution_safety_v1"
-PRETRADE_CONTROLLER_SCHEMA_VERSION = "alis_strategy_controller_pretrade_v2"
+PRETRADE_CONTROLLER_SCHEMA_VERSION = "alis_strategy_controller_pretrade_v3"
+PREVIOUS_PRETRADE_CONTROLLER_SCHEMA_VERSION = "alis_strategy_controller_pretrade_v2"
 LEGACY_PRETRADE_CONTROLLER_SCHEMA_VERSION = "alis_strategy_controller_pretrade_v1"
 INDUSTRY_ALLOCATION_SCHEMA_VERSION = "alis_industry_allocation_v1"
 PORTFOLIO_COMPETITION_SCHEMA_VERSION = "portfolio_method_competition_v3"
 LEGACY_PORTFOLIO_COMPETITION_SCHEMA_VERSION = "portfolio_method_competition_v2"
 EXPECTED_RETURN_SCHEMA_VERSION = "alis_a_share_expected_return_20d_v1"
-DECISION_MANIFEST_SCHEMA_VERSION = "alis_decision_version_manifest_v2"
+DECISION_MANIFEST_SCHEMA_VERSION = "alis_decision_version_manifest_v3"
+PREVIOUS_DECISION_MANIFEST_SCHEMA_VERSION = "alis_decision_version_manifest_v2"
 UNIFIED_T1_ALLOWED_VETOES = {
     "missing_open_price",
     "suspension",
@@ -144,8 +148,13 @@ def _validate_formal_cutoff_alignment(contract: dict[str, Any]) -> None:
 
 
 def _validate_selection_snapshot(snapshot: dict[str, Any]) -> None:
-    if str(snapshot.get("schema_version") or "") != UNIFIED_SELECTION_SCHEMA_VERSION:
+    selection_schema = str(snapshot.get("schema_version") or "")
+    if selection_schema not in {
+        UNIFIED_SELECTION_SCHEMA_VERSION,
+        PREVIOUS_UNIFIED_SELECTION_SCHEMA_VERSION,
+    }:
         raise ReplayRiskGateError("统一计划缺少选股合同版本", code="invalid_authoritative_plan")
+    tiered = selection_schema == UNIFIED_SELECTION_SCHEMA_VERSION
     expected_hash = str(snapshot.get("selection_hash") or "")
     payload = {key: value for key, value in snapshot.items() if key != "selection_hash"}
     if not expected_hash or _canonical_hash(payload) != expected_hash:
@@ -169,10 +178,46 @@ def _validate_selection_snapshot(snapshot: dict[str, Any]) -> None:
         snapshot.get("holding_admitted_symbols"),
         field="selection.holding_admitted_symbols",
     )
-    if not set(admitted) <= set(ranked) & set(research_admitted):
-        raise ReplayRiskGateError("统一计划正式入选标的不属于 Top K 研究准入交集", code="invalid_authoritative_plan")
-    if not set(holding_admitted) <= set(holdings) & set(research_admitted):
-        raise ReplayRiskGateError("统一计划持仓复核结果与研究准入不一致", code="invalid_authoritative_plan")
+    if tiered:
+        core = _unique_symbols(snapshot.get("core_symbols"), field="selection.core_symbols")
+        restricted = _unique_symbols(snapshot.get("restricted_symbols"), field="selection.restricted_symbols")
+        hard_blocked = _unique_symbols(snapshot.get("hard_blocked_symbols"), field="selection.hard_blocked_symbols")
+        tradable = _unique_symbols(snapshot.get("tradable_symbols"), field="selection.tradable_symbols")
+        holding_core = _unique_symbols(snapshot.get("holding_core_symbols"), field="selection.holding_core_symbols")
+        holding_restricted = _unique_symbols(snapshot.get("holding_restricted_symbols"), field="selection.holding_restricted_symbols")
+        if (
+            set(core) | set(restricted) | set(hard_blocked) != set(ranked)
+            or set(core) & set(restricted)
+            or set(core) & set(hard_blocked)
+            or set(restricted) & set(hard_blocked)
+            or tradable != core + restricted
+            or admitted != tradable
+            or research_admitted != core
+            or holding_admitted != holding_core + holding_restricted
+            or not set(holding_core + holding_restricted) <= set(holdings)
+        ):
+            raise ReplayRiskGateError("统一计划研究层级集合不一致", code="invalid_authoritative_plan")
+        tier_contract = snapshot.get("research_tier_contract") if isinstance(snapshot.get("research_tier_contract"), dict) else {}
+        tier_hash = str(tier_contract.get("contract_hash") or "")
+        tier_payload = {key: value for key, value in tier_contract.items() if key != "contract_hash"}
+        tier_items = tier_contract.get("items") if isinstance(tier_contract.get("items"), dict) else {}
+        if (
+            str(tier_contract.get("schema_version") or "") != "alis_equity_research_tier_v1"
+            or not tier_hash
+            or _canonical_hash(tier_payload) != tier_hash
+            or set(tier_items) != set(ranked) | set(holdings)
+            or set(tier_contract.get("core_symbols") or []) != set(core) | set(holding_core)
+            or set(tier_contract.get("restricted_symbols") or []) != set(restricted) | set(holding_restricted)
+            or set(tier_contract.get("hard_blocked_symbols") or []) != (
+                (set(ranked) | set(holdings)) - set(core) - set(restricted) - set(holding_core) - set(holding_restricted)
+            )
+        ):
+            raise ReplayRiskGateError("统一计划研究层级合同无效", code="invalid_authoritative_plan")
+    else:
+        if not set(admitted) <= set(ranked) & set(research_admitted):
+            raise ReplayRiskGateError("统一计划正式入选标的不属于 Top K 研究准入交集", code="invalid_authoritative_plan")
+        if not set(holding_admitted) <= set(holdings) & set(research_admitted):
+            raise ReplayRiskGateError("统一计划持仓复核结果与研究准入不一致", code="invalid_authoritative_plan")
     authority = snapshot.get("authority") if isinstance(snapshot.get("authority"), dict) else {}
     if (
         str(authority.get("formal_candidate_authority") or "") != "unified_selection_contract"
@@ -363,7 +408,11 @@ def _validate_selection_snapshot(snapshot: dict[str, Any]) -> None:
                         code="invalid_authoritative_plan",
                     )
     research_evidence = snapshot.get("research_evidence") if isinstance(snapshot.get("research_evidence"), dict) else {}
-    for symbol in set(admitted) | set(holding_admitted):
+    evidence_required_symbols = (
+        set(snapshot.get("core_symbols") or []) | set(snapshot.get("holding_core_symbols") or [])
+        if tiered else set(admitted) | set(holding_admitted)
+    )
+    for symbol in evidence_required_symbols:
         evidence = research_evidence.get(symbol) if isinstance(research_evidence.get(symbol), dict) else {}
         thesis = evidence.get("thesis_snapshot") if isinstance(evidence.get("thesis_snapshot"), dict) else {}
         hypotheses = [
@@ -402,12 +451,17 @@ def _validate_selection_snapshot(snapshot: dict[str, Any]) -> None:
         for item in dynamic_items
         if isinstance(item.get("gate"), dict) and item["gate"].get("admitted") is True
     }
+    expected_dynamic_symbols = (
+        (set(ranked) | set(holdings)) - set(snapshot.get("hard_blocked_symbols") or [])
+        - set((snapshot.get("research_tier_contract") or {}).get("hard_blocked_symbols") or [])
+        if tiered else set(research_admitted)
+    )
     if (
         str(dynamic_gate.get("as_of_time") or "") != str(snapshot.get("data_as_of_time") or "")
-        or set(dynamic_symbols) != set(research_admitted)
+        or set(dynamic_symbols) != expected_dynamic_symbols
         or len(dynamic_symbols) != len(set(dynamic_symbols))
-        or set(admitted) != set(ranked) & dynamic_admitted
-        or set(holding_admitted) != set(holdings) & dynamic_admitted
+        or (not tiered and set(admitted) != set(ranked) & dynamic_admitted)
+        or (not tiered and set(holding_admitted) != set(holdings) & dynamic_admitted)
     ):
         raise ReplayRiskGateError("统一计划动态准入门快照与入选结果不一致", code="invalid_authoritative_plan")
     coverage = snapshot.get("coverage") if isinstance(snapshot.get("coverage"), dict) else {}
@@ -441,16 +495,19 @@ def validate_unified_decision_contract(contract: dict[str, Any]) -> None:
     schema_version = str(contract.get("schema_version") or "") if isinstance(contract, dict) else ""
     if schema_version not in {
         UNIFIED_DAILY_DECISION_SCHEMA_VERSION,
+        PREVIOUS_UNIFIED_DAILY_DECISION_SCHEMA_VERSION,
         LEGACY_UNIFIED_DAILY_DECISION_SCHEMA_VERSION,
     }:
         raise ReplayRiskGateError("新正式计划必须使用统一日决策合同", code="invalid_authoritative_plan")
     legacy = schema_version == LEGACY_UNIFIED_DAILY_DECISION_SCHEMA_VERSION
+    previous = schema_version == PREVIOUS_UNIFIED_DAILY_DECISION_SCHEMA_VERSION
     expected_safety_schema = (
         LEGACY_UNIFIED_EXECUTION_SAFETY_SCHEMA_VERSION if legacy
         else UNIFIED_EXECUTION_SAFETY_SCHEMA_VERSION
     )
     expected_controller_schema = (
         LEGACY_PRETRADE_CONTROLLER_SCHEMA_VERSION if legacy
+        else PREVIOUS_PRETRADE_CONTROLLER_SCHEMA_VERSION if previous
         else PRETRADE_CONTROLLER_SCHEMA_VERSION
     )
     expected_competition_schema = (
@@ -465,7 +522,10 @@ def validate_unified_decision_contract(contract: dict[str, Any]) -> None:
         "portfolio_method_competition",
         "execution_safety_contract",
         "decision_version_manifest",
-    ) + (() if legacy else ("risk_limit_contract",))
+    ) + (() if legacy else ("risk_limit_contract",)) + (
+        ("research_tier_contract", "tiered_equity_budget")
+        if schema_version == UNIFIED_DAILY_DECISION_SCHEMA_VERSION else ()
+    )
     missing = [key for key in required_dicts if not isinstance(contract.get(key), dict) or not contract.get(key)]
     if missing:
         raise ReplayRiskGateError(
@@ -488,6 +548,20 @@ def validate_unified_decision_contract(contract: dict[str, Any]) -> None:
             raise ReplayRiskGateError("统一计划风险上限合同哈希不一致", code="invalid_authoritative_plan")
     _validate_selection_snapshot(contract["selection_snapshot"])
     selection = contract["selection_snapshot"]
+    if schema_version == UNIFIED_DAILY_DECISION_SCHEMA_VERSION:
+        if contract.get("research_tier_contract") != selection.get("research_tier_contract"):
+            raise ReplayRiskGateError("正式计划研究层级合同未冻结或与选股快照不一致", code="invalid_authoritative_plan")
+        tier_budget = contract.get("tiered_equity_budget") if isinstance(contract.get("tiered_equity_budget"), dict) else {}
+        budget_hash = str(tier_budget.get("contract_hash") or "")
+        budget_payload = {key: value for key, value in tier_budget.items() if key != "contract_hash"}
+        if (
+            str(tier_budget.get("schema_version") or "") != "alis_tiered_equity_budget_v1"
+            or not budget_hash
+            or _canonical_hash(budget_payload) != budget_hash
+            or set(tier_budget.get("core_symbols") or []) != set(selection.get("core_symbols") or [])
+            or set(tier_budget.get("restricted_symbols") or []) != set(selection.get("restricted_symbols") or [])
+        ):
+            raise ReplayRiskGateError("正式计划股票分层预算合同无效", code="invalid_authoritative_plan")
     signal_date = str(contract.get("signal_date") or "").replace("-", "")[:8]
     trade_date = str(contract.get("trade_date") or "").replace("-", "")[:8]
     if (
@@ -583,6 +657,20 @@ def validate_unified_decision_contract(contract: dict[str, Any]) -> None:
         ):
             raise ReplayRiskGateError(f"统一计划 Controller 动作与边界内容不一致：{symbol}", code="invalid_authoritative_plan")
         _finite_weight(item.get("current_weight"), field=f"{symbol}.action.current_weight")
+        if schema_version == UNIFIED_DAILY_DECISION_SCHEMA_VERSION and item.get("is_defensive_asset") is not True:
+            tier_item = ((contract.get("research_tier_contract") or {}).get("items") or {}).get(symbol) or {}
+            if str(item.get("research_tier") or "") != str(tier_item.get("tier") or ""):
+                raise ReplayRiskGateError(f"Controller 研究层级未绑定：{symbol}", code="invalid_authoritative_plan")
+            if str(item.get("research_tier") or "") == "restricted":
+                restricted_cap = _finite_weight(
+                    (contract.get("tiered_equity_budget") or {}).get("restricted_symbol_cap"),
+                    field="tiered_equity_budget.restricted_symbol_cap",
+                )
+                if _finite_weight(item.get("max_weight"), field=f"{symbol}.action.max") > max(
+                    restricted_cap,
+                    _finite_weight(item.get("current_weight"), field=f"{symbol}.action.current_weight"),
+                ) + 1e-8:
+                    raise ReplayRiskGateError(f"受限机会池标的超过冻结上限：{symbol}", code="invalid_authoritative_plan")
         if not legacy:
             risk_item = (risk_limits.get("items") or {}).get(symbol) or {}
             final_limit = _finite_weight(risk_item.get("final_limit"), field=f"risk.{symbol}.final_limit")
@@ -933,7 +1021,12 @@ def validate_unified_decision_contract(contract: dict[str, Any]) -> None:
     ):
         raise ReplayRiskGateError("统一计划 Champion 绑定不一致", code="invalid_authoritative_plan")
     manifest = contract["decision_version_manifest"]
-    if str(manifest.get("schema_version") or "") != DECISION_MANIFEST_SCHEMA_VERSION:
+    expected_manifest_schema = (
+        DECISION_MANIFEST_SCHEMA_VERSION
+        if schema_version == UNIFIED_DAILY_DECISION_SCHEMA_VERSION
+        else PREVIOUS_DECISION_MANIFEST_SCHEMA_VERSION
+    )
+    if str(manifest.get("schema_version") or "") != expected_manifest_schema:
         raise ReplayRiskGateError("统一计划决策版本清单版本无效", code="invalid_authoritative_plan")
     if str(manifest.get("trade_date") or "").replace("-", "")[:8] != signal_date:
         raise ReplayRiskGateError("统一计划版本清单日期与信号日不一致", code="invalid_authoritative_plan")
@@ -946,7 +1039,7 @@ def validate_unified_decision_contract(contract: dict[str, Any]) -> None:
     ):
         raise ReplayRiskGateError("统一计划未冻结有效系统发布版本", code="missing_active_system_release")
     if not legacy and (
-        (manifest.get("execution_contract") or {}).get("decision_schema") != UNIFIED_DAILY_DECISION_SCHEMA_VERSION
+        (manifest.get("execution_contract") or {}).get("decision_schema") != schema_version
         or (manifest.get("execution_contract") or {}).get("t1_safety_schema") != UNIFIED_EXECUTION_SAFETY_SCHEMA_VERSION
         or (manifest.get("execution_contract") or {}).get("quantity_policy")
         != "t_day_frozen_exact_quantity_or_t1_safety_veto"
@@ -954,12 +1047,21 @@ def validate_unified_decision_contract(contract: dict[str, Any]) -> None:
         raise ReplayRiskGateError("统一计划执行版本清单不完整", code="invalid_authoritative_plan")
     manifest_selection = manifest.get("selection") if isinstance(manifest.get("selection"), dict) else {}
     if (
-        str(manifest_selection.get("schema_version") or "") != UNIFIED_SELECTION_SCHEMA_VERSION
+        str(manifest_selection.get("schema_version") or "") != str(selection.get("schema_version") or "")
         or str(manifest_selection.get("selection_hash") or "") != str(selection.get("selection_hash") or "")
         or manifest_selection.get("environment_snapshot") != selection.get("environment_snapshot")
         or manifest_selection.get("factor_expert_snapshot") != selection.get("factor_expert_snapshot")
     ):
         raise ReplayRiskGateError("统一计划选股快照与版本清单不一致", code="invalid_authoritative_plan")
+    if schema_version == UNIFIED_DAILY_DECISION_SCHEMA_VERSION and (
+        str(manifest_selection.get("research_tier_schema") or "")
+        != str((selection.get("research_tier_contract") or {}).get("schema_version") or "")
+        or str(manifest_selection.get("research_tier_contract_hash") or "")
+        != str((selection.get("research_tier_contract") or {}).get("contract_hash") or "")
+        or (manifest.get("portfolio") or {}).get("tiered_equity_budget")
+        != contract.get("tiered_equity_budget")
+    ):
+        raise ReplayRiskGateError("统一计划研究层级版本清单不一致", code="invalid_authoritative_plan")
     factor_contract = manifest.get("factor_contract") if isinstance(manifest.get("factor_contract"), dict) else {}
     factor_bindings = (selection.get("factor_expert_snapshot") or {}).get("factor_bindings") or {}
     if (
@@ -1016,6 +1118,7 @@ def normalize_authoritative_plan(plan: dict[str, Any]) -> dict[str, Any]:
     contract_schema = str(decision_contract.get("schema_version") or "")
     unified = contract_schema in {
         UNIFIED_DAILY_DECISION_SCHEMA_VERSION,
+        PREVIOUS_UNIFIED_DAILY_DECISION_SCHEMA_VERSION,
         LEGACY_UNIFIED_DAILY_DECISION_SCHEMA_VERSION,
     }
     if contract_schema.startswith("alis_unified_") and not unified:

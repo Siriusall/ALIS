@@ -56,6 +56,34 @@ def test_formal_oos_warning_does_not_block_qualified_equity_buy(monkeypatch):
     assert equity["max_weight"] > 0
 
 
+def test_restricted_opportunity_gets_bounded_entry_without_core_research_authority(monkeypatch):
+    monkeypatch.setattr(strategy_controller, "active_strategy_policy_context", _policy_context)
+    result = strategy_controller.build_pretrade_strategy_controller(
+        candidate_symbols=["000002"],
+        holding_symbols=[],
+        selections={"000002": {"name": "受限候选", "score": 88, "model_signals": {}}},
+        research_evidence={"000002": {"eligible_for_core": False}},
+        research_tiers={"000002": {"tier": "restricted"}},
+        tiered_equity_budget={
+            "schema_version": "alis_tiered_equity_budget_v1",
+            "restricted_symbol_cap": .03,
+        },
+        expected_returns={"000002": .02},
+        current_weights={},
+        position_weight_caps={"000002": .03},
+        execution_guard={"status": "allowed", "mode": "normal"},
+    )
+
+    action = result["actions"][0]
+    assert action["research_tier"] == "restricted"
+    assert action["research_eligible"] is False
+    assert action["permission_allowed"] is True
+    assert action["intent"] == "restricted_advisory_entry"
+    assert action["max_weight"] == .03
+    assert action["research_quality_discount"] == .35
+    assert result["policy"]["restricted_tier_cannot_support_model_promotion"] is True
+
+
 def test_controller_freezes_exit_before_optimizer(monkeypatch):
     monkeypatch.setattr(strategy_controller, "active_strategy_policy_context", _policy_context)
     result = strategy_controller.build_pretrade_strategy_controller(

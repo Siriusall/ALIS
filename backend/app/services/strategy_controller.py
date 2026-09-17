@@ -10,7 +10,7 @@ from app.services.review_learning import materialize_decision_outcomes
 from app.services.risk_limit_contract import DEFAULT_GLOBAL_SINGLE_ASSET_LIMIT, risk_limit_for
 
 STRATEGY_CONTROLLER_VERSION = "strategy_controller_v1"
-PRETRADE_CONTROLLER_SCHEMA_VERSION = "alis_strategy_controller_pretrade_v2"
+PRETRADE_CONTROLLER_SCHEMA_VERSION = "alis_strategy_controller_pretrade_v3"
 STRATEGY_MODEL_KEY = "strategy_controller"
 MINIMUM_CANDIDATE_SHADOW_SESSIONS = 20
 
@@ -307,6 +307,8 @@ def build_pretrade_strategy_controller(
     holding_symbols: list[str],
     selections: dict[str, dict[str, Any]] | None = None,
     research_evidence: dict[str, dict[str, Any]] | None = None,
+    research_tiers: dict[str, dict[str, Any]] | None = None,
+    tiered_equity_budget: dict[str, Any] | None = None,
     expected_returns: dict[str, float] | None = None,
     current_weights: dict[str, float] | None = None,
     thesis_status_by_symbol: dict[str, str] | None = None,
@@ -325,6 +327,12 @@ def build_pretrade_strategy_controller(
     policy = ctx.get("strategy_policy") if isinstance(ctx.get("strategy_policy"), dict) else active_strategy_policy()
     selection_map = dict(selections or {})
     evidence_map = dict(research_evidence or {})
+    tier_map = {
+        str(key): dict(value)
+        for key, value in (research_tiers or {}).items()
+        if isinstance(value, dict)
+    }
+    tier_budget = dict(tiered_equity_budget or {})
     expected_map = {str(key): float(value or 0.0) for key, value in (expected_returns or {}).items()}
     current = {str(key): max(0.0, float(value or 0.0)) for key, value in (current_weights or {}).items()}
     thesis = {str(key): str(value or "") for key, value in (thesis_status_by_symbol or {}).items()}
@@ -360,13 +368,18 @@ def build_pretrade_strategy_controller(
         is_holding = symbol in holding_set and current_weight > 1e-9
         is_candidate = symbol in candidate_set
         is_defensive = symbol in defensive
+        research_tier = str((tier_map.get(symbol) or {}).get("tier") or (
+            "core" if research.get("eligible_for_core", is_candidate or is_defensive) else "hard_blocked"
+        ))
         contract_cap = risk_limit_for(risk_limit_contract, symbol, single_cap)
         symbol_cap = min(single_cap, contract_cap, position_caps.get(symbol, single_cap))
         hard_breaches = hard_breach_by_symbol.get(symbol) or []
         hard_weight_breach = bool(hard_breaches) and symbol_cap < current_weight - 1e-8
         thesis_invalid = thesis.get(symbol) in {"invalidated", "failed"}
         research_error = str(research.get("evaluation_status") or "") == "error"
-        research_eligible = bool(research.get("eligible_for_core", is_candidate or is_defensive))
+        research_eligible = research_tier == "core"
+        restricted_opportunity = research_tier == "restricted"
+        hard_research_blocked = research_tier == "hard_blocked"
         add_eligible = bool(model_signals.get("add_position_eligible", True))
         proposed_action = "hold"
         action = "hold"
@@ -418,7 +431,7 @@ def build_pretrade_strategy_controller(
             allowed = False
             permission = {"allowed_sides": ["HOLD"], "can_buy": False, "can_sell": False}
             reason = "持仓研究刷新异常；缺少可证伪证据时冻结持有，禁止把系统错误解释为卖出信号"
-        elif is_holding and (thesis_invalid or not research_eligible or not is_candidate):
+        elif is_holding and (thesis_invalid or hard_research_blocked or not is_candidate):
             proposed_action = action = "sell_exit"
             min_weight = max_weight = 0.0
             intent = "sell_exit"
@@ -429,7 +442,7 @@ def build_pretrade_strategy_controller(
                 "target_max_weight": 0.0,
                 "reason_codes": ["thesis_invalidated" if thesis_invalid else "research_admission_failed"],
             }
-            reason = "持仓 Thesis 已失效，冻结退出" if thesis_invalid else "持仓未通过当日统一研究准入，冻结退出"
+            reason = "持仓 Thesis 已失效，冻结退出" if thesis_invalid else "持仓触发数据或风险硬门，冻结退出"
         elif is_holding and position_pnl.get(symbol, 0.0) <= -0.06 and expected <= -0.05:
             proposed_action = action = "sell_exit"
             min_weight = max_weight = 0.0
@@ -449,6 +462,20 @@ def build_pretrade_strategy_controller(
             intent = "advisory_reduce"
             permission = {"allowed_sides": ["SELL", "HOLD"], "can_buy": False, "can_sell": True}
             reason = "20日预期收益为负，禁止加仓并建议降权；组合可因整手和成本约束保持"
+        elif is_holding and restricted_opportunity and expected > minimum_change and current_weight < symbol_cap - 1e-8:
+            proposed_action = action = "add_position"
+            min_weight = current_weight
+            max_weight = symbol_cap
+            intent = "restricted_advisory_add"
+            permission = {"allowed_sides": ["BUY", "HOLD"], "can_buy": True, "can_sell": False}
+            reason = "研究证据尚不足以进入核心池；仅允许在受限机会池上限内加仓"
+        elif is_holding and restricted_opportunity:
+            proposed_action = action = "hold"
+            min_weight = 0.0
+            max_weight = current_weight
+            intent = "restricted_hold_no_add"
+            permission = {"allowed_sides": ["SELL", "HOLD"], "can_buy": False, "can_sell": True}
+            reason = "研究证据不足；保留现有持仓但禁止扩大受限暴露"
         elif is_holding and is_candidate and add_eligible and expected > minimum_change:
             proposed_action = action = "add_position"
             min_weight = current_weight
@@ -456,7 +483,14 @@ def build_pretrade_strategy_controller(
             intent = "advisory_add"
             permission = {"allowed_sides": ["BUY", "HOLD"], "can_buy": True, "can_sell": False}
             reason = "持仓继续通过准入且预期收益覆盖最小改善门，允许加仓"
-        elif not is_holding and is_candidate and expected > 0:
+        elif not is_holding and is_candidate and restricted_opportunity and expected > 0:
+            proposed_action = action = "buy_candidate"
+            min_weight = 0.0
+            max_weight = symbol_cap
+            intent = "restricted_advisory_entry"
+            permission = {"allowed_sides": ["BUY", "HOLD"], "can_buy": True, "can_sell": False}
+            reason = "通过交易硬门但研究证据不足；只允许受限机会池小仓位建仓"
+        elif not is_holding and is_candidate and research_eligible and expected > 0:
             proposed_action = action = "buy_candidate"
             min_weight = 0.0
             max_weight = min(symbol_cap, 0.10)
@@ -503,6 +537,8 @@ def build_pretrade_strategy_controller(
             "max_weight": round(max_weight, 8),
             "expected_20d_return_before_trade_cost": round(expected, 8),
             "research_eligible": research_eligible,
+            "research_tier": research_tier,
+            "research_quality_discount": 1.0 if research_tier == "core" else 0.35 if research_tier == "restricted" else 0.0,
             "is_defensive_asset": is_defensive,
             "permission": permission,
             "intent": intent,
@@ -532,12 +568,15 @@ def build_pretrade_strategy_controller(
         "actions": rows,
         "weight_bounds": bounds,
         "risk_limit_contract": risk_limit_contract or {},
+        "tiered_equity_budget": tier_budget,
         "policy": {
             "controller_precedes_optimizer": True,
             "optimizer_may_not_change_action_direction": True,
             "mandatory_obligations_precede_objective": True,
             "negative_expected_return_new_entry_forbidden": True,
             "quarantine_equity_buy_add_forbidden": quarantined,
+            "restricted_tier_cannot_support_model_promotion": True,
+            "restricted_tier_uses_bounded_weight_caps": True,
         },
     }
 

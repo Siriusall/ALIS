@@ -140,8 +140,9 @@ def list_theses(
             item["evidence"] = _loads(item.pop("evidence_json", "[]"), [])
         by_thesis.setdefault(int(item["thesis_id"]), []).append(item)
     for value in values:
-        value["hypotheses"] = by_thesis.get(int(value["id"]), []) if include_hypotheses else []
-        value["derived_status"], value["derived_confidence"] = _derive_thesis_state(value["hypotheses"])
+        thesis_hypotheses = by_thesis.get(int(value["id"]), [])
+        value["hypotheses"] = thesis_hypotheses if include_hypotheses else []
+        value["derived_status"], value["derived_confidence"] = _derive_thesis_state(thesis_hypotheses)
     return values
 
 
@@ -354,7 +355,7 @@ def generate_thesis_for_stock(
     add("核心利润不能进入显著衰退", "core_profit_growth", minimum=-15, warning_min=0)
     add("经营现金流应能支持账面利润", "cash_conversion", minimum=0, warning_min=.5)
     add("资产负债水平不得突破风险边界", "debt_to_assets", maximum=90, warning_max=80)
-    add("基准估值情景应保留正安全边际", "valuation_base_upside", minimum=0, warning_min=.1)
+    add("基准估值情景应保留正安全边际", "valuation_base_upside", minimum=0, warning_min=.1, necessary=False)
     add("增长加速度不应显著转负", "growth_acceleration", minimum=-20, warning_min=-5, necessary=False)
     if not hypotheses:
         return {"ok": False, "ts_code": code, "status": "insufficient_evidence", "reason": "no_machine_checkable_hypotheses"}

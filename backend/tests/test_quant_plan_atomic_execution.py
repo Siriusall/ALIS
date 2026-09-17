@@ -6,7 +6,15 @@ from types import SimpleNamespace
 import pytest
 
 from app.db import store
+from app.integrations.broker_adapter import OrderRequest
 from app.services import profit_loop, quant_run_engine, quant_task_runner
+from app.services.execution_engine import simulate_open_execution
+from app.services.research_tier_contract import (
+    build_research_tier_contract,
+    build_tiered_equity_budget,
+    classify_dynamic_gate,
+)
+from app.services.strategy_gate import evaluate_strategy_gate
 
 
 def _task():
@@ -17,6 +25,172 @@ def _task():
         "exchange_group": "HS",
         "replay_mode": "autonomous_daily",
     }
+
+
+def test_restricted_research_tier_survives_frozen_plan_and_t1_atomic_execution(monkeypatch):
+    """Simulate tomorrow's formal path without touching the production ledger."""
+    gate = evaluate_strategy_gate(
+        research_score=80,
+        confidence=.8,
+        data_quality=90,
+        risk_eligible=True,
+        market_state="S1",
+        sentiment_score=70,
+        expectation_score=70,
+        valuation_score=70,
+        valuation_upside=.05,
+    )
+    tier = classify_dynamic_gate(gate, prior_tier="core")
+    assert gate["admitted"] is False
+    assert tier["tier"] == "restricted"
+    assert tier["trading_eligible"] is True
+
+    tier_contract = build_research_tier_contract({"000001": tier})
+    tier_budget = build_tiered_equity_budget(
+        market_state="S1",
+        base_equity_budget=.85,
+        core_symbols=[],
+        restricted_symbols=["000001"],
+    )
+    target_weight = float(tier_budget["restricted_symbol_cap"])
+    preview = simulate_open_execution(
+        [OrderRequest(
+            symbol="000001",
+            side="BUY",
+            price=10.0,
+            quantity=0,
+            name="平安银行",
+            change_pct=.2,
+            volume=1_000_000,
+            close=10.0,
+        )],
+        budget=200_000 * float(tier_budget["effective_equity_budget"]),
+        total_equity=200_000,
+        max_single_position_pct=.15,
+        symbol_scores={"000001": 90},
+        industry_by_symbol={"000001": "银行"},
+        target_weights={"000001": target_weight},
+        max_order_value_by_symbol={"000001": 1_000_000},
+    )
+    filled = [order for order in preview.orders if order.status == "simulated"]
+    assert len(filled) == 1
+    order = filled[0]
+
+    monkeypatch.setattr(
+        "app.services.system_release_center.release_status",
+        lambda: {
+            "ok": True,
+            "active_release": {"id": 77},
+            "drift_components": [],
+        },
+    )
+    monkeypatch.setattr(
+        "app.services.decision_version_manifest.build_decision_version_manifest",
+        lambda **_kwargs: {
+            "schema_version": "alis_decision_version_manifest_v3",
+            "release": {"id": 77, "manifest_hash": "simulated-release"},
+        },
+    )
+    contract = profit_loop.build_daily_decision_contract(
+        portfolio={
+            "selection_source": "unified_full_market_selection",
+            "decision_data_gate": {"decision_ready": True},
+            "execution_checks": [{"key": "risk_gate", "status": "pass"}],
+            "final_target_weights": {"000001": target_weight},
+            "risk_budget": gate,
+            "research_tier_contract": tier_contract,
+            "tiered_equity_budget": tier_budget,
+            "rebalance_proposal": [{
+                "symbol": "000001",
+                "name": "平安银行",
+                "controller_action": "buy_candidate",
+                "target_weight": target_weight,
+                "planned_quantity": order.quantity,
+                "research_tier": "restricted",
+                "research_quality_blockers": gate["research_blockers"],
+            }],
+            "execution_orders": [{
+                "symbol": "000001",
+                "side": "BUY",
+                "planned_quantity": order.quantity,
+            }],
+            "selection_snapshot": {
+                "strategy_id": 1,
+                "data_as_of_time": "2026-09-17T15:00:00+08:00",
+            },
+        },
+        trade_date="20260917",
+        planned_execute_date="20260918",
+    )
+    assert contract["execution_authorized"] is True
+    assert contract["target_symbols"] == ["000001"]
+    assert contract["proposal"][0]["research_tier"] == "restricted"
+    assert contract["research_tier_contract"] == tier_contract
+    assert contract["tiered_equity_budget"] == tier_budget
+
+    state = {
+        "cash": 200_000.0,
+        "positions": {},
+        "executions": [],
+        "plan_status": "executing",
+    }
+
+    @contextmanager
+    def atomic_scope():
+        snapshot = deepcopy(state)
+        try:
+            yield object()
+        except BaseException:
+            state.clear()
+            state.update(snapshot)
+            raise
+
+    def apply_buy(**kwargs):
+        payload = kwargs["orders"][0]
+        assert float(kwargs["budget"]) <= state["cash"]
+        state["cash"] -= float(kwargs["budget"])
+        state["positions"][payload["symbol"]] = int(payload["quantity"])
+        state["executions"].append(101)
+        return 101
+
+    def finalize(execution_id):
+        assert execution_id == 101
+        state["plan_status"] = "executed"
+
+    total_buy_cost = round(order.price * order.quantity + order.commission + order.transfer_fee, 2)
+    monkeypatch.setattr(store, "atomic_business_transaction", atomic_scope)
+    monkeypatch.setattr(quant_run_engine, "get_positions", lambda: [])
+    monkeypatch.setattr(quant_run_engine, "get_account_balance", lambda: 200_000.0)
+    monkeypatch.setattr(quant_run_engine, "create_and_apply_buy_execution", apply_buy)
+
+    execution_id = quant_run_engine._commit_prepared_execution(
+        strategy_id=1,
+        execute_date="20260918",
+        executed_at="2026-09-18T09:30:00+08:00",
+        top_n=20,
+        total_buy_cost=total_buy_cost,
+        orders_payload=[{
+            "symbol": "000001",
+            "name": "平安银行",
+            "side": "BUY",
+            "price": order.price,
+            "quantity": order.quantity,
+            "commission": order.commission,
+            "transfer_fee": order.transfer_fee,
+        }],
+        sold_ops_payload=[],
+        positions_before_execution={},
+        pretrade_positions=[],
+        pretrade_cash_balance=200_000.0,
+        frozen_exact_quantity_orders=True,
+        release_id=77,
+        finalize_execution=finalize,
+    )
+
+    assert execution_id == 101
+    assert state["plan_status"] == "executed"
+    assert state["positions"] == {"000001": order.quantity}
+    assert 0 <= state["cash"] < 200_000
 
 
 def test_formal_plan_ledger_and_terminal_status_share_one_atomic_scope(monkeypatch):

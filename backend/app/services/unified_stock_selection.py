@@ -7,9 +7,17 @@ from typing import Any
 from app.services.backtest_data_source import BacktestDataSource
 from app.services.point_in_time import normalize_explicit_timestamp, signal_available_time
 from app.services.production_strategy import resolve_production_strategy_champion
+from app.services.research_tier_contract import (
+    CORE,
+    HARD_BLOCKED,
+    RESTRICTED,
+    build_research_tier_contract,
+    classify_core_eligibility,
+    classify_dynamic_gate,
+)
 
 
-UNIFIED_SELECTION_SCHEMA_VERSION = "alis_unified_stock_selection_v1"
+UNIFIED_SELECTION_SCHEMA_VERSION = "alis_unified_stock_selection_v2"
 
 
 def _compact_date(value: str) -> str:
@@ -183,6 +191,7 @@ def build_unified_stock_selection(
     research_blocks: list[dict[str, Any]] = []
     research_errors: list[dict[str, Any]] = []
     research_evidence: dict[str, dict[str, Any]] = {}
+    research_tiers: dict[str, dict[str, Any]] = {}
     for symbol in research_targets:
         code = _ts_code(symbol)
         try:
@@ -206,6 +215,15 @@ def build_unified_stock_selection(
                     "evidence_as_of_time": cutoff,
                 },
             }
+            research_tiers[symbol] = {
+                "tier": HARD_BLOCKED,
+                "core_research_eligible": False,
+                "trading_eligible": False,
+                "reason_code": "research_admission_error",
+                "failed_gates": [],
+                "hard_failed_gates": ["research_infrastructure"],
+                "research_quality_failed_gates": [],
+            }
             continue
         failed_gates = [
             str(gate.get("key") or gate.get("label") or "")
@@ -217,9 +235,12 @@ def build_unified_stock_selection(
             if isinstance(thesis_preparation.get("item"), dict)
             else None
         )
+        tier = classify_core_eligibility(eligibility)
+        research_tiers[symbol] = tier
         research_evidence[symbol] = {
             "evaluation_status": "evaluated",
             "eligible_for_core": bool(eligibility.get("eligible_for_core")),
+            "research_tier": tier["tier"],
             "failed_gates": failed_gates,
             "gates": eligibility.get("gates") or [],
             "thesis_count": int(eligibility.get("thesis_count") or 0),
@@ -232,25 +253,74 @@ def build_unified_stock_selection(
             "raw_metrics": eligibility.get("raw_metrics") or {},
             "valuation": eligibility.get("valuation") or {},
         }
-        if eligibility.get("eligible_for_core"):
+        if tier["tier"] == CORE:
             research_admitted.append(symbol)
-        else:
+        elif tier["tier"] == HARD_BLOCKED:
             research_blocks.append({
                 "symbol": symbol,
                 "ts_code": code,
                 "side": "BUY",
-                "code": "unified_research_admission_failed",
-                "message": "统一选股研究硬门未通过：" + ",".join(failed_gates),
+                "code": "unified_research_hard_blocked",
+                "message": "统一选股数据或风险硬门未通过：" + ",".join(failed_gates),
+                "research_tier": HARD_BLOCKED,
             })
 
+    trading_research_symbols = [
+        symbol for symbol in research_targets
+        if (research_tiers.get(symbol) or {}).get("tier") != HARD_BLOCKED
+    ]
     dynamic_admitted, dynamic_blocks, dynamic_gate = _apply_dynamic_admission(
-        research_admitted,
+        trading_research_symbols,
         as_of_time=cutoff,
     )
     dynamic_gate = _freeze_dynamic_gate(dynamic_gate)
-    dynamic_admitted_set = set(dynamic_admitted)
-    admitted_symbols = [symbol for symbol in ranked_symbols if symbol in dynamic_admitted_set]
-    holding_admitted_symbols = [symbol for symbol in holdings if symbol in dynamic_admitted_set]
+    # Preserve a complete point-in-time gate snapshot even when the dynamic
+    # provider returns no per-symbol rows (for example a temporarily missing
+    # market context).  The formal V2 contract requires one item for every
+    # ranked/held symbol that is not hard blocked; these rows remain restricted
+    # and therefore cannot silently become core evidence.
+    if not (dynamic_gate.get("items") or []):
+        dynamic_gate = {
+            **dynamic_gate,
+            "items": [
+                {
+                    "symbol": symbol,
+                    "ts_code": _ts_code(symbol),
+                    "gate": {
+                        "admitted": False,
+                        "hard_blockers": [],
+                        "research_blockers": ["dynamic_gate_unavailable"],
+                    },
+                }
+                for symbol in trading_research_symbols
+            ],
+        }
+    dynamic_items = {
+        str(item.get("symbol") or ""): item
+        for item in (dynamic_gate.get("items") or [])
+        if isinstance(item, dict) and str(item.get("symbol") or "")
+    }
+    for symbol in trading_research_symbols:
+        prior = str((research_tiers.get(symbol) or {}).get("tier") or RESTRICTED)
+        gate = (dynamic_items.get(symbol) or {}).get("gate") or {}
+        dynamic_tier = classify_dynamic_gate(gate, prior_tier=prior)
+        research_tiers[symbol] = {
+            **(research_tiers.get(symbol) or {}),
+            **dynamic_tier,
+        }
+        research_evidence.setdefault(symbol, {})["research_tier"] = dynamic_tier["tier"]
+    tier_contract = build_research_tier_contract(research_tiers)
+    core_set = set(tier_contract["core_symbols"])
+    restricted_set = set(tier_contract["restricted_symbols"])
+    hard_blocked_set = set(tier_contract["hard_blocked_symbols"])
+    core_symbols = [symbol for symbol in ranked_symbols if symbol in core_set]
+    restricted_symbols = [symbol for symbol in ranked_symbols if symbol in restricted_set]
+    hard_blocked_symbols = [symbol for symbol in ranked_symbols if symbol in hard_blocked_set]
+    tradable_symbols = core_symbols + restricted_symbols
+    admitted_symbols = tradable_symbols
+    holding_core_symbols = [symbol for symbol in holdings if symbol in core_set]
+    holding_restricted_symbols = [symbol for symbol in holdings if symbol in restricted_set]
+    holding_admitted_symbols = holding_core_symbols + holding_restricted_symbols
     filter_summary = ranking_detail.get("filter_summary") if isinstance(ranking_detail.get("filter_summary"), dict) else {}
     universe_count = int(filter_summary.get("universe") or 0)
     evaluated_count = len(research_targets) - len(research_errors)
@@ -262,7 +332,13 @@ def build_unified_stock_selection(
         "at_least_one_research_evaluation": evaluated_count > 0,
     }
     infrastructure_blocked = not all(coverage_gates.values())
-    status = "blocked" if infrastructure_blocked else "ready" if admitted_symbols else "empty_opportunity"
+    opportunity_status = (
+        "core_and_restricted" if core_symbols and restricted_symbols
+        else "core_only" if core_symbols
+        else "restricted_only" if restricted_symbols
+        else "no_qualified_equity_candidate"
+    )
+    status = "blocked" if infrastructure_blocked else "ready" if tradable_symbols else "empty_opportunity"
     blocked_by_symbol: dict[str, list[dict[str, Any]]] = {}
     for block in ranking_detail.get("blocked_events") or []:
         if not isinstance(block, dict):
@@ -347,7 +423,8 @@ def build_unified_stock_selection(
             "schema_version": "alis_daily_model_ab_snapshot_v1",
             "with_models": {
                 "ranked_symbols": ranked_symbols,
-                "admitted_symbols": admitted_symbols,
+                "admitted_symbols": core_symbols,
+                "restricted_symbols_excluded_from_promotion_evidence": restricted_symbols,
             },
             "without_models": (
                 ranking_detail.get("model_disabled_baseline")
@@ -369,10 +446,18 @@ def build_unified_stock_selection(
         "champion_id": int(champion.get("champion_id") or 0),
         "champion_version": str(champion.get("champion_version") or ""),
         "ranked_symbols": ranked_symbols,
-        "research_admitted_symbols": research_admitted,
+        "research_admitted_symbols": core_symbols,
+        "core_symbols": core_symbols,
+        "restricted_symbols": restricted_symbols,
+        "hard_blocked_symbols": hard_blocked_symbols,
+        "tradable_symbols": tradable_symbols,
         "admitted_symbols": admitted_symbols,
         "holding_symbols": holdings,
+        "holding_core_symbols": holding_core_symbols,
+        "holding_restricted_symbols": holding_restricted_symbols,
         "holding_admitted_symbols": holding_admitted_symbols,
+        "research_tier_contract": tier_contract,
+        "opportunity_status": opportunity_status,
         "research_evidence": research_evidence,
         "research_blocks": research_blocks,
         "research_errors": research_errors,
@@ -390,7 +475,7 @@ def build_unified_stock_selection(
             "research_error_ratio": round(error_ratio, 8),
             "gates": coverage_gates,
         },
-        "source_policy": "full_market_factor_model_then_research_then_dynamic_gate_v1",
+        "source_policy": "full_market_factor_model_then_tiered_research_and_dynamic_gate_v2",
         "authority": {
             "formal_candidate_authority": "unified_selection_contract",
             "legacy_pool_membership_required": False,
@@ -413,10 +498,18 @@ def build_unified_stock_selection(
         "champion_id": int(champion.get("champion_id") or 0),
         "champion_version": str(champion.get("champion_version") or ""),
         "ranked_symbols": ranked_symbols,
-        "research_admitted_symbols": research_admitted,
+        "research_admitted_symbols": core_symbols,
+        "core_symbols": core_symbols,
+        "restricted_symbols": restricted_symbols,
+        "hard_blocked_symbols": hard_blocked_symbols,
+        "tradable_symbols": tradable_symbols,
         "admitted_symbols": admitted_symbols,
         "holding_symbols": holdings,
+        "holding_core_symbols": holding_core_symbols,
+        "holding_restricted_symbols": holding_restricted_symbols,
         "holding_admitted_symbols": holding_admitted_symbols,
+        "research_tier_contract": tier_contract,
+        "opportunity_status": opportunity_status,
         "selections": [
             selection_by_symbol[symbol]
             for symbol in ranked_symbols

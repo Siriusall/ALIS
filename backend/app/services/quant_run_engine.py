@@ -1048,9 +1048,10 @@ def run_for_trade_date(
             authoritative_plan.get("decision_contract")
             if isinstance(authoritative_plan.get("decision_contract"), dict) else {}
         )
-        if str(frozen_decision_contract.get("schema_version") or "") != "alis_unified_daily_decision_v2":
+        frozen_schema = str(frozen_decision_contract.get("schema_version") or "")
+        if frozen_schema not in {"alis_unified_daily_decision_v3", "alis_unified_daily_decision_v2"}:
             raise ReplayRiskGateError(
-                "正式执行只接受 V2 冻结日决策合同；旧合同仅保留审计证据",
+                "正式执行只接受 V3/V2 冻结日决策合同；更旧合同仅保留审计证据",
                 code="legacy_authoritative_plan",
             )
         frozen_cutoff = normalize_explicit_timestamp(frozen_decision_contract.get("data_as_of_time"))
@@ -1087,10 +1088,10 @@ def run_for_trade_date(
                     "统一正式计划的信号日或执行日与任务不一致",
                     code="invalid_authoritative_plan",
                 )
-        frozen_exact_quantity_orders = (
-            str(frozen_decision_contract.get("schema_version") or "")
-            == "alis_unified_daily_decision_v2"
-        )
+        frozen_exact_quantity_orders = frozen_schema in {
+            "alis_unified_daily_decision_v3",
+            "alis_unified_daily_decision_v2",
+        }
         if frozen_exact_quantity_orders:
             frozen_order_by_symbol = {
                 str(item.get("symbol") or ""): dict(item)

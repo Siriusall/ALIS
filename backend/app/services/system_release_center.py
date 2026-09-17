@@ -27,7 +27,7 @@ CONTRACT_CATALOG: dict[str, dict[str, Any]] = {
     "contract.decision_manifest": {"version": DECISION_MANIFEST_SCHEMA_VERSION, "critical": True},
     "contract.point_in_time": {"version": "alis_market_observation_clock_v1", "critical": True},
     "contract.execution": {"version": "alis_t1_execution_safety_v2", "critical": True},
-    "contract.unified_decision": {"version": "alis_unified_daily_decision_v2", "critical": True},
+    "contract.unified_decision": {"version": "alis_unified_daily_decision_v3", "critical": True},
     "contract.oos_hard_data": {"version": "alis_progressive_oos_v5", "critical": False},
     "contract.sealed_holdout": {"version": "alis_sealed_strategy_holdout_v4_immutable_observation", "critical": False},
 }

@@ -1,6 +1,9 @@
 import pytest
 
+from app.integrations.broker_adapter import OrderRequest
+from app.services.execution_engine import simulate_open_execution
 from app.services.market_context import _transparent_regime, bocpd_change_alarm, classify_market_profile, score_market_sentiment, score_theme_narratives
+from app.services.research_tier_contract import build_tiered_equity_budget, classify_dynamic_gate
 from app.services.strategy_gate import evaluate_strategy_gate
 
 
@@ -42,7 +45,7 @@ def test_bear_market_changes_budget_not_research_fact() -> None:
     assert bear["safety_margin_multiplier"] > bull["safety_margin_multiplier"]
 
 
-def test_dynamic_safety_margin_blocks_expensive_candidate() -> None:
+def test_dynamic_safety_margin_keeps_core_research_gate_hard() -> None:
     result = evaluate_strategy_gate(
         research_score=80, confidence=.8, data_quality=90, risk_eligible=True,
         market_state="bear", sentiment_score=40, expectation_score=70,
@@ -50,8 +53,59 @@ def test_dynamic_safety_margin_blocks_expensive_candidate() -> None:
     )
     assert result["required_safety_margin"] == pytest.approx(.135)
     assert result["admitted"] is False
+    assert result["hard_blockers"] == []
+    assert result["research_blockers"] == ["基准估值安全边际12.0%低于动态要求13.5%"]
     assert result["risk_budget_multiplier"] == 0
-    assert result["cash_target"] == 1
+    assert classify_dynamic_gate(result, prior_tier="core")["tier"] == "restricted"
+
+
+def test_valuation_shortfall_does_not_override_hard_research_blocker() -> None:
+    result = evaluate_strategy_gate(
+        research_score=64, confidence=.8, data_quality=90, risk_eligible=True,
+        market_state="S1", sentiment_score=70, expectation_score=70,
+        valuation_score=70, valuation_upside=.05,
+    )
+    assert result["admitted"] is False
+    assert result["hard_blockers"] == []
+    assert result["research_blockers"] == [
+        "研究准入分低于65",
+        "基准估值安全边际5.0%低于动态要求11.0%",
+    ]
+    assert result["risk_budget_multiplier"] == 0
+    assert result["soft_blockers"]
+
+
+def test_restricted_trading_layer_reaches_a_share_execution_preview() -> None:
+    gate = evaluate_strategy_gate(
+        research_score=80, confidence=.8, data_quality=90, risk_eligible=True,
+        market_state="S1", sentiment_score=70, expectation_score=70,
+        valuation_score=70, valuation_upside=.05,
+    )
+    tier = classify_dynamic_gate(gate, prior_tier="core")
+    budget = build_tiered_equity_budget(
+        market_state="S1", base_equity_budget=.85,
+        core_symbols=[], restricted_symbols=["000001"],
+    )
+    orders = simulate_open_execution(
+        [OrderRequest(
+            symbol="000001", side="BUY", price=10.0, quantity=0,
+            name="平安银行", change_pct=.2, volume=1_000_000, close=10.0,
+        )] if tier["trading_eligible"] else [],
+        budget=200_000 * budget["effective_equity_budget"],
+        total_equity=200_000,
+        max_single_position_pct=.15,
+        symbol_scores={"000001": 90},
+        industry_by_symbol={"000001": "银行"},
+        target_weights={"000001": budget["restricted_symbol_cap"]},
+        max_order_value_by_symbol={"000001": 1_000_000},
+    ).orders
+
+    assert gate["admitted"] is False
+    assert tier["tier"] == "restricted"
+    assert budget["opportunity_status"] == "restricted_only"
+    assert len(orders) == 1
+    assert orders[0].status == "simulated"
+    assert orders[0].quantity > 0
 
 
 def test_fixed_four_market_states_and_constitution_multipliers() -> None:
