@@ -377,7 +377,7 @@ def load_raw_record_versions(
         values = [str(value) for value in ts_codes if str(value)]
         if values:
             placeholders = ",".join("?" for _ in values)
-            if is_postgres and has_accepted_projection:
+            if is_postgres and accepted_projection_available:
                 # Drive the accepted projection by the requested securities.
                 # Restricting only ``v`` leaves PostgreSQL free to walk the
                 # full historical projection before the hash lookup.
