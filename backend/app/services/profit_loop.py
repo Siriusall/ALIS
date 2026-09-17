@@ -795,6 +795,15 @@ def _position_returns(
     if as_of_time and not cutoff:
         return {}
     end_date = str(trade_date_end or "").replace("-", "")[:8]
+    history_start = ""
+    if len(end_date) == 8 and end_date.isdigit():
+        # The query only needs the latest ``history_limit`` trading bars.  A
+        # three-calendar-day allowance per bar safely covers weekends and
+        # exchange holidays while preventing a PIT scan over every historical
+        # accepted snapshot version.
+        history_start = (
+            datetime.strptime(end_date, "%Y%m%d") - timedelta(days=history_limit * 3)
+        ).strftime("%Y%m%d")
     placeholders = ",".join("?" for _ in symbol_by_code)
     from app.data_platform.services.observation_clock import (
         load_raw_record_versions,
@@ -890,6 +899,7 @@ def _position_returns(
                     "fund_daily",
                     cutoff=cutoff,
                     ts_codes=[missing_code],
+                    trade_date_start=history_start,
                     trade_date_end=end_date,
                     limit=history_limit,
                 )
@@ -2704,7 +2714,6 @@ def _materialize_daily_rebalance_plan_locked(
     signal_date: str = "",
 ) -> dict[str, Any]:
     """Persist one immutable plan version per materially different daily input."""
-<<<<<<< HEAD
     # The wall clock may already be on the next calendar day when the prior
     # close bundle finishes. An explicit completed signal date prevents the
     # planner from selecting tomorrow's incomplete target session.

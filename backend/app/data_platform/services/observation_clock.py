@@ -377,6 +377,12 @@ def load_raw_record_versions(
         values = [str(value) for value in ts_codes if str(value)]
         if values:
             placeholders = ",".join("?" for _ in values)
+            if is_postgres and has_accepted_projection:
+                # Drive the accepted projection by the requested securities.
+                # Restricting only ``v`` leaves PostgreSQL free to walk the
+                # full historical projection before the hash lookup.
+                predicates.append(f"accepted.ts_code IN ({placeholders})")
+                params.extend(values)
             predicates.append(f"v.ts_code IN ({placeholders})")
             params.extend(values)
     if periods:
@@ -704,6 +710,12 @@ def load_snapshot_versions(
         values = [str(value) for value in ts_codes if str(value)]
         if values:
             placeholders = ",".join("?" for _ in values)
+            if is_postgres and has_accepted_projection:
+                # Keep the accepted projection on the same narrow symbol set
+                # as the immutable version lookup.  This is essential for
+                # bounded per-symbol return histories on the daily plan path.
+                predicates.append(f"accepted.ts_code IN ({placeholders})")
+                params.extend(values)
             predicates.append(f"v.ts_code IN ({placeholders})")
             params.extend(values)
     if trade_date:
