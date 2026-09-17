@@ -770,15 +770,10 @@ def load_snapshot_versions(
         if is_postgres:
             source_sql = f"""SELECT {qualified_columns}
                               FROM dc_stock_daily_snapshot accepted
-                              JOIN LATERAL (
-                                  SELECT id,ts_code,trade_date,payload_json,source_code,economic_available_time,
-                                         observed_at,first_observed_at,observation_provenance,content_hash,created_at
-                                    FROM dc_stock_daily_snapshot_version v
-                                   WHERE v.ts_code=accepted.ts_code
-                                     AND v.trade_date=accepted.trade_date
-                                     AND v.content_hash=accepted.content_hash
-                                   LIMIT 1
-                              ) v ON true
+                              JOIN dc_stock_daily_snapshot_version v
+                                ON v.ts_code=accepted.ts_code
+                               AND v.trade_date=accepted.trade_date
+                               AND v.content_hash=accepted.content_hash
                              WHERE {' AND '.join(predicates)}"""
         else:
             source_sql = f"""SELECT {qualified_columns}

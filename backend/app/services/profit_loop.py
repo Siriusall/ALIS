@@ -810,7 +810,6 @@ def _position_returns(
         load_snapshot_versions,
     )
     with data_conn() as c:
-<<<<<<< HEAD
         # Bound the immutable PIT scan to the requested history window.  A
         # trade-date upper bound alone makes PostgreSQL walk every historical
         # revision for the selected symbols before the per-code window can be
