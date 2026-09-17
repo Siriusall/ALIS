@@ -810,6 +810,7 @@ def _position_returns(
         load_snapshot_versions,
     )
     with data_conn() as c:
+<<<<<<< HEAD
         # Bound the immutable PIT scan to the requested history window.  A
         # trade-date upper bound alone makes PostgreSQL walk every historical
         # revision for the selected symbols before the per-code window can be
@@ -832,17 +833,20 @@ def _position_returns(
             ).fetchone()
             if start_row:
                 trade_date_start = str(dict(start_row).get("start_date") or "")
-        versioned = load_snapshot_versions(
-            c,
-            cutoff=cutoff,
-            ts_codes=list(symbol_by_code),
-            trade_date_start=trade_date_start,
-            trade_date_end=end_date,
-            # A global result cap lets the first dense symbol consume the
-            # entire window and leaves the remaining requested series empty.
-            # Keep the historical bound independently for every security.
-            per_ts_code_limit=history_limit,
-        )
+        try:
+            versioned = load_snapshot_versions(
+                c,
+                cutoff=cutoff,
+                ts_codes=list(symbol_by_code),
+                trade_date_start=trade_date_start,
+                trade_date_end=end_date,
+                # A global result cap lets the first dense symbol consume the
+                # entire window and leaves the remaining requested series empty.
+                # Keep the historical bound independently for every security.
+                per_ts_code_limit=history_limit,
+            )
+        except Exception as exc:
+            raise RuntimeError(f"position_returns_snapshot_versions: {exc}") from exc
         if versioned is None and as_of_time:
             # A formal cutoff cannot fall back to the mutable snapshot
             # projection.  It has no immutable observation proof and may have
@@ -894,15 +898,20 @@ def _position_returns(
             # other requested series while preserving the PIT contract.
             raw_versions: list[dict[str, Any]] | None = []
             for missing_code in missing_codes:
-                rows_for_code = load_raw_record_versions(
-                    c,
-                    "fund_daily",
-                    cutoff=cutoff,
-                    ts_codes=[missing_code],
-                    trade_date_start=history_start,
-                    trade_date_end=end_date,
-                    limit=history_limit,
-                )
+                try:
+                    rows_for_code = load_raw_record_versions(
+                        c,
+                        "fund_daily",
+                        cutoff=cutoff,
+                        ts_codes=[missing_code],
+                        trade_date_start=trade_date_start,
+                        trade_date_end=end_date,
+                        limit=history_limit,
+                    )
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"position_returns_fund_daily ts_code={missing_code}: {exc}"
+                    ) from exc
                 if rows_for_code is None:
                     raw_versions = None
                     break
