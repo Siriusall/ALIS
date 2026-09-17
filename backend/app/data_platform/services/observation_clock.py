@@ -386,9 +386,15 @@ def load_raw_record_versions(
             predicates.append(f"v.period IN ({placeholders})")
             params.extend(values)
     if trade_date_start:
+        if is_postgres and accepted_projection_available:
+            predicates.append("p.trade_date>=?")
+            params.append(str(trade_date_start))
         predicates.append("v.trade_date>=?")
         params.append(str(trade_date_start))
     if trade_date_end:
+        if is_postgres and accepted_projection_available:
+            predicates.append("p.trade_date<=?")
+            params.append(str(trade_date_end))
         predicates.append("v.trade_date<=?")
         params.append(str(trade_date_end))
     bounded_periods = max(1, int(period_limit)) if period_limit else 0
