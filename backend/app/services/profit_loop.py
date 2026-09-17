@@ -6,6 +6,7 @@ import math
 import os
 import threading
 from contextlib import contextmanager
+from time import perf_counter
 from datetime import datetime, time as dtime, timedelta
 from statistics import mean
 from typing import Any
@@ -979,6 +980,7 @@ def _build_formal_unified_selection(
             "schema_version": "alis_unified_stock_selection_v2",
             "error": "latest_decision_trade_date_missing",
         }
+    started_at = perf_counter()
     try:
         from app.services.unified_stock_selection import build_unified_stock_selection
 
@@ -994,7 +996,10 @@ def _build_formal_unified_selection(
             "ok": False,
             "status": "blocked",
             "schema_version": "alis_unified_stock_selection_v2",
-            "error": str(exc)[:500],
+            "error": (
+                "portfolio_stage=unified_selection "
+                f"elapsed_ms={round((perf_counter() - started_at) * 1000)} error={str(exc)[:400]}"
+            ),
         }
 
 
@@ -1145,6 +1150,16 @@ def build_model_live_monitor(*, persist: bool = True) -> dict[str, Any]:
 
 
 def build_portfolio_reoptimization(*, signal_date: str = "") -> dict[str, Any]:
+    def run_stage(stage: str, callback):
+        started_at = perf_counter()
+        try:
+            return callback()
+        except Exception as exc:
+            elapsed_ms = round((perf_counter() - started_at) * 1000)
+            raise RuntimeError(
+                f"portfolio_stage={stage} elapsed_ms={elapsed_ms} error={exc}"
+            ) from exc
+
     positions = get_positions()
     names = {str(p.get("symbol") or ""): str(p.get("name") or "") for p in positions}
     holding_symbols = [str(p.get("symbol") or "") for p in positions if str(p.get("symbol") or "")]
@@ -1179,16 +1194,22 @@ def build_portfolio_reoptimization(*, signal_date: str = "") -> dict[str, Any]:
     # universe.  Validate them before running selection, optimisation, or any
     # cost-basis-derived preview calculation.
     try:
-        valuation_cache = build_position_market_series_cache(
-            positions,
-            as_of=selection_trade_date,
-            lookback=120,
-            observation_cutoff=observation_cutoff,
+        valuation_cache = run_stage(
+            "position_market_series",
+            lambda: build_position_market_series_cache(
+                positions,
+                as_of=selection_trade_date,
+                lookback=120,
+                observation_cutoff=observation_cutoff,
+            ),
         )
-        missing_position_valuations = missing_exact_position_valuations(
-            positions,
-            valuation_cache,
-            as_of=selection_trade_date,
+        missing_position_valuations = run_stage(
+            "position_valuation_completeness",
+            lambda: missing_exact_position_valuations(
+                positions,
+                valuation_cache,
+                as_of=selection_trade_date,
+            ),
         )
     except Exception as exc:  # noqa: BLE001 - a read failure is a hard input gap
         return _blocked_portfolio_reoptimization(
@@ -1216,10 +1237,13 @@ def build_portfolio_reoptimization(*, signal_date: str = "") -> dict[str, Any]:
             missing_symbols=missing_symbols,
         )
     try:
-        risk = build_live_portfolio_risk(
-            valuation_cache=valuation_cache,
-            positions=positions,
-            as_of=selection_trade_date,
+        risk = run_stage(
+            "live_portfolio_risk",
+            lambda: build_live_portfolio_risk(
+                valuation_cache=valuation_cache,
+                positions=positions,
+                as_of=selection_trade_date,
+            ),
         )
     except Exception as exc:  # noqa: BLE001 - keep an explicit non-executable result
         return _blocked_portfolio_reoptimization(
@@ -1289,10 +1313,13 @@ def build_portfolio_reoptimization(*, signal_date: str = "") -> dict[str, Any]:
             for row in c.execute(f"SELECT split_part(ts_code,'.',1) symbol,name FROM dc_stock_master WHERE split_part(ts_code,'.',1) IN ({placeholders})", tuple(missing_names)).fetchall():
                 item = dict(row)
                 names[str(item.get("symbol") or "")] = str(item.get("name") or "")
-    returns = _position_returns(
-        symbols,
-        as_of_time=observation_cutoff or None,
-        trade_date_end=valuation_as_of,
+    returns = run_stage(
+        "position_returns",
+        lambda: _position_returns(
+            symbols,
+            as_of_time=observation_cutoff or None,
+            trade_date_end=valuation_as_of,
+        ),
     )
     current_weights = {
         str(item.get("symbol") or ""): _safe_float(item.get("weight"))
@@ -1464,10 +1491,13 @@ def build_portfolio_reoptimization(*, signal_date: str = "") -> dict[str, Any]:
             symbols.append(symbol)
         names[symbol] = str((defensive_meta.get(symbol) or {}).get("name") or names.get(symbol) or symbol)
         trading_costs[symbol] = one_way_cost
-    defensive_returns = _position_returns(
-        list(defensive_weights),
-        as_of_time=observation_cutoff or None,
-        trade_date_end=valuation_as_of,
+    defensive_returns = run_stage(
+        "defensive_returns",
+        lambda: _position_returns(
+            list(defensive_weights),
+            as_of_time=observation_cutoff or None,
+            trade_date_end=valuation_as_of,
+        ),
     )
     returns.update(defensive_returns)
     expected_items = (
@@ -1495,12 +1525,15 @@ def build_portfolio_reoptimization(*, signal_date: str = "") -> dict[str, Any]:
         symbol_order=symbols,
     )
     equity_candidates = [symbol for symbol in symbols if symbol not in {"510880", "511010", "511880", "512890", "518880"}]
-    industry_allocation = build_industry_allocation(
-        symbols=equity_candidates,
-        symbol_scores={symbol: _safe_float(expected.get(symbol)) * 100 for symbol in equity_candidates},
-        equity_budget=equity_budget,
-        market_state=state,
-        as_of_time=str(selection_contract.get("data_as_of_time") or "") if unified_available else None,
+    industry_allocation = run_stage(
+        "industry_allocation",
+        lambda: build_industry_allocation(
+            symbols=equity_candidates,
+            symbol_scores={symbol: _safe_float(expected.get(symbol)) * 100 for symbol in equity_candidates},
+            equity_budget=equity_budget,
+            market_state=state,
+            as_of_time=str(selection_contract.get("data_as_of_time") or "") if unified_available else None,
+        ),
     )
     admitted_industries = set((industry_allocation.get("industry_targets") or {}).keys())
     symbol_industries = industry_allocation.get("symbol_industries") or {}
@@ -1623,7 +1656,7 @@ def build_portfolio_reoptimization(*, signal_date: str = "") -> dict[str, Any]:
         dynamic_caps=position_weight_caps,
     )
     controller_candidates = list(dict.fromkeys(unified_symbols + reviewed_holding_symbols))
-    pretrade_controller = build_pretrade_strategy_controller(
+    pretrade_controller = run_stage("pretrade_controller", lambda: build_pretrade_strategy_controller(
         candidate_symbols=controller_candidates,
         holding_symbols=holding_symbols,
         selections=unified_selection_by_symbol,
@@ -1648,10 +1681,10 @@ def build_portfolio_reoptimization(*, signal_date: str = "") -> dict[str, Any]:
             "tiered_equity_budget": tiered_equity_budget,
             "market_state": state,
         },
-    )
+    ))
     controller_bounds = dict(pretrade_controller.get("weight_bounds") or {})
     target_budget = min(1.0, equity_budget + sum(defensive_weights.values()))
-    optimizer = two_group_cvar_optimizer(
+    optimizer = run_stage("cvar_optimizer", lambda: two_group_cvar_optimizer(
         returns,
         expected_returns=expected,
         buckets=buckets,
@@ -1660,7 +1693,7 @@ def build_portfolio_reoptimization(*, signal_date: str = "") -> dict[str, Any]:
         crowding=industry_penalty,
         weight_bounds=controller_bounds,
         target_budget=target_budget,
-    )
+    ))
     raw_weights = dict(optimizer.get("weights") or {})
     account_equity = _safe_float((risk.get("account") or {}).get("equity"))
     current_quantities = {
@@ -1676,16 +1709,19 @@ def build_portfolio_reoptimization(*, signal_date: str = "") -> dict[str, Any]:
     for symbol in symbols:
         if _safe_float(reference_prices.get(symbol)) > 0:
             continue
-        valuation = point_in_time_position_market_series(
-            symbol=symbol,
-            as_of=selection_trade_date,
-            lookback=20,
-            data_source=valuation_source,
-            observation_cutoff=observation_cutoff or None,
+        valuation = run_stage(
+            "reference_price",
+            lambda symbol=symbol: point_in_time_position_market_series(
+                symbol=symbol,
+                as_of=selection_trade_date,
+                lookback=20,
+                data_source=valuation_source,
+                observation_cutoff=observation_cutoff or None,
+            ),
         )
         reference_prices[symbol] = _safe_float(valuation.get("price"))
     from app.services.portfolio_method_competition import compete_portfolio_methods
-    method_competition = compete_portfolio_methods(
+    method_competition = run_stage("portfolio_method_competition", lambda: compete_portfolio_methods(
         returns_by_symbol=returns,
         expected_returns=expected,
         current_weights=current_weights,
@@ -1700,7 +1736,7 @@ def build_portfolio_reoptimization(*, signal_date: str = "") -> dict[str, Any]:
         weight_bounds=controller_bounds,
         symbol_industries=symbol_industries,
         industry_targets=industry_allocation.get("industry_targets") or {},
-    )
+    ))
     scaled_weights = {
         symbol: round(_safe_float(weight), 8)
         for symbol, weight in (method_competition.get("weights") or {}).items()
@@ -2668,11 +2704,15 @@ def _materialize_daily_rebalance_plan_locked(
     signal_date: str = "",
 ) -> dict[str, Any]:
     """Persist one immutable plan version per materially different daily input."""
+<<<<<<< HEAD
     # The wall clock may already be on the next calendar day when the prior
-    # close bundle finishes.  An explicit completed signal date prevents the
-    # planner from selecting tomorrow's still-incomplete target session and
-    # losing the just-published T+1 opportunity.
-    portfolio = portfolio or build_portfolio_reoptimization(signal_date=signal_date)
+    # close bundle finishes. An explicit completed signal date prevents the
+    # planner from selecting tomorrow's incomplete target session.
+    if portfolio is None:
+        try:
+            portfolio = build_portfolio_reoptimization(signal_date=signal_date)
+        except Exception as exc:
+            raise RuntimeError(f"portfolio_reoptimization_failed: {exc}") from exc
     decision_gate = portfolio.get("decision_data_gate") if isinstance(portfolio.get("decision_data_gate"), dict) else {}
     trade_date = str(decision_gate.get("target_trade_date") or "")
     if not trade_date:
