@@ -71,6 +71,10 @@ HISTORICAL_PIT_EVIDENCE_RECHECK_SECONDS = max(
     24 * 60 * 60,
     min(int(os.getenv("EVOLUTION_HISTORICAL_PIT_EVIDENCE_RECHECK_SECONDS", str(24 * 60 * 60))), 7 * 24 * 60 * 60),
 )
+HISTORICAL_TASK_RECONCILIATION_INTERVAL_SECONDS = max(
+    300,
+    min(int(os.getenv("EVOLUTION_HISTORICAL_TASK_RECONCILIATION_INTERVAL_SECONDS", "1800")), 24 * 60 * 60),
+)
 RESOURCE_BUDGET_RETRY_SECONDS = max(
     2, min(int(os.getenv("EVOLUTION_RESOURCE_BUDGET_RETRY_SECONDS", "5")), 300)
 )
@@ -113,6 +117,7 @@ PUBLICATION_PROBE_RECONCILIATION_LIMIT = max(
 )
 _model_watchdog_last_at = 0.0
 _last_worker_reconciliation_at = 0.0
+_historical_task_reconciliation_last_at = 0.0
 LEGACY_TASK_RECONCILIATION_VERSION = "alis_evolution_task_reconciliation_v1"
 WORKER_ID = f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
 SYSTEM_AUTONOMY_RECOVERY_POLICY_VERSION = "v3"
@@ -784,6 +789,27 @@ def reconcile_historical_contract_incompatible_tasks(*, limit: int = 200) -> dic
         "reconciled": reconciled,
         "count": len(reconciled),
     }
+
+
+def _reconcile_historical_contract_tasks_if_due() -> dict[str, Any]:
+    """Keep terminal-evidence cleanup off the hot queue-claim path.
+
+    This maintenance scan has no bearing on executable tasks.  A timed-out
+    historical query must therefore not prevent a worker from claiming work,
+    especially while the close-of-day decision pipeline needs the database.
+    """
+    global _historical_task_reconciliation_last_at
+    now = time.monotonic()
+    if now - _historical_task_reconciliation_last_at < HISTORICAL_TASK_RECONCILIATION_INTERVAL_SECONDS:
+        return {"ok": True, "count": 0, "deferred": True}
+    # Throttle failures too; otherwise a transient timeout becomes a tight
+    # retry loop that repeatedly competes with production work.
+    _historical_task_reconciliation_last_at = now
+    try:
+        return reconcile_historical_contract_incompatible_tasks()
+    except Exception as exc:  # noqa: BLE001 - maintenance cannot block task execution
+        logger.warning("historical task reconciliation deferred after error: %s", exc)
+        return {"ok": False, "count": 0, "deferred": True, "error": str(exc)}
 
 
 def reconcile_historical_data_gate_waiting_tasks(*, limit: int = 200) -> dict[str, Any]:
@@ -4220,7 +4246,7 @@ def _run_worker_reconciliations() -> None:
             reconciliation["count"],
             [item.get("id") for item in reconciliation.get("quarantined") or []],
         )
-    historical_reconciliation = reconcile_historical_contract_incompatible_tasks()
+    historical_reconciliation = _reconcile_historical_contract_tasks_if_due()
     if historical_reconciliation.get("count"):
         logger.info(
             "quarantined %s historical contract-incompatible task(s): %s",

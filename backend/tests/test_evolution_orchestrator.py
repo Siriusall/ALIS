@@ -1034,6 +1034,19 @@ def test_worker_defers_data_block_without_creating_lineage_tasks(monkeypatch):
     assert deferred[0][1]["status"] == "blocked_by_decision_data"
 
 
+def test_historical_reconciliation_timeout_does_not_block_task_claim(monkeypatch):
+    task = {"id": 92, "task_type": "research_maintenance", "status": "running"}
+    monkeypatch.setattr(evolution, "_historical_task_reconciliation_last_at", 0.0)
+    monkeypatch.setattr(evolution, "HISTORICAL_TASK_RECONCILIATION_INTERVAL_SECONDS", 300)
+    monkeypatch.setattr(evolution, "reconcile_historical_contract_incompatible_tasks", lambda: (_ for _ in ()).throw(TimeoutError("statement timeout")))
+    monkeypatch.setattr(evolution, "_claim_next_task", lambda: task)
+    monkeypatch.setattr(evolution, "_run_claimed_task", lambda claimed: {"id": claimed["id"], "status": "completed"})
+
+    result = evolution.run_worker_once()
+
+    assert result == {"id": 92, "status": "completed"}
+
+
 def test_data_gate_deferral_reuses_task_id_and_does_not_consume_attempt(monkeypatch):
     transition = {}
     monkeypatch.setattr(
