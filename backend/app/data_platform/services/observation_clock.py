@@ -381,7 +381,7 @@ def load_raw_record_versions(
                 # Drive the accepted projection by the requested securities.
                 # Restricting only ``v`` leaves PostgreSQL free to walk the
                 # full historical projection before the hash lookup.
-                predicates.append(f"accepted.ts_code IN ({placeholders})")
+                predicates.append(f"p.ts_code IN ({placeholders})")
                 params.extend(values)
             predicates.append(f"v.ts_code IN ({placeholders})")
             params.extend(values)
