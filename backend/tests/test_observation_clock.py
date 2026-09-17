@@ -424,7 +424,7 @@ def test_current_projection_loader_requires_its_immutable_version():
     ]
 
 
-def test_postgres_current_projection_materializes_both_exact_date_sides(monkeypatch):
+def test_postgres_current_projection_probes_versions_from_accepted_keys(monkeypatch):
     captured = {}
 
     class Result:
@@ -454,8 +454,8 @@ def test_postgres_current_projection_materializes_both_exact_date_sides(monkeypa
     )
 
     assert load_current_raw_record_versions(Connection(), "adj_factor", "20260825") == []
-    assert "versions AS MATERIALIZED" in captured["sql"]
-    assert captured["params"] == ("adj_factor", "20260825", "adj_factor", "20260825")
+    assert "JOIN LATERAL" in captured["sql"]
+    assert captured["params"] == ("adj_factor", "20260825")
     load_current_raw_record_versions(
         Connection(), "adj_factor", "20260825", payload_fields=("ts_code", "adj_factor"),
     )

@@ -566,10 +566,11 @@ def load_current_raw_record_versions(
         _explicit_timestamp_sql("v.created_at", is_postgres=is_postgres),
     ]
     if is_postgres:
-        # PostgreSQL can badly underestimate the correlation between API and
-        # date on the append-only table and start from tens of millions of
-        # versions.  Freeze the exact accepted session first; this is the same
-        # authoritative hash join with a bounded and deterministic join side.
+        # Start from the accepted daily projection.  A conventional join lets
+        # PostgreSQL choose the append-only version table as the outer side,
+        # scanning every version for an API/date before it applies the
+        # accepted content hash.  LATERAL fixes the small accepted projection
+        # as the outer side and probes the immutable key for each record.
         payload_expression = "v.payload_json"
         if payload_fields:
             if any(not field.replace('_', '').isalnum() for field in payload_fields):
@@ -584,29 +585,25 @@ def load_current_raw_record_versions(
                 f"WHERE key IN ({field_literals})) AS payload_json"
             )
         sql = f"""
-            WITH accepted AS MATERIALIZED (
-                SELECT api_name,record_key,trade_date,content_hash
-                  FROM dc_tushare_raw_records
-                 WHERE api_name=? AND trade_date=?
-                   AND NULLIF(TRIM(COALESCE(content_hash,'')),'') IS NOT NULL
-            ), versions AS MATERIALIZED (
-                SELECT id,api_name,record_key,ts_code,trade_date,period,ann_date,
-                       payload_json,source_code,economic_available_time,observed_at,
-                       first_observed_at,observation_provenance,content_hash,created_at
-                  FROM dc_tushare_raw_record_version v
-                 WHERE v.api_name=? AND v.trade_date=?
-                   AND {' AND '.join(version_predicates)}
-            )
             SELECT v.id,v.api_name,v.record_key,v.ts_code,v.trade_date,
                    v.period,v.ann_date,{payload_expression},v.source_code,
                    v.economic_available_time,v.observed_at,v.first_observed_at,
                    v.observation_provenance,v.content_hash,v.created_at
-              FROM accepted p
-              JOIN versions v
-                ON v.api_name=p.api_name
-               AND v.record_key=p.record_key
-               AND v.content_hash=p.content_hash
-               AND v.trade_date=p.trade_date
+              FROM dc_tushare_raw_records p
+              JOIN LATERAL (
+                  SELECT id,api_name,record_key,ts_code,trade_date,period,ann_date,
+                         payload_json,source_code,economic_available_time,observed_at,
+                         first_observed_at,observation_provenance,content_hash,created_at
+                    FROM dc_tushare_raw_record_version v
+                   WHERE v.api_name=p.api_name
+                     AND v.record_key=p.record_key
+                     AND v.content_hash=p.content_hash
+                     AND v.trade_date=p.trade_date
+                     AND {' AND '.join(version_predicates)}
+                   LIMIT 1
+              ) v ON true
+             WHERE p.api_name=? AND p.trade_date=?
+               AND NULLIF(TRIM(COALESCE(p.content_hash,'')),'') IS NOT NULL
              ORDER BY v.observed_at,v.id
         """
     else:
@@ -626,11 +623,7 @@ def load_current_raw_record_versions(
                AND {' AND '.join(version_predicates)}
              ORDER BY v.observed_at,v.id
         """
-    params = (
-        (str(api_name), str(trade_date), str(api_name), str(trade_date))
-        if is_postgres
-        else (str(api_name), str(trade_date))
-    )
+    params = (str(api_name), str(trade_date))
     return [dict(row) for row in c.execute(sql, params).fetchall()]
 
 
