@@ -707,12 +707,21 @@ def load_snapshot_versions(
             predicates.append(f"v.ts_code IN ({placeholders})")
             params.extend(values)
     if trade_date:
+        if is_postgres and has_accepted_projection:
+            predicates.append("accepted.trade_date=?")
+            params.append(str(trade_date))
         predicates.append("v.trade_date=?")
         params.append(str(trade_date))
     if trade_date_start:
+        if is_postgres and has_accepted_projection:
+            predicates.append("accepted.trade_date>=?")
+            params.append(str(trade_date_start))
         predicates.append("v.trade_date>=?")
         params.append(str(trade_date_start))
     if trade_date_end:
+        if is_postgres and has_accepted_projection:
+            predicates.append("accepted.trade_date<=?")
+            params.append(str(trade_date_end))
         predicates.append("v.trade_date<=?")
         params.append(str(trade_date_end))
     per_code_limit = max(1, int(per_ts_code_limit)) if per_ts_code_limit else 0
@@ -746,7 +755,21 @@ def load_snapshot_versions(
         # Do not rank or correlate against the 7 GB projection: if its chosen
         # hash arrived after the caller's PIT cutoff, returning no row is the
         # required fail-closed result.
-        source_sql = f"""SELECT {qualified_columns}
+        if is_postgres:
+            source_sql = f"""SELECT {qualified_columns}
+                              FROM dc_stock_daily_snapshot accepted
+                              JOIN LATERAL (
+                                  SELECT id,ts_code,trade_date,payload_json,source_code,economic_available_time,
+                                         observed_at,first_observed_at,observation_provenance,content_hash,created_at
+                                    FROM dc_stock_daily_snapshot_version v
+                                   WHERE v.ts_code=accepted.ts_code
+                                     AND v.trade_date=accepted.trade_date
+                                     AND v.content_hash=accepted.content_hash
+                                   LIMIT 1
+                              ) v ON true
+                             WHERE {' AND '.join(predicates)}"""
+        else:
+            source_sql = f"""SELECT {qualified_columns}
                               FROM dc_stock_daily_snapshot accepted
                               JOIN dc_stock_daily_snapshot_version v
                                 ON v.ts_code=accepted.ts_code
