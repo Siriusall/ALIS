@@ -4246,13 +4246,6 @@ def _run_worker_reconciliations() -> None:
             reconciliation["count"],
             [item.get("id") for item in reconciliation.get("quarantined") or []],
         )
-    historical_reconciliation = _reconcile_historical_contract_tasks_if_due()
-    if historical_reconciliation.get("count"):
-        logger.info(
-            "quarantined %s historical contract-incompatible task(s): %s",
-            historical_reconciliation["count"],
-            [item.get("id") for item in historical_reconciliation.get("reconciled") or []],
-        )
     historical_data_gate_reconciliation = reconcile_historical_data_gate_waiting_tasks()
     if historical_data_gate_reconciliation.get("count"):
         logger.info(
@@ -4294,6 +4287,16 @@ def run_worker_once() -> dict[str, Any] | None:
     _run_worker_reconciliations()
     task = _claim_next_task()
     if not task:
+        # Historical terminal-evidence cleanup is maintenance only.  It must
+        # yield to every runnable task, including close-of-day refresh and
+        # decision work that shares this database budget.
+        historical_reconciliation = _reconcile_historical_contract_tasks_if_due()
+        if historical_reconciliation.get("count"):
+            logger.info(
+                "quarantined %s historical contract-incompatible task(s): %s",
+                historical_reconciliation["count"],
+                [item.get("id") for item in historical_reconciliation.get("reconciled") or []],
+            )
         return None
     task_id = int(task["id"])
     with _active_task_lock:
