@@ -34,17 +34,149 @@ export function snapshotStatus(payload: unknown) {
   return String((payload as Json).status || "unavailable").trim().toLowerCase();
 }
 
-export function snapshotIsHealthy(payload: unknown): payload is Json {
+const unavailableSectionStatuses = new Set(["error", "unavailable", "warming_up"]);
+const sectionEnvelopeKeys = new Set([
+  "status", "ok", "data_available", "available", "component", "error",
+  "retry_after_seconds", "reason", "message",
+]);
+
+function hasMeaningfulSectionValue(value: unknown): boolean {
+  if (value === null || value === undefined || value === "") return false;
+  if (Array.isArray(value)) return value.length > 0;
+  if (typeof value !== "object") return true;
+  return Object.entries(value as Json).some(([key, item]) => {
+    if (sectionEnvelopeKeys.has(key)) return false;
+    return hasMeaningfulSectionValue(item);
+  });
+}
+
+function snapshotHasReadableSection(payload: Json) {
+  const data = snapshotData(payload);
+  if (!data) return false;
+  return Object.entries(data).some(([, section]) => {
+    if (!section || typeof section !== "object" || Array.isArray(section)) {
+      return hasMeaningfulSectionValue(section);
+    }
+    const status = String((section as Json).status || "").trim().toLowerCase();
+    return !unavailableSectionStatuses.has(status) || hasMeaningfulSectionValue(section);
+  });
+}
+
+/**
+ * A snapshot can be useful before it is fresh.  In particular, a durable
+ * last-known-good document remains the only evidence the browser can show
+ * while the control worker replaces an invalidated generation.  Do not make
+ * stale/refreshing part of this predicate: those fields describe freshness,
+ * not whether the document can render.
+ */
+export function snapshotIsRenderable(payload: unknown): payload is Json {
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) return false;
+  const status = snapshotStatus(payload);
+  return status !== "warming_up"
+    && status !== "unavailable"
+    && snapshotHasData(payload)
+    && snapshotHasReadableSection(payload as Json);
+}
+
+export function snapshotIsHealthy(payload: unknown): payload is Json {
+  if (!snapshotIsRenderable(payload)) return false;
   const snapshot = payload as Json;
-  const status = snapshotStatus(snapshot);
   // A completed document may be degraded because one named section is
   // unavailable. Its other sections are still authoritative and must render;
-  // only transient/no-document states keep the page behind loading.
-  return status !== "warming_up"
+  // freshness is intentionally a separate condition from renderability.
+  // An error document may retain several readable sections. It belongs on
+  // screen as degraded evidence, but it must stay on the retry path rather
+  // than being promoted to the next healthy last-known-good generation.
+  return snapshotStatus(snapshot) !== "error"
     && !Boolean(snapshot.stale)
     && !Boolean(snapshot.refreshing)
     && snapshotHasData(snapshot);
+}
+
+/**
+ * Snapshot builders can return an error document containing several usable
+ * sections.  Surface that as a partial page rather than a total front-end
+ * failure.  `document_status` retains the raw server result for diagnostics.
+ */
+export function snapshotPresentationStatus(payload: unknown) {
+  const status = snapshotStatus(payload);
+  return status === "error" && snapshotIsRenderable(payload) ? "degraded" : status;
+}
+
+/**
+ * The API may expose worker availability explicitly.  Accept the compact
+ * names used by older and newer releases so a browser deployed independently
+ * of the API still stops aggressive retrying when no builder can run.
+ */
+export function snapshotRefreshUnavailable(payload: unknown) {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return false;
+  const snapshot = payload as Json;
+  if (snapshotStatus(snapshot) === "unavailable") return true;
+  if (snapshot.refresh_available === false || snapshot.worker_available === false) return true;
+  const workerStatus = String(
+    snapshot.snapshot_worker_status
+      || snapshot.refresh_worker_status
+      || snapshot.worker_status
+      || "",
+  ).trim().toLowerCase();
+  if (/^(inactive|disabled|offline|unavailable|failed|error|stopped)$/.test(workerStatus)) return true;
+  if (/(?:snapshot|refresh|worker).*(?:unavailable|inactive|disabled|offline|failed|stopped)/.test(workerStatus)) return true;
+  const error = snapshot.error && typeof snapshot.error === "object" && !Array.isArray(snapshot.error)
+    ? snapshot.error as Json
+    : {};
+  const code = String(
+    snapshot.refresh_error_code
+      || snapshot.error_code
+      || error.code
+      || error.kind
+      || "",
+  ).trim().toLowerCase();
+  return /(?:snapshot|refresh|worker).*(?:unavailable|inactive|disabled|offline|failed|stopped)/.test(code)
+    || code === "snapshot_build_unavailable";
+}
+
+function snapshotRetryHintMs(payload: unknown) {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return 0;
+  const snapshot = payload as Json;
+  const seconds = Number(
+    snapshot.refresh_retry_after_seconds
+      || snapshot.retry_after_seconds
+      || snapshot.error?.retry_after_seconds
+      || 0,
+  );
+  return Number.isFinite(seconds) && seconds > 0
+    ? Math.min(600_000, Math.max(1_000, Math.round(seconds * 1_000)))
+    : 0;
+}
+
+/**
+ * Keep an active rebuild responsive, but do not turn a stopped worker or a
+ * network outage into a request every five seconds from each open console.
+ */
+export function snapshotRetryDelay(
+  payload: unknown,
+  attempt: number,
+  regularPollMs: number,
+) {
+  const index = Math.max(0, Math.floor(attempt));
+  const retryHintMs = snapshotRetryHintMs(payload);
+  if (snapshotRefreshUnavailable(payload)) {
+    const delays = [30_000, 60_000, 120_000, 300_000, 600_000];
+    return Math.max(retryHintMs, delays[Math.min(index, delays.length - 1)]);
+  }
+  if (snapshotStatus(payload) === "warming_up" || (payload as Json | null)?.stale || (payload as Json | null)?.refreshing) {
+    const delays = [5_000, 10_000, 20_000, 45_000, 90_000, 180_000, 300_000];
+    return Math.max(retryHintMs, delays[Math.min(index, delays.length - 1)]);
+  }
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    const delays = [2_000, 5_000, 15_000, 30_000, 60_000, 120_000, 300_000];
+    return delays[Math.min(index, delays.length - 1)];
+  }
+  if (snapshotStatus(payload) === "error") {
+    const delays = [15_000, 30_000, 60_000, 120_000, 300_000];
+    return Math.max(retryHintMs, delays[Math.min(index, delays.length - 1)]);
+  }
+  return regularPollMs;
 }
 
 export function snapshotErrorCode(section: Json) {
@@ -90,17 +222,27 @@ export function snapshotSectionErrors(payload: Json) {
 }
 
 export function snapshotRetryMessage(payload: Json, hasVisibleData: boolean) {
+  if (snapshotRefreshUnavailable(payload)) {
+    return hasVisibleData
+      ? "后台页面快照刷新器暂不可用，继续展示最近一次已验证页面快照，正在等待下一个完整快照"
+      : "后台页面快照刷新器暂不可用，正在等待服务恢复后生成首个页面快照";
+  }
   if (snapshotStatus(payload) === "warming_up") {
     return hasVisibleData
-      ? "服务端页面快照正在生成，继续展示最近一次可验证数据"
+      ? "服务端页面快照正在生成，继续展示最近一次可验证数据，正在等待下一个完整快照"
       : "服务端页面快照正在生成，尚无可验证的页面数据";
   }
   if (payload.stale) {
     return hasVisibleData
-      ? "服务端页面快照已失效，继续展示最近一次可验证数据"
+      ? "服务端页面快照已失效，继续展示最近一次可验证数据，正在等待下一个完整快照"
       : "服务端页面快照已失效，正在等待首个可验证版本";
   }
   if (payload.refreshing) return "服务端正在生成新的页面快照";
+  if (snapshotStatus(payload) === "error") {
+    return hasVisibleData
+      ? "本次页面快照生成未完成，继续展示最近一次可验证数据，正在等待下一个完整快照"
+      : "本次页面快照生成未完成，正在等待下一个完整版本";
+  }
   if (snapshotStatus(payload) === "degraded") {
     return "新页面快照包含部分可用证据，正在等待完整版本";
   }

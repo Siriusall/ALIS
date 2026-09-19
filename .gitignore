@@ -74,3 +74,6 @@ AGENTS.md
 *.sh
 *.bat
 *.ps1
+
+# This audited bootstrap is a deployment contract, not a machine-local helper.
+!deploy/bootstrap-chain-monitor-ssh.sh

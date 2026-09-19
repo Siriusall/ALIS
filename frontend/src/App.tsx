@@ -104,6 +104,10 @@ function SnapshotStatusBar({
   const sourceStatus = String(snapshot.sourceStatus || "").toLowerCase();
   const stale = Boolean(snapshot.stale);
   const serverRefreshing = Boolean(snapshot.refreshing);
+  // An older document can remain trustworthy even when its builder is not
+  // currently reachable. This is a recoverable operational state, not a
+  // reason to hide the page behind a generic refresh failure.
+  const refreshWorkerUnavailable = snapshot.refreshAvailable === false;
   const active = refreshing || serverRefreshing;
   const latest = Boolean(snapshot.generatedAt)
     && !stale
@@ -114,6 +118,8 @@ function SnapshotStatusBar({
   const businessPartial = businessStatus === "partial" || businessStatus === "blocked";
   const stateLabel = failed
     ? "快照刷新异常"
+    : refreshWorkerUnavailable
+      ? latest ? "页面快照已同步 · 刷新器待恢复" : "页面快照待更新 · 刷新器待恢复"
     : latest
       ? sourceStatus === "degraded" || businessPartial ? "快照已同步 · 业务部分可用" : "页面快照已同步"
       : serverRefreshing || stale
@@ -121,6 +127,8 @@ function SnapshotStatusBar({
         : "正在检查最新快照";
   const progressLabel = failed
     ? "等待后台重试"
+    : refreshWorkerUnavailable
+      ? "后台刷新器不可用，等待服务恢复"
     : latest
       ? "刷新已完成"
       : serverRefreshing || stale
@@ -128,7 +136,7 @@ function SnapshotStatusBar({
         : progress.total > 0 && progress.completed >= progress.total
           ? "正在确认服务端版本"
           : "正在读取快照状态";
-  const tone = failed ? "error" : latest ? "latest" : "refreshing";
+  const tone = failed ? "error" : refreshWorkerUnavailable ? "warning" : latest ? "latest" : "refreshing";
 
   return <div className={`snapshot-status-bar is-${tone}`} role="status" aria-live="polite">
     <div className="snapshot-status-main"><span className="snapshot-state-dot"/><strong>{stateLabel}</strong><small>页面快照：{snapshotPageLabels[String(snapshot.page)] || "当前页面"}</small></div>

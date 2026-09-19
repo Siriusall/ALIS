@@ -24,6 +24,7 @@ import httpx
 
 from app.data_platform.db import _read_conn as data_read_conn
 from app.db.store import _read_conn as business_read_conn
+from app.services.console_snapshots import snapshot_health as console_snapshot_health
 
 logger = logging.getLogger("quant.system_alerts")
 _BUSINESS_TZ = ZoneInfo("Asia/Shanghai")
@@ -47,10 +48,15 @@ class AlertIssue:
     title: str
     detail: str
     severity: str = "critical"
+    # Diagnostics with a changing observation age (for example a worker
+    # heartbeat) need one stable identity.  Otherwise every polling cycle
+    # produces a new alert plus a false recovery for the previous one.
+    dedupe_key: str = ""
 
     @property
     def fingerprint(self) -> str:
-        source = f"{self.code}\n{self.title}\n{self.detail}".encode()
+        source = self.dedupe_key or f"{self.code}\n{self.title}\n{self.detail}"
+        source = source.encode()
         return hashlib.sha256(source).hexdigest()
 
 
@@ -146,10 +152,168 @@ def _critical_task_issues(now: datetime) -> list[AlertIssue]:
     ) for row in rows]
 
 
+def _snapshot_issues() -> list[AlertIssue]:
+    """Turn the durable snapshot-worker health contract into stable alerts.
+
+    The snapshot service already distinguishes an absent/expired heartbeat
+    from stale page documents.  Keep those signals separate here: a stopped
+    worker and a page that cannot catch up need different operational action.
+    Page identity, rather than its age, is deliberately used for deduplication
+    so an unchanged outage does not generate one notification per poll.
+    """
+
+    try:
+        health = console_snapshot_health()
+    except Exception as exc:  # noqa: BLE001 - monitoring must report probe failures
+        return [AlertIssue(
+            "console_snapshot_health_probe_failed",
+            "控制台快照健康探针不可用",
+            f"无法读取快照 Worker 或页面健康状态：{type(exc).__name__}",
+            dedupe_key="console_snapshot_health_probe",
+        )]
+    if not isinstance(health, dict):
+        return [AlertIssue(
+            "console_snapshot_health_probe_invalid",
+            "控制台快照健康探针返回无效数据",
+            "快照健康接口未返回结构化状态。",
+            dedupe_key="console_snapshot_health_probe",
+        )]
+
+    issues: list[AlertIssue] = []
+    worker = health.get("worker")
+    worker = worker if isinstance(worker, dict) else {}
+    # A current heartbeat is only liveness evidence.  A worker can be alive
+    # while every build is failing; alert on that operational degradation
+    # separately so it is not silently treated as a healthy refresh service.
+    worker_live = bool(worker.get("heartbeat_healthy", worker.get("live", worker.get("healthy"))))
+    worker_degraded = bool(
+        worker.get("degraded")
+        or str(worker.get("operational_status") or "").lower() == "degraded"
+        or str(worker.get("status") or "").lower() == "degraded"
+    )
+    if not worker_live:
+        status = str(worker.get("status") or health.get("status") or "worker_unavailable")
+        reason = str(worker.get("reason") or "snapshot_worker_unavailable")
+        issues.append(AlertIssue(
+            "console_snapshot_worker_unhealthy",
+            "控制台快照 Worker 心跳异常",
+            f"状态：{status}；原因：{reason}。",
+            dedupe_key="console_snapshot_worker",
+        ))
+    elif worker_degraded:
+        status = str(worker.get("status") or "degraded")
+        reason = str(worker.get("reason") or "snapshot_worker_degraded")
+        issues.append(AlertIssue(
+            "console_snapshot_worker_degraded",
+            "控制台快照 Worker 持续降级",
+            f"状态：{status}；原因：{reason}。进程仍存活，但页面刷新可能持续失败。",
+            dedupe_key="console_snapshot_worker",
+        ))
+
+    pages = health.get("pages")
+    pages = pages if isinstance(pages, dict) else {}
+    required = health.get("required_pages")
+    required_pages = [str(page) for page in required] if isinstance(required, (list, tuple)) else sorted(pages)
+    if not required_pages and str(health.get("status") or "") not in {"ready", "degraded"}:
+        issues.append(AlertIssue(
+            "console_snapshot_page_health_unavailable",
+            "控制台快照页面健康状态不可用",
+            f"整体状态：{str(health.get('status') or 'unavailable')}。",
+            dedupe_key="console_snapshot_pages",
+        ))
+        return issues
+
+    for page_key in sorted(set(required_pages)):
+        page = pages.get(page_key)
+        page = page if isinstance(page, dict) else {}
+        state = str(page.get("status") or "unavailable").strip().lower()
+        if state in {"ready", "degraded"}:
+            continue
+        reason = str(page.get("reason") or "snapshot_page_unavailable")
+        error_code = str(page.get("last_error_code") or "")
+        detail = f"页面：{page_key}；状态：{state}；原因：{reason}"
+        if error_code:
+            detail += f"；最近错误：{error_code}"
+        issues.append(AlertIssue(
+            "console_snapshot_page_unhealthy",
+            f"控制台快照页面异常：{page_key}",
+            detail + "。",
+            dedupe_key=f"console_snapshot_page:{page_key}",
+        ))
+    return issues
+
+
+def _chain_monitor_issues() -> list[AlertIssue]:
+    """Consume the app-local cross-node monitor state for remote failures.
+
+    The alert worker has direct database visibility for snapshot health, but
+    it cannot reliably infer SSH reachability or the two research processes.
+    The chain monitor runs on this same app node and writes an atomic state
+    file, which makes those remote checks visible to the normal alert/recovery
+    and deduplication path.
+    """
+
+    path = Path(_env(
+        "ALIS_CHAIN_MONITOR_STATE_FILE",
+        "/var/lib/alis-chain-monitor/state.json",
+    ))
+    state = _load_state(path)
+    if not state:
+        return [AlertIssue(
+            "chain_monitor_state_unavailable",
+            "跨节点链路监控状态不可用",
+            f"未能读取 {path}；无法确认应用、数据库快照和研究 Worker 链路。",
+            dedupe_key="chain_monitor:state",
+        )]
+    observed = _parse_alert_timestamp(state.get("observed_at"))
+    stale_after = max(120, min(int(_env("ALIS_CHAIN_MONITOR_STALE_SECONDS", "360")), 3600))
+    age = None if observed is None else max(0.0, (_now() - observed).total_seconds())
+    if age is None or age > stale_after:
+        return [AlertIssue(
+            "chain_monitor_state_stale",
+            "跨节点链路监控未按时运行",
+            f"最后状态时间：{state.get('observed_at') or '未记录'}；允许间隔：{stale_after} 秒。",
+            dedupe_key="chain_monitor:state",
+        )]
+    results = state.get("results")
+    if not isinstance(results, dict):
+        return [AlertIssue(
+            "chain_monitor_state_invalid",
+            "跨节点链路监控状态无效",
+            "状态文件没有 results 字段，无法确认远端节点。",
+            dedupe_key="chain_monitor:state",
+        )]
+    issues: list[AlertIssue] = []
+    for role, result in sorted(results.items()):
+        if not isinstance(result, dict) or bool(result.get("ok")):
+            continue
+        code = str(result.get("code") or "unknown")
+        detail = str(result.get("detail") or "未记录失败详情").replace("\n", " ")[:600]
+        issues.append(AlertIssue(
+            "chain_monitor_target_unhealthy",
+            f"跨节点链路异常：{role}",
+            f"节点：{role}；返回码：{code}；详情：{detail}",
+            dedupe_key=f"chain_monitor:target:{role}",
+        ))
+    return issues
+
+
+def _parse_alert_timestamp(value: Any) -> datetime | None:
+    try:
+        parsed = datetime.fromisoformat(str(value or "").replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=_BUSINESS_TZ)
+    return parsed.astimezone(_BUSINESS_TZ)
+
+
 def collect_impacting_issues(now: datetime | None = None) -> list[AlertIssue]:
     current = now or _now()
     readers: tuple[Callable[[], list[AlertIssue]], ...] = (
         _health_issue,
+        _snapshot_issues,
+        _chain_monitor_issues,
         lambda: _blocked_plan_issues(current),
         lambda: _missing_daily_output_issues(current),
         lambda: _critical_task_issues(current),
@@ -233,6 +397,18 @@ def _send_with_resend(*, subject: str, text_body: str, html_body: str, idempoten
         },
         timeout=20,
     )
+    # Resend returns 409 when this exact idempotency key has already been
+    # accepted. Treat it as a successful prior delivery; retrying with a fresh
+    # key would create duplicate emergency notifications.
+    if response.status_code == 409:
+        try:
+            payload = response.json()
+        except (TypeError, ValueError):
+            payload = {}
+        payload = payload if isinstance(payload, dict) else {}
+        message_id = str(payload.get("id") or f"idempotent:{idempotency_key}")
+        logger.info("Resend idempotency conflict accepted message_id=%s", message_id)
+        return message_id
     response.raise_for_status()
     payload = response.json()
     message_id = str(payload.get("id") or "")
@@ -320,22 +496,42 @@ def run_alert_cycle(state_path: Path | None = None) -> dict[str, Any]:
     issues = collect_impacting_issues()
     current = {issue.fingerprint: asdict(issue) for issue in issues}
     new_issues = [issue for issue in issues if issue.fingerprint not in previous]
-    recovered = [AlertIssue(**item) for fingerprint, item in previous.items() if fingerprint not in current]
+    recovered = [
+        AlertIssue(**item)
+        for fingerprint, item in previous.items()
+        if fingerprint not in current and isinstance(item, dict)
+    ]
     sent_new = False
     sent_recovered = False
-    delivery_error = ""
-    try:
-        if new_issues:
+    delivery_errors: list[str] = []
+    acknowledged = dict(previous)
+    if new_issues:
+        try:
             send_issue_email(new_issues)
             sent_new = True
-        if recovered:
+            for issue in new_issues:
+                acknowledged[issue.fingerprint] = asdict(issue)
+        except Exception as exc:  # noqa: BLE001 - delivery cannot block monitored workloads
+            delivery_errors.append(str(exc)[:500])
+            logger.error("System alert email delivery failed kind=new error=%s", type(exc).__name__)
+    if recovered:
+        try:
             send_issue_email(recovered, recovered=True)
             sent_recovered = True
-    except Exception as exc:  # noqa: BLE001 - delivery cannot block monitored workloads
-        delivery_error = str(exc)[:500]
-        logger.error("System alert email delivery failed: %s", type(exc).__name__)
-    if not delivery_error:
-        state["active"] = current
+            for issue in recovered:
+                acknowledged.pop(issue.fingerprint, None)
+        except Exception as exc:  # noqa: BLE001 - delivery cannot block monitored workloads
+            delivery_errors.append(str(exc)[:500])
+            logger.error("System alert email delivery failed kind=recovery error=%s", type(exc).__name__)
+    # Preserve only currently observed issues plus old issues whose recovery
+    # notification failed. This prevents a successfully delivered batch from
+    # being resent merely because another batch failed in the same cycle.
+    state["active"] = {
+        fingerprint: item
+        for fingerprint, item in acknowledged.items()
+        if fingerprint in current or fingerprint in previous
+    }
+    delivery_error = "; ".join(delivery_errors)[:500]
     state.update({
         "checked_at": _now().isoformat(timespec="seconds"),
         "delivery_error": delivery_error,

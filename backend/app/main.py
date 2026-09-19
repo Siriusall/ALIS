@@ -388,6 +388,31 @@ def _health_payload(*, require_redis: bool = True) -> dict:
     unhealthy_heartbeats = [name for name, state in runtime_heartbeats.items() if not state.get("healthy", True)]
     if background_owner and unhealthy_heartbeats:
         runtime_issues.append(f"Background component errors: {', '.join(unhealthy_heartbeats)}")
+    # Snapshot production is a separate database-local process.  Its failure
+    # must be visible in the public health contract even though the API can
+    # still serve liveness and the last committed document.  Keep this as a
+    # non-blocking dependency advisory so an expired page does not create a
+    # circular readiness failure while the worker is recovering.
+    try:
+        from app.services.console_snapshots import snapshot_health
+
+        console_snapshots = snapshot_health()
+    except Exception as exc:  # telemetry must never turn /health into a 500
+        logger.warning("Console snapshot health unavailable error_type=%s", type(exc).__name__)
+        console_snapshots = {
+            "healthy": False,
+            "status": "worker_unavailable",
+            "reason": "snapshot_health_probe_failed",
+            "error_type": type(exc).__name__,
+        }
+    snapshot_advisory = None
+    if not bool(console_snapshots.get("healthy")):
+        snapshot_advisory = {
+            "code": "console_snapshot_worker_unhealthy",
+            "message": "控制台快照 Worker 或页面新鲜度异常；页面将继续展示最后可验证文档并自动重试",
+            "reason": console_snapshots.get("reason") or console_snapshots.get("status"),
+            "blocking": False,
+        }
     issues = (
         ([] if not require_redis or redis.get("available", False) else ["Redis unavailable: durable stream tasks are disabled"])
         + ([] if revisions_ready else [
@@ -416,7 +441,7 @@ def _health_payload(*, require_redis: bool = True) -> dict:
     payload = {
         "status": "ok" if ready else "error",
         "ready": ready,
-        "degraded": databases_ready and bool(issues),
+        "degraded": databases_ready and bool(issues or snapshot_advisory),
         "issues": issues,
         "advisories": ([] if not deployment_pending else [{
             "code": "deployment_pending_restart",
@@ -424,7 +449,7 @@ def _health_payload(*, require_redis: bool = True) -> dict:
             "runtime_commit": release_drift.get("runtime_commit"),
             "repository_commit": release_drift.get("repository_commit"),
             "blocking": False,
-        }]),
+        }]) + ([snapshot_advisory] if snapshot_advisory else []),
         "dependencies": {
             "primary_database": primary,
             "data_platform_database": data_platform,
@@ -439,6 +464,7 @@ def _health_payload(*, require_redis: bool = True) -> dict:
             "background_runtime": runtime_boundary,
             "evolution_runtime": evolution,
             "runtime_heartbeats": runtime_heartbeats,
+            "console_snapshots": console_snapshots,
         },
     }
     if require_redis:

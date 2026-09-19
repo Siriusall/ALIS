@@ -101,6 +101,27 @@ def test_health_keeps_current_runtime_ready_while_new_repository_is_staged(monke
     assert result["advisories"][0]["blocking"] is False
 
 
+def test_health_exposes_snapshot_worker_as_a_non_blocking_dependency(monkeypatch):
+    from app.services import console_snapshots
+
+    _healthy_dependencies(monkeypatch)
+    monkeypatch.setattr(main, "redis_health", lambda: {"available": True})
+    monkeypatch.setattr(main, "runtime_heartbeat_status", lambda: {"scheduler": {"healthy": True}})
+    monkeypatch.setattr(console_snapshots, "snapshot_health", lambda: {
+        "healthy": False,
+        "status": "worker_unavailable",
+        "reason": "snapshot_worker_heartbeat_expired",
+        "pages": [],
+    })
+
+    result = _payload(main.health())
+
+    assert result["ready"] is True
+    assert result["degraded"] is True
+    assert result["dependencies"]["console_snapshots"]["status"] == "worker_unavailable"
+    assert any(item["code"] == "console_snapshot_worker_unhealthy" for item in result["advisories"])
+
+
 def test_health_is_not_ready_when_active_release_manifest_drifts(monkeypatch):
     _healthy_dependencies(monkeypatch)
     monkeypatch.setattr(main, "redis_health", lambda: {"available": True})

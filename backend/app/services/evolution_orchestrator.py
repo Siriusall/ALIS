@@ -658,6 +658,7 @@ def reconcile_historical_contract_incompatible_tasks(*, limit: int = 200) -> dic
             """SELECT id,task_type,phase,message,error,result_json
                  FROM evolution_tasks
                 WHERE status='failed'
+                  AND task_type IN ('strategy_evolution_cycle','strategy_environment_backtest')
                   AND COALESCE(lease_owner,'')=''
                   AND COALESCE(phase,'')<>'historical_contract_incompatible'
                 ORDER BY id ASC LIMIT ?""",
@@ -720,6 +721,7 @@ def reconcile_historical_data_gate_waiting_tasks(*, limit: int = 200) -> dict[st
             """SELECT id,task_type,phase,message,error,result_json
                  FROM evolution_tasks
                 WHERE status='failed'
+                  AND task_type='strategy_shadow_cycle'
                   AND COALESCE(lease_owner,'')=''
                   AND COALESCE(phase,'')<>'historical_data_gate_waiting'
                 ORDER BY id ASC LIMIT ?""",

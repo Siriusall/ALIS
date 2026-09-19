@@ -1,42 +1,251 @@
 #!/usr/bin/env python3
-import json, os, subprocess, time
+"""Cross-node ALIS chain monitor.
+
+The monitor is independent of the browser and of a single systemd
+``active`` bit. It checks API liveness/readiness, the database-local snapshot
+worker's durable heartbeat/page state, and both research-worker processes.
+Results are persisted so the alert worker can notify on state transitions.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
-STATE = Path(os.environ.get('ALIS_MONITOR_STATE', '/var/lib/alis-chain-monitor'))
-EVENTS = STATE / 'events.jsonl'
+
+STATE = Path(os.environ.get("ALIS_MONITOR_STATE", "/var/lib/alis-chain-monitor"))
+EVENTS = STATE / "events.jsonl"
+
+
+def _app_probe() -> str:
+    return r'''
+set -eu
+if systemctl cat alis-console-snapshot-worker >/dev/null 2>&1; then
+    test "$(systemctl is-active alis-console-snapshot-worker 2>/dev/null || true)" != active
+fi
+python3 - <<'PY'
+import json, urllib.error, urllib.request
+
+def get(path):
+    req = urllib.request.Request(
+        "http://127.0.0.1:8000/api/" + path,
+        headers={"User-Agent": "alis-chain-monitor/2"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=12) as response:
+            return response.status, json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        try:
+            body = json.loads(exc.read().decode("utf-8"))
+        except Exception:
+            body = {"error": str(exc)}
+        return exc.code, body
+
+checks = {}
+live_status, live = get("live")
+checks["live"] = {"status": live_status, "alive": bool(live.get("alive"))}
+health_status, health = get("health")
+dependencies = health.get("dependencies") or {}
+snapshot = dependencies.get("console_snapshots") or {}
+checks["health"] = {
+    "status": health_status,
+    "ready": bool(health.get("ready")),
+    "issues": list(health.get("issues") or [])[:8],
+    "snapshot": {
+        "ok": bool(snapshot.get("ok")),
+        "healthy": bool(snapshot.get("healthy")),
+        "status": snapshot.get("status"),
+        "reason": snapshot.get("reason"),
+    },
+}
+failures = []
+if live_status != 200 or not checks["live"]["alive"]:
+    failures.append("api_liveness")
+if health_status >= 500 or not checks["health"]["ready"]:
+    failures.append("api_readiness")
+if snapshot and not checks["health"]["snapshot"]["ok"]:
+    failures.append("snapshot_dependency")
+print(json.dumps({"checks": checks, "failures": failures}, ensure_ascii=False))
+raise SystemExit(1 if failures else 0)
+PY
+'''
+
+
+def _db_probe() -> str:
+    return r'''
+set -eu
+systemctl is-enabled --quiet alis-db-snapshot-worker
+test "$(systemctl is-active alis-db-snapshot-worker)" = active
+set -a
+. /etc/alis/db-snapshot-worker.env
+set +a
+cd /opt/alis-db-snapshot/backend
+PYTHONPATH=/opt/alis-db-snapshot/backend \
+  /opt/alis-db-snapshot/shared/app-venv/bin/python - <<'PY'
+import json
+from app.services.console_snapshots import snapshot_health
+
+value = snapshot_health()
+print(json.dumps(value, ensure_ascii=False))
+if not value.get("ok"):
+    raise SystemExit(1)
+PY
+'''
+
+
+def _research_probe() -> str:
+    return r'''
+set -eu
+for unit in alis-control-worker alis-research-worker; do
+  test "$(systemctl is-active "$unit")" = active
+  pid="$(systemctl show "$unit" -p MainPID --value)"
+  test "$pid" != 0
+  test -d "/proc/$pid"
+done
+if systemctl cat alis-console-snapshot-worker >/dev/null 2>&1; then
+  test "$(systemctl is-active alis-console-snapshot-worker 2>/dev/null || true)" != active
+fi
+'''
+
+
 TARGETS = {
-    'app': ('ubuntu@124.221.86.123', "python3 - <<'PY'\nimport json,urllib.request\nchecks=['ready','live','console/snapshots','trading-ready?detail=compact']\nfail=[]\nfor path in checks:\n try:\n  r=urllib.request.urlopen('http://127.0.0.1:8000/api/'+path,timeout=12); b=r.read(); print(path,r.status,len(b))\n  if r.status>=500: fail.append(path)\n except Exception as e:\n  # protected business endpoints are still reachable if they return 401/403; transport failures are not\n  if 'HTTP Error 401' in str(e) or 'HTTP Error 403' in str(e): print(path,'protected')\n  else: fail.append(path); print(path,e)\nraise SystemExit(1 if fail else 0)\nPY"),
-    'db': ('ubuntu@122.51.159.195', "systemctl is-active alis-market-dataset-publish.timer && systemctl is-active alis-db-snapshot-worker"),
-    'research': ('ubuntu@124.223.225.117', "test \"$(systemctl is-active alis-research-worker)\" = active && test \"$(systemctl show alis-research-worker -p MainPID --value)\" != 0"),
+    "app": (
+        os.environ.get("ALIS_APP_MONITOR_TARGET", "ubuntu@124.221.86.123"),
+        _app_probe(),
+    ),
+    "db": (
+        os.environ.get("ALIS_DB_MONITOR_TARGET", "ubuntu@122.51.159.195"),
+        _db_probe(),
+    ),
+    "research": (
+        os.environ.get("ALIS_RESEARCH_MONITOR_TARGET", "ubuntu@124.223.225.117"),
+        _research_probe(),
+    ),
 }
 
-def probe(role, spec):
+
+def probe(role: str, spec: tuple[str, str]) -> dict[str, Any]:
     host, command = spec
     try:
-        key = os.environ.get('ALIS_MONITOR_KEY_' + role.upper())
-        args = ['ssh','-o','BatchMode=yes','-o','ConnectTimeout=8','-o','StrictHostKeyChecking=accept-new']
-        if key: args += ['-i', key]
-        p = subprocess.run(args + [host,command], text=True, capture_output=True, timeout=15)
-        if p.returncode == 0:
-            return {'ok': True, 'detail': p.stdout.strip()[-1000:]}
-        return {'ok': False, 'detail': (p.stderr or p.stdout).strip()[-1000:], 'code': p.returncode}
-    except Exception as exc:
-        return {'ok': False, 'detail': str(exc)}
+        key = os.environ.get("ALIS_MONITOR_KEY_" + role.upper())
+        known_hosts = os.path.expanduser(
+            os.environ.get(
+                "ALIS_MONITOR_SSH_KNOWN_HOSTS",
+                "/etc/alis/chain-monitor/known_hosts",
+            )
+        )
+        # Do not silently fall back to the service user's agent or ~/.ssh.
+        # A monitor that runs with an unrelated operator key can report a
+        # partial view of production, and TOFU host-key acceptance makes a
+        # transient DNS/route mistake indistinguishable from the real node.
+        if not key:
+            return {
+                "ok": False,
+                "detail": f"monitor_key_missing:ALIS_MONITOR_KEY_{role.upper()}",
+                "code": 78,
+            }
+        key = os.path.expanduser(key)
+        if not os.path.isfile(key):
+            return {
+                "ok": False,
+                "detail": f"monitor_key_unreadable:{key}",
+                "code": 78,
+            }
+        try:
+            if os.stat(key).st_mode & 0o077:
+                return {
+                    "ok": False,
+                    "detail": f"monitor_key_permissions:{key}",
+                    "code": 78,
+                }
+        except OSError as exc:
+            return {
+                "ok": False,
+                "detail": f"monitor_key_stat_failed:{type(exc).__name__}",
+                "code": 78,
+            }
+        if not os.path.isfile(known_hosts):
+            return {
+                "ok": False,
+                "detail": f"monitor_known_hosts_missing:{known_hosts}",
+                "code": 78,
+            }
+        args = [
+            "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
+            "-o", "ConnectionAttempts=1", "-o", "ServerAliveInterval=5",
+            "-o", "ServerAliveCountMax=1", "-o", "IdentitiesOnly=yes",
+            "-o", "StrictHostKeyChecking=yes", "-o", "GlobalKnownHostsFile=/dev/null",
+            "-o", f"UserKnownHostsFile={known_hosts}", "-o", "ProxyCommand=none",
+            "-i", key,
+        ]
+        result = subprocess.run(
+            args + [host, command],
+            text=True,
+            capture_output=True,
+            timeout=30,
+        )
+        output = (result.stdout or result.stderr or "").strip()
+        return {
+            "ok": result.returncode == 0,
+            "detail": output[-2000:],
+            "code": result.returncode,
+        }
+    except Exception as exc:  # noqa: BLE001 - monitor must report its own failure
+        return {"ok": False, "detail": str(exc)[:1000], "code": -1}
 
-def main():
+
+def _signature(results: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    """Keep volatile command output out of state-transition detection."""
+    return {
+        role: {
+            "ok": bool(value.get("ok")),
+            "code": int(value.get("code") or 0),
+        }
+        for role, value in sorted(results.items())
+    }
+
+
+def _load_json(path: Path) -> dict[str, Any] | None:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else None
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def main() -> int:
     STATE.mkdir(parents=True, exist_ok=True)
     results = {role: probe(role, spec) for role, spec in TARGETS.items()}
     now = datetime.now(timezone.utc).isoformat()
-    current = {'observed_at': now, 'results': results}
-    state_file = STATE / 'state.json'
-    previous = json.loads(state_file.read_text()) if state_file.exists() else None
-    if not previous or previous.get('results') != results:
-        with EVENTS.open('a') as f:
-            f.write(json.dumps(current, ensure_ascii=True) + '\n')
-    state_file.write_text(json.dumps(current, ensure_ascii=True, indent=2))
-    if not all(v['ok'] for v in results.values()):
-        raise SystemExit(2)
+    current = {
+        "observed_at": now,
+        "results": results,
+        "signature": _signature(results),
+        "healthy": all(bool(item.get("ok")) for item in results.values()),
+    }
+    state_file = STATE / "state.json"
+    previous = _load_json(state_file)
+    if not previous or previous.get("signature") != current["signature"]:
+        event = {
+            "observed_at": now,
+            "previous_signature": (previous or {}).get("signature"),
+            "signature": current["signature"],
+            "healthy": current["healthy"],
+            "results": results,
+        }
+        with EVENTS.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(event, ensure_ascii=False) + "\n")
+    temporary = state_file.with_suffix(".tmp")
+    temporary.write_text(json.dumps(current, ensure_ascii=False, indent=2), encoding="utf-8")
+    temporary.replace(state_file)
+    print(json.dumps(current, ensure_ascii=False))
+    return 0 if current["healthy"] else 2
 
-if __name__ == '__main__':
-    main()
+
+if __name__ == "__main__":
+    sys.exit(main())

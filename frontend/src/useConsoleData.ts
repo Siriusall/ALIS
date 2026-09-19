@@ -8,6 +8,10 @@ import {
   responseIsTerminal,
   snapshotData,
   snapshotIsHealthy,
+  snapshotIsRenderable,
+  snapshotPresentationStatus,
+  snapshotRefreshUnavailable,
+  snapshotRetryDelay,
   snapshotRetryMessage,
   snapshotSectionErrors,
   snapshotStatus,
@@ -96,11 +100,62 @@ function snapshotPollInterval(pathname: string) {
   return SNAPSHOT_POLL_INTERVAL_MS[pathname] || 600_000;
 }
 
-function cachedHealthySnapshot(page: string): Json | null {
+function snapshotViewData(
+  page: string,
+  snapshot: ConsoleData,
+  payload?: Json,
+  readHealth?: "healthy" | "partial" | "degraded",
+  refreshPayload?: Json,
+): ConsoleData {
+  const refreshState = refreshPayload || payload;
+  const rawSourceStatus = payload ? snapshotStatus(payload) : "unavailable";
+  const sourceStatus = payload ? snapshotPresentationStatus(payload) : rawSourceStatus;
+  const health = readHealth || (
+    refreshState?.stale || refreshState?.refreshing
+      ? "degraded"
+      : sourceStatus === "degraded"
+        ? "partial"
+        : "healthy"
+  );
+  return {
+    ...snapshot,
+    __snapshot: {
+      page,
+      version: String(payload?.version || snapshot.__snapshot?.version || ""),
+      generatedAt: String(payload?.generated_at || snapshot.__snapshot?.generatedAt || ""),
+      checkedAt: payload ? new Date().toISOString() : String(snapshot.__snapshot?.checkedAt || ""),
+      attemptedAt: new Date().toISOString(),
+      sourceStatus,
+      documentStatus: String(payload?.document_status || rawSourceStatus),
+      businessStatus: String(payload?.business_status || "unknown"),
+      dataAsOf: String(payload?.data_as_of || ""),
+      staleReason: String(refreshState?.stale_reason || ""),
+      refreshAvailable: !snapshotRefreshUnavailable(refreshState),
+      refreshWorkerStatus: String(
+        refreshState?.snapshot_worker_status
+          || refreshState?.refresh_worker_status
+          || refreshState?.worker_status
+          || "",
+      ),
+      refreshErrorCode: String(
+        refreshState?.refresh_error_code
+          || refreshState?.error_code
+          || refreshState?.error?.code
+          || "",
+      ),
+      health,
+      stale: Boolean(refreshState?.stale),
+      refreshing: Boolean(refreshState?.refreshing)
+        || Boolean(refreshState && !snapshotIsRenderable(refreshState)),
+    },
+  };
+}
+
+function cachedRenderableSnapshot(page: string): Json | null {
   const cacheKey = `snapshot:${page}`;
   const cached = cache.get(cacheKey);
   if (!cached) return null;
-  if (!snapshotIsHealthy(cached.value)) {
+  if (!snapshotIsRenderable(cached.value)) {
     cache.delete(cacheKey);
     return null;
   }
@@ -202,7 +257,7 @@ function subscribePending(pending: PendingRequest, signal?: AbortSignal): Promis
 async function loadPath(cacheKey: string, path: string, force = false, signal?: AbortSignal): Promise<Json> {
   let cached = cache.get(cacheKey);
   const isSnapshot = cacheKey.startsWith("snapshot:");
-  if (cached && (!responseIsTerminal(cached.value) || (isSnapshot && !snapshotIsHealthy(cached.value)))) {
+  if (cached && (!responseIsTerminal(cached.value) || (isSnapshot && !snapshotIsRenderable(cached.value)))) {
     cache.delete(cacheKey);
     cached = undefined;
   }
@@ -220,7 +275,7 @@ async function loadPath(cacheKey: string, path: string, force = false, signal?: 
   if (isSnapshot) snapshotRequestGeneration.set(cacheKey, generation);
   let requestEntry: PendingRequest;
   const request = readApi(path, controller.signal).then((value) => {
-    if (responseIsTerminal(value) && (!isSnapshot || snapshotIsHealthy(value))
+    if (responseIsTerminal(value) && (!isSnapshot || snapshotIsRenderable(value))
       && (!isSnapshot || snapshotRequestGeneration.get(cacheKey) === generation)) {
       cache.set(cacheKey, { value, readAt: Date.now() });
     }
@@ -350,9 +405,9 @@ export async function preloadConsoleRoutes(paths: string[], concurrency = 3) {
   if (snapshotPaths.length) {
     return Promise.allSettled(snapshotPaths.map(async (page) => {
       const payload = await loadPath(`snapshot:${page}`, `/api/console/snapshots/${page}`);
-      // Hover prefetch must not make a warming or stale response look like a
-      // usable document to the next route transition.
-      if (!snapshotIsHealthy(payload)) throw new Error("snapshot_not_ready");
+      // Hover prefetch may retain a stale last-known-good document, but never
+      // makes a cold warming/error envelope look like page content.
+      if (!snapshotIsRenderable(payload)) throw new Error("snapshot_not_ready");
       return payload;
     }));
   }
@@ -376,11 +431,14 @@ export async function preloadConsoleRoutes(paths: string[], concurrency = 3) {
 export function useConsoleData(pathname: string) {
   const keys = useMemo(() => routeKeys[pathname] || routeKeys["/overview"], [pathname]);
   const snapshotPage = snapshotPages[pathname];
-  const initialSnapshot = snapshotPage ? cachedHealthySnapshot(snapshotPage) : null;
-  const cachedData = (snapshotData(initialSnapshot) || Object.fromEntries(keys.flatMap((key) => {
-    const item = cache.get(key);
-    return item ? [[key, item.value]] : [];
-  }))) as ConsoleData;
+  const initialSnapshot = snapshotPage ? cachedRenderableSnapshot(snapshotPage) : null;
+  const initialSnapshotData = snapshotData(initialSnapshot);
+  const cachedData = (initialSnapshotData && snapshotPage
+    ? snapshotViewData(snapshotPage, initialSnapshotData as ConsoleData, initialSnapshot || undefined)
+    : Object.fromEntries(keys.flatMap((key) => {
+      const item = cache.get(key);
+      return item ? [[key, item.value]] : [];
+    }))) as ConsoleData;
   for (const request of initialDynamicRequests(pathname, cachedData)) {
     const item = cache.get(request.cacheKey);
     if (item) cachedData[request.dataKey] = item.value;
@@ -409,12 +467,13 @@ export function useConsoleData(pathname: string) {
   const controller = useRef<AbortController | null>(null);
   const retryTimer = useRef<number | null>(null);
   const retryAttempt = useRef(0);
+  const snapshotRetryState = useRef("");
   const snapshotNextPollDelay = useRef<number | null>(null);
   const lastGoodSnapshot = useRef<{ page: string; payload: Json } | null>(
     snapshotPage && initialSnapshot ? { page: snapshotPage, payload: initialSnapshot } : null,
   );
   const lastVisibleSnapshot = useRef<{ page: string; data: ConsoleData } | null>(
-    snapshotPage && snapshotData(initialSnapshot) ? { page: snapshotPage, data: snapshotData(initialSnapshot)! } : null,
+    snapshotPage && initialSnapshotData ? { page: snapshotPage, data: cachedData } : null,
   );
 
   const refresh = useCallback(async (force = true) => {
@@ -429,8 +488,7 @@ export function useConsoleData(pathname: string) {
     const snapshotPage = snapshotPages[pathname];
     const activeController = controller.current;
     if (snapshotPage) {
-      const snapshotCacheKey = `snapshot:${snapshotPage}`;
-      const cachedSnapshot = cachedHealthySnapshot(snapshotPage);
+      const cachedSnapshot = cachedRenderableSnapshot(snapshotPage);
       if (cachedSnapshot) lastGoodSnapshot.current = { page: snapshotPage, payload: cachedSnapshot };
       const priorGood = lastGoodSnapshot.current?.page === snapshotPage
         ? snapshotData(lastGoodSnapshot.current.payload)
@@ -439,39 +497,24 @@ export function useConsoleData(pathname: string) {
         ? lastVisibleSnapshot.current.data
         : null;
       const visibleBeforeRead = priorGood || priorVisible;
-      if (force) cache.delete(snapshotCacheKey);
+      // Keep the last-known-good browser copy while a forced request is in
+      // flight. If the API or worker is unavailable, route changes must still
+      // be able to render that evidence instead of turning a transient read
+      // failure into a cold page.
 
       const showSnapshotData = (
         snapshot: ConsoleData,
         payload?: Json,
         readHealth?: "healthy" | "partial" | "degraded",
+        refreshPayload?: Json,
       ) => {
-        const sourceStatus = payload ? snapshotStatus(payload) : "unavailable";
-        const health = readHealth || (
-          payload?.stale || payload?.refreshing
-            ? "degraded"
-            : sourceStatus === "degraded"
-              ? "partial"
-              : "healthy"
+        const visibleSnapshot = snapshotViewData(
+          snapshotPage,
+          snapshot,
+          payload,
+          readHealth,
+          refreshPayload,
         );
-        const visibleSnapshot = {
-          ...snapshot,
-          __snapshot: {
-            page: snapshotPage,
-            version: String(payload?.version || snapshot.__snapshot?.version || ""),
-            generatedAt: String(payload?.generated_at || snapshot.__snapshot?.generatedAt || ""),
-            checkedAt: payload ? new Date().toISOString() : String(snapshot.__snapshot?.checkedAt || ""),
-            attemptedAt: new Date().toISOString(),
-            sourceStatus,
-            documentStatus: String(payload?.document_status || sourceStatus),
-            businessStatus: String(payload?.business_status || "unknown"),
-            dataAsOf: String(payload?.data_as_of || ""),
-            staleReason: String(payload?.stale_reason || ""),
-            health,
-            stale: Boolean(payload?.stale),
-            refreshing: Boolean(payload?.refreshing),
-          },
-        };
         lastVisibleSnapshot.current = { page: snapshotPage, data: visibleSnapshot };
         setData(visibleSnapshot);
         setLoadedRoute({ pathname, generation: activeRouteGeneration });
@@ -479,15 +522,41 @@ export function useConsoleData(pathname: string) {
       const scheduleSnapshotRetry = (
         message: string,
         hasVisibleData: boolean,
-        retryInMs = snapshotPollInterval(pathname),
+        payload?: Json,
       ) => {
+        const retryInMs = snapshotRetryDelay(
+          payload,
+          retryAttempt.current,
+          snapshotPollInterval(pathname),
+        );
         retryAttempt.current += 1;
         snapshotNextPollDelay.current = retryInMs;
         if (controller.current !== activeController) return;
         setProgress({ completed: 0, total: 1 });
         setLoading(!hasVisibleData);
-        setRefreshing(true);
+        // The server status bar still reports a pending refresh. Keep the
+        // manual action available when it explicitly reports no worker.
+        setRefreshing(!snapshotRefreshUnavailable(payload));
         setLoadingMessage(`${message}；${Math.ceil(retryInMs / 1000)} 秒后自动重试`);
+      };
+      const resetRetryOnSnapshotProgress = (payload: Json) => {
+        const retryState = [
+          snapshotPage,
+          payload.version,
+          payload.refresh_generation,
+          payload.generated_at,
+          payload.last_attempt_generation,
+          payload.last_attempt_at,
+          payload.refresh_available,
+          payload.refresh_error_code,
+          payload.snapshot_worker_status,
+          payload.refresh_worker_status,
+          payload.worker_status,
+        ].map((value) => String(value || "")).join("|");
+        if (retryState && retryState !== snapshotRetryState.current) {
+          retryAttempt.current = 0;
+          snapshotRetryState.current = retryState;
+        }
       };
 
       if (visibleBeforeRead) {
@@ -513,7 +582,17 @@ export function useConsoleData(pathname: string) {
         if (snapshotIsHealthy(payload) && nextSnapshot) {
           lastGoodSnapshot.current = { page: snapshotPage, payload };
           showSnapshotData(nextSnapshot, payload);
+          if (snapshotRefreshUnavailable(payload)) {
+            resetRetryOnSnapshotProgress(payload);
+            const sectionErrors = snapshotSectionErrors(payload);
+            const retryMessage = snapshotRetryMessage(payload, true);
+            sectionErrors.snapshot = retryMessage;
+            setErrors(sectionErrors);
+            scheduleSnapshotRetry(retryMessage, true, payload);
+            return;
+          }
           retryAttempt.current = 0;
+          snapshotRetryState.current = "";
           snapshotNextPollDelay.current = null;
           setProgress({ completed: 1, total: 1 });
           setLoading(false);
@@ -523,27 +602,55 @@ export function useConsoleData(pathname: string) {
           return;
         }
 
+        if (snapshotIsRenderable(payload) && nextSnapshot) {
+          lastGoodSnapshot.current = { page: snapshotPage, payload };
+          showSnapshotData(nextSnapshot, payload, "degraded");
+          resetRetryOnSnapshotProgress(payload);
+          const sectionErrors = snapshotSectionErrors(payload);
+          const retryMessage = snapshotRetryMessage(payload, true);
+          // A healthy last-known-good page that is merely awaiting the worker
+          // belongs in the status bar, not in the fatal-looking error strip.
+          if (snapshotRefreshUnavailable(payload)) sectionErrors.snapshot = retryMessage;
+          setErrors(sectionErrors);
+          scheduleSnapshotRetry(retryMessage, true, payload);
+          return;
+        }
+
         // Keep content and metadata from the same server document. Reusing
         // priorGood here displayed old evidence under a new generation time.
-        const fallbackData = (snapshotStatus(payload) === "warming_up" ? null : nextSnapshot)
-          || priorGood || priorVisible;
-        if (fallbackData) showSnapshotData(fallbackData, payload, "degraded");
+        const fallbackData = priorGood || priorVisible;
+        const fallbackPayload = lastGoodSnapshot.current?.page === snapshotPage
+          ? lastGoodSnapshot.current.payload
+          : undefined;
+        if (fallbackData) showSnapshotData(fallbackData, fallbackPayload, "degraded", payload);
         const sectionErrors = snapshotSectionErrors(payload);
-        sectionErrors.snapshot = snapshotRetryMessage(payload, Boolean(fallbackData));
+        const retryMessage = snapshotRetryMessage(payload, Boolean(fallbackData));
+        sectionErrors.snapshot = retryMessage;
         setErrors(sectionErrors);
-        scheduleSnapshotRetry(
-          sectionErrors.snapshot,
-          Boolean(fallbackData),
-          payload.refreshing || payload.stale ? 5_000 : snapshotPollInterval(pathname),
-        );
+        scheduleSnapshotRetry(retryMessage, Boolean(fallbackData), payload);
       } catch (error: any) {
         if (activeController.signal.aborted || controller.current !== activeController) return;
+        const hasVisibleData = Boolean(visibleBeforeRead);
         const message = error?.name === "AbortError"
-          ? "页面快照读取超时，不能据此判断为无数据"
-          : "页面快照暂不可读，正在等待下一个完整版本";
-        if (visibleBeforeRead) showSnapshotData(visibleBeforeRead, undefined, "degraded");
+          ? hasVisibleData
+            ? "页面快照读取超时，继续展示最近一次可验证数据，正在等待下一个完整快照"
+            : "页面快照读取超时，不能据此判断为无数据"
+          : hasVisibleData
+            ? "页面快照暂不可读，继续展示最近一次可验证数据，正在等待下一个完整快照"
+            : "页面快照暂不可读，正在等待下一个完整版本";
+        const fallbackPayload = lastGoodSnapshot.current?.page === snapshotPage
+          ? lastGoodSnapshot.current.payload
+          : undefined;
+        const readFailurePayload: Json = {
+          status: "unavailable",
+          stale: true,
+          refreshing: true,
+          refresh_available: false,
+          refresh_error_code: error?.name === "AbortError" ? "snapshot_read_timeout" : "snapshot_read_unavailable",
+        };
+        if (visibleBeforeRead) showSnapshotData(visibleBeforeRead, fallbackPayload, "degraded", readFailurePayload);
         setErrors({ snapshot: message });
-        scheduleSnapshotRetry(message, Boolean(visibleBeforeRead));
+        scheduleSnapshotRetry(message, hasVisibleData, readFailurePayload);
       }
       return;
     }
@@ -708,14 +815,17 @@ export function useConsoleData(pathname: string) {
     };
   }, [pathname, refresh, snapshotPage]);
 
-  const cachedSnapshot = snapshotPage ? cachedHealthySnapshot(snapshotPage) : null;
+  const cachedSnapshot = snapshotPage ? cachedRenderableSnapshot(snapshotPage) : null;
   const cachedSnapshotData = snapshotData(cachedSnapshot);
+  const cachedSnapshotView = snapshotPage && cachedSnapshotData
+    ? snapshotViewData(snapshotPage, cachedSnapshotData as ConsoleData, cachedSnapshot || undefined)
+    : null;
   const snapshotRouteReady = Boolean(cachedSnapshotData)
     || (loadedRoute.pathname === pathname && loadedRoute.generation === activeRouteGeneration);
   const stateMatchesSnapshotRoute = loadedRoute.pathname === pathname
     && loadedRoute.generation === activeRouteGeneration;
   const visibleData = snapshotPage
-    ? stateMatchesSnapshotRoute ? data : cachedSnapshotData || data
+    ? stateMatchesSnapshotRoute ? data : cachedSnapshotView || data
     : data;
   const visibleLoading = snapshotPage ? loading || !snapshotRouteReady : loading;
   const cachedSnapshotErrors = cachedSnapshot ? snapshotSectionErrors(cachedSnapshot) : {};

@@ -13,13 +13,15 @@ import hashlib
 import json
 import logging
 import os
+import socket
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
-from threading import Lock
+from threading import Event, Lock, Thread
 from typing import Any, Callable
 
 from fastapi.encoders import jsonable_encoder
+from fastapi import HTTPException
 from fastapi.responses import JSONResponse
 
 from app.data_platform.redis_store import delete as redis_delete
@@ -72,6 +74,45 @@ _diagnostic_cache_lock = Lock()
 _diagnostic_cache_generation = 0
 logger = logging.getLogger(__name__)
 
+# The database-local worker is deliberately observable from the application
+# node.  A process-local flag or systemd's ``active`` state cannot tell us
+# whether the worker is making progress through page builds.
+_SNAPSHOT_WORKER_KEY = "console_snapshot_worker"
+_SNAPSHOT_WORKER_HEARTBEAT_INTERVAL_SECONDS = 30
+_SNAPSHOT_WORKER_STALE_SECONDS = 180
+_SNAPSHOT_WORKER_RUNTIME_SCHEMA_READY = False
+_snapshot_worker_runtime_lock = Lock()
+_snapshot_worker_runtime: dict[str, Any] = {
+    "worker_id": "",
+    "node_name": "",
+    "status": "starting",
+    "started_at": "",
+    "heartbeat_at": "",
+    "cycle_started_at": "",
+    "cycle_completed_at": "",
+    "current_page": "",
+    "last_success_page": "",
+    "last_success_at": "",
+    "last_error_code": "",
+    "last_error_at": "",
+    "pages_completed": 0,
+}
+_snapshot_worker_runtime_last_persisted = 0.0
+_snapshot_worker_status_cache: tuple[float, dict[str, Any]] | None = None
+_snapshot_worker_status_cache_lock = Lock()
+_SNAPSHOT_WORKER_STATUS_CACHE_SECONDS = 5.0
+_BUSINESS_DATA_BLOCK_CODES = frozenset({
+    "position_market_data_not_ready",
+    "trade_calendar_not_ready",
+    "decision_data_not_ready",
+    "overview_data_not_ready",
+    "equity_curve_data_not_ready",
+    "strict_snapshot_trade_date_missing",
+    "latest_market_day_not_materialized",
+    "market_data_not_ready",
+    "snapshot_data_not_ready",
+})
+
 _RUNTIME_OVERLAY_KEYS = frozenset({
     "health",
     "tradingReady",
@@ -107,6 +148,322 @@ def _failure_retry_seconds() -> int:
         return max(5, min(120, int(raw))) if raw else _FAILURE_RETRY_SECONDS
     except ValueError:
         return _FAILURE_RETRY_SECONDS
+
+
+def _worker_stale_seconds() -> int:
+    raw = os.getenv("ALIS_CONSOLE_SNAPSHOT_WORKER_STALE_SECONDS", "")
+    try:
+        return max(60, min(3600, int(raw))) if raw else _SNAPSHOT_WORKER_STALE_SECONDS
+    except ValueError:
+        return _SNAPSHOT_WORKER_STALE_SECONDS
+
+
+def _worker_page_stale_seconds(page_key: str) -> int:
+    raw = os.getenv(
+        f"ALIS_CONSOLE_SNAPSHOT_{page_key.upper()}_MAX_STALE_SECONDS", "",
+    )
+    try:
+        if raw:
+            return max(_ttl(page_key), min(86400, int(raw)))
+    except ValueError:
+        pass
+    # A short runtime TTL is useful for the browser but should not make the
+    # operational health signal flap while a single expensive page is being
+    # assembled.  The worker heartbeat catches a stopped process within three
+    # minutes; this separate page limit detects an alive worker stuck on one
+    # page or perpetually yielding its queue.
+    return max(_ttl(page_key) * 3, _worker_stale_seconds() * 2, 300)
+
+
+def _worker_identity() -> tuple[str, str]:
+    node = str(os.getenv("ALIS_NODE_NAME") or socket.gethostname())[:160]
+    return f"{node}:{os.getpid()}", node
+
+
+def _ensure_runtime_table() -> None:
+    """Verify/create the worker runtime table without doing production DDL.
+
+    The explicit sim migration owns PostgreSQL schema changes.  The SQLite
+    branch exists only for isolated test fixtures, matching the page snapshot
+    compatibility path above.
+    """
+
+    global _SNAPSHOT_WORKER_RUNTIME_SCHEMA_READY
+    if _SNAPSHOT_WORKER_RUNTIME_SCHEMA_READY:
+        return
+    with _schema_lock:
+        if _SNAPSHOT_WORKER_RUNTIME_SCHEMA_READY:
+            return
+        with _conn() as conn:
+            if bool(getattr(conn, "_is_postgres", False)):
+                row = conn.execute(
+                    "SELECT to_regclass(?) AS table_name",
+                    ("public.console_snapshot_worker_runtime",),
+                ).fetchone()
+                table_name = str((dict(row) if row else {}).get("table_name") or "")
+                if not table_name:
+                    raise RuntimeError(
+                        "console_snapshot_worker_runtime schema is missing; run sim migrations before starting the worker"
+                    )
+            else:
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS console_snapshot_worker_runtime (
+                        worker_key VARCHAR(64) PRIMARY KEY,
+                        worker_id VARCHAR(160) NOT NULL,
+                        node_name VARCHAR(160) NOT NULL,
+                        status VARCHAR(32) NOT NULL,
+                        started_at VARCHAR(64) NOT NULL,
+                        heartbeat_at VARCHAR(64) NOT NULL,
+                        cycle_started_at VARCHAR(64),
+                        cycle_completed_at VARCHAR(64),
+                        current_page VARCHAR(32) NOT NULL DEFAULT '',
+                        last_success_page VARCHAR(32) NOT NULL DEFAULT '',
+                        last_success_at VARCHAR(64),
+                        last_error_code VARCHAR(128) NOT NULL DEFAULT '',
+                        last_error_at VARCHAR(64),
+                        pages_completed BIGINT NOT NULL DEFAULT 0,
+                        details_json TEXT NOT NULL DEFAULT '{}',
+                        updated_at VARCHAR(64) NOT NULL
+                    )
+                    """
+                )
+        _SNAPSHOT_WORKER_RUNTIME_SCHEMA_READY = True
+
+
+def _runtime_row_payload(row: Any) -> dict[str, Any] | None:
+    if not row:
+        return None
+    value = dict(row)
+    try:
+        details = json.loads(value.get("details_json") or "{}")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        details = {}
+    value["details"] = details if isinstance(details, dict) else {}
+    value.pop("details_json", None)
+    return value
+
+
+def _persist_worker_runtime(*, force: bool = False) -> None:
+    """Persist the in-memory worker state at most once per 30 seconds."""
+
+    global _snapshot_worker_runtime_last_persisted
+    now_monotonic = time.monotonic()
+    with _snapshot_worker_runtime_lock:
+        if not force and now_monotonic - _snapshot_worker_runtime_last_persisted < _SNAPSHOT_WORKER_HEARTBEAT_INTERVAL_SECONDS:
+            return
+        state = dict(_snapshot_worker_runtime)
+        _snapshot_worker_runtime_last_persisted = now_monotonic
+    try:
+        _ensure_runtime_table()
+        with _conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO console_snapshot_worker_runtime
+                    (worker_key,worker_id,node_name,status,started_at,heartbeat_at,
+                     cycle_started_at,cycle_completed_at,current_page,last_success_page,
+                     last_success_at,last_error_code,last_error_at,pages_completed,
+                     details_json,updated_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT (worker_key) DO UPDATE SET
+                    worker_id=EXCLUDED.worker_id,
+                    node_name=EXCLUDED.node_name,
+                    status=EXCLUDED.status,
+                    started_at=EXCLUDED.started_at,
+                    heartbeat_at=EXCLUDED.heartbeat_at,
+                    cycle_started_at=EXCLUDED.cycle_started_at,
+                    cycle_completed_at=EXCLUDED.cycle_completed_at,
+                    current_page=EXCLUDED.current_page,
+                    last_success_page=EXCLUDED.last_success_page,
+                    last_success_at=EXCLUDED.last_success_at,
+                    last_error_code=EXCLUDED.last_error_code,
+                    last_error_at=EXCLUDED.last_error_at,
+                    pages_completed=EXCLUDED.pages_completed,
+                    details_json=EXCLUDED.details_json,
+                    updated_at=EXCLUDED.updated_at
+                """,
+                (
+                    _SNAPSHOT_WORKER_KEY,
+                    state["worker_id"],
+                    state["node_name"],
+                    state["status"],
+                    state["started_at"],
+                    state["heartbeat_at"],
+                    state["cycle_started_at"] or None,
+                    state["cycle_completed_at"] or None,
+                    state["current_page"],
+                    state["last_success_page"],
+                    state["last_success_at"] or None,
+                    state["last_error_code"],
+                    state["last_error_at"] or None,
+                    int(state.get("pages_completed") or 0),
+                    json.dumps(state.get("details") or {}, ensure_ascii=False, separators=(",", ":")),
+                    state["heartbeat_at"],
+                ),
+            )
+    except Exception:
+        # A heartbeat must never terminate the snapshot worker.  The health
+        # reader will report ``worker_unavailable`` until the schema/DB recovers.
+        logger.warning("Console snapshot worker heartbeat persistence failed", exc_info=True)
+
+
+def record_worker_heartbeat(
+    *,
+    status: str = "running",
+    current_page: str | None = None,
+    last_success_page: str | None = None,
+    last_error_code: str | None = None,
+    details: dict[str, Any] | None = None,
+    force: bool = False,
+) -> None:
+    """Update and durably persist the snapshot worker runtime projection."""
+
+    now = _now()
+    with _snapshot_worker_runtime_lock:
+        if not _snapshot_worker_runtime["worker_id"]:
+            worker_id, node_name = _worker_identity()
+            _snapshot_worker_runtime.update({
+                "worker_id": worker_id,
+                "node_name": node_name,
+                "started_at": now,
+            })
+        _snapshot_worker_runtime["status"] = str(status or "running")[:32]
+        _snapshot_worker_runtime["heartbeat_at"] = now
+        if current_page is not None:
+            _snapshot_worker_runtime["current_page"] = str(current_page or "")[:32]
+        if last_success_page is not None:
+            _snapshot_worker_runtime["last_success_page"] = str(last_success_page or "")[:32]
+            if last_success_page:
+                _snapshot_worker_runtime["last_success_at"] = now
+                _snapshot_worker_runtime["pages_completed"] = int(
+                    _snapshot_worker_runtime.get("pages_completed") or 0
+                ) + 1
+        if last_error_code is not None:
+            _snapshot_worker_runtime["last_error_code"] = str(last_error_code or "")[:128]
+            _snapshot_worker_runtime["last_error_at"] = now if last_error_code else ""
+        if details is not None:
+            _snapshot_worker_runtime["details"] = dict(details)
+            event = str(details.get("event") or "")
+            if event == "cycle_started":
+                _snapshot_worker_runtime["cycle_started_at"] = now
+            elif event == "cycle_completed":
+                _snapshot_worker_runtime["cycle_completed_at"] = now
+    _persist_worker_runtime(force=force or status in {"stopped", "failed"} or bool(last_error_code))
+
+
+def _read_worker_runtime() -> dict[str, Any] | None:
+    try:
+        _ensure_runtime_table()
+        with _read_conn() as conn:
+            row = conn.execute(
+                """SELECT worker_key,worker_id,node_name,status,started_at,heartbeat_at,
+                          cycle_started_at,cycle_completed_at,current_page,last_success_page,
+                          last_success_at,last_error_code,last_error_at,pages_completed,
+                          details_json,updated_at
+                     FROM console_snapshot_worker_runtime WHERE worker_key=?""",
+                (_SNAPSHOT_WORKER_KEY,),
+            ).fetchone()
+        return _runtime_row_payload(row)
+    except Exception as exc:
+        logger.warning("Console snapshot worker runtime unavailable error_type=%s", type(exc).__name__)
+        return None
+
+
+def worker_runtime_status(*, now: datetime | None = None) -> dict[str, Any]:
+    """Return separate liveness and operational views of the snapshot worker.
+
+    A fresh heartbeat only proves that the process is alive.  It does not prove
+    that page builds are succeeding: the worker deliberately remains alive
+    while retrying transient data gates and build failures.  Keep that
+    distinction explicit so callers do not turn a continuously failing worker
+    into a false ``healthy`` signal (or, conversely, stop refresh retries just
+    because one build is degraded).
+    """
+
+    record = _read_worker_runtime()
+    current = now or datetime.now(timezone.utc)
+    if not record:
+        return {
+            "status": "worker_unavailable",
+            "operational_status": "unavailable",
+            "healthy": False,
+            "heartbeat_healthy": False,
+            "live": False,
+            "degraded": False,
+            "reason": "snapshot_worker_heartbeat_missing",
+            "heartbeat_at": None,
+            "heartbeat_age_seconds": None,
+            "worker": None,
+        }
+    heartbeat = _parse_timestamp(record.get("heartbeat_at"))
+    age = None if heartbeat is None else max(0.0, (current - heartbeat).total_seconds())
+    raw_status = str(record.get("status") or "").strip().lower()
+    active = raw_status in {"starting", "running", "degraded"}
+    heartbeat_healthy = bool(active and age is not None and age <= _worker_stale_seconds())
+    operational_degraded = bool(heartbeat_healthy and raw_status == "degraded")
+    healthy = bool(heartbeat_healthy and not operational_degraded)
+    status = "degraded" if operational_degraded else "ready" if heartbeat_healthy else "worker_unavailable"
+    reason = (str(record.get("last_error_code") or "snapshot_worker_degraded")
+              if operational_degraded else "" if heartbeat_healthy else (
+        "snapshot_worker_heartbeat_invalid" if heartbeat is None
+        else "snapshot_worker_heartbeat_expired" if age > _worker_stale_seconds()
+        else "snapshot_worker_not_running"
+    ))
+    return {
+        "status": status,
+        "operational_status": "degraded" if operational_degraded else "ready" if heartbeat_healthy else "unavailable",
+        "healthy": healthy,
+        "heartbeat_healthy": heartbeat_healthy,
+        "live": heartbeat_healthy,
+        "degraded": operational_degraded,
+        "reason": reason,
+        "heartbeat_at": record.get("heartbeat_at"),
+        "heartbeat_age_seconds": round(age, 3) if age is not None else None,
+        "stale_after_seconds": _worker_stale_seconds(),
+        "worker": record,
+    }
+
+
+def _cached_worker_runtime_status() -> dict[str, Any]:
+    """Avoid a runtime-table query for every browser page read."""
+
+    global _snapshot_worker_status_cache
+    observed = time.monotonic()
+    with _snapshot_worker_status_cache_lock:
+        cached = _snapshot_worker_status_cache
+        if cached and observed - cached[0] < _SNAPSHOT_WORKER_STATUS_CACHE_SECONDS:
+            return copy.deepcopy(cached[1])
+    value = worker_runtime_status()
+    with _snapshot_worker_status_cache_lock:
+        _snapshot_worker_status_cache = (observed, copy.deepcopy(value))
+    return value
+
+
+def _with_refresh_runtime(
+    response: dict[str, Any],
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Attach bounded refresh availability without changing page data shape."""
+
+    worker = _cached_worker_runtime_status()
+    worker_record = worker.get("worker") if isinstance(worker.get("worker"), dict) else {}
+    # Refresh remains possible while a live worker is retrying a degraded
+    # build.  Use liveness for this gate; operational health is reported
+    # separately to the API/monitoring callers.
+    available = bool(worker.get("heartbeat_healthy", worker.get("live", worker.get("healthy"))))
+    refresh_error = ""
+    if not available:
+        refresh_error = str(worker.get("reason") or "snapshot_worker_unavailable")
+    elif bool(worker.get("degraded")):
+        refresh_error = str(worker.get("reason") or "snapshot_worker_degraded")
+    elif bool(response.get("refreshing")):
+        refresh_error = str((metadata or {}).get("last_error_code") or "")
+    response["refresh_available"] = available
+    response["snapshot_worker_status"] = str(worker.get("status") or "worker_unavailable")
+    response["worker_status"] = str(worker_record.get("status") or worker.get("status") or "worker_unavailable")
+    response["refresh_error_code"] = refresh_error
+    response["refresh_retry_after_seconds"] = _failure_retry_seconds()
+    return response
 
 
 def _cached_diagnostic(
@@ -247,6 +604,62 @@ def _as_json(value: Any) -> Any:
     return jsonable_encoder(value)
 
 
+def _http_exception_detail(exc: HTTPException) -> dict[str, Any]:
+    detail = exc.detail
+    if isinstance(detail, dict):
+        # Route details are already structured.  Keep only JSON-compatible
+        # fields so exception objects/tracebacks never enter a durable page.
+        encoded = _as_json(detail)
+        return encoded if isinstance(encoded, dict) else {"message": str(encoded)}
+    return {"message": str(detail or "")}
+
+
+def _is_business_data_block(exc: HTTPException) -> bool:
+    if int(getattr(exc, "status_code", 0) or 0) != 503:
+        return False
+    detail = _http_exception_detail(exc)
+    code = str(detail.get("code") or "").strip().lower()
+    if code in _BUSINESS_DATA_BLOCK_CODES:
+        return True
+    # A few legacy readers expose a more specific readiness code.  Restrict
+    # this fallback to explicit data/readiness wording; a generic 503 remains
+    # a hard section error and therefore protects the last-known-good page.
+    return any(token in code for token in ("data_not_ready", "market_data", "snapshot_trade_date"))
+
+
+def _degraded_business_section(
+    page_key: str,
+    name: str,
+    exc: HTTPException,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    detail = _http_exception_detail(exc)
+    code = str(detail.get("code") or "snapshot_business_data_not_ready")[:128]
+    message = str(detail.get("message") or "目标交易日数据尚未就绪，页面其余分区仍可用。")[:500]
+    error = {
+        **detail,
+        "code": code,
+        "message": message,
+        "status_code": int(getattr(exc, "status_code", 503) or 503),
+        "retryable": True,
+        "business_blocked": True,
+    }
+    value = {
+        "ok": False,
+        "status": "degraded",
+        "data_available": False,
+        "component": name,
+        "retry_after_seconds": _failure_retry_seconds(),
+        "error": error,
+    }
+    logger.info(
+        "Console snapshot section blocked by expected business data readiness page=%s section=%s code=%s",
+        page_key,
+        name,
+        code,
+    )
+    return value, {"status": "degraded", "error": error, "kind": "business_data_block"}
+
+
 def _section(page_key: str, name: str, reader: Callable[[], Any]) -> tuple[Any, dict[str, Any]]:
     try:
         value = _as_json(reader())
@@ -256,6 +669,23 @@ def _section(page_key: str, name: str, reader: Callable[[], Any]) -> tuple[Any, 
         # itself failed or the endpoint explicitly says no data is available.
         unavailable = isinstance(value, dict) and value.get("data_available") is False and not _has_readable_evidence(value)
         return value, {"status": "degraded" if unavailable else "ready", "error": ""}
+    except HTTPException as exc:
+        if _is_business_data_block(exc):
+            return _degraded_business_section(page_key, name, exc)
+        logger.warning(
+            "Console snapshot section HTTP failure page=%s section=%s status=%s",
+            page_key,
+            name,
+            getattr(exc, "status_code", ""),
+        )
+        error = {
+            "code": "snapshot_section_http_error",
+            "message": "该页面分区暂时不可用，系统将自动重试。",
+            "status_code": int(getattr(exc, "status_code", 500) or 500),
+        }
+        return {"ok": False, "status": "unavailable", "error": error}, {
+            "status": "error", "error": error,
+        }
     except Exception as exc:  # a page can surface partial evidence safely
         logger.warning(
             "Console snapshot section unavailable page=%s section=%s error_type=%s",
@@ -991,6 +1421,164 @@ def _parse_timestamp(value: Any) -> datetime | None:
     return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed.astimezone(timezone.utc)
 
 
+def snapshot_health(*, now: datetime | None = None) -> dict[str, Any]:
+    """Assess the end-to-end durable snapshot chain.
+
+    ``ready`` means the worker heartbeat is current and every page remains
+    within its bounded stale allowance. ``fresh`` on each page separately
+    records the browser TTL state. ``degraded`` means a committed document has
+    an explicitly blocked business-data section. ``stale`` means a
+    last-known-good document exceeded its allowed stale age. A missing/expired
+    worker heartbeat is reported separately as ``worker_unavailable`` so an
+    operator can distinguish a data gate from a stopped service.
+    """
+
+    checked_at = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    worker = worker_runtime_status(now=checked_at)
+    try:
+        _ensure_table()
+        with _read_conn() as conn:
+            rows = conn.execute(
+                """SELECT page_key,version,generated_at,as_of,status,invalidated_at,
+                          updated_at,refresh_generation,last_attempt_generation,
+                          last_attempt_at,last_error_code
+                     FROM console_page_snapshots"""
+            ).fetchall()
+    except Exception as exc:
+        logger.warning("Console snapshot page health unavailable error_type=%s", type(exc).__name__)
+        worker_live = bool(worker.get("heartbeat_healthy", worker.get("live", worker.get("healthy"))))
+        return {
+            "ok": False,
+            "healthy": False,
+            "degraded": False,
+            "stale": worker_live,
+            "status": "worker_unavailable" if not worker_live else "stale",
+            "reason": (
+                str(worker.get("reason") or "snapshot_worker_unavailable")
+                if not worker_live
+                else "snapshot_page_health_unavailable"
+            ),
+            "checked_at": checked_at.isoformat(),
+            "worker": worker,
+            "pages": {},
+            "summary": {"ready": 0, "degraded": 0, "stale": 0, "unavailable": len(PAGE_KEYS)},
+            "error": {"code": "snapshot_page_health_unavailable"},
+        }
+
+    by_page = {str(dict(row).get("page_key") or ""): dict(row) for row in rows}
+    pages: dict[str, dict[str, Any]] = {}
+    counts = {"ready": 0, "degraded": 0, "stale": 0, "unavailable": 0}
+    for page_key in PAGE_KEYS:
+        record = by_page.get(page_key)
+        if not record:
+            item = {
+                "status": "unavailable",
+                "healthy": False,
+                "current": False,
+                "fresh": False,
+                "refresh_due": True,
+                "usable": False,
+                "last_known_good": False,
+                "reason": "snapshot_missing",
+                "generated_at": None,
+                "age_seconds": None,
+                "ttl_seconds": _ttl(page_key),
+                "allowed_stale_seconds": _worker_page_stale_seconds(page_key),
+                "version": "",
+                "last_error_code": "",
+            }
+            pages[page_key] = item
+            counts["unavailable"] += 1
+            continue
+        generated = _parse_timestamp(record.get("generated_at"))
+        age = None if generated is None else max(0.0, (checked_at - generated).total_seconds())
+        committed = _has_committed_snapshot(record)
+        invalidated = bool(record.get("invalidated_at"))
+        invalidated_at = _parse_timestamp(record.get("invalidated_at"))
+        invalidated_age = (
+            None if invalidated_at is None else max(0.0, (checked_at - invalidated_at).total_seconds())
+        )
+        fresh = bool(committed and not invalidated and age is not None and age <= _ttl(page_key))
+        refresh_due = not fresh
+        stale_age_exceeded = age is None or age > _worker_page_stale_seconds(page_key)
+        invalidation_exceeded = invalidated and (
+            invalidated_age is None or invalidated_age > _worker_page_stale_seconds(page_key)
+        )
+        if not committed:
+            state = "unavailable"
+            reason = "snapshot_not_committed"
+        elif stale_age_exceeded or invalidation_exceeded:
+            state = "stale"
+            reason = "source_invalidation_age_exceeded" if invalidated else "snapshot_age_exceeded"
+        elif str(record.get("status") or "") == "degraded":
+            state = "degraded"
+            reason = "snapshot_business_data_degraded"
+        else:
+            state = "ready"
+            reason = "source_invalidated" if invalidated else "snapshot_ttl_expired" if refresh_due else ""
+        counts[state] += 1
+        pages[page_key] = {
+            "status": state,
+            "healthy": state == "ready",
+            "current": state in {"ready", "degraded"},
+            "fresh": fresh,
+            "refresh_due": refresh_due,
+            "usable": state in {"ready", "degraded", "stale"},
+            "last_known_good": committed,
+            "reason": reason,
+            "generated_at": record.get("generated_at"),
+            "as_of": record.get("as_of"),
+            "age_seconds": round(age, 3) if age is not None else None,
+            "ttl_seconds": _ttl(page_key),
+            "allowed_stale_seconds": _worker_page_stale_seconds(page_key),
+            "version": record.get("version") or "",
+            "refresh_generation": _generation(record),
+            "invalidated_at": record.get("invalidated_at"),
+            "invalidation_age_seconds": round(invalidated_age, 3) if invalidated_age is not None else None,
+            "last_attempt_at": record.get("last_attempt_at"),
+            "last_error_code": record.get("last_error_code") or "",
+        }
+
+    # ``healthy`` is the operational signal.  Older/mocked worker payloads
+    # only expose that field, so retain a compatibility fallback while using
+    # the explicit heartbeat signal for liveness decisions.
+    worker_live = bool(worker.get("heartbeat_healthy", worker.get("live", worker.get("healthy"))))
+    worker_degraded = bool(
+        worker.get("degraded")
+        or str(worker.get("operational_status") or "").lower() == "degraded"
+        or str(worker.get("status") or "").lower() == "degraded"
+    )
+    if not worker_live:
+        overall_status = "worker_unavailable"
+        overall_reason = str(worker.get("reason") or "snapshot_worker_unavailable")
+    elif counts["unavailable"] or counts["stale"]:
+        overall_status = "stale"
+        overall_reason = "snapshot_page_stale"
+    elif counts["degraded"] or worker_degraded:
+        overall_status = "degraded"
+        overall_reason = (
+            str(worker.get("reason") or "snapshot_worker_degraded")
+            if worker_degraded and not counts["degraded"]
+            else "snapshot_page_degraded"
+        )
+    else:
+        overall_status = "ready"
+        overall_reason = ""
+    return {
+        "ok": overall_status in {"ready", "degraded"},
+        "healthy": overall_status == "ready",
+        "degraded": overall_status == "degraded",
+        "stale": overall_status == "stale",
+        "status": overall_status,
+        "reason": overall_reason,
+        "checked_at": checked_at.isoformat(),
+        "worker": worker,
+        "pages": pages,
+        "summary": counts,
+        "required_pages": list(PAGE_KEYS),
+    }
+
+
 def _retry_is_deferred(record: dict[str, Any], now: datetime) -> bool:
     try:
         attempted_generation = int(record.get("last_attempt_generation"))
@@ -1046,6 +1634,35 @@ def _wait_or_stop(stopper: Any | None, seconds: float) -> bool:
         time.sleep(seconds)
         return False
     return bool(stopper.wait(seconds))
+
+
+def _build_with_heartbeat_pulse(page_key: str) -> dict[str, Any]:
+    """Keep a durable liveness signal while one serial page build is slow.
+
+    A page reader can legitimately perform a bounded historical aggregation.
+    Its liveness must not depend on returning before the worker heartbeat
+    threshold, otherwise a healthy busy process looks identical to a stopped
+    systemd unit.  The pulse only writes the small runtime row; it never runs
+    another page reader or expands aggregation concurrency.
+    """
+
+    finished = Event()
+
+    def pulse() -> None:
+        while not finished.wait(_SNAPSHOT_WORKER_HEARTBEAT_INTERVAL_SECONDS):
+            record_worker_heartbeat(
+                status="running",
+                current_page=page_key,
+                details={"event": "page_build_heartbeat", "page": page_key},
+            )
+
+    thread = Thread(target=pulse, name=f"console-snapshot-heartbeat-{page_key}", daemon=True)
+    thread.start()
+    try:
+        return build(page_key)
+    finally:
+        finished.set()
+        thread.join(timeout=1.0)
 
 
 def _control_work_active(*, include_research: bool = True) -> bool:
@@ -1117,41 +1734,105 @@ def _snapshot_build_should_yield(page_key: str = "") -> bool:
 def run_snapshot_worker_forever(stop_event: Any | None = None) -> None:
     """Run only on the control worker; serialize expensive page aggregation."""
     stopper = stop_event
-    while stopper is None or not stopper.is_set():
-        try:
-            due = _pages_due_for_refresh()
-        except Exception as exc:  # database failures must not involve the API host
-            logger.warning("Console snapshot due scan unavailable error_type=%s", type(exc).__name__)
-            if _wait_or_stop(stopper, 5.0):
-                return
-            continue
-        for page_key in due:
-            if stopper is not None and stopper.is_set():
-                return
+    record_worker_heartbeat(status="starting", force=True)
+    try:
+        while stopper is None or not stopper.is_set():
+            record_worker_heartbeat(
+                status="running",
+                details={"event": "cycle_started"},
+            )
             try:
-                if page_key != "runtime" and _snapshot_build_should_yield(page_key):
-                    continue
-            except Exception as exc:
-                logger.warning(
-                    "Console snapshot workload gate unavailable error_type=%s",
-                    type(exc).__name__,
+                due = _pages_due_for_refresh()
+            except Exception as exc:  # database failures must not involve the API host
+                logger.warning("Console snapshot due scan unavailable error_type=%s", type(exc).__name__)
+                record_worker_heartbeat(
+                    status="degraded",
+                    last_error_code="snapshot_due_scan_unavailable",
+                    details={"error_type": type(exc).__name__},
+                    force=True,
                 )
-                break
-            try:
-                build(page_key)
-            except Exception as exc:  # retain any LKG; the next scan retries safely
-                logger.warning(
-                    "Console snapshot build unavailable page=%s error_type=%s",
-                    page_key,
-                    type(exc).__name__,
+                if _wait_or_stop(stopper, 5.0):
+                    return
+                continue
+            for page_key in due:
+                if stopper is not None and stopper.is_set():
+                    return
+                try:
+                    if page_key != "runtime" and _snapshot_build_should_yield(page_key):
+                        record_worker_heartbeat(
+                            status="running",
+                            current_page="",
+                            details={"last_skipped_page": page_key, "reason": "workload_gate"},
+                            force=True,
+                        )
+                        continue
+                except Exception as exc:
+                    logger.warning(
+                        "Console snapshot workload gate unavailable error_type=%s",
+                        type(exc).__name__,
+                    )
+                    record_worker_heartbeat(
+                        status="degraded",
+                        last_error_code="snapshot_workload_gate_unavailable",
+                        details={"error_type": type(exc).__name__, "page": page_key},
+                        force=True,
+                    )
+                    break
+                record_worker_heartbeat(
+                    status="running",
+                    current_page=page_key,
+                    details={"event": "page_started", "page": page_key},
+                    force=True,
                 )
-            # Never fan out expensive aggregations across the small DB.
-            if _wait_or_stop(stopper, 1.0):
+                try:
+                    result = _build_with_heartbeat_pulse(page_key)
+                    result_status = str((result or {}).get("status") or "error")
+                    if result_status in {"ready", "degraded"}:
+                        record_worker_heartbeat(
+                            status="running" if result_status == "ready" else "degraded",
+                            current_page="",
+                            last_success_page=page_key,
+                            last_error_code="" if result_status == "ready" else "snapshot_business_data_degraded",
+                            details={"event": "page_completed", "page": page_key, "snapshot_status": result_status},
+                            force=True,
+                        )
+                    else:
+                        record_worker_heartbeat(
+                            status="degraded",
+                            current_page="",
+                            last_error_code="snapshot_build_error",
+                            details={"event": "page_failed", "page": page_key, "snapshot_status": result_status},
+                            force=True,
+                        )
+                except Exception as exc:  # retain any LKG; the next scan retries safely
+                    logger.warning(
+                        "Console snapshot build unavailable page=%s error_type=%s",
+                        page_key,
+                        type(exc).__name__,
+                    )
+                    record_worker_heartbeat(
+                        status="degraded",
+                        current_page="",
+                        last_error_code="snapshot_build_unavailable",
+                        details={"event": "page_exception", "page": page_key, "error_type": type(exc).__name__},
+                        force=True,
+                    )
+                # Never fan out expensive aggregations across the small DB.
+                if _wait_or_stop(stopper, 1.0):
+                    return
+            # A workload-gate break leaves due pages in the queue. Without a wait
+            # this spins on PostgreSQL continuously while research owns the DB.
+            record_worker_heartbeat(
+                status="running",
+                current_page="",
+                details={"event": "cycle_completed", "pages_due": len(due)},
+            )
+            if _wait_or_stop(stopper, 5.0 if due else 1.0):
                 return
-        # A workload-gate break leaves due pages in the queue. Without a wait
-        # this spins on PostgreSQL continuously while research owns the DB.
-        if _wait_or_stop(stopper, 5.0 if due else 1.0):
-            return
+    finally:
+        # A graceful stop is useful evidence: health should not treat an
+        # intentionally stopped service as a live worker until it starts again.
+        record_worker_heartbeat(status="stopped", current_page="", force=True)
 
 
 def build(page_key: str) -> dict[str, Any]:
@@ -1262,7 +1943,7 @@ def read(page_key: str, *, force: bool = False) -> dict[str, Any]:
         response["stale"] = expired
         response["refreshing"] = expired
         response["stale_reason"] = "snapshot_ttl_expired" if expired else ""
-        return _with_runtime_overlay(page_key, response)
+        return _with_refresh_runtime(_with_runtime_overlay(page_key, response), metadata)
     if isinstance(cached, dict):
         redis_delete(_redis_key(page_key))
     generation = _generation(metadata)
@@ -1279,12 +1960,15 @@ def read(page_key: str, *, force: bool = False) -> dict[str, Any]:
         # version while waiting, avoiding repeated cross-node payload transfers.
         if not metadata.get("invalidated_at"):
             set_json(_redis_key(page_key), response, ttl=_app_cache_ttl())
-        return _with_runtime_overlay(page_key, response)
+        return _with_refresh_runtime(_with_runtime_overlay(page_key, response), metadata)
     if durable and str(durable.get("status") or "") == "unavailable":
         durable["stale"] = False
         durable["refreshing"] = True
-        return _with_runtime_overlay(page_key, durable)
-    return _with_runtime_overlay(page_key, _warming_payload(page_key, generation))
+        return _with_refresh_runtime(_with_runtime_overlay(page_key, durable), metadata)
+    return _with_refresh_runtime(
+        _with_runtime_overlay(page_key, _warming_payload(page_key, generation)),
+        metadata,
+    )
 
 
 def status() -> dict[str, Any]:
@@ -1297,10 +1981,14 @@ def status() -> dict[str, Any]:
             "FROM console_page_snapshots ORDER BY page_key"
         ).fetchall()
     items = [dict(row) for row in rows]
+    health = snapshot_health()
     return {
-        "ok": True,
+        # The endpoint itself remains readable during an outage, while `ok`
+        # describes whether its page/worker chain is currently usable.
+        "ok": bool(health.get("ok")),
         "items": items,
         "pages": list(PAGE_KEYS),
+        "health": health,
         "payload_size_bytes": sum(int(item.get("payload_size_bytes") or 0) for item in items),
         "compressed_size_bytes": sum(int(item.get("compressed_size_bytes") or 0) for item in items),
     }

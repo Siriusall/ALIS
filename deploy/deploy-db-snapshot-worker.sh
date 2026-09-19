@@ -8,7 +8,6 @@ Usage: deploy-db-snapshot-worker.sh BUNDLE
 Required environment:
   ALIS_DB_SNAPSHOT_SSH_TARGET
   ALIS_DB_SNAPSHOT_SSH_KEY
-  ALIS_OLD_SNAPSHOT_WORKER_DISABLED=1
 
 The database host must already contain /etc/alis/db-snapshot-worker.env with
 localhost DATABASE_URL and DATA_PLATFORM_DATABASE_URL values. Apply the sim
@@ -21,10 +20,6 @@ bundle=${1:-}
 test -f "$bundle" || { usage >&2; exit 2; }
 : "${ALIS_DB_SNAPSHOT_SSH_TARGET:?required}"
 : "${ALIS_DB_SNAPSHOT_SSH_KEY:?required}"
-test "${ALIS_OLD_SNAPSHOT_WORKER_DISABLED:-}" = 1 || {
-  echo "refusing deployment until the old console snapshot worker is disabled" >&2
-  exit 3
-}
 
 manifest=$(tar -xOf "$bundle" ./.alis-release-manifest)
 commit=$(sed -n 's/^git_commit=//p' <<<"$manifest")
@@ -64,6 +59,11 @@ rm -rf '$release/backend/.venv' && ln -sfn /opt/alis-db-snapshot/shared/app-venv
 set -a
 . /etc/alis/db-snapshot-worker.env
 set +a
+cd '$release/backend'
+# The database-local worker owns the sim schema contract. Apply the migration
+# here before checking the head so DB-first recovery does not depend on a later
+# app deployment.
+/opt/alis-db-snapshot/shared/app-venv/bin/python scripts/manage_migrations.py upgrade --database sim
 PYTHONPATH='$release/backend' /opt/alis-db-snapshot/shared/app-venv/bin/python - <<'PY'
 from app.services.system_release_center import SIM_SCHEMA_HEAD, database_revisions
 current = database_revisions()
@@ -83,16 +83,55 @@ install -o root -g root -m 644 '$release/deploy/alis-market-dataset-publish.serv
 install -o root -g root -m 644 '$release/deploy/alis-market-dataset-publish.timer' /etc/systemd/system/alis-market-dataset-publish.timer
 systemctl daemon-reload
 systemctl enable --now alis-market-dataset-publish.timer
+# The old worker lived on the shared worker host. Disable it explicitly so
+# two builders cannot race the same generation after a rollback or reboot;
+# the database-local unit below is the sole production owner.
+systemctl disable --now alis-console-snapshot-worker 2>/dev/null || true
 systemctl enable alis-db-egress-guard
 systemctl restart alis-db-egress-guard
 systemctl enable --now alis-db-egress-guard-account.timer
+systemctl unmask alis-db-snapshot-worker
 systemctl enable alis-db-snapshot-worker
 # enable --now does not restart an already running Python process after the
 # release symlink changes; it would keep old readers and their caches alive.
 systemctl restart alis-db-snapshot-worker
 test "\$(systemctl is-active alis-db-snapshot-worker)" = active
+test "\$(systemctl is-enabled alis-db-snapshot-worker)" = enabled
 pid=\$(systemctl show alis-db-snapshot-worker -p MainPID --value)
 test "\$(readlink -f /proc/\$pid/cwd)" = '$release/backend'
+set -a
+. /etc/alis/db-snapshot-worker.env
+set +a
+export PYTHONPATH='$release/backend'
+for n in \$(seq 1 30); do
+  if /opt/alis-db-snapshot/shared/app-venv/bin/python - <<'PY'
+from app.services.console_snapshots import snapshot_health
+
+value = snapshot_health()
+worker = value.get("worker") or {}
+# ``healthy`` is operational health: a live worker may be ``degraded`` while
+# a business-data gate is waiting for its source to materialize.  Deployment
+# must prove the heartbeat and a usable current document, not require every
+# business section to be ready at that instant.
+if not worker.get("heartbeat_healthy", worker.get("live", False)):
+    raise SystemExit(1)
+pages = value.get("pages") or {}
+items = pages.values() if isinstance(pages, dict) else pages
+if not any(
+    isinstance(item, dict)
+    and bool(item.get("current"))
+    and str(item.get("status") or "") in {"ready", "degraded"}
+    for item in items
+):
+    raise SystemExit(1)
+PY
+  then
+    exit 0
+  fi
+  sleep 2
+done
+echo 'snapshot worker heartbeat/page health did not become healthy' >&2
+exit 1
 REMOTE
 
 echo "release_commit=$commit"

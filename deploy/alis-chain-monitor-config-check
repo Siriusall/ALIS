@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Validate the monitor's SSH boundary before a probe is allowed to run.  The
+# monitor must use dedicated, pinned credentials; falling back to root's
+# ~/.ssh or accepting a new host key would turn a partial/redirected probe
+# into a false production signal.
+
+env_file=${ALIS_CHAIN_MONITOR_ENV_FILE:-/etc/alis/chain-monitor.env}
+is_private_file() {
+  local mode
+  mode=$(stat -c '%a' "$1")
+  (( (8#$mode & 8#077) == 0 ))
+}
+
+test -f "$env_file" || {
+  echo "missing chain monitor environment: $env_file" >&2
+  exit 78
+}
+test ! -L "$env_file" || {
+  echo "chain monitor environment must not be a symlink: $env_file" >&2
+  exit 78
+}
+test "$(stat -c '%U' "$env_file")" = root || {
+  echo "chain monitor environment must be root-owned" >&2
+  exit 78
+}
+! is_private_file "$env_file" && {
+  echo "chain monitor environment is group/world-readable" >&2
+  exit 78
+}
+
+# systemd's EnvironmentFile syntax is deliberately kept to simple KEY=value
+# records by the bootstrap script.  Source it here so this check can also be
+# run manually before a daemon reload.
+set -a
+. "$env_file"
+set +a
+
+known_hosts=${ALIS_MONITOR_SSH_KNOWN_HOSTS:-/etc/alis/chain-monitor/known_hosts}
+test -f "$known_hosts" || {
+  echo "missing pinned monitor known_hosts: $known_hosts" >&2
+  exit 78
+}
+test ! -L "$known_hosts" || {
+  echo "monitor known_hosts must not be a symlink" >&2
+  exit 78
+}
+test "$(stat -c '%U' "$known_hosts")" = root || {
+  echo "monitor known_hosts must be root-owned" >&2
+  exit 78
+}
+test -s "$known_hosts" || {
+  echo "monitor known_hosts is empty" >&2
+  exit 78
+}
+
+for role in APP DB RESEARCH; do
+  target_var=ALIS_${role}_MONITOR_TARGET
+  key_var=ALIS_MONITOR_KEY_${role}
+  target=${!target_var:-}
+  key=${!key_var:-}
+  [[ "$target" =~ ^[^@[:space:]]+@[^[:space:]]+$ ]] || {
+    echo "invalid $target_var" >&2
+    exit 78
+  }
+  test -n "$key" && [[ "$key" = /* ]] || {
+    echo "$key_var must be an absolute path" >&2
+    exit 78
+  }
+  test -f "$key" && test ! -L "$key" || {
+    echo "missing monitor key for $role" >&2
+    exit 78
+  }
+  ! is_private_file "$key" && {
+    echo "monitor key for $role is group/world-readable" >&2
+    exit 78
+  }
+  test "$(stat -c '%U' "$key")" = root || {
+    echo "monitor key for $role must be root-owned" >&2
+    exit 78
+  }
+  ssh-keygen -y -f "$key" >/dev/null 2>&1 || {
+    echo "monitor key for $role is not a usable unencrypted private key" >&2
+    exit 78
+  }
+  host=${target#*@}
+  host=${host#\[}
+  host=${host%\]}
+  # ssh-keygen understands both normal and hashed known_hosts entries.
+  ssh-keygen -F "$host" -f "$known_hosts" >/dev/null 2>&1 || {
+    echo "no pinned host key for $host" >&2
+    exit 78
+  }
+done
+
+echo "chain-monitor-config=ok"

@@ -311,7 +311,7 @@ deploy/deploy-research-worker.sh BUNDLE
 
 它部署共享计算代码。部署后必须分别核对计算机上的 `alis-control-worker` 和 `alis-research-worker`，不能只看研究服务。
 
-数据库快照部署：
+数据库快照部署（应先于研究机和应用机；脚本会在数据库机执行 sim migration，再启用 Worker）：
 
 ```bash
 deploy/deploy-db-snapshot-worker.sh BUNDLE
@@ -329,6 +329,40 @@ readlink -f <backend-symlink>
 ```
 
 然后验证数据库任务状态、API 和浏览器真实页面。`systemctl active` 不代表数据路径正确。
+
+### 控制台快照验收
+
+生产快照唯一由数据库机 `alis-db-snapshot-worker` 生成；应用机和研究机不得同时运行旧的 `alis-console-snapshot-worker`。快照 Worker 的 systemd 状态、持久 heartbeat、页面文档新鲜度必须一起验证：
+
+```bash
+ssh alis-db 'systemctl is-enabled alis-db-snapshot-worker; systemctl is-active alis-db-snapshot-worker'
+ssh alis-db 'set -a; . /etc/alis/db-snapshot-worker.env; set +a; cd /opt/alis-db-snapshot/backend; PYTHONPATH=$PWD /opt/alis-db-snapshot/shared/app-venv/bin/python -c "import json; from app.services.console_snapshots import snapshot_health; print(json.dumps(snapshot_health(), ensure_ascii=False, indent=2))"'
+ssh alis-app 'systemctl is-active alis-chain-monitor.timer; systemctl start alis-chain-monitor.service'
+```
+
+发布验收至少要求 Worker heartbeat 未过期，且至少一个页面已有 `ready` 或 `degraded` 的当前文档；随后等待完整一轮页面构建。`degraded` 表示明确的业务数据门未就绪，页面仍可展示其余证据；`stale`、`worker_unavailable`、`unavailable` 必须作为故障处理。
+
+恢复已被人为停用的 Worker 时，先发布包含 migration 的 release，再使用部署脚本恢复；不要仅手工 `start` 旧 release。部署脚本会解除 mask、执行 enable、验证 PID 指向新 release、heartbeat 和首份页面文档。链路 monitor 每两分钟检查 API、DB 快照服务和两个研究 Worker；alert worker 从同一快照健康契约与 monitor state 发送故障和恢复通知。
+
+### 跨节点 monitor SSH 凭据
+
+`alis-chain-monitor` 在应用机以 root 运行，不能依赖 root 的默认 SSH agent、`~/.ssh/known_hosts` 或 `accept-new`。首次部署或更换主机指纹时，操作者先准备一份已通过独立渠道核验的 `known_hosts`，再运行：
+
+```bash
+export ALIS_APP_SSH_TARGET=ubuntu@124.221.86.123
+export ALIS_APP_SSH_KEY=/path/to/app-deploy-key
+export ALIS_DB_SNAPSHOT_SSH_TARGET=ubuntu@122.51.159.195
+export ALIS_DB_SNAPSHOT_SSH_KEY=/path/to/db-deploy-key
+export ALIS_RESEARCH_WORKER_SSH_TARGET=ubuntu@124.223.225.117
+export ALIS_RESEARCH_WORKER_SSH_KEY=/path/to/research-deploy-key
+export ALIS_MONITOR_KNOWN_HOSTS_FILE=$HOME/.ssh/known_hosts
+export ALIS_MONITOR_AUTHORIZED_FROM=124.221.86.123
+deploy/bootstrap-chain-monitor-ssh.sh
+```
+
+Bootstrap 脚本只把三条目标主机的已核验 host-key 提取到应用机 `/etc/alis/chain-monitor/known_hosts`，并在应用机本地生成三把专用 Ed25519 私钥。对应公钥以 `from="<应用机路由源地址>",restrict` 选项追加到各目标 `ubuntu` 用户的 `authorized_keys`；默认来源由 bootstrap 在应用机按每个目标的实际路由探测，也可用 `ALIS_MONITOR_AUTHORIZED_FROM` 显式指定已核验地址/CIDR。私钥不会进入仓库、发布包或操作者电脑。配置文件 `/etc/alis/chain-monitor.env` 和私钥均为 root 所有且不可被组/其他用户读取。monitor 使用 `IdentitiesOnly=yes`、`GlobalKnownHostsFile=/dev/null` 和 `StrictHostKeyChecking=yes`，任何缺 key、权限不正确或未固定 host-key 的情况都会在 `ExecStartPre` 阶段失败并明确告警。
+
+应用发布脚本会安装 `alis-chain-monitor-config-check`，并在启用 timer 前拒绝缺少上述配置或密钥的发布；可用 `ALIS_CHAIN_MONITOR_ENV_FILE` 显式上传已 provision 的非秘密 env 文件，但不能绕过 key/host-key 校验。轮换步骤是重新运行 bootstrap（保留旧 key 直到一次成功验证），确认 monitor 状态为 healthy 后，再从三台目标的 `authorized_keys` 删除旧的 `alis-chain-monitor-*` 行。不要使用 `ssh-keyscan` 生成生产信任根，也不要把部署用的高权限 operator key 直接配置给 monitor。
 
 ## 11. 任务和数据库检查
 
@@ -358,7 +392,7 @@ ORDER BY priority DESC, id;
 
 ### 页面值旧
 
-先查快照和部署版本，不要只要求硬刷新。
+先查 `snapshot_health()`、Worker heartbeat 和 deployment release，不要只要求硬刷新。浏览器继续展示有数据的 LKG 时应标记为 stale/degraded 并低频重试；只有冷启动且没有可渲染文档才显示页面加载失败。
 
 ### 任务中心没有实时流
 

@@ -7,6 +7,10 @@ Usage: deploy-app.sh BUNDLE
 
 Required environment:
   ALIS_APP_SSH_TARGET, ALIS_APP_SSH_KEY
+
+Optional environment:
+  ALIS_CHAIN_MONITOR_ENV_FILE  Upload an already provisioned monitor env file
+                               before installing the monitor unit.
 HELP
 }
 
@@ -34,6 +38,17 @@ app_ssh() { ssh "${ssh_opts[@]}" -i "$ALIS_APP_SSH_KEY" "$ALIS_APP_SSH_TARGET" "
 
 scp -O -q "${ssh_opts[@]}" -i "$ALIS_APP_SSH_KEY" "$bundle" "$ALIS_APP_SSH_TARGET:$remote_archive"
 
+if [[ -n ${ALIS_CHAIN_MONITOR_ENV_FILE:-} ]]; then
+  test -f "$ALIS_CHAIN_MONITOR_ENV_FILE" || {
+    echo "ALIS_CHAIN_MONITOR_ENV_FILE is missing: $ALIS_CHAIN_MONITOR_ENV_FILE" >&2
+    exit 2
+  }
+  monitor_env_archive="/tmp/alis-chain-monitor-env-${short}"
+  scp -O -q "${ssh_opts[@]}" -i "$ALIS_APP_SSH_KEY" \
+    "$ALIS_CHAIN_MONITOR_ENV_FILE" "$ALIS_APP_SSH_TARGET:$monitor_env_archive"
+  app_ssh "sudo install -o root -g root -m 600 '$monitor_env_archive' /etc/alis/chain-monitor.env; sudo rm -f '$monitor_env_archive'"
+fi
+
 app_ssh "sudo bash -lc 'set -euo pipefail
   test \"\$(sha256sum $remote_archive | awk \"{print \\\$1}\")\" = $sha
   test ! -e $app_release
@@ -51,6 +66,22 @@ app_ssh "sudo bash -lc 'set -euo pipefail
   sudo -u www-data test -r $app_release/frontend/dist/index.html
   /opt/alis/shared/app-venv/bin/pip install -q -r $app_release/backend/requirements.txt
   /opt/alis/shared/app-venv/bin/python -m compileall -q $app_release/backend/app $app_release/backend/migrations
+  install -d -o root -g root -m 755 /usr/local/libexec /usr/local/sbin
+  install -o root -g root -m 755 $app_release/deploy/alis-chain-monitor-config-check /usr/local/sbin/alis-chain-monitor-config-check
+  install -o root -g root -m 755 $app_release/deploy/alis-chain-monitor.py /usr/local/libexec/alis-chain-monitor.py
+  install -o root -g root -m 644 $app_release/deploy/alis-chain-monitor.service /etc/systemd/system/alis-chain-monitor.service
+  install -o root -g root -m 644 $app_release/deploy/alis-chain-monitor.timer /etc/systemd/system/alis-chain-monitor.timer
+  install -o root -g root -m 644 $app_release/deploy/alis-alert-worker.service /etc/systemd/system/alis-alert-worker.service
+  test -f /etc/alis/chain-monitor.env || { echo "missing /etc/alis/chain-monitor.env; run deploy/bootstrap-chain-monitor-ssh.sh first" >&2; exit 78; }
+  /usr/local/sbin/alis-chain-monitor-config-check
+  systemctl daemon-reload
+  systemctl enable --now alis-chain-monitor.timer
+  systemctl enable --now alis-alert-worker
+  test "\$(systemctl is-active alis-chain-monitor.timer)" = active
+  test "\$(systemctl is-active alis-alert-worker)" = active
+  # The database-local unit is the only supported snapshot writer.  Retire a
+  # legacy app-host unit if an older release left it installed.
+  systemctl disable --now alis-console-snapshot-worker 2>/dev/null || true
   set -a; source /etc/alis/alis.env; set +a
   cd $app_release/backend
   .venv/bin/python scripts/manage_migrations.py upgrade
@@ -71,6 +102,13 @@ governance_payload=$(printf '%s' \
   'from app.services.system_release_center import run_release_governance_cycle,release_status; run_release_governance_cycle(actor="production_release_v2"); s=release_status(); a=s.get("active_release") or {}; c=((a.get("manifest") or {}).get("components") or {}).get("code.backend") or {}; assert s.get("ok") and not s.get("drift") and c.get("version") == "'"$commit"'", s' \
   | base64 | tr -d '\n')
 app_ssh "sudo bash -lc 'set -a; source /etc/alis/alis.env; set +a; cd /opt/alis/current/backend; echo $governance_payload | base64 -d | .venv/bin/python -'"
+
+# Run the freshly installed monitor once after governance.  This is an
+# explicit release gate: a healthy API alone is not enough when the snapshot
+# worker, database heartbeat, or either research worker is down.
+app_ssh "sudo systemctl start alis-chain-monitor.service"
+app_ssh 'test "$(systemctl is-active alis-chain-monitor.timer)" = active'
+app_ssh 'test "$(systemctl show alis-chain-monitor.service -p ExecMainStatus --value)" = 0'
 
 echo "app_release=$app_release"
 echo "status=healthy"

@@ -93,6 +93,9 @@ ln -sfn /opt/alis-research-worker/shared/runtime-cache '$release/backend/.cache'
 /opt/alis-research-worker/shared/app-venv/bin/pip install -q -r '$release/backend/requirements.txt'
 /opt/alis-research-worker/shared/app-venv/bin/python -m compileall -q '$release/backend/app' '$release/backend/migrations'
 install -o root -g root -m 644 '$release/deploy/alis-research-worker.service' /etc/systemd/system/alis-research-worker.service
+# Snapshot construction is owned by the database-local worker.  A legacy
+# console worker on this host would race the durable refresh generation.
+systemctl disable --now alis-console-snapshot-worker 2>/dev/null || true
 sed -i 's/^ALIS_BUILD_GIT_SHA=.*/ALIS_BUILD_GIT_SHA=$commit/' /etc/alis/research-worker.env
 grep -q '^ALIS_BUILD_GIT_SHA=$commit\$' /etc/alis/research-worker.env
 grep -Eq '^ALIS_MARKET_DATASET_SOURCE=ssh://[^/]+/opt/alis-db-snapshot/shared/market-datasets$' /etc/alis/research-worker.env
