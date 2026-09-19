@@ -4,3 +4,4 @@ deploy/alis-market-dataset-read text eol=lf
 deploy/*.sh text eol=lf
 deploy/*.service text eol=lf
 deploy/*.timer text eol=lf
+deploy/* text eol=lf
