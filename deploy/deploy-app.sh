@@ -77,8 +77,8 @@ app_ssh "sudo bash -lc 'set -euo pipefail
   systemctl daemon-reload
   systemctl enable --now alis-chain-monitor.timer
   systemctl enable --now alis-alert-worker
-  test "\$(systemctl is-active alis-chain-monitor.timer)" = active
-  test "\$(systemctl is-active alis-alert-worker)" = active
+  test \$(systemctl is-active alis-chain-monitor.timer) = active
+  test \$(systemctl is-active alis-alert-worker) = active
   # The database-local unit is the only supported snapshot writer.  Retire a
   # legacy app-host unit if an older release left it installed.
   systemctl disable --now alis-console-snapshot-worker 2>/dev/null || true
