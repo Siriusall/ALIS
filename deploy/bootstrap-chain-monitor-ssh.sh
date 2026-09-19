@@ -122,7 +122,7 @@ ssh_opts=(
   -F /dev/null
   -o BatchMode=yes
   -o ConnectTimeout=10
-  -o ConnectionAttempts=1
+  -o ConnectionAttempts=3
   -o StrictHostKeyChecking=yes
   -o "UserKnownHostsFile=$known_hosts_source"
   -o GlobalKnownHostsFile=/dev/null
@@ -131,13 +131,33 @@ ssh_opts=(
 )
 
 app_ssh() {
-  ssh "${ssh_opts[@]}" -i "$ALIS_APP_SSH_KEY" "$ALIS_APP_SSH_TARGET" "$@"
+  local attempt=1
+  while true; do
+    if ssh "${ssh_opts[@]}" -i "$ALIS_APP_SSH_KEY" "$ALIS_APP_SSH_TARGET" "$@"; then
+      return 0
+    fi
+    if (( attempt >= 3 )); then
+      return 1
+    fi
+    sleep "$attempt"
+    attempt=$((attempt + 1))
+  done
 }
 
 node_ssh() {
   local target=$1 key=$2
   shift 2
-  ssh "${ssh_opts[@]}" -i "$key" "$target" "$@"
+  local attempt=1
+  while true; do
+    if ssh "${ssh_opts[@]}" -i "$key" "$target" "$@"; then
+      return 0
+    fi
+    if (( attempt >= 3 )); then
+      return 1
+    fi
+    sleep "$attempt"
+    attempt=$((attempt + 1))
+  done
 }
 
 remote_stamp="$(date +%s)-$$"
