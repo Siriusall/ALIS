@@ -40,6 +40,8 @@ def test_chain_monitor_probes_the_snapshot_and_both_research_workers() -> None:
     assert "console_snapshots" in app_command
     assert "alis-db-snapshot-worker" in db_command
     assert "snapshot_health" in db_command
+    assert "sudo -n bash -s" in db_command
+    assert "/etc/alis/db-snapshot-worker.env" in db_command
     assert "alis-control-worker" in research_command
     assert "alis-research-worker" in research_command
 

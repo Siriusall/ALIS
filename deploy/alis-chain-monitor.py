@@ -79,6 +79,12 @@ PY
 def _db_probe() -> str:
     return r'''
 set -eu
+# The monitor SSH key is intentionally restricted to the deployment account.
+# The database worker env contains credentials and is root-readable only, so
+# keep the privileged portion inside a non-interactive sudo root shell rather
+# than weakening the env file permissions or copying secrets to the monitor.
+sudo -n bash -s <<'ALIS_DB_PROBE'
+set -eu
 systemctl is-enabled --quiet alis-db-snapshot-worker
 test "$(systemctl is-active alis-db-snapshot-worker)" = active
 set -a
@@ -95,6 +101,7 @@ print(json.dumps(value, ensure_ascii=False))
 if not value.get("ok"):
     raise SystemExit(1)
 PY
+ALIS_DB_PROBE
 '''
 
 
