@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import timedelta
 from threading import Event, Thread
 
 import pytest
@@ -715,6 +716,30 @@ def test_db_local_snapshot_cannot_be_starved_by_research(monkeypatch):
     monkeypatch.setattr(snapshots, "_control_work_active", lambda **_: False)
     monkeypatch.setattr(snapshots, "_data_ingestion_active", lambda: True)
     assert snapshots._snapshot_build_should_yield("research") is True
+
+
+def test_db_local_snapshot_refreshes_at_business_page_ttl_under_research(monkeypatch):
+    monkeypatch.setenv("ALIS_CONSOLE_SNAPSHOT_BOUNDED_RESEARCH_YIELD", "1")
+    monkeypatch.setattr(snapshots, "optional_network_work_allowed", lambda: True)
+    monkeypatch.setattr(snapshots, "_data_ingestion_active", lambda: False)
+    monkeypatch.setattr(
+        snapshots,
+        "_control_work_active",
+        lambda include_research=True: include_research,
+    )
+    now = snapshots.datetime.now(snapshots.timezone.utc)
+    monkeypatch.setattr(
+        snapshots,
+        "_snapshot_metadata",
+        lambda _: {"generated_at": (now - timedelta(minutes=9)).isoformat()},
+    )
+    assert snapshots._snapshot_build_should_yield("overview") is True
+    monkeypatch.setattr(
+        snapshots,
+        "_snapshot_metadata",
+        lambda _: {"generated_at": (now - timedelta(minutes=11)).isoformat()},
+    )
+    assert snapshots._snapshot_build_should_yield("overview") is False
 
 
 def test_read_discards_invalidated_redis_snapshot_without_recaching_lkg(monkeypatch):

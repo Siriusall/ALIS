@@ -55,9 +55,13 @@ _DEFAULT_TTLS = {
 _FAILURE_RETRY_SECONDS = 15
 _APP_CACHE_TTL_SECONDS = 86400
 _DIAGNOSTIC_CACHE_SECONDS = 300
+# A busy research queue may defer one serial page build, but it must not turn
+# the browser's ten-minute TTL into an hour-long stale window.  Keep the
+# override bounded and default to one normal business-page TTL; the worker
+# still yields immediately to ingestion and live control work.
 _SNAPSHOT_FORCE_REFRESH_SECONDS = max(
-    30 * 60,
-    min(int(os.getenv("ALIS_CONSOLE_SNAPSHOT_FORCE_REFRESH_SECONDS", str(60 * 60))), 24 * 60 * 60),
+    5 * 60,
+    min(int(os.getenv("ALIS_CONSOLE_SNAPSHOT_FORCE_REFRESH_SECONDS", str(10 * 60))), 24 * 60 * 60),
 )
 _DIAGNOSTIC_PAGE_KEYS = frozenset({"overview", "operations", "data"})
 _DB_HEAVY_TASK_TYPES = frozenset({
