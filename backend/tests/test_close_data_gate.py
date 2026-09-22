@@ -492,6 +492,64 @@ def test_auto_simulation_uses_exchange_calendar_for_holidays_and_trade_days(monk
     ) is True
 
 
+def test_late_close_recovery_materializes_prior_session_before_today_close(monkeypatch) -> None:
+    class Connection:
+        def __init__(self, row):
+            self.row = row
+        def execute(self, *_args, **_kwargs):
+            return self
+        def fetchone(self):
+            return self.row
+    class Context:
+        def __init__(self, row):
+            self.connection = Connection(row)
+        def __enter__(self):
+            return self.connection
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(quant_task_runner, "_is_exchange_trade_day", lambda _value: True)
+    monkeypatch.setattr(
+        quant_task_runner,
+        "list_consolidated_trade_dates",
+        lambda: ["2026-09-21", "2026-09-22"],
+    )
+    monkeypatch.setattr(quant_task_runner, "data_conn", lambda: Context({"value": "20260923"}))
+    monkeypatch.setattr(quant_task_runner, "business_conn", lambda: Context(None))
+
+    dates = quant_task_runner._late_close_plan_recovery_dates(
+        datetime(2026, 9, 23, 1, 30), quant_task_runner.dtime(15, 1),
+    )
+
+    assert dates == ["2026-09-21", "2026-09-22"]
+
+
+def test_late_close_recovery_preserves_existing_frozen_plan(monkeypatch) -> None:
+    class Connection:
+        def __init__(self, row):
+            self.row = row
+        def execute(self, *_args, **_kwargs):
+            return self
+        def fetchone(self):
+            return self.row
+    class Context:
+        def __init__(self, row):
+            self.connection = Connection(row)
+        def __enter__(self):
+            return self.connection
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(quant_task_runner, "_is_exchange_trade_day", lambda _value: True)
+    monkeypatch.setattr(quant_task_runner, "list_consolidated_trade_dates", lambda: ["2026-09-22"])
+    monkeypatch.setattr(quant_task_runner, "data_conn", lambda: Context({"value": "20260923"}))
+    monkeypatch.setattr(quant_task_runner, "business_conn", lambda: Context({"status": "planned"}))
+
+    assert quant_task_runner._late_close_plan_recovery_dates(
+        datetime(2026, 9, 23, 1, 30), quant_task_runner.dtime(15, 1),
+    ) == []
+
+
 def test_auto_simulation_rejects_unrecorded_calendar_dates(monkeypatch) -> None:
     class EmptyConnection:
         def execute(self, *_args, **_kwargs):

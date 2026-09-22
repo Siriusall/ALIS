@@ -771,6 +771,44 @@ def _auto_simulation_check_due(now: datetime, close_time: dtime) -> bool:
     return _is_exchange_trade_day(business_now) and business_now.time() >= close_time
 
 
+def _late_close_plan_recovery_dates(now: datetime, close_time: dtime) -> list[str]:
+    """Return the completed prior-session series when its formal plan is missing.
+
+    Close data can finish after midnight.  Waiting for the next day's normal
+    close tick would make the prior session's immutable T+1 plan impossible to
+    create before its execution session.  Recover only when the authoritative
+    exchange calendar proves that today is exactly the next open session and
+    no plan row exists for the completed signal date.  Existing frozen,
+    blocked, executed, or missed rows remain immutable audit evidence.
+    """
+
+    business_now = now.astimezone(_BUSINESS_TZ) if now.tzinfo else now.replace(tzinfo=_BUSINESS_TZ)
+    if business_now.time() >= close_time or not _is_exchange_trade_day(business_now):
+        return []
+    dates = list_consolidated_trade_dates()
+    if not dates:
+        return []
+    latest_signal = _trade_date_key(dates[-1])
+    today = business_now.strftime("%Y%m%d")
+    if len(latest_signal) != 8 or latest_signal >= today:
+        return []
+    with data_conn() as conn:
+        row = conn.execute(
+            "SELECT MIN(cal_date) AS value FROM dc_trade_calendar "
+            "WHERE exchange='SSE' AND is_open=1 AND cal_date>?",
+            (latest_signal,),
+        ).fetchone()
+    if str(dict(row or {}).get("value") or "").replace("-", "")[:8] != today:
+        return []
+    with business_conn() as conn:
+        existing = conn.execute(
+            "SELECT status FROM daily_rebalance_plans "
+            "WHERE trade_date=? ORDER BY version DESC LIMIT 1",
+            (latest_signal,),
+        ).fetchone()
+    return [] if existing else dates
+
+
 def start_auto_simulation_scheduler() -> bool:
     """Start the close-of-day simulator trigger once per process.
 
@@ -800,6 +838,18 @@ def start_auto_simulation_scheduler() -> bool:
                     )
                 from app.services.profit_loop import effective_rebalance_clock
                 close_time = effective_rebalance_clock()
+                late_close_dates = _late_close_plan_recovery_dates(now, close_time)
+                if late_close_dates:
+                    recovery = _materialize_current_plan_and_find_due_context(late_close_dates)
+                    materialization = recovery.get("today_materialization") or {}
+                    logger.info(
+                        "午夜后恢复上一交易日正式计划 signal_date=%s status=%s persisted=%s",
+                        _trade_date_key(late_close_dates[-1]),
+                        materialization.get("status"),
+                        materialization.get("persisted"),
+                    )
+                    _wait_for_auto_simulation_retry(beat)
+                    continue
                 if _auto_simulation_check_due(now, close_time):
                     target, decision_data_ready = _ensure_close_data_ready()
                     dates = list_consolidated_trade_dates()

@@ -1098,6 +1098,11 @@ def _semantic_payload_hash(payload: dict[str, Any]) -> str:
 def _business_metadata(data: dict[str, Any], sections: dict[str, dict[str, Any]]) -> dict[str, Any]:
     dates: list[str] = []
     business_failures: list[str] = []
+    # Coverage contracts such as the exchange calendar intentionally extend
+    # into future sessions.  They describe the known schedule horizon, not
+    # business observations already available to the console.  Never let a
+    # future coverage endpoint become the page's "data as of" date.
+    business_today = datetime.now(timezone(timedelta(hours=8))).strftime("%Y%m%d")
 
     def visit(value: Any, path: str = "") -> None:
         if isinstance(value, dict):
@@ -1105,7 +1110,7 @@ def _business_metadata(data: dict[str, Any], sections: dict[str, dict[str, Any]]
                 child = f"{path}.{key}" if path else key
                 if key in {"trade_date", "latest_trade_date", "data_date", "data_as_of"}:
                     candidate = str(item or "").replace("-", "")[:8]
-                    if len(candidate) == 8 and candidate.isdigit():
+                    if len(candidate) == 8 and candidate.isdigit() and candidate <= business_today:
                         dates.append(candidate)
                 if key == "status" and str(item or "") in {"failed", "partial", "blocked", "unavailable", "error"}:
                     business_failures.append(child)

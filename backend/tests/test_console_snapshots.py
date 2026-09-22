@@ -248,6 +248,22 @@ def test_snapshot_separates_document_and_business_freshness():
     assert "research.status" in metadata["business_issues"]
 
 
+def test_snapshot_business_date_ignores_future_calendar_coverage():
+    metadata = snapshots._business_metadata(
+        {
+            "watermarks": {
+                "items": [
+                    {"asset_key": "snapshot", "latest_trade_date": "20260922"},
+                    {"asset_key": "trade_calendar", "latest_trade_date": "20261231"},
+                ],
+            },
+        },
+        {"watermarks": {"status": "ready"}},
+    )
+
+    assert metadata["data_as_of"] == "20260922"
+
+
 def test_evidence_snapshot_freezes_first_decision_detail_and_verification(monkeypatch):
     from app.api.routes import research
 
