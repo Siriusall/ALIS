@@ -55,6 +55,10 @@ _DEFAULT_TTLS = {
 _FAILURE_RETRY_SECONDS = 15
 _APP_CACHE_TTL_SECONDS = 86400
 _DIAGNOSTIC_CACHE_SECONDS = 300
+_SNAPSHOT_FORCE_REFRESH_SECONDS = max(
+    30 * 60,
+    min(int(os.getenv("ALIS_CONSOLE_SNAPSHOT_FORCE_REFRESH_SECONDS", str(60 * 60))), 24 * 60 * 60),
+)
 _DIAGNOSTIC_PAGE_KEYS = frozenset({"overview", "operations", "data"})
 _DB_HEAVY_TASK_TYPES = frozenset({
     "factor_daily_cycle",
@@ -1722,13 +1726,18 @@ def _snapshot_build_should_yield(page_key: str = "") -> bool:
     # retains absolute priority; other deployment topologies keep yielding.
     if os.getenv("ALIS_CONSOLE_SNAPSHOT_BOUNDED_RESEARCH_YIELD", "0") != "1" or not page_key:
         return True
-    if _control_work_active(include_research=False):
-        return True
     metadata = _snapshot_metadata(page_key) or {}
     generated_at = _parse_timestamp(metadata.get("generated_at"))
-    return generated_at is not None and (
+    if generated_at is None or (
         datetime.now(timezone.utc) - generated_at
-    ).total_seconds() < 1800
+    ).total_seconds() >= _SNAPSHOT_FORCE_REFRESH_SECONDS:
+        # A bounded control/research workload must not turn a stale console
+        # into a permanent outage.  Allow one serial page build once its
+        # maximum staleness is exceeded; ingestion still has absolute priority.
+        return False
+    if _control_work_active(include_research=False):
+        return True
+    return True
 
 
 def run_snapshot_worker_forever(stop_event: Any | None = None) -> None:

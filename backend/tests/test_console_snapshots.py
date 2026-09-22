@@ -711,7 +711,7 @@ def test_db_local_snapshot_cannot_be_starved_by_research(monkeypatch):
     assert snapshots._snapshot_build_should_yield("research") is True
     monkeypatch.setattr(snapshots, "_snapshot_metadata", lambda _: {"generated_at": "2020-01-01T00:00:00Z"})
     monkeypatch.setattr(snapshots, "_control_work_active", lambda **_: True)
-    assert snapshots._snapshot_build_should_yield("research") is True
+    assert snapshots._snapshot_build_should_yield("research") is False
     monkeypatch.setattr(snapshots, "_control_work_active", lambda **_: False)
     monkeypatch.setattr(snapshots, "_data_ingestion_active", lambda: True)
     assert snapshots._snapshot_build_should_yield("research") is True
