@@ -33,7 +33,7 @@ test -n "$data_head"
 sha=$(sha256sum "$bundle" 2>/dev/null | awk '{print $1}' || shasum -a 256 "$bundle" | awk '{print $1}')
 stamp=$(date +%Y%m%d-%H%M%S)
 short=${commit:0:7}
-remote_archive="/tmp/alis-research-${short}.tar.gz"
+remote_archive="/tmp/alis-worker-${short}.tar.gz"
 release="$release_root/${stamp}-${short}"
 ssh_opts=(-o BatchMode=yes -o ConnectTimeout=10 -o ProxyCommand=none)
 if [[ -n ${ALIS_RESEARCH_WORKER_SSH_PROXY_COMMAND:-} ]]; then
@@ -43,36 +43,46 @@ worker_ssh() { ssh "${ssh_opts[@]}" -i "$ALIS_RESEARCH_WORKER_SSH_KEY" "$ALIS_RE
 
 scp -O -q "${ssh_opts[@]}" -i "$ALIS_RESEARCH_WORKER_SSH_KEY" "$bundle" "$ALIS_RESEARCH_WORKER_SSH_TARGET:$remote_archive"
 old_release=$(worker_ssh 'sudo readlink -f /opt/alis-research-worker/backend')
+control_was_active=$(worker_ssh 'systemctl is-active alis-control-worker 2>/dev/null || true')
 worker_was_active=$(worker_ssh 'systemctl is-active alis-research-worker 2>/dev/null || true')
 release_finished=0
 restore_worker_on_error() {
   local exit_code=$?
-  if (( ! release_finished )) && [[ $worker_was_active == active ]]; then
-    worker_ssh 'sudo systemctl start alis-research-worker' || true
+  if (( ! release_finished )); then
+    worker_ssh 'sudo systemctl stop alis-control-worker alis-research-worker 2>/dev/null || true' || true
+    worker_ssh "sudo ln -sfn '$old_release' /opt/alis-research-worker/backend; sudo chown -h alis-research:alis-research /opt/alis-research-worker/backend; sudo systemctl daemon-reload" || true
+    if [[ $control_was_active == active ]]; then
+      worker_ssh 'sudo systemctl restart alis-control-worker' || true
+    fi
+    if [[ $worker_was_active == active ]]; then
+      worker_ssh 'sudo systemctl restart alis-research-worker' || true
+    fi
   fi
   exit "$exit_code"
 }
 trap restore_worker_on_error ERR
 protection_code=$(printf '%s' \
-  'from app.db.store import _conn; scope=_conn(); conn=scope.__enter__(); row=conn.execute("SELECT COUNT(*) AS count FROM evolution_tasks WHERE status=\x27running\x27 AND COALESCE(worker_pool,\x27control\x27)=\x27research\x27").fetchone(); print(int(dict(row).get("count") or 0)); scope.__exit__(None,None,None)' \
+  'from app.db.store import _conn; scope=_conn(); conn=scope.__enter__(); rows=conn.execute("SELECT worker_pool AS pool, COUNT(*) AS count FROM evolution_tasks WHERE status=? GROUP BY worker_pool", ("running",)).fetchall(); counts={str(dict(row).get("pool")): int(dict(row).get("count") or 0) for row in rows}; print("control={0} research={1}".format(counts.get("control", 0), counts.get("research", 0))); scope.__exit__(None,None,None)' \
   | base64 | tr -d '\n')
-research_running=$(worker_ssh "sudo bash -lc 'set -a; . /etc/alis/research-worker.env; set +a; cd /opt/alis-research-worker/backend; echo $protection_code | base64 -d | /opt/alis-research-worker/shared/app-venv/bin/python -'")
-if [[ ! $research_running =~ ^[0-9]+$ ]]; then
-  echo "research_worker_protection_probe_failed; refusing release switch" >&2
+running_counts=$(worker_ssh "sudo bash -lc 'set -a; . /etc/alis/control-worker.env; set +a; cd /opt/alis-research-worker/backend; echo $protection_code | base64 -d | /opt/alis-research-worker/shared/app-venv/bin/python -'")
+if [[ ! $running_counts =~ ^control=[0-9]+\ research=[0-9]+$ ]]; then
+  echo "worker_protection_probe_failed; refusing release switch" >&2
   exit 1
 fi
-if (( research_running > 0 )); then
-  # A controlled software release has priority over resumable research work.
-  # Stop the only research claimant first, then atomically return its tasks to
-  # the queue without changing attempts, checkpoints, results, or governance.
-  worker_ssh 'sudo systemctl stop alis-research-worker'
-  worker_ssh 'test "$(systemctl is-active alis-research-worker 2>/dev/null || true)" != active'
+control_running=${running_counts#control=}; control_running=${control_running%% research=*}
+research_running=${running_counts##* research=}
+if (( control_running > 0 || research_running > 0 )); then
+  # Stop both claimants before returning their leases to the queue.  This
+  # keeps the release switch atomic across the control and research pools.
+  [[ $control_was_active == active ]] && worker_ssh 'sudo systemctl stop alis-control-worker'
+  [[ $worker_was_active == active ]] && worker_ssh 'sudo systemctl stop alis-research-worker'
+  worker_ssh 'test "$(systemctl is-active alis-control-worker 2>/dev/null || true)" != active; test "$(systemctl is-active alis-research-worker 2>/dev/null || true)" != active'
   pause_code=$(printf '%s' \
-    'from datetime import datetime; from zoneinfo import ZoneInfo; from app.db.store import _conn; now=datetime.now(ZoneInfo("Asia/Shanghai")).isoformat(); scope=_conn(); conn=scope.__enter__(); rows=conn.execute("SELECT id FROM evolution_tasks WHERE status=\x27running\x27 AND COALESCE(worker_pool,\x27control\x27)=\x27research\x27 FOR UPDATE").fetchall(); ids=[int(dict(row)["id"]) for row in rows]; [conn.execute("UPDATE evolution_tasks SET status=\x27queued\x27,phase=\x27paused_for_release\x27,message=\x27版本更新优先：研究任务已保留检查点并暂停，Worker 更新后自动恢复\x27,lease_owner=NULL,lease_expires_at=NULL,heartbeat_at=?,next_run_at=?,updated_at=? WHERE id=? AND status=\x27running\x27 AND COALESCE(worker_pool,\x27control\x27)=\x27research\x27",(now,now,now,task_id)) for task_id in ids]; scope.__exit__(None,None,None); print(len(ids))' \
+    'from datetime import datetime; from zoneinfo import ZoneInfo; from app.db.store import _conn; now=datetime.now(ZoneInfo("Asia/Shanghai")).isoformat(); scope=_conn(); conn=scope.__enter__(); rows=conn.execute("SELECT id FROM evolution_tasks WHERE status=? AND COALESCE(worker_pool, ?) IN (?, ?) FOR UPDATE", ("running", "control", "control", "research")).fetchall(); ids=[int(dict(row)["id"]) for row in rows]; sql="UPDATE evolution_tasks SET status=?,phase=?,message=?,lease_owner=NULL,lease_expires_at=NULL,heartbeat_at=?,next_run_at=?,updated_at=? WHERE id=? AND status=? AND COALESCE(worker_pool, ?) IN (?, ?)"; [conn.execute(sql, ("queued", "paused_for_release", "版本更新优先：任务已保留检查点并暂停，双 Worker 更新后自动恢复", now, now, now, task_id, "running", "control", "control", "research")) for task_id in ids]; scope.__exit__(None,None,None); print(len(ids))' \
     | base64 | tr -d '\n')
-  paused_count=$(worker_ssh "sudo bash -lc 'set -a; . /etc/alis/research-worker.env; set +a; cd /opt/alis-research-worker/backend; echo $pause_code | base64 -d | /opt/alis-research-worker/shared/app-venv/bin/python -'")
+  paused_count=$(worker_ssh "sudo bash -lc 'set -a; . /etc/alis/control-worker.env; set +a; cd /opt/alis-research-worker/backend; echo $pause_code | base64 -d | /opt/alis-research-worker/shared/app-venv/bin/python -'")
   [[ $paused_count =~ ^[0-9]+$ ]]
-  echo "research_tasks_paused_for_release=$paused_count"
+  echo "worker_tasks_paused_for_release=$paused_count"
 fi
 
 worker_ssh "sudo bash -s" <<REMOTE
@@ -93,11 +103,14 @@ ln -sfn /opt/alis-research-worker/shared/runtime-cache '$release/backend/.cache'
 /opt/alis-research-worker/shared/app-venv/bin/pip install -q -r '$release/backend/requirements.txt'
 /opt/alis-research-worker/shared/app-venv/bin/python -m compileall -q '$release/backend/app' '$release/backend/migrations'
 install -o root -g root -m 644 '$release/deploy/alis-research-worker.service' /etc/systemd/system/alis-research-worker.service
+install -o root -g root -m 644 '$release/deploy/alis-control-worker.service' /etc/systemd/system/alis-control-worker.service
 # Snapshot construction is owned by the database-local worker.  A legacy
 # console worker on this host would race the durable refresh generation.
 systemctl disable --now alis-console-snapshot-worker 2>/dev/null || true
 sed -i 's/^ALIS_BUILD_GIT_SHA=.*/ALIS_BUILD_GIT_SHA=$commit/' /etc/alis/research-worker.env
 grep -q '^ALIS_BUILD_GIT_SHA=$commit\$' /etc/alis/research-worker.env
+sed -i 's/^ALIS_BUILD_GIT_SHA=.*/ALIS_BUILD_GIT_SHA=$commit/' /etc/alis/control-worker.env
+grep -q '^ALIS_BUILD_GIT_SHA=$commit\$' /etc/alis/control-worker.env
 grep -Eq '^ALIS_MARKET_DATASET_SOURCE=ssh://[^/]+/opt/alis-db-snapshot/shared/market-datasets$' /etc/alis/research-worker.env
 grep -Eq '^ALIS_MARKET_DATASET_ROOT=/var/lib/alis-research-worker/market-datasets$' /etc/alis/research-worker.env
 dataset_key=\$(sed -n 's/^ALIS_MARKET_DATASET_SSH_KEY=//p' /etc/alis/research-worker.env)
@@ -108,13 +121,14 @@ chown -h alis-research:alis-research /opt/alis-research-worker/backend
 systemctl daemon-reload
 REMOTE
 
+worker_ssh "sudo systemctl restart alis-control-worker"
 worker_ssh "sudo systemctl restart alis-research-worker"
-worker_ssh 'test "$(systemctl is-active alis-research-worker)" = active'
+worker_ssh 'test "$(systemctl is-active alis-control-worker)" = active; test "$(systemctl is-active alis-research-worker)" = active'
 worker_ssh "test \"\$(sudo readlink -f /opt/alis-research-worker/backend)\" = '$release/backend'"
-worker_ssh "pid=\$(systemctl show alis-research-worker -p MainPID --value); test \"\$(sudo readlink -f /proc/\$pid/cwd)\" = '$release/backend'"
+worker_ssh "for unit in alis-control-worker alis-research-worker; do pid=\$(systemctl show \$unit -p MainPID --value); test \"\$(sudo readlink -f /proc/\$pid/cwd)\" = '$release/backend'; done"
 
 release_finished=1
 trap - ERR
 echo "release_commit=$commit"
-echo "research_worker_release=$release"
+echo "worker_release=$release"
 echo "status=healthy"

@@ -34,6 +34,7 @@ MIN_SAME_DAY_REFERENCE = 2
 PRICE_TOLERANCE = 0.0011
 VOLUME_RELATIVE_TOLERANCE = 0.002
 AMOUNT_RELATIVE_TOLERANCE = 0.002
+PREVIOUS_CLOSE_CANDIDATE_LIMIT = 32
 
 
 def _now() -> str:
@@ -283,8 +284,9 @@ def _previous_canonical_closes(c: Any, trade_date: str, codes: list[str]) -> dic
         rows = c.execute(
             """SELECT payload_json,source_code FROM dc_tushare_raw_records
                WHERE api_name='fund_daily' AND ts_code=? AND trade_date<?
-               ORDER BY trade_date DESC""",
-            (code, trade_date),
+               ORDER BY trade_date DESC
+               LIMIT ?""",
+            (code, trade_date, PREVIOUS_CLOSE_CANDIDATE_LIMIT),
         ).fetchall()
         for row in rows:
             payload = _payload(dict(row).get("payload_json"))

@@ -255,6 +255,77 @@ def test_network_budget_excludes_optional_research_claims(monkeypatch):
     assert set(evolution.NETWORK_OPTIONAL_TASK_TYPES).issubset(set(params))
 
 
+def test_publication_probe_claim_yields_to_runnable_non_probe_work(monkeypatch):
+    statements = []
+
+    class Result:
+        rowcount = 0
+
+        def fetchone(self):
+            return None
+
+    class Connection:
+        _is_postgres = True
+
+        def execute(self, sql, params=()):
+            statements.append((str(sql), params))
+            return Result()
+
+    @contextmanager
+    def connection():
+        yield Connection()
+
+    monkeypatch.setattr(evolution, "_conn", connection)
+    monkeypatch.setattr(evolution, "_defer_long_research_claims", lambda _now: False)
+    monkeypatch.setattr(evolution, "optional_network_work_allowed", lambda: True)
+
+    assert evolution._claim_next_task() is None
+    claim_sql, params = statements[0]
+    assert "NOT EXISTS" in claim_sql
+    assert "research_data_publication_probe" in claim_sql
+    assert evolution.WORKER_POOL in params
+
+
+def test_publication_probe_ttl_reconciliation_only_cancels_queued_rows(monkeypatch):
+    events = []
+
+    class Result:
+        rowcount = 1
+
+        def fetchall(self):
+            return [{"id": 71}, {"id": 72}]
+
+    class ReadConnection:
+        def execute(self, sql, params=()):
+            events.append(("read", str(sql), params))
+            return Result()
+
+    class WriteConnection:
+        def execute(self, sql, params=()):
+            events.append(("write", str(sql), params))
+            assert "status IN ('queued','retry_wait')" in str(sql)
+            assert "research_data_publication_probe" in str(sql)
+            return Result()
+
+    @contextmanager
+    def read_connection():
+        yield ReadConnection()
+
+    @contextmanager
+    def write_connection():
+        yield WriteConnection()
+
+    monkeypatch.setattr(evolution, "_read_conn", read_connection)
+    monkeypatch.setattr(evolution, "_conn", write_connection)
+
+    result = evolution.reconcile_stale_publication_probes(limit=2, ttl_seconds=1200)
+
+    assert result["count"] == 2
+    assert result["cancelled"] == [71, 72]
+    assert events[0][0] == "read"
+    assert all(event[0] == "write" for event in events[1:])
+
+
 def test_network_budget_rechecks_already_claimed_optional_task(monkeypatch):
     monkeypatch.setattr(evolution, "optional_network_work_allowed", lambda: False)
 

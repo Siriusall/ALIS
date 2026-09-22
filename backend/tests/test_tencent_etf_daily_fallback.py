@@ -229,6 +229,31 @@ def test_fallback_accepts_validated_previous_fallback_close(monkeypatch):
     assert result["rows_written"] == 1
 
 
+def test_previous_canonical_close_query_is_bounded_for_large_history():
+    connection = _db()
+    for index in range(100):
+        _insert_bar(
+            connection,
+            "511880.SH",
+            f"2025{index // 25 + 1:02d}{index % 25 + 1:02d}",
+            {
+                "close": 100 + index,
+                "verification_status": "provider_contract_and_previous_close_cross_checked",
+            },
+            source="tencent_etf_quote_fallback",
+        )
+    connection.commit()
+    statements = []
+    connection.set_trace_callback(statements.append)
+
+    result = fallback._previous_canonical_closes(
+        connection, "20260101", ["511880.SH"]
+    )
+
+    assert result["511880.SH"] > 0
+    assert any("LIMIT 32" in statement.upper() for statement in statements)
+
+
 def test_fallback_uses_sina_only_for_missing_previous_close(monkeypatch):
     connection = _db()
     connection.commit()

@@ -1,0 +1,36 @@
+[Unit]
+Description=ALIS Control Plane Evolution Worker
+After=network-online.target wg-quick@wg0.service
+Wants=network-online.target wg-quick@wg0.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/alis-research-worker/backend
+EnvironmentFile=/etc/alis/control-worker.env
+Environment=PYTHONPATH=/opt/alis-research-worker/backend
+Environment=ALIS_WORKER_POOL=control
+Environment=ALIS_BUSINESS_DB_MAX_CONNECTIONS=2
+Environment=ALIS_DATA_DB_MAX_CONNECTIONS=2
+Environment=DATABASE_CONNECT_TIMEOUT_SECONDS=5
+Environment=DATABASE_STATEMENT_TIMEOUT_MS=30000
+Environment=DATABASE_IDLE_IN_TRANSACTION_TIMEOUT_MS=15000
+Environment=ALIS_WORKER_PROFILE=4gb
+Environment=ALIS_V10_ENV_PARALLELISM=1
+Environment=OMP_NUM_THREADS=1
+Environment=OPENBLAS_NUM_THREADS=1
+Environment=MKL_NUM_THREADS=1
+Environment=NUMEXPR_NUM_THREADS=1
+Environment=VECLIB_MAXIMUM_THREADS=1
+ExecStart=/opt/alis-research-worker/shared/app-venv/bin/python -m app.evolution_worker_main
+Restart=always
+RestartSec=10
+User=alis-research
+NoNewPrivileges=true
+PrivateTmp=true
+MemoryHigh=1200M
+MemoryMax=1600M
+MemorySwapMax=1G
+TasksMax=128
+
+[Install]
+WantedBy=multi-user.target

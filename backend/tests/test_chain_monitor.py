@@ -44,6 +44,9 @@ def test_chain_monitor_probes_the_snapshot_and_both_research_workers() -> None:
     assert "/etc/alis/db-snapshot-worker.env" in db_command
     assert "alis-control-worker" in research_command
     assert "alis-research-worker" in research_command
+    assert "readlink -f /opt/alis-research-worker/backend" in research_command
+    assert "/proc/$pid/cwd" in research_command
+    assert "ALIS_BUILD_GIT_SHA" in research_command
 
 
 def test_chain_monitor_emits_only_on_meaningful_transition(monkeypatch, tmp_path: Path) -> None:

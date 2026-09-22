@@ -99,7 +99,20 @@ MODEL_TRAIN_MAX_SECONDS = max(
 MODEL_WATCHDOG_INTERVAL_SECONDS = max(
     30, min(int(os.getenv("ALIS_MODEL_WATCHDOG_INTERVAL_SECONDS", "60")), 600)
 )
+WORKER_RECONCILIATION_INTERVAL_SECONDS = max(
+    60,
+    min(int(os.getenv("ALIS_WORKER_RECONCILIATION_INTERVAL_SECONDS", "300")), 3600),
+)
+PUBLICATION_PROBE_TTL_SECONDS = max(
+    5 * 60,
+    min(int(os.getenv("EVOLUTION_PUBLICATION_PROBE_TTL_SECONDS", str(20 * 60))), 6 * 60 * 60),
+)
+PUBLICATION_PROBE_RECONCILIATION_LIMIT = max(
+    1,
+    min(int(os.getenv("EVOLUTION_PUBLICATION_PROBE_RECONCILIATION_LIMIT", "200")), 1000),
+)
 _model_watchdog_last_at = 0.0
+_last_worker_reconciliation_at = 0.0
 LEGACY_TASK_RECONCILIATION_VERSION = "alis_evolution_task_reconciliation_v1"
 WORKER_ID = f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
 SYSTEM_AUTONOMY_RECOVERY_POLICY_VERSION = "v3"
@@ -607,6 +620,60 @@ def reconcile_superseded_evolution_tasks(*, limit: int = 200) -> dict[str, Any]:
     }
 
 
+def reconcile_stale_publication_probes(
+    *,
+    limit: int = PUBLICATION_PROBE_RECONCILIATION_LIMIT,
+    ttl_seconds: int = PUBLICATION_PROBE_TTL_SECONDS,
+) -> dict[str, Any]:
+    """Quarantine publication probes that have waited beyond their TTL.
+
+    Probe rows are audit evidence, so they are never deleted.  Only queued and
+    retry_wait rows are eligible; a running probe remains owned by its worker.
+    The read and write are bounded separately so a historical backlog cannot
+    create one large transaction or block normal task claims.
+    """
+    now = _now()
+    cutoff = (now - timedelta(seconds=max(60, int(ttl_seconds)))).isoformat()
+    bounded_limit = max(1, min(int(limit), 1000))
+    with _read_conn() as conn:
+        rows = conn.execute(
+            """SELECT id FROM evolution_tasks
+                 WHERE task_type='research_data_publication_probe'
+                   AND status IN ('queued','retry_wait')
+                   AND created_at < ?
+                 ORDER BY created_at ASC, id ASC LIMIT ?""",
+            (cutoff, bounded_limit),
+        ).fetchall()
+    cancelled: list[int] = []
+    if rows:
+        now_text = now.isoformat()
+        with _conn() as conn:
+            for row in rows:
+                task_id = int(row["id"])
+                cursor = conn.execute(
+                    """UPDATE evolution_tasks
+                          SET status='cancelled', phase='superseded', progress=1,
+                              message=?, error=NULL, stop_requested=1,
+                              finished_at=?, lease_owner=NULL, lease_expires_at=NULL,
+                              heartbeat_at=?, updated_at=?
+                        WHERE id=? AND task_type='research_data_publication_probe'
+                          AND status IN ('queued','retry_wait')""",
+                    (
+                        f"publication probe 超过 {max(1, int(ttl_seconds)) // 60} 分钟 TTL，已保留审计并回收",
+                        now_text, now_text, now_text, task_id,
+                    ),
+                )
+                if int(cursor.rowcount or 0) > 0:
+                    cancelled.append(task_id)
+    return {
+        "ok": True,
+        "schema_version": "alis_publication_probe_ttl_reconciliation_v1",
+        "cutoff": cutoff,
+        "cancelled": cancelled,
+        "count": len(cancelled),
+    }
+
+
 def _historical_contract_incompatibility_reason(task: dict[str, Any]) -> str | None:
     """Recognise retired frozen bindings that cannot become valid by retrying."""
     if str(task.get("task_type") or "") not in {
@@ -636,8 +703,10 @@ def _historical_data_gate_waiting_reason(task: dict[str, Any]) -> str | None:
     """
     if str(task.get("task_type") or "") != "strategy_shadow_cycle":
         return None
-    result = _loads(task.get("result_json"), {})
-    status = str(result.get("status") or "") if isinstance(result, dict) else ""
+    status = str(task.get("result_status") or "")
+    if not status:
+        result = _loads(task.get("result_json"), {})
+        status = str(result.get("status") or "") if isinstance(result, dict) else ""
     evidence = f"{task.get('phase') or ''} {task.get('message') or ''} {task.get('error') or ''}".lower()
     if status == "blocked_by_decision_data" and "oos 永久硬数据未就绪" in evidence:
         return "历史影子任务受当时决策/OOS 数据门阻断，保留等待证据"
@@ -655,7 +724,7 @@ def reconcile_historical_contract_incompatible_tasks(*, limit: int = 200) -> dic
     now = _now().isoformat()
     with _read_conn() as conn:
         rows = conn.execute(
-            """SELECT id,task_type,phase,message,error,result_json
+            """SELECT id,task_type,phase,message,error
                  FROM evolution_tasks
                 WHERE status='failed'
                   AND task_type IN ('strategy_evolution_cycle','strategy_environment_backtest')
@@ -664,30 +733,34 @@ def reconcile_historical_contract_incompatible_tasks(*, limit: int = 200) -> dic
                 ORDER BY id ASC LIMIT ?""",
             (max(1, min(int(limit), 500)),),
         ).fetchall()
-    pending: list[tuple[dict[str, Any], str, dict[str, Any]]] = []
+    pending: list[tuple[dict[str, Any], str]] = []
     for row in rows:
         task = dict(row)
         reason = _historical_contract_incompatibility_reason(task)
         if not reason:
             continue
-        result = _loads(task.get("result_json"), {})
-        result = result if isinstance(result, dict) else {}
-        classification = result.get("classification") if isinstance(result.get("classification"), dict) else {}
-        result.update({
-            "schema_version": "alis_evolution_failure_classification_v1",
-            "classification": {
-                **classification,
-                "category": "historical_contract_incompatible",
-                "retryable": False,
-                "recommended_action": "quarantine_historical_contract",
-                "reconciliation_reason": reason,
-            },
-        })
-        pending.append((task, reason, result))
+        pending.append((task, reason))
     reconciled: list[dict[str, Any]] = []
     if pending:
         with _conn() as conn:
-            for task, reason, result in pending:
+            for task, reason in pending:
+                result_row = conn.execute(
+                    "SELECT result_json FROM evolution_tasks WHERE id=?",
+                    (int(task["id"]),),
+                ).fetchone()
+                result = _loads(dict(result_row or {}).get("result_json"), {})
+                result = result if isinstance(result, dict) else {}
+                classification = result.get("classification") if isinstance(result.get("classification"), dict) else {}
+                result.update({
+                    "schema_version": "alis_evolution_failure_classification_v1",
+                    "classification": {
+                        **classification,
+                        "category": "historical_contract_incompatible",
+                        "retryable": False,
+                        "recommended_action": "quarantine_historical_contract",
+                        "reconciliation_reason": reason,
+                    },
+                })
                 cursor = conn.execute(
                     """UPDATE evolution_tasks
                        SET phase='historical_contract_incompatible',
@@ -717,34 +790,48 @@ def reconcile_historical_data_gate_waiting_tasks(*, limit: int = 200) -> dict[st
     """Mark proven historical data-gate waits without changing task outcomes."""
     now = _now().isoformat()
     with _read_conn() as conn:
+        is_postgres = bool(getattr(conn, "_is_postgres", False))
+        result_column = (
+            ",COALESCE(result_json::jsonb->>'status','') AS result_status"
+            if is_postgres else ",result_json"
+        )
+        result_predicate = (
+            "AND COALESCE(result_json::jsonb->>'status','')='blocked_by_decision_data'"
+            if is_postgres else ""
+        )
         rows = conn.execute(
-            """SELECT id,task_type,phase,message,error,result_json
+            f"""SELECT id,task_type,phase,message,error{result_column}
                  FROM evolution_tasks
                 WHERE status='failed'
                   AND task_type='strategy_shadow_cycle'
                   AND COALESCE(lease_owner,'')=''
                   AND COALESCE(phase,'')<>'historical_data_gate_waiting'
+                  {result_predicate}
                 ORDER BY id ASC LIMIT ?""",
             (max(1, min(int(limit), 500)),),
         ).fetchall()
-    pending: list[tuple[dict[str, Any], str, dict[str, Any]]] = []
+    pending: list[tuple[dict[str, Any], str]] = []
     for row in rows:
         task = dict(row)
         reason = _historical_data_gate_waiting_reason(task)
         if not reason:
             continue
-        result = _loads(task.get("result_json"), {})
-        result = result if isinstance(result, dict) else {}
-        result["historical_reconciliation"] = {
-            "schema_version": "alis_historical_data_gate_reconciliation_v1",
-            "reason": reason,
-            "reconciled_at": now,
-        }
-        pending.append((task, reason, result))
+        pending.append((task, reason))
     reconciled: list[dict[str, Any]] = []
     if pending:
         with _conn() as conn:
-            for task, reason, result in pending:
+            for task, reason in pending:
+                result_row = conn.execute(
+                    "SELECT result_json FROM evolution_tasks WHERE id=?",
+                    (int(task["id"]),),
+                ).fetchone()
+                result = _loads(dict(result_row or {}).get("result_json"), {})
+                result = result if isinstance(result, dict) else {}
+                result["historical_reconciliation"] = {
+                    "schema_version": "alis_historical_data_gate_reconciliation_v1",
+                    "reason": reason,
+                    "reconciled_at": now,
+                }
                 cursor = conn.execute(
                     """UPDATE evolution_tasks
                        SET phase='historical_data_gate_waiting',
@@ -838,7 +925,7 @@ def reconcile_shadow_equity_evidence_gap_tasks(*, limit: int = 200) -> dict[str,
     now = _now().isoformat()
     with _read_conn() as conn:
         rows = conn.execute(
-            """SELECT id,task_type,phase,message,error,result_json
+            """SELECT id,task_type,phase,message,error
                  FROM evolution_tasks
                 WHERE status='failed'
                   AND task_type='strategy_shadow_cycle'
@@ -847,7 +934,7 @@ def reconcile_shadow_equity_evidence_gap_tasks(*, limit: int = 200) -> dict[str,
                 ORDER BY id ASC LIMIT ?""",
             (max(1, min(int(limit), 500)),),
         ).fetchall()
-    pending: list[tuple[dict[str, Any], dict[str, Any], dict[str, Any]]] = []
+    pending: list[tuple[dict[str, Any], dict[str, Any]]] = []
     for row in rows:
         task = dict(row)
         classification = classify_plan_model_training_failure(
@@ -855,19 +942,23 @@ def reconcile_shadow_equity_evidence_gap_tasks(*, limit: int = 200) -> dict[str,
         )
         if str(classification.get("category") or "") != "shadow_equity_evidence_gap":
             continue
-        result = _loads(task.get("result_json"), {})
-        result = result if isinstance(result, dict) else {}
-        result["classification"] = classification
-        result["shadow_evidence_reconciliation"] = {
-            "schema_version": "alis_shadow_equity_evidence_gap_v1",
-            "reason": "相邻权益点未形成；不伪造收益、不重放同日结果",
-            "reconciled_at": now,
-        }
-        pending.append((task, classification, result))
+        pending.append((task, classification))
     reconciled: list[int] = []
     if pending:
         with _conn() as conn:
-            for task, classification, result in pending:
+            for task, classification in pending:
+                result_row = conn.execute(
+                    "SELECT result_json FROM evolution_tasks WHERE id=?",
+                    (int(task["id"]),),
+                ).fetchone()
+                result = _loads(dict(result_row or {}).get("result_json"), {})
+                result = result if isinstance(result, dict) else {}
+                result["classification"] = classification
+                result["shadow_evidence_reconciliation"] = {
+                    "schema_version": "alis_shadow_equity_evidence_gap_v1",
+                    "reason": "相邻权益点未形成；不伪造收益、不重放同日结果",
+                    "reconciled_at": now,
+                }
                 cursor = conn.execute(
                     """UPDATE evolution_tasks
                        SET phase='shadow_equity_evidence_gap',
@@ -915,7 +1006,7 @@ def create_evolution_task(
     with _conn() as conn:
         if conn._is_postgres:
             lock_key = (
-                f"active-task-type:{task_type}"
+                f"active-task-type:{resolved_worker_pool}:{task_type}"
                 if coalesce_active_type
                 else key
             )
@@ -924,9 +1015,10 @@ def create_evolution_task(
             active = conn.execute(
                 """SELECT id FROM evolution_tasks
                    WHERE task_type=?
+                     AND worker_pool=?
                      AND status IN ('queued','running','retry_wait')
                    ORDER BY priority ASC,created_at ASC LIMIT 1""",
-                (str(task_type),),
+                (str(task_type), resolved_worker_pool),
             ).fetchone()
             if active:
                 return _get_evolution_task_summary(int(active["id"])) or {"id": int(active["id"])}
@@ -1379,6 +1471,24 @@ def _claim_next_task() -> dict[str, Any] | None:
         placeholders = ",".join("?" for _ in NETWORK_OPTIONAL_TASK_TYPES)
         claim_exclusions.append(f"AND task_type NOT IN ({placeholders})")
         claim_params.extend(sorted(NETWORK_OPTIONAL_TASK_TYPES))
+    # Publication probes are useful evidence, but a historical probe backlog
+    # must never starve current autonomy/data tasks.  Only claim a probe when
+    # no other runnable task is waiting in the same pool; this is deliberately
+    # a claim-time rule so existing queued rows are handled without a bulk
+    # rewrite or deletion.
+    claim_exclusions.append(
+        """AND (
+            task_type <> 'research_data_publication_probe'
+            OR NOT EXISTS (
+                SELECT 1 FROM evolution_tasks AS other
+                 WHERE other.status IN ('queued','retry_wait')
+                   AND other.worker_pool=?
+                   AND (other.next_run_at IS NULL OR other.next_run_at<=?)
+                   AND other.task_type <> 'research_data_publication_probe'
+            )
+        )"""
+    )
+    claim_params.extend([WORKER_POOL, now.isoformat()])
     network_budget_clause = " ".join(claim_exclusions)
     with _conn() as conn:
         suffix = " FOR UPDATE SKIP LOCKED" if conn._is_postgres else ""
@@ -4089,7 +4199,18 @@ def _run_claimed_task(task: dict[str, Any]) -> dict[str, Any]:
     return _read_evolution_task_for_worker(task_id) or task
 
 
-def run_worker_once() -> dict[str, Any] | None:
+def _run_worker_reconciliations() -> None:
+    """Run historical/watchdog maintenance on a bounded cadence.
+
+    Claiming a task is the latency-sensitive path.  Reconciliation scans are
+    intentionally throttled so a large historical queue cannot turn every
+    poll into repeated database work before the next task is even selected.
+    """
+    global _last_worker_reconciliation_at
+    now_monotonic = time.monotonic()
+    if now_monotonic - _last_worker_reconciliation_at < WORKER_RECONCILIATION_INTERVAL_SECONDS:
+        return
+    _last_worker_reconciliation_at = now_monotonic
     reconciliation = reconcile_superseded_evolution_tasks()
     if reconciliation.get("count"):
         logger.warning(
@@ -4132,6 +4253,17 @@ def run_worker_once() -> dict[str, Any] | None:
             model_stagnation_reconciliation["count"],
             model_stagnation_reconciliation.get("stale_training_runs"),
         )
+    publication_probe_reconciliation = reconcile_stale_publication_probes()
+    if publication_probe_reconciliation.get("count"):
+        logger.warning(
+            "quarantined %s stale publication probe(s): %s",
+            publication_probe_reconciliation["count"],
+            publication_probe_reconciliation.get("cancelled") or [],
+        )
+
+
+def run_worker_once() -> dict[str, Any] | None:
+    _run_worker_reconciliations()
     task = _claim_next_task()
     if not task:
         return None
@@ -4284,6 +4416,7 @@ def start_evolution_scheduler() -> bool:
                         },
                         max_attempts=1,
                         priority=65,
+                        coalesce_active_type=True,
                     )
                 if _is_scheduled_trade_day(now) and now.hour >= 16:
                     create_evolution_task(

@@ -108,11 +108,20 @@ ALIS_DB_PROBE
 def _research_probe() -> str:
     return r'''
 set -eu
+current="$(readlink -f /opt/alis-research-worker/backend)"
+test -n "$current"
+manifest_commit="$(sed -n 's/^git_commit=//p' "$current/.alis-release-manifest")"
+test -n "$manifest_commit"
 for unit in alis-control-worker alis-research-worker; do
   test "$(systemctl is-active "$unit")" = active
   pid="$(systemctl show "$unit" -p MainPID --value)"
   test "$pid" != 0
   test -d "/proc/$pid"
+  test "$(readlink -f "/proc/$pid/cwd")" = "$current"
+  env_file="/etc/alis/${unit#alis-}.env"
+  expected_commit="$(sed -n 's/^ALIS_BUILD_GIT_SHA=//p' "$env_file")"
+  test -n "$expected_commit"
+  test "$expected_commit" = "$manifest_commit"
 done
 if systemctl cat alis-console-snapshot-worker >/dev/null 2>&1; then
   test "$(systemctl is-active alis-console-snapshot-worker 2>/dev/null || true)" != active
