@@ -239,16 +239,17 @@ def test_due_plan_is_not_blocked_by_today_decision_data(monkeypatch):
     assert context["today_materialization"]["status"] == "deferred_until_due_plan_processed"
 
 
-def test_no_due_plan_does_not_materialize_before_decision_data_is_ready(monkeypatch):
+def test_no_due_plan_materializes_latest_completed_signal_after_wall_clock_rollover(monkeypatch):
     monkeypatch.setattr(
         runner,
         "_build_autonomous_plan_context",
         lambda _dates: {"ok": False, "reason": "no_due_formal_plan"},
     )
+    calls = []
     monkeypatch.setattr(
         runner,
         "_materialize_current_plan_and_find_due_context",
-        lambda _dates: (_ for _ in ()).throw(AssertionError("must defer materialization")),
+        lambda dates: calls.append(dates) or {"ok": False, "reason": "no_due_formal_plan"},
     )
 
     context = runner._resolve_autonomous_plan_context(
@@ -257,15 +258,16 @@ def test_no_due_plan_does_not_materialize_before_decision_data_is_ready(monkeypa
     )
 
     assert context["ok"] is False
-    assert context["today_materialization"]["status"] == "deferred_until_decision_data_ready"
+    assert calls == [["2026-08-18"]]
 
 
 def test_today_materializes_when_no_plan_is_due(monkeypatch):
     runner._plan_materialization_retry_after.clear()
     materialization = {"status": "planned", "persisted": True}
+    captured = {}
     monkeypatch.setattr(
         "app.services.profit_loop.materialize_daily_rebalance_plan",
-        lambda: materialization,
+        lambda **kwargs: captured.update(kwargs) or materialization,
     )
     monkeypatch.setattr(
         "app.services.profit_loop.list_pending_daily_rebalance_execution_inputs",
@@ -276,6 +278,7 @@ def test_today_materializes_when_no_plan_is_due(monkeypatch):
 
     assert context["ok"] is False
     assert context["today_materialization"] == materialization
+    assert captured["signal_date"] == "2026-07-27"
 
 
 def test_plan_query_timeout_enters_bounded_cooldown(monkeypatch):
@@ -288,7 +291,7 @@ def test_plan_query_timeout_enters_bounded_cooldown(monkeypatch):
 
     monkeypatch.setattr(
         "app.services.profit_loop.materialize_daily_rebalance_plan",
-        timeout,
+        lambda **_kwargs: timeout(),
     )
     monkeypatch.setattr(
         "app.services.profit_loop.list_pending_daily_rebalance_execution_inputs",

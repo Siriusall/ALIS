@@ -82,8 +82,8 @@ _defensive_execution_refresh_attempts: dict[str, float] = {}
 _plan_materialization_retry_lock = threading.Lock()
 _plan_materialization_retry_after: dict[str, float] = {}
 _PLAN_MATERIALIZATION_TIMEOUT_COOLDOWN_SEC = max(
-    300,
-    min(int(os.getenv("QUANT_PLAN_TIMEOUT_COOLDOWN_SEC", "900")), 3600),
+    30,
+    min(int(os.getenv("QUANT_PLAN_TIMEOUT_COOLDOWN_SEC", "60")), 600),
 )
 
 
@@ -1351,7 +1351,10 @@ def _materialize_current_plan_and_find_due_context(dates: list[str]) -> dict:
         try:
             from app.services.profit_loop import materialize_daily_rebalance_plan
 
-            result = materialize_daily_rebalance_plan()
+            # Generate from the latest completed market session, not from the
+            # wall-clock target after midnight.  This preserves the prior
+            # session's T+1 plan opportunity when close data arrived late.
+            result = materialize_daily_rebalance_plan(signal_date=latest)
             materialization = result if isinstance(result, dict) else {"result": result}
         except Exception as exc:  # noqa: BLE001 - due execution remains independent
             logger.warning("每日正式调仓方案生成失败 trade_date=%s: %s", latest, str(exc)[:200])
@@ -1390,15 +1393,10 @@ def _resolve_autonomous_plan_context(
                 "reason": "due_frozen_plan_has_execution_priority",
             },
         }
-    if not decision_data_ready:
-        return {
-            **due_context,
-            "today_materialization": {
-                "ok": False,
-                "status": "deferred_until_decision_data_ready",
-                "reason": "today_decision_data_not_ready",
-            },
-        }
+    # A current wall-clock target can be one session ahead of the latest
+    # completed close.  Still attempt materialization with the explicit latest
+    # signal date; the portfolio gate will fail closed if that slice is not
+    # complete, while a completed prior close can immediately produce T+1.
     return _materialize_current_plan_and_find_due_context(dates)
 
 

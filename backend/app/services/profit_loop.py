@@ -2439,9 +2439,17 @@ def _persist_contract_validation_failure(
     return get_latest_daily_rebalance_plan(trade_date)
 
 
-def materialize_daily_rebalance_plan(portfolio: dict[str, Any] | None = None) -> dict[str, Any]:
+def materialize_daily_rebalance_plan(
+    portfolio: dict[str, Any] | None = None,
+    *,
+    signal_date: str = "",
+) -> dict[str, Any]:
     """Persist one immutable plan version per materially different daily input."""
-    portfolio = portfolio or build_portfolio_reoptimization()
+    # The wall clock may already be on the next calendar day when the prior
+    # close bundle finishes.  An explicit completed signal date prevents the
+    # planner from selecting tomorrow's still-incomplete target session and
+    # losing the just-published T+1 opportunity.
+    portfolio = portfolio or build_portfolio_reoptimization(signal_date=signal_date)
     decision_gate = portfolio.get("decision_data_gate") if isinstance(portfolio.get("decision_data_gate"), dict) else {}
     trade_date = str(decision_gate.get("target_trade_date") or "")
     if not trade_date:
