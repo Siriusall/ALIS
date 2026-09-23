@@ -110,7 +110,8 @@ def _research_probe() -> str:
 set -eu
 current="$(sudo -n readlink -f /opt/alis-research-worker/backend)"
 test -n "$current"
-manifest_commit="$(sudo -n sed -n 's/^git_commit=//p' "$current/.alis-release-manifest")"
+release_root="$(sudo -n dirname "$current")"
+manifest_commit="$(sudo -n sed -n 's/^git_commit=//p' "$release_root/.alis-release-manifest")"
 test -n "$manifest_commit"
 for unit in alis-control-worker alis-research-worker; do
   test "$(sudo -n systemctl is-active "$unit")" = active
