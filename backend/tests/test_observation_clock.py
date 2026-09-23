@@ -464,6 +464,47 @@ def test_postgres_current_projection_probes_versions_from_accepted_keys(monkeypa
     assert "v.content_hash=p.content_hash" in captured["sql"]
 
 
+def test_postgres_raw_loader_date_bounds_use_accepted_projection_guard(monkeypatch):
+    captured = {}
+
+    class Result:
+        def fetchall(self):
+            return []
+
+    class Connection:
+        _is_postgres = True
+
+        def execute(self, sql, params=()):
+            captured["sql"] = sql
+            captured["params"] = params
+            return Result()
+
+    projection_columns = {"api_name", "record_key", "content_hash", "trade_date"}
+    version_columns = {
+        "api_name", "record_key", "ts_code", "trade_date", "period", "ann_date",
+        "payload_json", "source_code", "economic_available_time", "observed_at",
+        "first_observed_at", "observation_provenance", "content_hash", "created_at", "id",
+    }
+    monkeypatch.setattr(
+        observation_clock,
+        "_table_columns",
+        lambda _connection, table: projection_columns
+        if table == "dc_tushare_raw_records"
+        else version_columns,
+    )
+
+    assert load_raw_record_versions(
+        Connection(),
+        "daily",
+        ts_codes=["000001.SZ"],
+        trade_date_start="20260825",
+        trade_date_end="20260825",
+    ) == []
+    assert "p.ts_code IN (?)" in captured["sql"]
+    assert "p.trade_date>=?" in captured["sql"]
+    assert "p.trade_date<=?" in captured["sql"]
+
+
 def test_raw_loader_does_not_move_an_accepted_hash_between_trade_dates():
     """The accepted projection's session is part of immutable PIT identity."""
 

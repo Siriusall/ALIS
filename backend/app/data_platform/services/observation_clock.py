@@ -311,10 +311,13 @@ def load_raw_record_versions(
     # visible version.  If a small isolated fixture has no projection table,
     # retain the historical latest-observation behaviour.
     projection_columns = _table_columns(c, "dc_tushare_raw_records")
+    accepted_projection_available = {
+        "api_name", "record_key", "content_hash",
+    }.issubset(projection_columns)
     projection_winner_sql = "0"
     projection_filter_sql = ""
     accepted_trade_date_join = ""
-    if {"api_name", "record_key", "content_hash"}.issubset(projection_columns):
+    if accepted_projection_available:
         projection_winner_sql = "1"
         # Do not fall back to another immutable version when the accepted
         # projection is outside a requested PIT cutoff.  That is a real data
