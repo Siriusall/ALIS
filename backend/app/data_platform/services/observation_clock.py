@@ -645,6 +645,7 @@ def load_snapshot_versions(
     trade_date: str = "",
     per_ts_code_limit: int = 0,
     limit: int = 0,
+    payload_fields: tuple[str, ...] = (),
 ) -> list[dict[str, Any]] | None:
     """Read latest immutable normalized snapshot rows under the PIT clock.
 
@@ -720,8 +721,22 @@ def load_snapshot_versions(
         "id,ts_code,trade_date,payload_json,source_code,economic_available_time,"
         "observed_at,first_observed_at,observation_provenance,content_hash,created_at"
     )
+    payload_expression = "v.payload_json"
+    # Exact-date scheduler readiness only consumes a small field set.  On the
+    # PostgreSQL data host, returning each normalized bar's complete JSON body
+    # turns a bounded PIT read into a ClientWrite/network bottleneck.  Keep the
+    # immutable hash and all clock predicates unchanged while projecting only
+    # explicitly requested fields.  Broad research/history callers retain the
+    # full payload contract by leaving ``payload_fields`` empty.
+    if is_postgres and payload_fields and (trade_date or trade_date_start or trade_date_end or cutoff_by_trade_date):
+        fields = tuple(dict.fromkeys(str(field) for field in payload_fields if str(field)))
+        if all(field.replace("_", "").isalnum() for field in fields):
+            pairs = ",".join(
+                f"'{field}',v.payload_json::jsonb->'{field}'" for field in fields
+            )
+            payload_expression = f"jsonb_build_object({pairs})::text AS payload_json"
     qualified_columns = (
-        "v.id,v.ts_code,v.trade_date,v.payload_json,v.source_code,"
+        f"v.id,v.ts_code,v.trade_date,{payload_expression},v.source_code,"
         "v.economic_available_time,v.observed_at,v.first_observed_at,"
         "v.observation_provenance,v.content_hash,v.created_at"
     )

@@ -477,7 +477,15 @@ def _snapshot_data_status(trade_date: str = "") -> tuple[str, dict[str, int]]:
         stock_codes = {str(dict(row).get("ts_code") or "") for row in stock_rows}
         stock_codes.discard("")
         stock_count = len(stock_codes)
-        snapshot_versions = load_snapshot_versions(c, cutoff=cutoff_text, trade_date=target)
+        snapshot_versions = load_snapshot_versions(
+            c,
+            cutoff=cutoff_text,
+            trade_date=target,
+            payload_fields=(
+                "ts_code", "trade_date", "open", "pre_close", "total_mv",
+                "up_limit", "down_limit",
+            ),
+        )
         daily_versions = load_raw_record_versions(
             c, "daily", cutoff=cutoff_text, trade_date_start=target, trade_date_end=target,
         )
