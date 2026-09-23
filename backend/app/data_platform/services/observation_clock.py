@@ -399,6 +399,31 @@ def load_raw_record_versions(
             "ON p.api_name=v.api_name AND p.record_key=v.record_key AND p.content_hash=v.content_hash"
             f"{accepted_trade_date_join}"
         )
+    # Core market readers immediately decode a small, known field set from
+    # payload_json.  On PostgreSQL, returning the complete JSON document for
+    # every accepted row turns an otherwise bounded date query into a
+    # ClientWrite/network bottleneck.  Keep the immutable hash/PIT predicates
+    # unchanged, but project only the market fields when the request is date
+    # bounded.  Unbounded research APIs retain their full payload contract.
+    narrow_core_payload = bool(
+        is_postgres
+        and api_name in {"daily", "daily_basic", "stk_limit", "adj_factor", "fund_daily", "index_daily"}
+        and (trade_date_start or trade_date_end or (trade_date_start and trade_date_end))
+    )
+    payload_expression = "v.payload_json"
+    if narrow_core_payload:
+        core_fields = (
+            "ts_code", "trade_date", "name", "open", "high", "low", "close",
+            "pre_close", "vol", "amount", "pct_chg", "change_pct", "total_mv",
+            "circ_mv", "pe_ttm", "pb", "turnover_rate", "up_limit", "down_limit",
+            "adj_factor", "period", "ann_date",
+        )
+        # Use explicit SQL literals rather than interpolating a caller value;
+        # core_fields above is a fixed source-controlled tuple.
+        pairs = ",".join(
+            f"'{field}',v.payload_json::jsonb->'{field}'" for field in core_fields
+        )
+        payload_expression = f"jsonb_build_object({pairs})::text AS payload_json"
     selected_columns = (
         "id,api_name,record_key,ts_code,trade_date,period,ann_date,payload_json,"
         "source_code,economic_available_time,observed_at,first_observed_at,"
@@ -406,7 +431,7 @@ def load_raw_record_versions(
     )
     qualified_columns = (
         "v.id,v.api_name,v.record_key,v.ts_code,v.trade_date,v.period,v.ann_date,"
-        "v.payload_json,v.source_code,v.economic_available_time,v.observed_at,"
+        f"{payload_expression},v.source_code,v.economic_available_time,v.observed_at,"
         "v.first_observed_at,v.observation_provenance,v.content_hash,v.created_at"
     )
     if bounded_periods:
@@ -468,7 +493,7 @@ def load_raw_record_versions(
         # observed after the cutoff must remain invisible rather than falling
         # back to an older immutable version.
         sql = f"""SELECT v.id,v.api_name,v.record_key,v.ts_code,v.trade_date,
-                        v.period,v.ann_date,v.payload_json,v.source_code,
+                        v.period,v.ann_date,{payload_expression},v.source_code,
                         v.economic_available_time,v.observed_at,
                         v.first_observed_at,v.observation_provenance,v.content_hash,v.created_at
                    FROM {source_sql}
@@ -477,7 +502,7 @@ def load_raw_record_versions(
     else:
         sql = f"""WITH ranked AS (
                  SELECT v.id,v.api_name,v.record_key,v.ts_code,v.trade_date,
-                        v.period,v.ann_date,v.payload_json,v.source_code,
+                        v.period,v.ann_date,{payload_expression},v.source_code,
                         v.economic_available_time,v.observed_at,
                         v.first_observed_at,v.observation_provenance,v.content_hash,v.created_at,
                         ROW_NUMBER() OVER (
