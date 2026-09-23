@@ -549,7 +549,7 @@ def sync_market_dataset(
     )
 
 
-def _read_partition(path: Path, part: dict) -> list[dict]:
+def _read_partition(path: Path, part: dict, *, columns: list[str] | None = None) -> list[dict]:
     import pyarrow.parquet as pq
 
     if (
@@ -564,7 +564,7 @@ def _read_partition(path: Path, part: dict) -> list[dict]:
             parquet.schema_arrow.names,
             require_required=int(part["rows"]) > 0,
         )
-        rows = parquet.read().to_pylist()
+        rows = parquet.read(columns=columns).to_pylist() if columns else parquet.read().to_pylist()
     if len(rows) != part["rows"] or len(_valid_rows(rows)) != len(rows):
         raise DatasetUnavailable("dataset row/clock contract mismatch")
     if any(not part["start"] <= _ymd(row["trade_date"]) <= part["end"] for row in rows):
@@ -618,6 +618,7 @@ class MarketDataset:
         ts_codes=None,
         date_clause: str = "",
         date_params: tuple = (),
+        columns: list[str] | None = None,
     ) -> list[dict]:
         if category not in ("snapshot", *RAW_APIS):
             raise DatasetUnavailable("category outside frozen market contract")
@@ -643,14 +644,20 @@ class MarketDataset:
             if part["category"] != category or part["end"] < lo or part["start"] > hi:
                 continue
             sha = part["sha256"]
-            if sha not in self._cache:
-                self._cache[sha] = _read_partition(
-                    self.root / "objects" / f"{sha}.parquet", part
+            if columns:
+                partition_rows = _read_partition(
+                    self.root / "objects" / f"{sha}.parquet", part, columns=columns
                 )
-                if len(self._cache) > 2:
-                    self._cache.popitem(last=False)
-            self._cache.move_to_end(sha)
-            for row in self._cache[sha]:
+            else:
+                if sha not in self._cache:
+                    self._cache[sha] = _read_partition(
+                        self.root / "objects" / f"{sha}.parquet", part
+                    )
+                    if len(self._cache) > 2:
+                        self._cache.popitem(last=False)
+                self._cache.move_to_end(sha)
+                partition_rows = self._cache[sha]
+            for row in partition_rows:
                 day = row["trade_date"]
                 if not lo <= day <= hi or (lower_exclusive and day == lo):
                     continue

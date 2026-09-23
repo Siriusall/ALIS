@@ -371,10 +371,12 @@ class BacktestDataSource:
             return None
 
     def _versioned_snapshot_rows(self, ymd: str, *, ts_codes: list[str] | None = None,
-                                 date_clause: str = "", date_params: tuple = ()) -> list[dict] | None:
+                                 date_clause: str = "", date_params: tuple = (),
+                                 columns: list[str] | None = None) -> list[dict] | None:
         if self.market_dataset is not None:
             rows = self.market_dataset.rows("snapshot", cutoff=self._as_of_time, ymd=ymd,
-                                            ts_codes=ts_codes, date_clause=date_clause, date_params=date_params)
+                                            ts_codes=ts_codes, date_clause=date_clause,
+                                            date_params=date_params, columns=columns)
             return [self._decode_versioned_snapshot_row(row) for row in rows]
         cache_key = (
             str(self._as_of_time or ""), str(ymd or ""),
@@ -531,7 +533,13 @@ class BacktestDataSource:
             return []
         if self.market_dataset is not None:
             return self._versioned_snapshot_rows("", ts_codes=ts_codes,
-                                                 date_clause=date_clause, date_params=date_params)
+                                                 date_clause=date_clause, date_params=date_params,
+                                                 columns=[
+                                                     "ts_code", "trade_date", "close", "volume",
+                                                     "turnover", "adj_factor", "observed_at",
+                                                     "first_observed_at", "economic_available_time",
+                                                     "created_at", "observation_provenance", "content_hash",
+                                                 ])
         try:
             placeholders = ",".join("?" for _ in ts_codes)
             postgres = _is_postgres()
