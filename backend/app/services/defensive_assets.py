@@ -140,20 +140,35 @@ def _fund_daily_rows(
     if limit and target and not exact_date:
         versioned_parts: list[dict[str, Any]] = []
         versioned: list[dict[str, Any]] | None = versioned_parts
-        for code in codes:
-            rows_for_code = load_raw_record_versions(
+        if bool(getattr(connection, "_is_postgres", False)):
+            # The date window is already bounded and the loader limit is
+            # disabled, so one accepted-hash PIT query cannot starve a code.
+            # Grouping below still applies the per-code history limit.  Keep
+            # the per-code loop for SQLite fixtures and legacy adapters.
+            versioned = load_raw_record_versions(
                 connection,
                 "fund_daily",
                 cutoff=cutoff,
-                ts_codes=[code],
+                ts_codes=codes,
                 trade_date_start=history_start,
                 trade_date_end=target,
                 limit=0,
             )
-            if rows_for_code is None:
-                versioned = None
-                break
-            versioned_parts.extend(rows_for_code)
+        else:
+            for code in codes:
+                rows_for_code = load_raw_record_versions(
+                    connection,
+                    "fund_daily",
+                    cutoff=cutoff,
+                    ts_codes=[code],
+                    trade_date_start=history_start,
+                    trade_date_end=target,
+                    limit=0,
+                )
+                if rows_for_code is None:
+                    versioned = None
+                    break
+                versioned_parts.extend(rows_for_code)
     else:
         versioned = load_raw_record_versions(
             connection,
