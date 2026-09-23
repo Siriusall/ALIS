@@ -403,7 +403,9 @@ class BacktestDataSource:
                 if postgres and ymd:
                     accepted_slice_cte = (
                         "WITH accepted_snapshot AS MATERIALIZED ("
-                        "SELECT ts_code,trade_date,content_hash "
+                        "SELECT ts_code,trade_date,content_hash,name,close,open,high,low,"
+                        "pre_close,change_pct,volume,turnover,total_mv,circ_mv,pe_ttm,pb,"
+                        "turnover_rate,adj_factor "
                         "FROM dc_stock_daily_snapshot WHERE trade_date=?"
                         ") "
                     )
@@ -462,28 +464,20 @@ class BacktestDataSource:
                 # unchanged; this is only a transport/query-shape change.
                 if postgres:
                     sql = f"""{accepted_slice_cte}SELECT v.ts_code,v.trade_date,
-                                snapshot_fields.name,snapshot_fields.close,
-                                snapshot_fields.open AS daily_open,
-                                snapshot_fields.high AS daily_high,
-                                snapshot_fields.low AS daily_low,
-                                snapshot_fields.pre_close AS daily_pre_close,
-                                snapshot_fields.pct_chg AS change_pct,
-                                snapshot_fields.vol AS volume,
-                                snapshot_fields.amount AS turnover,
-                                snapshot_fields.total_mv,snapshot_fields.circ_mv,
-                                snapshot_fields.pe_ttm,snapshot_fields.pb,
-                                snapshot_fields.turnover_rate,snapshot_fields.adj_factor,
+                                p.name,p.close,
+                                p.open AS daily_open,
+                                p.high AS daily_high,
+                                p.low AS daily_low,
+                                p.pre_close AS daily_pre_close,
+                                p.change_pct,
+                                p.volume,p.turnover,
+                                p.total_mv,p.circ_mv,
+                                p.pe_ttm,p.pb,
+                                p.turnover_rate,p.adj_factor,
                                 v.source_code,v.economic_available_time,v.observed_at,
                                 v.first_observed_at,v.observation_provenance,
                                 v.content_hash,v.created_at
                            FROM {version_source_sql}
-                           CROSS JOIN LATERAL jsonb_to_record(v.payload_json::jsonb)
-                             AS snapshot_fields(
-                               name TEXT,close TEXT,open TEXT,high TEXT,low TEXT,
-                               pre_close TEXT,pct_chg TEXT,vol TEXT,amount TEXT,
-                               total_mv TEXT,circ_mv TEXT,pe_ttm TEXT,pb TEXT,
-                               turnover_rate TEXT,adj_factor TEXT
-                             )
                           WHERE {where}
                           ORDER BY v.ts_code,v.trade_date,v.observed_at,v.id"""
                 else:
