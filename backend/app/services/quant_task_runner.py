@@ -167,7 +167,18 @@ def _latest_completed_signal_date(dates: list[str]) -> str:
                         "SELECT pg_advisory_unlock(hashtext(?))",
                         (_PLAN_DATA_IO_LOCK_KEY,),
                     )
-        return normalized.get(ready, "")
+        selected = normalized.get(ready, "")
+        # The live scheduler runs during the current exchange session.  When
+        # that session is already the newest ready slice, the due T+1 plan is
+        # the prior completed signal feeding today's execution window.
+        if ready == _business_now().strftime("%Y%m%d"):
+            prior = [
+                (key, value) for key, value in normalized.items()
+                if key < ready
+            ]
+            if prior:
+                return max(prior, key=lambda item: item[0])[1]
+        return selected
     except Exception as exc:  # noqa: BLE001 - date selection is fail-closed
         logger.warning("读取最新已完成决策日失败，暂不生成正式计划: %s", str(exc)[:200])
         return ""
