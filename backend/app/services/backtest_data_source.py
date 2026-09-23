@@ -474,9 +474,8 @@ class BacktestDataSource:
                                 p.total_mv,p.circ_mv,
                                 p.pe_ttm,p.pb,
                                 p.turnover_rate,p.adj_factor,
-                                v.source_code,v.economic_available_time,v.observed_at,
-                                v.first_observed_at,v.observation_provenance,
-                                v.content_hash,v.created_at
+                                v.economic_available_time,v.observed_at,
+                                v.first_observed_at,v.created_at
                            FROM {version_source_sql}
                           WHERE {where}
                           ORDER BY v.ts_code,v.trade_date,v.observed_at,v.id"""
