@@ -412,12 +412,15 @@ def load_raw_record_versions(
     )
     payload_expression = "v.payload_json"
     if narrow_core_payload:
-        core_fields = (
-            "ts_code", "trade_date", "name", "open", "high", "low", "close",
-            "pre_close", "vol", "amount", "pct_chg", "change_pct", "total_mv",
-            "circ_mv", "pe_ttm", "pb", "turnover_rate", "up_limit", "down_limit",
-            "adj_factor", "period", "ann_date",
-        )
+        core_fields_by_api = {
+            "daily": ("ts_code", "trade_date", "name", "open", "high", "low", "close", "pre_close", "vol", "amount", "pct_chg", "change_pct"),
+            "daily_basic": ("ts_code", "trade_date", "total_mv", "circ_mv", "turnover_rate", "close", "pe_ttm", "pb"),
+            "stk_limit": ("ts_code", "trade_date", "up_limit", "down_limit"),
+            "adj_factor": ("ts_code", "trade_date", "adj_factor"),
+            "fund_daily": ("ts_code", "trade_date", "name", "open", "high", "low", "close", "pre_close", "vol", "amount", "pct_chg", "change_pct"),
+            "index_daily": ("ts_code", "trade_date", "name", "open", "high", "low", "close", "pre_close", "vol", "amount", "pct_chg", "change_pct"),
+        }
+        core_fields = core_fields_by_api.get(api_name, ("ts_code", "trade_date"))
         # Use explicit SQL literals rather than interpolating a caller value;
         # core_fields above is a fixed source-controlled tuple.
         pairs = ",".join(
