@@ -408,7 +408,7 @@ def load_raw_record_versions(
     narrow_core_payload = bool(
         is_postgres
         and api_name in {"daily", "daily_basic", "stk_limit", "adj_factor", "fund_daily", "index_daily"}
-        and (trade_date_start or trade_date_end or (trade_date_start and trade_date_end))
+        and (trade_date_start or trade_date_end or cutoff_by_trade_date)
     )
     payload_expression = "v.payload_json"
     if narrow_core_payload:
