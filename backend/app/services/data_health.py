@@ -181,7 +181,7 @@ def build_data_health_report(limit_days: int = 30) -> dict[str, Any]:
 def _latest_adj_factor_coverage(trade_date: str) -> dict[str, Any]:
     """Read immutable, field-valid adj-factor observations for experiment gating."""
     from app.data_platform.db import _conn
-    from app.data_platform.services.data_center import _strict_adj_factor_codes
+    from app.data_platform.services.data_center import strict_adj_factor_count
 
     with _conn() as conn:
         row = conn.execute(
@@ -190,13 +190,13 @@ def _latest_adj_factor_coverage(trade_date: str) -> dict[str, Any]:
                WHERE api_name='adj_factor' AND trade_date=? AND result_status='success'""",
             (str(trade_date),),
         ).fetchone()
-        valid_codes = _strict_adj_factor_codes(conn, trade_date)
+        valid_count = strict_adj_factor_count(conn, trade_date)
     rows_read = int((dict(row) if row else {}).get("rows_read") or 0)
     return {
         "trade_date": str(trade_date),
-        "rows_read": len(valid_codes),
+        "rows_read": valid_count,
         "request_rows_read": rows_read,
-        "ready": len(valid_codes) >= 500,
+        "ready": valid_count >= 500,
         "minimum_rows": 500,
         "evidence_source": "immutable_observation_versions",
     }

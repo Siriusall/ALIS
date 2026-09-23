@@ -30,6 +30,8 @@ from app.data_platform.tushare_client import (
 from app.data_platform.services.runtime_logs import write_runtime_log
 from app.data_platform.redis_store import set_add as redis_set_add, set_remove as redis_set_remove
 from app.data_platform.services.observation_clock import (
+    _explicit_timestamp_sql,
+    _valid_provenance_sql,
     append_raw_record_version,
     append_snapshot_version,
     economic_available_time,
@@ -6196,6 +6198,65 @@ def _strict_adj_factor_codes(c: Any, trade_date: str) -> set[str]:
         if code and math.isfinite(factor) and factor > 0:
             valid.add(code)
     return valid
+
+
+def strict_adj_factor_count(c: Any, trade_date: str) -> int:
+    """Count valid accepted adj-factor observations without exporting a full slice.
+
+    Formal readiness only needs the cardinality.  Returning thousands of
+    immutable rows to the API host makes a compact exact-date check vulnerable
+    to cross-host ClientWrite stalls, even though PostgreSQL completes the
+    accepted-hash join quickly.  Keep the same immutable evidence predicates
+    and evaluate the field validity on the data host instead.
+    """
+    target = str(trade_date or "").replace("-", "")[:8]
+    if len(target) != 8:
+        return 0
+    if not bool(getattr(c, "_is_postgres", False)):
+        return len(_strict_adj_factor_codes(c, target))
+
+    # A malformed historical JSON payload must remain invalid evidence rather
+    # than aborting the readiness check.  The CASE guards every jsonb cast.
+    payload = (
+        "CASE WHEN pg_input_is_valid(v.payload_json, 'jsonb') "
+        "THEN v.payload_json::jsonb END"
+    )
+    code = f"NULLIF(TRIM(COALESCE({payload}->>'ts_code',v.ts_code,'')), '')"
+    factor = f"NULLIF(TRIM(COALESCE({payload}->>'adj_factor','')), '')"
+    numeric_factor = (
+        f"{factor} ~ '^[+-]?([0-9]+(\\.[0-9]*)?|\\.[0-9]+)([eE][+-]?[0-9]+)?$' "
+        f"AND ({factor})::double precision > 0"
+    )
+    predicates = [
+        "v.api_name=?",
+        "v.trade_date=?",
+        "v.content_hash<>''",
+        _valid_provenance_sql("v.observation_provenance"),
+        _explicit_timestamp_sql("v.observed_at", is_postgres=True),
+        _explicit_timestamp_sql("v.first_observed_at", is_postgres=True),
+        _explicit_timestamp_sql("v.economic_available_time", is_postgres=True),
+        _explicit_timestamp_sql("v.created_at", is_postgres=True),
+    ]
+    sql = f"""
+        WITH accepted AS MATERIALIZED (
+            SELECT api_name,record_key,trade_date,content_hash
+              FROM dc_tushare_raw_records
+             WHERE api_name=? AND trade_date=?
+               AND NULLIF(TRIM(COALESCE(content_hash,'')),'') IS NOT NULL
+        )
+        SELECT COUNT(DISTINCT {code}) AS valid_count
+          FROM accepted p
+          JOIN dc_tushare_raw_record_version v
+            ON v.api_name=p.api_name
+           AND v.record_key=p.record_key
+           AND v.content_hash=p.content_hash
+           AND v.trade_date=p.trade_date
+         WHERE {' AND '.join(predicates)}
+           AND {code} IS NOT NULL
+           AND {numeric_factor}
+    """
+    row = c.execute(sql, ("adj_factor", target, "adj_factor", target)).fetchone()
+    return int((dict(row) if row else {}).get("valid_count") or 0)
 
 
 def _decision_source_observation_ready(source_items: list[dict[str, Any]]) -> bool:

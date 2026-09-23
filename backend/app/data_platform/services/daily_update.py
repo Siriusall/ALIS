@@ -146,9 +146,9 @@ def _benchmark_ready_for_date(c: Any, trade_date: str) -> bool:
 
 def _adj_factor_ready_for_date(c: Any, trade_date: str) -> bool:
     """Require at least 500 valid immutable factor observations."""
-    from app.data_platform.services.data_center import _strict_adj_factor_codes
+    from app.data_platform.services.data_center import strict_adj_factor_count
 
-    return len(_strict_adj_factor_codes(c, trade_date)) >= 500
+    return strict_adj_factor_count(c, trade_date) >= 500
 
 
 def _fund_daily_execution_fields_ready(payload_json: Any) -> bool:
