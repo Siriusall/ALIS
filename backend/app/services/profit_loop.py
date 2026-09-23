@@ -5,6 +5,7 @@ import hashlib
 import math
 import os
 import threading
+from contextlib import contextmanager
 from datetime import datetime, time as dtime, timedelta
 from statistics import mean
 from typing import Any
@@ -12,7 +13,13 @@ from zoneinfo import ZoneInfo
 
 from app.data_platform.db import _conn as data_conn, _read_conn as data_read_conn
 from app.core.a_share_fees import is_exchange_etf, normalize_exchange_etf_ts_code
-from app.db.store import _conn as business_conn, get_account_baseline, get_positions
+from app.db.store import (
+    _conn as business_conn,
+    _is_postgres as business_is_postgres,
+    _read_conn as business_read_conn,
+    get_account_baseline,
+    get_positions,
+)
 from app.data_platform.services.market_calendar import target_trade_date
 from app.services.backtest_data_source import BacktestDataSource
 from app.services.decision_store import list_pool_members
@@ -2439,7 +2446,91 @@ def _persist_contract_validation_failure(
     return get_latest_daily_rebalance_plan(trade_date)
 
 
+_PLAN_MATERIALIZATION_LOCK_NAMESPACE = "alis:daily-plan-materialization:"
+
+
+def _plan_materialization_in_progress(*, signal_date: str, reason: str = "") -> dict[str, Any]:
+    return {
+        "id": None,
+        "trade_date": str(signal_date or ""),
+        "data_as_of_date": str(signal_date or ""),
+        "planned_execute_date": "",
+        "planned_execute_at": "",
+        "version": None,
+        "plan_version": "",
+        "status": "materialization_in_progress",
+        "persisted": False,
+        "is_executed": False,
+        "execution_authorized": False,
+        "retryable": True,
+        "blocked_reason": reason or "同一信号日已有正式计划生成任务运行；本次让路并由调度器自动重试",
+        "proposal": [],
+        "selection_snapshot": {},
+        "decision_contract_schema_version": UNIFIED_DAILY_DECISION_SCHEMA_VERSION,
+        "generation_policy": "正式计划生成跨进程单飞；禁止并发重算同一信号日",
+    }
+
+
+@contextmanager
+def _plan_materialization_lease(signal_date: str):
+    """Serialize the expensive formal-plan build across API and workers.
+
+    The plan is built from the data-platform database but persisted in the
+    business database.  A PostgreSQL session advisory lock on the business
+    database is therefore the smallest cross-process single-flight boundary;
+    SQLite/MySQL test doubles simply run without the production lock.
+    """
+    key = str(signal_date or "").replace("-", "")[:8]
+    if not key or not business_is_postgres():
+        yield True
+        return
+    lock_key = f"{_PLAN_MATERIALIZATION_LOCK_NAMESPACE}{key}"
+    with business_read_conn() as conn:
+        row = conn.execute(
+            "SELECT pg_try_advisory_lock(hashtext(?)) AS acquired",
+            (lock_key,),
+        ).fetchone()
+        acquired = bool(row.get("acquired") if isinstance(row, dict) else row[0])
+        if not acquired:
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            try:
+                conn.execute("SELECT pg_advisory_unlock(hashtext(?))", (lock_key,))
+            except Exception:  # noqa: BLE001 - closing the session releases it
+                pass
+
+
+def _materialize_daily_rebalance_plan_with_portfolio(
+    *, signal_date: str = "",
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    key = str(signal_date or "").replace("-", "")[:8]
+    with _plan_materialization_lease(key) as acquired:
+        if not acquired:
+            return _plan_materialization_in_progress(signal_date=key), {}
+        portfolio = build_portfolio_reoptimization(signal_date=key)
+        return _materialize_daily_rebalance_plan_locked(portfolio, signal_date=key), portfolio
+
+
 def materialize_daily_rebalance_plan(
+    portfolio: dict[str, Any] | None = None,
+    *,
+    signal_date: str = "",
+) -> dict[str, Any]:
+    key = str(signal_date or "").replace("-", "")[:8]
+    if not key and isinstance(portfolio, dict):
+        gate = portfolio.get("decision_data_gate")
+        if isinstance(gate, dict):
+            key = str(gate.get("target_trade_date") or "").replace("-", "")[:8]
+    with _plan_materialization_lease(key) as acquired:
+        if not acquired:
+            return _plan_materialization_in_progress(signal_date=key)
+        return _materialize_daily_rebalance_plan_locked(portfolio, signal_date=key)
+
+
+def _materialize_daily_rebalance_plan_locked(
     portfolio: dict[str, Any] | None = None,
     *,
     signal_date: str = "",
@@ -3713,12 +3804,21 @@ def build_simulation_learning_loop(*, persist: bool = True) -> dict[str, Any]:
 def build_profit_loop(*, persist: bool = True, signal_date: str = "") -> dict[str, Any]:
     attribution = build_return_attribution_loop(persist=persist)
     monitor = build_model_live_monitor(persist=persist)
-    portfolio = (
-        build_portfolio_reoptimization(signal_date=signal_date)
-        if signal_date
-        else build_portfolio_reoptimization()
-    )
-    rebalance_plan = materialize_daily_rebalance_plan(portfolio) if persist else get_latest_daily_rebalance_plan()
+    if persist and signal_date:
+        # The formal plan owner builds the expensive portfolio under the same
+        # cross-process lease as persistence.  This prevents the API scheduler
+        # and control-worker autonomy cycle from doing the same 4k-row PIT
+        # snapshot read concurrently.
+        rebalance_plan, portfolio = _materialize_daily_rebalance_plan_with_portfolio(
+            signal_date=signal_date,
+        )
+    else:
+        portfolio = (
+            build_portfolio_reoptimization(signal_date=signal_date)
+            if signal_date
+            else build_portfolio_reoptimization()
+        )
+        rebalance_plan = materialize_daily_rebalance_plan(portfolio) if persist else get_latest_daily_rebalance_plan()
     portfolio_candles = build_portfolio_candles()
     sells = build_sell_rebalance_diagnostics(monitor, portfolio, persist=persist)
     learning = build_simulation_learning_loop(persist=persist)

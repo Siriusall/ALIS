@@ -452,7 +452,42 @@ class BacktestDataSource:
                 params.append(self._as_of_time)
             where = " AND ".join(predicates)
             if has_accepted_projection:
-                sql = f"""{accepted_slice_cte}SELECT v.ts_code,v.trade_date,v.payload_json,v.source_code,
+                # The immutable payload is a large JSON document.  Returning
+                # it for every symbol made the production planner spend most
+                # of its 30s statement budget in ClientWrite while sending
+                # several thousand rows over the private link.  The snapshot
+                # readers only consume this bounded field set, so decode the
+                # accepted immutable version server-side and return narrow
+                # scalar columns.  The exact accepted content-hash join is
+                # unchanged; this is only a transport/query-shape change.
+                if postgres:
+                    sql = f"""{accepted_slice_cte}SELECT v.ts_code,v.trade_date,
+                                snapshot_fields.name,snapshot_fields.close,
+                                snapshot_fields.open AS daily_open,
+                                snapshot_fields.high AS daily_high,
+                                snapshot_fields.low AS daily_low,
+                                snapshot_fields.pre_close AS daily_pre_close,
+                                snapshot_fields.pct_chg AS change_pct,
+                                snapshot_fields.vol AS volume,
+                                snapshot_fields.amount AS turnover,
+                                snapshot_fields.total_mv,snapshot_fields.circ_mv,
+                                snapshot_fields.pe_ttm,snapshot_fields.pb,
+                                snapshot_fields.turnover_rate,snapshot_fields.adj_factor,
+                                v.source_code,v.economic_available_time,v.observed_at,
+                                v.first_observed_at,v.observation_provenance,
+                                v.content_hash,v.created_at
+                           FROM {version_source_sql}
+                           CROSS JOIN LATERAL jsonb_to_record(v.payload_json::jsonb)
+                             AS snapshot_fields(
+                               name TEXT,close TEXT,open TEXT,high TEXT,low TEXT,
+                               pre_close TEXT,pct_chg TEXT,vol TEXT,amount TEXT,
+                               total_mv TEXT,circ_mv TEXT,pe_ttm TEXT,pb TEXT,
+                               turnover_rate TEXT,adj_factor TEXT
+                             )
+                          WHERE {where}
+                          ORDER BY v.ts_code,v.trade_date,v.observed_at,v.id"""
+                else:
+                    sql = f"""{accepted_slice_cte}SELECT v.ts_code,v.trade_date,v.payload_json,v.source_code,
                                 v.economic_available_time,v.observed_at,v.first_observed_at,
                                 v.observation_provenance,v.content_hash,v.created_at
                            FROM {version_source_sql}
