@@ -95,6 +95,10 @@ def _strict_snapshot_payload_rows(
         trade_date_start=trade_date_start,
         trade_date_end=trade_date_end,
         trade_date=trade_date,
+        payload_fields=(
+            "ts_code", "trade_date", "change_pct", "pct_chg",
+            "turnover", "amount",
+        ),
     )
     if rows is None:
         return None
