@@ -6238,20 +6238,16 @@ def strict_adj_factor_count(c: Any, trade_date: str) -> int:
         _explicit_timestamp_sql("v.created_at", is_postgres=True),
     ]
     sql = f"""
-        WITH accepted AS MATERIALIZED (
-            SELECT api_name,record_key,trade_date,content_hash
-              FROM dc_tushare_raw_records
-             WHERE api_name=? AND trade_date=?
-               AND NULLIF(TRIM(COALESCE(content_hash,'')),'') IS NOT NULL
-        )
         SELECT COUNT(DISTINCT {code}) AS valid_count
-          FROM accepted p
-          JOIN dc_tushare_raw_record_version v
+          FROM dc_tushare_raw_record_version v
+          JOIN dc_tushare_raw_records p
             ON v.api_name=p.api_name
            AND v.record_key=p.record_key
            AND v.content_hash=p.content_hash
            AND v.trade_date=p.trade_date
-         WHERE {' AND '.join(predicates)}
+         WHERE p.api_name=? AND p.trade_date=?
+           AND NULLIF(TRIM(COALESCE(p.content_hash,'')),'') IS NOT NULL
+           AND {' AND '.join(predicates)}
            AND {code} IS NOT NULL
            AND {numeric_factor}
     """
