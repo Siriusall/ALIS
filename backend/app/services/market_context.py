@@ -1117,8 +1117,8 @@ def market_context_as_of(as_of_time: str, *, trade_date: str | None = None) -> d
         rows = [dict(row) for row in c.execute(
             """SELECT trade_date,result_json,model_version,available_time,created_at,updated_at
                  FROM dc_market_context_snapshot
-                WHERE trade_date<=?
-                ORDER BY trade_date DESC""",
+                WHERE trade_date=?
+                LIMIT 1""",
             (requested_trade_date,),
         ).fetchall()]
 
