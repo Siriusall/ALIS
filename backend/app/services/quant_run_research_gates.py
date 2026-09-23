@@ -215,6 +215,7 @@ def apply_dynamic_strategy_gate(
     target_symbols: List[str],
     *,
     as_of_time: str,
+    research_cache: Dict[str, Dict[str, Any]] | None = None,
 ) -> tuple[List[str], List[Dict[str, Any]], Dict[str, Any]]:
     """Apply environment, expectation and valuation gates to admitted names."""
     from app.services.defensive_assets import defensive_allocation_for_state
@@ -267,7 +268,9 @@ def apply_dynamic_strategy_gate(
     items: List[Dict[str, Any]] = []
     for symbol in target_symbols:
         code = normalize_ts_code(symbol)
-        research = build_stock_research(code, persist=True, as_of_time=as_of_time)
+        research = (research_cache or {}).get(code)
+        if not isinstance(research, dict):
+            research = build_stock_research(code, persist=True, as_of_time=as_of_time)
         dimensions = research.get("dimensions") or {}
         research_state = research.get("research_state") or {}
         ready_scores = [

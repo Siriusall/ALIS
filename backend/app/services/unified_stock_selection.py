@@ -57,22 +57,24 @@ def _prepare_research_admission(ts_code: str, *, as_of_time: str) -> tuple[dict[
     from app.services.research_workflow import evaluate_core_pool_eligibility
     from app.services.thesis_store import generate_thesis_for_stock
 
-    prepared = generate_thesis_for_stock(ts_code, as_of_time=as_of_time)
+    prepared = generate_thesis_for_stock(ts_code, as_of_time=as_of_time, include_research=True)
     thesis = prepared.get("item") if isinstance(prepared.get("item"), dict) else None
+    research = prepared.get("research") if isinstance(prepared.get("research"), dict) else None
     eligibility = evaluate_core_pool_eligibility(
         ts_code,
         as_of_time=as_of_time,
         prepared_thesis=thesis,
+        prepared_research=research,
     )
     return prepared, eligibility
 
 
 def _apply_dynamic_admission(
-    symbols: list[str], *, as_of_time: str,
+    symbols: list[str], *, as_of_time: str, research_cache: dict[str, dict[str, Any]] | None = None,
 ) -> tuple[list[str], list[dict[str, Any]], dict[str, Any]]:
     from app.services.quant_run_engine import _apply_dynamic_strategy_gate
 
-    return _apply_dynamic_strategy_gate(symbols, as_of_time=as_of_time)
+    return _apply_dynamic_strategy_gate(symbols, as_of_time=as_of_time, research_cache=research_cache)
 
 
 def _ts_code(symbol: str) -> str:
@@ -191,6 +193,7 @@ def build_unified_stock_selection(
     research_blocks: list[dict[str, Any]] = []
     research_errors: list[dict[str, Any]] = []
     research_evidence: dict[str, dict[str, Any]] = {}
+    research_cache: dict[str, dict[str, Any]] = {}
     research_tiers: dict[str, dict[str, Any]] = {}
     for symbol in research_targets:
         code = _ts_code(symbol)
@@ -198,6 +201,8 @@ def build_unified_stock_selection(
             thesis_preparation, eligibility = _prepare_research_admission(
                 code, as_of_time=cutoff,
             )
+            if isinstance(thesis_preparation.get("research"), dict):
+                research_cache[code] = thesis_preparation["research"]
         except Exception as exc:  # one bad stock must not hide the rest of the cross-section
             error = {
                 "symbol": symbol,
@@ -272,6 +277,7 @@ def build_unified_stock_selection(
     dynamic_admitted, dynamic_blocks, dynamic_gate = _apply_dynamic_admission(
         trading_research_symbols,
         as_of_time=cutoff,
+        research_cache=research_cache,
     )
     dynamic_gate = _freeze_dynamic_gate(dynamic_gate)
     # Preserve a complete point-in-time gate snapshot even when the dynamic

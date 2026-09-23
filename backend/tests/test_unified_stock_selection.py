@@ -128,6 +128,70 @@ def test_holding_research_is_frozen_separately_from_top_k(monkeypatch):
     assert set(result["research_evidence"]) == {"000001", "600000"}
 
 
+def test_empty_dynamic_gate_freezes_restricted_rows_for_every_trading_research_symbol(monkeypatch):
+    monkeypatch.setattr(
+        unified_stock_selection,
+        "resolve_production_strategy_champion",
+        lambda: {"strategy_id": 1, "champion_id": 50, "champion_version": "v50"},
+    )
+    monkeypatch.setattr(
+        unified_stock_selection,
+        "BacktestDataSource",
+        lambda: type("DS", (), {"set_as_of_time": lambda self, value: None})(),
+    )
+    monkeypatch.setattr(
+        unified_stock_selection,
+        "_rank_full_market",
+        lambda **_kwargs: (
+            ["000001"],
+            {
+                "selections": [{"symbol": "000001", "score": 90}],
+                "filter_summary": {"universe": 500},
+            },
+        ),
+    )
+    monkeypatch.setattr(
+        unified_stock_selection,
+        "_prepare_research_admission",
+        lambda code, **_kwargs: (
+            {"ok": True, "research": {"risk": {"eligible": True}}},
+            {
+                "eligible_for_core": True,
+                "gates": [],
+                "thesis_count": 1,
+                "research_dimensions": {},
+                "raw_metrics": {},
+                "valuation": {},
+            },
+        ),
+    )
+    monkeypatch.setattr(
+        unified_stock_selection,
+        "_apply_dynamic_admission",
+        lambda symbols, **kwargs: (
+            [],
+            [{"symbol": symbol, "code": "market_context_pit_unavailable"} for symbol in symbols],
+            {
+                "status": "blocked",
+                "as_of_time": kwargs.get("as_of_time"),
+                "items": [],
+            },
+        ),
+    )
+
+    result = unified_stock_selection.build_unified_stock_selection(signal_date="20260923")
+
+    items = result["selection_contract"]["dynamic_gate"]["items"]
+    assert [item["symbol"] for item in items] == ["000001"]
+    assert items[0]["gate"] == {
+        "admitted": False,
+        "hard_blockers": [],
+        "research_blockers": ["dynamic_gate_unavailable"],
+    }
+    assert result["restricted_symbols"] == ["000001"]
+    assert result["core_symbols"] == []
+
+
 def test_research_cross_section_error_ratio_above_twenty_percent_blocks(monkeypatch):
     monkeypatch.setattr(
         unified_stock_selection,

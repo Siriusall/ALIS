@@ -301,6 +301,7 @@ def review_due_theses(*, limit: int = 100, review_interval_days: int = 30) -> di
 
 def generate_thesis_for_stock(
     ts_code: str, *, force: bool = False, as_of_time: str | None = None,
+    include_research: bool = False,
 ) -> dict[str, Any]:
     """Create or refresh a falsifiable system thesis from authoritative research facts."""
     from app.services.research_engine import build_stock_research
@@ -310,13 +311,14 @@ def generate_thesis_for_stock(
     if as_of_time is not None:
         research_kwargs["as_of_time"] = as_of_time
     research = build_stock_research(code, **research_kwargs)
+    cached = {"research": research} if include_research else {}
     if not research.get("ok"):
-        return {"ok": False, "ts_code": code, "status": "blocked", "reason": research.get("reason") or "research_unavailable"}
+        return {"ok": False, "ts_code": code, "status": "blocked", "reason": research.get("reason") or "research_unavailable", **cached}
     if not research.get("risk", {}).get("eligible"):
-        return {"ok": False, "ts_code": code, "status": "blocked", "reason": "risk_hard_veto", "research": research.get("risk")}
+        return {"ok": False, "ts_code": code, "status": "blocked", "reason": "risk_hard_veto", **cached}
     ready = [key for key, value in (research.get("dimensions") or {}).items() if value.get("status") == "ready"]
     if len(ready) < 3:
-        return {"ok": False, "ts_code": code, "status": "insufficient_evidence", "reason": "fewer_than_three_ready_dimensions", "ready_dimensions": ready}
+        return {"ok": False, "ts_code": code, "status": "insufficient_evidence", "reason": "fewer_than_three_ready_dimensions", "ready_dimensions": ready, **cached}
 
     all_existing = [
         item for item in list_theses(
@@ -338,7 +340,7 @@ def generate_thesis_for_stock(
             review_thesis(int(existing[0]["id"]), as_of_time=as_of_time)
             if as_of_time is not None else review_thesis(int(existing[0]["id"]))
         )
-        return {"ok": True, "ts_code": code, "status": "reviewed_existing", "created": False, "item": reviewed}
+        return {"ok": True, "ts_code": code, "status": "reviewed_existing", "created": False, "item": reviewed, **cached}
 
     metrics = research.get("raw_metrics") or {}
     classification = research.get("research_state", {}).get("classification") or "研究观察"
@@ -358,7 +360,7 @@ def generate_thesis_for_stock(
     add("基准估值情景应保留正安全边际", "valuation_base_upside", minimum=0, warning_min=.1, necessary=False)
     add("增长加速度不应显著转负", "growth_acceleration", minimum=-20, warning_min=-5, necessary=False)
     if not hypotheses:
-        return {"ok": False, "ts_code": code, "status": "insufficient_evidence", "reason": "no_machine_checkable_hypotheses"}
+        return {"ok": False, "ts_code": code, "status": "insufficient_evidence", "reason": "no_machine_checkable_hypotheses", **cached}
 
     dimension_summary = "、".join(f"{key}:{research['dimensions'][key]['score']:.1f}" for key in ready)
     item = create_thesis({
@@ -381,6 +383,7 @@ def generate_thesis_for_stock(
         "item": reviewed,
         "ready_dimensions": ready,
         "evidence_as_of_time": as_of_time,
+        **cached,
     }
 
 

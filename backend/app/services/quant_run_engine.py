@@ -92,11 +92,13 @@ def _apply_research_admission(target_symbols: List[str], *, as_of_time: str | No
 
 def _apply_dynamic_strategy_gate(
     target_symbols: List[str], *, as_of_time: str,
+    research_cache: Dict[str, Dict[str, Any]] | None = None,
 ) -> tuple[List[str], List[Dict[str, Any]], Dict[str, Any]]:
     """Apply P2 environment/expectation/valuation gates to already research-admitted names."""
     return _research_gates.apply_dynamic_strategy_gate(
         target_symbols,
         as_of_time=as_of_time,
+        research_cache=research_cache,
     )
 
 
