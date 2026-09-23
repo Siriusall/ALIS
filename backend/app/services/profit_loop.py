@@ -2470,6 +2470,7 @@ def _persist_contract_validation_failure(
 
 
 _PLAN_MATERIALIZATION_LOCK_NAMESPACE = "alis:daily-plan-materialization:"
+_PLAN_DATA_IO_LOCK_KEY = "alis:daily-plan-data-io"
 
 
 def _plan_materialization_in_progress(*, signal_date: str, reason: str = "") -> dict[str, Any]:
@@ -2520,6 +2521,7 @@ def _plan_materialization_lease(signal_date: str):
         data_conn_scope = data_read_conn()
         data_conn = data_conn_scope.__enter__()
         data_acquired = False
+        data_io_acquired = False
         try:
             if bool(getattr(data_conn, "_is_postgres", False)):
                 data_row = data_conn.execute(
@@ -2534,8 +2536,29 @@ def _plan_materialization_lease(signal_date: str):
             if not data_acquired:
                 yield False
                 return
+            if bool(getattr(data_conn, "_is_postgres", False)):
+                io_row = data_conn.execute(
+                    "SELECT pg_try_advisory_lock(hashtext(?)) AS acquired",
+                    (_PLAN_DATA_IO_LOCK_KEY,),
+                ).fetchone()
+                data_io_acquired = bool(
+                    io_row.get("acquired") if isinstance(io_row, dict) else io_row[0]
+                )
+            else:
+                data_io_acquired = True
+            if not data_io_acquired:
+                yield False
+                return
             yield True
         finally:
+            if data_io_acquired and bool(getattr(data_conn, "_is_postgres", False)):
+                try:
+                    data_conn.execute(
+                        "SELECT pg_advisory_unlock(hashtext(?))",
+                        (_PLAN_DATA_IO_LOCK_KEY,),
+                    )
+                except Exception:  # noqa: BLE001 - closing the session releases it
+                    pass
             if data_acquired and bool(getattr(data_conn, "_is_postgres", False)):
                 try:
                     data_conn.execute("SELECT pg_advisory_unlock(hashtext(?))", (lock_key,))

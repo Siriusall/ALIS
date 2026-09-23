@@ -281,6 +281,31 @@ def test_today_materializes_when_no_plan_is_due(monkeypatch):
     assert captured["signal_date"] == "2026-07-27"
 
 
+def test_materialization_uses_latest_decision_ready_signal_date(monkeypatch):
+    runner._plan_materialization_retry_after.clear()
+    captured = {}
+    monkeypatch.setattr(
+        runner,
+        "_latest_completed_signal_date",
+        lambda dates: "2026-09-22",
+    )
+    monkeypatch.setattr(
+        "app.services.profit_loop.list_pending_daily_rebalance_execution_inputs",
+        lambda: [],
+    )
+    monkeypatch.setattr(
+        "app.services.profit_loop.materialize_daily_rebalance_plan",
+        lambda **kwargs: captured.update(kwargs) or {"status": "planned", "persisted": True},
+    )
+
+    context = runner._materialize_current_plan_and_find_due_context([
+        "2026-09-22", "2026-09-23",
+    ])
+
+    assert context["today_materialization"]["persisted"] is True
+    assert captured["signal_date"] == "2026-09-22"
+
+
 def test_plan_query_timeout_enters_bounded_cooldown(monkeypatch):
     runner._plan_materialization_retry_after.clear()
     calls = {"count": 0}

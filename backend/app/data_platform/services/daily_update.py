@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import threading
+from contextlib import contextmanager
 from datetime import date, datetime, time as dtime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -33,6 +34,48 @@ from app.core.error_evidence import error_evidence
 _lock = threading.Lock()
 _state: dict[str, Any] = {"running": False, "phase": "idle", "message": "等待更新"}
 _scheduler_lock = threading.Lock()
+_PLAN_DATA_IO_LOCK_KEY = "alis:daily-plan-data-io"
+
+
+def _try_acquire_data_plan_io_lock(conn: Any) -> bool:
+    """Join the formal-plan/data-refresh single-flight boundary."""
+    if not bool(getattr(conn, "_is_postgres", False)):
+        return True
+    row = conn.execute(
+        "SELECT pg_try_advisory_lock(hashtext(?)) AS acquired",
+        (_PLAN_DATA_IO_LOCK_KEY,),
+    ).fetchone()
+    return bool(row.get("acquired") if isinstance(row, dict) else row[0])
+
+
+def _release_data_plan_io_lock(conn: Any) -> None:
+    if not bool(getattr(conn, "_is_postgres", False)):
+        return
+    try:
+        conn.execute(
+            "SELECT pg_advisory_unlock(hashtext(?))",
+            (_PLAN_DATA_IO_LOCK_KEY,),
+        )
+    except Exception:  # noqa: BLE001 - closing the session still releases it
+        pass
+
+
+@contextmanager
+def _data_plan_io_lease_on(conn: Any):
+    acquired = _try_acquire_data_plan_io_lock(conn)
+    try:
+        yield acquired
+    finally:
+        if acquired:
+            _release_data_plan_io_lock(conn)
+
+
+@contextmanager
+def _data_plan_io_lease():
+    """Protect raw daily refreshes from the expensive formal-plan read set."""
+    with _read_conn() as conn:
+        with _data_plan_io_lease_on(conn) as acquired:
+            yield acquired
 
 
 def _is_expected_scheduler_wait(exc: BaseException) -> bool:
@@ -568,16 +611,23 @@ def _worker(parent_run_id: int) -> None:
         _set_state(phase="market", message=f"正在更新 {trade_date} 行情和估值", progress=50, trade_date=trade_date)
         with _conn() as c:
             already_ready_date = _latest_decision_ready_trade_date(c)
-        market_result = (
-            {
-                "ok": True,
-                "status": "canonical_slice_already_ready",
-                "trade_date": trade_date,
-                "policy": "skip_redundant_bulk_after_probe_discovery",
-            }
-            if already_ready_date == trade_date
-            else sync_market_bundle(trade_date)
-        )
+        with _data_plan_io_lease() as io_acquired:
+            if not io_acquired:
+                raise DailyUpdateDataBlocked(
+                    f"正式计划正在读取数据，暂缓 {trade_date} 日更行情拉取",
+                    category="formal_plan_materialization_in_progress",
+                    retry_after_seconds=60,
+                )
+            market_result = (
+                {
+                    "ok": True,
+                    "status": "canonical_slice_already_ready",
+                    "trade_date": trade_date,
+                    "policy": "skip_redundant_bulk_after_probe_discovery",
+                }
+                if already_ready_date == trade_date
+                else sync_market_bundle(trade_date)
+            )
         steps.append({"step": "market", "result": market_result})
         with _conn() as c:
             ready_date = _latest_decision_ready_trade_date(c)
@@ -816,8 +866,15 @@ def _worker(parent_run_id: int) -> None:
         # The market updater is successful only after the same strict decision
         # contract used by the executor passes.  A raw fetch/coverage row by
         # itself must never produce a healthy completion.
-        with _read_conn() as c:
-            final_contract = decision_data_contract(trade_date, conn=c)
+        with _data_plan_io_lease() as io_acquired:
+            if not io_acquired:
+                raise DailyUpdateDataBlocked(
+                    f"正式计划正在读取数据，暂缓 {trade_date} 日更合同复核",
+                    category="formal_plan_materialization_in_progress",
+                    retry_after_seconds=60,
+                )
+            with _read_conn() as c:
+                final_contract = decision_data_contract(trade_date, conn=c)
         if not final_contract.get("ok"):
             raise DailyUpdateDataBlocked(
                 str(final_contract.get("reason") or f"{trade_date} 决策数据严格合同未通过"),
@@ -1152,13 +1209,33 @@ def daily_update_status(*, compact: bool = False) -> dict[str, Any]:
             # gate when today's slice is incomplete.  Report only the exact
             # target state; full diagnostics retain the historical lookup.
             if compact:
-                target = target_trade_date(c)
-                state["latest_decision_ready_trade_date"] = (
-                    target if decision_data_contract(target, conn=c).get("ok") else ""
-                )
+                try:
+                    target = target_trade_date(c)
+                except Exception:
+                    target = ""
+                with _data_plan_io_lease_on(c) as io_acquired:
+                    if io_acquired and target:
+                        state["latest_decision_ready_trade_date"] = (
+                            target if decision_data_contract(target, conn=c).get("ok") else ""
+                        )
+                    else:
+                        state["latest_decision_ready_trade_date"] = ""
+                        state["decision_query_deferred"] = True
             else:
-                state["latest_decision_ready_trade_date"] = _latest_decision_ready_trade_date(c)
-                target = target_trade_date(c)
+                try:
+                    target = target_trade_date(c)
+                except Exception:
+                    target = ""
+                with _data_plan_io_lease_on(c) as io_acquired:
+                    if io_acquired:
+                        state["latest_decision_ready_trade_date"] = _latest_decision_ready_trade_date(c)
+                    else:
+                        state["latest_decision_ready_trade_date"] = ""
+                        state["decision_query_deferred"] = True
+            if not target:
+                if compact:
+                    state.pop("steps", None)
+                return state
             probe_rows = c.execute(
                 """SELECT dataset,provider,status,probed_at,next_probe_at,latency_ms
                    FROM dc_market_provider_probe WHERE trade_date=?
@@ -1237,7 +1314,16 @@ def simple_health(*, compact: bool = False) -> dict[str, Any]:
     try:
         with _read_conn() as c:
             target = target_trade_date(c)
-            contract = decision_data_contract(target, conn=c)
+            with _data_plan_io_lease_on(c) as io_acquired:
+                if io_acquired:
+                    contract = decision_data_contract(target, conn=c)
+                    latest_ready = _latest_decision_ready_trade_date(c) if not compact else ""
+                else:
+                    contract = {
+                        "ok": False,
+                        "reason": "formal_plan_materialization_in_progress",
+                    }
+                    latest_ready = ""
             snapshot_count, snapshot_count_estimated = estimated_table_count(c, "dc_stock_daily_snapshot")
             values = {
                 "stock_count": c.execute("SELECT COUNT(*) cnt FROM dc_stock_master").fetchone(),
@@ -1252,7 +1338,7 @@ def simple_health(*, compact: bool = False) -> dict[str, Any]:
                 "latest_decision_ready_trade_date": {
                     "value": (
                         target if contract.get("ok") else ""
-                    ) if compact else _latest_decision_ready_trade_date(c)
+                    ) if compact else latest_ready
                 },
                 "latest_announcement": c.execute("SELECT MAX(publish_time) value FROM dc_announcement_raw").fetchone(),
                 "failed_runs": c.execute("SELECT COUNT(*) cnt FROM data_ingestion_runs WHERE status='failed'").fetchone(),

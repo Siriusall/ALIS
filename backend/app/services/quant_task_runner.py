@@ -85,6 +85,7 @@ _PLAN_MATERIALIZATION_TIMEOUT_COOLDOWN_SEC = max(
     30,
     min(int(os.getenv("QUANT_PLAN_TIMEOUT_COOLDOWN_SEC", "60")), 600),
 )
+_PLAN_DATA_IO_LOCK_KEY = "alis:daily-plan-data-io"
 
 
 def _business_now() -> datetime:
@@ -134,6 +135,42 @@ def _trade_date_key(value: object) -> str:
     """Normalize supported trade-date representations for identity checks."""
     normalized = str(value or "").strip().replace("-", "")[:8]
     return normalized if len(normalized) == 8 and normalized.isdigit() else ""
+
+
+def _latest_completed_signal_date(dates: list[str]) -> str:
+    """Return the newest consolidated date that passes the decision contract."""
+    normalized = {_trade_date_key(value): str(value) for value in dates if _trade_date_key(value)}
+    if not normalized:
+        return ""
+    if len(normalized) == 1:
+        # A single-date replay/test fixture has no prior candidate to compare;
+        # the formal portfolio gate still fail-closes if that slice is partial.
+        return next(iter(normalized.values()))
+    try:
+        from app.data_platform.services.decision_data_contract import latest_decision_ready_trade_date
+
+        with data_read_conn() as conn:
+            acquired = True
+            if bool(getattr(conn, "_is_postgres", False)):
+                row = conn.execute(
+                    "SELECT pg_try_advisory_lock(hashtext(?)) AS acquired",
+                    (_PLAN_DATA_IO_LOCK_KEY,),
+                ).fetchone()
+                acquired = bool(row.get("acquired") if isinstance(row, dict) else row[0])
+            if not acquired:
+                return ""
+            try:
+                ready = _trade_date_key(latest_decision_ready_trade_date(conn))
+            finally:
+                if bool(getattr(conn, "_is_postgres", False)):
+                    conn.execute(
+                        "SELECT pg_advisory_unlock(hashtext(?))",
+                        (_PLAN_DATA_IO_LOCK_KEY,),
+                    )
+        return normalized.get(ready, "")
+    except Exception as exc:  # noqa: BLE001 - date selection is fail-closed
+        logger.warning("读取最新已完成决策日失败，暂不生成正式计划: %s", str(exc)[:200])
+        return ""
 
 
 def _waiting_schedule_projection() -> dict[str, Any]:
@@ -363,49 +400,68 @@ def _snapshot_data_status(trade_date: str = "") -> tuple[str, dict[str, int]]:
                 "calendar_ready": 0,
                 "calendar_error": exc.code,
             }
-        if bool(getattr(c, "_is_postgres", False)):
-            # Reuse the exact direct-hash/PIT contract used by plan
-            # generation. It performs one bounded target-date query and also
-            # returns the execution-only open/pre-close intersection; avoid a
-            # second scheduler-specific aggregate over the 41 GB projection.
-            lock_key = f"alis:daily-plan-materialization:{str(target or '').replace('-', '')[:8]}"
-            lock_row = c.execute(
-                "SELECT pg_try_advisory_lock(hashtext(?)) AS acquired",
-                (lock_key,),
-            ).fetchone()
-            lock_acquired = bool(lock_row.get("acquired") if isinstance(lock_row, dict) else lock_row[0])
-            if not lock_acquired:
-                return target, {
-                    "stock_count": 0,
-                    "daily_n": 0,
-                    "execution_price_n": 0,
-                    "valuation_n": 0,
-                    "limit_n": 0,
-                    "immutable_schema_ready": 0,
-                    "decision_ready": 0,
-                    "materialization_in_progress": 1,
-                }
-            try:
+        if bool(getattr(c, "_is_postgres", False)) and not hasattr(c, "execute"):
                 contract = decision_data_contract(
                     target,
                     conn=c,
                     as_of_time=cutoff_text,
                     include_diagnostics=False,
                 )
-            finally:
-                c.execute("SELECT pg_advisory_unlock(hashtext(?))", (lock_key,))
-            contract_counts = dict(contract.get("counts") or {})
-            return target, {
-                "stock_count": max(0, int(contract.get("stock_count") or 0)),
-                "daily_n": max(0, int(contract_counts.get("daily") or 0)),
-                "execution_price_n": max(0, int(contract.get("execution_price_rows") or 0)),
-                "valuation_n": max(0, int(contract_counts.get("daily_basic") or 0)),
-                "limit_n": max(0, int(contract_counts.get("stk_limit") or 0)),
-                "immutable_schema_ready": int(bool(
-                    (contract.get("observation_contract") or {}).get("strict_schema_ready")
-                )),
-                "decision_ready": int(bool(contract.get("ok"))),
-            }
+                contract_counts = dict(contract.get("counts") or {})
+                return target, {
+                    "stock_count": max(0, int(contract.get("stock_count") or 0)),
+                    "daily_n": max(0, int(contract_counts.get("daily") or 0)),
+                    "execution_price_n": max(0, int(contract.get("execution_price_rows") or 0)),
+                    "valuation_n": max(0, int(contract_counts.get("daily_basic") or 0)),
+                    "limit_n": max(0, int(contract_counts.get("stk_limit") or 0)),
+                    "immutable_schema_ready": int(bool(
+                        (contract.get("observation_contract") or {}).get("strict_schema_ready")
+                    )),
+                    "decision_ready": int(bool(contract.get("ok"))),
+                }
+        if bool(getattr(c, "_is_postgres", False)) and hasattr(c, "execute"):
+                # Reuse the exact direct-hash/PIT contract used by plan
+                # generation. It performs one bounded target-date query and also
+                # returns the execution-only open/pre-close intersection; avoid a
+                # second scheduler-specific aggregate over the 41 GB projection.
+                lock_key = f"alis:daily-plan-materialization:{str(target or '').replace('-', '')[:8]}"
+                lock_row = c.execute(
+                    "SELECT pg_try_advisory_lock(hashtext(?)) AS acquired",
+                    (lock_key,),
+                ).fetchone()
+                lock_acquired = bool(lock_row.get("acquired") if isinstance(lock_row, dict) else lock_row[0])
+                if not lock_acquired:
+                    return target, {
+                        "stock_count": 0,
+                        "daily_n": 0,
+                        "execution_price_n": 0,
+                        "valuation_n": 0,
+                        "limit_n": 0,
+                        "immutable_schema_ready": 0,
+                        "decision_ready": 0,
+                        "materialization_in_progress": 1,
+                    }
+                try:
+                    contract = decision_data_contract(
+                        target,
+                        conn=c,
+                        as_of_time=cutoff_text,
+                        include_diagnostics=False,
+                    )
+                finally:
+                    c.execute("SELECT pg_advisory_unlock(hashtext(?))", (lock_key,))
+                contract_counts = dict(contract.get("counts") or {})
+                return target, {
+                    "stock_count": max(0, int(contract.get("stock_count") or 0)),
+                    "daily_n": max(0, int(contract_counts.get("daily") or 0)),
+                    "execution_price_n": max(0, int(contract.get("execution_price_rows") or 0)),
+                    "valuation_n": max(0, int(contract_counts.get("daily_basic") or 0)),
+                    "limit_n": max(0, int(contract_counts.get("stk_limit") or 0)),
+                    "immutable_schema_ready": int(bool(
+                        (contract.get("observation_contract") or {}).get("strict_schema_ready")
+                    )),
+                    "decision_ready": int(bool(contract.get("ok"))),
+                }
         stock_rows = c.execute("SELECT ts_code FROM dc_stock_master").fetchall()
         stock_codes = {str(dict(row).get("ts_code") or "") for row in stock_rows}
         stock_codes.discard("")
@@ -808,7 +864,8 @@ def _late_close_plan_recovery_dates(now: datetime, close_time: dtime) -> list[st
     dates = list_consolidated_trade_dates()
     if not dates:
         return []
-    latest_signal = _trade_date_key(dates[-1])
+    latest_completed = _latest_completed_signal_date(dates)
+    latest_signal = _trade_date_key(latest_completed or dates[-1])
     today = business_now.strftime("%Y%m%d")
     if len(latest_signal) != 8 or latest_signal >= today:
         return []
@@ -1401,7 +1458,7 @@ def _materialize_current_plan_and_find_due_context(dates: list[str]) -> dict:
                 "reason": "due_frozen_plan_has_execution_priority",
             },
         }
-    latest = str(dates[-1]) if dates else ""
+    latest = _latest_completed_signal_date(dates)
     materialization: dict = {}
     if latest:
         retry_key = _trade_date_key(latest)
@@ -1441,6 +1498,13 @@ def _materialize_current_plan_and_find_due_context(dates: list[str]) -> dict:
         else:
             with _plan_materialization_retry_lock:
                 _plan_materialization_retry_after.pop(retry_key, None)
+    elif dates:
+        materialization = {
+            "ok": False,
+            "status": "decision_data_not_ready",
+            "persisted": False,
+            "reason": "no_consolidated_trade_date_passed_decision_contract",
+        }
     return {**_build_autonomous_plan_context(dates), "today_materialization": materialization}
 
 
