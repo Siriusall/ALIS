@@ -2517,9 +2517,31 @@ def _plan_materialization_lease(signal_date: str):
         if not acquired:
             yield False
             return
+        data_conn_scope = data_read_conn()
+        data_conn = data_conn_scope.__enter__()
+        data_acquired = False
         try:
+            if bool(getattr(data_conn, "_is_postgres", False)):
+                data_row = data_conn.execute(
+                    "SELECT pg_try_advisory_lock(hashtext(?)) AS acquired",
+                    (lock_key,),
+                ).fetchone()
+                data_acquired = bool(
+                    data_row.get("acquired") if isinstance(data_row, dict) else data_row[0]
+                )
+            else:
+                data_acquired = True
+            if not data_acquired:
+                yield False
+                return
             yield True
         finally:
+            if data_acquired and bool(getattr(data_conn, "_is_postgres", False)):
+                try:
+                    data_conn.execute("SELECT pg_advisory_unlock(hashtext(?))", (lock_key,))
+                except Exception:  # noqa: BLE001 - closing the session releases it
+                    pass
+            data_conn_scope.__exit__(None, None, None)
             try:
                 conn.execute("SELECT pg_advisory_unlock(hashtext(?))", (lock_key,))
             except Exception:  # noqa: BLE001 - closing the session releases it
