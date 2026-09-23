@@ -799,10 +799,33 @@ def _position_returns(
         load_snapshot_versions,
     )
     with data_conn() as c:
+        # Bound the immutable PIT scan to the requested history window.  A
+        # trade-date upper bound alone makes PostgreSQL walk every historical
+        # revision for the selected symbols before the per-code window can be
+        # applied; on the production snapshot this needlessly touches GBs of
+        # rows and can hit the 30s statement timeout.
+        trade_date_start = ""
+        if end_date:
+            start_row = c.execute(
+                f"""SELECT MIN(trade_date) AS start_date
+                      FROM (
+                            SELECT trade_date
+                              FROM dc_stock_daily_snapshot
+                             WHERE ts_code IN ({placeholders})
+                               AND trade_date<=?
+                             GROUP BY trade_date
+                             ORDER BY trade_date DESC
+                             LIMIT ?
+                           ) bounded_dates""",
+                tuple(symbol_by_code) + (end_date, history_limit),
+            ).fetchone()
+            if start_row:
+                trade_date_start = str(dict(start_row).get("start_date") or "")
         versioned = load_snapshot_versions(
             c,
             cutoff=cutoff,
             ts_codes=list(symbol_by_code),
+            trade_date_start=trade_date_start,
             trade_date_end=end_date,
             # A global result cap lets the first dense symbol consume the
             # entire window and leaves the remaining requested series empty.
