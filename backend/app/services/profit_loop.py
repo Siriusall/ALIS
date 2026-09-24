@@ -317,24 +317,6 @@ def _ensure_tables_once() -> None:
             order_json TEXT NOT NULL DEFAULT '{}',
             PRIMARY KEY(plan_id, order_index)
         )""")
-        # One-time compatibility backfill.  It runs only for plans missing a
-        # projection; all subsequent scheduler and execution reads are narrow.
-        missing = c.execute(
-            """SELECT p.id,p.proposal_json,p.input_hash
-                 FROM daily_rebalance_plans p
-                WHERE NOT EXISTS (
-                    SELECT 1 FROM daily_rebalance_plan_projection x WHERE x.plan_id=p.id
-                )
-                ORDER BY p.id DESC LIMIT 20"""
-        ).fetchall()
-        for row in missing:
-            item = dict(row)
-            try:
-                contract = json.loads(item.get("proposal_json") or "{}")
-            except (TypeError, json.JSONDecodeError):
-                contract = {}
-            if isinstance(contract, dict):
-                _persist_plan_projection(c, int(item.get("id") or 0), contract, str(item.get("input_hash") or ""))
 
 
 def _persist_plan_projection(conn: Any, plan_id: int, contract: dict[str, Any], input_hash: str = "") -> None:
