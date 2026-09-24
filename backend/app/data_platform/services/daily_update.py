@@ -128,6 +128,13 @@ def _latest_usable_snapshot_date(c: Any) -> str:
 
 
 def _latest_decision_ready_trade_date(c: Any) -> str:
+    # This helper is also called from the mutable daily-update worker
+    # connection. The strict PIT contract can scan large raw JSON tables and
+    # may hit statement_timeout; never let that bounded read abort the worker
+    # transaction. Re-enter through an isolated autocommit reader.
+    if not bool(getattr(c, "_autocommit_read_only", False)):
+        with _read_conn() as read_conn:
+            return latest_decision_ready_trade_date(read_conn)
     return latest_decision_ready_trade_date(c)
 
 
