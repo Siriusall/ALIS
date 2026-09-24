@@ -3342,7 +3342,7 @@ def list_pending_daily_rebalance_execution_inputs() -> list[dict[str, Any]]:
         legacy_contracts: dict[int, dict[str, Any]] = {}
         try:
             projection_rows = c.execute(
-                f"""SELECT p.id,p.schema_version,p.target_symbols_json,p.target_weights_json,
+                    f"""SELECT p.plan_id AS id,p.schema_version,p.target_symbols_json,p.target_weights_json,
                          p.decision_manifest_json,p.risk_budget_json,p.selection_snapshot_json,
                          p.execution_authorized,o.order_index,o.order_json
                     FROM daily_rebalance_plan_projection p
@@ -3355,6 +3355,12 @@ def list_pending_daily_rebalance_execution_inputs() -> list[dict[str, Any]]:
             # Isolated legacy fixtures may not have the projection tables.
             # Production PostgreSQL creates them in _ensure_tables_once and
             # therefore never takes this compatibility path.
+            # A failed projection query aborts a PostgreSQL transaction; reset
+            # it before attempting the legacy fallback on the same connection.
+            try:
+                c.rollback()
+            except Exception:
+                pass
             projection_rows = []
             legacy_rows = c.execute(
                 f"SELECT id,proposal_json FROM daily_rebalance_plans WHERE id IN ({placeholders})",
