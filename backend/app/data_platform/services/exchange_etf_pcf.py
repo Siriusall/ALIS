@@ -207,34 +207,16 @@ def _save_pcf(result: dict[str, Any]) -> int:
 
 
 def _etf_universe(trade_date: str) -> list[tuple[str, str]]:
-    with _conn() as c:
-        rows = c.execute("""SELECT ts_code,payload_json FROM dc_tushare_raw_records
-                            WHERE api_name='fund_basic' ORDER BY ts_code""").fetchall()
-    tracked = set(tracked_etf_codes())
-    universe: list[tuple[str, str]] = []
-    for row in rows:
-        item = dict(row)
-        payload = item.get("payload_json") or {}
-        if isinstance(payload, str):
-            try:
-                payload = json.loads(payload)
-            except json.JSONDecodeError:
-                payload = {}
-        code = str(item.get("ts_code") or payload.get("ts_code") or "")
-        if code[:6] not in tracked:
-            continue
-        if "ETF" not in str(payload.get("name") or "").upper() or not code.endswith((".SH", ".SZ")):
-            continue
-        if str(payload.get("list_date") or "") > trade_date or (payload.get("delist_date") and str(payload["delist_date"]) < trade_date):
-            continue
-        universe.append((code[:6], "SSE" if code.endswith(".SH") else "SZSE"))
-    # Keep a deterministic fallback even before fund_basic has been seeded;
-    # these codes are an explicit ALIS contract, not a guessed fund universe.
-    found = {code for code, _ in universe}
-    for code in tracked_etf_codes():
-        if code not in found:
-            universe.append((code, "SSE" if code.startswith(("5", "6")) else "SZSE"))
-    return sorted(universe)
+    # The PCF universe is an explicit, bounded ALIS asset contract.  Do not
+    # pull fund_basic.payload_json across the application/data-platform link;
+    # the database-local publisher may use that raw evidence when refreshing
+    # the Parquet dataset, while this execution-side fallback only needs the
+    # tracked codes and exchange routing.
+    del trade_date
+    return sorted(
+        (code, "SSE" if code.startswith(("5", "6")) else "SZSE")
+        for code in tracked_etf_codes()
+    )
 
 
 def sync_exchange_etf_pcf(trade_date: str, *, limit_funds: int = 0) -> dict[str, Any]:
