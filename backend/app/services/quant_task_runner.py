@@ -431,48 +431,17 @@ def _snapshot_data_status(trade_date: str = "") -> tuple[str, dict[str, int]]:
                     "decision_ready": int(bool(contract.get("ok"))),
                 }
         if bool(getattr(c, "_is_postgres", False)) and hasattr(c, "execute"):
-                # Reuse the exact direct-hash/PIT contract used by plan
-                # generation. It performs one bounded target-date query and also
-                # returns the execution-only open/pre-close intersection; avoid a
-                # second scheduler-specific aggregate over the 41 GB projection.
-                lock_key = f"alis:daily-plan-materialization:{str(target or '').replace('-', '')[:8]}"
-                lock_row = c.execute(
-                    "SELECT pg_try_advisory_lock(hashtext(?)) AS acquired",
-                    (lock_key,),
-                ).fetchone()
-                lock_acquired = bool(lock_row.get("acquired") if isinstance(lock_row, dict) else lock_row[0])
-                if not lock_acquired:
-                    return target, {
-                        "stock_count": 0,
-                        "daily_n": 0,
-                        "execution_price_n": 0,
-                        "valuation_n": 0,
-                        "limit_n": 0,
-                        "immutable_schema_ready": 0,
-                        "decision_ready": 0,
-                        "materialization_in_progress": 1,
-                    }
-                try:
-                    contract = decision_data_contract(
-                        target,
-                        conn=c,
-                        as_of_time=cutoff_text,
-                        include_diagnostics=False,
-                    )
-                finally:
-                    # A statement timeout aborts the current PostgreSQL
-                    # transaction. Roll it back before releasing the session
-                    # advisory lock; otherwise the unlock itself fails with
-                    # ``current transaction is aborted`` and poisons the next
-                    # scheduler poll on the same connection.
-                    try:
-                        c.rollback()
-                    except Exception:
-                        pass
-                    try:
-                        c.execute("SELECT pg_advisory_unlock(hashtext(?))", (lock_key,))
-                    except Exception:
-                        pass
+                # Do not bind the strict PIT contract to the scheduler's
+                # metadata connection. Its raw-evidence SQL can hit the
+                # bounded statement timeout on the large data platform; an
+                # independent autocommit reader then gets discarded cleanly
+                # instead of poisoning the scheduler transaction or its
+                # advisory lock cleanup path.
+                contract = decision_data_contract(
+                    target,
+                    as_of_time=cutoff_text,
+                    include_diagnostics=False,
+                )
                 contract_counts = dict(contract.get("counts") or {})
                 return target, {
                     "stock_count": max(0, int(contract.get("stock_count") or 0)),
