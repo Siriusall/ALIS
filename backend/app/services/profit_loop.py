@@ -843,6 +843,10 @@ def _position_returns(
                 # entire window and leaves the remaining requested series empty.
                 # Keep the historical bound independently for every security.
                 per_ts_code_limit=history_limit,
+                # Position returns only consume change_pct.  Projecting the
+                # single field avoids transferring the full immutable payload
+                # for every historical bar during formal plan generation.
+                payload_fields=("change_pct",),
             )
         except Exception as exc:
             raise RuntimeError(f"position_returns_snapshot_versions: {exc}") from exc
