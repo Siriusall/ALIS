@@ -545,6 +545,18 @@ def test_missing_market_context_has_its_own_formal_plan_block_status():
     assert "点时证据" in reason
 
 
+def test_contract_rebuild_flag_is_explicit_and_only_applies_to_contract_block():
+    assert profit_loop._controlled_rebuild_allowed(
+        "blocked_by_contract_validation", rebuild_blocked=True,
+    ) is True
+    assert profit_loop._controlled_rebuild_allowed(
+        "blocked_by_contract_validation", rebuild_blocked=False,
+    ) is False
+    assert profit_loop._controlled_rebuild_allowed(
+        "blocked_by_execution_recovery", rebuild_blocked=True,
+    ) is False
+
+
 def test_sell_diagnostics_do_not_write_cost_price_fallback_as_zero_return(monkeypatch):
     monkeypatch.setattr(
         profit_loop,

@@ -2700,10 +2700,20 @@ def _materialize_daily_rebalance_plan_with_portfolio(
         return _materialize_daily_rebalance_plan_locked(portfolio, signal_date=key), portfolio
 
 
+def _controlled_rebuild_allowed(status: str, *, rebuild_blocked: bool) -> bool:
+    """Allow only an explicit rebuild of a contract-invalidated candidate.
+
+    The original row remains immutable evidence.  Execution-recovery and
+    other operational blocks must never be bypassed by a materialization retry.
+    """
+    return bool(rebuild_blocked) and str(status or "") == "blocked_by_contract_validation"
+
+
 def materialize_daily_rebalance_plan(
     portfolio: dict[str, Any] | None = None,
     *,
     signal_date: str = "",
+    rebuild_blocked: bool = False,
 ) -> dict[str, Any]:
     key = str(signal_date or "").replace("-", "")[:8]
     if not key and isinstance(portfolio, dict):
@@ -2713,13 +2723,18 @@ def materialize_daily_rebalance_plan(
     with _plan_materialization_lease(key) as acquired:
         if not acquired:
             return _plan_materialization_in_progress(signal_date=key)
-        return _materialize_daily_rebalance_plan_locked(portfolio, signal_date=key)
+        return _materialize_daily_rebalance_plan_locked(
+            portfolio,
+            signal_date=key,
+            rebuild_blocked=rebuild_blocked,
+        )
 
 
 def _materialize_daily_rebalance_plan_locked(
     portfolio: dict[str, Any] | None = None,
     *,
     signal_date: str = "",
+    rebuild_blocked: bool = False,
 ) -> dict[str, Any]:
     """Persist one immutable plan version per materially different daily input."""
     # The wall clock may already be on the next calendar day when the prior
@@ -2799,6 +2814,10 @@ def _materialize_daily_rebalance_plan_locked(
             latest_same_day_query += " FOR UPDATE"
         latest_same_day = c.execute(latest_same_day_query, (trade_date,)).fetchone()
     latest_same_day_status = str(dict(latest_same_day or {}).get("status") or "")
+    controlled_rebuild = _controlled_rebuild_allowed(
+        latest_same_day_status,
+        rebuild_blocked=rebuild_blocked,
+    )
     if latest_same_day_status == "planned":
         frozen_plan = get_latest_daily_rebalance_plan(trade_date)
         frozen_plan["generation_policy"] = (
@@ -2818,7 +2837,7 @@ def _materialize_daily_rebalance_plan_locked(
         "blocked_by_optimizer",
         "blocked_by_execution_checks",
         "blocked_by_execution_recovery",
-    }:
+    } and not controlled_rebuild:
         blocked_plan = get_latest_daily_rebalance_plan(trade_date)
         blocked_plan["generation_policy"] = (
             "同一信号日已有不可执行合同；保留原始证据且禁止重复生成，"
@@ -2919,7 +2938,11 @@ def _materialize_daily_rebalance_plan_locked(
         "release_id": row.get("release_id"),
         "selection_snapshot": contract.get("selection_snapshot") or {},
         "decision_contract_schema_version": contract.get("schema_version"),
-        "generation_policy": "仅在最新交易日决策数据门通过后生成可执行版本；未通过时保留不可执行预览",
+        "generation_policy": (
+            "受控合同重建：保留旧阻断版本作为审计证据，创建新的同信号日版本"
+            if controlled_rebuild
+            else "仅在最新交易日决策数据门通过后生成可执行版本；未通过时保留不可执行预览"
+        ),
         "execution_policy": (
             f"执行日{effective_rebalance_clock().strftime('%H:%M')}后随发布探针持续检查；"
             "收盘数据与冻结执行切片完整时立即自动执行，每个交易日最多一次"
