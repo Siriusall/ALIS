@@ -1576,11 +1576,14 @@ def build_portfolio_reoptimization(*, signal_date: str = "") -> dict[str, Any]:
             if isinstance(item.get("thesis_snapshot"), dict)
         }
     else:
-        from app.services.thesis_store import list_theses
-        thesis_status_by_symbol = {
-            str(item.get("ts_code") or "").split(".")[0]: str(item.get("derived_status") or "")
-            for item in list_theses(limit=1000, include_hypotheses=False)
-        }
+        # Legacy compatibility mode must not scan the entire thesis table for
+        # every formal plan.  That table contains evidence-heavy rows and the
+        # unbounded ``ORDER BY updated_at`` projection can exceed the database
+        # statement timeout before the optimizer even starts.  Unified
+        # selection already carries point-in-time thesis snapshots; when it is
+        # unavailable, leave thesis status explicitly unknown rather than
+        # blocking plan generation on a non-authoritative full-table read.
+        thesis_status_by_symbol = {}
     position_pnl_by_symbol: dict[str, float] = {}
     for symbol, position in position_map.items():
         quantity = _safe_float(position.get("quantity"))
