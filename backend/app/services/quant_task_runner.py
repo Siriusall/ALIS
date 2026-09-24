@@ -1020,7 +1020,7 @@ def start_auto_simulation_scheduler() -> bool:
                     logger.warning("自动模拟调度暂缓本轮数据探测，将在下一周期重试: %s", str(exc)[:200])
                     beat("auto_simulation_scheduler")
                 else:
-                    logger.warning("自动模拟调度检查失败: %s", str(exc)[:200])
+                    logger.exception("自动模拟调度检查失败: %s", str(exc)[:200])
                     beat("auto_simulation_scheduler", error=str(exc))
             threading.Event().wait(_AUTO_SIMULATION_INTERVAL_SEC)
 
