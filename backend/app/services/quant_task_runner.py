@@ -460,7 +460,19 @@ def _snapshot_data_status(trade_date: str = "") -> tuple[str, dict[str, int]]:
                         include_diagnostics=False,
                     )
                 finally:
-                    c.execute("SELECT pg_advisory_unlock(hashtext(?))", (lock_key,))
+                    # A statement timeout aborts the current PostgreSQL
+                    # transaction. Roll it back before releasing the session
+                    # advisory lock; otherwise the unlock itself fails with
+                    # ``current transaction is aborted`` and poisons the next
+                    # scheduler poll on the same connection.
+                    try:
+                        c.rollback()
+                    except Exception:
+                        pass
+                    try:
+                        c.execute("SELECT pg_advisory_unlock(hashtext(?))", (lock_key,))
+                    except Exception:
+                        pass
                 contract_counts = dict(contract.get("counts") or {})
                 return target, {
                     "stock_count": max(0, int(contract.get("stock_count") or 0)),
