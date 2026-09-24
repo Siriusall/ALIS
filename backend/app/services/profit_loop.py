@@ -2909,8 +2909,20 @@ def _materialize_daily_rebalance_plan_locked(
                 VALUES(?,?,?,?,?,?,?,?,?)""",
                 (trade_date, planned_execute_date, planned_execute_at, version, input_hash, plan_status, canonical, _now(),
                  int(((decision_version_manifest.get("release") or {}).get("id")) or 0) or None))
+            # The frozen contract is stored in proposal_json and can be very
+            # large for a full-market selection. This response only needs
+            # plan metadata; selecting the full row here can transfer the
+            # entire JSON payload over the production DB connection and hit
+            # statement_timeout immediately after the INSERT. Keep the
+            # authoritative contract in the row, but read back only the
+            # columns needed to build the materialization result.
             row = dict(c.execute(
-                "SELECT * FROM daily_rebalance_plans WHERE trade_date=? AND version=?", (trade_date, version)
+                """SELECT id,trade_date,planned_execute_date,planned_execute_at,
+                          version,input_hash,status,execution_id,generated_at,
+                          executed_at,release_id
+                     FROM daily_rebalance_plans
+                    WHERE trade_date=? AND version=?""",
+                (trade_date, version),
             ).fetchone())
     row_status = str(row.get("status") or plan_status)
     row_blocked_reason = {
