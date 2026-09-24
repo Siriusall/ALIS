@@ -412,48 +412,61 @@ def _snapshot_data_status(trade_date: str = "") -> tuple[str, dict[str, int]]:
                 "calendar_error": exc.code,
             }
         if bool(getattr(c, "_is_postgres", False)) and not hasattr(c, "execute"):
-                contract = decision_data_contract(
-                    target,
-                    conn=c,
-                    as_of_time=cutoff_text,
-                    include_diagnostics=False,
-                )
-                contract_counts = dict(contract.get("counts") or {})
-                return target, {
-                    "stock_count": max(0, int(contract.get("stock_count") or 0)),
-                    "daily_n": max(0, int(contract_counts.get("daily") or 0)),
-                    "execution_price_n": max(0, int(contract.get("execution_price_rows") or 0)),
-                    "valuation_n": max(0, int(contract_counts.get("daily_basic") or 0)),
-                    "limit_n": max(0, int(contract_counts.get("stk_limit") or 0)),
-                    "immutable_schema_ready": int(bool(
-                        (contract.get("observation_contract") or {}).get("strict_schema_ready")
-                    )),
-                    "decision_ready": int(bool(contract.get("ok"))),
-                }
+            contract = decision_data_contract(
+                target,
+                conn=c,
+                as_of_time=cutoff_text,
+                include_diagnostics=False,
+            )
+            contract_counts = dict(contract.get("counts") or {})
+            return target, {
+                "stock_count": max(0, int(contract.get("stock_count") or 0)),
+                "daily_n": max(0, int(contract_counts.get("daily") or 0)),
+                "execution_price_n": max(0, int(contract.get("execution_price_rows") or 0)),
+                "valuation_n": max(0, int(contract_counts.get("daily_basic") or 0)),
+                "limit_n": max(0, int(contract_counts.get("stk_limit") or 0)),
+                "immutable_schema_ready": int(bool(
+                    (contract.get("observation_contract") or {}).get("strict_schema_ready")
+                )),
+                "decision_ready": int(bool(contract.get("ok"))),
+            }
         if bool(getattr(c, "_is_postgres", False)) and hasattr(c, "execute"):
-                # Do not bind the strict PIT contract to the scheduler's
-                # metadata connection. Its raw-evidence SQL can hit the
-                # bounded statement timeout on the large data platform; an
-                # independent autocommit reader then gets discarded cleanly
-                # instead of poisoning the scheduler transaction or its
-                # advisory lock cleanup path.
+            # Do not bind the strict PIT contract to the scheduler's
+            # metadata connection. Its raw-evidence SQL can hit the
+            # bounded statement timeout on the large data platform; an
+            # independent autocommit reader then gets discarded cleanly
+            # instead of poisoning the scheduler transaction or its
+            # advisory lock cleanup path.
+            try:
                 contract = decision_data_contract(
                     target,
                     as_of_time=cutoff_text,
                     include_diagnostics=False,
                 )
-                contract_counts = dict(contract.get("counts") or {})
+            except Exception as exc:  # noqa: BLE001 - bounded scheduler retry
+                logger.warning("严格决策合同探针超时，暂缓本轮 target=%s error=%s", target, str(exc)[:200])
                 return target, {
-                    "stock_count": max(0, int(contract.get("stock_count") or 0)),
-                    "daily_n": max(0, int(contract_counts.get("daily") or 0)),
-                    "execution_price_n": max(0, int(contract.get("execution_price_rows") or 0)),
-                    "valuation_n": max(0, int(contract_counts.get("daily_basic") or 0)),
-                    "limit_n": max(0, int(contract_counts.get("stk_limit") or 0)),
-                    "immutable_schema_ready": int(bool(
-                        (contract.get("observation_contract") or {}).get("strict_schema_ready")
-                    )),
-                    "decision_ready": int(bool(contract.get("ok"))),
+                    "stock_count": 0,
+                    "daily_n": 0,
+                    "execution_price_n": 0,
+                    "valuation_n": 0,
+                    "limit_n": 0,
+                    "immutable_schema_ready": 0,
+                    "decision_ready": 0,
+                    "contract_timeout": 1,
                 }
+            contract_counts = dict(contract.get("counts") or {})
+            return target, {
+                "stock_count": max(0, int(contract.get("stock_count") or 0)),
+                "daily_n": max(0, int(contract_counts.get("daily") or 0)),
+                "execution_price_n": max(0, int(contract.get("execution_price_rows") or 0)),
+                "valuation_n": max(0, int(contract_counts.get("daily_basic") or 0)),
+                "limit_n": max(0, int(contract_counts.get("stk_limit") or 0)),
+                "immutable_schema_ready": int(bool(
+                    (contract.get("observation_contract") or {}).get("strict_schema_ready")
+                )),
+                "decision_ready": int(bool(contract.get("ok"))),
+            }
         stock_rows = c.execute("SELECT ts_code FROM dc_stock_master").fetchall()
         stock_codes = {str(dict(row).get("ts_code") or "") for row in stock_rows}
         stock_codes.discard("")

@@ -641,8 +641,14 @@ def decision_data_contract(
                     ] = _count(item.get("rows"))
             except Exception as exc:  # noqa: BLE001 - production gates fail closed
                 if use_savepoints:
-                    active.execute("ROLLBACK TO SAVEPOINT decision_base_counts")
-                    active.execute("RELEASE SAVEPOINT decision_base_counts")
+                    try:
+                        active.execute("ROLLBACK TO SAVEPOINT decision_base_counts")
+                        active.execute("RELEASE SAVEPOINT decision_base_counts")
+                    except Exception:  # noqa: BLE001 - discard a poisoned owner connection
+                        try:
+                            active.rollback()
+                        except Exception:
+                            pass
                 base_query_error = type(exc).__name__
             else:
                 if use_savepoints:
@@ -674,8 +680,14 @@ def decision_data_contract(
                 # continue; if cleanup itself fails, let the outer owner
                 # discard the poisoned connection rather than hiding it.
                 if use_savepoints:
-                    active.execute("ROLLBACK TO SAVEPOINT decision_strict_evidence")
-                    active.execute("RELEASE SAVEPOINT decision_strict_evidence")
+                    try:
+                        active.execute("ROLLBACK TO SAVEPOINT decision_strict_evidence")
+                        active.execute("RELEASE SAVEPOINT decision_strict_evidence")
+                    except Exception:  # noqa: BLE001 - discard a poisoned owner connection
+                        try:
+                            active.rollback()
+                        except Exception:
+                            pass
                 strict_query_error = type(exc).__name__
     finally:
         if context is not None:
