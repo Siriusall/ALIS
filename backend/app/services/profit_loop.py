@@ -292,6 +292,125 @@ def _ensure_tables_once() -> None:
         c.execute("ALTER TABLE daily_rebalance_plans ADD COLUMN IF NOT EXISTS release_id BIGINT")
         c.execute("ALTER TABLE daily_rebalance_plans ADD COLUMN IF NOT EXISTS execution_data_evidence_json TEXT NOT NULL DEFAULT '{}'")
         c.execute("ALTER TABLE daily_rebalance_plans ADD COLUMN IF NOT EXISTS next_probe_at VARCHAR(64)")
+        c.execute("""CREATE TABLE IF NOT EXISTS daily_rebalance_plan_projection (
+            plan_id BIGINT PRIMARY KEY,
+            execution_authorized BOOLEAN NOT NULL DEFAULT FALSE,
+            schema_version VARCHAR(128) NOT NULL DEFAULT '',
+            target_symbols_json TEXT NOT NULL DEFAULT '[]',
+            target_weights_json TEXT NOT NULL DEFAULT '{}',
+            decision_manifest_json TEXT NOT NULL DEFAULT '{}',
+            risk_budget_json TEXT NOT NULL DEFAULT '{}',
+            selection_snapshot_json TEXT NOT NULL DEFAULT '{}',
+            input_hash VARCHAR(128) NOT NULL DEFAULT '',
+            proposal_count INTEGER NOT NULL DEFAULT 0,
+            actionable_count INTEGER NOT NULL DEFAULT 0,
+            created_at VARCHAR(64) NOT NULL
+        )""")
+        c.execute("""CREATE TABLE IF NOT EXISTS daily_rebalance_plan_orders (
+            plan_id BIGINT NOT NULL,
+            order_index INTEGER NOT NULL,
+            symbol VARCHAR(32) NOT NULL DEFAULT '',
+            side VARCHAR(16) NOT NULL DEFAULT '',
+            quantity INTEGER NOT NULL DEFAULT 0,
+            action VARCHAR(64) NOT NULL DEFAULT '',
+            weight_change DOUBLE PRECISION NOT NULL DEFAULT 0,
+            order_json TEXT NOT NULL DEFAULT '{}',
+            PRIMARY KEY(plan_id, order_index)
+        )""")
+        # One-time compatibility backfill.  It runs only for plans missing a
+        # projection; all subsequent scheduler and execution reads are narrow.
+        missing = c.execute(
+            """SELECT p.id,p.proposal_json,p.input_hash
+                 FROM daily_rebalance_plans p
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM daily_rebalance_plan_projection x WHERE x.plan_id=p.id
+                )
+                ORDER BY p.id DESC LIMIT 20"""
+        ).fetchall()
+        for row in missing:
+            item = dict(row)
+            try:
+                contract = json.loads(item.get("proposal_json") or "{}")
+            except (TypeError, json.JSONDecodeError):
+                contract = {}
+            if isinstance(contract, dict):
+                _persist_plan_projection(c, int(item.get("id") or 0), contract, str(item.get("input_hash") or ""))
+
+
+def _persist_plan_projection(conn: Any, plan_id: int, contract: dict[str, Any], input_hash: str = "") -> None:
+    """Persist the execution-safe projection beside the immutable JSON contract.
+
+    The raw contract remains audit evidence. Runtime scheduling and execution
+    probes consume these narrow rows so proposal research payloads never cross
+    the production DB connection.
+    """
+    proposal = contract.get("proposal") if isinstance(contract, dict) else []
+    orders = contract.get("execution_orders") if isinstance(contract, dict) else []
+    proposal = proposal if isinstance(proposal, list) else []
+    orders = orders if isinstance(orders, list) else []
+    compact_orders: list[dict[str, Any]] = []
+    for item in orders:
+        if not isinstance(item, dict):
+            continue
+        compact_orders.append({
+            key: item.get(key)
+            for key in ("symbol", "side", "quantity", "action", "weight_change",
+                        "planned_execution_price", "reference_close", "planned_quantity",
+                        "planned_side", "ts_code")
+            if key in item
+        })
+    actionable = sum(
+        1 for item in proposal
+        if isinstance(item, dict)
+        and str(item.get("action") or "") not in {"", "hold", "observe"}
+        and abs(_safe_float(item.get("weight_change"))) > 1e-9
+    )
+    plan_projection = (
+        int(plan_id), bool(contract.get("execution_authorized")),
+        str(contract.get("schema_version") or ""),
+        json.dumps(contract.get("target_symbols") or [], ensure_ascii=False, separators=(",", ":")),
+        json.dumps(contract.get("target_weights") or {}, ensure_ascii=False, separators=(",", ":")),
+        json.dumps(contract.get("decision_version_manifest") or {}, ensure_ascii=False, separators=(",", ":")),
+        json.dumps({
+            **(contract.get("risk_budget") or {}),
+            "risk_budget": contract.get("risk_budget") or {},
+            "portfolio_method_competition": contract.get("portfolio_method_competition") or {},
+        }, ensure_ascii=False, separators=(",", ":")),
+        json.dumps(contract.get("selection_snapshot") or {}, ensure_ascii=False, separators=(",", ":")),
+        str(input_hash or ""), len(proposal), actionable, _now(),
+    )
+    conn.execute(
+        """INSERT INTO daily_rebalance_plan_projection
+           (plan_id,execution_authorized,schema_version,target_symbols_json,target_weights_json,
+            decision_manifest_json,risk_budget_json,selection_snapshot_json,input_hash,
+            proposal_count,actionable_count,created_at)
+           VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+           ON CONFLICT(plan_id) DO UPDATE SET
+             execution_authorized=excluded.execution_authorized,
+             schema_version=excluded.schema_version,
+             target_symbols_json=excluded.target_symbols_json,
+             target_weights_json=excluded.target_weights_json,
+             decision_manifest_json=excluded.decision_manifest_json,
+             risk_budget_json=excluded.risk_budget_json,
+             selection_snapshot_json=excluded.selection_snapshot_json,
+             input_hash=excluded.input_hash,
+             proposal_count=excluded.proposal_count,
+             actionable_count=excluded.actionable_count,
+             created_at=excluded.created_at""",
+        plan_projection,
+    )
+    conn.execute("DELETE FROM daily_rebalance_plan_orders WHERE plan_id=?", (int(plan_id),))
+    for index, item in enumerate(compact_orders):
+        conn.execute(
+            """INSERT INTO daily_rebalance_plan_orders
+               (plan_id,order_index,symbol,side,quantity,action,weight_change,order_json)
+               VALUES(?,?,?,?,?,?,?,?)""",
+            (int(plan_id), index, str(item.get("symbol") or item.get("ts_code") or ""),
+             str(item.get("side") or item.get("planned_side") or ""),
+             int(item.get("quantity") or item.get("planned_quantity") or 0),
+             str(item.get("action") or ""), _safe_float(item.get("weight_change")),
+             json.dumps(item, ensure_ascii=False, separators=(",", ":"))),
+        )
 
 
 def _normalize_execution_ts_code(symbol: str) -> str:
@@ -2591,6 +2710,12 @@ def _persist_contract_validation_failure(
                 int((((contract.get("decision_version_manifest") or {}).get("release") or {}).get("id")) or 0) or None,
             ),
         )
+        inserted = c.execute(
+            "SELECT id FROM daily_rebalance_plans WHERE trade_date=? AND version=?",
+            (trade_date, version),
+        ).fetchone()
+        if inserted:
+            _persist_plan_projection(c, int(dict(inserted).get("id") or 0), contract, input_hash)
     return get_latest_daily_rebalance_plan(trade_date)
 
 
@@ -2912,6 +3037,12 @@ def _materialize_daily_rebalance_plan_locked(
                 VALUES(?,?,?,?,?,?,?,?,?)""",
                 (trade_date, planned_execute_date, planned_execute_at, version, input_hash, plan_status, canonical, _now(),
                  int(((decision_version_manifest.get("release") or {}).get("id")) or 0) or None))
+            inserted = c.execute(
+                "SELECT id FROM daily_rebalance_plans WHERE trade_date=? AND version=?",
+                (trade_date, version),
+            ).fetchone()
+            if inserted:
+                _persist_plan_projection(c, int(dict(inserted).get("id") or 0), contract, input_hash)
             # The frozen contract is stored in proposal_json and can be very
             # large for a full-market selection. This response only needs
             # plan metadata; selecting the full row here can transfer the
@@ -3226,14 +3357,67 @@ def list_pending_daily_rebalance_execution_inputs() -> list[dict[str, Any]]:
         if not planned_ids:
             return []
         placeholders = ",".join("?" for _ in planned_ids)
-        contract_rows = c.execute(
-            f"SELECT id,proposal_json FROM daily_rebalance_plans WHERE id IN ({placeholders})",
-            tuple(planned_ids),
-        ).fetchall()
-    contracts_by_id = {
-        int(dict(row).get("id") or 0): str(dict(row).get("proposal_json") or "{}")
-        for row in contract_rows
-    }
+        legacy_contracts: dict[int, dict[str, Any]] = {}
+        try:
+            projection_rows = c.execute(
+                f"""SELECT p.id,p.schema_version,p.target_symbols_json,p.target_weights_json,
+                         p.decision_manifest_json,p.risk_budget_json,p.selection_snapshot_json,
+                         p.execution_authorized,o.order_index,o.order_json
+                    FROM daily_rebalance_plan_projection p
+                    LEFT JOIN daily_rebalance_plan_orders o ON o.plan_id=p.plan_id
+                   WHERE p.plan_id IN ({placeholders})
+                   ORDER BY p.plan_id,o.order_index""",
+                    tuple(planned_ids),
+                ).fetchall()
+        except Exception:
+            # Isolated legacy fixtures may not have the projection tables.
+            # Production PostgreSQL creates them in _ensure_tables_once and
+            # therefore never takes this compatibility path.
+            projection_rows = []
+            legacy_rows = c.execute(
+                f"SELECT id,proposal_json FROM daily_rebalance_plans WHERE id IN ({placeholders})",
+                tuple(planned_ids),
+            ).fetchall()
+            for legacy in legacy_rows:
+                item = dict(legacy)
+                try:
+                    contract = json.loads(item.get("proposal_json") or "{}")
+                except (TypeError, json.JSONDecodeError):
+                    contract = {}
+                legacy_contracts[int(item.get("id") or 0)] = contract
+        if projection_rows and "proposal_json" in dict(projection_rows[0]) and "schema_version" not in dict(projection_rows[0]):
+            legacy_contracts = {}
+            for legacy in projection_rows:
+                item = dict(legacy)
+                try:
+                    contract = json.loads(item.get("proposal_json") or "{}")
+                except (TypeError, json.JSONDecodeError):
+                    contract = {}
+                legacy_contracts[int(item.get("id") or 0)] = contract
+            projection_rows = []
+    contracts_by_id: dict[int, dict[str, Any]] = {}
+    contracts_by_id.update(legacy_contracts)
+    for row in projection_rows:
+        item = dict(row)
+        plan_id = int(item.get("id") or 0)
+        current = contracts_by_id.setdefault(plan_id, {
+            "schema_version": str(item.get("schema_version") or ""),
+            "execution_authorized": bool(item.get("execution_authorized")),
+            "target_symbols": json.loads(item.get("target_symbols_json") or "[]"),
+            "target_weights": json.loads(item.get("target_weights_json") or "{}"),
+            "decision_version_manifest": json.loads(item.get("decision_manifest_json") or "{}"),
+            "risk_budget": json.loads(item.get("risk_budget_json") or "{}"),
+            "selection_snapshot": json.loads(item.get("selection_snapshot_json") or "{}"),
+            "proposal": [],
+            "execution_orders": [],
+        })
+        if item.get("order_json"):
+            try:
+                order = json.loads(item.get("order_json") or "{}")
+            except (TypeError, json.JSONDecodeError):
+                order = {}
+            if isinstance(order, dict):
+                current["execution_orders"].append(order)
     from app.services.defensive_assets import DEFENSIVE_ASSETS
 
     registered = {
@@ -3251,7 +3435,7 @@ def list_pending_daily_rebalance_execution_inputs() -> list[dict[str, Any]]:
         signal_date = str(item.get("trade_date") or "").replace("-", "")[:8]
         execute_date = str(item.get("planned_execute_date") or "").replace("-", "")[:8]
         try:
-            contract = json.loads(contracts_by_id.get(int(item.get("id") or 0), "{}"))
+            contract = contracts_by_id.get(int(item.get("id") or 0), {})
         except (TypeError, json.JSONDecodeError):
             contract = {}
         plan_symbols = {

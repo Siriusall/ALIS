@@ -11,17 +11,12 @@ from app.db.store import _conn as business_conn
 def build_portfolio_console_research() -> dict[str, Any]:
     """Read frozen portfolio competition evidence without rerunning research."""
     with business_conn() as c:
-        proposal_column = "proposal_json"
-        if bool(getattr(c, "_is_postgres", False)):
-            proposal_column = """jsonb_build_object(
-                'portfolio_method_competition',
-                    COALESCE(proposal_json::jsonb->'portfolio_method_competition','{}'::jsonb),
-                'risk_budget',COALESCE(proposal_json::jsonb->'risk_budget','{}'::jsonb)
-            )::text AS proposal_json"""
         row = c.execute(
-            f"""SELECT id,trade_date,version,status,{proposal_column},generated_at
-               FROM daily_rebalance_plans
-               ORDER BY trade_date DESC,version DESC,id DESC LIMIT 1"""
+            """SELECT p.id,r.trade_date,r.version,r.status,r.generated_at,
+                      p.risk_budget_json
+                 FROM daily_rebalance_plan_projection p
+                 JOIN daily_rebalance_plans r ON r.id=p.plan_id
+                ORDER BY r.trade_date DESC,r.version DESC,r.id DESC LIMIT 1"""
         ).fetchone()
     if not row:
         return {
@@ -34,7 +29,7 @@ def build_portfolio_console_research() -> dict[str, Any]:
         }
     item = dict(row)
     try:
-        contract = json.loads(item.get("proposal_json") or "{}")
+        contract = json.loads(item.get("risk_budget_json") or "{}")
     except (TypeError, json.JSONDecodeError):
         contract = {}
     competition = contract.get("portfolio_method_competition")
@@ -76,5 +71,5 @@ def build_portfolio_console_research() -> dict[str, Any]:
             "generated_at": item.get("generated_at"),
         },
         "portfolio_optimization": {"optimizer": {"method_competition": compact_competition}},
-        "risk_budget": contract.get("risk_budget") or {},
+        "risk_budget": contract.get("risk_budget") or contract,
     }

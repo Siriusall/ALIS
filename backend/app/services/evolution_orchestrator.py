@@ -2958,8 +2958,15 @@ def execute_evolution_task(
     dataset_required = str(os.getenv("ALIS_MARKET_DATASET_REQUIRED", "0")).strip().lower() in {
         "1", "true", "yes", "on",
     }
+    if WORKER_POOL == "research" and not optional_network_work_allowed():
+        raise EvolutionTaskBudgetExceeded("research worker network budget exhausted")
     if dataset_required and str(task.get("task_type")) in dataset_tasks and not source:
         raise EvolutionTaskBudgetExceeded("market dataset source is required for research task")
+    if dataset_required and str(task.get("task_type")) in dataset_tasks:
+        from app.services.market_dataset import dataset_configuration_status
+        dataset_status = dataset_configuration_status()
+        if not dataset_status.get("ready"):
+            raise EvolutionTaskBudgetExceeded("market dataset preflight failed; research task paused")
     if source and str(task.get("task_type")) in dataset_tasks:
         task_id = int(task["id"])
         payload = dict(task.get("payload") or {})
