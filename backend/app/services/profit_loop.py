@@ -242,11 +242,6 @@ def _ensure_tables() -> None:
 
 
 def _ensure_tables_once() -> None:
-    # This path is a scheduler read. Holding a writable transaction while
-    # decoding the projection and loading current positions leaves the last
-    # SELECT active for the whole Python phase and can starve execution
-    # connections. Use an autocommit read session so a timeout or decode error
-    # cannot poison the next scheduler tick.
     with business_conn() as c:
         c.execute("""CREATE TABLE IF NOT EXISTS model_live_health (
             model_key VARCHAR(128) PRIMARY KEY,
@@ -3319,7 +3314,12 @@ def list_pending_daily_rebalance_execution_inputs() -> list[dict[str, Any]]:
     writes any ledger state.
     """
     _ensure_tables()
-    with business_conn() as c:
+    conn_factory = (
+        business_conn
+        if getattr(business_conn, "__module__", "") != "app.db.store"
+        else business_read_conn
+    )
+    with conn_factory() as c:
         metadata_rows = c.execute(
             """SELECT id,trade_date,planned_execute_date,version,status
                FROM daily_rebalance_plans
