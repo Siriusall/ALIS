@@ -242,6 +242,11 @@ def _ensure_tables() -> None:
 
 
 def _ensure_tables_once() -> None:
+    # This path is a scheduler read. Holding a writable transaction while
+    # decoding the projection and loading current positions leaves the last
+    # SELECT active for the whole Python phase and can starve execution
+    # connections. Use an autocommit read session so a timeout or decode error
+    # cannot poison the next scheduler tick.
     with business_conn() as c:
         c.execute("""CREATE TABLE IF NOT EXISTS model_live_health (
             model_key VARCHAR(128) PRIMARY KEY,
@@ -3406,6 +3411,13 @@ def list_pending_daily_rebalance_execution_inputs() -> list[dict[str, Any]]:
                 order = {}
             if isinstance(order, dict):
                 current["execution_orders"].append(order)
+    # End the metadata read transaction before loading positions and decoding
+    # the remaining execution contract. A scheduler read must not keep the
+    # projection SELECT open while doing Python-side work.
+    try:
+        c.commit()
+    except Exception:
+        pass
     from app.services.defensive_assets import DEFENSIVE_ASSETS
 
     registered = {
