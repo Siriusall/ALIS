@@ -52,7 +52,7 @@ const snapshotPages: Record<string, string> = {
   "/decision": "decision",
   "/portfolio": "portfolio",
   "/operations": "operations",
-  "/system": "operations",
+  "/system": "runtime",
   "/system/versions": "versions",
   "/data": "data",
   "/models": "models",

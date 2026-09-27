@@ -846,6 +846,7 @@ def _readers(page_key: str) -> dict[str, Callable[[], Any]]:
 
     pages: dict[str, dict[str, Callable[[], Any]]] = {
         "overview": {
+            **common,
             "nodeActivities": lambda: model_strategy.model_strategy_node_activities(limit_days=7),
             "oos": bounded_oos,
             "sealed": bounded_sealed,
@@ -878,9 +879,16 @@ def _readers(page_key: str) -> dict[str, Callable[[], Any]]:
             "latestPlan": lambda: decision_latest_plan(compact=True),
         },
         "operations": {
+            **common,
             "oos": bounded_oos,
             "sealed": bounded_sealed,
             "owner": model_strategy.model_strategy_owner_summary,
+            "tasks": lambda: model_strategy.model_strategy_task_center(limit=16, log_limit=5, compact=True),
+            "evolutionTasks": lambda: model_strategy.model_strategy_evolution_tasks(limit=20),
+            "evolutionSchedule": model_strategy.model_strategy_evolution_schedule,
+            "quantTasks": lambda: quant_runs.quant_run_tasks(limit=10),
+            "quantStatus": quant_runs.quant_run_status,
+            "quantRecent": lambda: quant_runs.quant_run_recent(limit=5),
             "operationsPage": lambda: __import__("app.api.routes.positions", fromlist=["get_operations_page"]).get_operations_page(execution_id=None, limit=20, offset=0),
             "executionsPage": lambda: __import__("app.api.routes.positions", fromlist=["get_executions_page"]).get_executions_page(limit=20, offset=0),
             "ledgerAudit": model_strategy.model_strategy_ledger_audit,
@@ -923,6 +931,8 @@ def _readers(page_key: str) -> dict[str, Callable[[], Any]]:
         },
         "models": {
             "planModels": lambda: model_strategy.model_strategy_plan_models(console=True),
+            "factorResearch": lambda: __import__("app.api.routes.factors", fromlist=["factor_research_status"]).factor_research_status(console=True, compact=False),
+            "tasks": lambda: model_strategy.model_strategy_task_center(limit=24, log_limit=40, compact=True),
             "modelOperations": model_strategy.model_strategy_plan_model_operations,
             "models": model_strategy.model_strategy_status,
             "modelMarketLive": model_strategy.model_strategy_live_market_context,
@@ -985,6 +995,7 @@ def _readers(page_key: str) -> dict[str, Callable[[], Any]]:
             "ledger": quant_runs.quant_run_ledger_summary,
         },
         "waves": {
+            "researchAnalytics": lambda: __import__("app.api.routes.factors", fromlist=["factor_research_analytics"]).factor_research_analytics(),
             "researchAnalyticsConsole": lambda: __import__("app.api.routes.factors", fromlist=["factor_research_analytics_console"]).factor_research_analytics_console(),
             "researchExpertHistory": lambda: __import__("app.api.routes.factors", fromlist=["factor_research_analytics_experts"]).factor_research_analytics_experts(limit=100),
             "researchEnvironmentSimilarity": lambda: __import__("app.api.routes.factors", fromlist=["factor_research_analytics_environment_similarity"]).factor_research_analytics_environment_similarity(),

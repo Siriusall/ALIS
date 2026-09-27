@@ -12,7 +12,7 @@ def build_portfolio_console_research() -> dict[str, Any]:
     """Read frozen portfolio competition evidence without rerunning research."""
     with business_conn() as c:
         row = c.execute(
-            """SELECT p.id,r.trade_date,r.version,r.status,r.generated_at,
+            """SELECT r.id,r.trade_date,r.version,r.status,r.generated_at,
                       p.risk_budget_json
                  FROM daily_rebalance_plan_projection p
                  JOIN daily_rebalance_plans r ON r.id=p.plan_id
