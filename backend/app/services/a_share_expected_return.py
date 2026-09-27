@@ -93,8 +93,10 @@ def _model_components(selection: dict[str, Any]) -> tuple[dict[str, float], floa
         available += 1
         components[key] = (_clip(_safe(percentile), 0.0, 1.0) - 0.5) * scale
         multiplier = _clip(_safe(model.get("weight_multiplier"), 1.0), 0.0, 1.0)
-        if str(model.get("status") or "") == "degraded" or multiplier < 1.0:
-            degradation_penalty += (1.0 - multiplier) * scale * 0.50
+        # Degradation penalty applies only when an active model explicitly fails or degrades at runtime,
+        # not when baseline factors assume 100% of policy weight under quarantine governance.
+        if str(model.get("status") or "") == "degraded":
+            degradation_penalty += scale * 0.25
     return components, degradation_penalty, available
 
 
@@ -147,7 +149,7 @@ def build_a_share_expected_return_contract(
         model_components, degradation_penalty, model_count = _model_components(selection)
         factor_pct = factor_percentiles.get(symbol, 0.5)
         fused_pct = fused_percentiles.get(symbol, 0.5)
-        factor_component = (factor_pct - 0.5) * 0.040
+        factor_component = (factor_pct - 0.5) * (0.055 if model_count == 0 else 0.040)
         residual_rank_component = (fused_pct - 0.5) * 0.015
         research_quality, ready_dimensions = _research_quality(research)
         research_component = (research_quality - 0.5) * 0.015
