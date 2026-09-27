@@ -255,6 +255,7 @@ function subscribePending(pending: PendingRequest, signal?: AbortSignal): Promis
 }
 
 async function loadPath(cacheKey: string, path: string, force = false, signal?: AbortSignal): Promise<Json> {
+  if (force) cache.delete(cacheKey);
   let cached = cache.get(cacheKey);
   const isSnapshot = cacheKey.startsWith("snapshot:");
   if (cached && (!responseIsTerminal(cached.value) || (isSnapshot && !snapshotIsRenderable(cached.value)))) {
