@@ -49,3 +49,24 @@ def test_expected_return_uses_cross_sectional_rank_instead_of_raw_microcap_retur
     assert result["optimizer_expected_returns"]["000001"] <= 0.12
     assert result["optimizer_expected_returns"]["600000"] >= -0.10
     assert result["optimizer_expected_returns"]["000001"] > result["optimizer_expected_returns"]["600000"]
+
+
+def test_expected_return_damps_negative_environment_drag_when_alpha_is_strong():
+    strong_stock = _selection(90)
+    weak_stock = _selection(10)
+    result = build_a_share_expected_return_contract(
+        symbols=["000001", "600000"],
+        selections={"000001": strong_stock, "600000": weak_stock},
+        research_evidence={},
+        returns_by_symbol={"000001": [0.01] * 30, "600000": [-0.01] * 30},
+        market_state="S2",
+        trading_costs={},
+    )
+    item_strong = next(it for it in result["items"] if it["symbol"] == "000001")
+    item_weak = next(it for it in result["items"] if it["symbol"] == "600000")
+
+    assert item_strong["base_environment_prior"] == -0.004
+    assert item_strong["environment_prior"] > item_strong["base_environment_prior"]
+    assert item_weak["environment_prior"] == item_weak["base_environment_prior"]
+    assert result["optimizer_expected_returns"]["000001"] > 0
+    assert result["optimizer_expected_returns"]["600000"] < 0

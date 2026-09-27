@@ -111,7 +111,7 @@ def build_tiered_equity_budget(
         opportunity_status = "no_qualified_equity_candidate"
     per_symbol_cap = min(
         RESTRICTED_SINGLE_ASSET_LIMIT,
-        restricted_limit / len(restricted),
+        restricted_limit,
     ) if restricted else 0.0
     base_contract = {
         "schema_version": EQUITY_BUDGET_SCHEMA_VERSION,

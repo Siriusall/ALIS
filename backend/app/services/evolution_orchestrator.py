@@ -85,7 +85,7 @@ LEASE_RECOVERY_INTERVAL_SECONDS = max(
     15, min(int(os.getenv("EVOLUTION_LEASE_RECOVERY_INTERVAL_SECONDS", "30")), 300)
 )
 HEARTBEAT_PULSE_SECONDS = max(
-    1, min(int(os.getenv("EVOLUTION_HEARTBEAT_PULSE_SECONDS", "5")), 60)
+    1, min(int(os.getenv("EVOLUTION_HEARTBEAT_PULSE_SECONDS", "20")), 60)
 )
 HEARTBEAT_DB_RETRY_ATTEMPTS = max(
     1, min(int(os.getenv("EVOLUTION_HEARTBEAT_DB_RETRY_ATTEMPTS", "3")), 5)
@@ -4443,7 +4443,7 @@ def start_evolution_scheduler() -> bool:
                     priority=90,
                 )
                 ensure_latest_ready_system_cycle()
-                if 9 <= now.hour < 19:
+                if _is_scheduled_trade_day(now) and 9 <= now.hour < 19:
                     probe_bucket = f"{now.hour:02d}{(now.minute // 10) * 10:02d}"
                     create_evolution_task(
                         task_type="research_data_publication_probe",

@@ -14,7 +14,7 @@ MODEL_COMPONENT_SCALES = {
 ENVIRONMENT_PRIORS = {
     "S0": 0.015,
     "S1": 0.0025,
-    "S2": -0.015,
+    "S2": -0.004,
     "S3": -0.0075,
 }
 
@@ -103,9 +103,9 @@ def _theme_crowding_penalty(selection: dict[str, Any]) -> tuple[float, str]:
     narrative = signals.get("narrative") if isinstance(signals.get("narrative"), dict) else {}
     lifecycle = str(narrative.get("lifecycle") or "未识别")
     penalty = {
-        "成熟/拥挤": 0.010,
-        "亢奋": 0.010,
-        "分歧": 0.007,
+        "成熟/拥挤": 0.003,
+        "亢奋": 0.003,
+        "分歧": 0.002,
     }.get(lifecycle, 0.0)
     return penalty, lifecycle
 
@@ -170,7 +170,12 @@ def build_a_share_expected_return_contract(
             **model_components,
         }
         raw_alpha = sum(alpha_components.values())
-        gross_before_penalties = environment_prior + reliability * raw_alpha
+        if environment_prior < 0 and raw_alpha > 0:
+            env_scale = _clip(1.0 - (raw_alpha / 0.020), 0.20, 1.0)
+            effective_env_prior = environment_prior * env_scale
+        else:
+            effective_env_prior = environment_prior
+        gross_before_penalties = effective_env_prior + reliability * raw_alpha
         expected_before_trade_cost = _clip(
             gross_before_penalties - degradation_penalty - theme_penalty,
             -0.10,
@@ -183,7 +188,8 @@ def build_a_share_expected_return_contract(
             "symbol": symbol,
             "expected_20d_return_before_trade_cost": round(expected_before_trade_cost, 8),
             "estimated_entry_net_20d_return": round(entry_net, 8),
-            "environment_prior": round(environment_prior, 8),
+            "environment_prior": round(effective_env_prior, 8),
+            "base_environment_prior": round(environment_prior, 8),
             "alpha_before_reliability": round(raw_alpha, 8),
             "reliability": round(reliability, 8),
             "components": {key: round(value, 8) for key, value in alpha_components.items()},

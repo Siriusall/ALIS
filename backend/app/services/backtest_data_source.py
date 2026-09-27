@@ -613,7 +613,13 @@ class BacktestDataSource:
 
     def _postgres_trade_dates(self, start: str, end: str) -> List[str]:
         if self.market_dataset is not None:
-            return [self._fmt_date(d) for d in self.market_dataset.dates(start, end)]
+            manifest_start = self.market_dataset.manifest["start"]
+            manifest_end = self.market_dataset.manifest["end"]
+            clamped_start = max(start.replace("-", ""), manifest_start)
+            clamped_end = min(end.replace("-", ""), manifest_end)
+            if clamped_start > clamped_end:
+                return []
+            return [self._fmt_date(d) for d in self.market_dataset.dates(clamped_start, clamped_end)]
         try:
             with _read_data_conn() as conn:
                 rows = conn.execute(

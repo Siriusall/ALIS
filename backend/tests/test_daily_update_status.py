@@ -366,6 +366,78 @@ def test_scheduler_reads_etf_execution_evidence_after_metadata_transaction_close
     assert events[:3] == ["metadata_enter", "metadata_exit", "etf_read"]
 
 
+def test_scheduler_yields_after_same_trade_date_completed(monkeypatch):
+    events = []
+
+    class _Conn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    class _StopLoop(Exception):
+        pass
+
+    monkeypatch.setattr(daily_update, "_DAILY_UPDATE_INTERVAL_SEC", 0)
+    monkeypatch.setattr("app.services.runtime_heartbeat.mark_started", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr("app.services.runtime_heartbeat.beat", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(daily_update, "_read_conn", lambda: _Conn())
+    monkeypatch.setattr(daily_update, "_scheduler_should_check", lambda *_args: True)
+    monkeypatch.setattr(daily_update, "target_trade_date", lambda *_args, **_kwargs: "20260924")
+    monkeypatch.setattr(
+        daily_update,
+        "_recent_success_policy",
+        lambda *_args, **_kwargs: {
+            "allowed": False,
+            "reason": "same_trade_date_completed",
+            "finished_at": "2026-09-24T16:00:00+08:00",
+        },
+    )
+    monkeypatch.setattr(daily_update, "_latest_decision_ready_trade_date", lambda *_args: events.append("ready"))
+    monkeypatch.setattr(daily_update, "_benchmark_ready_for_date", lambda *_args: events.append("benchmark"))
+    monkeypatch.setattr(daily_update, "_adj_factor_ready_for_date", lambda *_args: events.append("adj"))
+    monkeypatch.setattr(daily_update, "_derived_research_lag", lambda *_args: events.append("derived"))
+    monkeypatch.setattr(
+        "app.services.defensive_assets.defensive_asset_execution_status",
+        lambda *_args: events.append("etf") or {"ok": True},
+    )
+    monkeypatch.setattr(daily_update, "_set_state", lambda **kwargs: events.append(kwargs.get("phase")))
+    monkeypatch.setattr(daily_update, "_business_now", lambda: datetime(2026, 9, 24, 16, 1, 0))
+
+    def _run_once(target, stop_error):
+        try:
+            target()
+        except stop_error:
+            pass
+
+    monkeypatch.setattr(
+        daily_update.threading,
+        "Thread",
+        lambda *, target, **_kwargs: type(
+            "_Thread",
+            (),
+            {"start": lambda self: _run_once(target, _StopLoop)},
+        )(),
+    )
+    monkeypatch.setattr(
+        daily_update.threading,
+        "Event",
+        lambda: type("_Event", (), {"wait": lambda _self, _seconds: (_ for _ in ()).throw(_StopLoop())})(),
+    )
+
+    original_started = daily_update._scheduler_started
+    daily_update._scheduler_started = False
+    try:
+        assert daily_update.start_daily_update_scheduler() is True
+    finally:
+        daily_update._scheduler_started = original_started
+
+    assert events[0] == "completed_idle"
+    assert "ready" not in events and "benchmark" not in events and "adj" not in events
+    assert "derived" not in events and "etf" not in events
+
+
 def test_retry_cooldown_accepts_aware_now_with_legacy_naive_timestamp() -> None:
     finished_at = "2026-07-24T16:55:00"
 

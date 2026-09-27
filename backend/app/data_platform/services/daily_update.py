@@ -1042,6 +1042,7 @@ def start_daily_update_scheduler() -> bool:
     def _loop() -> None:
         from app.services.runtime_heartbeat import mark_started, beat
         mark_started("daily_update_scheduler", interval_seconds=_DAILY_UPDATE_INTERVAL_SEC)
+        completed_idle_trade_date = None
         while True:
             try:
                 now = _business_now()
@@ -1052,19 +1053,63 @@ def start_daily_update_scheduler() -> bool:
                 with _read_conn() as c:
                     target = target_trade_date(c, now=now)
                     should_check = _scheduler_should_check(now, target)
-                    if should_check:
+                    # A successful refresh is terminal for this trade date.
+                    # Keep the minute heartbeat alive, but yield immediately
+                    # instead of re-reading all readiness/ETF diagnostics.
+                    if should_check and target == completed_idle_trade_date:
+                        completed_policy = {
+                            "allowed": False,
+                            "reason": "same_trade_date_completed_cached",
+                        }
+                    else:
+                        try:
+                            completed_policy = (
+                                _recent_success_policy(c, target, now=now)
+                                if should_check and target
+                                else {"allowed": True}
+                            )
+                        except Exception:
+                            # Optional terminal fast-path; a diagnostic read error
+                            # must not disable the existing readiness checks.
+                            completed_policy = {"allowed": True}
+                    if should_check and not completed_policy.get("allowed"):
+                        _set_state(
+                            running=False,
+                            phase="completed_idle",
+                            message=f"{target} 日更已完成，等待下一个交易日",
+                            trade_date=target,
+                            finished_at=completed_policy.get("finished_at"),
+                            next_scheduler_check_at=(
+                                _business_now() + timedelta(seconds=_DAILY_UPDATE_INTERVAL_SEC)
+                            ).isoformat(timespec="seconds"),
+                        )
+                        if completed_policy.get("reason") in {
+                            "same_trade_date_completed",
+                            "already_completed",
+                            "same_trade_date_completed_cached",
+                        }:
+                            completed_idle_trade_date = target
+                        ready = ""
+                        benchmark_ready = False
+                        adj_factor_ready = False
+                        retry_policy = {"allowed": False, "reason": "already_completed"}
+                        derived_research_lag = False
+                        completed_idle = True
+                    else:
+                        completed_idle = False
+                    if should_check and not completed_idle:
                         ready = _latest_decision_ready_trade_date(c)
                         benchmark_ready = _benchmark_ready_for_date(c, target)
                         adj_factor_ready = _adj_factor_ready_for_date(c, target)
                         retry_policy = _daily_update_retry_policy(c, target, now=now)
                         derived_research_lag = _derived_research_lag(c, target)
-                    else:
+                    elif not should_check:
                         ready = ""
                         benchmark_ready = False
                         adj_factor_ready = False
                         retry_policy = {"allowed": False, "reason": "before_close_data_window"}
                         derived_research_lag = _derived_research_lag(c, target)
-                if should_check:
+                if should_check and not completed_idle:
                     # Keep the scheduler's short metadata transaction separate
                     # from the per-ETF immutable-evidence reads. A statement
                     # timeout aborts a PostgreSQL transaction; doing the latter
