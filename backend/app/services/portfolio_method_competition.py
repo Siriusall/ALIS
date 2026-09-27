@@ -362,6 +362,7 @@ def _evaluate(
     symbol_industries: dict[str, str],
     industry_targets: dict[str, float],
     industry_penalty_rate: float,
+    market_state: str = "S1",
 ) -> dict[str, Any]:
     weights = dict(execution_projection.get("weights") or {})
     series = _portfolio_returns(weights, returns)
@@ -394,9 +395,17 @@ def _evaluate(
         industry_targets=industry_targets,
         penalty_rate=industry_penalty_rate,
     )
+    # Regime-adaptive risk penalty: encourage momentum capture in bull regimes (S0)
+    # and enforce strict tail-risk mitigation in bear/stress regimes (S2/S3).
+    cvar_penalty_multiplier = {
+        "S0": 0.60,
+        "S1": 1.00,
+        "S2": 1.25,
+        "S3": 1.50,
+    }.get(str(market_state or "S1"), 1.00)
     objective = (
         expected_20d
-        - 1.25 * cvar_20d
+        - cvar_penalty_multiplier * cvar_20d
         - cost
         - 0.10 * volatility_daily * math.sqrt(20.0)
         - industry_penalty
@@ -483,6 +492,7 @@ def compete_portfolio_methods(
     symbol_industries: dict[str, str] | None = None,
     industry_targets: dict[str, float] | None = None,
     industry_penalty_rate: float = 0.01,
+    market_state: str = "S1",
 ) -> dict[str, Any]:
     """Choose among four lot-executable portfolios under one frozen contract."""
     symbols = sorted(
