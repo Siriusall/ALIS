@@ -1862,7 +1862,7 @@ def build_portfolio_reoptimization(*, signal_date: str = "") -> dict[str, Any]:
         weight_bounds=controller_bounds,
         symbol_industries=symbol_industries,
         industry_targets=industry_allocation.get("industry_targets") or {},
-        market_state=market_regime_state,
+        market_state=state,
     ))
     scaled_weights = {
         symbol: round(_safe_float(weight), 8)
