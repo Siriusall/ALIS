@@ -4444,14 +4444,14 @@ def start_evolution_scheduler() -> bool:
                 )
                 ensure_latest_ready_system_cycle()
 
-                if _is_scheduled_trade_day(now) and now.hour >= 16:
+                if _is_scheduled_trade_day(now) and (now.hour > 18 or (now.hour == 18 and now.minute >= 15)):
                     create_evolution_task(
                         task_type="factor_daily_cycle",
                         dedupe_key=f"factor_daily_cycle:{now.date().isoformat()}",
                         payload={"trigger": "daily_scheduler"},
                         priority=20,
                     )
-                if _is_scheduled_trade_day(now) and now.hour >= 17:
+                if _is_scheduled_trade_day(now) and now.hour >= 19:
                     create_evolution_task(
                         task_type="system_autonomy_cycle",
                         dedupe_key=f"system_autonomy_cycle:{now.date().isoformat()}",

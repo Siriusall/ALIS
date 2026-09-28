@@ -784,8 +784,8 @@ def frozen_order_data_gate_error(audit: dict[str, Any]):
 
 def _fallback_execution_clock() -> dtime:
     """Use the publication-discovery window, not a guessed fixed close time."""
-    hour = max(0, min(int(os.getenv("ALIS_DAILY_UPDATE_HOUR", "15")), 23))
-    minute = max(0, min(int(os.getenv("ALIS_DAILY_UPDATE_MINUTE", "1")), 59))
+    hour = max(0, min(int(os.getenv("ALIS_DAILY_UPDATE_HOUR", "16")), 23))
+    minute = max(0, min(int(os.getenv("ALIS_DAILY_UPDATE_MINUTE", "30")), 59))
     return dtime(hour, minute)
 
 

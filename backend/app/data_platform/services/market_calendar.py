@@ -7,8 +7,8 @@ from typing import Any
 
 def after_close_data_ready_time() -> dt_time:
     """Use the same configurable clock as daily refresh and T+1 execution."""
-    hour = max(0, min(int(os.getenv("ALIS_DAILY_UPDATE_HOUR", "15")), 23))
-    minute = max(0, min(int(os.getenv("ALIS_DAILY_UPDATE_MINUTE", "1")), 59))
+    hour = max(0, min(int(os.getenv("ALIS_DAILY_UPDATE_HOUR", "16")), 23))
+    minute = max(0, min(int(os.getenv("ALIS_DAILY_UPDATE_MINUTE", "30")), 59))
     return dt_time(hour, minute)
 
 

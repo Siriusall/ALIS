@@ -68,8 +68,8 @@ _DEFAULT_ENABLE_DATA_HEALTH_GATE = str(os.getenv("QUANT_ENABLE_DATA_HEALTH_GATE"
 _AUTO_SIMULATION_ENABLED = str(os.getenv("QUANT_AUTO_SIMULATION", "1")).strip().lower() in {"1", "true", "yes", "on"}
 _AUTO_SIMULATION_INTERVAL_SEC = max(60, min(int(os.getenv("QUANT_AUTO_SIMULATION_INTERVAL_SEC", "60")), 3600))
 _AUTO_SIMULATION_CLOSE_TIME = dtime(
-    max(0, min(int(os.getenv("ALIS_DAILY_UPDATE_HOUR", "15")), 23)),
-    max(0, min(int(os.getenv("ALIS_DAILY_UPDATE_MINUTE", "1")), 59)),
+    max(0, min(int(os.getenv("ALIS_DAILY_UPDATE_HOUR", "16")), 23)),
+    max(0, min(int(os.getenv("ALIS_DAILY_UPDATE_MINUTE", "30")), 59)),
 )
 _DEFENSIVE_EXECUTION_REFRESH_INTERVAL_SEC = max(
     60,
