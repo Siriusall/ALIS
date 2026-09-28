@@ -4443,19 +4443,7 @@ def start_evolution_scheduler() -> bool:
                     priority=90,
                 )
                 ensure_latest_ready_system_cycle()
-                if _is_scheduled_trade_day(now) and 9 <= now.hour < 19:
-                    probe_bucket = f"{now.hour:02d}{(now.minute // 10) * 10:02d}"
-                    create_evolution_task(
-                        task_type="research_data_publication_probe",
-                        dedupe_key=f"research_data_publication_probe:v1:{now.date().isoformat()}:{probe_bucket}",
-                        payload={
-                            "trigger": "ten_minute_publication_probe",
-                            "include_futures": now.hour >= 15,
-                        },
-                        max_attempts=1,
-                        priority=65,
-                        coalesce_active_type=True,
-                    )
+
                 if _is_scheduled_trade_day(now) and now.hour >= 16:
                     create_evolution_task(
                         task_type="factor_daily_cycle",
