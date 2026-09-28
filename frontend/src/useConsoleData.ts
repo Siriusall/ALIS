@@ -29,7 +29,7 @@ export type ConsoleData = Partial<Record<keyof typeof endpoints, Json>> & {
 // /factors aliases only redirect in App, so they do not keep a separate fan-out map.
 const routeKeys: Record<string, Array<keyof typeof endpoints>> = {
   "/overview": ["owner", "ledger", "portfolio", "tradingReady", "latestPlan", "health", "adminTasksLive", "dailyUpdateStatus", "watermarks", "ledgerAudit", "nodeActivities"],
-  "/system": ["health", "tradingReady", "adminTasksLive"],
+  "/system": ["health", "tradingReady", "adminTasksLive", "nodeActivities"],
   "/system/versions": ["systemVersionStatus", "systemReleases", "systemContracts"],
   "/decision": ["owner", "decision", "tradingReady", "latestPlan"],
   "/portfolio": ["owner", "ledger", "positions", "portfolio", "risk", "research", "latestPlan"],

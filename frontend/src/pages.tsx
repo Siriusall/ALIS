@@ -299,9 +299,7 @@ export function Overview({ data }: { data: ConsoleData }) {
     <HomeRuntimeSummary data={data}/>
     <Section title="历史周期异常与系统自行处理事项" detail="周期证据与当前实时 readiness 分开显示；只有需要所有者授权的事项会提升为强通知。">{incidents.length ? <div className="incident-list">{incidents.slice(0, 6).map((item, i) => {const historical=String(pick(item,["evidence_scope"],""))==="completed_cycle";return <div key={i}><Status>{pick(item, ["disposition", "status"], "观察")}</Status><div><strong>{historical ? "历史周期证据 · " : ""}{pick(item, ["title", "summary", "name"], "运行事项")}</strong><p>{pick(item, ["next_review", "reason", "detail"], "等待下一周期复核")}{historical && pick(item,["observed_at"],"") ? ` · 观测于 ${String(pick(item,["observed_at"],""))}` : ""}</p></div></div>})}</div> : <Empty title="没有需要所有者处理的事项" detail="等待未来样本和冷却期不计为故障。" />}<a className="text-link" href="/operations">查看系统运行证据 →</a></Section>
 
-    <Section title="节点每日活动与排障日志" detail="展示三台服务器（数据库中台、计算研究集群、应用调度网关）每日运行任务、执行状态与最新异常，便于定位问题。">
-      <NodeDailyActivities data={data.nodeActivities} />
-    </Section>
+
   </>;
 }
 
@@ -318,28 +316,29 @@ function NodeDailyActivities({ data }: { data?: Json }) {
     { key: "app_node", defaultName: "应用/调度网关 (124.221.86.123)", icon: Workflow },
   ];
 
-  return <div className="node-activities-container">
-    <div className="node-day-selector">
-      <span className="selector-label"><Clock3 size={15}/> 观测日期：</span>
-      <div className="day-chips">
+  return <div>
+    <div className="candidate-account-toolbar">
+      <div>
         {days.map((d, idx) => {
           const isSelected = idx === selectedDayIndex;
           const label = String(pick(d, ["date"], ""));
           const totalFailed = Number(pick(d, ["db_node.failed"], 0)) + Number(pick(d, ["compute_node.failed"], 0)) + Number(pick(d, ["app_node.failed"], 0));
           return <button
+            type="button"
             key={label || idx}
-            className={'day-chip' + (isSelected ? ' is-active' : '') + (totalFailed > 0 ? ' has-failed' : '')}
+            className={isSelected ? "active" : ""}
             onClick={() => setSelectedDayIndex(idx)}
           >
-            <strong>{label}</strong>
-            {totalFailed > 0 && <span className="badge-fail">{totalFailed} 异常</span>}
+            {label}
+            {totalFailed > 0 && <span>{totalFailed} 异常</span>}
           </button>;
         })}
       </div>
+      <small>观测日期：{String(pick(currentDay, ["date"], ""))}</small>
     </div>
 
-    <div className="node-cards-grid">
-      {nodes.map(({ key, defaultName, icon: Icon }) => {
+    <div className="runtime-node-grid">
+      {nodes.map(({ key, defaultName }) => {
         const node = pick(currentDay, [key], {}) as Json;
         const name = String(pick(node, ["name"], defaultName));
         const role = String(pick(node, ["role"], ""));
@@ -348,26 +347,27 @@ function NodeDailyActivities({ data }: { data?: Json }) {
         const queued = Number(pick(node, ["queued"], 0));
         const running = Number(pick(node, ["running"], 0));
         const tasks = firstArray(node, ["tasks"]);
+        const statusTone = failed > 0 ? "failed" : running > 0 ? "running" : completed > 0 ? "healthy" : "unknown";
 
-        return <article className={'node-activity-card' + (failed > 0 ? ' has-error' : '')} key={key}>
-          <header className="node-card-head">
-            <div className="node-title-group">
-              <Icon size={18} className="node-icon" />
-              <div>
-                <h4>{name}</h4>
-                {role && <small>{role}</small>}
-              </div>
+        return <article className={`runtime-node-card runtime-node-${statusTone}`} key={key}>
+          <header>
+            <div>
+              <span>{key === "db_node" ? "DB NODE" : key === "compute_node" ? "COMPUTE WORKER" : "APP GATEWAY"}</span>
+              <h3>{name}</h3>
             </div>
-            <div className="node-status-badges">
-              {running > 0 && <Status tone="info">{running} 运行中</Status>}
-              {completed > 0 && <Status tone="good">{completed} 完成</Status>}
-              {queued > 0 && <Status tone="watch">{queued} 排队</Status>}
-              {failed > 0 && <Status tone="danger">{failed} 失败</Status>}
-              {completed === 0 && failed === 0 && queued === 0 && running === 0 && <Status tone="neutral">无任务</Status>}
-            </div>
+            <Status tone={failed > 0 ? "danger" : running > 0 ? "info" : completed > 0 ? "good" : "neutral"}>
+              {failed > 0 ? `${failed} 项异常` : running > 0 ? `${running} 运行中` : completed > 0 ? `${completed} 完成` : "无任务"}
+            </Status>
           </header>
+          <p>{role}</p>
 
-          <div className="node-task-list">
+          <dl>
+            <div><dt>已完成</dt><dd>{completed}</dd></div>
+            <div><dt>异常/阻断</dt><dd>{failed}</dd></div>
+            <div><dt>排队中</dt><dd>{queued}</dd></div>
+          </dl>
+
+          <div className="runtime-task-list">
             {tasks.length ? tasks.map((t, tIdx) => {
               const taskType = String(pick(t, ["task_type"], "未命名任务"));
               const taskStatus = String(pick(t, ["status"], ""));
@@ -377,17 +377,20 @@ function NodeDailyActivities({ data }: { data?: Json }) {
               const lastFinish = String(pick(t, ["last_finish"], ""));
               const rowsWritten = Number(pick(t, ["rows_written"], 0));
 
-              return <div className={'node-task-item status-' + taskStatus} key={tIdx}>
-                <div className="task-item-main">
-                  <Status tone={toneOf(taskStatus)}>{taskStatus}</Status>
-                  <strong className="task-name">{taskType}</strong>
-                  <span className="task-count">× {count}</span>
-                  {rowsWritten > 0 && <small className="rows-info">写入 {rowsWritten.toLocaleString()} 行</small>}
+              return <article className="runtime-task-row" key={tIdx}>
+                <div className="runtime-task-main">
+                  <div>
+                    <strong>{taskTextLabel(taskType, "计划任务")}</strong>
+                    <span>× {count}</span>
+                  </div>
+                  <p>{error ? `异常：${error}` : rowsWritten > 0 ? `写入 ${rowsWritten.toLocaleString()} 行数据` : `状态：${runtimeStatusLabel(taskStatus)}`}</p>
                 </div>
-                {error && <div className="task-error-msg"><TriangleAlert size={14}/><span>{error}</span></div>}
-                {(firstStart || lastFinish) && <div className="task-time-range"><small>{firstStart ? ('首次 ' + firstStart.slice(11, 19)) : ''}{lastFinish ? (' · 最终 ' + lastFinish.slice(11, 19)) : ''}</small></div>}
-              </div>;
-            }) : <div className="node-task-empty"><small>当日暂无调度任务</small></div>}
+                <div className="runtime-task-state">
+                  <Status tone={toneOf(taskStatus)}>{runtimeStatusLabel(taskStatus)}</Status>
+                  <small>{firstStart ? firstStart.slice(11, 19) : ""}{lastFinish ? ` ~ ${lastFinish.slice(11, 19)}` : ""}</small>
+                </div>
+              </article>;
+            }) : <div className="runtime-node-current"><div className="is-idle"><Clock3 size={13}/><span><strong>当日暂无调度任务</strong><small>节点处于待机或未分配任务状态</small></span></div></div>}
           </div>
         </article>;
       })}
@@ -1029,6 +1032,9 @@ export function SystemObservatory({ data }: { data: ConsoleData }) {
     <div className="runtime-work-grid"><Section title="实时执行流" detail="只显示真正处于 running 的业务任务，不把常驻服务算作任务。">{running.length?<div className="runtime-task-list">{running.map((row,index)=><RuntimeTaskRow row={row} key={String(pick(row,["id"],index))}/>)}</div>:<Empty title="当前没有正在执行的业务任务" detail="节点仍可能保持健康并等待下一项调度。" />}</Section><Section title="待执行队列" detail="按重试优先、任务优先级和创建时间排序。">{queued.length?<div className="runtime-task-list">{queued.slice(0,12).map((row,index)=><RuntimeTaskRow row={row} queueIndex={index} key={String(pick(row,["id"],index))}/>)}</div>:<Empty title="队列为空" detail="没有等待领取或等待重试的任务。" />}</Section></div>
     <Section title="后续安排" detail="系统调度器已计算出的下一批计划；条件未满足时会明确标注。"><div className="runtime-upcoming-grid">{upcoming.map((item,index)=><article key={String(pick(item,["task_type"],index))}><header><Clock3 size={15}/><Status>{pick(item,["status"],"scheduled")}</Status></header><strong>{pick(item,["name"],"计划任务")}</strong><p>{pick(item,["execution_node"],"待分配节点")}</p><time>{formatSystemTime(pick(item,["scheduled_at"],""),"等待交易日或数据条件")}</time></article>)}</div></Section>
     <Section title="任务健康与异常" detail="只保留当前未解决的阻断、失败或心跳停滞任务；历史已恢复事项不显示。">{incidents.length?<div className="runtime-incident-list">{incidents.map((item,index)=><article key={String(pick(item,["id"],index))}><TriangleAlert size={16}/><div><strong>{taskTextLabel(pick(item,["name","task_type"],""),"异常任务")}</strong><p>{pick(item,["incident_reason","error","message"],"任务状态异常")}</p><small>{pick(item,["execution_node"],"待确认节点")} · {formatSystemTime(pick(item,["updated_at","heartbeat_at"],""))}</small></div><Status tone="danger">{pick(item,["status"],"failed")}</Status></article>)}</div>:<Empty title="当前没有未解决异常" detail="任务心跳、队列和三台物理服务器状态均未发现需要处理的问题。" />}</Section>
+    <Section title="节点每日活动与排障日志" detail="按日汇总展示三台物理服务器（数据库中台、计算研究集群、应用调度网关）任务执行记录与异常。">
+      <NodeDailyActivities data={data.nodeActivities} />
+    </Section>
   </>;
 }
 

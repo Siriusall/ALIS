@@ -894,6 +894,7 @@ def _readers(page_key: str) -> dict[str, Callable[[], Any]]:
             "ledgerAudit": model_strategy.model_strategy_ledger_audit,
         },
         "runtime": {
+            "nodeActivities": lambda: model_strategy.model_strategy_node_activities(limit_days=7),
             "health": common["health"],
             "tradingReady": common["tradingReady"],
             "adminTasksLive": lambda: model_strategy.model_strategy_task_center(limit=16, log_limit=5, compact=True),
